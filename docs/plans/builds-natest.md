@@ -1556,39 +1556,23 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 ### Phase 73 — Two stopped-call tests stop failing at random  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-06, from queue's 18b gate; one case also from this unit's Phase 71 targeted test. Each test failed once and passed on rerun.
+No code change. Both causes are named from evidence, and neither cause is in a test.
 
-**Goal:** each of the two tests has a named cause from evidence and passes under forced delay, with every checked behavior kept.
-
-**Spec:**
-1. `direct/test_verify_token_memory_history.py`, `test_cancel_during_memory_wait_releases_token_and_waiter`, line 110: `self.assertEqual(self.live_group_processes(process.pid), [])` gave `Lists differ: [2634236] != []`. The check reads once, directly after `process.wait()`. A member of the group that is still ending can give this result. Log: the `direct/test_verify_token_memory_history.py` section of the targeted test log.
-2. `direct/test_verify_mac_copy_ownership.py`, `test_a_stopped_call_leaves_no_step_or_copy_running`: the failure text is not known. Ask no one for it. Force delays and read which assertion fails. Lines 29-32 send SIGTERM, wait for the marker, then read the marker again.
-3. For each test, quote the failing line and the source line before any fix. Say which process stays and why, from `/proc` or `ps` evidence. A process that verify.sh leaves running is a defect in production: send the evidence to the director, and do not hide it with a longer wait.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- Mac case: `test_a_stopped_call_leaves_no_step_or_copy_running` failed in queue's tree, which lacks Phase 63's `wait_for_marker_exit`. Phase 63 (c6deef7b5) fixes it.
+- Token case: 3 of 60 paired runs (5%) failed at `test_verify_token_memory_history.py:110`. Each survivor was `sleep 60` from `verify.sh:3259` (`sleep "$TOKEN_RENEW_S" &`). It stayed alive at least 10 s in the verifier's process group, with no pending signal. `stop_token_renewer` (`verify.sh:3271-3272`) signals and waits only for the renewer pid.
+- verify-unit owns the token defect. Its next tip carries the `jobs -p` fix and a forced regression test. The line 110 assertion stays as the acceptance test for that fix.
 
 **Files:**
-- `scripts/direct/test_verify_token_memory_history.py`
-- `scripts/direct/verify_token_wait_test_support.py`
-- `scripts/direct/test_verify_mac_copy_ownership.py`
-- `scripts/direct/verify_mac_offload_test_support.py`
+- `scripts/direct/test_verify_token_memory_history.py` — unchanged
+- `scripts/direct/verify_token_wait_test_support.py` — unchanged
+- `scripts/direct/test_verify_mac_copy_ownership.py` — unchanged
+- `scripts/direct/verify_mac_offload_test_support.py` — unchanged
 
-**Workers:** 1 writer; the two tests share one kind of cause
-- `impl3` — all files above, role impl
+**Gotchas:** the forced-pass form in the goal is not reached for the token case, because a longer wait would hide the production defect. The exact signal timing inside the renewer stays unproved.
 
-**Constraints from prior phases:**
-- Phase 63: a flake fix waits on events. A forced case fails before the fix and passes after it.
-- Phase 70: a hang that does not reproduce gets a report that names the wait, and the cause stays open.
-- Verify's forms: `test_verify_mac_copy_ownership.py` and `test_verify_token_memory_history.py` are not in Phase 41g's list.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- for each test, the quoted failing line, the source line and the named cause are in the summary, or the summary states that the cause stays open, with the evidence and the owner
-- a forced case fails before each fix and passes after it, on a tempdir copy
-- each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
-- the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a longer wait or a retry in the test, because it hides a process that `verify.sh` leaves running.
 
 ### Phase 74 — `copies/test_copy_guard.py` uses half its CPU  · status: todo
 **Depends on:** none
@@ -1649,5 +1633,41 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 **Acceptance gate:**
 - the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
 - CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 76 — Verify hold fixtures read their own run root  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the verify hold test fixtures read unit runs only under their own tempdir, never the live `/tmp/claude/unit`, with every checked behavior kept.
+
+**Spec:**
+1. User rule (via the showrunner, 2026-11-06): tests never touch live units.
+2. Cause: `scripts/direct/verify_hold_wait_test_support.py` sets no run root. `unit_runs.held_by_session` and `unit_runs.director` then read the real `/tmp/claude/unit`. `session_staff.py:150`, `worker.py:371` and `worker.py:427` pass `ROSTER_RUN_ROOT`. `progress_history.py:5786` reads `UNIT_RUN_ROOT`. herdr found the read from "no unit staff row" lines in red gate output.
+3. Trace each read from the fixture's `verify.sh` call to `unit_runs.run_roots`. Name each environment variable that selects a run root on that path.
+4. Set each such variable in the fixture environment to a folder under the fixture root. Make the folder once in the class seed when a reader needs it to exist.
+5. Check the other `scripts/direct/verify_*_test_support.py` fixtures for the same read. Apply the same fix where a fixture reaches the read.
+6. Change only test support files. verify-unit changes `verify.sh` and `record.py` in its next tip.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/verify_hold_wait_test_support.py` — the hold fixture environment
+- `scripts/direct/verify_*_test_support.py` — only those that reach the same read
+
+**Workers:** 1 writer on slot `impl` (one fixture change; the files do not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 72: `direct/test_findings_simplify.py` stopped a live staff read with `isolated_staff_file`. Reuse that helper where a fixture also reads `STAFF_FILE`.
+- `VerifyHoldTools.setUp` copies one class seed into each test's root. A path set in the seed must point inside that root.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `scripts/direct/test_verify_hold_signals.py`, `_wait`, `_history` and `_workers` pass under `scripts/test_times/module_run.py`
+- every other importer of each changed support file passes
+- a proof on a tempdir copy shows no open of a path under the live `/tmp/claude/unit` during the four modules
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
