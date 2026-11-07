@@ -113,7 +113,8 @@ class AstraReviewTests(StaffTestCase):
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
             "staff_id": worker.id, "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
-        self.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
+        # The fixture's cleanups run after the os.kill guard ends, so the record's real process is stopped then.
+        self.fixture.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
