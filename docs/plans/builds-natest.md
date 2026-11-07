@@ -1593,33 +1593,18 @@ No code change. Both causes are named from evidence, and neither cause is in a t
 ### Phase 75 — `production/test_add_unit.py` uses half its CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_add_unit.py` (59.8 CPU s per gate) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`production/test_add_unit.py` uses 66.0% less CPU, with all 64 tests kept. Three same-load pairs: CPU 59.76 to 20.34 s, processes 2,575 to 2,483, execs 2,414 to 2,234, wall 68.56 to 26.73 s.
 
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of the setup that repeats, and of each real launch of the add-unit command.
-2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `setUpModule` patches `herdr.Herdr.start_command` with `unittest.enterModuleContext`. The patch runs the argv through `herdr.run_program`, which the existing fake transport answers.
+- `test_real_brief_admission_can_switch_to_its_approved_plan` calls the brief in process for its two admissions.
+- The standby test and the cross-production refusal test keep their real CLI processes.
 
 **Files:**
 - `scripts/production/test_add_unit.py` — the module
 
-**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
-- `impl4` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 59: a complete fixture seed copied per test took one module from 53.7 to 28.5 CPU s. Check each copied file for the seed's root path.
-- Phase 55: look first for repeated first launches that are setup.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:** the Herdr tests own the waiting `start_command` behavior. They cover CLI completion, observation and deadline expiry, but not a `Popen` failure or `AgentExited`; the old add-unit tests did not force those cases either.
 
 ### Phase 76 — Verify hold fixtures read their own run root  · status: todo
 **Depends on:** none
