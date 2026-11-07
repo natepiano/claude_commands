@@ -97,7 +97,7 @@ class EndSessionTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update({
             "HOME": str(self.root),
-            "PYTHONPATH": str(END_SESSION.resolve().parents[2]),
+            "PYTHONPATH": os.pathsep.join((str(END_SESSION.resolve().parents[2]), os.environ.get("PYTHONPATH", ""))),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "CODEX_THREAD_ID": "",
             "COPIES_CONFIG": str(END_SESSION.resolve().parents[2] / "config/copies.conf"),
