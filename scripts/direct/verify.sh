@@ -1415,20 +1415,27 @@ if kind == "token":
     elif payload and payload != "unknown":
         roster = fields(read(board / "mesh_roster.json"))
         matches = [entry for name, entry in roster.items() if isinstance(entry, dict)
-                   and (name == payload or entry.get("slot") == payload or name.endswith("-" + payload))]
-        worker = matches[0] if len(matches) == 1 else {}
-        reference = text(worker.get("staff_id"))
-        if not reference and len(matches) <= 1:
-            references = set()
+                   and name == payload]
+        if not matches:
             for path in board.glob("impl_worker_*.json"):
                 worker = fields(read(path))
-                if (text(worker.get("name")) == payload or text(worker.get("slot")) == payload
+                if (text(worker.get("slot")) == payload
                         or path.stem == "impl_worker_" + payload):
-                    if value := text(worker.get("staff_id")):
-                        references.add(value)
-            if len(references) == 1:
-                reference = references.pop()
+                    matches.append(worker)
+        if not matches:
+            matches = [entry for entry in roster.values() if isinstance(entry, dict)
+                       and entry.get("slot") == payload]
         state = fields(read(board / "progress_history_state.json"))
+        if matches:
+            reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""
+        else:
+            active_pass = state.get("pass", {})
+            worker = active_pass.get(payload, {}) if isinstance(active_pass, dict) else {}
+            if isinstance(active_pass, dict) and payload not in active_pass:
+                workers = [entry for entry in active_pass.values() if isinstance(entry, dict)
+                           and entry.get("worker_name") == payload]
+                worker = workers[0] if len(workers) == 1 else {}
+            reference = text(worker.get("worker_id")) if isinstance(worker, dict) else ""
         try:
             record = staff.snapshot()
             member = record.by_id(staff.StaffId(reference)) if reference else None
@@ -1440,8 +1447,6 @@ if kind == "token":
                 owner = unit.name if isinstance(unit, staff.StaffRow) else ""
         except (OSError, ValueError):
             pass
-        if not owner:
-            owner_flag, owner = "--holder-unit", text(state.get("unit"))
 elif kind == "hold":
     from scripts.build_hold import build_hold
     from scripts.build_targets import build_targets
@@ -1510,7 +1515,9 @@ phase_wait_start() {
             IFS= read -r holder_pid < "$BOARD_DIR/locks/cargo.d/holder_pid" || true
         fi
         observation="$slot:$holder_pid"
-        if [[ "${PHASE_TOKEN_OBSERVATION:-}" == "$observation" ]]; then
+        if [[ -z "$slot" || "$slot" == unknown ]]; then
+            PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""
+        elif [[ "${PHASE_TOKEN_OBSERVATION:-}" == "$observation" && -n "${PHASE_TOKEN_HOLDER:-}" ]]; then
             holder="${PHASE_TOKEN_HOLDER:-}"
         else
             if ! holder="$(phase_wait_holder_flags token "$slot")"; then

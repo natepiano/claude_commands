@@ -302,7 +302,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Ruled out:** a pinned step that waits on every busy answer — it waited on leftovers that no live session holds.
 
-### Phase 8a — Resolve the token holder from recorded identities  · status: todo
+### Phase 8a — Resolve the token holder from recorded identities  · status: done
 
 **Depends on:** Phase 8.
 

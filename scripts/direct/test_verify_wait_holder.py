@@ -21,6 +21,8 @@ from scripts.lint import memory_admit
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 FIRST_SESSION = fixture_runtime_id("thread-first")
@@ -269,6 +271,182 @@ exit 0
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(wait_rows(board)[-1]["event_type"], "wait_finished")
+
+
+class VerifyRecordedTokenIdentityTests(VerifyTokenWaitFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        isolate_run_sources(self.environment, self.root)
+        session = self.root / "session"
+        self.record_phase(session)
+        board = self.root / "token-board"
+        board.mkdir()
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            owner, = staff.initial_snapshot().find(kind="unit")
+        self.write_token_record("progress_history_state.json", {"owner_staff_id": owner.id})
+        waits = self.root / "identity-waits"
+        waits.mkdir()
+        observer = self.root / "identity-python"
+        _ = observer.write_text('''#!/bin/sh
+printf '%s\\n' "${VERIFY_PY_HELPER:-recorder}" >> "$TEST_HOLDER_PY_CALLS"
+exec "$TEST_REAL_PYTHON" "$@"
+''')
+        observer.chmod(0o755)
+        self.environment.update({"TEST_HOLDER_PY_CALLS": str(self.root / "identity-python-calls"),
+                                 "TEST_REAL_PYTHON": sys.executable,
+                                 "TEST_IDENTITY_ROOT": str(self.root)})
+
+    def write_token_record(self, name: str, record: dict[str, object]) -> None:
+        _ = (self.root / "token-board" / name).write_text(json.dumps(record))
+
+    def worker_reference(self, name: str) -> str:
+        roster = cast(dict[str, dict[str, str]], json.loads(
+            (self.root / "session/mesh_roster.json").read_text()))
+        return roster[name]["staff_id"]
+
+    def acquire_identity_token(self, owner: str) -> None:
+        result = subprocess.run(["bash", str(BOARD), "acquire", str(self.root / "token-board"),
+                                 owner, "cargo", "--pid", str(os.getpid()), "--hold", "3600"],
+                                env=self.environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def record_token_passes(self, body: str = 'phase_wait_start token "cargo token"\n') -> list[dict[str, object]]:
+        recorded_count = len(wait_rows(self.root / "session"))
+        script = self.root / "identity-wait.sh"
+        _ = script.write_text('set -euo pipefail\n' + shell_functions(
+            VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
+PY=$TEST_IDENTITY_ROOT/identity-python
+PHASE_WAIT_SESSION=$TEST_IDENTITY_ROOT/session
+PHASE_WAIT_RECORDER=$1
+HOLD_WAIT_DIR=$TEST_IDENTITY_ROOT/identity-waits
+BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
+''' + body + '\nphase_wait_finish token\n')
+        result = subprocess.run(["bash", str(script), str(VERIFY.with_name("progress_history.py"))],
+                                cwd=self.root, env=self.environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = wait_rows(self.root / "session")[recorded_count:]
+        self.assertEqual(rows[0]["event_type"], "wait_started", rows)
+        self.assertEqual(rows[-1]["event_type"], "wait_finished", rows)
+        self.assertEqual({row["wait_id"] for row in rows}, {rows[0]["wait_id"]})
+        return rows
+
+    def test_director_token_uses_the_recorded_owner_without_a_director_file(self) -> None:
+        self.acquire_identity_token("director")
+        rows = self.record_token_passes('phase_wait_start token "cargo token"\n' * 3)
+        self.assertEqual(recorded_holders(rows), [named_holder(
+            "slot", "cargo", fixture_runtime_id("fixture-director"))])
+        self.assertEqual((self.root / "identity-python-calls").read_text().splitlines(),
+                         ["PHASE_WAIT_HOLDER", "recorder", "recorder"])
+
+    def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
+        reference = self.worker_reference("fixture-first")
+        self.write_token_record("impl_worker_saved.json", {"slot": "writer", "staff_id": reference,
+                                                          "model": "fixture"})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl", "worker_id": self.worker_reference("fixture-first")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.acquire_identity_token("impl")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_dispatch_worker_name_resolves_when_the_dispatch_slot_differs(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.acquire_identity_token("impl2")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_duplicate_dispatch_worker_names_use_the_owner_unit(self) -> None:
+        state = cast(dict[str, object], json.loads(
+            (self.root / "token-board/progress_history_state.json").read_text()))
+        state["pass"] = {
+            "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")},
+            "test": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-second")}}
+        self.write_token_record("progress_history_state.json", state)
+        self.acquire_identity_token("impl2")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_exact_roster_key_wins_over_a_suffix_match_and_saved_record(self) -> None:
+        self.write_token_record("mesh_roster.json", {
+            "writer": {"staff_id": self.worker_reference("fixture-first")},
+            "other-writer": {"staff_id": self.worker_reference("fixture-second")}})
+        self.write_token_record("impl_worker_writer.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_saved_worker_stem_wins_over_a_roster_slot_match(self) -> None:
+        self.write_token_record("impl_worker_writer.json", {
+            "staff_id": self.worker_reference("fixture-first")})
+        self.write_token_record("mesh_roster.json", {
+            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-second")}})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_roster_slot_match_names_the_worker_when_no_exact_record_exists(self) -> None:
+        self.write_token_record("mesh_roster.json", {
+            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-first")}})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", FIRST_SESSION)])
+
+    def test_missing_worker_staff_row_uses_the_recorded_owner_unit(self) -> None:
+        self.write_token_record("impl_worker_writer.json", {"slot": "writer", "staff_id": "missing-worker"})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_ambiguous_worker_records_do_not_choose_a_session(self) -> None:
+        self.write_token_record("impl_worker_first.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-first")})
+        self.write_token_record("impl_worker_second.json", {
+            "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
+        self.acquire_identity_token("writer")
+        self.assertEqual(recorded_holders(self.record_token_passes()),
+                         [named_holder("slot", "cargo", "wait", unit=True)])
+
+    def test_occupied_slot_retries_until_a_saved_identity_appears(self) -> None:
+        self.write_token_record("progress_history_state.json", {})
+        _ = (self.root / "pending-worker.json").write_text(json.dumps({
+            "slot": "writer", "staff_id": self.worker_reference("fixture-first")}))
+        self.acquire_identity_token("writer")
+        rows = self.record_token_passes('''phase_wait_start token "cargo token"
+cp "$TEST_IDENTITY_ROOT/pending-worker.json" "$BOARD_DIR/impl_worker_writer.json"
+phase_wait_start token "cargo token"
+phase_wait_start token "cargo token"
+''')
+        holders = recorded_holders(rows)
+        self.assertEqual(cast(dict[str, object], holders[0])["state"], "HolderNotNamed")
+        self.assertEqual(holders[1:], [named_holder("slot", "cargo", FIRST_SESSION)])
+        self.assertEqual((self.root / "identity-python-calls").read_text().splitlines().count(
+            "PHASE_WAIT_HOLDER"), 2)
+
+    def test_absent_and_unknown_token_owners_do_not_start_a_lookup(self) -> None:
+        for owner in ("", "unknown"):
+            with self.subTest(owner=owner):
+                if owner:
+                    self.acquire_identity_token(owner)
+                calls = self.root / "identity-python-calls"
+                calls.unlink(missing_ok=True)
+                rows = self.record_token_passes('phase_wait_start token "cargo token"\n' * 3)
+                self.assertEqual(cast(dict[str, object], recorded_holders(rows)[-1])["state"], "HolderNotNamed")
+                self.assertEqual(calls.read_text().splitlines(), ["recorder", "recorder"])
 
 
 class VerifyHoldHolderTests(VerifyHoldWaitFixture):
