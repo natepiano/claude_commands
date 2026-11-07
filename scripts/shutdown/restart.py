@@ -18,7 +18,7 @@ from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
 from scripts.shutdown import shutdown_record, pane_record
-from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed, NoRoleAccount
+from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
@@ -42,7 +42,7 @@ class WorkerRestore(Protocol):
 
 class MemberLifecycle(Protocol):
     def resume_account(self, kind: Literal["claude", "codex"], row: staff.StaffRow,
-                       *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection | NoRoleAccount: ...
+                       *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection: ...
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
     def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
@@ -191,7 +191,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             _ = stop_resume.heal_account_trust(folder, selected.dir,
                 Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
             environment = named_account_environment(selected.dir)
-        elif isinstance(selected, accounts.CodexWorkersAccount):
+        else:
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
             environment = {**names.environment(projected), **environment}

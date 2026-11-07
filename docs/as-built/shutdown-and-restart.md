@@ -45,7 +45,8 @@ The default reason is `resumed by name`.
 The shared resume path reads the saved environment, arguments, and folder.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Other Claude sessions keep their saved account.
+Other Claude sessions, and sessions with no staff row, use the configured units account.
+When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
 Restart and folder moves use the role account.
 A herdr server restore keeps the saved account for both families.

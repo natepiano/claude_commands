@@ -13,7 +13,7 @@ Use the `agents` program.
 
 Resume restores the saved folder and environment.
 Codex uses the configured `workers` account; Claude units and showrunners use their configured role accounts.
-Other Claude sessions keep their saved accounts; `--to ACCOUNT` overrides the account.
+Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
 The default reason is `resumed by name`.
 A running session prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.

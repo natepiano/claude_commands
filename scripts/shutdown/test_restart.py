@@ -759,6 +759,29 @@ class RestartTests(RestartTestCase):
             self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
         self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(target))
 
+    def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
+        self.running.clear()
+        row = replace(self.rows[0], kind="agent")
+        source, target = self.root / ".claude3", self.root / ".claude2"
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session)])
+        for requested, expected in (("", target), ("claude3", source)):
+            with (self.subTest(target=requested),
+                  patch.object(pane_record, "publication_for_session",
+                      return_value=pane_launch.LaunchPublication(self.root / "agents.json", entry)),
+                  patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", target)) as role,
+                  patch.object(herdr, "prepare_session_environment",
+                      return_value=herdr.PreparedAgentEnvironment(self.root, {})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired()))):
+                self.assertEqual(restart.start_row(row, staff.StaffSnapshot((row,)), herdr.Herdr("agents"),
+                                                  target_account=requested), "w1:p0")
+                self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(expected))
+                if requested:
+                    role.assert_not_called()
+                else:
+                    role.assert_called_once_with("unit")
+
     def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
         target = self.root / ".claude2"
         before = (target / ".claude.json").read_text()
