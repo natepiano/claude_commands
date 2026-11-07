@@ -1,7 +1,8 @@
 # Unit rename
 
-`rename_unit.py plan|apply|verify <showrunner name> <old> <new>` renames one staff unit.
+`rename.py plan|apply <old> <new>` renames one staff unit.
 The command reads the unit from its staff row.
+Use a staff id, `showrunner/name`, or a unique name; see `production-rename.md`.
 It keeps the staff id, current session, parent, and recorded role.
 A pending rename finishes before the command sets the displays.
 A same-name request sets the session, tab, and pane names to the staff name.

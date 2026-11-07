@@ -98,7 +98,7 @@ class ControlTests(ControlFixture):
         self.pinned_step(kind="build")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.pinned_step()
-        step_record.state("pinned", step_record.StepState.ON_SSH, "aws")
+        _ = step_record.record_path("pinned").with_suffix(".state").write_text("on_ssh aws\n")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.assertEqual(self.aws.count("start-instances"), 0)
 

@@ -104,7 +104,7 @@ exit "$CLEANUP_TEST_STATUS"
         disk_status: int = 0,
         free_floor_gib: float = 100,
     ) -> subprocess.CompletedProcess[str]:
-        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
             enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,

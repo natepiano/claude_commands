@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
@@ -20,8 +20,10 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, overrid
 
 if TYPE_CHECKING:
     from ..lib import process_start as process_identity
+    from ..copies.copies_test_support import copies_environment
 else:
     from scripts.lib import process_start as process_identity
+    from scripts.copies.copies_test_support import copies_environment
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
@@ -93,6 +95,19 @@ class CommandEvent(TypedDict):
     copy_claim: NotRequired[bool]
     what: NotRequired[str]
     claim: NotRequired[RemoteClaimRecord]
+
+
+def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str]:
+    words = shlex.split(argv[-1])
+    if "mirror-use" not in words:
+        return list(argv)
+    boundary = words.index("--")
+    case.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
+    case.assertEqual(len(words[boundary + 3:]), 1)
+    case.assertIn("--owner", words[:boundary])
+    case.assertIn("--repository", words[:boundary])
+    case.assertIn("--session", words[:boundary])
+    return [*argv[:-1], words[boundary + 3]]
 
 
 class SelectorEvent(TypedDict):
@@ -296,6 +311,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.environment = {
             **os.environ,
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
@@ -526,6 +542,8 @@ raise SystemExit(offload.main())
         events = [cast(CommandEvent, json.loads(line))
                   for line in path.read_text(encoding="utf-8").splitlines()]
         for event in events:
+            if event["command"] == "ssh" and "copies.py mirror-use " in event["args"][-1]:
+                event["args"] = mirror_use_payload(self, event["args"])
             if "claim" in event:
                 event["copy_claim"] = event["claim"].get("copy", False)
                 event["what"] = event["claim"]["what"]

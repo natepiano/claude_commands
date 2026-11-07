@@ -37,14 +37,17 @@ from scripts.message.sessions import SessionRecord
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import stop_resume
+from scripts.shutdown import stop_resume, restart
+from scripts.herdr import worker_panes
 from scripts.shutdown import pane_record as staff_pane_record
 import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.lib.conf import UseConfiguredValue
 from scripts.copies import copies
-from scripts.lib import conf
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.remote_test_support import local_remote_transport
+from scripts.lib import atomic_file, conf
 from scripts.agents import worker_lifecycle
 from scripts.direct import workers
 
@@ -72,6 +75,42 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 @final
 class RetireUnitTests(unittest.TestCase):
 
+
+    def test_retirement_continues_after_a_member_stop_raises(self) -> None:
+        with (mock.patch.object(stop_resume, "stop", side_effect=[OSError("stop read failed"), stop_resume.NotRunning(SEAT)]) as stops,
+              mock.patch.object(retire_unit, "refusals", return_value=[]),
+              mock.patch.object(retire_unit, "remove", return_value=[]) as remove):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(stops.call_count, 2)
+        self.assertEqual(output.count("stop read failed"), 1)
+        remove.assert_called_once()
+
+    def test_retire_keeps_stopped_worker_rows(self) -> None:
+        row = staff.snapshot().find(kind="worker", parent=self.unit_staff_id)[0]
+        states: list[worker_panes.WorkerPane] = [worker_panes.OpenWorker(row, "outside-pane", "same-terminal", herdr.AgentStatus.WORKING)]
+        self.marked = None
+        self.claude = [item for item in self.claude if item["sessionId"] != DIRECTOR]
+        atomic_file.write_text_atomic(self.run_folder / "worker_transport", "herdr\n")
+        def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            return list(states)
+        def stop(member: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+            del client
+            self.assertEqual(member, row)
+            self.assertGreater(deadline, time.monotonic())
+            states[0] = worker_panes.StoppedWorker(row, "outside-pane", "same-terminal")
+            return True
+        with (mock.patch.object(worker_panes, "worker_run", return_value=self.run_folder),
+              mock.patch.object(worker_panes, "observe", side_effect=observe),
+              mock.patch.object(restart, "stop_row", side_effect=stop) as stops):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(stops.call_count, 1)
+        self.assertEqual(staff.by_id(row.id), row)
+        unit = staff.by_id(self.unit_staff_id)
+        assert unit is not None
+        self.assertIsInstance(unit.worktree, staff.RemovedWorktree)
+        self.assertEqual(states, [worker_panes.StoppedWorker(row, "outside-pane", "same-terminal")])
 
     def test_retirement_uses_the_staff_worktree(self) -> None:
         plan = self.worktree / "docs/plans/alpha.md"
@@ -238,13 +277,8 @@ class RetireUnitTests(unittest.TestCase):
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.limits()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root),
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
-        }))
+        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -273,6 +307,8 @@ class RetireUnitTests(unittest.TestCase):
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
+        atomic_file.write_text_atomic(self.run_folder / "worker_transport", "mesh\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_folder)})))
         # The test's own pid stands in for the app-server: the mesh stand-in never signals it.
         _ = (self.run_folder / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
         holds = self.root / "holds"
@@ -378,7 +414,8 @@ class RetireUnitTests(unittest.TestCase):
         stdout = ""
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
-    def stop_session(self, identity: str) -> stop_resume.Stopped | stop_resume.NotRunning:
+    def stop_session(self, identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped | stop_resume.NotRunning:
+        del deadline
         self.calls.append(["stop_resume.stop", identity])
         owner = next((item for item in self.claude if item["sessionId"] == identity), None)
         self.claude = [item for item in self.claude if item["sessionId"] != identity]
@@ -571,6 +608,44 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
+
+    def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
+        owner = copies.source_owner(self.worktree)
+        with copies.standing(owner, self.worktree, copies.CommittedSource("HEAD")) as checkout:
+            self.assertTrue(checkout.exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(checkout.exists())
+
+    def test_retirement_removes_only_its_remote_mirrors(self) -> None:
+        mine = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        other = copies.RemoteMirror("beta-unit", copies.SelectedRepository("hana"), "mac", "mirror/beta", "beta-session")
+        with fake_remote_removal((mine, other)) as remove:
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        remove.assert_called_once_with(mine)
+        self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
+
+    def test_retirement_refuses_a_busy_remote_mirror_before_worktree_removal(self) -> None:
+        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        copies.register_remote(mirror)
+        with copies.remote_lease(mirror):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("alpha-session", output)
+        self.assertIn("mirror/alpha", output)
+        self.assertTrue(self.worktree.exists())
+        self.assertTrue(copies.remote_record_path(mirror).exists())
+
+    def test_retirement_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
+        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac",
+                                     str(self.root / "mirrors/alpha"), "alpha-session")
+        with local_remote_transport(self.root):
+            self.assertEqual(publish_mirror(mirror), 0)
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(Path(mirror.path).exists())
+        self.assertFalse(copies.remote_record_path(mirror).exists())
 
 
 if __name__ == "__main__":

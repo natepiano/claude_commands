@@ -1,14 +1,8 @@
 ---
-description: Rename a unit through its showrunner.
+description: Rename a unit through the shared rename command.
 ---
 
 # Rename a unit
 
-Read `~/.claude/commands/showrunner/rename_unit.md` in full.
+Read `~/.claude/commands/showrunner/rename.md`.
 Use the supplied arguments: `$ARGUMENTS`.
-Run the command from the owning showrunner session.
-A same-name rename only sets the displays.
-A new-name rename changes matching folder and branch suffixes.
-The move stops and resumes the live unit and its live workers.
-A restart failure prints `shutdown.py restart --only <staff-id>` for manual recovery.
-A rerun reports stopped rows and keeps them stopped.
