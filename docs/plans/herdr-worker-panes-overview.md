@@ -68,12 +68,12 @@ This is a short form of the full plan, `docs/plans/herdr-worker-panes.md`. The p
     - Replaces: the joins at each read in 39 modules (plan Reference, "Staff record readers"). Showrunner parent files move into the row's `parent` field, readers and writers together.
     - Open choice: none.
     - Depends on: 1, 2.
-14. **Cleanup** (Phase 18)
+14. **Cleanup** (Phase 19)
     - Does: after a check that no run pins `mesh` and no mesh process runs, it deletes the mesh code and its state, no later than 7 days after the default switch. The launchers lose their mesh branch and the `WORKER_TRANSPORT` switch. It updates the as-built docs.
     - Replaces: nothing new; it deletes `codex_mesh.py` (8652 lines), `review_pool.py`, the unit worker ledger, `mesh_roster.json`, `*.pending.json`, the run `workers` log, `remove_workers.py`, the follow-claim code, `launch_friend.sh`, `end_friend.sh`, `WORKER_TRANSPORT`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, the mesh code in shutdown, accounts and displays, and the Codex app-server homes.
     - Open choice: the NixOS sign-in units (question 1(d)) retire here, or point at a pane restart if the sign-in probe is negative.
     - Depends on: 12, 13. It does not need item 3: it edits whichever registry file name is current.
-15. **One launcher** (Phase 19)
+15. **One launcher** (Phase 20)
     - Does: the three launchers merge into one, `scripts/direct/launch.py`; the three command names stay as thin entry points for their arguments.
     - Replaces: the shared launcher code in `implement.sh`, `review.sh` and `assign.sh`/`assign.py`.
     - Open choice: none.
