@@ -54,6 +54,7 @@ class PaneWorld(herdr.Herdr):
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
         self.launch_directories: list[Path] = []
         self.launch_timeouts: list[int] = []
+        self.agent_names: list[str] = []
         self.stops: list[str] = []
         self.signals: list[tuple[int, int]] = []
         self.stop_deadlines: list[float] = []
@@ -232,10 +233,13 @@ class PaneWorld(herdr.Herdr):
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
                opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
-               reported_unknown: str = "") -> herdr.AgentLaunched:
+               reported_unknown: str = "",
+               agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
         del name, opening, reported_unknown
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        self.agent_names.append(server_name)
         self.launches.append(destination)
         self.launch_directories.append(prepared.directory)
         self.launch_timeouts.append(timeout_ms)
@@ -256,7 +260,7 @@ class PaneWorld(herdr.Herdr):
             self.interrupt = ""
             raise OSError("interrupted after split")
         identity = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
-                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + agent))
+                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + server_name))
         self.activate(identity, pane, cast(Literal["claude", "codex"], kind))
         pid, family, _ = self.foreground[pane]
         self.processes[pid].environment.update(prepared.env)
@@ -463,6 +467,24 @@ class WorkerPaneTests(StaffTestCase):
     def start(self, name: str = "impl2", role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable = "impl",
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
+
+    def test_each_parent_uses_its_name_for_the_server_agent_and_keeps_the_worker_name(self) -> None:
+        first = self.start("impl")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        second_root = self.root / "second-unit"
+        second_root.mkdir()
+        parent = fixture_member("unit", name="second-unit", parent=self.parent.parent,
+                                worktree=staff.PresentWorktree("natedev", second_root))
+        self.world.add(parent, "w2:p0", workspace="w2", tab="w2:t2")
+        second = worker_panes.start_or_resume(parent.id, staff.WorkerName.parse("impl"), "impl")
+        self.assertIsInstance(second, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        assert isinstance(second, worker_panes.OpenWorker)
+        self.assertEqual(self.world.agent_names, ["unit-impl", "second-unit-impl"])
+        self.assertEqual([first.row.name, second.row.name], ["impl", "impl"])
+        self.assertEqual([self.world.locations[result.pane]["label"] for result in (first, second)], ["impl", "impl"])
+        self.assertEqual([first.row.parent, second.row.parent],
+                         [staff.ReportsTo(self.parent.id), staff.ReportsTo(parent.id)])
 
     def command(self, *arguments: str) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:

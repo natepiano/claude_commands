@@ -1131,6 +1131,8 @@ class BumpGateRecord(TypedDict):
     tip: str
     checkpoint: str
     production_doc: str
+    owner_id: str
+    unit_id: str
     name: str
     merge_branch: str
     checkout: str
@@ -1203,12 +1205,12 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                 continue
             for attempt in (1, 2):
                 try:
-                    unit_address, showrunner_address = bump_gate_addresses(current["name"], current["unit"])
-                    address = unit_address if recipient == "unit" else showrunner_address
-                    if not address:
-                        raise ValueError(f"no current {recipient} address for {current['name']}/{current['unit']}")
+                    members = staff.snapshot().rows_by_id
+                    owner = members[staff.StaffId(current["owner_id"])]
+                    target = members[staff.StaffId(current["unit_id"])] if recipient == "unit" else owner
+                    address = f"session:{target.current_session}"
                     result = subprocess.run(
-                        [PYTHON, script, "--to", address, "--from", current["name"], "--text", text],
+                        [sys.executable, script, "--to", address, "--from", owner.name, "--text", text],
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:
@@ -1216,7 +1218,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                     delivered.append(recipient)
                     save_record(path, current)
                     break
-                except (OSError, ValueError) as error:
+                except (OSError, ValueError, KeyError) as error:
                     print(f"bump gate send {recipient} attempt {attempt} failed: {error}", flush=True)
 
 
@@ -1238,9 +1240,13 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
     resume_delivery = False
     launch_failure = ""
     log = path.with_name("bump-gate.log")
+    members = request.staff_record if request.staff_record is not None else staff.snapshot()
+    unit = next(row for row in members.find(kind="unit", parent=request.production.owner.id)
+                if row.name == request.unit.name)
     record: BumpGateRecord = {
         "tip": tip, "checkpoint": request.commit,
         "production_doc": str(request.production.doc), "name": request.production.name,
+        "owner_id": str(request.production.owner.id), "unit_id": str(unit.id),
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
         "production_log": str(request.production.log.relative_to(request.production.checkout)),
         "zone": str(request.production.zone), "unit": request.unit.name,
@@ -1302,25 +1308,6 @@ def deliver_gate_result(request: MergeRequest, merge_head: str, tip: str) -> Non
         return
     with Path(record["log"]).open("a", encoding="utf-8") as output, redirect_stdout(output):
         send_result(path, record)
-
-
-def bump_gate_addresses(name: str, unit: str) -> tuple[str, str]:
-    """Resolve recipients through the production's current unit and showrunner lookup."""
-    from scripts.production import showrunners
-
-    unit_address = ""
-    showrunner_address = ""
-    try:
-        found = unit_lookup.labeled_session(name, unit)
-        if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
-            unit_address = f"session:{found.claude.session_id}"
-    except OSError as error:
-        report("bump gate notice", "failed", str(error))
-    try:
-        showrunner_address = showrunners.current_address(name)
-    except (OSError, ValueError) as error:
-        report("bump gate notice", "failed", str(error))
-    return unit_address, showrunner_address
 
 
 def run(request: MergeRequest) -> int:

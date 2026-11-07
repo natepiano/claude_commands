@@ -174,6 +174,7 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Waiting Test")
         _ = self.git("config", "user.email", "waiting@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "README.md", "base\n")
         self.write(self.checkout / "shared.txt", "base\n")
         self.production_doc()

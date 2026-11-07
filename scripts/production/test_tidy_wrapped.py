@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import copy_record
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
@@ -41,6 +42,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"
@@ -90,17 +92,17 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_removes_production_and_unit_checkouts_before_state(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
-                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+                                          "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         owner = self.owner("done")
-        _ = fixture_member("unit", name="alpha", parent=owner.id)
-        _ = fixture_member("unit", name="beta", parent=owner.id,
+        alpha = fixture_member("unit", name="alpha", parent=owner.id)
+        beta = fixture_member("unit", name="beta", parent=owner.id,
                            worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "beta"))
         state = self.state_files("done")
-        with copies.standing("alpha", source, copies.CommittedSource("HEAD")) as unit_tree:
-            with copies.standing("done", source, copies.CommittedSource("HEAD")) as production_tree:
+        with copies.standing(str(alpha.id), source, copies.CommittedSource("HEAD")) as unit_tree:
+            with copies.standing(str(owner.id), source, copies.CommittedSource("HEAD")) as production_tree:
                 pass
-            with copies.standing("beta", source, copies.CommittedSource("HEAD")) as retired_tree:
+            with copies.standing(str(beta.id), source, copies.CommittedSource("HEAD")) as retired_tree:
                 pass
             with copies.standing("live", source, copies.CommittedSource("HEAD")) as unrelated:
                 pass
@@ -115,19 +117,20 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(any(path.exists() for path in state))
         self.assertEqual(self.run_tidy(doc).returncode, 0)
 
-    def test_wrap_removes_unit_suffix_copies_and_keeps_another_units_copy(self) -> None:
+    def test_wrap_removes_unit_row_copies_and_keeps_another_units_copy(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
-                                         "cleanup@example.invalid", {"file.txt": "content"}).checkout
+                                         "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         owner = self.owner("done")
         active = fixture_member("unit", name="alpha", parent=owner.id)
         retired = fixture_member("unit", name="beta", parent=owner.id,
-                                 worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
-        with copies.standing(copies.unit_owner(active.name), source, copies.CommittedSource("HEAD")) as unit_tree:
+                                 worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "beta"))
+        other = fixture_member("unit", name="live", parent=self.owner("live").id)
+        with copies.standing(str(active.id), source, copies.CommittedSource("HEAD")) as unit_tree:
             pass
-        with copies.standing(copies.unit_owner(retired.name), source, copies.CommittedSource("HEAD")) as retired_tree:
+        with copies.standing(str(retired.id), source, copies.CommittedSource("HEAD")) as retired_tree:
             pass
-        with copies.standing("live-unit", source, copies.CommittedSource("HEAD")) as unrelated:
+        with copies.standing(str(other.id), source, copies.CommittedSource("HEAD")) as unrelated:
             pass
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -137,10 +140,10 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
-                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+                                          "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        with copies.workspace("done", source, "HEAD", name="damaged", branch="worker") as tree:
+        with copies.workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
             pass
         record = tree / copy_record.RECORD
         original = record.read_text()
@@ -360,7 +363,7 @@ class TidyWrappedTests(unittest.TestCase):
     def test_wrap_removes_only_the_owners_remote_mirrors(self) -> None:
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
-        mine = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        mine = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
         other = copies.RemoteMirror("live", copies.SelectedRepository("hana"), "mac", "mirror/live", "live-session")
         with fake_remote_removal((mine, other)) as remove:
             _ = tidy_wrapped.tidy("done", doc)
@@ -371,7 +374,7 @@ class TidyWrappedTests(unittest.TestCase):
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        mirror = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
         copies.register_remote(mirror)
         with copies.remote_lease(mirror):
             with self.assertRaisesRegex(tidy_wrapped.TidyRefused, "mirror/done.*done-session"):
@@ -382,7 +385,7 @@ class TidyWrappedTests(unittest.TestCase):
     def test_wrap_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
-        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac",
+        mirror = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/done"), "done-session")
         with local_remote_transport(self.root):
             self.assertEqual(publish_mirror(mirror), 0)

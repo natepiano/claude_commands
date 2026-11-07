@@ -115,6 +115,16 @@ After a restart, the service restores live run places and removes ended run plac
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
+
+The queue Step column and cards show the project before the step, such as `nateroids nextest`.
+A step without a project name shows only the step.
+An absolute repository path does not supply a project name.
+Matching and history retain the original step name.
+The queue omits a live unowned scope when its run has no reservation and keeps no memory.
+A run with a memory hold shows through that hold.
+The services block and the block for processes from ended builds remain visible.
+The card selector still finds an unowned run by its owner.
+The memory page keeps this memory in Other.
 `memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
 
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
@@ -1033,7 +1043,31 @@ A cleanup plan is written to a temporary file and linked into place only when no
 Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
 **One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
-The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
+The service commits proposals and stores the pass.
+It encodes View and Explain replies on the first request after each pass.
+It keeps those bytes until the next pass ends.
+Mine keeps the full reading and reuses the View encoding.
+The protocol encodes each reply tree once.
+A pending configuration still causes a pass before a query reply.
+One reader thread collects process, scope, pressure, and memory evidence.
+The reader publishes physical memory and sampler observations under a lock and wakes the service loop.
+Each reading contains the monotonic time when its read started.
+The loop applies the current peak hold and frozen test-phase need at each pass.
+The reader applies no reservation policy.
+The loop combines the latest reading with its current reservations and waiters.
+A reading can be one pass cadence old.
+The reader uses `waiting_pass_seconds` while steps wait and `running_pass_seconds` otherwise.
+A change from the running cadence to the waiting cadence wakes the reader.
+The service collects the first reading before it starts the serving loop.
+The reader starts when an unusable configuration becomes usable.
+An unknown owner requests an early reading.
+A deferred request uses only a reading that starts at or after the request arrives.
+An older reading leaves the request deferred.
+The reader sends exceptions to the loop and continues at the configured cadence.
+Direct test instances can supply a fixed reader.
+Persistence reuses each unchanged record's encoding.
+The state bytes, atomic writes, and lifecycle commit order stay the same.
+`query_timeout_seconds` stays 0.5.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
 
@@ -1126,6 +1160,11 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
+Running rows show a `machine` column after `min` and before `pid`.
+The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
+A narrow view omits the machine column before it reduces name space.
+Waiting rows have no machine value. Services lines do not change.
+The admission service admits each running step on its own machine. No per-row protocol field is added.
 `keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
 `RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
 `admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.

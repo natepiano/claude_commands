@@ -318,9 +318,8 @@ holds the checkout's `.claude-busy` lock through verification and cleanup. Each
 checkout owns a real `target/`; the configured second checkout owns a separate
 cache. Supervision metadata is removed after lint; the checkout and target stay.
 The floor sweep may reclaim idle marked targets, so a later run can build cold.
-No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place;
-`copies.py remove --owner <style-production> --repo <repo>` removes idle ones.
-See `gate-checkouts.md` for configured paths, pool limits and lock rules.
+No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place.
+See `gate-checkouts.md` for removal, configured paths, pool limits and lock rules.
 
 ### Child hand-off merge
 

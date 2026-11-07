@@ -1216,8 +1216,8 @@ from a new parent attaches through `resume`, which handles pending hand-offs.
 
 Standing gate checkouts retain their own `target/` after a sync or a production
 wrap. The floor sweep may reclaim an idle marked cache; it keeps a busy tree's
-cache. Use `copies.py remove --owner <style-production> --repo <repo>` to remove
-that production's idle checkouts (see `docs/as-built/gate-checkouts.md`).
+cache. A wrap leaves the standing checkouts in place.
+See `docs/as-built/gate-checkouts.md` for removal.
 
 ## Report
 

@@ -517,6 +517,77 @@ class SweepStartupTests(unittest.TestCase):
 
 
 class BuildAdmissionTests(unittest.TestCase):
+    def clippy_capture(self, root: Path, command: str, config_text: str) -> subprocess.CompletedProcess[str]:
+        cargo = root / "cargo"
+        _ = cargo.write_text('''#!/bin/sh
+printf '%s\\n' "$@" > "$TMPDIR/cargo-argv"
+printf '%s\\n' "${CARGO_MAKEFLAGS-absent}" "${MAKEFLAGS-absent}" "${MFLAGS-absent}" > "$TMPDIR/cargo-pool"
+''')
+        cargo.chmod(0o755)
+        config = root / "lint.conf"
+        _ = config.write_text("clippy=on\n[clippy]\n" + config_text)
+        shell = '''
+buildlog_step_compiles() { return 1; }
+buildlog_begin() { BUILDLOG_START="" BUILDLOG_PEAK=""; }
+buildlog_exec() { "$@"; }
+buildlog_end() { shift 3; printf '%s\\n' "$@" > "$TMPDIR/recorded-argv"; }
+sweep_after_step() { :; }
+"$@" --workspace --all-targets --all-features --keep-going -- -W clippy::pedantic
+'''
+        return self.run_invoke(root, shell, [command], environment={
+            "PATH": str(root) + os.pathsep + os.environ["PATH"],
+            "LINT_CONFIG_READER": str(LINT_CONFIG_READER), "LINT_CONFIG_FILE": str(config),
+            "LINT_INVOKE_SOURCED": "", "BUILDLOG_MEM_RESERVATION": "",
+            "CARGO_MAKEFLAGS": "cargo-pool", "MAKEFLAGS": "make-pool", "MFLAGS": "m-pool",
+        })
+
+    def test_clippy_fix_uses_configured_jobs_and_plain_clippy_keeps_the_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
+            lints = ["--", "-D", "warnings", "-W", "clippy::pedantic"]
+            for jobs in (3, 5):
+                with self.subTest(jobs=jobs):
+                    result = self.clippy_capture(root, "invoke_clippy_fix", f"clippy_fix_jobs={jobs}\n")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    arguments = (root / "cargo-argv").read_text().splitlines()
+                    jobs_index = arguments.index("--jobs")
+                    self.assertEqual(arguments[jobs_index + 1], str(jobs))
+                    del arguments[jobs_index:jobs_index + 2]
+                    self.assertEqual(arguments, ["clippy", "--fix", "--allow-dirty",
+                                                 "--allow-staged", "--allow-no-vcs", *scope, *lints])
+                    self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+                    self.assertIn("--fix", (root / "recorded-argv").read_text().splitlines())
+            plain = self.clippy_capture(root, "invoke_clippy", "clippy_fix_jobs=5\n")
+            self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+            self.assertEqual(plain.stderr, "")
+            self.assertEqual((root / "cargo-argv").read_text().splitlines(), ["clippy", *scope, *lints])
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(),
+                             ["cargo-pool", "make-pool", "m-pool"])
+
+    def test_clippy_fix_warns_once_for_invalid_jobs_and_uses_eight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.clippy_capture(root, "invoke_clippy_fix", "clippy_fix_jobs=bad\n")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+            self.assertIn("clippy_fix_jobs=bad", result.stderr)
+            self.assertIn("using 8", result.stderr)
+            arguments = (root / "cargo-argv").read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--jobs") + 1], "8")
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+
+    def test_clippy_fix_uses_eight_jobs_when_the_key_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.clippy_capture(root, "invoke_clippy_fix", "")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stderr, "")
+            arguments = (root / "cargo-argv").read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--jobs") + 1], "8")
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+
     def run_invoke(
         self, root: Path, shell: str, arguments: list[str], *,
         environment: dict[str, str] | None = None, cwd: Path | None = None,
