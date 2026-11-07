@@ -33,6 +33,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
+from scripts.shutdown import remote
 from scripts.whoami import note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402
@@ -1759,7 +1760,7 @@ def _paid_credits_notice(label: str, report: Report,
     except ValueError:
         credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
     return ZeroEpisodeNotice(id="quota.paid_credits", values={
-        "sender": "quota_alert", "account": label, "machine": os.uname().nodename, "credits": credits_left,
+        "sender": "quota_alert", "account": label, "machine": remote.local_machine(), "credits": credits_left,
         "refill": reset_display(refusals.KnownReset(reset)),
         "next_reset": reset_display(refusals.KnownReset(next_reset)),
     })

@@ -1,6 +1,8 @@
 """Find a unit's review history through the command with disposable local and Mac roots."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import subprocess
@@ -90,7 +92,7 @@ class UnitRunTests(unittest.TestCase):
         self.write_production()
         owner = recorded_showrunner("show", self.production)
         _ = fixture_member("unit", name="review", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.worktree))
 
     def write_production(self) -> None:
         _ = self.production.write_text("# Show\n", encoding="utf-8")
@@ -104,11 +106,11 @@ class UnitRunTests(unittest.TestCase):
             folder = event.pop("working_dir", None)
             if event.get("event_type") == "run_started" and isinstance(folder, str):
                 normalized = Path(os.path.normpath(folder))
-                row = staff.snapshot().unit_by_worktree("natedev", normalized)
+                row = staff.snapshot().unit_by_worktree(remote.local_machine(), normalized)
                 if row is None:
                     row = fixture_member("unit", name="history-" + run_id, parent=owner.id,
                                          runtime_id=fixture_runtime_id("history:" + run_id),
-                                         worktree=staff.PresentWorktree("natedev", normalized))
+                                         worktree=staff.PresentWorktree(remote.local_machine(), normalized))
                 event["main_agent"] = {"family": "claude", "session_id": row.current_session}
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return path
@@ -166,7 +168,7 @@ class UnitRunTests(unittest.TestCase):
         before = path.read_bytes(), path.stat().st_mtime_ns
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "review")
         destination = self.root / "staff-folder"
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
         self.assert_match(self.run_script("--no-mac"), "staff-run", "natedev", 10)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 

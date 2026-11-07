@@ -6,6 +6,7 @@ import fcntl
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -692,6 +693,16 @@ class WorkerGroupPendingTests(StaffTestCase):
         create_claude_account("claude1", "claude@example.invalid")
         notes = note_file.notes_dir()
         _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
+        binary = self.root / "bin"
+        binary.mkdir(exist_ok=True)
+        codex = binary / "codex"
+        _ = codex.write_text("#!" + sys.executable + "\n" +
+            "import json, sys\nfor line in sys.stdin:\n"
+            + "    request = json.loads(line)\n"
+            + "    if 'id' in request:\n"
+            + "        print(json.dumps({'id': request['id'], 'result': {}}), flush=True)\n")
+        codex.chmod(0o700)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
         self.assertEqual(accounts.setup("codex1"), [])
         write_codex_auth(home / ".codex1", "codex@example.invalid")
         report = agent_accounts.Report("Codex", email="codex@example.invalid",

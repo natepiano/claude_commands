@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import io
 import os
@@ -47,7 +49,7 @@ UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/ru
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
     staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
-                   worktree=staff.PresentWorktree("natedev", DOC.parents[1])),
+                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1])),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
 ))
 
@@ -94,7 +96,7 @@ class NightlyReviewTests(unittest.TestCase):
         doc = self.root / (name + ".md")
         _ = doc.write_text("# Transcript owner\n")
         row = fixture_member("showrunner", name=name, runtime_id=fixture_runtime_id(name),
-                             doc=staff.LiveDoc("natedev", doc))
+                             doc=staff.LiveDoc(remote.local_machine(), doc))
         return row.current_session
 
     def test_timer_runs_messages_after_rust(self) -> None:

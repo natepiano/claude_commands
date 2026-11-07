@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
@@ -163,7 +165,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / "removed"), expected=row.worktree)
             _ = unit_membership("example", "standby")
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)

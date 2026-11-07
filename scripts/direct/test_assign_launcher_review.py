@@ -386,6 +386,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
         session = self.panes.command_case.fixture.parent.current_session

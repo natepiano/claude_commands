@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from ledger_test_support import ticket_owner_id
 
 import errno
@@ -803,7 +805,7 @@ class StyleProposalsTests(unittest.TestCase):
         doc = self.repo / ".git/decision-review.md"
         _ = doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** main\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
         owner = proposal_issue.staff_reference("sample-style", "showrunner")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         with self.ledger() as ledger:
             _ = self.hold(ledger)
             issue, = self.file(ledger)

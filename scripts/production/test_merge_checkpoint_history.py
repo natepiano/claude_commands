@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import sys
 import json
 import os
@@ -39,7 +41,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.env["STAFF_FILE"] = str(record_path)
         with mock.patch.dict(os.environ, self.env):
             row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.unit), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.unit), expected=row.worktree)
             found = merge_checkpoint.merged_checkpoints(read_production("example"))
         self.assertEqual(found, (merge_checkpoint.MergedCheckpoint("alpha", "2", checkpoint),))
 

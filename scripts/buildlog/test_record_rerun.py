@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 import unittest
 from collections.abc import Callable, Generator
@@ -31,6 +30,7 @@ from cgroup_test_support import CPU, save_scope_counters, write_cgroup
 import test_launch_recording as launch_tests
 import test_record as record_tests
 from test_index import point_root_at, step as indexed_step
+from test_memory_window import configured_host_cli, configured_local_host
 from test_launches import CLI
 
 if TYPE_CHECKING:
@@ -88,6 +88,7 @@ class RecordRerunTests(unittest.TestCase):
         self.fixture = record_tests.RecordTests()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         environment = self.fixture.environment(
             **mac_natedev_environment(self.fixture.base / "config"),
             BUILDLOG_TRANSCRIPTS=str(self.fixture.base / "transcripts"),
@@ -138,7 +139,7 @@ class RecordRerunTests(unittest.TestCase):
             TZ="UTC",
         )
         result = subprocess.run(
-            [sys.executable, str(CLI), *arguments], cwd=self.fixture.base,
+            configured_host_cli(CLI, *arguments), cwd=self.fixture.base,
             env=environment, capture_output=True, text=True, check=False, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

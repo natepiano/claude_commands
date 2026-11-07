@@ -55,7 +55,7 @@ def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.Comple
     database = index.index_path()
     before = database.read_bytes()
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("cli.py")), *args],
+        memory_fixtures.configured_host_cli(Path(__file__).with_name("cli.py"), *args),
         env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
     )
     test.assertEqual(result.returncode, 0, result.stderr)
@@ -517,7 +517,7 @@ class MemoryMomentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
-        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
+        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", side_effect=memory_fixtures.configured_local_host)))
 
     def memory_cells(self, lines: list[str]) -> dict[str, dict[str, str]]:
         start = next(number for number, line in enumerate(lines) if line.startswith("| Memory "))

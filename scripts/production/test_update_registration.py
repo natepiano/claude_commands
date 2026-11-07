@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import io
 import os
@@ -169,7 +171,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.timer("example")
         parent = showrunner_relationship("example")
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
-                                       worktree=staff.PresentWorktree("natedev", self.root / "alpha")).id
+                                       worktree=staff.PresentWorktree(remote.local_machine(), self.root / "alpha")).id
 
     def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
@@ -302,7 +304,7 @@ class QuestionIdentityTests(RegistrationFixture):
         assert row is not None
         removed = self.root / "removed-asker-worktree"
         self.assertFalse(removed.exists())
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed),
+        row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), removed),
                                  expected=row.worktree)
         displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
@@ -397,7 +399,7 @@ class QuestionIdentityTests(RegistrationFixture):
         owner = staff.by_id(self.asker_id)
         assert owner is not None
         second = fixture_member("unit", name="beta", parent=owner.parent,
-                                worktree=staff.PresentWorktree("natedev", self.root / "beta"))
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.root / "beta"))
         legacy = [{"since": "2026-10-06T08:00", "text": "Choose the layout",
                    "question": "Keep the layout?", "asked_by": str(asker)}
                   for asker in (self.asker_id, second.id)]
@@ -436,7 +438,7 @@ class QuestionIdentityTests(RegistrationFixture):
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="child", parent=parent.parent,
-                               doc=staff.LiveDoc("natedev", child_doc))
+                               doc=staff.LiveDoc(remote.local_machine(), child_doc))
         self.write_open_for("child", {"since": "2026-10-06T08:00", "text": "Choose the compiler",
                                       "question": "Use this compiler?", "asked_by": str(child.id)})
         self.assertFalse((self.state / "notifier/showrunner-child").exists())
@@ -640,7 +642,7 @@ class QuestionIdentityTests(RegistrationFixture):
 
     def test_open_and_answer_use_the_document_owner_without_a_timer_after_rename(self) -> None:
         self.file_question()
-        owner = staff.snapshot().by_doc("natedev", self.doc)
+        owner = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         assert owner is not None
         timer = self.state / f"notifier/showrunner-{self.fixture_staff_id()}"
         shutil.rmtree(timer)

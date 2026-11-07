@@ -19,7 +19,7 @@ def diff_file(path: str, lines: list[str], start: int = 1) -> str:
 
 class RerunLensTests(unittest.TestCase):
     def scan(self, diff: str) -> list[str]:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "phase.diff"
             _ = path.write_text(diff)
             result = subprocess.run([sys.executable, str(SCRIPT), "arm", "--diff", str(path)],

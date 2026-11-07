@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import importlib.util
 import io
 import json
@@ -58,7 +60,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         _ = fixture_member("showrunner", name="example", runtime_id=SESSION,
-                           doc=staff.LiveDoc("natedev", self.doc))
+                           doc=staff.LiveDoc(remote.local_machine(), self.doc))
 
     def run_hook(self, payload: dict[str, str], **env: str) -> str:
         result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,

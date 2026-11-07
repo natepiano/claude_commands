@@ -8,7 +8,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -27,6 +26,7 @@ else:
 
 import index
 import memory
+import record
 import scratch
 import sweep
 from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
@@ -43,6 +43,21 @@ END = "2026-10-05T00:30-07:00"
 START_UTC = "2026-10-05T06:30:00.000Z"
 END_UTC = "2026-10-05T07:30:00.000Z"
 
+
+
+def configured_local_host() -> str:
+    """Read the local record host from the fixture's target configuration."""
+    return record.local_step_identity().hosts[0]
+
+
+def configured_host_cli(script: Path, *arguments: str) -> list[str]:
+    """Use the configured record host in the child process."""
+    return [sys.executable, "-c",
+            "import runpy, sys; from pathlib import Path; "
+            + "script = sys.argv.pop(1); sys.argv[0] = script; "
+            + "sys.path.insert(0, str(Path(script).resolve().parent)); "
+            + "import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; "
+            + "runpy.run_path(script, run_name='__main__')", str(script), *arguments]
 
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
     path = root / "lint.conf"
@@ -117,6 +132,7 @@ class MemoryWindowTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(patch.object(store, "host_name", side_effect=configured_local_host))
         self.enterContext(patch.dict(os.environ, config_environment(self.base)))
         self.root = self.base / "buildlog"
         self.fake_bin = self.base / "bin"
@@ -161,7 +177,7 @@ class MemoryWindowTests(unittest.TestCase):
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CLI), *args],
+            configured_host_cli(CLI, *args),
             cwd=self.base,
             env=self.env(),
             capture_output=True,
@@ -280,7 +296,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         recorded = cast(Record, json.loads(lines[0]))
         self.assertEqual(recorded["kind"], "memory_snapshot")
-        self.assertEqual(recorded["host"], socket.gethostname().split(".")[0])
+        self.assertEqual(recorded["host"], configured_local_host())
         self.assertTrue(str(recorded["at"]).endswith("Z"))
         slices = cast(dict[str, Record], recorded["slices"])
         self.assertEqual({key: slices["builds"][key] for key in (

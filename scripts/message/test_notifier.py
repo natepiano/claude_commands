@@ -8,7 +8,6 @@ import shutil
 import socket
 import subprocess
 import tempfile
-import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +15,9 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -44,6 +45,8 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"__ETC_ZSHENV_SOURCED": "1"})))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
         self.addCleanup(self.owned.finish)
         self.launch_pids = self.root / "launch-pids"
@@ -60,14 +63,25 @@ class NotifierTests(unittest.TestCase):
         launcher_dir = self.root / "launcher-bin"
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
+        monitor = """import os
+import subprocess
+import sys
+from pathlib import Path
+code = 127
+try:
+    code = subprocess.run(sys.argv[2:], check=False).returncode
+finally:
+    Path(sys.argv[1], 'run-exit-' + str(os.getpid())).write_text(str(code))
+"""
         _ = launcher.write_text(
             "\n".join((
                 "#!/usr/bin/env python3",
-                "import subprocess",
+                "import subprocess, os",
                 "from pathlib import Path",
                 "import sys",
                 "# The caller installs the inherited ownership marker before launch.",
-                "child = subprocess.Popen(sys.argv[sys.argv.index('--') + 1:], "
+                f"monitor = {monitor!r}",
+                f"child = subprocess.Popen([sys.executable, '-c', monitor, {str(self.root)!r}, *sys.argv[sys.argv.index('--') + 1:]], "
                 + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
                 + "stderr=subprocess.DEVNULL, start_new_session=True)",
                 f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
@@ -177,15 +191,20 @@ class NotifierTests(unittest.TestCase):
         path = self.state_dir / "example" / "fire.log"
         return path.read_text().splitlines() if path.exists() else []
 
-    def wait_for_text(self, path: Path, expected: str) -> str:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while time.monotonic() < deadline:
-            if path.exists():
-                contents = path.read_text()
-                if expected in contents:
-                    return contents
-            time.sleep(0.02)
-        self.fail(f"{path} did not contain {expected!r} before the deadline")
+    def wait_for_text(self, path: Path, expected: str, *, observe_launch: bool = False) -> str:
+        def ready() -> bool:
+            if path.exists() and expected in path.read_text():
+                return True
+            if observe_launch:
+                self.assertTrue(self.launch_pids.exists(), "the fake launcher did not start a child")
+                pid = self.launch_pids.read_text().splitlines()[-1]
+                status = self.root / ("run-exit-" + pid)
+                self.assertFalse(status.exists(), f"child {pid} exited before {path}: "
+                                 + (status.read_text() if status.exists() else ""))
+            return False
+
+        wait_until(ready, path.parent)
+        return path.read_text()
 
     def fail_mv_to(self, filename: str) -> Path:
         real_mv = shutil.which("mv")
@@ -538,6 +557,19 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(any("timeout" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
 
+    def test_run_marker_wait_reports_an_exited_child(self) -> None:
+        job = self.root / "job"
+        _ = job.write_text("#!/bin/sh\nexit 9\n")
+        job.chmod(0o755)
+        _ = self.successful("new", "example", "--every", "1", "--run", str(job))
+        _ = self.successful("tick", now=MINUTE + 60)
+        with self.assertRaisesRegex(AssertionError, "exited before"):
+            _ = self.wait_for_text(self.root / "missing-marker", "started", observe_launch=True)
+
+    def test_run_marker_wait_reports_a_missing_child(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "did not start a child"):
+            _ = self.wait_for_text(self.root / "missing-marker", "started", observe_launch=True)
+
     def test_run_only_job_survives_tick_process_group_exit_and_logs_failure(self) -> None:
         started = self.root / "started"
         finished = self.root / "finished"
@@ -563,7 +595,7 @@ class NotifierTests(unittest.TestCase):
         try:
             _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)
-            _ = self.wait_for_text(started, "started")
+            _ = self.wait_for_text(started, "started", observe_launch=True)
             self.assertFalse(finished.exists())
         finally:
             if tick.poll() is None:

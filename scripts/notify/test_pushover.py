@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -18,6 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pushover
 import review
@@ -109,6 +112,12 @@ class PushoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        binary = folder / "bin"
+        binary.mkdir()
+        claude = binary / "claude"
+        _ = claude.write_text("#!/bin/sh\nexit 99\n")
+        claude.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
         self.keys = folder / "env"
         _ = self.keys.write_text("# comment\nPUSHOVER_USER=u123\nPUSHOVER_TOKEN='a456'\n")
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", folder / "log"))

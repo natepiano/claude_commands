@@ -1,6 +1,8 @@
 """A showrunner's hand paths for stopping or moving a session are refused and name /showrunner:move."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import importlib.util
 import json
 import os
@@ -97,7 +99,7 @@ class SessionTest(unittest.TestCase):
 
         _ = self.enterContext(isolated_staff_file(Path(root.name) / "staff.json", {}))
         _ = fixture_member("showrunner", name="production", runtime_id=SHOWRUNNER,
-                           doc=staff.LiveDoc("natedev", doc))
+                           doc=staff.LiveDoc(remote.local_machine(), doc))
 
     def run_hook(self, session_id: str, command: str, tool: str = "Bash") -> str:
         payload = {"session_id": session_id, "tool_name": tool, "tool_input": {"command": command}}

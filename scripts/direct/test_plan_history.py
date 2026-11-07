@@ -92,7 +92,7 @@ class PlanDependencyTests(unittest.TestCase):
                 )
 
     def read_unit_dependencies(self, in_staff: bool, depends: str) -> list[str] | None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.md"
             _ = plan.write_text(
                 "# Plan\n\n### Phase 100 — Delivery · status: todo\n"
@@ -144,7 +144,7 @@ class PlanDependencyTests(unittest.TestCase):
             ("Phase 1 and Phase 2", ["1", "2"]),
             ("Phase 1, and Phase 2", ["1", "2"]),
         ]
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.md"
             document = plan.parent / "production.md"
             _ = document.write_text("# Production\n")

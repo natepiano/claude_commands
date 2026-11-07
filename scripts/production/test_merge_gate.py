@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import unittest
 import fcntl
 
@@ -32,7 +34,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = fixture_member("showrunner", name="unrelated")
-        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
+        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)

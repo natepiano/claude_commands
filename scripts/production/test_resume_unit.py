@@ -3,6 +3,8 @@
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import io
@@ -63,7 +65,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertTrue((self.worktree / ".git").is_file())
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         row = unit_membership("alpha", "alpha")
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.worktree))
+        self.assertEqual(row.worktree, staff.PresentWorktree(remote.local_machine(), self.worktree))
         self.assertIsInstance(resume_unit.find_unit("alpha", "alpha"), resume_unit.NoRecoveryRequired)
 
 
@@ -106,7 +108,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         unit_config.discard_parked(row.id)
         before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
         for flags in ((), ("--dry-run",)):
@@ -178,7 +180,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         self.retained_config()
 
     def retained_config(self, *, plan: str = "docs/plans/alpha.md") -> None:
@@ -221,7 +223,7 @@ class ResumeUnitTests(unittest.TestCase):
     def test_resume_unit_rerun(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
             unit_config.AppPort(1), ("scripts",),
             unit_config.RetiredSession("2026-10-20", DIRECTOR, unit_config.Branch("alpha")))
@@ -263,7 +265,7 @@ class ResumeUnitTests(unittest.TestCase):
         tip = git(retirement.checkout, "rev-parse", "main")
         code, output = retirement.retire()
         self.assertEqual(code, 0, output)
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", retirement.worktree)))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(remote.local_machine(), retirement.worktree)))
         launched_ids: list[staff.StaffId] = []
         commands: list[list[str]] = []
 
@@ -362,7 +364,7 @@ class ResumeUnitTests(unittest.TestCase):
         source.symlink_to(self.doc)
         _ = self.staff.record_production("alpha", source)
         row = unit_membership("alpha", "alpha")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         wrapper = self.root / "resume-launch.py"
         # The inner launcher boundary supplies no live pane. Its public main and
         # staff step are real, including the inherited operation lock.
@@ -605,7 +607,7 @@ class ResumeUnitTests(unittest.TestCase):
         parked = unit_config.parked_path(row.id)
         before = parked.read_bytes(), parked.stat().st_mtime_ns
         destination = self.root / "changed-staff-folder"
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), destination), expected=row.worktree)
         unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         command = resume_unit.launch_command(unit)

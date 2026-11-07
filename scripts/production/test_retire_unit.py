@@ -4,6 +4,8 @@ Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import fixture_member, fixture_worker
 
 import io
@@ -88,7 +90,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.checkout, "worktree", "add", str(director), "alpha-branch")
         _ = unit_config.write(director, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                              unit_config.AppPort(1), ("scripts",)))
-        _ = staff.set_worktree(self.unit_staff_id, staff.PresentWorktree("natedev", director), expected=staff.PresentWorktree("natedev", self.worktree))
+        _ = staff.set_worktree(self.unit_staff_id, staff.PresentWorktree(remote.local_machine(), director), expected=staff.PresentWorktree(remote.local_machine(), self.worktree))
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(director.exists())
@@ -280,7 +282,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         parent = fixture_member("showrunner", name="alpha")
         self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
-                         worktree=staff.PresentWorktree("natedev", self.worktree)).id
+                         worktree=staff.PresentWorktree(remote.local_machine(), self.worktree)).id
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         _ = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
@@ -402,7 +404,7 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertEqual(git(self.checkout, "ls-remote", "origin", f"refs/retired/{unit.id}"), "")
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.worktree)))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(remote.local_machine(), self.worktree)))
 
 
     def test_a_finished_berth_reservation_is_released_on_replay(self) -> None:
@@ -526,7 +528,7 @@ class RetireUnitTests(unittest.TestCase):
             ["build_hold.py", "release", "--holder", DIRECTOR],
         ])
         self.assertIn("alpha retired", output)
-        self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
+        self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree))
         row = staff.by_id(self.unit_staff_id)
         assert row is not None
         self.assertEqual(row.current_session, DIRECTOR)
@@ -566,7 +568,7 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
-        self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
+        self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree))
 
     def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
         owner = copies.source_owner(self.worktree)
