@@ -1207,35 +1207,20 @@ The targeted test on the gate had three red modules, and none came from this pha
 ### Phase 59 — `style/test_style_proposals.py` uses half its CPU  · status: done
 **Depends on:** Phase 61, Phase 64
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/style/test_style_proposals.py` (60.8 CPU s, 112.7 s wall, 186 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`style/test_style_proposals.py` uses 47.0% less CPU, with all 186 test names and 838 assertion calls kept. Three same-load pairs: CPU 53.75 to 28.51 s, processes 19,147 to 14,152, execs 18,841 to 14,031, wall 83.86 to 63.54 s.
 
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of the setup that repeats: `setUp()` at `test_style_proposals.py:113` makes the rules repository, commits its rules, seeds staff and initializes the ledger, and `approved_decision()` and `decision_closed_as_built()` repeat completed setup before later checks. The workspace already has a shared seed. Keep the setup assertions in the behavior map.
-2. Cut in the Speed method's order, direct calls first.
-3. A cut in a production file goes to the director first, with the measured gain. Do not edit `scripts/style/style_sync.py` or `scripts/style/test_style_sync.py`: devtools holds them.
-4. devtools 3z holds this file and `style_proposals.py` for import lines only. Before the checkpoint, take 3z through builds when the showrunner says builds has it (showrunner, 2026-11-06).
-5. A helper that this phase restructures replaces `dict[str, str | None]` at `test_style_proposals.py:3185`, where `None` means delete, with semantic values such as `WriteFile(content) | DeleteFile`.
-6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `setUpClass` runs `fixture.prepare_fixture()` once and copies `fixture.root` to `cls.fixture_seed`.
+- `setUp` copies the seed, rewrites the seed root in `staff.json` only, and binds the patches through `use_fixture()`. It starts no Git command.
+- `approved_decision` and `decision_closed_as_built` keep their real writes and assertions.
 
 **Files:**
 - `scripts/style/test_style_proposals.py` — the module
 
-**Workers:** 1 writer on slot `impl` (one module; the file does not split)
-- `impl` — all files above, role impl
+**Gotchas:** the remaining cost is rule loading: `_load_rule` in `scripts/style/rules.py` starts `git hash-object` for each rule read, 6,556 starts and 9.85 CPU s across 2,080 calls. The proposal for one immutable rule result per content version went to the style owner, with an estimated gain of 4.9 CPU s.
 
-**Constraints from prior phases:**
-- Phase 55: look first for repeated first launches that are setup. A shared first run took one module from 62.3 to 33.0 CPU s.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Phase 56: an event wait uses one held descriptor and bounded reads. Same-load pairs run after the last repair lands.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/style -p 'test_style_proposals.py'` green; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** more seeds for the decision helpers, because their findings and later mutations differ.
 
 ### Phase 60 — `show.py top` ranks by CPU, and `module_cost.py` counts process starts  · status: done
 **Depends on:** none
