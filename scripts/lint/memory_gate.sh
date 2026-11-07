@@ -15,11 +15,7 @@ BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
 export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
 
 buildlog_memory_python() {
-    if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
-        "$HOME/.claude/scripts/lib/py" "$@"
-    else
-        python3 "$@"
-    fi
+    "${BASH_SOURCE[0]%/*}/../lib/py" "$@"
 }
 
 # Status 0 when the holder directory is missing or readable with no entry.
@@ -121,7 +117,7 @@ build_hold_wait_local() {
         return 2
     fi
     output_pid=$!
-    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" 2>&"$output_fd" &
+    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" 2>&"$output_fd" &
     waiter_pid=$!
     exec {output_fd}>&-
     wait "$waiter_pid" || status=$?
@@ -145,7 +141,7 @@ build_hold_check_local() {
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
     local status=0
-    python3 "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
+    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
     build_hold_check_result "$status" check-local
 }
 

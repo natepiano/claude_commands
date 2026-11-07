@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture
 else:
-    from memory_test_support import write_config_fixture
+    from scripts.lint.memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("audit.py")
 
@@ -47,6 +47,7 @@ class AuditCommandTests(unittest.TestCase):
         (self.workspace / ".git").mkdir()
         self.state_directory.mkdir()
         self.bin_directory.mkdir()
+        (self.bin_directory / "bash").symlink_to("/bin/bash")
         self.write_workspace()
         self.write_config("linux-target,compound-review")
         self.write_command_stands()
@@ -56,6 +57,7 @@ class AuditCommandTests(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_COMMAND_LOG": str(self.command_log),
             "PATH": str(self.bin_directory),
+            "CLAUDE_PYTHON": sys.executable,
         }
 
     def write_workspace(self) -> None:
@@ -163,7 +165,7 @@ exit 97
 
     def run_audit(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), str(self.workspace), *arguments],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT), str(self.workspace), *arguments],
             env=self.environment,
             capture_output=True,
             text=True,

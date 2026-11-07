@@ -15,13 +15,12 @@ from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 from scripts.lib.socket_test_support import short_socket_directory
-from test_support import ShutdownTestCase
-import sessions
-import process_identity
-from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
-from relay_test_support import write_relay_record
+from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.message import sessions
+from scripts.message import process_identity
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 
 
 SCRIPT = Path(__file__).with_name("sessions.py")

@@ -21,7 +21,6 @@ from threading import Barrier, Lock, local
 from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
-from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts, moves
 from scripts.whoami import account, agent_accounts
 from scripts.shutdown import restart, stop_resume, stop_results
@@ -35,16 +34,14 @@ from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.lib.resume_message import PausedSeat
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, isolated_staff_file
 from scripts.usage import agents_log
-import herdr
-import pane_record
-import pane_launch
-import sessions
-import shutdown
-import unit_lookup
-from test_pane_restore import FakeClient
+from scripts.herdr import herdr, pane_launch
+from scripts.shutdown import pane_record, shutdown
+from scripts.message import sessions
+from scripts.message import sessions as runtime_sessions
+from scripts.production import unit_lookup
+from scripts.shutdown.test_pane_restore import FakeClient
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
-from test_support import conversation_liveness
 
 
 class ResumeClock(local):
@@ -866,7 +863,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertFalse(pane_record.read("agents")["w1:p2"].get("ended", False))
 
     def test_unknown_name_lists_only_close_local_units_and_showrunners(self) -> None:
-        import remote
+        from scripts.shutdown import remote
 
         machine = remote.local_machine()
         rows = (
@@ -1059,7 +1056,6 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(stall_watch, "STATE_DIR",
                                          Path(self.enterContext(tempfile.TemporaryDirectory()))))
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
-        _ = self.enterContext(patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness))
         _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
@@ -1080,7 +1076,6 @@ class StopResumeTests(unittest.TestCase):
         process(os.environ, 123, 1, ["claude"], {}, cwd=self.root)
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.clock.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
-        _ = self.enterContext(patch("unit_runs.held", return_value=[]))
         _ = self.enterContext(patch.object(unit_runs, "held", return_value=[]))
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
@@ -1241,10 +1236,10 @@ class StopResumeTests(unittest.TestCase):
         run = str(self.root / "worker run")
         for phase in ("ad hoc", ""):
             with self.subTest(phase=phase):
-                command = ["bash", str(stop_resume.SCRIPTS / "direct/implement.sh")]
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"), "--role", "implement",
+                           "--session-dir", run, "--cwd", "/old tree", "--prompt", "old prompt", "--to", "writer"]
                 if phase:
                     command.extend(("--phase", phase))
-                command.extend((run, "/old tree", "old prompt", "impl", "the task", "impl", "writing", "0", "impl"))
                 seat = PausedSeat(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(stop_resume.resume_worker_command(seat, "/current tree"))
@@ -2430,7 +2425,7 @@ class StopResumeTests(unittest.TestCase):
         return result, log.read_text(encoding="utf-8")
 
     def test_detached_stay_check_alerts_on_early_exit_without_restarting(self) -> None:
-        import quota_alert
+        from scripts.whoami import quota_alert
         with patch.object(quota_alert, "tell_user") as push:
             result, log = self.run_stay_child()
         self.assertEqual(result, 1)
@@ -2443,7 +2438,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production import showrunners, staff_sources
         from scripts.accounts import unit_watchdog
         from scripts.notify.push_texts import RenderedPush
-        import quota_alert
+        from scripts.whoami import quota_alert
         identity = staff.StaffId(self.entry["session_id"])
         owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
@@ -2472,7 +2467,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_named_probe_reports_rounded_time_account_retry_and_shutdown_sender(self) -> None:
         from scripts.production import showrunners
-        import quota_alert
+        from scripts.whoami import quota_alert
         self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1"
         pane_record.write("agents", self.entry)
         with (patch.object(showrunners, "current_address", return_value="session:requester"),
@@ -2492,7 +2487,7 @@ class StopResumeTests(unittest.TestCase):
     def test_unnamed_session_uses_its_id_in_alert_and_retry(self) -> None:
         from scripts.production import showrunners
         from scripts.notify.push_texts import RenderedPush
-        import quota_alert
+        from scripts.whoami import quota_alert
         self.entry["name"] = ""
         self.client.rows[0]["label"] = None
         pane_record.write("agents", self.entry)
@@ -2508,7 +2503,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_no_requester_or_unit_never_tells_showrunners_and_only_pushes_non_probes(self) -> None:
         from scripts.production import showrunners
-        import quota_alert
+        from scripts.whoami import quota_alert
         for probe in (False, True):
             with self.subTest(probe=probe):
                 self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
@@ -2526,7 +2521,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_non_unit_early_exit_tells_only_the_requesting_showrunner(self) -> None:
         from scripts.production import showrunners
-        import quota_alert
+        from scripts.whoami import quota_alert
         requester = fixture_member("showrunner", name="requester",
             runtime_id="019b3a40-4250-7000-8000-000000000201")
         with (patch.object(staff, "runtime_id", return_value=requester.current_session),

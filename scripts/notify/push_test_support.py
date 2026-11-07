@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 from unittest import mock
-import pushover
-import push_texts
-from user_action import SessionLine, NO_SESSION_LINE
+from scripts.notify import pushover
+from scripts.notify import push_texts
+from scripts.notify.user_action import SessionLine, NO_SESSION_LINE
 
 
 def registered_send(argv: list[str], keys: Path, post: pushover.Post) -> int:

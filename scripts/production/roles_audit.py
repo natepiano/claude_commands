@@ -24,9 +24,7 @@ import tomllib
 import tokenize
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from code_kind import is_test_code  # noqa: E402
+from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 
 

@@ -14,17 +14,10 @@ from heapq import heappop, heappush
 from pathlib import Path
 from typing import Literal, cast
 
-if __package__:
-    from .transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
-                              ExactOrderedCaptureAttempts, FailedCapture, MeasuredHanaShotDuration, NamedCaptureView,
-                              SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptToolEvent,
-                              parsed_tool_event_category)
-else:
-    from transcripts import (  # pyright: ignore[reportImplicitRelativeImport]
-        AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures, ExactOrderedCaptureAttempts,
-        FailedCapture, MeasuredHanaShotDuration, NamedCaptureView, SelectedCaptureTarget, SuccessfulCapture,
-        ToolCall, TranscriptToolEvent, parsed_tool_event_category,
-    )
+from scripts.shot_report.transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
+                          ExactOrderedCaptureAttempts, FailedCapture, MeasuredHanaShotDuration, NamedCaptureView,
+                          SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptToolEvent,
+                          parsed_tool_event_category)
 
 Method = Literal["by hand", "/hana_shot"]
 ScreenshotSource = Literal[

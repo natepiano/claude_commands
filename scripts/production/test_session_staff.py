@@ -14,8 +14,8 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
-import herdr
-from pane_launch import PaneLaunch
+from scripts.herdr import herdr
+from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
@@ -52,7 +52,7 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(self.staff_state(), before)
 
     def test_unknown_process_identity_preserves_healthy_unit_status(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
 
         broken = unit_membership("show", "broken")
         healthy = unit_membership("show", "healthy")

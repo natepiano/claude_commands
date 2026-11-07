@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-import style_footprint
+from scripts.style import style_footprint
 
 
 SCRIPT = Path(__file__).with_name("style_footprint.py")
@@ -73,7 +73,7 @@ class StyleFootprintTests(unittest.TestCase):
                 elif error.code is not None:
                     print(error.code, file=sys.stderr)
                     code = 1
-        return subprocess.CompletedProcess([sys.executable, str(SCRIPT), *arguments], code,
+        return subprocess.CompletedProcess([str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), *arguments], code,
                                            output.getvalue(), errors.getvalue())
 
     def check(self, base: str, head: str = "HEAD", *extra: str) -> subprocess.CompletedProcess[str]:
@@ -181,7 +181,7 @@ class StyleFootprintTests(unittest.TestCase):
             return original_run(arguments, capture_output=capture_output, text=text, check=check,
                                 env=env, input=input, errors=errors)
 
-        with mock.patch("style_footprint.subprocess.run", side_effect=fail_write_tree):
+        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_write_tree):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
@@ -201,7 +201,7 @@ class StyleFootprintTests(unittest.TestCase):
         base = self.commit()
         for options in ([], ["--head", "HEAD", "--worktree"]):
             with self.subTest(options=options):
-                result = subprocess.run([sys.executable, str(SCRIPT), "check", "--repo", str(self.repo),
+                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), "check", "--repo", str(self.repo),
                                          "--base", base, *options], capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
@@ -1846,7 +1846,7 @@ class StyleFootprintTests(unittest.TestCase):
             return run(arguments, capture_output=capture_output, text=text, check=check, input=input, errors=errors)
 
         output = io.StringIO()
-        with mock.patch("style_footprint.subprocess.run", side_effect=fail_merge_tree):
+        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_merge_tree):
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--head", head])
         self.assertEqual((code, output.getvalue()),

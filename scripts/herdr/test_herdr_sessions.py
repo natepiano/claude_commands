@@ -20,11 +20,11 @@ from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import patch
 
-import herdr
-import herdr_sessions
-import sessions
-from fake_herdr import CommandResponse
-from sessions import SessionRecord, UnreadableSessionRecord, read_session
+from scripts.herdr import herdr
+from scripts.herdr import herdr_sessions
+from scripts.message import sessions
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config

@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-from typing import TYPE_CHECKING, cast
+from typing import cast
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_hold_test_support import IsolatedBuildHoldTest, SCRIPT
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, SCRIPT
+from scripts.lib import test_hang_guard
 
 
 class AwsHoldCliTests(IsolatedBuildHoldTest):

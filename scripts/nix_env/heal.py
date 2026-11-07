@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Restart idle Claude sessions that missed their worktree's nix environment.
 
 Registry decoding and process identity belong to message/sessions.py. Build
@@ -24,16 +24,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.lib import conf, nix_env
 from scripts.message import send_result, sessions
 from scripts.message import send_budget
-sys.path.insert(0, str(SCRIPTS / "notify"))
 if TYPE_CHECKING:
     from scripts.notify import push_texts, review
 else:
-    import push_texts
-    import review
+    from scripts.notify import push_texts
+    from scripts.notify import review
 
 
 def state_directory() -> Path:

@@ -7,16 +7,13 @@ import shutil
 import shlex
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 
 from scripts.herdr import fake_herdr
 from scripts.lint.memory_test_support import config_environment
@@ -26,12 +23,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import rename
-import pane_record
-if TYPE_CHECKING:
-    from scripts.style import style_ledger
-else:
-    import style_ledger
+from scripts.production import rename
+from scripts.shutdown import pane_record
+from scripts.style import style_ledger
 
 SCRIPT = Path(__file__).with_name("rename.py")
 SLUG = "demo"
@@ -377,7 +371,6 @@ class FolderRenameFixture(StaffTestCase):
             path = self.home / ".codex/sessions/2026/11/04" / f"rollout-fixture-{self.owner.current_session}.jsonl"
         path.parent.mkdir(parents=True)
         _ = path.write_text("{}\n")
-
 
 
 class FolderSessionFixture:

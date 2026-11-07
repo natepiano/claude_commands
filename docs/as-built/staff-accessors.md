@@ -80,10 +80,10 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot |
 | `scripts/direct/assign.py` | read | runtime_id |
+| `scripts/direct/assign_claude.py` | read | local_snapshot |
+| `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
-| `scripts/direct/implement.sh` | read | local_snapshot |
-| `scripts/direct/implement_launcher_test_support.py` | read | staff.json path |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
@@ -139,9 +139,9 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/merge_gate.py` | read | staff.json path |
-| `scripts/production/merge_gate_test_support.py` | read | LiveDoc |
+| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/production_doc.py` | read | StaffSnapshot, LiveDoc, WrappedDoc |
+| `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
@@ -213,15 +213,15 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
-| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
+| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-155 accessors: 30 write, 124 read, 1 owner.
+155 accessors: 31 write, 123 read, 1 owner.
 
 ## Approved copies
 
 | Copy | Writer | Reader | Approved |
 |---|---|---|---|
-| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
+| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/hierarchy.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
 

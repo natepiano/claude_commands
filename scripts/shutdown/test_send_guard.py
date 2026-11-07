@@ -8,11 +8,11 @@ from collections.abc import Callable
 from typing import Never, cast, final
 from unittest.mock import patch
 
-import remote
-import remote_control
-import restart_support
-import shutdown
-from test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import remote
+from scripts.shutdown import remote_control
+from scripts.shutdown import restart_support
+from scripts.shutdown import shutdown
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
 
 
 LOGIN = "owner@example.com"

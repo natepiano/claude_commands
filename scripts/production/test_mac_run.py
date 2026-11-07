@@ -243,7 +243,7 @@ class MacRunTests(unittest.TestCase):
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(MAC_TEST), *arguments],
+            [str(SCRIPT.parents[1] / "lib/py"), str(MAC_TEST), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,

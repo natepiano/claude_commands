@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -13,19 +12,17 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
+from scripts.production import add_unit
 from scripts.production import staff, unit_config
-import unit_lookup
-import sessions
+from scripts.production import unit_lookup
+from scripts.message import sessions
 from scripts.shutdown import stop_resume
-import herdr
-from herdr import HerdrPlace
-from test_support import ShutdownTestCase
+from scripts.herdr import herdr
+from scripts.herdr.herdr import HerdrPlace
+from scripts.shutdown.test_support import ShutdownTestCase
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
 from scripts.production.staff_test_support import fixture_runtime_id, unit_membership
 
 
