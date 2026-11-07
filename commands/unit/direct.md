@@ -1,10 +1,10 @@
-Run every worker through `bash ~/.claude/scripts/direct/assign.sh` as a background shell of the director session.
-This rule covers all roles and both Claude and Codex.
-Direct calls to worker launchers refuse with one line that names `assign.sh`.
-
 ---
 description: Direct phases, reviews, and checkpoints.
 ---
+
+Run every worker through `bash ~/.claude/scripts/direct/assign.sh` as a background shell of the director session.
+This rule covers all roles and both Claude and Codex.
+Direct calls to worker launchers refuse with one line that names `assign.sh`.
 
 # Direct
 
