@@ -100,16 +100,11 @@ def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
             _ = path.write_text(json.dumps(expected))
         status = worker_state.worker_status_path(launch.run, launch.slot)
         claim = launch.run / f"impl_claim_{launch.slot}.json"
-        pid = _read(claim).get("pid", 0)
-        stale = False
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                stale = True
-                claim.unlink(missing_ok=True)
-            else:
-                _fail(f"{name} is claimed by launcher {pid}")
+        owner = worker_state.read_worker_claim(claim)
+        if isinstance(owner, worker_state.HeldWorkerClaim):
+            _fail(f"{name} is claimed by launcher {owner.pid}")
+        stale = isinstance(owner, worker_state.EndedWorkerClaim)
+        claim.unlink(missing_ok=True)
         if stale or (status.exists() and status.read_text().strip() == "implementing"):
             _ = status.write_text("error\n")
         claude = env.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
@@ -122,7 +117,7 @@ def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
         row = next((row for row in rows if row.get("sessionId") == session), missing)
         if row.get("status") != "idle":
             _fail(f"{name} is busy or gone")
-        _ = claim.write_text(json.dumps({"pid": os.getpid(), "worker": name}))
+        worker_state.publish_worker_claim(claim, name)
 
 
 def _release(launch: ClaudeLaunch) -> None:
