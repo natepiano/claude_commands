@@ -1135,6 +1135,18 @@ class RosterTests(unittest.TestCase):
         self.assertIsInstance(found, send.LocalRosterIncomplete)
         peer.assert_not_called()
 
+    def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit"}))
+        lost = unit_labels.LiveRun(run, unit_labels.NoRunningDirector())
+        problems: list[str] = []
+
+        found = roster._worker_ledger(lost, problems, staff.snapshot())  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(found, [])
+        self.assertEqual(problems, [f"{run}: run owner missing-unit: unit staff row is unavailable"])
+
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
             entries = self._entries()

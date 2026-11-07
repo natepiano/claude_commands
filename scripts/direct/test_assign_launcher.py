@@ -174,7 +174,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CLAUDE_BIN": str(binary),
             "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
-            "UNIT_WORKER_WAIT_ATTEMPTS": "1", "UNIT_WORKER_POLL_SECS": "0",
+            "UNIT_WORKER_POLL_SECS": "0",
         })))
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         return calls

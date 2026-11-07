@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build and inspect Claude and Codex account directories; select Claude roles."""
 
 from __future__ import annotations

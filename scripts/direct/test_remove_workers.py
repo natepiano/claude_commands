@@ -294,6 +294,22 @@ class RemoveWorkersTest(unittest.TestCase):
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
         self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
 
+    def test_own_run_removal_reports_phase_completion_with_a_live_director(self) -> None:
+        own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
+        self.list_rows([row("own1", "p-impl")])
+        result, removed = self.run_remove_workers(own)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(removed, ["own1"])
+        self.assertEqual(result.stdout, "removed worker p-impl (own1): its run finished this phase\n")
+
+    def test_sweep_removal_reports_a_dead_director(self) -> None:
+        _ = self.run_dir("orphaned", ["orph1"], orchestrator=GONE_ORCHESTRATOR)
+        self.list_rows([row("orph1", "p-impl")])
+        result, removed = self.run_remove_workers()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(removed, ["orph1"])
+        self.assertEqual(result.stdout, "removed worker p-impl (orph1): unit director is not live\n")
+
     def test_unreadable_run_owner_does_not_stop_other_worker_removal(self) -> None:
         for transport in ("mesh", "herdr"):
             with self.subTest(transport=transport):

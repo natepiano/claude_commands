@@ -750,7 +750,7 @@ def _worker_ledger(run: _LiveRun, problems: list[str], membership: staff.StaffSn
         owner = (membership.by_current_session(run.director.session_id)
                  if isinstance(run.director, _DirectorSession)
                  else worker_admission.parent(membership, run=run.path))
-    except ValueError as error:
+    except (ValueError, staff.StaffUnreadable) as error:
         _problem(problems, str(run.path), error)
         return []
     if owner is None:
