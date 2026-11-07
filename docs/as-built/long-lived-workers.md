@@ -418,7 +418,7 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |
 | `scripts/whoami/agent_notes.py` | `credits` on Codex readings |
-| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. A Codex pane worker takes the same value as `model_auto_compact_token_limit` at launch. |
+| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. `assign.py` compacts an idle mesh worker above it before new work. A pane worker has no in-turn compaction option. Codex keeps its own full-window limit. |
 | `commands/unit/direct.md` | Defines `<LongLivedWorkers/>`, with references from `<PhaseCleanup/>` and `<CompactionContract/>`. |
 | `docs/direct/repair_rounds.md` | References `<LongLivedWorkers/>` from `<FixDispatch/>`. |
 | `docs/direct/early_review.md` | Defines `<EarlyReviewArm/>` and uses the early review worker (`EARLY_REVIEW_SLOT`). |

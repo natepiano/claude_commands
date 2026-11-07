@@ -451,6 +451,11 @@ class PaneRestoreTests(unittest.TestCase):
 
 @final
 class RestoreStaffNamesTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "run_in_pane"))
+
     def saved_batch(self, *, machine: Literal["natedev", "mac"] = "natedev") -> tuple[Path, FakeClient]:
         parent, unit, worker = self.tree()
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
@@ -479,7 +484,6 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
-        _ = self.enterContext(mock.patch.object(FakeClient, "run_in_pane"))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
         unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))

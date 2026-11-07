@@ -2984,6 +2984,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 30: herdr adds no draft restore step after a submit; Claude keeps the draft itself. A draft lost in a stop and resume is the agents unit's fix.
 - Phase 27: only a worker with an active dispatch reopens on restore, restart or a move; an idle worker stays closed until its next assign. Keep this rule when the mesh branch goes.
 - Phase 33: `worker_pass` picks the newest matching pass by `started_at`, never the last in dict order. Keep this when the short mesh slots go.
+- Phase 32: every launch destination runs `unalias <kind>` through `Herdr.run_in_pane` before `agent start`. Keep the one step when the launch path changes; a test fake pane shows an empty shell first.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3237,7 +3238,7 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 **Spec:**
 
 1. `worker_run` takes the worker row. It returns the run of the worker's newest pass from the existing worker-to-run evidence (`session_staff.worker_run_index` or the reader under it). Do not add a second index.
-2. A worker with no pass in any run keeps today's answer (the director's first held run, else the fallback folder).
+2. A worker with no pass in any run keeps today's answer (the director's first held run, else the fallback folder). `start_or_resume` picks a run before a new worker row exists: keep a parent path for `NewWorkerSlot`, and use the worker evidence only for an existing row.
 3. Change every caller of `worker_run` to pass the worker row: `mesh_runs.caller_from_environment`, `worker.py restore`, `worker_panes.close` (its `HolderRun.CURRENT` default), `pane_moves.run_for_worker`, and each other caller that `grep -rn "worker_run(" scripts` finds.
 4. Add no check, refusal or validation that this list does not name.
 
@@ -3246,7 +3247,7 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 **Workers:** `1 writer`.
 
 **Acceptance gate:**
-- New tests: a director with two runs whose names sort with the worker's run second; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
+- New tests: a director with two runs whose names sort with the worker's run second; a first admission of a new worker while the director holds two runs; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
 - The changed test modules pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
 - The full gate passes.
 
@@ -3269,6 +3270,10 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 **Depends on:** Phase 29 (sdlc placed it after 29 and before 28, 2026-11-07). Phase 19 waits for this phase.
 
 sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane worker fails with exit 3, `FAILED: codex_mesh.py send: codex_mesh: tool-based-ui-demo-fix2 is ended; message not delivered`. `send.py` (`codex`, `scripts/message/send.py:2234`) still sends every Codex message through `codex_mesh.py send`, which reads the old mesh roster entry as ended. sdlc's rule: `send.py` delivers to a pane worker through the one pane delivery function that assign uses, with no second copy. The `codex_mesh` route goes with Phase 19.
+
+Second case (sdlc [099e44fb], 2026-11-07): `send.py --to morty` returns `QUEUED: no live session answers to session:01a18dbb-...`, and `--to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` returns `FAILED: no live Codex daemon has thread 01a18dbb... loaded; checked ~/.codex, ~/.codex1, ~/.codex2`, while that Codex session runs in a herdr pane. `send.py` looks only for app-server daemons. This phase also delivers to a Codex session in a pane by its thread id: `herdr agent list` names the pane whose `agent_session.value` is that id, and the message goes through the one submit path. A test covers a Codex pane session with no staff row and no app-server.
+
+**Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A test fake pane shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
 
 The Work Order is written at the phase start.
 
@@ -3309,34 +3314,18 @@ Defect (demo-unit, 2026-11-07): pane worker `tool-based-ui-demo-test` (Codex thr
 - A unit test: the Codex launch arguments do not contain `model_auto_compact_token_limit`.
 - `scripts.herdr.test_worker_panes` passes; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
 
-### Phase 32 — A launch keeps the caller's Codex home  · status: todo
+### Phase 32 — A launch keeps the caller's Codex home  · status: done
 
-**Depends on:** none. Placed after the Phase 27 and 30 checkpoints and before Phase 29 (director's call, sent to sdlc 2026-11-07). Phase 19 waits for this phase.
+#### As-built
 
-sdlc reported a finding from the agents unit's live proof (2026-11-07): `herdr.launch_agent` called with `CODEX_HOME=~/.codex2` started the Codex process on `~/.codex1`. Account moves to a second Codex account depend on this value. The code keeps the value through `agent_base_environment` and `nix_env.ensure` (`scripts/herdr/herdr.py:4826-4853`), and `Herdr.open_tab` passes it to the new pane as `tab create --env` (`:1362`). So the loss is after herdr.py hands it to herdr: in the pane shell start, or in `herdr agent start --kind codex` (`:1920`).
+`launch_prepared_agent` (`scripts/herdr/herdr.py`) runs `unalias <kind> 2>/dev/null;` through `Herdr.run_in_pane` in the destination pane before `agent start`, for an `ExistingPane`, a `NewTab` and a `SplitPane`. An `ExistingPane` also gets the environment exports in the same script and its terminal. Cause: the pane's interactive zsh has `alias codex='… accounts.py exec workers'`, and `accounts.exec_account` sets `CODEX_HOME` to the workers account. Before, only `ExistingPane` removed the alias, so a new tab or split started Codex on the workers account. A live proof ran in `zz-proof-codexhome` with its folders under `~/scratch/herdrcheck/codexhome-*` (13:17 and 13:20 EST).
 
-The agents unit's evidence (2026-11-07, `/tmp/claude/unit/fac3cc89-6c14-4c9a-9d7d-1c7c22403037/phases/morty-workers/proof/`): `live_proof_3.log` (12:15:49 EST) and `live_proof_4.log` (12:20:23-12:23:45 EST) called `herdr.launch_agent(..., {'CODEX_HOME': '/home/natepiano/.codex2'}, 'codex', [...], NoOpeningPrompt(), ...)` into a `NewTab`. The Codex process read `CODEX_HOME=/home/natepiano/.codex1` from its environment at launch. `live_proof_7.log` started on codex2 because it ran `env CODEX_HOME=~/.codex2 codex ...` in a plain pane with `run_in_pane`, not through `launch_agent`.
+**Files:**
+- `scripts/herdr/herdr.py` — `launch_prepared_agent`.
+- `scripts/herdr/test_herdr.py` — the `NewTab` and `SplitPane` launches remove the alias through the same step.
+- Test fixtures: `scripts/production/add_showrunner_test_support.py` and `add_unit_test_support.py` make a fake zsh process for each new pane (`STUB_STATE/pane-shell`) and report the agent only when its parent is that shell. `scripts/herdr/test_herdr_sessions.py`, `scripts/lib/test_nix_env_launches.py`, `scripts/shutdown/test_pane_restore.py`, `test_restart.py` and `scripts/production/test_add_showrunner.py` patch `Herdr.run_in_pane` in setUp.
 
-Likely cause, from the code: the pane shell is an interactive zsh with `alias codex='~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec workers'`, and `accounts.exec_account` sets `CODEX_HOME` to the workers account (`scripts/accounts/accounts.py:1514`). The `ExistingPane` route of `launch_prepared_agent` runs `unalias {kind}` before the start (`scripts/herdr/herdr.py:4922`); the `NewTab` and `SplitPane` routes do not. `live_proof_7.log` ran `~/.local/bin/codex` by path, so no alias applied.
-
-#### Work Order
-
-**Goal:** a Codex or Claude agent that herdr starts in a pane runs with the caller's account environment, for every destination.
-
-**Spec:**
-
-1. Prove the cause live before any edit (Acceptance gate). Launch Codex through `herdr.launch_agent` into a `NewTab` with `CODEX_HOME=~/.codex2`. Name the account folder the Codex process uses from its open files (`/proc/<pid>/fd`), not from its environment. Record the cause in the summary.
-2. Fix in one shared place that every destination passes through: the shell alias of the agent kind no longer replaces the canonical executable. Use the `unalias` step that the `ExistingPane` route has; do not keep a second copy of it.
-3. Add no check, refusal, validation, retry or wait that this list does not name.
-
-**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- A unit test: a `NewTab` launch and a `SplitPane` launch remove the kind's alias before `agent start`, through the same step as `ExistingPane`.
-- A live proof, before and after the fix, in a tab named `zz-proof-codexhome` in the agents herdr session, with its working directory under `/home/natepiano/scratch/herdrcheck/`: the Codex process opens files only under `~/.codex2`. Close only the ids that the proof opened.
-- `HerdrTests` and `PromptSubmissionTests` pass; basedpyright on both files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
+**Gotchas:** `run_in_pane` waits until the pane shows an empty shell. A fake pane that answers `pane process-info` with the agent already in the foreground fails with "would send keys to … other live work".
 
 ### Phase 34 — A worker's turn end tells the director; no shell waits  · status: todo
 
@@ -3354,6 +3343,14 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
     2. A turn end with `DONE` while a background run still runs is not a result yet. The run's own completion checks the pass again when it finishes.
     3. A finished run whose result never reached the transcript puts the anomaly line in the director's message, and the pass completes.
     4. One test for each of 6.1, 6.2 and 6.3.
+
+7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held.
+8. **One completion rule (plan review after Phase 32).** The C1210 exception is in `_dispatch_turn` after a quiet wait, not in `dispatch_receipt`, which returns `DispatchWaitingForRuns` when a finished run's result is absent. Extract one completion decision before the wait is deleted. The hook and a detached run's completion both call it; 6.4's tests go through both.
+9. **Default policy is a named state.** `worker.dispatch` and `worker_panes.start_or_resume` take `LaunchPolicy | None`, where `None` means the role's configured policy. When this phase changes those signatures, replace `None` with a named state (for example `ConfiguredRolePolicy`).
+
+**Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A hook launch fixture shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
+
+**Restructure (sdlc [a3ae4ca3], 2026-11-07):** fix-rounds-unit cuts `commands/unit/direct.md` to a core and moves mode-only sections to files read on demand. Merge sdlc after it lands, then put this phase's `direct.md` edits into the new layout.
 
 **Files (first list; the Work Order at the phase start settles it):** `scripts/production/worker.py` and `test_worker.py`; `scripts/direct/assign.py`, `assign.sh`, `progress_history.py` and their tests; `scripts/herdr/worker_panes.py` and `test_worker_panes.py`; one new turn-end hook script in `scripts/herdr/` with its test; `commands/unit/direct.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`; `docs/as-built/long-lived-workers.md` and `herdr-adoption.md`.
 
