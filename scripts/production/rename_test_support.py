@@ -267,7 +267,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.folder_git(self.checkout, "worktree", "add", "-b", "unit-branch", str(self.old_folder))
         parent = fixture_member("showrunner", name="production")
         fixed = fixture_member("unit", name="kept-name", parent=parent.id,
-                               worktree=staff.PresentWorktree("natedev", self.old_folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), self.old_folder))
         self.owner = staff.update_current_session(fixed.current_session,
             staff.native_id(fixture_runtime_id("folder-move-current")))
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
@@ -538,7 +538,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.env.update(STAFF_FILE=str(self.staff_file), STAFF_TEST_OWNER_FILE=str(self.staff_file))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc("natedev", self.doc))
+        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc(remote.local_machine(), self.doc))
         with staff.operation(), unit_move.production_lock():
             pass
 

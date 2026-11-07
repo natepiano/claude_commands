@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 from types import ModuleType
 import json
@@ -180,7 +182,7 @@ class RegistrationFixture(unittest.TestCase):
         runner = recorded_showrunner("example", self.doc)
         self.owner_id = runner.id
         _ = fixture_member("unit", name="alpha", parent=runner.id,
-                           worktree=staff.PresentWorktree("natedev", alpha))
+                           worktree=staff.PresentWorktree(remote.local_machine(), alpha))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
 
@@ -303,11 +305,11 @@ class RegistrationFixture(unittest.TestCase):
             return fixed.id
         matches = [row for row in record.find(kind="showrunner") if row.name == name]
         owner = matches[0] if matches else fixture_member("showrunner", name=name)
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.document_for(name)))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), self.document_for(name)))
         if not reference or reference == "showrunner":
             return owner.id
         return fixture_member("unit", name=unit_names.name(reference), parent=owner.id,
-                              worktree=staff.PresentWorktree("natedev", self.root / unit_names.name(reference))).id
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root / unit_names.name(reference))).id
 
     def write_open_for(self, name: str, *items: dict[str, str]) -> None:
         owner = self.fixture_staff_id(name=name)

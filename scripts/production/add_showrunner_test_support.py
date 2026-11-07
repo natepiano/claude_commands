@@ -2,6 +2,8 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -252,7 +254,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def timer(self, production_name: str, session: str) -> None:
         _ = fixture_member("showrunner", name=production_name, runtime_id=session,
-                           doc=staff.LiveDoc("natedev", self.doc(production_name)))
+                           doc=staff.LiveDoc(remote.local_machine(), self.doc(production_name)))
         self.timer_conf(production_name).parent.mkdir(parents=True, exist_ok=True)
         _ = self.timer_conf(production_name).write_text(self.timer_text(production_name, session), encoding="utf-8")
 
@@ -307,7 +309,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         if "--resume" in extra and "--cwd" in extra and owner is None:
             owner = fixture_member("showrunner", name=production_name,
                                    runtime_id=extra[extra.index("--resume") + 1],
-                                   doc=staff.LiveDoc("natedev", doc))
+                                   doc=staff.LiveDoc(remote.local_machine(), doc))
         if owner is not None:
             _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", owner.current_session)
         self.prepare_herdr(production_name)
