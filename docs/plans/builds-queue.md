@@ -335,6 +335,38 @@ only I can bump
 
 **Ruled out:** a repository name list; deleting stale gate folders in this phase.
 
+### Phase 18 — A standing gate tree takes its owner from the staff row and its folder from the repository's identity  · status: done
+
+**Asked by:** the builds showrunner, 2026-11-05, from a user shot at 20:38: about 90 gate trees in the user's project list. Before other new work.
+
+**Depends on:** 18a and 18b on GitHub builds. Merge both, with verify 35b's mirrors and locks, into this phase's tree before its gate.
+
+#### Work Order
+
+**Goal:** Each standing tree has one known owner and one folder for its repository, and retire and end remove a unit's trees.
+
+**Spec:**
+1. **Owner.** `copies.py run` and `copies.py remove` take the owner from the calling session's staff row. A worker row uses its parent unit's name. Delete the `--owner` flag (builds ruling, 2026-11-05: a command flag needs no user approval). A caller with no staff row gets a one-line error that says so. `standing()` and `remove_trees()` keep their owner parameter for in-process callers, whose owners are not free text: `merge_gate.py`, `style_sync.py`, `ci_points.py`, `bump_gate.py`. Do not edit `rust_release.py` (build freeze); report its fixed owner in the summary.
+2. **Retire and end.** Retire (`scripts/production/retire_unit.py`) and the end of a unit run (`scripts/direct/end_session.sh`) remove the unit's idle standing trees and workspaces with the one shared call that `scripts/production/tidy_wrapped.py:96` uses. A failure to remove a busy tree does not stop the retire or the end; it prints one line, and the existing cleanup takes the tree later. A kept remote mirror still refuses the retire before the worktree removal, because no sweep removes a mirror (director call, no user words): `remove_trees` raises `RemoteMirrorKept`.
+3. **Repository name.** Phase 18a owns `repository_name`. Keep its rule when merging, and add no second rule.
+4. **Old folders.** This phase removes no old folder and has no deploy step. Hierarchies Phase 28 deletes the stale gate folders (builds ruling, 2026-11-06). Delete `<phase folder>/migrate_18.py`.
+5. **Copy guard.** The refusal text in `scripts/copies/copy_guard.py:37` recommends `copies.py run --owner verify`. Change that command to the form with no `--owner`, and keep every guard decision.
+6. **Docs.** Update `docs/as-built/gate-checkouts.md`, `docs/as-built/style-showrunner.md`, `docs/style_production.md`, `commands/mend_fix.md` and `commands/adversarial.md` to the command with no `--owner`.
+7. **Report only.** Find the test that wrote style trees (`integration-<sha>`, `beta`, `bulk_sample`) into the real gates root on 2026-11-03 at 14:39. State whether a later isolation fix covers it, with evidence.
+
+**Files:**
+- `scripts/copies/copies.py` — the owner, the name and the flag.
+- `scripts/copies/test_copies.py` — the tests.
+- `scripts/copies/copy_guard.py` — the refusal text.
+- `scripts/production/retire_unit.py`, `scripts/production/test_retire_unit.py` — retire.
+- `scripts/direct/end_session.sh`, `scripts/direct/test_end_session.py` — end.
+- `scripts/hooks/test_codex_hooks.py` — the command text in the hook test.
+- `docs/as-built/gate-checkouts.md`, `docs/as-built/style-showrunner.md`, `docs/style_production.md`, `commands/mend_fix.md`, `commands/adversarial.md` — item 6.
+
+**Workers:** `1 writer` — `impl2`, code, tests and docs. The item 7 report is complete.
+
+**Acceptance gate:** `copies.py run` with no owner flag makes a tree under `<gates root>/<identity>/<unit>-gate` in tests with a private staff file and a private gates root. Clone, worktree and main checkout of one repository give one name. Retire and end remove only that unit's trees, for a Rust repository's standing copy and a fresh copy of a repository with no build cache. Copies, retire, hook, scratch and sweep suites pass; basedpyright 0/0/0. Change-Review: the user's project list shows one folder per repository.
+
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
 #### As-built
