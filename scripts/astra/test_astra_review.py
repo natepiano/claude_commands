@@ -23,7 +23,7 @@ from scripts.production import staff  # noqa: E402
 from scripts.production.test_worker import PaneCommandRouter, WorkerCommandTests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.herdr import herdr
+from scripts.herdr import herdr, side_pane
 from scripts.direct import assign
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
@@ -280,18 +280,34 @@ class AstraReviewTests(StaffTestCase):
         self.assertEqual(len(self.world.closed), 1)
 
     def test_unproved_consultation_close_fails_and_preserves_the_report(self) -> None:
+        retained_panes: list[str] = []
+        close_results: list[side_pane.SidePaneCloseUnavailable] = []
+        close = side_pane.close
+
+        def record_close(label: str) -> side_pane.ClosedSidePane | side_pane.SidePaneCloseUnavailable:
+            closed = close(label)
+            if isinstance(closed, side_pane.SidePaneCloseUnavailable):
+                close_results.append(closed)
+            return closed
+
         def duplicate_terminal(pid: int, number: int) -> None:
             pane = next(pane for pane, process in self.world.foreground.items() if process[0] == pid)
+            retained_panes.append(pane)
             self.world.signal(pid, number)
             self.world.locations["w2:p9"] = {**self.world.locations[pane], "pane_id": "w2:p9"}
 
-        with patch.object(os, "kill", side_effect=duplicate_terminal):
+        with patch.object(os, "kill", side_effect=duplicate_terminal), \
+                patch.object(side_pane, "close", side_effect=record_close):
             result = self.run_script(str(self.document))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.saved_prompt().with_name("review.md").read_text().strip(), self.fixture.agent.final)
         self.assertIn("exit 1", result.stderr)
         self.assertEqual(self.world.closed, [])
         self.assertEqual(len(self.world.signals), 1)
+        self.assertIn(f"Saved: {self.saved_prompt().with_name('review.md')}", result.stderr)
+        self.assertIn(f"assign.sh: consultation close unproved: {close_results[0].reason};", result.stderr)
+        label = self.world.locations[retained_panes[0]]["label"]
+        self.assertIn(f"pane {retained_panes[0]} ({label}) stays open", result.stderr)
 
     def test_the_prompt_names_the_document_and_the_focus_and_forbids_building(self) -> None:
         self.assertEqual(self.run_script(str(self.document), "the rollout order").returncode, 0)

@@ -874,7 +874,7 @@ def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy) -
 
 def execute_consultation(args: Arguments, cwd: Path) -> int:
     """Start a consultation without a staff row."""
-    opened = False
+    opened: side_pane.AbsentSidePane | side_pane.OpenSidePane = side_pane.AbsentSidePane()
     result = 1
     try:
         question = ""
@@ -893,7 +893,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
         if args.operation != AssignmentOperation.ASTRA_REVIEW:
             print("done")
             return 0
-        opened = True
+        opened = current
         client = herdr.Herdr(herdr.shared_session())
         process = client.pane_agent_process(current.pane, current.terminal)
         source = herdr.codex_transcript(process.pid)
@@ -907,10 +907,12 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
         print(f"assign.sh: consultation unavailable: {error}", file=sys.stderr)
         result = worker_panes.ExitCode.UNCERTAIN
     finally:
-        if opened:
+        if isinstance(opened, side_pane.OpenSidePane):
             try:
                 closed = side_pane.close(args.new_worker)
                 if isinstance(closed, side_pane.SidePaneCloseUnavailable):
+                    print(f"assign.sh: consultation close unproved: {closed.reason}; "
+                          + f"pane {opened.pane} ({args.new_worker}) stays open", file=sys.stderr)
                     result = 1
             except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"assign.sh: consultation close failed: {error}", file=sys.stderr)
