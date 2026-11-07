@@ -7,30 +7,22 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
-import index
-from index import GATE_TABLES
-from test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
+from scripts.buildlog import index
+from scripts.buildlog.index import GATE_TABLES
+from scripts.buildlog.test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-if TYPE_CHECKING:
-    from . import record, store
-    from ..test_times import gate_record
-    from ..test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from ..test_times.gate_record_test_support import gate_run, remove_run_measurements
-else:
-    from scripts.buildlog import record, store
-    from scripts.test_times import gate_record
-    from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+from scripts.buildlog import record, store
+from scripts.test_times import gate_record
+from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
+from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"
@@ -120,7 +112,7 @@ class GateIndexTests(unittest.TestCase):
         self.assertEqual(index.update(), 1)
         common: Record = {"src": source, "host": "fixture-host", "started_at": STARTED}
         expected_run: Record = {
-            **{key: value for key, value in run.items() if key not in {"suites", "modules"}},
+            **{key: value for key, value in run.items() if key not in {"suites", "modules", "dirty_paths", "dirty_path_count"}},
             **common, "id": "gate-one", "aborted": 1, "dirty": 1,
             "modules_run": 3, "tests_run": 111,
         }
@@ -153,10 +145,12 @@ class GateIndexTests(unittest.TestCase):
         path = self.root / source
         entry = next(store.locked_rows(path))
         remove_run_measurements(entry)
+        del entry["step"]
         _ = path.write_bytes(encode(entry))
         original = path.read_bytes()
         self.assertEqual(index.update(), 1)
         self.assertEqual(rows("SELECT slow_test_s, tests_run, modules_run FROM gate_runs"), [(None, None, 3)])
+        self.assertEqual(rows("SELECT step FROM gate_runs"), [("",)])
         self.assertEqual(rows("SELECT tests_run FROM gate_modules WHERE suite = ? AND attempt = ?"
                               + " AND module = ?", "scripts", 2, "test_shared.py"), [(7,)])
         self.assertEqual(path.read_bytes(), original)

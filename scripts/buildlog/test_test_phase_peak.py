@@ -15,11 +15,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import launches
-import record
-import store
-import test_record as record_tests
-import test_record_rerun as recovery_tests
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog import test_record_rerun as recovery_tests
 
 if TYPE_CHECKING:
     from ..lint import test_invoke_scope as scope_tests

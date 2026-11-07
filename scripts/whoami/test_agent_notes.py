@@ -17,29 +17,27 @@ from dataclasses import dataclass, field
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import Self, cast, override
 from unittest.mock import ANY, MagicMock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib import conf
 from scripts.whoami.note_file import note_name
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
-import codex_pacer
-import five_hour
-import quota_alert
+from scripts.whoami import codex_pacer
+from scripts.whoami import five_hour
+from scripts.whoami import quota_alert
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -114,7 +112,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
-        _ = self.enterContext(patch("sessions.live_sessions", return_value=[]))
+        _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
@@ -1098,10 +1096,7 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_notes_pass_shares_process_scan_without_changing_outputs_or_decisions(self) -> None:
         from scripts.accounts import unit_watchdog
-        if TYPE_CHECKING:
-            from scripts.herdr import herdr
-        else:
-            import herdr
+        from scripts.herdr import herdr
         proc = self.root / "proc"
         proc.mkdir()
         home = self.root / ".codex"

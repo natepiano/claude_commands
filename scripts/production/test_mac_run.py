@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise mac_run.sh coordination with disposable state and command stand-ins."""
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
-from scripts.direct.wait_for_test_state import wait_for_file, wait_until
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import ImmutableGitSeed
 
@@ -222,9 +223,12 @@ class MacRunTests(unittest.TestCase):
             SITE_CUSTOMIZE, encoding="utf-8"
         )
         # The runner's session must not own the fixture's Mac block.
+        seed_interpreter_cache(self.root / "cache")
         self.environment = {
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
             "HOME": str(self.home),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
@@ -237,13 +241,15 @@ class MacRunTests(unittest.TestCase):
             "TMPDIR": str(self.temp_directory),
         }
 
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+
     def write_executable(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/usr/bin/env zsh\n" + source, encoding="utf-8")
         path.chmod(0o755)
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(MAC_TEST), *arguments],
+            [str(SCRIPT.parents[1] / "lib/py"), str(MAC_TEST), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,
@@ -311,8 +317,12 @@ class MacRunTests(unittest.TestCase):
     def assert_claim_released(self) -> None:
         self.assertFalse((self.state_directory / "run.json").exists())
 
-    def wait_for_path(self, path: Path) -> None:
-        wait_for_file(path)
+    def wait_for_path(self, path: Path, process: subprocess.Popen[str]) -> None:
+        wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
+        if process.poll() is not None:
+            output, errors = process.communicate()
+            self.fail("mac_run exited before the build marker: " + output + errors)
+        self.assertTrue(path.exists())
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(
@@ -663,6 +673,12 @@ class MacRunTests(unittest.TestCase):
     def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
         self.assert_clone_records_after_cleanup(23)
 
+    def test_build_marker_wait_reports_a_failed_child(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            with self.assertRaisesRegex(AssertionError, "fixture start failed"):
+                self.wait_for_path(self.stub_state / "build-started", process)
+
     def test_signals_clean_remote_work_before_releasing_claim(self) -> None:
         for signal_number, cleanup_status in (
             (signal.SIGTERM, 0),
@@ -682,7 +698,7 @@ class MacRunTests(unittest.TestCase):
                     }
                 )
                 try:
-                    self.wait_for_path(self.stub_state / "build-started")
+                    self.wait_for_path(self.stub_state / "build-started", process)
                     send_process_group(process.pid, signal_number)
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except BaseException:

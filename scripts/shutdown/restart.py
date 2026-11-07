@@ -12,20 +12,15 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from importlib import import_module
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-for dependency in ("herdr", "message", "lib", "shutdown"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
 from scripts.shutdown import shutdown_record, pane_record
 from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed, NoRoleAccount
 from scripts.shutdown.codex_trust import trust_arguments
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
 
 
@@ -177,7 +172,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(live)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
-        import remote
+        from scripts.shutdown import remote
         if machine != remote.local_machine():
             raise ValueError(f"{row.name}: session is on {machine}")
         from scripts.shutdown.launch_names import LaunchNames
@@ -283,7 +278,7 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                  resolver: session_staff.RowResolver | None = None,
                  codex: herdr.CodexConversations | None = None) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
-    import remote
+    from scripts.shutdown import remote
 
     selected: list[staff.StaffRow] = []
     shared_unknown = 0
@@ -388,7 +383,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
                      for space in herdr.saved_layout(client.session)["workspaces"]
                      for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
-        for row, pane in row_panes(selected, client):
+        visible = row_panes(list(record.rows) if stop_all else selected, client)
+        for row, pane in visible:
+            if row not in selected:
+                continue
             try:
                 workspace, index, tab = client.pane_tab(pane)
                 positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
@@ -396,6 +394,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _anomaly(row, error)
         for row in selected:
             print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
+        for row in {row.id: row for row, _pane in visible if row not in selected}.values():
+            print(f"{row.name}: left alone; no proved local restart target")
         return 0
     errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []

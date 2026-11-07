@@ -101,7 +101,7 @@
       "Bash(date)",
       "Bash(true)",
       "Bash(git ls-files)",
-      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [
@@ -475,7 +475,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 283800,
+  "autoCompactWindow": 258000,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"

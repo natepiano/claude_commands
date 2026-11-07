@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Measure one glyph in a screenshot: its cap height and its contrast.
 
 Box one capital letter or digit, tight, with a little background around it and

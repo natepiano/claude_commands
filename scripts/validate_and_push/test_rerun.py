@@ -1,11 +1,8 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
-from pathlib import Path
 import shutil
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 

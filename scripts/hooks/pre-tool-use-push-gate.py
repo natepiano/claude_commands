@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Allow a built-in push only with the recent failed send's reviewed text."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -15,16 +19,15 @@ from enum import Enum
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 
+from scripts.hooks._push_fallback import fallback_matches, marker_path, object_record, text
+
 if TYPE_CHECKING:
-    from ._push_fallback import fallback_matches, marker_path, object_record, text
-    from ..notify.review import ReleaseOutcome, posting_wait_seconds
-    from ..notify import push_texts
+    from scripts.notify.review import ReleaseOutcome, posting_wait_seconds
+    from scripts.notify import push_texts
 else:
-    from _push_fallback import fallback_matches, marker_path, object_record, text
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     try:
-        from review import ReleaseOutcome, posting_wait_seconds
-        import push_texts
+        from scripts.notify.review import ReleaseOutcome, posting_wait_seconds
+        from scripts.notify import push_texts
     except Exception as error:
         print(f"push gate: {type(error).__name__}: {error}", file=sys.stderr)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -101,10 +104,7 @@ def release_hold(source: str, identity: str, machine: str, timeout: float, *,
                            capture_output=True, text=True, check=True, timeout=timeout)
         lines = result.stdout.strip().splitlines()
         return ReleaseOutcome(lines[-1] if lines else "")
-    notify = str(Path(__file__).resolve().parents[1] / "notify")
-    if notify not in sys.path:
-        sys.path.insert(0, notify)
-    reviewer = cast(HoldReview, cast(object, importlib.import_module("review")))
+    reviewer = cast(HoldReview, cast(object, importlib.import_module('scripts.notify.review')))
     return reviewer.release_if_matches(source, identity, timeout=timeout, clock=clock, sleep=sleep)
 
 

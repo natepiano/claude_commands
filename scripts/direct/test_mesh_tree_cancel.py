@@ -17,6 +17,7 @@ from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, V
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 
@@ -28,6 +29,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(session / "worker_transport", "mesh\n")
         native = fixture_runtime_id(identity)
         environment = {**fixture.environment, "CODEX_THREAD_ID": native,
                        "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",

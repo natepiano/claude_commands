@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Serve review snapshots only on this machine's Tailscale IPv4 address."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import ipaddress
@@ -12,13 +16,16 @@ import subprocess
 import sys
 import time
 import threading
+from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast, override
 from urllib.parse import parse_qs, unquote, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Detect file changes before the first stamp, including changes during imports.
+STARTED_NS = time.time_ns()
+
 from scripts.lib import conf
 from scripts.production import change_routing
 from scripts.review_links import change_page, change_browser
@@ -27,6 +34,31 @@ from scripts.review_links.review_link import private_name
 
 class TailscaleAddressLost(RuntimeError):
     """The server's bound address is no longer this machine's Tailscale address."""
+
+
+class CodeChanged(RuntimeError):
+    """A loaded module changed and the server must restart."""
+
+
+class ModuleStampUnavailable(Enum):
+    UNREADABLE = "unreadable"
+
+
+def loaded_module_stamps() -> dict[Path, tuple[int, int] | ModuleStampUnavailable]:
+    checkout = Path(__file__).resolve().parents[2]
+    stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = {}
+    for module in list(sys.modules.values()):
+        filename = getattr(module, "__file__", None)
+        if not isinstance(filename, str):
+            continue
+        path = Path(filename).resolve()
+        if path.is_relative_to(checkout):
+            try:
+                stat = path.stat()
+                stamps[path] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                stamps[path] = ModuleStampUnavailable.UNREADABLE
+    return stamps
 
 
 def tailscale_ip() -> str:
@@ -290,6 +322,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
+        self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
+        self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
         threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
@@ -313,6 +347,18 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 _ = sweep_snapshots(self.root, time.time())
             except OSError as error:
                 print(f"review-links sweep: {error}", file=sys.stderr)
+        if now >= self.next_code_check:
+            settings = conf.read("review_links")
+            self.next_code_check = now + settings.number("code_check_seconds")
+            stamps = loaded_module_stamps()
+            for path, stamp in stamps.items():
+                if (stamp is ModuleStampUnavailable.UNREADABLE or stamp[0] >= STARTED_NS
+                        or (path in self.module_stamps and self.module_stamps[path] != stamp)):
+                    with self.delivery_status.locked():
+                        if self.delivery_status.request_attempts:
+                            return
+                    raise CodeChanged(f"code changed: {path}")
+            self.module_stamps.update(stamps)
 
 
 def main(arguments: list[str]) -> int:
@@ -323,9 +369,13 @@ def main(arguments: list[str]) -> int:
         address = tailscale_ip()
         root = change_routing.review_root()
         root.mkdir(parents=True, exist_ok=True)
-        with ReviewLinksServer((address, cast(int, args.port)), root) as server:
-            print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
-            server.serve_forever()
+        try:
+            with ReviewLinksServer((address, cast(int, args.port)), root) as server:
+                print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+                server.serve_forever()
+        except CodeChanged as error:
+            print(f"review-links: {error}", file=sys.stderr)
+            os.execv(sys.executable, sys.orig_argv)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, TailscaleAddressLost) as error:

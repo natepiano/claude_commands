@@ -96,7 +96,7 @@ active Claude or Codex transcript. `_main_identity_from_codex` and
 `_main_identity_from_claude` each return `KnownMainIdentity |
 MainIdentityUnavailable`; `_detect_main_identity()` takes explicit `--main-*`
 flags first, then the Codex transcript (`CODEX_THREAD_ID`), then the Claude one
-(`CLAUDE_CODE_SESSION_ID`), and falls back to model `unknown`. `implement.sh` and `review.sh` provide the
+(`CLAUDE_CODE_SESSION_ID`), and falls back to model `unknown`. `assign.py` and `review.sh` provide the
 called task, family, model, and effort after resolving `config/models.conf`.
 
 Each recorder command takes a session lock around its state transition. Each
@@ -187,7 +187,7 @@ command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. implement.sh passes its `--phase` to `landed` and `abandon`. Findings get stable
+--phase`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
@@ -238,7 +238,8 @@ when a phase stops, so the shipped values set where a phase starts being reporte
 as slow, not where it is cut off.
 
 A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
-A dispatch alone adds no round. Passes without a ledger round retain overlap grouping.
+A dispatch alone adds no round. Passes without a ledger batch add no round to `repair_round`.
+`history.py rounds` still reports their overlap groups, including gate, merge and live work.
 `dispatch` records the batch before the worker launch. Its `round` is a stable audit number.
 `repair_round` uses the fix pass history and its `launch_check.fix_cause.round` ledger number. Missing pass history gives no repair rounds.
 `abandon --reason "<launch refusal>"` refunds a refused launch's reserved fix attempt.
@@ -317,7 +318,7 @@ enclose the target, one range end alone, a blank basis, or no active phase and
 no `--phase-id`. `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the
 process `TZ` is not read.
 
-`implement.sh` and `review.sh` own pass lifecycle: they set
+`assign.py` and `review.sh` own pass lifecycle: they set
 `UNIT_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
 calls, per invocation so the agent subprocess never inherits it. The recorder
 rejects an unowned call, because a hand-written pass forges one that never ran

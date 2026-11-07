@@ -14,7 +14,7 @@ SHUTDOWN = Path(__file__).resolve().parent
 RUNAWAY = """
 import time
 import unittest
-import test_support
+from scripts.shutdown import test_support
 test_support.TEST_TIME_LIMIT_SECONDS = 1
 class Runaway(test_support.ShutdownTestCase):
     def test_never_finishes(self) -> None:

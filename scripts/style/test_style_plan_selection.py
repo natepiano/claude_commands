@@ -2,34 +2,39 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.production.staff_test_support import foreign_hostname
+
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import errno
 import io
 import re
 import sqlite3
 import subprocess
-import sys
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_proposals
+from scripts.style import style_plan
+from scripts.style import style_proposals
 
-import berth_board
-import rules
-import style_ledger
-import unit_files
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import unit_files
+from scripts.shutdown import remote
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, recorded_showrunner
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
-from unit_plans import AllCrates
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.unit_plans import AllCrates
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 @final
@@ -39,7 +44,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         self.finish_judging()
         record = staff.initial_snapshot()
-        parent = record.by_doc("natedev", self.doc)
+        parent = record.by_doc(remote.local_machine(), self.doc)
         assert parent is not None
         own = next(row for row in record.find(kind="unit", parent=parent.id) if row.name == "names")
         other = fixture_member("showrunner", name="other-style")

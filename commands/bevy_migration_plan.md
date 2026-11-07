@@ -63,7 +63,7 @@ PRODUCTION_DOC = [that showrunner row's `doc.path`]
 PLAYBOOK = ${CODEBASE}/docs/bevy_migration/playbook.md (earlier upgrades' lessons; may not exist)
 ```
 
-**Production and watch:** A unit belongs to a production when its staff row has a showrunner parent. The `/showrunner:bevy_upgrade` watch is open for it when `python3 ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${SHOWRUNNER_NAME}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
+**Production and watch:** A unit belongs to a production when its staff row has a showrunner parent. The `/showrunner:bevy_upgrade` watch is open for it when `~/.claude/scripts/lib/py ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${SHOWRUNNER_NAME}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
 
 **Path Expansion Note:**
 - When constructing bash commands, ensure tildes are expanded to actual paths

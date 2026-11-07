@@ -15,7 +15,7 @@ Use this command for a unit's question or your own question. Do not file questio
 6. Add the question to your next `open_for_user` state.
 
 ```sh
-python3 ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> [--unit <unit staff id>] --text "<title>" --question "<full question>" [--urgency blocks]
+~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> [--unit <unit staff id>] --text "<title>" --question "<full question>" [--urgency blocks]
 ```
 
 Omit `--unit` for your own question. A current unit label is also accepted. The stored `asked_by` always holds the fixed staff id.

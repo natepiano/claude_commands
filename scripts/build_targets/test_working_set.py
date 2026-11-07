@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import working_set
+from scripts.build_targets import working_set
 from scripts.production import session_staff, staff
 from scripts.shutdown import remote
 

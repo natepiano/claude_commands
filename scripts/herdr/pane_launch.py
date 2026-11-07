@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
 
 from scripts.message import sessions
-from place import HerdrPlace
+from scripts.herdr.place import HerdrPlace
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib import atomic_file, legacy_identity
 from scripts.production import staff

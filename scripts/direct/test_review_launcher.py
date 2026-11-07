@@ -407,7 +407,7 @@ class FixtureReadinessTests(unittest.TestCase):
                         return False  # Exit races the wait, after registration.
                     return child.poll() is not None
 
-                def polling_waiter(_a: Path, _b: Path) -> IntervalReleasePolling:
+                def polling_waiter(_a: Path, _b: Path, _mask: int) -> IntervalReleasePolling:
                     return IntervalReleasePolling()
 
                 with ExitStack() as patches:

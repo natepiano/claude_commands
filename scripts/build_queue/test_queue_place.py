@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import TYPE_CHECKING, Unpack, cast
+from typing import Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
@@ -30,10 +30,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue import admission_records as records, step_estimator
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from ..buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config

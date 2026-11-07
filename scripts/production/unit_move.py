@@ -4,6 +4,10 @@ Folder moves stop, move, publish the location, and resume the unit.
 Rename callers control their own step order and progress records.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import argparse
@@ -21,17 +25,13 @@ from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
-import progress_history  # noqa: E402
-import tidy_wrapped  # noqa: E402
-import unit_lookup  # noqa: E402
-import herdr  # noqa: E402
-import pane_record  # noqa: E402
+from scripts.direct import progress_history  # noqa: E402
+from scripts.production import tidy_wrapped  # noqa: E402
+from scripts.production import unit_lookup  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from rename_state import RenameRefused, read_json, write_json  # noqa: E402
+from scripts.production.rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -546,7 +546,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         live = observe().copy()
         for member in members:
             if member.id not in live:
-                print(f"info: {member.name}: stopped; shutdown.py restart --only {member.id}")
+                print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         if move_complete:
             staff.folder_move_path(unit).unlink(missing_ok=True)
             return True
@@ -559,7 +559,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if member.id not in reported:
                 reason = str(error).splitlines()
                 detail = reason[0] if reason else "restart is incomplete"
-                print(f"unit_move: anomaly: {member.name}: {detail}; shutdown.py restart --only {member.id}", file=sys.stderr)
+                print(f"unit_move: anomaly: {member.name}: {detail}; agents restart --only {member.id}", file=sys.stderr)
                 reported.add(member.id)
 
         panes = client.panes() if live else []

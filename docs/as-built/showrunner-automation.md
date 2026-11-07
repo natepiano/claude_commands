@@ -124,16 +124,100 @@ Each local Promote checkout must exist before the command pushes.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
   6. *test*: each package owning a changed file (nearest `Cargo.toml`, named by its directory) through `verify.sh test`, each changed `crates/<pkg>/examples/<name>` through `verify.sh example`, then each Merge tests command, into `<scratch>/merge_<short>_test.log` with `<name>_EXIT=<rc>` lines. A command that cannot start is exit 127. `parse_merge_tests(lines, checkout)` reads the commands at input: each backticked entry before the first unbackticked `(` is split with `shlex`, each word passes `expanduser` then `expandvars` (the commands run with no shell), and an entry is refused by name when a `$VAR` is still left, or when its first word is neither on PATH nor an executable file in the checkout (a package name or a directory, as cargo-liner wrote, 2026-10-17). A shrink runs none.
-  7. *red*: each red command reruns once alone. When every test in its nextest `FAIL` rows is listed in Known flaky tests, only those tests rerun (`verify.sh --filter <name>` per test, else `-E test(=<name>)`). Green alone continues with a LOG note when that held, or when the command is a package listed in Known flakes; otherwise `reset --keep HEAD~1` after confirming `HEAD` is this merge and is not on origin.
-  8. *push and promote*. `GitPush`: merge `origin/main` with `--no-ff` when it has diverged, push the merge branch (on failure, abort the merge and reset to the old origin tip if origin did not move). `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
+  7. *red*: run each failed command once alone.
+     If every nextest `FAIL` row names a Known flaky test, run only those tests again.
+     Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
+     A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
+     Otherwise, confirm that `HEAD` is this merge and is not on origin, then use `reset --keep HEAD~1`.
+  8. *push and promote*. `GitPush` merges `origin/main` with `--no-ff` when it has diverged, then pushes the merge branch. A failed merge always runs `git merge --abort`, including during a repeated promotion. Conflicts produce `push: held` with the conflicting paths, separated by commas. A repeated promotion keeps HEAD and the work tree as they were before the push step. When rollback is allowed and origin did not move, the push step also resets the checkpoint merge. The message asks the unit to merge `origin/main` into the merge branch, resolve the conflict, and run the push again. A merge failure without conflicting paths stays failed. Other push failures use the same rollback rule. `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
   9. *record*: for a code checkpoint, `review_regime.py add --unit --plan <the unit's Plan cell> --phase --regime --started --merged <merge commit time> --holds --merge-defects` plus the five review numbers and any `--excluded`. The ledger names a row by unit, plan and phase (2026-10-12), because a unit that runs a second plan starts again at phase 1; then the LOG line `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <tests> green; pushed[; promoted]`. A LOG that already has this line skips the step.
 - **Merge report.** Step 8 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
-- **Change review** (`scripts/production/change_review.py`). A good line is `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`: exactly three non-empty parts split on ` | `, written for a person with no context (user, 2026-10-19), or `Change-Review: none — <why>`; `check` and the commit hook (`scripts/hooks/pre-tool-use-change-review-gate.py`, through `change_review.problem`) refuse any other line and print the three-part form. A merge commit may carry only `Change-Review: none — <why>`. The commit hook and the merge gates refuse a visible or Covers line through `change_review.merge_review_problem`. Before the merge, a unit commit `checkpoint(...)` that changes more than Markdown and carries no good `Change-Review:` line, and that no later plain (non-merge) commit names in a `Change-Review-Covers: <hash>` line, is held (`change review: held`). After the push, each visible line becomes a row at the end of the `## To review` table in the list of the production's top-level showrunner, `~/rust/hanadocs/change-review/change-review - <showrunner>.md` (a child production's rows go to its root's list; `showrunners.py` root, then that showrunner's session name). The doc's required `- **Change review:**` line opts the production in and is the fallback path while the root showrunner is not running; a line naming another path is warned about. A write refuses, with nothing written, a change that a row under To review already holds from the same merge; a short hash and a longer hash of one merge match (`_held`; on 2026-10-22 rows with 8-character hashes repeated C74–C79, written with 7, as C94–C99). Each row has the next C number, the push date and merged hash, the How to check cell `<how to try it> You see: <what you see>` (a period goes after the first part when it ends without one), and `not yet` only when the table has Hana's `On the Mac build` column. Each new row gets a Production cell with the showrunner staff name. The writer adds this column when the table has none. `/next` shows a showrunner only the rows of its production and those below it, and a row with an empty cell belongs to the list's root (user 2026-10-25). `publication_changes` supplies both the Production and Producer cells for each visible change. It maps the checkpoint branch to a unit staff row. The staff row supplies the production document and the staff id. A checkpoint without a matching Units row uses the merging production and an empty Producer cell. `merge_gate` reads the staff record before it merges. `merge_checkpoint` reads it before it pushes and undoes its unpushed local merge when the read fails. Each run reuses that one read for the rows. A style production's changes are its parent's (`credited`: a doc with `Kind: style` takes its `Parent production`), because a style hand-off lands its work on the parent's merge branch; so the style showrunner's `/next` never shows them (user, 2026-10-27). Every cell goes through `row_production`, in merge rows, `add` and `backfill-production` alike. A child with no Change review line of its own reads its root's list for `/next change`. `backfill-production [--list L] [--write]` fills the empty cells of older rows under To review, in one list or in every list, within the productions of the list's root (`list_tree`): from the row's merge hash (Merged cell, else On the Mac build), the checkpoint that names the row's change, else the one production of every checkpoint the merge brought in, else the production whose merge branch has the merge on its first-parent line. It prints each cell and each row it cannot trace, with why, and writes only with --write. `drift` counts a merge as having rows when a row carries its hash or any row, under To review or Reviewed, carries one of its changes (a reviewed row keeps no Merged cell). It leaves out the checkpoints of units outside the list's tree (`foreign_units`), which a merge of main brings in. Then `drift` names each merge since 2026-10-15 whose visible lines have no row. A doc without the line prints `change review: ok — the production doc has no Change review line; no rows written`. A missing list is created from the skeleton on its first row: frontmatter in key order (`date_created` and `date_modified` as `"[[YYYY-MM-DD]]"`, `productions` as a block list of quoted `~` doc paths, `showrunner` bare), the title `# <showrunner> showrunner: changes to review`, one line, `## To review` `| # | Change | Merged | How to check |`, `## Reviewed` `| # | Change | Verdict | Date |`. Every write sets `date_modified` and adds the writing production's doc to `productions` unless an entry already names the same file, in `~` or absolute form; a list without frontmatter gains it. Writes take `--production` (or the calling showrunner's timer), and the merge gate's `--change-review` needs `--production` too. Every write (merge rows, `add`, `edit`, `verdict`) holds an `flock` on the list's directory, so concurrent writers keep every row and no lock file lands in the vault. After each write, still under the lock, a list in a git work tree is committed alone and never pushed: `git add --intent-to-add` when untracked, then `git commit --only -m "change-review: <showrunner> <add C4 | row C5 from <hash> | rows C5–C7 from <hash> | edit C4 | verdict C2>" -- <list>`, which leaves every other staged change staged; a refused commit (a held `index.lock`) prints one `written but not committed` line, the write still succeeds, and the next write commits the file's full content. The vault's Templater must exclude the change-review folder: its creation trigger rewrites a new list within half a second and can drop a row (the vault owner sets Excluded folders → `change-review`). `/change_review` runs `list-path`, `showrunner`, `add` (a change no checkpoint line carries; `--change`, `--check` and `--see` are all required), `edit` (rewrites the Change and How to check cells of one row under To review, keeping its id, Merged cell, other cells and place; an id not under To review is refused), `show` (only when the user asks) and `verdict` (moves a row to the top of Reviewed; `works`/`fine` lands it, anything else returns it to its unit). `merge_gate.py` does the same for a `~/.claude` merge.
-- **Interrupted checkpoint recovery.** A unit rerun recovers Change-Review commits from the original merge's parents, even after that merge was pushed or later checkpoints landed. It restores missing rows before promotion. Completion receipts under Git's `checkpoint-completed/<merge>/change-review` prevent re-adding completed reviews; if the process stopped after writing the list but before its receipt, matching rows from that merge are recognized without another write. Failed list writes leave the step open for the same command to retry.
+- **Change review** (`scripts/production/change_review.py`).
+  A visible checkpoint line has three fields: `<what changed> | <how to try> | <what you see>`.
+  An optional fourth field, `after <step>`, names a required rebuild, restart or deploy.
+  An invisible change uses `Change-Review: none — <why>`.
+  `problem` reads both visible forms through the shared parser.
+  A merge message can carry only invisible lines.
+  The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
+  A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
+  `Change-Review-Covers: <hash>` names each covered commit.
+  The merge gates retain their staff reads before publication.
+
+  All merge callers use `list_ready` after every promotion step succeeds, including the Mac pull.
+  A failed step adds no rows.
+  Git publication receipts and style notices retain their existing behavior, including on failed promotions.
+  There is no `change-review` receipt.
+  `list_ready` fetches `origin main` in the source checkout before it checks ancestry.
+  A failed fetch prints one error line, adds nothing, and does not fail the merge.
+  It scans first-parent merges on the production's merge branch from 2026-11-06.
+  Older merges add no rows.
+  It passes each merge's commits through `publication_changes` and excludes foreign units through `foreign_units`.
+  Child handoffs retain their production routing.
+  A row requires its merge to be an ancestor of `origin/main`.
+  The row records that merge's short hash.
+
+  A line with `after <step>` waits outside the list.
+  The scan prints the merge, the step and the exact `live` command only for uncovered lines.
+  The session that completes the step runs `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
+  `live` requires both arguments and releases only the named step through `list_ready`.
+  A step with no matching line gives an error.
+  `add --merged` and `live` share the ancestor check and refusal text.
+  `append` and `drift` are removed.
+  Git trailers hold waiting changes; the phase adds no store or waiting section.
+
+  A row in either section covers the same change when its merge contains the checkpoint.
+  A row without a known merge also covers the change.
+  A later fix can add a new row with the same words.
+  The directory lock covers the missing-row check and the row write.
+  A merge with one existing line adds only its missing lines.
+  A repeated call adds nothing.
+  Concurrent calls retain each row once.
+  A missing list starts from the existing skeleton.
+  The required **Change review** field selects the production's list.
+  Each top-level showrunner owns one list; child rows reach the root's list.
+  A child without the field uses the merging production's list and keeps its own production credit.
+  A different path in the field prints a warning.
+
+  `publication_changes` joins each checkpoint branch to its unit staff row.
+  The row supplies the production document and the fixed Producer id.
+  An unresolved unit uses the merging production and an empty Producer cell.
+  A style production credits its parent.
+  Each open Production cell holds the producer's fixed staff id, or the showrunner's id when the producer is unknown.
+  Readers follow current staff names and parents.
+  Reviewed rows retain the production name recorded at the verdict.
+  `/next` shows the selected production and its descendants.
+
+  Each row receives the next C number, the write date, the merge hash and its How to check cell.
+  The How to check cell contains `<how to try it> You see: <what you see>`.
+  The writer inserts a period when the first part lacks closing punctuation.
+  The On the Mac build cell starts as `not yet` when that column exists.
+  Writes update `date_modified` and the frontmatter's `productions` list.
+  The list skeleton includes date fields, the showrunner, a title, To review and Reviewed tables.
+  A directory lock protects every write without a separate lock file.
+  A write commits only the list when the list is in a Git worktree.
+  It never pushes the commit or changes another staged file.
+  A failed commit prints `written but not committed`; the next write commits the complete list.
+  The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
+
+  `add` records ready changes that have no checkpoint line.
+  `edit` retains the row id, merge, other cells and position.
+  `show` displays the next row only when the user asks.
+  `verdict` moves a row to Reviewed; `works` or `fine` accepts it.
+  Other verdicts return the change to its unit.
+  `list-path` and `showrunner` resolve the list and its root owner.
+  `backfill-production [--list L] [--write]` retains its older owner-cell repair.
+  It traces an empty cell through the merge's checkpoint, production ownership, then first-parent history.
+  It prints unresolved rows and writes only with `--write`.
+- **Interrupted checkpoint recovery.** A successful retry scans the same Git history after promotion completes.
+  It adds each missing ready line once, including when an earlier call stopped after the list write.
+  A failed main push or Mac pull adds no rows.
+  The next successful call adds the rows from earlier promoted merges.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
+- **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
+  It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
-  The gate runs test modules under a memory cap.
+  The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
@@ -273,9 +357,19 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
-    The command prints unplaced processes below the table on stdout.
-    The process scanner also supplies processes outside the pane lookup.
-    `CodexProcessThreads.thread` reads native identity, terminal metadata and a unique loaded daemon thread name.
+    The command prints read failures below the table on stdout when they make the table wrong or incomplete.
+    Staff name conflicts also produce lines. Each process has at most one line.
+    The command does not scan other processes.
+    A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
+    A process without an identity reports an unreadable thread when its pane holds staff.
+    One staff candidate retains its pane placement with unknown status.
+    `CodexProcessThreads.thread` reads the open rollout first.
+    With no open rollout, it reads the thread environment and resume arguments.
+    It then reads the native pane session and the terminal title with daemon names, only when this process is the pane's one foreground process.
+    A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
+    Other rollout read failures stop identity recovery.
+    The worker scanner uses this reader before it joins the current thread to its staff row.
+    A missing pane launch record does not make a resolved staff worker unknown.
     `send.morty_stamp` matches Morty's thread against `MORTY_NATIVE_ID` from `config/send.conf`.
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
@@ -490,7 +584,7 @@ Copied pane marks do not select rows.
   An unchanged commit and source reuse the cached expected paths.
   The reader keeps the last answer visible while the background refresh runs.
   The answer changes only when a refresh writes a new result.
-  Read the machines with `python3 /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
+  Read the machines with `/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
   This command prints one machine per line, or nothing when no machine needs a rebuild.
   Both results return exit 0.
   The command and the status line use `rebuild_row.read` to read the same file.

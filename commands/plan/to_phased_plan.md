@@ -156,13 +156,13 @@ block — nothing else. The prompt must include:
   3. **Layout** — a short map of only the dirs/files the phases touch.
   4. **Key files** — `path — role` for each file a phase reads or modifies, with
      line refs where the plan already cites them.
-  5. **Build / Test / Lint** — for Rust, always these `verify.sh` lines with
-     the package name filled in (never raw cargo commands — Cargo's default
-     target selection compiles a package's examples even under `-p <pkg>`,
-     and the worker must have no flag choices to make):
-     Build = `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
-     Test = `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
-     Lint = `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`.
+  5. **Build / Test / Lint** — use these forms for Rust.
+     Fill in the package name for a package check. Omit it for a workspace check.
+     Write exact commands for workers. Never use raw Cargo commands.
+     Cargo's default target selection compiles a package's examples even with `-p <pkg>`.
+     Build = `bash ~/.claude/scripts/direct/verify.sh check [<pkg>]`;
+     Test = `bash ~/.claude/scripts/direct/verify.sh test [<pkg>]`;
+     Lint = `bash ~/.claude/scripts/direct/verify.sh lint [<pkg>]`.
      <PhaseChecks/> defines the lint scope and the phase's style review under
      <ReviewPromptContract/>. For
      non-Rust projects, record the exact commands the project uses (read
@@ -278,11 +278,11 @@ not codebase searching.
      `impl` everything. Format and rule 7 are the format doc's.
    - **Constraints from prior phases** — facts later phases need from earlier ones
      (what got built, decisions that bind). Empty for Phase 1.
-   - **Acceptance gate** — the build/test/behavior proving the phase done.
-     Gate commands are the Delegation Context `verify.sh` lines (plus
-     `verify.sh example <pkg> <name>` only in phases whose Files touch that
-     example, and `verify.sh test <pkg> <int_test>` only in phases owning that
-     integration test) — never workspace-wide or example-building commands.
+   - **Acceptance gate** — name the build, test, and behavior that prove the phase complete.
+     Use the Delegation Context's `verify.sh` lines.
+     Add `verify.sh example [<pkg>] --name <name>` only when the phase's Files include that example.
+     Add `verify.sh test [<pkg>] --test <int_test>` only when the phase owns that integration test.
+     Name the package in these phase commands. Do not add workspace or example build commands.
    - **UX rules** — only for a phase that changes what users see, in the app
      or in any example, in a project
      with a UX guide (Hana: `~/rust/hanadocs/ux`). Add a `**UX checks:**` line
@@ -367,7 +367,7 @@ remaining `todo` phase. Do not validate archived `done` Work Orders; their
 byte-preserved historical format is outside the live Work Order contract:
 
 ```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+~/.claude/scripts/lib/py -m scripts.berth.work_order \
   --repository-root "${PLAN_REPOSITORY_ROOT}" validate --document "${DEST}" \
   --phase <todo-phase>
 ```

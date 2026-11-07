@@ -5,20 +5,30 @@ from contextlib import redirect_stderr
 from dataclasses import replace
 import os
 from pathlib import Path
-import re
 from io import StringIO
 import json
 from unittest import mock
 
 from scripts.lib import unit_runs
+from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
-import herdr
-from pane_launch import PaneLaunch
+from scripts.herdr import herdr
+from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
+        path = self.root / "missing/run/mesh_roster.json"
+        self.assertEqual(labels.read_worker_roster(path), {})
+        self.assertFalse(path.parent.parent.exists())
+        with worker_lifecycle.locked_state(path) as handle:
+            handle.publish('{}')
+        self.assertEqual(path.read_text(), '{}')
+        self.assertEqual(labels.read_worker_roster(path), {})
+
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
         from scripts.shutdown import pane_record
 
@@ -67,28 +77,113 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(self.staff_state(), before)
 
     def test_unknown_process_identity_preserves_healthy_unit_status(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
 
         broken = unit_membership("show", "broken")
         healthy = unit_membership("show", "healthy")
         place = labels.Place("agents", "w1:p1")
         launch = PaneLaunch(pane_id=place.pane, session_id=broken.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
-        for marks in ({}, {"CLAUDE_CODE_SESSION_ID": "unregistered"}):
-            with self.subTest(marks=marks):
-                processes = [herdr.HerdrProcess(910001, place, marks, "claude", ""),
-                             herdr.HerdrProcess(910002, labels.Place("agents", "w2:p1"),
-                                               {"CLAUDE_CODE_SESSION_ID": healthy.current_session}, "zsh", "")]
-                errors = StringIO()
-                with mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]), redirect_stderr(errors):
-                    observed = tuple(unit_lookup._herdr_labeled({}, unit_lookup.UnreadAt({}, unit_lookup.RecordsRead()), processes))  # pyright: ignore[reportPrivateUsage]
-                    grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
-                                                            sources=labels.MemberSources((launch,)))
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn("anomaly:", errors.getvalue())
-                states = grouped.status_units("show")
-                self.assertIsInstance(states["broken"].claude, labels.ClaudeUnknown)
-                self.assertIsInstance(states["healthy"].claude, labels.ClaudeNotRunning)
+        processes = [herdr.HerdrProcess(910001, place, {}, "claude", ""),
+                     herdr.HerdrProcess(910002, labels.Place("agents", "w2:p1"),
+                                       {"CLAUDE_CODE_SESSION_ID": healthy.current_session}, "zsh", "")]
+        errors = StringIO()
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
+              mock.patch.object(process_table, "snapshot", return_value={
+                  910001: process_table.Process(910001, 1, "claude", "claude")}),
+              mock.patch.object(herdr, "herdr_processes", return_value=processes), redirect_stderr(errors)):
+            observed = unit_lookup.observed_session_labels(record=staff.snapshot(), running=[])
+            grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
+                                                    sources=labels.MemberSources((launch,)))
+        self.assertEqual(errors.getvalue(),
+                         "anomaly: pid 910001 (claude) in herdr:agents:w1:p1: "
+                         + "cannot read its thread; staff status may be incomplete\n")
+        states = grouped.status_units("show")
+        self.assertIsInstance(states["broken"].claude, labels.ClaudeUnknown)
+        self.assertIsInstance(states["healthy"].claude, labels.ClaudeNotRunning)
+
+    def test_denied_thread_read_reports_only_when_the_pane_holds_staff(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w2C")
+        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+                            name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("thread read denied"), place,
+                                        labels.ObservedProcess(910001, "codex"))
+        for launches in ((launch,), ()):
+            with (self.subTest(staff_pane=bool(launches)),
+                  mock.patch.object(herdr, "shared_session", return_value=place.session),
+                  mock.patch.object(herdr, "process_environment", return_value={}),
+                  mock.patch.object(process_table, "snapshot", return_value={
+                      910001: process_table.Process(910001, 1, "codex", "codex")}),
+                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=PermissionError("rollout denied")),
+                  labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
+                grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
+                                                        sources=labels.MemberSources(launches))
+            if launches:
+                self.assertEqual(lines, [f"anomaly: {labels.holder_text(unknown)}: "
+                                         + "cannot read its thread; staff status may be incomplete"])
+                self.assertIsInstance(grouped.status_units("show")[row.name].claude, labels.ClaudeUnknown)
+            else:
+                self.assertEqual(lines, [])
+                self.assertEqual(grouped.status_units("show"), {})
+
+    def test_exited_process_in_a_staff_pane_is_quiet_and_not_placed(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w2C")
+        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+                            name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("thread read denied"), place,
+                                        labels.ObservedProcess(910001, "codex"))
+        with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(process_table, "snapshot", return_value={}),
+              redirect_stderr(StringIO()) as errors, labels.anomalies() as lines):
+            grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
+                                                    sources=labels.MemberSources((launch,)))
+        self.assertEqual(grouped.status_units("show"), {})
+        self.assertEqual(lines, [])
+        self.assertEqual(errors.getvalue(), "")
+        unobserved = replace(unknown, process=labels.ProcessUnobserved())
+        with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(process_table, "snapshot") as snapshot, labels.anomalies() as lines):
+            grouped = labels.group_labeled_sessions([unobserved], record=staff.snapshot(),
+                                                    sources=labels.MemberSources((launch,)))
+        snapshot.assert_not_called()
+        self.assertIsInstance(grouped.status_units("show")[row.name].claude, labels.ClaudeUnknown)
+        self.assertEqual(len(lines), 1)
+
+    def test_unregistered_thread_in_a_unit_pane_is_quiet_and_not_placed(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w2C")
+        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+                            name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
+        observed = [labels.LabeledSession("", labels.ClaudeUnknown("no registered session"), place,
+                    labels.ObservedProcess(910001, "codex"), labels.LiveSession(fixture_runtime_id("fake-thread"))),
+                    labels.LabeledSession("", labels.ClaudeNotRunning(), place,
+                    labels.ObservedProcess(910002, "zsh"), labels.LiveSession(row.current_session))]
+        errors = StringIO()
+        with (mock.patch.object(herdr, "shared_session", return_value=place.session), redirect_stderr(errors)):
+            grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
+                                                    sources=labels.MemberSources((launch,)))
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(grouped.status_units("show"), {row.name: replace(observed[1], unit=row.name)})
+
+    def test_unreadable_session_record_keeps_placement_and_reports_one_failure(self) -> None:
+        from scripts.production import unit_lookup
+        from scripts.message import sessions
+
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w1:p1")
+        processes = [herdr.HerdrProcess(910001, place, {"CLAUDE_CODE_SESSION_ID": row.current_session}, "claude", "")]
+        errors = StringIO()
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=processes),
+              mock.patch("scripts.production.unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
+              redirect_stderr(errors), labels.anomalies() as lines):
+            observed = unit_lookup.observed_session_labels(record=staff.snapshot())
+            grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(), sources=labels.MemberSources(()))
+        self.assertIsInstance(grouped.status_units("show")[row.name].claude, labels.ClaudeUnknown)
+        self.assertEqual(lines, ["anomaly: pid 910001 in herdr:agents:w1:p1: the session record of pid 910001 could not be read"])
+        self.assertEqual(errors.getvalue(), "")
 
     def test_agent_children_select_the_agent_without_an_anomaly(self) -> None:
         row = unit_membership("show", "unit")
@@ -107,38 +202,6 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})
 
-    def test_configured_morty_thread_is_placed_but_another_codex_thread_is_an_anomaly(self) -> None:
-        self.write_json(self.staff_file, {"schema": 2, "rows": []})
-        morty = fixture_runtime_id("morty-thread")
-        other = fixture_runtime_id("other-codex-thread")
-        config = self.root / "config"
-        config.mkdir()
-        source = Path(__file__).resolve().parents[2] / "config/send.conf"
-        text = re.sub(r"(?m)^MORTY_NATIVE_ID=.*$", f"MORTY_NATIVE_ID=codex:{morty}", source.read_text())
-        write_text_atomic(config / "send.conf", text)
-        observed = [labels.LabeledSession("", labels.ClaudeUnknown("no registered Claude"),
-                    labels.Place("agents", f"w{index}:p1"), labels.ObservedProcess(910100 + index, "codex"),
-                    labels.LiveSession(identity)) for index, identity in enumerate((morty, other))]
-        errors = StringIO()
-        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(errors),
-              labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
-            grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
-                                                    sources=labels.MemberSources(()))
-        self.assertNotIn(morty, "\n".join(lines))
-        self.assertIn(other, "\n".join(lines))
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(grouped.units, {})
-        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(errors),
-              mock.patch.object(staff_sources.CodexProcessThreads, "thread") as recover):
-            ordinary = labels.group_labeled_sessions(observed, record=staff.snapshot(),
-                                                      sources=labels.MemberSources(()))
-        self.assertIn(morty, errors.getvalue())
-        self.assertIn(other, errors.getvalue())
-        self.assertEqual(len(errors.getvalue().splitlines()), 2)
-        self.assertEqual(ordinary.units, {})
-        recover.assert_not_called()
-
     def test_morty_without_environment_identity_never_uses_the_retained_unit_launch(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
@@ -155,9 +218,12 @@ class StatusDiscoveryTests(StaffTestCase):
             return identity == morty
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(herdr, "codex_rollout_thread", side_effect=herdr.NoOpenCodexRollout("no rollout")),
               mock.patch.object(herdr, "process_environment", return_value={}),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
-              mock.patch.object(herdr.Herdr, "result", return_value={"pane": {"terminal_title_stripped": "morty | idle"}}),
+              mock.patch.object(herdr.Herdr, "result", return_value={
+                  "pane": {"terminal_title_stripped": "morty | idle"},
+                  "process_info": {"foreground_processes": [{"pid": 198033, "argv": ["codex"]}]}}),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
               mock.patch.object(labels, "morty_thread", side_effect=configured_morty),
               labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
@@ -166,24 +232,18 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(grouped.status_units("show"), {})
         self.assertEqual(lines, [])
 
-    def test_observations_from_both_readers_share_one_process_line(self) -> None:
-        from scripts.message import process_table
-
-        self.write_json(self.staff_file, {"schema": 2, "rows": []})
-        other = fixture_runtime_id("two-readers-codex")
-        unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), labels.Place("agents", "w2C"),
-                                        labels.ObservedProcess(294399, "codex"), labels.LiveSession(other))
-        table = {294399: process_table.Process(294399, 1, "codex", "codex")}
-        with (mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": other}),
-              labels.anomalies() as lines):
-            _ = labels.group_labeled_sessions([unknown], record=staff.snapshot(), sources=labels.MemberSources(()))
-            staff_sources.unplaced_processes(staff.snapshot(), labels.MemberSources(()))
+    def test_report_keeps_one_failure_line_per_process(self) -> None:
+        errors = StringIO()
+        with redirect_stderr(errors), labels.anomalies() as lines:
+            labels.report_anomaly("pid 294399: session record is unreadable", pid=294399)
+            labels.report_anomaly("pid 294399: owner record is unreadable", pid=294399)
             labels.report_anomaly("registry is unreadable")
-        self.assertEqual(len(lines), 2, lines)
-        self.assertIn("in herdr:agents:w2C", lines[0])
-        self.assertIn(f"pid 294399 (codex): {other}: no current staff row", lines[0])
-        self.assertEqual(lines[1], "anomaly: registry is unreadable")
+        self.assertEqual(lines, ["anomaly: pid 294399: session record is unreadable",
+                                 "anomaly: registry is unreadable"])
+        self.assertEqual(errors.getvalue(), "")
+        with redirect_stderr(errors):
+            labels.report_anomaly("session record is unreadable", pid=294399)
+        self.assertEqual(errors.getvalue(), "anomaly: session record is unreadable\n")
 
     def test_two_orphan_processes_have_separate_lines(self) -> None:
         row = replace(unit_membership("show", "unit"), parent=staff.StaffRoot())

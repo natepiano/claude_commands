@@ -6,6 +6,10 @@ report day's midnight without inspecting another machine's private sources.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -19,8 +23,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-import record
-import store
+from scripts.buildlog import record
+from scripts.buildlog import store
 
 SNAPSHOT_NAME = "recorder-health.json"
 SNAPSHOT_MAX_AGE_SECONDS = 2 * 60 * 60

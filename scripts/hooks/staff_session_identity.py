@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Publish a proved Claude runtime handoff before ordinary launch recording."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 import json
 import os
-from pathlib import Path
 import sys
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.message import sessions
 from scripts.shutdown import pane_record

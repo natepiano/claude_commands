@@ -1,6 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import contextlib
 import io
@@ -11,38 +13,31 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import change_review
-import footer_counts
-import next_item
+from scripts.production import change_review
+from scripts.production import footer_counts
+from scripts.production import next_item
 from scripts.production.production_doc import Production
-import proposals_folder
+from scripts.production import proposals_folder
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production import staff, unit_lookup
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
 from scripts.production.test_change_review import producer_rows
-from change_review import Visible
-from next_item import NextError, Queue
+from scripts.production.change_review import Visible
+from scripts.production.next_item import NextError, Queue
 
-# Importable once next_item has put scripts/lib and scripts/nightly_review on the path.
-import urgency
-from urgency import Entry, Urgency
+from scripts.lib import urgency
+from scripts.lib.urgency import Entry, Urgency
 
-if TYPE_CHECKING:
-    from ..nightly_review import candidates
-else:
-    import candidates
+from scripts.nightly_review import candidates
 
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 # The production an item in the tree test belongs to: each item's text holds `<name>-item`.
@@ -85,7 +80,7 @@ class NextItemTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
                 "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", PRODUCTION))
+        _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -204,7 +199,7 @@ class NextItemTests(unittest.TestCase):
         doc.parent.mkdir(parents=True)
         owner = staff.snapshot().by_path("demo")
         assert owner is not None
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         _ = doc.write_text(f"# Demo\n\n## Production Context\n\n- **Efficiency ledger:** {self.root / 'ledger.md'}\n")
         line = LEDGER.splitlines()[0]
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name), (0, f"efficiency\n{line}\n", ""))
@@ -213,7 +208,7 @@ class NextItemTests(unittest.TestCase):
                          f"efficiency\n{LEDGER.splitlines()[1]}\n")
         # A production whose doc names no Efficiency ledger has no efficiency items.
         bare = doc.with_name("bare-production.md")
-        _ = fixture_member("showrunner", name="bare", doc=staff.LiveDoc("natedev", bare))
+        _ = fixture_member("showrunner", name="bare", doc=staff.LiveDoc(remote.local_machine(), bare))
         _ = bare.write_text("# Bare\n\n## Production Context\n\n- **Repository:** /nowhere\n")
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(bare, staff.snapshot()).name)[1],
                          "no efficiency is waiting for you\n")
@@ -238,7 +233,7 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{name}.md").write_text(f"- 2026-10-12 rust/{name}: {name}-item gain — proposed\n")
             _ = doc.write_text(f"# {name}\n\n- **Efficiency ledger:** {self.root / f'{name}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
-            owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
             _ = (issues_folder / f"{name}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {owner.id}\ndate_created: 2026-10-01\n---\n")
         path = self.root / "change-review" / "change-review - natedev.md"
@@ -258,7 +253,7 @@ class NextItemTests(unittest.TestCase):
             existing = staff.snapshot().by_path(name)
             if existing is not None:
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
-            owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
             _ = (outstanding / f"{owner.id}.json").write_text(
                 f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
@@ -317,8 +312,8 @@ class NextItemTests(unittest.TestCase):
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
-        root = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
-        _ = fixture_member("showrunner", name="kid", parent=root.id, doc=staff.LiveDoc("natedev", kid))
+        root = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
+        _ = fixture_member("showrunner", name="kid", parent=root.id, doc=staff.LiveDoc(remote.local_machine(), kid))
         _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
                                       kid, record=staff.snapshot())
 

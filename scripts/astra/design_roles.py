@@ -5,6 +5,10 @@ Only the pinned authority changes placements. Local lifecycle actions keep threa
 assignment evidence and pending messages when a server or acknowledgement is lost.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import configparser
@@ -39,10 +43,10 @@ DESIGNER_SANDBOX = 'danger-full-access'
 
 
 class AstraCensusProjection(Protocol):
-    def hold(self, role: Literal['designer', 'reviewer'], staff_id: str, *,
-             design_id: str, role_id: str) -> object: ...
+    def HeldDesignRole(self, design_id: str, role_id: str) -> object: ...
+    def hold(self, role: Literal['designer', 'reviewer'], lifetime: object, staff_id: str) -> object: ...
     def release(self, staff_id: str) -> None: ...
-    def live_roles(self) -> Sequence[Mapping[str, object]]: ...
+    def live_roles(self, membership: staff.StaffSnapshot) -> Sequence[Mapping[str, object]]: ...
 
 
 def _census_projection() -> AstraCensusProjection:
@@ -611,29 +615,30 @@ def _worker_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> None:
-    """Dispatch through the worker command and save the completed reply."""
+    """Dispatch through assign.sh and save the completed reply."""
     if isinstance(design.binding, DesignBoundToPhase):
         run, phase = Path(design.binding.run_directory), design.binding.phase
     else:
         run, phase = design_directory(design.placement.design_id), 'astra-review'
-        _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design.repository])
-        _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
-                           '--phase-title', 'Held Astra review'])
+        state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
+        if not state:
+            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design.repository])
+        if not state.get('phase'):
+            _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
+                               '--phase-title', 'Held Astra review'])
     name = _instance(design, role).name
     parent = worker_parent(design, role, staff.snapshot())
-    assign_and_finish(['assign', 'astra-' + role, str(prompt), '--session-dir', str(run), '--parent', str(parent.id),
-        '--name', name, '--slot', name, '--phase', phase, '--kind', 'astra', '--reply', str(reply),
-        '--launcher-command', json.dumps([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])],
-        run=run, name=name)
-
-
-def assign_and_finish(arguments: list[str], *, run: Path, name: str) -> None:
-    """Assign the worker and record the completed pass in its dispatch run."""
-    result = _worker_command(arguments)
+    result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
+        '--target', 'durable-design-role', '--policy', 'astra-' + role,
+        '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
+        '--phase', phase, '--prompt', str(prompt), '--summary', str(reply)])
     if result.returncode:
         raise RoleRefused(result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained')
-    _recorder_command(['finish-pass', '--session-dir', str(run), '--status', 'completed'],
-                      env=dict(os.environ, UNIT_PASS_OWNER='launcher', UNIT_TEAM_ROLE=name))
+
+
+def _assign_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'), *arguments],
+                          capture_output=True, text=True, check=False)
 
 
 def _recorder_command(arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
@@ -649,8 +654,8 @@ def _project_hold(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -
     if isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):
         return
     _ = worker_parent(design, role, record)
-    _ = astra_roles.hold(role, instance.lifecycle.staff_id,
-                         design_id=design.placement.design_id, role_id=role)
+    _ = astra_roles.hold(role, astra_roles.HeldDesignRole(design.placement.design_id, role),
+                         str(instance.lifecycle.staff_id))
 
 
 def refresh_census(design_id: str) -> None:
@@ -701,7 +706,7 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
                 print(f'creation outcome unknown; run recover for {design_id}/{role}; replacement refused', file=sys.stderr)
             return design
         _validate_binding(design.binding, design.repository, role)
-    name = instance.name if instance.lifecycle.claim else 'astra-' + role + '-' + design_id[:8]
+    name = instance.name
     with _lock(directory):
         current = read_design(design_id)
         if current != design:
@@ -711,8 +716,12 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         _save(design)
     design = _begin_creation(design, role, 'pane-start')
     run = Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase) else directory
-    result = _worker_command(['add', 'astra-' + role, '--name', name, '--json',
-                              '--session-dir', str(run)])
+    parent = staff.snapshot().by_current_session(staff.runtime_id())
+    if parent is None or parent.kind not in ('unit', 'showrunner'):
+        raise RoleRefused('staff: caller: not opened: caller is not a unit or showrunner')
+    result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
+        '--target', 'durable-design-role', '--policy', 'astra-' + role, '--new-worker', name,
+        '--session-dir', str(run), '--parent', str(parent.id)])
     if result.returncode:
         raise RoleRefused(result.stderr.strip() or 'held worker startup did not complete; creation claim is retained')
     fields = _object(cast(object, json.loads(result.stdout)))
@@ -860,7 +869,7 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
             if (not pending and context.exists() and _read(context) == _mesh_context_fields(design)
                     and {role.lifecycle.staff_id for role in design.roles
                          if not isinstance(role.lifecycle, (RoleNotOpened, RoleEnded))}.issubset(
-                             entry['staff_id'] for entry in _census_projection().live_roles())):
+                             entry['staff_id'] for entry in _census_projection().live_roles(staff.snapshot()))):
                 return design
         else:
             if design.placement.generation != expected_generation:
@@ -1088,13 +1097,18 @@ def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
             yield design
 
 
-def held_document(document: Path) -> HeldDesign | None:
+@dataclass(frozen=True)
+class NotHeldDocument:
+    pass
+
+
+def held_document(document: Path) -> HeldDesign | NotHeldDocument:
     target = str(document.resolve())
     found = [design for design in _read_designs(lambda fields: fields.get('document') == target)
              if design.document == target]
     if len(found) > 1:
         raise RoleRefused('document has more than one held identity; recovery required')
-    return found[0] if found else None
+    return found[0] if found else NotHeldDocument()
 
 
 def unbind_run(run_directory: str) -> None:

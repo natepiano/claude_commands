@@ -48,6 +48,10 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -61,8 +65,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from test_phase import (
+from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
     TestPhaseChargeUse as TestPhaseChargeUse,
@@ -77,34 +80,18 @@ from test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-if __package__:
-    from . import cgroup_capture, store, step_context
-    from .repository import (
-        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
-        output as output,
-        remote_identity as remote_identity,
-        repository_key as repository_key,
-    )
-else:
-    import cgroup_capture
-    import store
-    import step_context
-    from repository import (
-        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
-        output as output,
-        remote_identity as remote_identity,
-        repository_key as repository_key,
-    )
+from scripts.buildlog import cgroup_capture, store, step_context
+from scripts.buildlog.repository import (
+    GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+    output as output,
+    remote_identity as remote_identity,
+    repository_key as repository_key,
+)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
+
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-if TYPE_CHECKING:
-    from ..aws_target.config import MeasurementUnavailable
+    from scripts.aws_target.config import MeasurementUnavailable
 
 
 __all__ = ["_target_hosts"]
@@ -162,20 +149,20 @@ def _target_hosts(values: Mapping[str, str], target: str) -> tuple[str, ...]:
 
 
 def mac_targets() -> tuple[str, ...]:
-    from target_config import SshTarget, read_targets
+    from scripts.build_targets.target_config import SshTarget, read_targets
 
     return tuple(target.name for target in read_targets()
                  if isinstance(target, SshTarget) and target.platform == "macos")
 
 
 def configured_targets() -> tuple[str, ...]:
-    from target_config import read_targets
+    from scripts.build_targets.target_config import read_targets
 
     return tuple(target.name for target in read_targets())
 
 
 def local_targets() -> tuple[str, ...]:
-    from target_config import LocalTarget, read_targets
+    from scripts.build_targets.target_config import LocalTarget, read_targets
 
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
@@ -534,7 +521,7 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    import parse
+    from scripts.buildlog import parse
 
     words = ["rustc"]
     chosen = parse.toolchain(argv)
@@ -695,7 +682,7 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    import parse
+    from scripts.buildlog import parse
 
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
@@ -947,8 +934,8 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 def step(args: list[str]) -> None:
     import hashlib
-    import parse
-    import treekey
+    from scripts.buildlog import parse
+    from scripts.buildlog import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
     argv = args[6:]
@@ -1122,14 +1109,18 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
 
 
 def call(args: list[str]) -> None:
+    from scripts.direct.step_record import NamedPackage, WorkspacePackages
+
     outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
     words = args[9:]
+    package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
+    selection = NamedPackage(package_name) if package_name else WorkspacePackages()
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
         "command": " ".join([verb, *words]),
         "verb": verb,
-        "package": words[0] if words and verb != "final" else None,
+        "package": selection.name if isinstance(selection, NamedPackage) else "workspace",
         "outcome": outcome,
         "status": optional_int(status),
         "cached": cached == "1",
@@ -1232,7 +1223,7 @@ def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
-    from target_config import SshTarget, read_targets
+    from scripts.build_targets.target_config import SshTarget, read_targets
 
     event, target, key, holder, reason, at = args[:6]
     if event not in ("began", "ended") or len(args) not in (6, 7):

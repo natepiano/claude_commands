@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import sqlite3
@@ -14,22 +16,20 @@ from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import dailies_input
-import dailies_render
+from scripts.production import dailies_input
+from scripts.production import dailies_render
 from scripts.production.production_doc import read_production
-from dailies_render import LENGTHS
-from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
+from scripts.production.dailies_render import LENGTHS
+from scripts.production.dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership, showrunner_relationship
-from unit_lookup import UnitState
-from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
+from scripts.production.unit_lookup import UnitState
+from scripts.production.dailies_input_test_support import (DailiesInputFixture, SCRIPT, SHIM, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
 
 
@@ -64,7 +64,7 @@ class DailiesInputTests(DailiesInputFixture):
         if doc != self.doc:
             write_text_atomic(doc, self.doc.read_text())
         row = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == name)
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(row.id, staff.LiveDoc(remote.local_machine(), doc))
         conf = self.root / "notifier-state" / f"showrunner-{row.id}" / "conf"
         write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {row.id}\n")
 
@@ -157,7 +157,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertEqual(self.unit()["name"], ALPHA)
                 self.assertNotIn("label", self.unit())
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
-                rendered = subprocess.run([sys.executable, str(RENDERER), str(self.output),
+                rendered = subprocess.run([str(SHIM), str(RENDERER), str(self.output),
                                            "--at", "2026-10-06T17:00"],
                                           env=self.env, capture_output=True, text=True, check=False)
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
@@ -675,7 +675,7 @@ class DailiesInputTests(DailiesInputFixture):
                 built = self.run_builder("--length", length)
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 rendered = subprocess.run(
-                    [sys.executable, str(RENDERER), str(self.output), "--at", AT],
+                    [str(SHIM), str(RENDERER), str(self.output), "--at", AT],
                     env=self.env, capture_output=True, text=True, check=False,
                 )
                 self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
@@ -1180,10 +1180,10 @@ class DailiesInputTests(DailiesInputFixture):
             (b"record locked\nmore detail", "record locked"),
         )
         production = read_production("example")
-        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", "example", "line", "--json"]
+        command = [str(SHIM), self.env["DAILIES_BEVY_UPGRADE"], "--production", "example", "line", "--json"]
         for stderr, reason in cases:
             with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
-                "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
+                "scripts.production.dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
             ) as run:
                 self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
                 run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
@@ -1446,7 +1446,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "00:30")
         self.assertNotIn("request /unit:eta:", result.stdout)
-        rendered = subprocess.run([sys.executable, str(RENDERER), str(self.output),
+        rendered = subprocess.run([str(SHIM), str(RENDERER), str(self.output),
                                    "--at", "2026-10-06T23:45"],
                                   env=self.env, capture_output=True, text=True, check=False)
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
@@ -1527,7 +1527,7 @@ class DailiesInputTests(DailiesInputFixture):
                           f"== {BETA}", "● Checking button labels", "ETA 16:40")
         self.judgment_file(beta=True)
         review = self.root / "race-review.py"
-        _ = review.write_text(RACE_WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        _ = review.write_text(RACE_WATCH_STUB.replace("__PYTHON__", sys.executable).replace("__SHIM__", str(SHIM)), encoding="utf-8")
         review.chmod(0o755)
         self.env.update({
             "DAILIES_REVIEW_REGIME": str(review),
@@ -1684,8 +1684,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertIsNone(saved["interval"])
 
     def test_style_ledger_uses_its_child_environment_after_rules_were_imported(self) -> None:
-        with mock.patch.object(sys, "path", [str(SCRIPT.parent.parent / "style"), *sys.path]):
-            import style_rules
+        from scripts.style import style_rules
 
         outer_catalog = self.root / "outer-catalog"
         with mock.patch.object(style_rules, "NATE_STYLE_DIR", outer_catalog):
@@ -1797,8 +1796,9 @@ class DailiesInputTests(DailiesInputFixture):
                                     (0, '{"rules_done": 1}', "")):
             with self.subTest(code=code, output=output):
                 def command(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-                    if path.name == "style_ledger.py":
-                        self.assertEqual(arguments, ("summary", "--repo", str(self.checkout), "--json"))
+                    if path == SHIM and Path(arguments[0]).name == "style_ledger.py":
+                        self.assertEqual(arguments, (str(SCRIPT.parent.parent / "style/style_ledger.py"),
+                                                     "summary", "--repo", str(self.checkout), "--json"))
                         return subprocess.CompletedProcess([str(path), *arguments], code, output, error)
                     return original_command(path, *arguments)
 

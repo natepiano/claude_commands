@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """dailies_render.py's footer, report, and timeline through this worktree's CLI."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import json
 import sys
@@ -19,10 +21,9 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import dailies_render
-from cli_fixture import invoke_cli
-from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -129,7 +130,7 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
                    "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
     if subprocess_cli:
-        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     else:
         result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
@@ -171,7 +172,7 @@ def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Gener
         folder.mkdir(exist_ok=True)
         doc = root / "reader-production.md"
         _ = doc.write_text(f"# Production — reader\n- **Proposals:** {folder}\n")
-        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
         timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-reader"
         timer.mkdir(parents=True, exist_ok=True)
         _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")
@@ -283,16 +284,15 @@ class ReportFooterTests(unittest.TestCase):
             program = '''import os, sys
 from pathlib import Path
 from types import ModuleType
-sys.path.insert(0, str(Path.cwd()))
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli
 assert "scripts.production.showrunners" not in sys.modules
-assert "dailies_render" not in sys.modules
+assert "scripts.production.dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render
+    from scripts.production import dailies_render
     from scripts.production import showrunners
     from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
@@ -967,7 +967,7 @@ class EtaResolutionTests(unittest.TestCase):
             self.assertEqual(expected.code, 0, expected.error)
             complete_state = state.read_bytes()
             _ = state.write_text(original, encoding="utf-8")
-            with mock.patch("atomic_file.os.replace", side_effect=OSError("stopped while saving")):
+            with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("stopped while saving")):
                 stopped = run(arguments, scratch)
             self.assertNotEqual(stopped.code, 0)
             self.assertEqual(state.read_text(), original)

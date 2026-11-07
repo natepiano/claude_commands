@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """
 Bevy Dependency Compatibility Checker
 
@@ -9,6 +9,10 @@ Example: bevy_dependency_check.py --bevy-version 0.17.1 --codebase ~/rust/my_gam
 
 Exit codes: 0 = success, 1 = error
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -23,9 +27,8 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
 
-import crates_io_pacer
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 class CrateVersion(TypedDict):

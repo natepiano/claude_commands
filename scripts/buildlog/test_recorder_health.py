@@ -15,12 +15,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import health
-import launches
-import record
-import report
-import store
-import test_record_rerun as recovery_tests
+from scripts.buildlog import health, launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog import test_record_rerun as recovery_tests
 
 
 class RecorderHealthTests(unittest.TestCase):

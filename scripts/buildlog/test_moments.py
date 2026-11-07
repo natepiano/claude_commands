@@ -1,13 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build-moment comparisons over fixture logs and fixture progress history."""
 
 from __future__ import annotations
+
+from scripts.production.staff_test_support import foreign_hostname
 
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -15,19 +16,21 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import index
-import memory
-import moments
-import report
-import store
-import test_report as report_fixtures
-import test_memory_window as memory_fixtures
-from test_index import Record, call, sample, step
-from test_memory_window import write_lint_config
+from scripts.buildlog import index
+from scripts.buildlog import memory, moments, report
+from scripts.buildlog import store
+from scripts.buildlog import test_report as report_fixtures
+from scripts.buildlog import test_memory_window as memory_fixtures
+from scripts.buildlog.test_index import Record, call, sample, step
+from scripts.buildlog.test_memory_window import write_lint_config
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
 END = START + timedelta(days=2)
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 def build(record_id: str, seconds: float, **fields: object) -> Record:
@@ -55,7 +58,7 @@ def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.Comple
     database = index.index_path()
     before = database.read_bytes()
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("cli.py")), *args],
+        memory_fixtures.configured_host_cli(Path(__file__).with_name("cli.py"), *args),
         env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
     )
     test.assertEqual(result.returncode, 0, result.stderr)
@@ -517,7 +520,7 @@ class MemoryMomentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
-        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
+        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", side_effect=memory_fixtures.configured_local_host)))
 
     def memory_cells(self, lines: list[str]) -> dict[str, dict[str, str]]:
         start = next(number for number, line in enumerate(lines) if line.startswith("| Memory "))
@@ -570,7 +573,8 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-import index, memory, moments, report
+from scripts.buildlog import index, memory, moments, report, record, store
+store.host_name = lambda: record.local_step_identity().hosts[0]
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)
@@ -581,7 +585,7 @@ with index.read_only() as connection:
     print("\\n".join(report.moments_section(connection, "2026-10-11")))
 '''
         result = subprocess.run(
-            [sys.executable, "-c", program], capture_output=True, text=True, check=False,
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
             timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                              "PYTHONPATH": str(Path(report.__file__).parent)},
         )

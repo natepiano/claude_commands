@@ -18,12 +18,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import index
-import parse
-import repository
-import test_record as record_tests
-from store import UNKNOWN_IDENTITY
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import parse
+from scripts.buildlog import repository
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.store import UNKNOWN_IDENTITY
+from scripts.buildlog.test_index import use_test_log
 
 if TYPE_CHECKING:
     from ..lib import test_hang_guard

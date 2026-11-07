@@ -279,16 +279,47 @@ Schema 25 also adds `held_findings.built_at`. For old built findings it uses the
 
 **Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<showrunner name>`, bounded at 35 s. A failure prints one line and exits 0.
 
-**Sync steps** (style showrunner; skipped when `tip seen` prints `seen`; `style_sync.py own-handoff --repo R --tip T --style-branch B` exits 0 when T's tree is B's tree, after `set-tip` and `tip done` with reason `own hand-off`, so only the tree-neutral merge and the wake remain, and exits 1 otherwise): merge the tip into the style branch and gate; `style_sync.py lint --repo R --checkout C --tip T` (`verify.sh lint --workspace --no-cache --check` in a standing checkout; one `lint-record` per tool; exit 0 clean, 1 diagnostics or a failed tool (continue), 2 error (stop), 128 + signal for SIGTERM or SIGHUP (stop); every exit it can catch stops verify.sh's process group, releases the standing checkout and deletes its temporary supervision metadata; each `style-sync-lint-*` dir holds `owner.json` (owner pid and the repo's git dir) and `verifier.pgid`, which verify.sh's own process writes before it starts verify.sh, and only while the owner runs; the sweep never follows a link; the owner record is deleted last and kept when metadata cleanup fails, and each run first removes stale metadata (and any legacy registration) whose owner and verify.sh group are both gone, so the dir stays while a killed run's verify.sh still runs); `set-tip --style-branch`, then `status` (report a nonzero unclassified count to the parent with "pull nate_style"); tell unit directors to merge at their next pause and wake sync waiters; `tip done`. The listed-site refresh runs on every read regardless.
+**Sync steps.** Skip these steps when `tip seen` prints `seen`.
+`style_sync.py own-handoff --repo R --tip T --style-branch B` checks whether T and B have the same tree.
+When they match, it runs `set-tip` and `tip done` with reason `own hand-off`, then exits 0.
+Only the merge with an unchanged tree and the wake remain.
+Otherwise it exits 1, and the style showrunner uses this sequence:
+
+1. Merge the tip into the style branch and run its gate.
+2. Run `style_sync.py lint --repo R --checkout C --tip T`.
+3. Run `set-tip --style-branch`.
+4. Run `status`.
+5. Report a nonzero unclassified count to the parent with `pull nate_style`.
+6. Tell unit directors to merge at their next pause.
+7. Wake sync waiters.
+8. Run `tip done`.
+
+The lint command runs `verify.sh lint --no-cache --check` in a standing checkout.
+It writes one `lint-record` per tool.
+Its status controls the sequence:
+
+- Exit 0 means clean.
+- Exit 1 means diagnostics or a failed tool; continue.
+- Exit 2 means an error; stop.
+- Exit 128 plus the signal means SIGTERM or SIGHUP; stop.
+
+Every exit it can catch stops the `verify.sh` process group and releases the standing checkout.
+It also deletes temporary supervision metadata.
+Each `style-sync-lint-*` folder holds `owner.json` with the owner PID and the repository's Git directory.
+It also holds `verifier.pgid`, written before `verify.sh` starts, and only while the owner runs.
+The sweep never follows a link.
+It deletes the owner record last and keeps it if metadata cleanup fails.
+Each run first removes stale metadata and legacy registration only when the owner and verifier group are both gone.
+Thus the folder stays while a killed run's `verify.sh` still runs.
+The refresh of listed sites runs on every read.
 
 **Warm sync target.** Lint uses `copies.standing` at the requested commit and
 holds the checkout's `.claude-busy` lock through verification and cleanup. Each
 checkout owns a real `target/`; the configured second checkout owns a separate
 cache. Supervision metadata is removed after lint; the checkout and target stay.
 The floor sweep may reclaim idle marked targets, so a later run can build cold.
-No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place;
-`copies.py remove --owner <style-production> --repo <repo>` removes idle ones.
-See `gate-checkouts.md` for configured paths, pool limits and lock rules.
+No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place.
+See `gate-checkouts.md` for removal, configured paths, pool limits and lock rules.
 
 ### Child hand-off merge
 

@@ -10,7 +10,6 @@ import re
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -18,31 +17,24 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import build_hold
-import hold_enforcer
-import unit_runs
-from sessions import SessionRecord
+from scripts.build_hold import build_hold
+from scripts.build_hold import hold_enforcer
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord
 
-from build_hold_test_support import (
+from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
-if TYPE_CHECKING:
-    from ..direct import step_record
-    from ..build_queue import admission_protocol, admission_service
-    from ..build_queue.admission_test_support import only_admitted
-    from ..lib import test_hang_guard
-else:
-    from scripts.direct import step_record
-    from scripts.build_queue import admission_protocol, admission_service
-    from scripts.build_queue.admission_test_support import only_admitted
-    from scripts.lib import test_hang_guard
+from scripts.direct import step_record
+from scripts.build_queue import admission_protocol, admission_service
+from scripts.build_queue.admission_test_support import only_admitted
+from scripts.lib import test_hang_guard
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
@@ -495,7 +487,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if argv[:1] == ["git"]:
                 return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
+            self.assertEqual(argv[:2], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
             calls.append(argv[2:])
@@ -2028,7 +2020,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(sent, ["one", "two", "two", "three"])
 
     def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
-        import build_targets
+        from scripts.build_targets import build_targets
         self.begin()
         cycle = self.cycle()
         cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
@@ -2331,7 +2323,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     "VERIFY_PROC_ROOT": str(self.proc), "VERIFY_STEPS_DIR": str(self.scratch / "steps"),
                 }):
                     step_record.write(step_record.StepRecord(
-                        "kept-step", 90, "900", self.scratch, "test", None,
+                        "kept-step", 90, "900", self.scratch, "test", step_record.WorkspacePackages(),
                         step_record.NatedevOnly("fixture"), step_record.StepState.ON_NATEDEV,
                         "2026-10-28T12:00:00+00:00",
                     ))

@@ -2,7 +2,7 @@
 description: Set account moves for low weekly quota.
 ---
 
-Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:
+Translate $ARGUMENTS into `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py next`:
 
 - “when units reach 1% switch to claude2” → `add units 1 claude2`.
 - “when workers reach 1% switch to codex2” → `add workers 1 codex2`; `claudeN` and bare `claude` are also workers targets. A numbered Claude target sets the account for worker launches; bare `claude` keeps the caller or showrunners account. Subagents inside a Claude session use that session’s account.

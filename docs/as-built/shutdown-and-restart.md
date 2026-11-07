@@ -1,5 +1,12 @@
 # Shutdown and restart
 
+The `/agents` skill uses the `agents` program.
+`agents` and `agents help` print the same usage and return status 0.
+The public commands are `help`, `status`, `resume`, `restart`, and `stop`.
+`agents status [ACCOUNT] [--json] [--here]` reports live sessions.
+`agents stop SESSION` stops the selected session and its workers.
+`agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
 `stop(session)` ends only the selected local session's process.
@@ -18,8 +25,8 @@ Stall-watch retires the saved prompt keys on its next pass, even after launch de
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
 
-`resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
-The executable is `scripts/shutdown/resume`.
+`agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
+The short form is `resume NAME`, through `scripts/shutdown/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
 The lookup accepts a short name, a staff id, or a current session id.
@@ -144,13 +151,13 @@ The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
 
-`shutdown.py restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
+`agents restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
 It stops each session, then starts each session.
 It saves only the row IDs whose starts failed.
 A stop checks the current conversation before it sends a signal.
 A failed row prints one anomaly line. Other rows continue.
 
-`shutdown.py restart` resumes the saved rows that do not run.
+`agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
 A row leaves the saved list when it starts or already runs.
 A failed start adds the row to the list.

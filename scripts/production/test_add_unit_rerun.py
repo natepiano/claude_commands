@@ -12,14 +12,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
-import add_unit
-import herdr
+from scripts.production import add_unit
+from scripts.herdr import herdr
 from scripts.production import unit_lookup
-import sessions
-import resume_unit
-import unit_lookup as script_unit_lookup
-import retire_unit
-import atomic_file
+from scripts.message import sessions
+from scripts.production import resume_unit
+from scripts.production import unit_lookup as script_unit_lookup
+from scripts.production import retire_unit
+from scripts.lib import atomic_file
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import unit_membership
@@ -300,7 +300,7 @@ class AddUnitRerunTests(AddUnitTestCase):
 
         def interrupted_stub(path: Path, text: str) -> None:
             if "## Source\n\n" in text and "Keep every source word." in text:
-                with patch("atomic_file.os.fsync", side_effect=OSError("full disk")):
+                with patch("scripts.lib.atomic_file.os.fsync", side_effect=OSError("full disk")):
                     write(path, text)
             else:
                 write(path, text)

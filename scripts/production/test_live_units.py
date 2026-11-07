@@ -5,19 +5,17 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import fake_showrunner
-import fake_unit_host
-from fake_unit_host import HostedUnit, labeled as marked
+from scripts.production import fake_showrunner
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
 
@@ -25,32 +23,33 @@ SCRIPT = Path(__file__).with_name("live_units.py")
 
 
 class RowDocumentLiveUnitsTests(StaffTestCase):
-    def test_read_units_collects_the_supplied_scan_with_the_same_staff_snapshot(self) -> None:
+    def test_read_units_collects_lookup_failures_with_the_same_staff_snapshot(self) -> None:
         import io
         from contextlib import redirect_stderr
         from scripts.production import live_units, session_staff
-        import unit_lookup
+        from scripts.production import unit_lookup
 
         fixture = self.row_production()
-        sources = unit_lookup.member_sources()
+        expected_sources = unit_lookup.member_sources()
         every = unit_lookup.LabeledProductions({}, {fixture.name: ("member",)})
         errors = io.StringIO()
 
-        def scan(record: staff.StaffSnapshot, observed: unit_lookup.MemberSources) -> None:
+        def observe(*, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources) -> unit_lookup.LabeledProductions:
             self.assertEqual(record.by_id(fixture.unit.id), fixture.unit)
-            self.assertIs(observed, sources)
-            session_staff.report_anomaly("codex pid 123: no current staff row")
+            self.assertIs(sources, expected_sources)
+            session_staff.report_anomaly("pid 123: session record is unreadable", pid=123)
+            return every
 
-        with (mock.patch.object(unit_lookup, "member_sources", return_value=sources),
-              mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+        with (mock.patch.object(unit_lookup, "member_sources", return_value=expected_sources),
+              mock.patch.object(unit_lookup, "every_labeled_session", side_effect=observe),
               redirect_stderr(errors)):
-            listing = live_units.read_units(fixture.name, scan)
+            listing = live_units.read_units(fixture.name)
             legacy = live_units.units_of(fixture.name)
 
         self.assertEqual([item.unit for item in listing.units], [fixture.unit.name])
-        self.assertEqual(listing.anomalies, ("anomaly: codex pid 123: no current staff row",))
+        self.assertEqual(listing.anomalies, ("anomaly: pid 123: session record is unreadable",))
         self.assertEqual(legacy, listing.units)
-        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "anomaly: pid 123: session record is unreadable\n")
 
     def test_incomplete_facts_keep_the_live_unit_and_one_named_problem(self) -> None:
         import io
@@ -69,7 +68,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                     (fixture.worktree / ".unit.toml").unlink()
                 errors = io.StringIO()
                 with (redirect_stderr(errors),
-                      mock.patch("unit_lookup.every_labeled_session", return_value=every)):
+                      mock.patch("scripts.production.unit_lookup.every_labeled_session", return_value=every)):
                     units = live_units.units_of(fixture.runner.name)
                 self.assertEqual([item.unit for item in units], ["member"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -166,7 +165,7 @@ class LiveUnitsTests(unittest.TestCase):
             "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", "show"))],
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *(arguments or ("--production", "show"))],
                               env=self.environment, capture_output=True, text=True, check=False)
 
     def test_offline_staff_unit_is_listed_without_a_worktree(self) -> None:
@@ -217,7 +216,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.members("alpha")
         self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha")})
         listed = self.run_script()
-        target = subprocess.run([sys.executable, str(SCRIPT.with_name("unit_lookup.py")),
+        target = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT.with_name("unit_lookup.py")),
                                  "pane", "show", "alpha"], env=self.environment,
                                 capture_output=True, text=True, check=False)
         self.assertEqual((listed.returncode, target.returncode), (0, 0), listed.stderr + target.stderr)

@@ -5,7 +5,8 @@ import json
 import io
 import subprocess
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from dataclasses import replace
 import os
@@ -17,14 +18,19 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_worker, unit_membership
 from scripts.astra import design_roles
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.server_test_support import owned_server_record
 
 _NOT_OPENED = design_roles.RoleNotOpened()
 
 
-def write_mesh_server_record(mesh: Path, codex_home: Path) -> None:
+@contextmanager
+def write_mesh_server_record(mesh: Path, codex_home: Path) -> Generator[None]:
     write_text_atomic(mesh / "mesh_server.json", json.dumps({
-        "codex_home": str(codex_home), "pid": os.getpid(), "port": 32100,
+        "codex_home": str(codex_home), "port": 32100,
     }))
+    with owned_server_record(mesh / "mesh_server.json"):
+        yield
 
 
 def designer_fixture(parent: staff.StaffId, name: str, codex_home: Path) -> staff.StaffRow:
@@ -69,8 +75,12 @@ class HeldRolePaneFixture:
         self.command_case.setUp()
         case.addCleanup(self.command_case.doCleanups)
         self.root = self.command_case.fixture.root
+        self.command_directory = self.root
         self.world = self.command_case.fixture.world
+        self.router = worker_tests.PaneCommandRouter()
+        self.router.setup(case, self.root)
         self.commands: list[list[str]] = []
+        self.recorder_commands: list[list[str]] = []
         write_text_atomic(self.root / "design.md", "# Private design\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
@@ -80,6 +90,8 @@ class HeldRolePaneFixture:
             "CODEX_HOME": str(self.root / "codex"),
         })))
         _ = case.enterContext(patch.object(design_roles, "_worker_command", side_effect=self.command))
+        _ = case.enterContext(patch.object(design_roles, "_assign_command", side_effect=self.assign))
+        _ = case.enterContext(patch.object(design_roles, "_recorder_command", side_effect=self.record))
         design_roles.register_repository("private-repo", {"natedev": str(self.root)})
         state_path = self.command_case.run_dir / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -102,6 +114,19 @@ class HeldRolePaneFixture:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             status = worker.main(arguments)
         return subprocess.CompletedProcess(arguments, status, output.getvalue(), errors.getvalue())
+
+    def assign(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        from scripts.direct import assign
+        from scripts.production.cli_fixture import invoke_cli
+
+        self.commands.append(arguments.copy())
+        return invoke_cli(assign, assign.main, arguments, os.environ.copy(), self.command_directory)
+
+    def record(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
+        self.recorder_commands.append(arguments.copy())
+        result = invoke_recorder(arguments, env, self.root)
+        if result.returncode:
+            raise design_roles.RoleRefused(result.stderr.strip() or "held dispatch recording did not complete")
 
     def open(self, role: design_roles.Role, *, bound: bool = True) -> design_roles.HeldDesign:
         return design_roles.open_role("private-repo", "design.md", role, "design",

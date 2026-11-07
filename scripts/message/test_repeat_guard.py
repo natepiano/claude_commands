@@ -22,10 +22,9 @@ from unittest.mock import patch
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import send
-import repeat_guard as guard
-import repeats
+from scripts.message import send
+from scripts.message import repeat_guard as guard
+from scripts.message import repeats
 from scripts.message.repeat_guard_test_support import (
     NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
     wait_for_notice_exit, wait_for_notice_readiness,
@@ -42,7 +41,7 @@ DEADLINE_CEILING_FACTOR = 10
 NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
-import send,repeat_guard as g,roster
+from scripts.message import send, repeat_guard as g, roster
 from scripts.message import send_result
 from scripts.production import staff
 staff.snapshot=lambda: staff.StaffSnapshot(())
@@ -182,7 +181,7 @@ class RepeatGuardTests(unittest.TestCase):
         program = """import json, sys, time
 from pathlib import Path
 from unittest.mock import patch
-import send
+from scripts.message import send
 guard = send.repeat_guard
 launch = guard.Popen
 def slow_start(*args, **kwargs):
@@ -237,7 +236,8 @@ print(json.dumps(held))
         site.mkdir()
         _ = (site / "guard_site_probe.py").write_text("ready = True\n")
         program = """import json, os
-import guard_site_probe, repeat_guard
+import guard_site_probe
+from scripts.message import repeat_guard
 print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
                   repeat_guard.GUARD_IO_CEILING_SECONDS]))
 """
@@ -508,7 +508,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual([notice["kind"] for notice in cast(list[dict[str, object]], saved["notices"])], ["owner"])
 
     def test_concurrent_processes_admit_on_contention_and_keep_valid_state(self) -> None:
-        program = ("import sys; from pathlib import Path; import repeat_guard as g; "
+        program = ("import sys; from pathlib import Path; from scripts.message import repeat_guard as g; "
                    + "print(g.check(Path(sys.argv[1]), g.Attempt('watchdog','morty','stopped','fixture-host',float(sys.argv[2]))).held)")
         def attempt(index: int) -> bool:
             result = subprocess.run([sys.executable, "-c", program, str(self.root), str(index)],
@@ -607,7 +607,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         program = """import json, sys, threading
 from dataclasses import asdict
 from pathlib import Path
-import repeat_guard as g
+from scripts.message import repeat_guard as g
 def stalled(path, text):
     Path(sys.argv[2]).write_text(str(path) + "\\n" + text)
     threading.Event().wait()
@@ -748,7 +748,7 @@ Path(sys.argv[1]).write_text(str(os.getpid()) + ' ' + str(child.pid))
 with open(sys.argv[3], 'w') as ready: ready.write('ready\n')
 os.kill(os.getpid(), signal.SIGSTOP)
 """
-        runner = "import sys; import send; send.run(sys.argv[1:], '', 60)"
+        runner = "import sys; from scripts.message import send; send.run(sys.argv[1:], '', 60)"
         command = [sys.executable, "-c", runner, sys.executable, "-c", child_program, str(marker), grandchild, str(ready)]
         # Start the deadline check only after the delivery descendants exist.
         child = subprocess.Popen(command, start_new_session=True,
@@ -828,7 +828,7 @@ original = Path.read_text
 def read(path, *args, **kwargs):
     return original(Path(sys.argv[1]) if path.name == "send_repeat_guard.conf" else path, *args, **kwargs)
 Path.read_text = read
-import repeat_guard as g
+from scripts.message import repeat_guard as g
 g.CONFIG=Path(sys.argv[1])
 launch = g.Popen
 def tracked(*args, **kwargs):

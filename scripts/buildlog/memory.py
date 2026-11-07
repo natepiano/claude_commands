@@ -15,20 +15,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-import index
-import cgroup_capture
-from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
-import store
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.buildlog import index, cgroup_capture, store
+from scripts.buildlog.cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_evidence import room_text
 from scripts.lint import memory_admit as gate
 
-import conf
+from scripts.lib import conf
 
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
@@ -88,7 +83,7 @@ def build_output_program(program: str) -> bool:
     executable = Path(program)
     if not executable.is_absolute():
         return False
-    import sweep
+    from scripts.lint import sweep
 
     return any(sweep.is_cargo_target(str(parent)) for parent in executable.resolve().parents)
 

@@ -34,6 +34,23 @@ _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
 
 
+@contextmanager
+def foreign_hostname() -> Generator[None]:
+    """Use one foreign hostname in the test and its Python children."""
+    with tempfile.TemporaryDirectory() as directory:
+        startup = Path(directory) / "sitecustomize.py"
+        _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
+        pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
+        from scripts.production import production_lifecycle, retire_unit, update_registration
+
+        with (mock.patch.object(retire_unit, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(socket, "gethostname", return_value="gate-fixture"),
+              mock.patch.dict(os.environ, {"PYTHONPATH": pythonpath})):
+            yield
+
+
 def fixture_account_home(home: Path) -> Path:
     """Keep fixture sessions outside the login user's real account folders."""
     for candidate, login in ((Path(os.path.abspath(home)), _LOGIN_HOME), (home.resolve(), _LOGIN_HOME.resolve())):
@@ -311,7 +328,7 @@ class ClaudeBackendFixture:
     def launch(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str],
                kind: str, agent_arguments: list[str], opening: object, timeout_ms: int, *,
                agent: str) -> object:
-        import herdr
+        from scripts.herdr import herdr
 
         del name, space, title, cwd, kind, timeout_ms, agent
         if not isinstance(opening, herdr.OpeningPrompt):
@@ -392,7 +409,7 @@ def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> s
     from scripts.production import unit_names
 
     row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
-    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
+    return staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), location), expected=row.worktree)
 
 
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
@@ -400,7 +417,7 @@ def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
     """Record private unit locations and configuration through the shared fixture writers."""
     _ = recorded_showrunner(showrunner, doc)
     row = unit_membership(showrunner, unit)
-    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+    row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
@@ -651,9 +668,8 @@ class StaffTestCase(unittest.TestCase):
             _ = contexts.enter_context(mock.patch(
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
-            _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.local_machine", return_value=machine,
-            ))
+            for module in {remote, sys.modules.get("remote", remote)}:
+                _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
             _ = contexts.enter_context(isolated_source_readers())
             if machine == "mac":
                 _ = os.environ.pop("STAFF_FILE", None)
@@ -782,7 +798,7 @@ class StaffTestCase(unittest.TestCase):
         production_membership(production_name, *units)
         for unit in units:
             row = unit_membership(production_name, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
@@ -807,9 +823,9 @@ class StaffTestCase(unittest.TestCase):
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
         write_text_atomic(doc, "# Production\n")
-        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
+        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
-                              worktree=staff.PresentWorktree("natedev", folder))
+                              worktree=staff.PresentWorktree(remote.local_machine(), folder))
         worker = fixture_worker("reader", unit.id)
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))

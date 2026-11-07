@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -18,10 +17,9 @@ from unittest.mock import patch
 
 from scripts.lib.socket_test_support import short_socket_directory
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-from codex_test_support import FakeDaemon, loaded_session_daemon, write_codex_account
-from relay_identity import relay_session_name
-from relay_test_support import write_relay_session
+from scripts.message.codex_test_support import FakeDaemon, loaded_session_daemon, write_codex_account
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_session
 
 HOOK = Path(__file__).with_name("post-tool-use-sendmessage-miss.py")
 
@@ -72,9 +70,9 @@ class SendMessageMissTests(unittest.TestCase):
             self.members["peer-thread"] = staff.StaffRow(staff.StaffId("peer-thread"), "unit", name, staff.StaffRoot(),
                                                        current_session=staff.StaffId("peer-thread"))
         with patch.dict(os.environ, self.environment, clear=True):
-            import codex_daemon
-            import roster
-            from codex_test_support import daemon_session_row
+            from scripts.message import codex_daemon
+            from scripts.message import roster
+            from scripts.message.codex_test_support import daemon_session_row
 
             rows = [replace(daemon_session_row(codex_daemon.CodexDaemon(
                 self.home, self.home / "app-server-control/app-server-control.sock"), "peer-thread", name),

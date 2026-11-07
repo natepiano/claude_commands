@@ -32,8 +32,10 @@ Use one `design_roles.py` designer and at most one reviewer per design.
 `models.conf` selects the role's model and effort.
 Held roles use `worker.py` with explicit `astra-designer` or `astra-reviewer` roles.
 Keep the worker's row, native conversation, and pane across rounds, phases, and runs.
-An ad hoc Astra review outside the staff hierarchy keeps its one-turn `codex exec` path.
-Ask-a-friend uses `side_pane.py open|send|close` beside its caller and creates no staff row.
+An ad hoc Astra review outside the staff hierarchy uses a consultation pane through `assign.sh`.
+Ask-a-friend opens a consultation pane through `assign.sh` beside its caller.
+The consultation creates no staff row.
+`side_pane.py send|close` uses the same terminal for later questions and closure.
 `design_roles.py` saves each headed prompt and reply. Do not also use `astra_work.py brief` for that role.
 For another designer, include `config/design_roles/designer.md` in its brief.
 Save the brief with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
@@ -149,11 +151,15 @@ Apply mesh instructions only when that existing pin is `mesh`.
 
 For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
+After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
+The close keeps the thread and staff row; the next assign resumes that thread.
+If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
 The worker command selects idle workers and reuses stopped workers.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
@@ -163,20 +169,29 @@ Exit 2 means refused.
 Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
 Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
 After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
-Apply the same recovery when a quiet wait returns exit 3 (`NO_DONE`).
+A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
+So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
+1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
+   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
+2. Read the worker's reply in the pane. Check the result and the DONE line.
+3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
+A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
+When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
 After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
 Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
 Read-only pane reviewers post no board lines and run no suites.
 The director or a writer handles required board posts and suites.
-A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a launch option, and the launcher makes no compaction call.
+A pane worker has no in-turn compaction option.
+Codex keeps its own full-window limit.
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
-Restore resumes the same conversations through `worker.py restore`.
+Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves keep the same conversation on the destination account.
-A stopped worker keeps its pane and terminal; a closed worker resumes in a new pane.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+A stopped worker with an active dispatch keeps its pane and terminal.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -187,6 +202,15 @@ For an existing `mesh` pin, keep each worker's thread through the existing unit 
 Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
 A failed compaction keeps the thread available for its own compaction.
 Never create another reviewer while its retained thread exists.
+At the next phase start, the director of a run with a `mesh` pin must follow these steps:
+
+1. Finish the current pass, or record the unfinished work in the plan.
+2. Keep the run's history, saved launcher arguments, and durable design bindings.
+3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
+4. Confirm with one `ps` read that no process of that run remains.
+   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
+   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
+5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
@@ -389,6 +413,14 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+`assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+Each recorder slot counts as one worker, even when its pass records no worker name.
+For Claude, this slot must record a new `pass_started` event during the launch.
+The launcher keeps the phase reservation and the launch exit code.
+After this end, omit `--session-dir` to start a new run on retry.
+An explicit `--session-dir` retains the existing retry behavior for that folder.
+For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
+
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
 A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
@@ -463,7 +495,7 @@ Codex only; no timer process:
 
 <BackgroundVerificationContract>
 Run every `verify.sh` call as one plain command,
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <command> [<package>] [flags]`,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
@@ -533,19 +565,37 @@ implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 </WritePromptContract>
 
 <VerificationContract>
-Rust workers run only exact prompt lines using
-`~/.claude/scripts/direct/verify.sh`:
+Rust workers run only exact prompt lines with this form:
+`bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
+Omit the package for the whole workspace. Give at most one positional word after the command.
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package> [--keep-going]` |
-| package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
-| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/direct/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
-| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint <package>` |
-| changed example | `bash ~/.claude/scripts/direct/verify.sh example <package> <name>` |
-| final workspace gate | `bash ~/.claude/scripts/direct/verify.sh final` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check [<package>] [--keep-going]` |
+| package or workspace tests | `bash ~/.claude/scripts/direct/verify.sh test [<package>]` |
+| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --test <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
+| a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
+| staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
+| example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
+| build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
+| final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
+| read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
+
+`check` and `build` keep Cargo's workspace selection, also with a named package.
+A named package owns feature names without a slash. Without a package, feature
+names pass unchanged. `doc` checks the whole staged workspace with the same
+feature rule. Its pass record stays the same.
+
+Without `--name`, `example` checks all examples in the selected package or workspace.
+With `--name` and no package, the example's member supplies its required features.
+`final` checks the whole workspace. A named package limits its nextest run and
+prevents a saved pass. `--tree` requires `--saved`.
+
+Use `--local` only for a test that cannot pass on macOS. A reservation reason
+is refused. Use `/build:hold hold <why> target mac` for a Mac hold.
+Before CI, either machine can answer a test, including merge gates.
 
 Rules:
 
@@ -617,7 +667,7 @@ recording the result.
 </VerificationNarration>
 
 <FindingsLedger>
-Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,
 including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
@@ -1026,9 +1076,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    protects the paths but writes no state, so a first touch of your own leaves
    the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
    edit checks under your bare session id, and cargo-berth maps its reservation
-   there, so the phase's own check later answers `left_unmapped` with it. With
-   one open phase, the hook and the backstop record that reservation as the
-   phase's `Active`. With two
+   there, so the phase's own check later answers `left_unmapped` with it.
+   The hook and the backstop record it as `Active` when the bare session maps that reservation and run.
+   No other open phase may hold it.
+   A sibling holds it through an `Active` state, a pending release, or its berth session map.
+   With two
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
@@ -1149,7 +1201,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1177,7 +1229,7 @@ always may — early launch is opportunistic, never required.
 Every path that ends an early launch before its real pass starts also drops the
 row it was given:
 
-`python3 ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
 and `EARLY_REVIEW`. The
@@ -1434,7 +1486,7 @@ A launch that needs a built binary — a smoke or shot helper's, or a launcher
 that takes a path — builds it with this one line, then starts the
 `binary: <path>` it prints:
 
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>]`
 
 It waits for a build hold, takes the cargo token and memory admission, and
 records the build, and its allow rule needs no approval. You and every helper
@@ -1570,11 +1622,10 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-For `herdr`, retain worker rows and panes for the next phase.
-Use `worker.py end <name>` only when permanent removal is required.
+For `herdr`, apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
 
 For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
-`python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
 It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
 <LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
