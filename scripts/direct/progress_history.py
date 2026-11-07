@@ -29,7 +29,7 @@ from typing import Literal, NoReturn, TypedDict, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs
@@ -6417,7 +6417,7 @@ def _finish_run(args: argparse.Namespace) -> None:
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
-    """The lenses a `finding_opened` event names, with `both` read as its pair."""
+    """Read a finding's lenses, with `both` read as its pair."""
     lens = _string(event.get("lens"))
     if lens == LEGACY_BOTH_LENS:
         return set(LEGACY_BOTH_LENSES)
@@ -6458,8 +6458,8 @@ def _review_trial(args: argparse.Namespace) -> None:
 
     A named phase selects its open instance or its latest completed instance.
     An unnamed command selects the current phase, including a completed phase.
-    Only events for that instance count.
-    Ledger opening events supply the finding counts, including routed and closed findings.
+    Only the selected instance contributes to the line.
+    Its ledger supplies the findings and dispatched rounds, including routed and closed findings.
     Review-worker minutes count finished review passes and UX review activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
@@ -6490,27 +6490,26 @@ def _review_trial(args: argparse.Namespace) -> None:
             f"No phase recorded in {_state_path(session_dir)}: review-trial reports "
             + "the phase start-phase opened, and this run has not opened one"
         )
-    ux_findings = 0
+    ledger = findings.read_phase_ledger(session_dir, instance_id, phase_id, plan_history.now_epoch())
+    ux_finding_ids: set[str] = set()
     code_finding_ids: set[str] = set()
+    for finding_id, value in (_object_dict(ledger.get("findings")) or {}).items():
+        entry = _object_dict(value)
+        if entry is None:
+            continue
+        lenses = _finding_lenses(entry)
+        if "ux" in lenses:
+            ux_finding_ids.add(finding_id)
+        if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
+            code_finding_ids.add(finding_id)
     review_seconds = 0
     ux_check_seconds = 0
-    ux_finding_ids: set[str] = set()
-    dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
     for event in _run_events(state):
         if _string(event.get("phase_instance_id")) != instance_id:
             continue
         event_type = _string(event.get("event_type"))
-        if event_type == "finding_opened":
-            lenses = _finding_lenses(event)
-            if "ux" in lenses:
-                ux_findings += 1
-                ux_finding_ids.add(_string(event.get("finding_id")))
-            if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
-                code_finding_ids.add(_string(event.get("finding_id")))
-        elif event_type == "finding_batch_dispatched":
-            dispatched.append(event)
-        elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
+        if event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
             review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
@@ -6523,10 +6522,13 @@ def _review_trial(args: argparse.Namespace) -> None:
             ux_check_seconds += elapsed
     # A fix pass carries the round the ledger dispatched (`fix_pass`), and the
     # dispatch names the findings that round covers.
+    rounds = ledger.get("rounds")
+    dispatched = cast(list[object], rounds) if isinstance(rounds, list) else []
     ux_rounds = {
         _integer(event.get("round"))
-        for event in dispatched
-        if ux_finding_ids.intersection(_string_list(event.get("covered")))
+        for value in dispatched
+        if (event := _object_dict(value)) is not None
+        and ux_finding_ids.intersection(_string_list(event.get("covered")))
     }
     ux_repair_seconds = sum(
         _integer(event.get("pass_elapsed_seconds"))
@@ -6534,7 +6536,7 @@ def _review_trial(args: argparse.Namespace) -> None:
         if _integer(event.get("fix_pass")) in ux_rounds
     )
     print(
-        f"review trial: ux {ux_findings} findings, code {len(code_finding_ids)} findings, "
+        f"review trial: ux {len(ux_finding_ids)} findings, code {len(code_finding_ids)} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
         + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"

@@ -5196,6 +5196,38 @@ with patch.object(fcntl, "flock", admission):
             "review-trial", "--session-dir", str(session), at=71_600,
         ))
 
+    def test_review_trial_counts_ledger_entries_without_opening_events(self) -> None:
+        self.write_full_config()
+        session = self.start_run("missing-opening-events", 71_500)
+        self.start_phase(session, 71_510)
+        for lens in ("ux", "contract", "ux,craft"):
+            _ = self.run_findings(
+                session, "open", "--severity", "minor", "--title", f"finding from {lens}",
+                "--caught-by", "worker", "--lens", lens, at=71_520,
+            )
+        history = Path(cast(str, self.read_state(session)["history_file"]))
+        events = self.read_events("missing-opening-events")
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in events
+                                      if event.get("event_type") != "finding_opened"))
+        expected = "review trial: ux 2 findings, code 2 findings"
+        self.assertIn(expected, self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_530,
+        ))
+        _ = self.run_command("finish-phase", "--session-dir", str(session),
+                             "--status", "completed", at=71_540)
+        _ = self.run_command("start-phase", "--session-dir", str(session),
+                             "--phase-id", "4", "--phase-title", "Next phase", at=71_550)
+        _ = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "a different ledger",
+            "--caught-by", "worker", "--lens", "contract", at=71_560,
+        )
+        self.assertIn(expected, self.run_command(
+            "review-trial", "--session-dir", str(session), "--phase-id", "3", at=71_570,
+        ))
+        self.assertIn("ux 0 findings, code 1 findings", self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_580,
+        ))
+
     def test_review_trial_keeps_a_routed_and_closed_finding(self) -> None:
         self.write_full_config()
         session = self.start_run("routed-trial", 71_500)
@@ -5402,6 +5434,10 @@ with patch.object(fcntl, "flock", admission):
         # Round 2 repairs a ux finding on two workers: 900 + 300 s is 20 minutes.
         repair("F002", "ux", 2, (("impl", 900), ("test", 300)), base + 3_000)
 
+        # Ledger rounds preserve the repair join when dispatch events are missing.
+        history = Path(cast(str, self.read_state(session_dir)["history_file"]))
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in self.read_events("uxcost")
+                                      if event.get("event_type") != "finding_batch_dispatched"))
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
