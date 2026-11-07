@@ -1322,7 +1322,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 
 **Ruled out:** a subreaper in the test process itself, which leaves each orphan as an unreaped zombie.
 
-### Phase 63 — Three verify test files stop failing at random  · status: todo
+### Phase 63 — Three verify test files stop failing at random  · status: done
 **Depends on:** none
 
 #### Work Order
