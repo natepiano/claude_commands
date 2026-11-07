@@ -877,6 +877,46 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
         self.assertEqual(remote_words[lint_index + 1 :], ["nextest", *words])
 
+    def test_nextest_and_copy_runs_deliver_forwarded_environment_to_the_remote_command(self) -> None:
+        self.environment.update({"NO_COLOR": "1", "TERM": "xterm-256color", "TERM_PROGRAM": "verify"})
+        for copy in (False, True):
+            with self.subTest(copy=copy):
+                result = self.command(copy=copy, runner_options=("--env", "NO_COLOR", "--env", "TERM", "--env", "TERM_PROGRAM"))
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assert_wire("passed", "")
+                remote = shlex.split(self.events_for("ssh")[-1]["args"][-1])
+                for name in ("NO_COLOR", "TERM", "TERM_PROGRAM"):
+                    self.assertIn(name + "=" + self.environment[name], remote)
+
+    def test_mac_nextest_clears_target_values_before_applying_call_values(self) -> None:
+        request = offload.OffloadRequest(
+            self.repository, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify",
+            holder_session="fixture-session", fetch=offload.FetchFolder("output"),
+            environment=(("CLICOLOR", "call-value"),))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            config = offload.read_config(self.config_path)
+            remote = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+            mirror = self.root / offload.remote_mirror(offload.KnownRepository("hana"))
+        mirror.mkdir(parents=True, exist_ok=True)
+        lint = self.root / ".claude/scripts/lint/lint"
+        lint.parent.mkdir(parents=True, exist_ok=True)
+        capture = self.root / "received-environment.json"
+        self.write_executable(lint, "import json, os\nfrom pathlib import Path\n"
+                              + f"Path({str(capture)!r}).write_text(json.dumps(dict(os.environ)))\n")
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, "-c", remote], cwd=self.root, env={
+                    **self.environment, "HOME": str(self.root), "PATH": os.environ["PATH"],
+                    "NO_COLOR": "target-value", "HANA_TARGET_ONLY": "target-value",
+                    "CLICOLOR": "target-value", "LC_TERMINAL": "target-terminal",
+                }, capture_output=True, text=True, check=False, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                observed = cast(dict[str, str], json.loads(capture.read_text()))
+                self.assertNotIn("NO_COLOR", observed)
+                self.assertNotIn("HANA_TARGET_ONLY", observed)
+                self.assertEqual(observed["CLICOLOR"], "call-value")
+                self.assertEqual(observed["LC_TERMINAL"], "target-terminal")
+
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(
             "generated/\n", encoding="utf-8"

@@ -508,6 +508,25 @@ or invalid value warns and uses the newest valid committed value; without a
 usable revision, `findings.py` lists the problems and exits 2 before running
 the command. `CONF_DIR` selects the fixture folder in tests.
 
+The test environment policy has three keys:
+
+- `VERIFY_RESULT_ENV_NAMES` names exported values that change test results.
+  The default names are `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, and `LANG`.
+  The locale names are `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`.
+  The list also includes `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, and `LC_TELEPHONE`.
+- `VERIFY_RESULT_ENV_PREFIXES` selects exported values by prefix.
+  The default prefixes are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
+  `LC_TERMINAL` and `LC_TERMINAL_VERSION` do not enter the key.
+- `VERIFY_TEST_FIXED_ENV` sets terminal values for each test, including the test step of `final`.
+  The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+
+`scripts/direct/result_environment.py` reads these keys through `conf.read` at use.
+The existing feature reader supplies the policy to Bash without another Python start.
+Test verdict keys include selected values and configured fixed values.
+Unset values differ from empty values.
+The new inputs do not change build keys or other command keys.
+Mac and SSH nextest runs receive the same values, including copy runs.
+
 ## dailies.conf
 
 The counts each production's dailies show on one line above the chart, in

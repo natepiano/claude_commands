@@ -54,7 +54,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.edit_source()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
-        self.assertEqual(len(cancellation_lines(output + errors, "test")), 1)
+        self.assertEqual(len(cancellation_lines(output + errors, "test")), 1, output + errors)
         self.assertEqual(sorted(waiters.iterdir()), [peer_entry], "cancel left its reacquisition entry")
         self.assertEqual((lock / "holder_pid").read_text(), str(holder.pid), "cancel released a peer's claim")
         self.assertIsNone(holder.poll(), "cancel killed its peer")

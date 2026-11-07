@@ -21,12 +21,14 @@ import unittest
 from unittest import mock
 
 if TYPE_CHECKING:
+    from ..copies.copies_test_support import copies_environment
     from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     from . import linux_runner, mac_test, offload, test_target_slots
     from .offload_test_support import mirror_use_payload
     from ..lint import sweep
     from ..lint.memory_test_support import write_config_fixture
 else:
+    from scripts.copies.copies_test_support import copies_environment
     from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     import linux_runner
     import mac_test
@@ -299,6 +301,29 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(evaluations[0]["inputs"], ["flake.lock", "flake.nix", "nix/shell.nix"])
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
+
+    def test_forwarded_test_environment_survives_the_development_shell(self) -> None:
+        _ = write_config_fixture(self.root / "direct.conf")
+        values = {"NO_COLOR": "1", "TERM": "xterm-256color", "COLORTERM": "truecolor",
+                  "TERM_PROGRAM": "verify", "COLUMNS": "80", "LINES": "24"}
+        self.environment.update(copies_environment(self.root))
+        self.environment["FAKE_NIX_EXPORTS"] = "\n".join(
+            "export " + name + "=shell-value"
+            for name in (*values, "CLICOLOR", "HANA_TARGET_ONLY", "LC_TERMINAL"))
+        capture = self.mirror / "received-environment.json"
+        lint = self.root / ".claude/scripts/lint/lint"
+        original = lint.read_text()
+        _ = lint.write_text(original.replace("tool = Path(sys.argv[0]).name",
+            "Path(" + repr(str(capture)) + ").write_text(json.dumps(dict(os.environ)))\n"
+            + "tool = Path(sys.argv[0]).name"))
+        request = replace(self.request(), environment=tuple(values.items()))
+        result = self.execute(request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads(capture.read_text()))
+        self.assertEqual({name: observed[name] for name in values}, values)
+        self.assertNotIn("CLICOLOR", observed)
+        self.assertNotIn("HANA_TARGET_ONLY", observed)
+        self.assertEqual(observed["LC_TERMINAL"], "shell-value")
 
     def test_pinned_selection_reaches_the_remote_step_environment(self) -> None:
         with mock.patch.dict(os.environ, {"BUILDLOG_PINNED_TARGET": "aws"}):

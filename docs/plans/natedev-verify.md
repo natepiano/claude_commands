@@ -1198,133 +1198,32 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41g — One form for every verify command  · status: done
 
-**Depends on:** Phase 41d.
+#### As-built
 
-#### Work Order
-
-**Source:** the user's "go" on C1149, through builds, 2026-11-06. "One owner switches all callers. No alias for the old forms."
-
-**Goal:** every command of `verify.sh` takes one form, `verify <command> [<package>] [flags]`. No package means the whole workspace. Each caller uses this form in this phase.
-
-**Spec:**
-
-1. One function parses the form, beside `parse_routing_arguments`. It takes at most one positional word, a package name. An empty package means the whole workspace. A second positional word prints the usage and exits 2.
-2. A package keeps the meaning that the command gives it today. Do not narrow a Cargo selection: `check` and `build` keep `--workspace`, and a named package still owns the feature names without a slash. Feature unification across the workspace is why, and a narrower selection costs rebuilds.
-3. Each command under the form:
-   - `check [<package>]`, `build [<package>]`: with no package, feature names pass unchanged.
-   - `test [<package>] [--test <name>]`: with no package, nextest runs the workspace. `--test <name>` replaces the positional integration test.
-   - `lint [<package>] [--check]`: with no package, it does what `lint --workspace` does today. `--workspace` is removed. `--check` works with or without a package.
-   - `doc [<package>]`: the run stays the whole staged workspace, and the pass record does not change. A package owns the feature names, as in `check`.
-   - `example [<package>] [--name <name>]`: `--name` replaces the positional name. With no name, Clippy runs on all examples of the package, or of the workspace when no package is given. With a name and no package, the member that has the example supplies its required features.
-   - `final [<package>] [--saved] [--tree <tree>]`: with a package, the check stays whole-workspace and nextest runs that package, and no pass is saved. `--saved` replaces `final-pass`, with the same answer and exit status. `--tree` is valid only with `--saved`.
-4. Remove `final-pass`, `lint --workspace`, the positional example name and the positional integration test. Add no alias. An old form exits 2 and prints a usage line that names the new form, so a worker with a stale prompt corrects itself in one step (builds, 2026-11-06).
-5. A record with no package names `workspace` as its package. `scripts/buildlog/record.py` writes the record: it reads the package from the parsed form, not from the first word, so `check --features foo` records `workspace` and `final <package>` records its package. `scripts/buildlog/index.py`, `scripts/buildlog/report.py`, `scripts/buildlog/mac_outcome.py` and `scripts/build_queue/step_estimator.py` read that word. Select through the existing `WorkspacePackages` and `NamedPackage` types of `scripts/direct/step_record.py`. Keep the display words apart from the Cargo and cache selectors. A `test` with no package counts as a gate run in memory admission, and the estimator uses the workspace figure.
-6. `scripts/direct/verify_metadata.py` answers for a whole workspace: `test-targets` and `build-targets` with no package read every member, and `example-features` with no package finds the member that has the example. `require_package` stays for a named package.
-7. A workspace `test` with a `linux_only` member does not run on the Mac. The check at `scripts/mac_test/offload.py:2178` uses the existing `workspace_has_linux_only` when the package is empty, as the other verbs do. A regression test holds this.
-8. Update `verify --help` and `verify help <command>` to the form, under 80 columns.
-9. Switch every caller in the Files list, and each further caller that a search finds. A doc that states a form states the new form, also `<package>` as `[<package>]`. Do not change `docs/plans`. Search `~/rust/nate_style` also, and name each hit outside this repository in the summary. Keep the script path `~/.claude/scripts/direct/verify.sh`: the permission rules name it.
+- Every `verify.sh` command takes one form: `verify <command> [<package>] [flags]`. No package means the whole workspace. `parse_command_arguments` parses it, beside `parse_routing_arguments`.
+- Command forms: `check [<package>]`, `build [<package>]`, `test [<package>] [--test <name>]`, `lint [<package>] [--check]`, `doc [<package>]`, `example [<package>] [--name <name>]`, `final [<package>] [--saved] [--tree <tree>]`.
+- A package keeps the meaning that the command gave it before: `check` and `build` stay `--workspace`, and a named package owns the feature names without a slash.
+- `final <package>` runs the whole-workspace check and that package's nextest, and saves no pass. `final --saved` gives the answer and status of the old saved-pass command.
+- The removed forms are the old saved-pass command, `lint --workspace`, the positional example name and the positional integration test. Each exits 2 and prints a usage line that names the new form. No alias exists.
+- A record with no package names `workspace`. `scripts/buildlog/record.py` reads the package from the parsed form. A `test` with no package counts as a gate run in memory admission.
+- `verify_metadata.py` answers for a whole workspace. A workspace `test` with a `linux_only` member does not run on the Mac.
+- Each caller and doc uses the form. The script path stays `~/.claude/scripts/direct/verify.sh`.
+- This phase changed no route.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/verify_metadata.py`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/test_offload.py`
-- `scripts/production/merge_checkpoint.py`
-- `scripts/buildlog/record.py`
-- `scripts/buildlog/index.py`
-- `scripts/buildlog/mac_outcome.py`
-- `scripts/buildlog/report.py`
-- `scripts/build_queue/step_estimator.py`
-- `scripts/direct/final_pass.py`
-- `scripts/hooks/checkpoint_gate.py`
-- `scripts/hooks/post-tool-use-fn-length.py`
-- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py`
-- `scripts/lint/invoke.sh`
-- `scripts/lint/lint_config.sh`
-- `scripts/style/add_style.py`
-- `scripts/style/bulk_run.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/agents/test_mesh_runs.py`
-- `scripts/berth/tests/test_work_order.py`
-- `scripts/buildlog/test_mac_idle.py`
-- `scripts/buildlog/test_report.py`
-- `scripts/direct/test_mesh_tree_cancel.py`
-- `scripts/direct/test_verify_final_pass_commits.py`
-- `scripts/direct/test_verify_final_pass_compiler.py`
-- `scripts/direct/test_verify_final_pass_edits.py`
-- `scripts/direct/test_verify_final_pass_failure.py`
-- `scripts/direct/test_verify_final_pass.py`
-- `scripts/direct/test_verify_final_pass_records.py`
-- `scripts/direct/test_verify_final_pass_script.py`
-- `scripts/direct/test_verify_final_pass_staged.py`
-- `scripts/direct/test_verify_final_pass_unstaged.py`
-- `scripts/direct/test_verify_final_pass_untracked.py`
-- `scripts/direct/test_verify_token_detach.py`
-- `scripts/direct/test_verify_tree_cancel_history.py`
-- `scripts/direct/test_verify_verbs.py`
-- `scripts/direct/verify_examples_test_support.py`
-- `scripts/direct/verify_final_pass_test_support.py`
-- `scripts/hooks/test_build_hold_guard.py`
-- `scripts/hooks/test_checkpoint_doc_gate.py`
-- `scripts/lib/test_process_group.py`
-- `scripts/production/test_merge_checkpoint_validation.py`
-- `scripts/production/test_unit_phases.py`
-- `scripts/style/style_plan_test_support.py`
-- `scripts/style/test_bulk_run.py`
-- `scripts/style/test_crate_run.py`
-- `scripts/style/test_style_sync.py`
-- `commands/build/hold.md`
-- `commands/build/mac.md`
-- `commands/lint_config.md`
-- `commands/plan/to_phased_plan.md`
-- `commands/producer/to_production.md`
-- `commands/release.md`
-- `commands/unit/checkpoint.md`
-- `commands/unit/direct.md`
-- `config/lint.conf`
-- `config/README.md`
-- `docs/as-built/build-followups-fn-length-hook.md`
-- `docs/as-built/build-followups.md`
-- `docs/as-built/build-followups-mul-add.md`
-- `docs/as-built/buildlog-memory-stalls.md`
-- `docs/as-built/buildlog-tests-per-edit-rust-release.md`
-- `docs/as-built/build-memory-admission.md`
-- `docs/as-built/builds-aws-target.md`
-- `docs/as-built/build-targets.md`
-- `docs/as-built/gate-checkouts.md`
-- `docs/as-built/mac-test-offload.md`
-- `docs/as-built/merge-gate-and-test-speed.md`
-- `docs/as-built/nextest-width-and-lint-scope.md`
-- `docs/as-built/phase-checks.md`
-- `docs/as-built/rustdoc-once-and-final-targets.md`
-- `docs/as-built/showrunner-automation.md`
-- `docs/as-built/style-showrunner.md`
-- `docs/direct/final_gate_commit.md`
-- `docs/direct/phase_checks.md`
-- `docs/direct_plan_format.md`
-- `docs/direct/write_prompt_contract.md`
-- `docs/production_format.md`
-- `docs/style_production.md`
-- `scripts/build_targets/working_set_owners.json`
+- `scripts/direct/verify.sh` — `parse_command_arguments`, the commands and the help text.
+- `scripts/direct/verify_metadata.py` — workspace answers.
+- `scripts/buildlog/record.py` — the package word of a record.
+- `scripts/mac_test/offload.py` — the `linux_only` check with an empty package.
+- `scripts/production/merge_checkpoint.py`, `scripts/style/style_sync.py` and the other callers — the new form.
+- `scripts/direct/test_verify_verbs.py` — each removed form and its usage line.
+- `commands/unit/direct.md`, `config/README.md`, `docs/as-built/` and the other docs — state the form.
 
-**Workers:** 2 writers: merge16 holds `scripts/`, fix16 holds every other path.
+**Gotchas:**
+- The Phase 41c function move turned two tests with a DEBUG trap red, because a trap without functrace does not enter a function. Repaired in `test_verify_token_mac_step.py` and `test_verify_lint_local_writes.py`. A move of a `verify.sh` function reaches each test whose trap watches its commands: search `trap .* DEBUG` and `BASH_COMMAND`.
+- `verify_mac_offload_test_support.py` keeps its trap without functrace: `route_test` is a top-level call for `test`.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- natest changes `test_verify*` modules at the same time. Change only the form words in those modules. Tell the director each module you change, so that natest can have the list.
-- Phase 41d: keep `parse_routing_arguments` callable through `shell_functions`.
-- Phases 29, 37 and 41c: this phase changes no route. Each command runs where it runs today.
-
-**Acceptance gate:**
-- A real `verify.sh` call on a tempdir workspace with no package runs `check`, `test` and `lint` over the workspace, and `test_verify_verbs.py` holds each removed form with exit 2.
-- `check --features foo` records `workspace`, and `final <package>` records that package and saves no pass.
-- A workspace `test` with a `linux_only` member answers `linux_only` from `mac_step_eligibility`.
-- Each removed form exits 2 and prints its new form.
-- `final --saved` gives the same answer and status as `final-pass` gave, in the `test_verify_final_pass*` modules.
-- A search of the repository, outside `docs/plans`, finds none of the removed forms.
-- The modules that the writers change pass, and basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
-
-### Phase 41i — A saved test pass holds the environment that changes test results  · status: todo
+### Phase 41i — A saved test pass holds the environment that changes test results  · status: done
 
 **Depends on:** Phase 41g.
 
@@ -1337,8 +1236,8 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Spec:**
 
 1. In `scripts/direct/tree_watch.py`, for the `test` command, the verdict key and the tree content key also hold each set variable named by two new keys in `config/direct.conf`, read at use:
-   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`.
-   - `VERIFY_RESULT_ENV_PREFIXES`: `LC_`, `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
+   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, and each locale category: `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, `LC_TELEPHONE`. `LC_TERMINAL` and `LC_TERMINAL_VERSION` change per pane and stay out.
+   - `VERIFY_RESULT_ENV_PREFIXES`: `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
    - `RUST_LOG` and the other `RUST` names already reach the key.
    - The build key does not change: a changed value reruns tests and rebuilds nothing. Each other command's key does not change.
    - An unset name and an empty name differ.
@@ -1348,15 +1247,29 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 4. The `verify.sh` header comment and `docs/as-built/mac-test-offload.md` state the rule. Correct each other doc line that the search for the saved-result key finds wrong.
 
 **Files:**
-- `scripts/direct/tree_watch.py`
-- `scripts/direct/verify.sh`
-- `scripts/mac_test/offload.py`
-- `scripts/direct/test_verify_build_key.py`
-- `scripts/direct/test_verify_result_environment.py`
-- `scripts/mac_test/test_offload.py`
 - `config/direct.conf`
 - `config/README.md`
 - `docs/as-built/mac-test-offload.md`
+- `scripts/direct/result_environment.py`
+- `scripts/direct/tree_watch.py`
+- `scripts/direct/verify.sh`
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/linux_runner.py`
+- `scripts/mac_test/copy_watch.py`
+- `scripts/buildlog/record.py`
+- `scripts/direct/test_verify_build_key.py`
+- `scripts/direct/test_verify_result_environment.py`
+- `scripts/direct/test_verify_mac_only.py`
+- `scripts/direct/test_verify_tree_cancel_reacquire.py`
+- `scripts/direct/test_verify_token_reclaim.py`
+- `scripts/mac_test/test_offload.py`
+- `scripts/mac_test/test_linux_runner.py`
+- `scripts/mac_test/test_offload_forward.py`
+
+**Gate repairs (builds, 2026-11-06, tip 2d040a08c):**
+- `scripts/buildlog/record.py` no longer imports `step_record`, so a row id loads no `tempfile` module. The package field is the package name or `workspace`.
+- The token renewer trap in `verify.sh` stops each background job and waits, so a stop between `sleep &` and the pid read leaves no live `sleep`. `test_stop_before_reading_the_sleep_pid_leaves_no_live_sleep` forces that stop.
+- `test_offload_forward.py` follows Spec item 3: a copy run with `--env` is no longer refused, and the byte test finds the forwarded values after the clear line. `test_named_environment_reaches_the_remote_copy_command` shows a copy run carries the value.
 
 **Workers:** fix16 holds all files, in its own tree.
 
@@ -1372,7 +1285,41 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - A real `verify.sh test` call that reaches a fake Mac runner under `NO_COLOR=1` shows `NO_COLOR=1` in the remote command, and a call that reaches a fake SSH runner shows it too.
 - A second call with a different `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` or `LINES` reuses the pass. The fake cargo on natedev, and the remote command on the fake Mac and SSH runners, show the fixed values and not the call's values.
 - `test_verify_build_key.py`: `NO_COLOR` changes the verdict key and not the build key. A `check` key does not change with `NO_COLOR`.
-- The modules that read the key pass. No assertion changes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+- The modules that read the key pass. Assertion changes, all from item 3: `test_verify_mac_only.py` expected the forwarded map to hold only the user's `--env` name; it now holds that name and the automatic values, and the comparison stays a whole-map comparison. `test_offload_forward.py` drops the refused `--env ... --copy` case, and its byte test finds the three forwarded values after the clear line instead of at a fixed index. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41j — A stop leaves no Mac log file  · status: todo
+
+**Depends on:** Phase 41i.
+
+#### Work Order
+
+**Source:** fix16's check run in phase 41i, 2026-11-06. Builds placed it after the 41i tip and before 41h, 21:35 EST.
+
+**Goal:** a signal during a Mac or SSH step leaves no temp log file, under any load.
+
+**Defect:** `verify.sh` starts `tee "$MAC_LOG_FILE"` and `tee -a "$MAC_LOG_FILE"` as process substitutions. Under load a tee can open the file after `forward_mac_runner_signal` removes it, so the name comes back and one temp file stays. Forced proof on 8b5df1f3f: a one-second delay before tee fails `test_signal_before_runner_start_removes_result_without_local_work` 3 of 3. Seen once without force; a rerun passes.
+
+**Spec:**
+
+1. The parent shell opens the Mac log file once, on a file descriptor, before it starts the runner. Both tee processes write through `/dev/fd/<N>` of that descriptor, so a late tee creates no name.
+2. Each place that removes `MAC_LOG_FILE` also closes the descriptor. The pass record reads the same file as today.
+3. A regression test delays tee start (the forced form of the proof) and shows that a stop leaves no temp file. It fails on the old code.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/direct/test_verify_mac_signal_boundaries.py`
+
+**Workers:** 1 writer, in its own tree from the builds tip that holds 41i.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time.
+- A move of a `verify.sh` function reaches each test whose DEBUG trap watches its commands. Search `trap .* DEBUG` and `BASH_COMMAND`, and run those modules.
+- Phase 41h edits `verify.sh` in another tree. Merge whichever lands second.
+
+**Acceptance gate:**
+- The new test fails on the old code and passes on the new code.
+- `test_verify_mac_signal_boundaries.py` and the other Mac step modules pass. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
@@ -1405,7 +1352,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
    | `build` | `build` (new) | `build` |
    | `final` | `check`, `nextest` | `check`, `test` |
 
-   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. **Held edit:** do not change the `kinds` line of `config/aws_target.conf` or its text in `config/README.md` in this edit round. The change would add `lint`, `example` and `build`. builds asked the user on 2026-11-06: approve, pinned only, or no. The director applies the answer as a separate edit. Until then a Linux target with today's `kinds` answers "target does not permit this command" for those steps, and no test reads the live `kinds` line. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
+   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. **Kinds edit:** the user approved it on 2026-11-06 ("approve"). `config/aws_target.conf` reads `kinds=test,check,doc,lint,example,build`, and `config/README.md` states that value. A `build` or `final` still goes to AWS only when pinned. No test reads the live `kinds` line. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
 5. `build` on another target prints `binary: <target>:<path>`.
 6. A pinned `final` runs both steps on the target, keeps the clean tree check, and saves no pass: a saved pass answers only for this machine. An unpinned `final` keeps `final_pass.py` unchanged, with its clean tree and compiler identity. Name this rule in the as-built.
 7. Update `verify help <command>`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md`.

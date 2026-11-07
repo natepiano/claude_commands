@@ -493,12 +493,18 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
+                   test_environment: tuple[tuple[str, str], ...] = (),
+                   clear_environment: str = '') -> str:
     arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
         arguments.extend(['--repo-identity', repo_identity])
+    for name, value in test_environment:
+        arguments.extend(['--env', name + '=' + value])
+    if clear_environment:
+        arguments.extend(['--clear-environment', clear_environment])
     arguments.extend(['--', *words])
     return shlex.join(arguments)
 
@@ -622,12 +628,14 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     if permission_refused(values):
         return 75
     try:
         with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -690,7 +698,9 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
 
 
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     if verb not in ('nextest', 'check', 'doc'):
         raise ValueError('Linux targets accept only test, check and doc')
     if verb == 'nextest':
@@ -728,6 +738,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),
     }
+    if verb == 'nextest':
+        environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
     if repo_identity:
@@ -762,6 +774,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
                + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                + '\n'.join(parity) + '\n'
+               + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
                + f'export {assignments}\n')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
@@ -801,6 +814,8 @@ class RunnerArguments(argparse.Namespace):
         self.call_id: str = ''
         self.tree_key: str = ''
         self.repo_identity: str = ''
+        self.environment: list[str] = []
+        self.clear_environment: str = ''
         self.words: list[str] = []
 
 
@@ -817,6 +832,8 @@ def main() -> int:
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
     _ = runner.add_argument('--repo-identity', default='')
+    _ = runner.add_argument('--clear-environment', default='')
+    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -828,7 +845,10 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key, arguments.repo_identity)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity,
+               tuple((name, value) for entry in arguments.environment
+                     for name, _, value in (entry.partition('='),)),
+               arguments.clear_environment)
 
 
 if __name__ == '__main__':

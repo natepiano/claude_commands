@@ -97,7 +97,6 @@ else:
     )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.direct.step_record import NamedPackage, WorkspacePackages
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
@@ -1127,13 +1126,12 @@ def call(args: list[str]) -> None:
     outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
     words = args[9:]
     package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
-    selection = NamedPackage(package_name) if package_name else WorkspacePackages()
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
         "command": " ".join([verb, *words]),
         "verb": verb,
-        "package": selection.name if isinstance(selection, NamedPackage) else "workspace",
+        "package": package_name or "workspace",
         "outcome": outcome,
         "status": optional_int(status),
         "cached": cached == "1",

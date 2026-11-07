@@ -234,13 +234,26 @@ A Mac-only call never runs on natedev, takes a local build token, enters memory 
 TERM, INT and HUP end the wait and record the caller's signal.
 
 `--env NAME` and `--fetch <folder>` require `--mac`. These flags can appear anywhere after the verb.
-Verify removes them before constructing Cargo arguments, cache keys and call records.
+Verify removes these flags before constructing Cargo arguments and call records.
+Test verdict keys include each `--env` value. Build keys exclude these values.
 Variable names must be valid and exported by the caller. Empty values are allowed.
 Verify saves the caller's values before assigning its own variables. A pipe transfers the values to Python without placing them on argv.
 The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `RUSTDOCFLAGS` at the verify interface.
 It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
 The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
 One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
+Each test uses the terminal values from `VERIFY_TEST_FIXED_ENV` in `config/direct.conf`.
+The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+The rule includes local tests and the test step of `final`.
+Test keys hold configured fixed values, instead of the caller's terminal values.
+
+`VERIFY_RESULT_ENV_NAMES` and `VERIFY_RESULT_ENV_PREFIXES` select other exported values for test verdict and tree content keys.
+Unset and empty values differ. These new inputs leave build keys and other command keys unchanged.
+A remote nextest run clears each selected name the call did not set, then applies the call's values.
+Mac and SSH nextest runs receive these values and `RUST_LOG`, `RUST_BACKTRACE`, and `RUST_LIB_BACKTRACE`.
+The same rule applies to unpinned runs, `--mac`, `--target`, and copy runs.
+Other remote verbs receive no new values.
+
 A Mac-only call reuses only a Mac pass. Forwarding or fetch disables cache reads and writes.
 If tests pass but fetch fails, the call exits 2 and retains the Mac pass evidence.
 A test failure retains the runner's status. No forwarded name, value or folder is added to the build log.
