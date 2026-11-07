@@ -308,3 +308,9 @@ From the sdlc showrunner, 2026-11-06. Devtools 7u replaced the production slug w
 From the sdlc showrunner, 2026-11-06, rca 261106-1. Separate hash, on branch `sdlc-fix-rounds-publish`, from sdlc. Add no new check.
 
 `scripts/lib/main_publish.commit` runs `git commit --only`. A stale `.git/MERGE_RR.lock` made git exit nonzero after it wrote the commit, because rerere runs after the commit. `commit` took that as no commit, restored the old file text and said the value was unchanged. HEAD held `SIMPLIFY_LENS=off`, the live file said on, the commit was not pushed, and every main promotion refused. The fix compares HEAD before and after: when HEAD moved, the commit exists, so the new file stays and the push goes on.
+
+### Phase 9x — A push that cannot merge origin/main leaves the checkout as it was  · status: done
+
+From the sdlc showrunner, 2026-11-06: "merge_checkpoint.py at push merged origin/main into sdlc, hit a conflict in 3 files, and left the showrunner checkout mid-merge. It must abort the merge on a conflict, leave the checkout as it was, and print a held line that names the files."
+
+Cause: `push_git` aborts its origin/main merge only when `may_undo` is true. `refresh_pushed_tip` calls it with false, so a conflict leaves the merge in place. The merge is `push_git`'s own step, so `push_git` aborts it on every failure, then holds with the conflicted paths.
