@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import final, override
 
-import crates_io_pacer
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 @final

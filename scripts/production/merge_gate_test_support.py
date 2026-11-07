@@ -17,7 +17,6 @@ from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
@@ -136,7 +135,9 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), os.environ.get("MERGE_GATE_TEST_PYTHONPATH"))
+            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         death = state / ("signal-" + suite)
@@ -472,6 +473,9 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
         self.write(self.checkout / "scripts/test_times/module_run.py",
                    (SCRIPT.parents[1] / "test_times/module_run.py").read_text())
+        shim = self.checkout / "scripts/lib/py"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:
@@ -565,11 +569,13 @@ class MergeGateFixture(unittest.TestCase):
                    + "raise SystemExit(merge_gate.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]
 
-    def run_promote_only(self) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+             "--ssh", str(self.bin / "ssh"),
+             *([] if "--production" in extra else ["--production", "quiet"]), *extra],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def calls(self) -> list[ToolCall]:
@@ -620,7 +626,11 @@ class MergeGateFixture(unittest.TestCase):
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"
-        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n"
+                   + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
+                   + "- **Merge branch:** `integration`\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
         return review, doc
 
     def publish_for_promotion(self) -> merge_gate.GateArguments:

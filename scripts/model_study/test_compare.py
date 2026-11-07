@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-from turns import Compaction, Turn
+from scripts.model_study.turns import Compaction, Turn
 
 
 SCRIPT = Path(__file__).with_name("model_study.py")

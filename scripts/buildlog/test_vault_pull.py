@@ -19,12 +19,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-import cli
-import conf
-import rust_release
-import sync
-import vault_pull
-from test_index import point_root_at
+from scripts.buildlog import cli
+from scripts.lib import conf
+from scripts.buildlog import rust_release, sync, vault_pull
+from scripts.buildlog.test_index import point_root_at
 
 if TYPE_CHECKING:
     from ..notify.push_texts import RenderedPush

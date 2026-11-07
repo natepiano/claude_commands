@@ -7,11 +7,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from compare import ComparisonReport
-from phases import PhaseReport
-import report
+from scripts.model_study.compare import ComparisonReport
+from scripts.model_study.phases import PhaseReport
+from scripts.model_study import report
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 MAX_JSON_BYTES = 300_000
 QUESTION = "Do Sonnet directors keep their turn time, tokens and work per phase against Opus?"

@@ -20,39 +20,21 @@ import sys
 import tempfile
 import time
 import threading
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import override_guard
-import build_hold
-import offload
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-from user_zone import user_zone
+from scripts.build_hold import override_guard
+from scripts.build_hold import build_hold
+from scripts.mac_test import offload
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone
 
-if TYPE_CHECKING:
-    from ..message import session_send
-    from ..lib import process_start as process_identity
-    from ..build_targets import target_config
-    from ..build_targets.target_config import ConfigError
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
-    from scripts.message import session_send
-    import target_config
-    from target_config import ConfigError
-
-
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
-
+from scripts.message import session_send
+from scripts.lib import process_start as process_identity
+from scripts.build_targets import target_config
+from scripts.build_targets.target_config import ConfigError
+from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -878,7 +860,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 
 def start_hold_recorder(event: MacBlockEvent) -> None:
-    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
                "hold-event", event.kind, event.target, timestamp(event.block.since), event.block.holder, event.block.reason,
                timestamp(event.at.astimezone(timezone.utc)), timestamp(event.block.expires)]
     try:
@@ -1064,7 +1046,7 @@ def delivery_target(delivery: MessageDelivery) -> str:
     try:
         result = subprocess.run(
             [
-                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "lib/py"),
                 str(sessions_script),
                 "socket",
                 f"session:{delivery.name}",
@@ -1568,7 +1550,7 @@ def start_watcher(paths: StatePaths) -> None:
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
         *environment,
-        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).resolve()),
         "watch",
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
@@ -1604,7 +1586,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
         "--unit", f"mac-test-claim-watch-{os.getpid()}", "--", "/usr/bin/env",
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
-        *environment, sys.executable, str(Path(__file__).resolve()), "watch-claim",
+        *environment, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "watch-claim",
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
     try:
@@ -1775,7 +1757,7 @@ def watch_claim(
         + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
         + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
         + "Claim it again before your next Mac command: "
-        + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
+        + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
         + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
     )
     print(text, flush=True)

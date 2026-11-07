@@ -17,8 +17,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import auto_silence
-import silence
+from scripts.notify import auto_silence
+from scripts.notify import silence
 
 if TYPE_CHECKING:
     from ..lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt

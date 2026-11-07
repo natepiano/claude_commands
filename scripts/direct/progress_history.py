@@ -302,7 +302,7 @@ PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
 PASS_OWNERSHIP_RULE = (
-    "Pass lifecycle belongs to the launchers. assign.sh and the implement.sh or "
+    "Pass lifecycle belongs to the launchers. assign.py and the "
     "review.sh it runs record pass_started and pass_finished. findings.py gate "
     "counts these passes for convergence. Manual pass records can falsely stop "
     "a run. Launch the work through assign.sh. Exception: if the unit director "
@@ -984,27 +984,17 @@ def _ensure_project_timing(
     return state
 
 
-# The worker this launcher occupies in its phase team, exported by implement.sh
-# before it calls start-pass. A phase runs two launchers against one state
-# file and each records its own pass, so this is the key their windows are kept
-# apart under -- without it a team phase and a solo phase produce identical rows.
-#
-# The variable says role and its value is a worker: `impl` and `test` name the
-# two chairs, not the work done in them. Both workers can be implementing at one moment and reviewing at another; the role a worker holds
-# right now lives on the coordination board, which records it as a `handoff` and
-# never writes it here. Reading the value as a role is the mistake this comment
-# exists to stop -- the variable is the half with the wrong name, and it stays
-# that way because implement.sh exports it.
+# assign.py exports the worker slot before it records a pass.
+# Each launcher records its pass under that slot.
+# The slot stays fixed when the worker's role changes on the board.
 TEAM_SLOT_ENV = "UNIT_TEAM_ROLE"
 
 
 def _team_slot() -> str:
-    """The recording member's worker, empty when nothing named one.
+    """Return the recording worker's slot.
 
-    Empty is a worker like any other rather than a missing value: passes predating
-    the field, and every recorder that does not run through implement.sh --
-    review.sh included -- record under it, and must stay distinguishable from a
-    launcher that really is sitting in `impl`.
+    Earlier passes and recorders that omit a slot use the empty slot.
+    Keep them separate from a launcher that records the `impl` slot.
     """
     return os.environ.get(TEAM_SLOT_ENV) or os.environ.get("PLAN_DELEGATE_TEAM_ROLE", "")
 
@@ -2738,8 +2728,7 @@ RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ET
 # board caps a post far higher than a terminal line can hold, and a wrapped
 # narration costs the reader the three-line scan the note exists to give.
 BOARD_NOTE_CHARS = 72
-# What implement.sh puts in front of the `done` and `blocked` it posts on the
-# worker's exit, so the note can tell the launcher's line from the worker's own.
+# assign.py prefixes its final `done` and `blocked` board lines with this text.
 LAUNCHER_PREFIX = "launcher:"
 # What a worker's own narration says when it is alive but not working: held up on
 # a peer's edit, on a token, on a gate. Nothing in the pass record separates that
@@ -3260,11 +3249,9 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
 
 
 def _launcher_authored(kind: str, message: str) -> bool:
-    """Whether a board line came from implement.sh rather than from the worker.
+    """Identify board lines that assign.py records.
 
-    The launcher writes two kinds of line: `register`, which is always its, and
-    a `done` or `blocked` on exit, which it prefixes `launcher:` so the note can
-    tell it from a `done` the worker posted itself.
+    The launcher records `register` lines and prefixes its final lines with `launcher:`.
     """
     return kind == "register" or message.startswith(LAUNCHER_PREFIX)
 
@@ -6787,9 +6774,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
     )
-    # Accepted and ignored: implement.sh and review.sh launchers started before
-    # 2026-10-15 18:00 EDT still pass it, since bash keeps the script it began
-    # with. Remove after 2026-10-22.
+    # Earlier shell launchers passed this option before 2026-10-15 18:00 EDT.
+    # Accept and ignore it for those recorded commands.
     _ = finish_pass.add_argument(
         "--agent-awake-seconds",
         default=argparse.SUPPRESS,

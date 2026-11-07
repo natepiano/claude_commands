@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from relay_identity import publish_relay_identity, relay_session_name
+from scripts.message.relay_identity import publish_relay_identity, relay_session_name
 
 
 def write_relay_record(state: Path, pid: int, sender: str) -> None:

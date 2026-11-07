@@ -25,9 +25,9 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 from scripts.production import staff, unit_names
 
 FENCE = "---"

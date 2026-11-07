@@ -19,11 +19,11 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
-import store
-import index as buildlog_index
-from memory_admit import expected_peak, git_identity, test_threads, read_memory_config
+from scripts.buildlog import store
+from scripts.buildlog import index as buildlog_index
+from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
 WASHOUT_S = 900

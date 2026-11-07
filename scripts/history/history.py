@@ -446,8 +446,8 @@ def _normalize(
         label=label,
         task=task,
         agent=agent,
-        # Empty on every pre-2026-08-31 pass and on any recorder outside
-        # implement.sh, so it groups as "-" rather than claiming a slot.
+        # Passes before 2026-08-31 have no slot.
+        # A recorder outside assign.py can omit the slot; history groups it as "-".
         # The one-day-old "team_role" spelling is not read: every event
         # written under it carried an empty value, so nothing is lost.
         slot=_string(event.get("team_slot")),

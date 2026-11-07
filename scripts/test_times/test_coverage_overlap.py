@@ -16,7 +16,6 @@ import textwrap
 from typing import TYPE_CHECKING, cast
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
@@ -174,8 +173,14 @@ class CoverageOverlapTests(unittest.TestCase):
                 (TOOL.with_name("line_collector.py"), tooling / "line_collector.py"),
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
+                *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
+                    "lib/py", "lib/conf.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "production/gate_modules.py", "test_times/module_run.py",
+                )),
             ):
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = shutil.copy2(source, destination)
+            _ = (root / "scripts/__init__.py").write_text("")
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
                 "config/test_times.conf": "COVERAGE_LEAF_PROGRAMS=git\n",
@@ -184,14 +189,14 @@ class CoverageOverlapTests(unittest.TestCase):
             for relative, source in sources.items():
                 destination = root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = destination.write_text(textwrap.dedent(source), encoding="utf-8")
+                _ = destination.write_text(textwrap.dedent(source).replace(
+                    "from product import", "from scripts.fixture.product import"), encoding="utf-8")
             output = root / "coverage.json"
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("GIT_", "NATEST_COVERAGE_"))}
             env.update({"HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                    "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-                   "PYTHONPATH": str(TOOL.parents[2]),
                    "COVERAGE_OUT": str(output)})
             _ = subprocess.run(
                 ["git", "init", "--quiet", str(root)], env=env, capture_output=True,
@@ -201,7 +206,7 @@ class CoverageOverlapTests(unittest.TestCase):
             patterns = sorted(Path(name).name for name in sources
                               if Path(name).name.startswith("test_") and Path(name).suffix == ".py")
             result = subprocess.run(
-                [sys.executable, str(tooling / TOOL.name), str(folder), *patterns], cwd=root, env=env,
+                [str(library / "py"), str(tooling / TOOL.name), str(folder), *patterns], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             yield result, output
@@ -1026,7 +1031,7 @@ class Inactive(unittest.TestCase):
             "outside.py": 'def outside() -> str:\n    return "outside"\n',
             "scripts/fixture/fixture_test_support.py": 'def support() -> str:\n    return "support"\n',
             "scripts/fixture/test_filter.py": PRELUDE + '''
-from fixture_test_support import support
+from scripts.fixture.fixture_test_support import support
 from outside import outside
 
 def helper_in_test() -> str:

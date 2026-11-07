@@ -7,7 +7,6 @@ import io
 import json
 import math
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -26,9 +25,6 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score.test_decide import choice_answer
 
 # proposals_table.py imports its production neighbors by bare name.
-PRODUCTION_DIR = str(Path(__file__).resolve().parents[1] / "production")
-if PRODUCTION_DIR not in sys.path:
-    sys.path.insert(0, PRODUCTION_DIR)
 from scripts.production.issues import Issue as ProposalIssue
 from scripts.production.proposals_table import proposal_score
 from scripts.lib import conf

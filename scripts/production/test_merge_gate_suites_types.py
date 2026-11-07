@@ -326,7 +326,7 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertNotIn("--priority", command)
 
     def test_off_disables_both_push_texts_at_use(self) -> None:
-        import push_texts
+        from scripts.notify import push_texts
 
         for run in (merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0),
                     GateRefused("runner failed")):
@@ -373,7 +373,7 @@ class NightlyPushTests(unittest.TestCase):
                         self.assertIn('"failed_modules": ["test/example"]', marker.read_text())
 
     def test_render_import_error_preserves_green_exit_and_marker(self) -> None:
-        import push_texts
+        from scripts.notify import push_texts
 
         run = merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
         marker = self.root / "state/full-required"
@@ -448,7 +448,7 @@ class NightlyPushTests(unittest.TestCase):
             self.assertIn("nightly.result", cast(list[str], sent.call_args.args[0]))
 
     def test_not_run_reason_removes_final_periods(self) -> None:
-        import push_texts
+        from scripts.notify import push_texts
 
         run = merge_gate.GateRun((), 0, 0)
         with self.execution(run) as sent, mock.patch.object(merge_gate, "nightly_git", side_effect=OSError("fetch\nfailed...")):
@@ -461,8 +461,8 @@ class NightlyPushTests(unittest.TestCase):
             self.assertIn("Why: fetch failed.", push_texts.render("nightly.not_run", **values).message)
 
     def test_not_run_reason_fits_the_message_limit(self) -> None:
-        import push_texts
-        from pushover import MESSAGE_MAX
+        from scripts.notify import push_texts
+        from scripts.notify.pushover import MESSAGE_MAX
 
         run = merge_gate.GateRun((), 0, 0)
         with self.execution(run) as sent, mock.patch.object(merge_gate, "nightly_git", side_effect=OSError("word\n" * 2000)):

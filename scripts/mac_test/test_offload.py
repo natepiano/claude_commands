@@ -24,20 +24,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 else:
-    from memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-import offload
+from scripts.mac_test import offload
 if TYPE_CHECKING:
     from ..build_targets import target_config
     from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
-    import target_config
-    import sync as buildlog_sync
-    import health as buildlog_health
-    import record as buildlog_record
-    import store as buildlog_store
-import conf
-from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+    from scripts.build_targets import target_config
+    from scripts.buildlog import sync as buildlog_sync
+    from scripts.buildlog import health as buildlog_health
+    from scripts.buildlog import record as buildlog_record
+    from scripts.buildlog import store as buildlog_store
+from scripts.lib import conf
+from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
