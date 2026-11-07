@@ -10,20 +10,19 @@ import io
 import json
 import os
 import socket
-import sys
 import unittest
 from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import fake_unit_host
-import production_lifecycle
+from scripts.production import fake_unit_host
+from scripts.production import production_lifecycle
 from scripts.production import showrunners
-import showrunner_tree
-from fake_unit_host import HostedUnit
+from scripts.herdr import worker_panes
+from scripts.shutdown import stop_resume
+from scripts.production import showrunner_tree
+from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import staff, unit_config
@@ -214,11 +213,14 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_rerun_after_showrunner_retirement_keeps_the_release_capture(self) -> None:
         self.finish_interrupted_wrap(True)
 
-    def test_wrap_with_workers_retires_pending_ids_on_an_already_wrapped_retry(self) -> None:
+    def test_wrap_keeps_stopped_worker_rows(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         worker = fixture_member("worker", name="impl1", parent=alpha.id)
-        result = self.run_lifecycle("wrap", "--no-ci")
+        with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]) as stops,
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.StoppedWorker(worker, "pane", "terminal")])):
+            result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(any(call.args[0] == alpha.id for call in stops.call_args_list))
         self.assertIn(worker.id, result.stdout)
         self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree("natedev", self.alpha)))
         self.assertEqual(staff.by_id(worker.id), worker)
@@ -1121,7 +1123,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(owner_after_wrap.id, runner.id)
 
     def test_wrap_reuses_its_staff_context_for_question_cleanup(self) -> None:
-        from update_registration import QuestionStaff
+        from scripts.production.update_registration import QuestionStaff
 
         with mock.patch.object(QuestionStaff, "read", side_effect=AssertionError("Reuse the wrap staff context")):
             self.test_wrap_closes_document_owned_questions_after_its_timer_stops()

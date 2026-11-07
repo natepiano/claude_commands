@@ -15,26 +15,27 @@ state the hooks and `--analysis` report read), so this never diverges from the
 text report.
 
 Usage (uv auto-installs Pillow from the inline metadata above):
-    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py
-    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --sort recency
-    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --scale linear --out /tmp/x.png
+    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py
+    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --sort recency
+    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --scale linear --out /tmp/x.png
 
 Prints the output PNG path on success.
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import math
 import os
 import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import cast
 
 from PIL import Image, ImageDraw, ImageFont
 
-# Reuse the canonical counter loader so this stays a single source of truth.
-sys.path.insert(0, str(Path.home() / ".claude" / "scripts" / "hooks"))
-from banned_words_lib import counter_analysis_rows  # noqa: E402
+from scripts.hooks.banned_words_lib import counter_analysis_rows
 
 # (count) -> (r, g, b)
 ColorFn = Callable[[int], tuple[int, int, int]]

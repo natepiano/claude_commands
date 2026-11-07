@@ -2,6 +2,10 @@
 """Inventory the live Claude work belonging to one account on this machine."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -15,33 +19,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-# Sibling imports need this folder. Append it so a caller's own modules
-# (buildlog's record) keep precedence over shutdown's.
-if str(SCRIPTS / "shutdown") not in sys.path:
-    sys.path.append(str(SCRIPTS / "shutdown"))
-for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
 from scripts.shutdown import remote
-from probe_session import PROBE_ENV
-import unit_runs
-import herdr
-import sessions
-from sessions import process_start as _process_start
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
 from scripts.usage import agents_log
 from scripts.direct.worker_state import ROSTER_LIVE, worker_status_path
 from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable, WorkerResume
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from session_types import (
+from scripts.shutdown.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,
@@ -1004,58 +998,3 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
     folder = session["cwd"]
     session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
     return session
-
-
-class MatchingSession(TypedDict):
-    kind: Literal["matching session"]
-    session: Session
-    workers: list[Session]
-
-
-class SessionAbsent(TypedDict):
-    kind: Literal["session absent"]
-
-
-class SessionIdentityLost(TypedDict):
-    kind: Literal["session identity lost"]
-
-
-class SessionAccountUnreadable(TypedDict):
-    kind: Literal["session account unreadable"]
-
-
-FreshSession = (
-    MatchingSession | SessionAbsent | SessionIdentityLost | SessionAccountUnreadable
-)
-
-
-def fresh_session(stored: Session, report: Inventory) -> FreshSession:
-    session_id = stored["session_id"]
-    occurrences = [item for item in report["sessions"] if item["session_id"] == session_id]
-    if any(item["pid"] != stored["pid"] or item["proc_start"] != stored["proc_start"]
-           for item in occurrences):
-        return {"kind": "session identity lost"}
-    current = next(iter(occurrences), None)
-    if current is not None:
-        return {
-            "kind": "matching session", "session": current,
-            "workers": [
-                item for item in report["sessions"]
-                if item["kind"] == "worker"
-                and item["owner"]["kind"] == "director"
-                and item["owner"]["session_id"] == session_id
-            ],
-        }
-    reason = next(
-        (
-            item["reason"]
-            for item in report["unattributed"]
-            if item["pid"] == stored["pid"]
-        ),
-        "",
-    )
-    if reason == "process start mismatch":
-        return {"kind": "session identity lost"}
-    if reason == "account unreadable":
-        return {"kind": "session account unreadable"}
-    return {"kind": "session absent"}

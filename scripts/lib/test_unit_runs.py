@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from scripts.message import sessions
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+    from scripts.message import sessions
 
 
 class RunOwnerMigrationTests(StaffTestCase):

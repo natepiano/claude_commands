@@ -172,8 +172,8 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertTrue(all(path.exists() for path in other))
 
     def test_multiple_documents_share_one_question_staff_context(self) -> None:
-        import tidy_wrapped
-        from update_registration import QuestionStaff
+        from scripts.production import tidy_wrapped
+        from scripts.production.update_registration import QuestionStaff
 
         documents = [self.doc(production_name, "wrapped") for production_name in ("first", "second")]
         paths = [path for production_name in ("first", "second") for path in self.state_files(production_name)]
@@ -195,7 +195,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(any(path.exists() for path in paths))
 
     def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
-        import tidy_wrapped
+        from scripts.production import tidy_wrapped
 
         doc = self.doc("done", "wrapped")
         owner = staff.rename(self.owner("done").id, "renamed-owner")
@@ -227,7 +227,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(reminders.exists())
 
     def test_wrap_refuses_ambiguous_document_ownership_without_changing_any_file(self) -> None:
-        import tidy_wrapped
+        from scripts.production import tidy_wrapped
 
         checkout = self.root / "main"
         checkout.mkdir()

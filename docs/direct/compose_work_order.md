@@ -11,7 +11,7 @@ that builds the wrong thing.
    fields:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+   ~/.claude/scripts/lib/py -m scripts.berth.work_order \
      --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
      --phase <target-phase>
    ```

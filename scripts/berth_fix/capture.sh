@@ -41,7 +41,7 @@ ledger=$common_git_directory/cargo-berth
 
 REPORT_DIR=$report CLIENT=$client REPOSITORY=$repository_root COMMON_GIT=$common_git_directory \
 BRANCH=$branch ENGINE=$engine ENGINE_VERSION=$engine_version ENGINE_MODIFIED=$engine_modified \
-WORKING_DIRECTORY=$PWD LEDGER=$ledger python3 -c '
+WORKING_DIRECTORY=$PWD LEDGER=$ledger "${BASH_SOURCE[0]%/*}/../lib/py" -c '
 import json, os, subprocess
 
 ledger = os.environ["LEDGER"]

@@ -1,6 +1,10 @@
 """Capture a step's tree key and target folder without loading the writer."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
@@ -10,14 +14,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, cargo_metadata_output_roots, read_cargo_output_roots
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, cargo_metadata_output_roots, read_cargo_output_roots
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if __package__:
-    from . import parse
-else:
-    import parse
+from scripts.buildlog import parse
 
 
 @dataclass(frozen=True)
@@ -105,7 +104,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
     program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
     if not program or parse.step_name([*program, *arguments]) == "fmt":
         return NoTargetFolder()
-    from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
+    from scripts.lib.cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
 
     try:
         settings = cargo_folder_settings(arguments, directory, effective, policy=CargoConfigPolicy.CURRENT_STRICT)
@@ -123,10 +122,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
         workspace = cargo_workspace_manifest(arguments, directory, cargo_home_folder(directory, effective))
         return CargoTargetFolder(workspace.resolve().parent / "target")
     except (OSError, ValueError) as error:
-        if __package__:
-            from . import store
-        else:
-            import store
+        from scripts.buildlog import store
 
         store.note_error(f"target folder: {error}")
         return UnresolvedTargetFolder()
@@ -182,7 +178,7 @@ def _output_evidence(argv: list[str], cwd: str, environment: Mapping[str, str]) 
     """Fingerprint the Cargo inputs that select the workspace and output folders."""
     import hashlib
     import json
-    from cargo_target_config import cargo_config_folders
+    from scripts.lib.cargo_target_config import cargo_config_folders
 
     program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
     if not program:
@@ -229,10 +225,7 @@ def _output_roots(metadata: str) -> None:
 
 
 def step_context(argv: list[str], metadata: str) -> None:
-    if __package__:
-        from . import treekey
-    else:
-        import treekey
+    from scripts.buildlog import treekey
 
     cwd = os.getcwd()
     print(treekey.tree_key(git_directory(argv, cwd)) or "")

@@ -12,31 +12,29 @@ import re
 import socket
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from typing import TYPE_CHECKING, Self, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
-    from ..buildlog import parse, record, repository, store
-    from ..buildlog.index import index_path_in
-    from ..buildlog.test_index import call, configure_cleanup, encode, step
-    from ..lib.rerun_test_support import initialize_repository
-    from ..lint.memory_test_support import write_config_fixture
-    from ..production.gate_modules import discover_test_modules
-    from . import gate_record, show
-    from .gate_record import GateRun, ModuleRun, TestTime
-    from .gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.buildlog import parse, record, repository, store
+    from scripts.buildlog.index import index_path_in
+    from scripts.buildlog.test_index import call, configure_cleanup, encode, step
+    from scripts.lib.rerun_test_support import initialize_repository
+    from scripts.lint.memory_test_support import write_config_fixture
+    from scripts.production.gate_modules import discover_test_modules
+    from scripts.test_times import gate_record, show
+    from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
+    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 else:
     # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
-    from index import index_path_in
-    from test_index import call, configure_cleanup, encode, step
+    from scripts.buildlog.index import index_path_in
+    from scripts.buildlog.test_index import call, configure_cleanup, encode, step
     from scripts.lib.rerun_test_support import initialize_repository
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
@@ -597,7 +595,7 @@ class TestTimesTests(unittest.TestCase):
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
         completed = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
             cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS,
         )

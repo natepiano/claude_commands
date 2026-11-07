@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Stop a session or restart staff rows on this machine."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -17,11 +21,12 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
+from scripts.agents import worker_lifecycle
 from scripts.agents import codex_mesh
-import herdr
-from inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
-from remote import other_machine, run_remote as run_remote
-import remote_control
+from scripts.herdr import herdr
+from scripts.shutdown.inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
+from scripts.shutdown.remote import other_machine, run_remote as run_remote
+from scripts.shutdown import remote_control
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount, named_claude_account, own_claude_account
 
 
@@ -247,8 +252,14 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         print(f"{report['machine']}: unavailable (rc {report['rc']})")
             return 0
-        result = (stop_resume.stop(options.session) if options.command == "stop" else
-                  stop_resume.resume(options.session, why=options.why, to=options.to))
+        if options.command == "stop":
+            record = staff.initial_snapshot()
+            row = record.by_member_reference(options.session)
+            unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
+            result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
+        else:
+            unresolved = []
+            result = stop_resume.resume(options.session, why=options.why, to=options.to)
         if isinstance(result, stop_resume.SessionNotFound):
             print(f"{result.name}: no session on this machine")
             return 2
@@ -261,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{result.session_id}: stopped pid {result.pid}")
         else:
             print(f"{result.session_id}: unchanged")
-        return 0
+        return int(bool(unresolved))
     except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount, InvalidInventory) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2

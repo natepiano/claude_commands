@@ -51,6 +51,10 @@ stay; an unreadable record, phase state or land target needs repair. Shared .cla
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl

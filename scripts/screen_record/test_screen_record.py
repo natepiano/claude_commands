@@ -43,7 +43,9 @@ if name == "xprop":
         count_file = root / "root-count"
         count = int(count_file.read_text()) + 1 if count_file.exists() else 1
         count_file.write_text(str(count))
-        if count <= settings.get("empty_root_calls", 0):
+        if "root_output" in settings:
+            print(settings["root_output"])
+        elif count <= settings.get("empty_root_calls", 0):
             print("_NET_CLIENT_LIST:  not found.")
         else:
             ids = [window["id"] for window in settings.get("windows", [])]
@@ -55,6 +57,8 @@ if name == "xprop":
         else:
             title = window["title"].replace("\\", "\\\\").replace('"', '\\"')
             print('WM_NAME(UTF8_STRING) = "' + title + '"')
+elif name == "xwininfo":
+    print(settings.get("tree", "xwininfo: Window id: 0x50d (the root window) (has no name)\n     0 children."))
 elif name == "ffmpeg":
     clip = Path(args[-1])
     if settings.get("inject_collision") and not clip.exists():
@@ -91,7 +95,7 @@ class ScreenRecordTests(unittest.TestCase):
         self.clips = self.root / "clips"
         self.stubs = self.root / "stubs"
         self.stubs.mkdir()
-        for name in ("xprop", "timeout", "ffmpeg"):
+        for name in ("xprop", "xwininfo", "timeout", "ffmpeg"):
             stub = self.stubs / name
             _ = stub.write_text("#!" + sys.executable + "\n" + STUB_BODY)
             stub.chmod(0o755)
@@ -262,6 +266,100 @@ class ScreenRecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - start, 2)
         self.assertGreaterEqual(len([call for call in self.calls_for("xprop") if call[0] == "-root"]), 4)
+
+    def assert_tree_window_records_with_required_limits(self, root_output: str) -> None:
+        self.settings.update({
+            "root_output": root_output,
+            "windows": [],
+            "tree": '''
+xwininfo: Window id: 0x50d (the root window) (has no name)
+  Root window id: 0x50d (the root window) (has no name)
+  Parent window id: 0x0 (none)
+     2 children:
+     0x2600006 "hana debug 15731": ("hana" "hana")  1280x720+0+0  +0+0
+        1 child:
+        0x2800003 (has no name): ()  1x1+0+0  +0+0
+''',
+        })
+        result = self.run_script("--window", "debug 15731", "--seconds", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(Path(result.stdout.strip()).exists())
+        self.assertIn("recorded 5 s of 'hana debug 15731'", result.stderr)
+        self.assertEqual(self.calls_for("xwininfo"), [["-root", "-tree"]])
+        self.assertEqual(self.calls_for("timeout")[0][:3], ["--kill-after=5", "20", "ffmpeg"])
+        self.assertEqual(len(self.calls_for("ffmpeg")), 1)
+        ffmpeg = self.calls_for("ffmpeg")[0]
+        for option, value in (
+            ("-window_id", "39845894"), ("-t", "5"), ("-fs", "500000000"),
+            ("-f", "x11grab"), ("-framerate", "60"), ("-draw_mouse", "0"),
+            ("-c:v", "libx264"), ("-pix_fmt", "yuv420p"),
+        ):
+            self.assertEqual(ffmpeg[ffmpeg.index(option) + 1], value)
+
+    def test_missing_client_list_records_the_matching_tree_window(self) -> None:
+        self.assert_tree_window_records_with_required_limits("_NET_CLIENT_LIST:  not found.")
+
+    def test_empty_client_list_records_the_matching_tree_window(self) -> None:
+        self.assert_tree_window_records_with_required_limits("_NET_CLIENT_LIST(WINDOW): window id # ")
+
+    def test_multiple_matching_tree_titles_stop_before_ffmpeg(self) -> None:
+        self.settings.update({
+            "root_output": "_NET_CLIENT_LIST:  not found.",
+            "tree": '''
+xwininfo: Window id: 0x50d (the root window) (has no name)
+     2 children:
+     0x2600006 "hana debug 15731": ("hana" "hana")  1280x720+0+0  +0+0
+     0x2800003 "other debug 15731": ("other" "other")  1280x720+0+0  +0+0
+''',
+        })
+        result = self.run_script("--window", "debug 15731", "--seconds", "2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("2 windows match", result.stderr)
+        self.assertIn("hana debug 15731", result.stderr)
+        self.assertIn("other debug 15731", result.stderr)
+        self.assertEqual(self.calls_for("ffmpeg"), [])
+
+    def test_raw_quotes_in_a_tree_title_preserve_multiple_matches(self) -> None:
+        self.settings.update({
+            "root_output": "_NET_CLIENT_LIST:  not found.",
+            "tree": '''
+xwininfo: Window id: 0x50d (the root window) (has no name)
+     2 children:
+     0x2600006 "editor "draft" debug 15731": ("editor" "Editor")  1280x720+0+0  +0+0
+     0x2800003 "other debug 15731": ("other" "other")  1280x720+0+0  +0+0
+''',
+        })
+        result = self.run_script("--window", "debug 15731", "--seconds", "2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("2 windows match", result.stderr)
+        self.assertIn('editor "draft" debug 15731', result.stderr)
+        self.assertEqual(self.calls_for("ffmpeg"), [])
+
+    def test_recorded_tree_title_preserves_two_literal_backslashes(self) -> None:
+        self.settings.update({
+            "root_output": "_NET_CLIENT_LIST:  not found.",
+            "tree": r'''
+xwininfo: Window id: 0x50d (the root window) (has no name)
+     1 child:
+     0x2600006 "C:\\build debug 15731": ("editor" "Editor")  1280x720+0+0  +0+0
+''',
+        })
+        result = self.run_script("--window", "debug 15731", "--seconds", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(r"recorded 2 s of 'C:\\build debug 15731'", result.stderr)
+        self.assertEqual(len(self.calls_for("ffmpeg")), 1)
+
+    def test_missing_xwininfo_is_required_only_for_the_fallback(self) -> None:
+        (self.stubs / "xwininfo").unlink()
+        result = self.run_script("--window", "debug 15731", "--seconds", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recorded_calls = self.calls_for("ffmpeg")
+        self.settings["root_output"] = "_NET_CLIENT_LIST:  not found."
+        result = self.run_script("--window", "debug 15731", "--seconds", "2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("xwininfo", result.stderr)
+        self.assertEqual(self.calls_for("ffmpeg"), recorded_calls)
 
     def test_multiple_matching_titles_stop_before_ffmpeg(self) -> None:
         self.settings["windows"] = [

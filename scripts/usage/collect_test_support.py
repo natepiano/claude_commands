@@ -9,14 +9,13 @@ import shutil
 import sqlite3
 import stat
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, override
+from typing import ClassVar, Literal, Protocol, TypedDict, cast, override
 from collections.abc import Iterable, Iterator
 from types import ModuleType
 from unittest.mock import patch
@@ -24,11 +23,7 @@ from unittest.mock import patch
 from scripts.usage import collect as collector
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-if TYPE_CHECKING:
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -210,7 +205,7 @@ class CollectorFixture(unittest.TestCase):
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
         environment["UNIT_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
-        command = [sys.executable, str(COLLECTOR), "--db", str(db), "--durability", "off",
+        command = [str(REPOSITORY / "scripts/lib/py"), str(COLLECTOR), "--db", str(db), "--durability", "off",
                    "--machine", machine, "--claude-root", str(self.claude_root),
                    "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
                    "--readings", str(self.root / "readings.jsonl"),
@@ -251,7 +246,7 @@ class CollectorFixture(unittest.TestCase):
 
         def run(arguments: list[str], *, stdin: int, capture_output: bool, text: bool,
                 timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
-            if arguments[:2] == [sys.executable, str(noop)]:
+            if arguments[:2] == [str(REPOSITORY / "scripts/lib/py"), str(noop)]:
                 def main() -> int:
                     exec(compile(noop.read_text(), str(noop), "exec"), {**vars(fake), "__name__": "__main__"})
                     return 0
@@ -305,7 +300,7 @@ sqlite3.connect = connect
 sys.argv.pop(0)
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
-        result = subprocess.run([sys.executable, "-c", program, *command[1:], *selection],
+        result = subprocess.run([str(REPOSITORY / "scripts/lib/py"), "-c", program, *command[1:], *selection],
                                 env=environment, cwd=REPOSITORY, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -499,7 +494,8 @@ class MacCollectorFixture(CollectorFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = shutil.copyfile(FIXTURES / "mac/fake_ssh.py", ssh)
+        _ = ssh.write_text((FIXTURES / "mac/fake_ssh.py").read_text().replace(
+            "${HOME}/.claude/scripts/lib/py", str(REPOSITORY / "scripts/lib/py")))
         ssh.chmod(0o700)
         self.claude_root: Path = self.root / "local/claude"
         self.codex_root: Path = self.root / "local/codex"
