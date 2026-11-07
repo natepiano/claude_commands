@@ -38,7 +38,7 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
-from scripts.shutdown import pane_record
+from scripts.shutdown import member_account, pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -51,7 +51,7 @@ from scripts.lib.resume_message import (
 )
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
-    SessionWithoutStaffRow, SESSION_WITHOUT_STAFF_ROW,
+    SESSION_WITHOUT_STAFF_ROW,
     StopUnproved as StopUnproved,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
@@ -577,21 +577,6 @@ def _codex_name_ids(name: str) -> list[str]:
         return []
 
 
-def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW,
-                   *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection:
-    """Keep an account selection or select the requested label or role account."""
-    if isinstance(to, (accounts.NamedAccount, accounts.CodexWorkersAccount)):
-        return to
-    if to:
-        return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
-                if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))
-    if kind == "codex":
-        return accounts.role_account("workers")
-    if not isinstance(row, SessionWithoutStaffRow) and row.kind in ("unit", "showrunner"):
-        return accounts.role_account(row.kind)
-    return accounts.role_account("unit")
-
-
 def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
     """Read the native resume arguments and the folder from the rollout metadata."""
     path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
@@ -706,7 +691,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
 
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
-        selected = resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or (
+        selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or (
             accounts.CodexWorkersAccount(source_label, source) if kind == "codex" and original is not None else ""))
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):

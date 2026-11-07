@@ -17,7 +17,7 @@ from scripts.message import sessions
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
-from scripts.shutdown import shutdown_record, pane_record
+from scripts.shutdown import member_account, shutdown_record, pane_record
 from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -41,8 +41,6 @@ class WorkerRestore(Protocol):
 
 
 class MemberLifecycle(Protocol):
-    def resume_account(self, kind: Literal["claude", "codex"], row: staff.StaffRow,
-                       *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection: ...
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
     def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
@@ -184,7 +182,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         projected = names.resume(original) if original is not None else None
         kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
             if original is not None else session_launch(str(row.current_session), row.name))
-        selected = stop_resume.resume_account(kind, row, to=target_account or (
+        selected = member_account.resume_account(kind, row, to=target_account or (
             accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(Path(original["config_dir"])),
                                          Path(original["config_dir"])) if kind == "codex" and original is not None else ""))
         if isinstance(selected, accounts.NamedAccount):

@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, mesh_runs
+from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
 from scripts.direct import assign, progress_history
@@ -1337,6 +1338,51 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["role"], "review")
         self.assertEqual(listing[0]["state"], "OpenWorker")
         self.assertEqual(listing[0]["activity"], "done")
+
+    def test_list_open_busy_worker_reports_work_account_and_home(self) -> None:
+        row = self.fixture.worker("astra-designer", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        self.fixture.world.locations["w1:p1"]["agent_status"] = "working"
+        self.fixture.dispatch(row, "astra-designer")
+        home = self.fixture.root / "selected-codex"
+        with patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex2", home)) as selected:
+            code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["state"], "OpenWorker")
+        self.assertEqual(listing[0]["role"], "astra-designer")
+        self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
+                         {"work": "busy", "account": "codex2", "home": str(home)})
+        selected.assert_called_once_with("workers")
+
+    def test_list_closed_worker_reports_work_account_and_home(self) -> None:
+        row = self.fixture.worker("astra-reviewer", family="claude")
+        self.fixture.dispatch(row, "astra-reviewer", completed=True)
+        home = self.fixture.root / "selected-claude"
+        with patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", home)) as selected:
+            code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["state"], "ClosedWorker")
+        self.assertEqual(listing[0]["role"], "astra-reviewer")
+        self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
+                         {"work": "idle", "account": "claude2", "home": str(home)})
+        selected.assert_called_once_with("unit")
+
+    def test_list_worker_without_backend_reports_account_unavailable(self) -> None:
+        row = self.fixture.worker("missing-backend", family="codex")
+        self.fixture.dispatch(row, "impl", completed=True)
+        (Path(os.environ["CODEX_HOME"]) / "sessions" / f"{row.current_session}.jsonl").unlink()
+        self.assertNotIn(row.id, staff.snapshot().backends)
+        code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["account"],
+                         {"state": "AccountUnavailable", "reason": "worker backend is unavailable"})
+        self.assertNotIn("home", listing[0])
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
         unit_runs.report_anomaly.cache_clear()

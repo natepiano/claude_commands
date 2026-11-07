@@ -503,6 +503,12 @@ An unreadable design prints one warning per operation; other designs remain read
 | `list` | Reports roles and problems. A local read needs no network request. |
 
 A pane binding uses `worker.py` operations. A mesh binding uses `assign.sh` for prime and follow operations.
+`worker.py list --json` gives each pane worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+It also computes three fields at read time and stores none of them:
+- `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+- `account`: the label of the account the member opens on, from `member_account.resume_account`.
+- `home`: that account's home as an absolute path.
+With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
 An ended design identity cannot reopen.
 `config/design_roles.conf` controls new role creation.
 `[roles] new_open=false` preserves existing identities and refuses new opens.
