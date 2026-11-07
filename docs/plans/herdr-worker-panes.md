@@ -2985,6 +2985,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 27: only a worker with an active dispatch reopens on restore, restart or a move; an idle worker stays closed until its next assign. Keep this rule when the mesh branch goes.
 - Phase 33: `worker_pass` picks the newest matching pass by `started_at`, never the last in dict order. Keep this when the short mesh slots go.
 - Phase 32: every launch destination runs `unalias <kind>` through `Herdr.run_in_pane` before `agent start`. Keep the one step when the launch path changes; a test fake pane shows an empty shell first.
+- Phase 35: a pane worker's Codex launch carries no `model_auto_compact_token_limit`. Do not bring back an in-turn compaction option; `UNIT_COMPACT_ABOVE_TOKENS` is for compaction between turns only.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3271,7 +3272,7 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 
 sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane worker fails with exit 3, `FAILED: codex_mesh.py send: codex_mesh: tool-based-ui-demo-fix2 is ended; message not delivered`. `send.py` (`codex`, `scripts/message/send.py:2234`) still sends every Codex message through `codex_mesh.py send`, which reads the old mesh roster entry as ended. sdlc's rule: `send.py` delivers to a pane worker through the one pane delivery function that assign uses, with no second copy. The `codex_mesh` route goes with Phase 19.
 
-Second case (sdlc [099e44fb], 2026-11-07): `send.py --to morty` returns `QUEUED: no live session answers to session:01a18dbb-...`, and `--to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` returns `FAILED: no live Codex daemon has thread 01a18dbb... loaded; checked ~/.codex, ~/.codex1, ~/.codex2`, while that Codex session runs in a herdr pane. `send.py` looks only for app-server daemons. This phase also delivers to a Codex session in a pane by its thread id: `herdr agent list` names the pane whose `agent_session.value` is that id, and the message goes through the one submit path. A test covers a Codex pane session with no staff row and no app-server.
+The second case (a Codex session in a pane, such as morty) moved to Phase 37 (sdlc [787d4c6f], 2026-11-07: start it now). This phase reuses the pane recipient that Phase 37 adds.
 
 **Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A test fake pane shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
 
@@ -3289,30 +3290,78 @@ The Work Order is written at the phase start.
 
 **Gotchas:** dict order in the recorder `pass` map is insertion order, not start order; never take the last match.
 
-### Phase 35 — A long worker thread does not compact in a loop  · status: todo
+### Phase 35 — A long worker thread does not compact in a loop  · status: done
 
-**Depends on:** Phase 33 (the same file). It runs right after the Phase 33 checkpoint.
+#### As-built
 
-Defect (demo-unit, 2026-11-07): pane worker `tool-based-ui-demo-test` (Codex thread `01a142f0-…`, pane w14:pX) compacted every 90 s from about 11:18 EST for 2.5 hours and made no edit. After each compaction its context is about 95,400 tokens; one tool call takes it to about 99,700. Cause: `worker_panes._policy_arguments` passes `-c model_auto_compact_token_limit=<UNIT_COMPACT_ABOVE_TOKENS>` (`scripts/herdr/worker_panes.py:585`), so Codex compacts inside a turn at 100,000 tokens. `config/direct.conf:65` says the value is for a different rule: "Compact an idle Codex worker before new work above this recorded context size." A long thread whose floor after compaction is near the limit compacts again at once.
+A pane worker's Codex launch has no in-turn compaction option. `worker_panes._policy_arguments` passes `--model`, `--sandbox`, `--ask-for-approval never`, `-c model_reasoning_effort=…`, `-c notice.hide_rate_limit_model_nudge=true` and the service tier; Codex keeps its own full-window compaction limit. Cause: the old `-c model_auto_compact_token_limit=<UNIT_COMPACT_ABOVE_TOKENS>` made a long thread whose floor after compaction was near 100,000 tokens compact after each tool call (demo's `tool-based-ui-demo-test`, 2.5 hours with no edit). `LaunchPolicy` holds `settings`, `sandbox` and `permission`; `ClaudeCompaction` and `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS` are gone. `UNIT_COMPACT_ABOVE_TOKENS` stays for idle mesh-worker compaction (`assign.py`). No between-turn compaction runs for pane workers until Phase 34 item 5.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `LaunchPolicy`, `_launch_policy`, `astra_review_policy`, `_policy_arguments`.
+- `config/direct.conf` — the `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS` block is removed.
+- Tests: `scripts/herdr/test_worker_panes.py`, `test_side_pane.py`, `scripts/astra/test_astra_review.py`, `test_design_roles.py` check that the option is absent.
+- Docs: `commands/unit/direct.md` (LongLivedWorkers), `docs/as-built/long-lived-workers.md`.
+
+### Phase 37 — A message reaches a Codex session in a pane  · status: done
+
+**Depends on:** Phase 35 (it runs right after the Phase 35 checkpoint, before Phase 29; sdlc [787d4c6f], 2026-11-07). Phase 31 waits for this phase (both edit `scripts/message/send.py`).
+
+Defect (user via sdlc, 2026-11-07 15:38 EST): `send.py --to morty` answers `QUEUED: no live session answers to session:01a18dbb-…`. Morty is a Codex TUI in herdr pane w2C:p1 (`codex … resume 01a18dbb-…`). `--to codex:01a18dbb-…` fails with `no live Codex daemon has thread … loaded`. Cause:
+
+1. `roster._herdr_codex_panes` (`scripts/message/roster.py:1362`) builds each herdr Codex pane entry with no `thread` and `reach=CannotReceiveMessages("interactive Codex in a herdr pane")`, though `herdr agent list` reports the thread as `agent_session.value`.
+2. So `send._staff_transport_matches` (`scripts/message/send.py:1910`) finds no entry for morty's staff row, and `resolve_recipient` falls back to `ClaudeRecipient("session:<id>")` (`send.py:2046`). No Claude session answers, and the message is queued.
+3. The `codex:` path reads only app-server daemons (`codex_daemon.daemons`), so a TUI in a pane is never found.
 
 #### Work Order
 
-**Goal:** a pane worker never compacts inside a turn because of `UNIT_COMPACT_ABOVE_TOKENS`.
+**Goal:** `send.py --to morty` and `send.py --to codex:<thread>` deliver to a Codex session in a herdr pane.
 
 **Spec:**
 
-1. Remove the `model_auto_compact_token_limit` argument from `_policy_arguments`. Codex keeps its own limit for a turn that fills the model window.
-2. Remove `LaunchPolicy.compact_above_tokens` and `ClaudeCompaction` if nothing else reads them; `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS` follows the same rule.
-3. The idle-before-new-work compaction that `config/direct.conf:65` describes goes into Phase 34 (it changes `worker.dispatch`, which the agents unit owns until its phase 15b merges). Until then no between-turn compaction runs.
-4. Add no check, refusal, validation, retry or wait that this list does not name.
+1. In `_herdr_codex_panes`, set the entry's `thread` to `CodexThread(<agent_session.value>)` when herdr reports a Codex `agent_session` of kind `id`, and make the entry messageable at `codex:<thread>`. Keep the entry's herdr session name and pane id on the entry.
+2. Add one recipient type for that entry. It delivers with `herdr.Herdr(<session>).prompt(<pane>, text, target=<thread>, proof=herdr.SubmitStarts(<timeout ms>))`, the call that `deliver_worker_text` uses (`send.py:3000`). Add no second submit path ([c827351d]).
+3. `_messageable_recipient` and the `codex:` lookup in `resolve_recipient` return this recipient for such an entry. A staff row whose `current_session` is that thread matches it through `_staff_transport_matches`, with no new match rule.
+4. A pane entry with no reported Codex session id stays `CannotReceiveMessages`, as today.
+5. A delivery failure reports `FAILED` with the herdr error, as other routes do.
+6. Wrong-family fallback (the user via morty, 2026-11-07: "Repair the actual TUI route and wrong-family fallback"; sdlc [02c751da]: pick no family without a source, and add no new staff field). A staff row has no family field. When a staff row matches no live roster entry, `resolve_recipient` (`send.py:2046`) returns a family-neutral queued recipient, not `ClaudeRecipient("session:<id>")`. It keeps the message in the same queue file as today (`queue_for` key `session-<id>`, so a Claude row that comes back still receives it). Its result line names the row and id with no `session:` form: `QUEUED: no live Claude or Codex session answers to <name> (<id>), so it is kept for it`. A live entry of either family still wins through `_staff_transport_matches`.
+7. Add no check, refusal, validation, retry or wait that this list does not name.
 
-**Files:** `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py`, and any test that names the removed argument.
+**Files:** `scripts/message/roster.py`, `scripts/message/send.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py` (or the send test module that covers `resolve_recipient`).
 
 **Workers:** `1 writer`.
 
 **Acceptance gate:**
-- A unit test: the Codex launch arguments do not contain `model_auto_compact_token_limit`.
-- `scripts.herdr.test_worker_panes` passes; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
+- A unit test: a herdr Codex pane with `agent_session` id T and no app-server gives a roster entry with thread T, messageable at `codex:T`.
+- A unit test: a staff `agent` row with `current_session` T resolves to the pane recipient, and delivery calls `Herdr.prompt` once with that pane and target T.
+- A unit test: `--to codex:T` resolves to the same recipient.
+- The changed modules pass; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
+- Live check by the director after the checkpoint: `send.py --from herdr-unit --to morty --text "<one-line ping>"` prints `SENT` and the text shows in morty's pane. Morty belongs to the user; send one ping only.
+
+### Phase 38 — One worker's assign reads only its own pane and row · status: todo
+
+**Depends on:** Phase 37 (it runs right after the Phase 37 checkpoint, before Phase 29; sdlc [b9d4c514], 2026-11-07).
+
+Defect (builds for natest, 2026-11-07 16:40 and 16:47 EST): `assign.sh` for natest's Phase 68 worker `claude-natedev-builds-natest-impl4` exits 8 (uncertain) twice while that worker works, and a rerun ends the same. The log names other sessions' panes (`agent argv is unavailable` w14:pA, w0:p2, w14:pT; `pane_not_found` w16:p2D, w14:p11; `current Codex rollout changed` w11:p11) and natest's closed rows impl3, fix1, rev10a, rev10c, fix2, port6, ft7, cr7 (`pane evidence is incomplete; absence is unproved`, `scripts/herdr/worker_panes.py:377`).
+
+#### Work Order
+
+**Goal:** one worker's assign depends only on that worker's own pane and staff row.
+
+**Spec:**
+
+1. Find each path by which another session's unreadable pane, or a closed sibling row, makes the assigned worker's result `UNCERTAIN` (8). Quote the log line and the source line for each.
+2. Fix it where the evidence is gathered: the assign reads and judges only the selected worker's row and its pane. The evidence of other rows and other panes does not change the selected worker's state or the assign exit code.
+3. `worker.py list` and `restore` keep their per-row states; a sibling's uncertain state stays on that sibling's line.
+4. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:** `scripts/herdr/worker_panes.py`, `scripts/production/worker.py`, `scripts/direct/assign.py` (only where an exit-8 path lives), and their tests.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: the selected worker's pane is open and working; another session's pane gives `agent argv is unavailable` and `pane_not_found`, and closed sibling rows have no pane. The assign does not exit 8.
+- A unit test: the selected worker's own pane evidence is unknown; the assign still exits 8.
+- The changed modules pass; basedpyright reads 0/0/0; the full gate passes.
 
 ### Phase 32 — A launch keeps the caller's Codex home  · status: done
 
