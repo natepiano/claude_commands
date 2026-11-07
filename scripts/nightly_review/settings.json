@@ -27,7 +27,8 @@
       "Bash(rebuild)",
       "Bash(rebuild *)",
       "Bash(macrebuild)",
-      "Bash(macrebuild *)"
+      "Bash(macrebuild *)",
+      "Edit(~/.claude5/**)"
     ]
   }
 }

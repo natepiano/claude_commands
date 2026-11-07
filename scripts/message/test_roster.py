@@ -905,6 +905,29 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(any(line.strip() == "your Codex sessions" for line in lines))
         self.assertTrue(any("~/projects/unit-one" in line for line in lines))
 
+    def test_claude_shell_status_shows_background_and_keeps_raw_data(self) -> None:
+        session_id = "acd50bad-5afa-5d3d-b155-3766b7d113e0"
+        self._write_session(str(os.getpid()), "runner", session_id,
+                            self.home / "projects" / "runner", status="shell")
+        self.assertEqual(self._entries()["runner"].status, "shell")
+        for here in (True, False):
+            with self.subTest(here=here):
+                result, lines, errors = self._run_main(here=here)
+                self.assertEqual((result, errors), (0, []))
+                runner = next(line for line in lines if f"[session:{session_id}]" in line)
+                self.assertIn("claude, background", runner)
+                self.assertNotIn("shell", runner)
+                result, lines, errors = self._run_main("--json", here=here)
+                self.assertEqual((result, errors), (0, []))
+                report = cast(dict[str, object], json.loads("\n".join(lines)))
+                entries = cast(list[dict[str, object]], report["entries"])
+                entry = next(row for row in entries if row["address"] == f"session:{session_id}")
+                self.assertEqual(entry["status"], "shell")
+                result, lines, errors = self._run_main("--snapshot", here=here)
+                self.assertEqual((result, errors), (0, []))
+                snapshot = roster.RosterSnapshot.decode("\n".join(lines)).result
+                self.assertEqual(next(row for row in snapshot.entries if row.name == "runner").status, "shell")
+
     def test_socketless_director_keeps_worker_links_and_json_addresses(self) -> None:
         self._write_session(
             "director-new", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", self.home / "projects" / "unit-one",
