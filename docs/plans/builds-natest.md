@@ -1662,34 +1662,17 @@ The verify hold and token wait fixtures keep every run root inside the test root
 ### Phase 78 — `production/test_staff.py` uses half its CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_staff.py` (56.8 CPU s per gate, 122 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`StaffCommandTestCase` runs 72 staff CLI calls in process through `invoke_cli` (`scripts/production/cli_fixture.py`). Gate CPU goes from 91.8 to 28.9 s, and process starts from 393 to 177, in three same-load pairs. All 122 tests pass.
 
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. About 160 other test modules import `staff_test_support.py`, so keep each cut inside the module.
-2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `StaffCommandTestCase.setUp` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside the test root before any CLI call.
+- The `pause` calls, the Mac transport test, the fake SSH processes and the lock, concurrency and killed-writer tests keep real processes.
 
 **Files:**
-- `scripts/production/test_staff.py` — the module
+- `scripts/production/test_staff.py` — staff CLI tests; command tests call the CLI in process
 
-**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
-- `impl4` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
-- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
-- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:** `staff.py pause` finds its caller through `runtime_id()`, which walks the parent processes. An in-process call has no such parent, so `pause` keeps `self.script(STAFF_SCRIPT, "pause", ...)`.
 
 ### Phase 79 — `style/test_add_style.py` uses half its CPU  · status: todo
 **Depends on:** none
