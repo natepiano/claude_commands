@@ -17,7 +17,6 @@ from types import ModuleType
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 
