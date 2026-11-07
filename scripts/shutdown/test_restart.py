@@ -59,6 +59,7 @@ class CodexSnapshotTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr, "process_environment", return_value={}))
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.native))
         _ = self.enterContext(patch.object(unit_runs, "run_roots", return_value=()))
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"))
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         records = registry_confirmation(frozenset(self.claude)).records

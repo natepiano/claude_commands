@@ -30,6 +30,8 @@ JSON stores `paused: {since, by, why}` only for a paused row.
 `resume(reference)` removes the field.
 The commands accept a unit or `--production <showrunner name>`.
 Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
+An unmatched `--except` value refuses the whole command before any write.
+The refusal names the value and the production. A unit of another production does not match.
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
@@ -114,10 +116,11 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
+| `scripts/message/morty_identity.py` | read | native_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
-| `scripts/message/send.py` | read | native_id, snapshot |
+| `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
