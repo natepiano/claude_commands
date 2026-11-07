@@ -281,6 +281,11 @@ class PromptInputNotReady:
 
 
 @dataclass(frozen=True)
+class PromptInputHoldsDraft:
+    screen: str
+
+
+@dataclass(frozen=True)
 class PromptInputTimedOut:
     """The destination did not become ready before the launch deadline."""
 
@@ -2127,7 +2132,7 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2141,19 +2146,25 @@ class Herdr:
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
         screen = _prompt_screen(raw)
         composer = _composer_input(raw)
-        if isinstance(composer, ComposerInput) and not composer.text.strip():
+        if isinstance(composer, ComposerInput):
+            if composer.text.strip():
+                return PromptInputHoldsDraft(screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
     def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        draft_stashed = False
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
+            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
+                self._send_keys(pane, "ctrl+s")
+                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
