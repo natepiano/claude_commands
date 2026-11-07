@@ -311,8 +311,7 @@ def _encode(value: object, variants: dict[str, type]) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    data = codec.snapshot_value(value)
-    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
+    return encode_record({"v": VERSION, "type": name, "data": value}) + "\n"
 
 
 def _parse(line: str | bytes, variants: dict[str, type]) -> object:

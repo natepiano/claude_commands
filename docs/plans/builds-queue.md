@@ -1274,3 +1274,20 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Gotchas:** a running bash keeps the `memory_gate.sh` functions it read at its start, so a step that waits across a promote runs the old loop against the new checker. For this reason no shell holds a closed list of checker values.
 
 **Ruled out:** a version-matching rule between the shell and the checker; a test that loads a previous release.
+
+### Phase 25 — A queue view answers inside its limit  · status: done
+
+#### As-built
+
+- One `OperatingSystemReader` thread reads the process table, the unowned slices, the scope activity files and the memory readings at the pass cadence (`waiting_pass_seconds` while steps wait, `running_pass_seconds` else). It returns raw evidence only and wakes the loop through an eventfd. The loop applies the current configuration and reservation records (need, width, peak hold) at each pass, so a pending configuration or a width change takes effect at once. The loop thread still owns all service state and makes no `/proc` or cgroup read.
+- `update()` wakes the reader when the cadence changes from running to waiting. A read that raises does not end the reader; the loop raises it as the pass did before.
+- Each reading carries `started_monotonic`. An Admit, Launch or estimate request for an owner whose pid and start time the reading lacks waits as a `DeferredOwnerRequest` and asks for an early read. It runs on the first reading that started after it arrived. A finished, refused or closed connection drops its deferred requests.
+- Each reply tree is encoded once (`snapshot_codec.py` returns scalars directly and caches dataclass field names). View and Explain bytes are encoded on the first request after a pass and kept until the next pass ends. Mine keeps its full content. `persist` encodes only the changed records; file bytes, fsync order and wire bytes do not change.
+- `query_timeout_seconds` stays 0.5; no configuration key changed.
+- Replay with no profiler (`measure_25.py --reuse`, 20 samples per group): a pass takes 16 ms median, 33 ms worst (372 ms median before). A View queued behind a pass, a Release, a TokenWait and a pending configuration waits 255 ms median, 406 ms worst; most of it is disk sync. The live probe after deploy is the proof.
+
+**Files:** `scripts/build_queue/admission_service.py`, `admission_protocol.py`, `snapshot_codec.py`; `test_admission_service.py`, `test_admission_protocol.py`; `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** a durable write still syncs the state file on the loop thread, so a View waits behind each Release and TokenWait sync. The next item "Durable writes leave the admission service loop" waits on the live probe.
+
+**Ruled out:** a larger `query_timeout_seconds`; a lock on service state; a second state-owning thread.
