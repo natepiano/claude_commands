@@ -1039,7 +1039,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              for line in path.read_text().splitlines()) + "\n")
         self.run_dir.mkdir()
         write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
-        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"unit": self.fixture.parent.name}))
+        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
         marker = unit_runs.marker(self.fixture.parent.current_session)
         marker.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(marker, str(self.run_dir) + "\n")

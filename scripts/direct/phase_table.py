@@ -30,6 +30,7 @@ if not __package__:
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.direct import plan_history
+from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
 from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
 from scripts.production.production_doc import Refusal, production_field
@@ -1253,8 +1254,16 @@ def build(session_dir: Path, *, resolver: session_staff.RowResolver | None = Non
     plan_doc = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
     if not plan_doc:
         raise NoState(f"Progress state does not name a plan in {session_dir}")
-    working_dir = Path(working_dir_text) if working_dir_text else Path.cwd()
-    return build_plan(plan_history.resolve_plan_path(working_dir, plan_doc), resolver=resolver)
+    if not working_dir_text:
+        try:
+            resolver = resolver if resolver is not None else session_staff.RowResolver(staff.initial_snapshot())
+            owner = unit_runs.run_owner(state, resolver.record)
+        except staff.StaffUnreadable as error:
+            raise NoState(f"Progress state has no available owner folder in {session_dir}: {error}") from error
+        if isinstance(owner, unit_runs.RunOwnerUnrecorded) or isinstance(owner.worktree, staff.WorktreeUnfilled):
+            raise NoState(f"Progress state has no recorded folder or unit staff owner in {session_dir}")
+        working_dir_text = str(owner.worktree.path)
+    return build_plan(plan_history.resolve_plan_path(Path(working_dir_text), plan_doc), resolver=resolver)
 
 
 def _clock(moment: datetime, zone: ZoneInfo) -> str:
