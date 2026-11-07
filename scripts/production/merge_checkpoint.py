@@ -644,7 +644,7 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
     steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package.folder)
              for package in sorted(packages)]
-    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
+    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, "--name", name], checkout)
                  for package, name in sorted(examples))
     steps.extend(CheckpointTestStep(f"merge test {index}", list(command), checkout)
                  for index, command in enumerate(merge_tests, 1))

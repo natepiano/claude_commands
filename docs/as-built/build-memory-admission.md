@@ -904,9 +904,37 @@ The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job
 
 ### `verify.sh` example guard
 
-`verify.sh build <pkg> [--bin <name> | --example <name>] [--release] [--features <list>]` builds what a smoke run or live shot launches: `BUILD_TARGETS_PY` reads the package's bins (or the one named bin or example, with its required features), `take_build_args` refuses a package with no binary and a target it lacks (exit 2), and `run cargo build --workspace --bin <name>…` builds under the workspace's feature set with the build hold, the cargo token, memory admission and a call record (verb `build`). `print_built_binaries` then prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each one. It has no pass record and no Mac offload. A helper's raw `cargo build` had needed the user's approval by hand on 2026-10-23; `/unit:direct` gives helpers this line.
+`verify.sh build [<pkg>] [--bin <name> | --example <name>] [--release] [--features <list>]` builds the selected binaries or example.
+`BUILD_TARGETS_PY` reads the package's binaries, or every member's binaries when no package is given.
+A named example supplies its required features.
+`take_build_args` refuses a missing target or a package without a binary with exit 2.
+The Cargo build keeps `--workspace` and the workspace's feature set.
+A named package owns feature names without a slash; without a package, feature names pass unchanged.
+The build uses the build hold, cargo token, memory admission, and a call record with verb `build`.
+`print_built_binaries` prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each target.
+The build saves no pass record and does not use Mac offload.
+Use this command for smoke and shot helpers.
 
-A gate run (`test <pkg>` with no `--filter` and no named target, `--features` allowed) and `final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA` and run `UNTESTED_EXAMPLES_PY` before the cache lookup and any build. An example target is an offender when a source line matches `^\s*#\[(cfg\(test\)|(\w+::)*test)\]`, whatever its `test` setting; a directory example (`examples/<dir>/main.rs`) is scanned through every `.rs` under its directory. An example that sets `test = true` is an offender too. A test offender prints `example <name> holds a test: <file>:<line> has <attribute>, and examples carry no tests.` and `move it into <package>'s src/ or tests/, or delete it.`; a `test = true` offender prints `example <name> sets test = true in <manifest>, and examples carry no tests.` and `remove test = true from its [[example]] entry.`. After all offenders, the call exits 2 with no cargo call besides `metadata`. `read_metadata` reuses `GATE_METADATA`. `verify.sh example-test` exits 2 with `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).` before anything else.
+A gate run is `test [<pkg>]` without `--filter` or `--test`; `--features` is allowed.
+A test without a package uses the workspace figure for memory admission and estimates.
+Gate runs and `final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA`.
+They run `UNTESTED_EXAMPLES_PY` before the cache lookup and any build.
+An example is invalid when a source line matches `^\s*#\[(cfg\(test\)|(\w+::)*test)\]` or its manifest sets `test = true`.
+The scan reads every `.rs` file inside a directory example (`examples/<dir>/main.rs`).
+Each source violation prints a reason and a correction:
+
+- `example <name> holds a test: <file>:<line> has <attribute>, and examples carry no tests.`
+- `move it into <package>'s src/ or tests/, or delete it.`
+
+Each manifest violation prints:
+
+- `example <name> sets test = true in <manifest>, and examples carry no tests.`
+- `remove test = true from its [[example]] entry.`
+
+After all violations, the call exits 2 with no Cargo call except `metadata`.
+`read_metadata` reuses `GATE_METADATA`.
+`verify.sh example-test` exits 2 before any work.
+It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
 ### Codex launcher capacity (`scripts/agents/codex_mesh.py`)
 

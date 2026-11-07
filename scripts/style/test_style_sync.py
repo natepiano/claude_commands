@@ -567,7 +567,7 @@ class StyleSyncTests(unittest.TestCase):
         fixture = verify_fixture.VerifyLintScopeTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        result = fixture.verify("lint", "--workspace", "--no-cache")
+        result = fixture.verify("lint", "--no-cache")
         self.assertEqual(fixture.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "--all"],
         ])
@@ -597,7 +597,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         source = fixture.root / "src/lib.rs"
         _ = source.write_text("pub fn value()->u8{1}\n")
         before = source.read_bytes()
-        result = fixture.invoke_verify("lint", "--workspace", "--check", "--no-cache", cwd=fixture.root)
+        result = fixture.invoke_verify("lint", "--check", "--no-cache", cwd=fixture.root)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(source.read_bytes(), before)
         self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]])
@@ -615,7 +615,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def test_lint_runs_workspace_gate_on_requested_tip_and_records_each_tool(self) -> None:
         verify = self.root / "verify.sh"
         _ = verify.write_text(
-            '#!/bin/bash\n[[ "$*" == "lint --workspace --check --no-cache" ]] || exit 2\n'
+            '#!/bin/bash\n[[ "$*" == "lint --check --no-cache" ]] || exit 2\n'
             + f'git rev-parse HEAD > "{self.root / "checked-tip"}"\n'
             + "cat <<'OUTPUT'\n" + RECORDED_LINT + "OUTPUT\n",
         )
