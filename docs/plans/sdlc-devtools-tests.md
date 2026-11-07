@@ -1410,3 +1410,32 @@ Source: sdlc, cargo-liner handler unit's lost work. A watchdog restart left `car
 **State:** none. Rows that `end` already retired stay retired; a lost thread starts a fresh worker on the same tree.
 
 **Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line. Phase 4a: run owners are staff ids.
+
+### Phase 8m — The end-session test does not read the live session  · status: done
+
+Source: sdlc [1225326b]. `direct/test_end_session` went red in the fix-rounds gate with "No active unit run marker for this session", then passed. `EndSessionTests.environment` (`scripts/direct/test_end_session.py:90`) copies `os.environ`. `end_session.sh` takes `DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"`, so a caller's `CODEX_THREAD_ID` overrides the fixture's `CLAUDE_CODE_SESSION_ID` and the script looks for a marker the fixture never wrote. Measured on 3664b48c3: with `CODEX_THREAD_ID=live-thread-x` set, the module fails (1 failure, 3 errors) with that line.
+
+**Depends on:** none. It stacks on 8l 3664b48c3 for the tree, not for its code.
+
+#### Work Order
+
+**Goal:** `direct.test_end_session` gives the same result whatever session identity its caller has.
+
+**Spec:**
+1. **The fixture owns the session identity.** `EndSessionTests.environment` removes each session-identity variable that `end_session.sh` and the scripts it runs read from the caller and the fixture does not set: `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` name. Read `end_session.sh`, `scripts/lib/unit_env.sh` and `scripts/lib/unit_runs.py` `environ` to confirm the list, and name each removed variable in the summary. The fixture keeps its own `CLAUDE_CODE_SESSION_ID`.
+2. The test that uses `patch.dict(os.environ, environment)` (`test_end_session.py:237`) gets the same environment, so its in-process staff reads see the same identity.
+3. **Out of scope.** No change to `end_session.sh` or any other source file. No new check. No assertion changes.
+
+**Acceptance:**
+- `direct.test_end_session` is green with and without `CODEX_THREAD_ID=live-thread-x` in the caller's environment, through the 3z runner.
+- basedpyright `0 errors, 0 warnings, 0 notes` on `scripts/direct/test_end_session.py`. The full gate passes.
+
+**Files:**
+- `scripts/direct/test_end_session.py` — the fixture.
+
+**Workers:** `1 tester`
+- `test` — the test file.
+
+**State:** none.
+
+**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line.
