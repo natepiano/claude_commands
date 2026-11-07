@@ -38,6 +38,14 @@ LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 def setUpModule() -> None:
     configure_test_zone()
 
+    def start_command(client: herdr.Herdr, argv: list[str], kind: str, pane: str,
+                      timeout: float) -> subprocess.CompletedProcess[str]:
+        del client, kind, pane
+        return herdr.run_program(argv, timeout)
+
+    # Use the existing fake transport. Herdr tests cover the waiting CLI process.
+    _ = unittest.enterModuleContext(patch.object(herdr.Herdr, "start_command", start_command))
+
 
 from scripts.production import staff, unit_config
 from scripts.production.production_doc import Production, read_production
@@ -146,7 +154,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.enterContext(patch("scripts.production.add_unit_test_support.SCRIPT", script))
 
     def test_real_brief_admission_can_switch_to_its_approved_plan(self) -> None:
-        _ = self.successful("alpha", "--brief", "Write a full plan.", subprocess_cli=True)
+        _ = self.successful("alpha", "--brief", "Write a full plan.")
         worktree = self.root / "project-alpha"
         before = unit_config.read(worktree)
         assert isinstance(before, unit_config.UnitConfig)
@@ -158,7 +166,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         for pid in (101, 102):
             shutil.rmtree(self.root / "proc" / str(pid))
         before_calls = len(self.herdr_calls())
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", subprocess_cli=True)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), before.port, before.responsibilities))
         prompts = [row[-1] for row in self.herdr_calls()[before_calls:] if row[2:4] == ["agent", "prompt"]]

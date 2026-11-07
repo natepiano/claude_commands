@@ -28,7 +28,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib import build_folders
 from scripts.lib.socket_test_support import short_socket_directory
 
@@ -403,9 +403,9 @@ class AdmissionFixture(ExitStack):
             yield self
         finally:
             stopped.set()
-            worker.join(timeout=3)
+            worker.join(timeout=TEST_HANG_GUARD_SECS)
             if worker.is_alive():
-                raise AssertionError("the private admission loop did not stop")
+                raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
             self.serving_active.clear()
             if failures:
                 raise failures[0]
@@ -424,8 +424,8 @@ class AdmissionFixture(ExitStack):
 
     @contextmanager
     def loop_turn(self) -> Generator[None]:
-        if not self.loop_access.acquire(timeout=3):
-            raise AssertionError("the private admission loop did not yield within 3 seconds")
+        if not self.loop_access.acquire(timeout=TEST_HANG_GUARD_SECS):
+            raise AssertionError(f"the private admission loop did not yield within {TEST_HANG_GUARD_SECS} seconds")
         self.loop_permission.depth = getattr(self.loop_permission, "depth", 0) + 1
         try:
             yield

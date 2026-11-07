@@ -18,6 +18,7 @@ from typing import TypedDict, cast, override
 
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 
 HOOK = Path(__file__).with_name("pre-tool-use-brp-launch-gate.sh")
@@ -71,6 +72,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -84,6 +86,8 @@ class BrpLaunchGateTests(unittest.TestCase):
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILDLOG_DIR": str(self.root / "buildlog"),
         }
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+        seed_interpreter_cache(self.root / "cache")
         self.admission = caller_admission(self, self.root, self.environment)
 
     def write_cycle(self) -> None:
@@ -145,6 +149,20 @@ class BrpLaunchGateTests(unittest.TestCase):
                 self.assertIn("HANA_TEST_PURPOSE", decision["permissionDecisionReason"])
                 self.assertIn("env", decision["permissionDecisionReason"])
                 self.assertNotIn("memory wait reached", result.stderr)
+
+    def test_hook_filename_in_its_folder_returns_the_denial(self) -> None:
+        self.use_memory_wait_stub("printf 'memory wait reached\\n' >&2\nreturn 0")
+        result = subprocess.run(
+            ["bash", self.hook.name], cwd=self.hook.parent, env=self.environment,
+            input=json.dumps({"tool_name": "mcp__brp__brp_launch",
+                              "tool_input": {"target_name": "hana", "env": {}}}),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = cast(HookResponse, json.loads(result.stdout))
+        self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("HANA_TEST_PURPOSE", response["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn("memory wait reached", result.stderr)
 
     def test_hana_with_a_purpose_reaches_memory_wait(self) -> None:
         self.use_memory_wait_stub("printf 'labelled Hana reached memory wait\\n' >&2\nreturn 0")

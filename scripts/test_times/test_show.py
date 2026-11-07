@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import chdir, closing, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 import io
 import os
 from pathlib import Path
 import re
+import select
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
-from typing import TYPE_CHECKING, Self, override
+from threading import Event
+import time
+from typing import TYPE_CHECKING, BinaryIO, Self, cast, override
 import unittest
 from unittest import mock
 
@@ -43,8 +48,50 @@ else:
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
+REPORT_PRINT_WAIT_SECS = 60
 REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
                    ("module", "tools/test_alpha.py"), ("test", "target"))
+
+REPORT_PROCESS = """\
+import os
+from pathlib import Path
+import runpy
+import socket
+import sys
+sys.path.insert(0, sys.argv[1])
+report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
+main = report['main']
+main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
+index = report['index']
+if sys.argv[3]:
+    table = sys.argv[3]
+    columns, key, description = index.TABLES[table]
+    index.TABLES[table] = (columns + [('fixture_column', 'TEXT', 'fixture column')], key, description)
+event = socket.socket(fileno=int(sys.argv[4]))
+parent = os.getpid()
+update = index.update
+if os.environ.get('TEST_LOCKED_INDEX'):
+    from contextlib import contextmanager
+    update_lock = index.update_lock_in
+    @contextmanager
+    def report_update_lock(root):
+        if os.getpid() == parent:
+            event.sendall(b'U')
+        with update_lock(root):
+            yield
+    index.update_lock_in = report_update_lock
+def refresh():
+    if os.getpid() != parent:
+        event.sendall(b'S')
+        event.recv(1)
+    return update()
+index.update = refresh
+status = main(sys.argv[5:])
+os.close(1)
+os.close(2)
+os.waitpid(-1, 0)
+os._exit(status)
+"""
 
 
 class ReportTime(datetime):
@@ -55,9 +102,15 @@ class ReportTime(datetime):
 
 
 def run(*arguments: str) -> tuple[int, str, str]:
+    # These report assertions use a complete snapshot. Process tests cover refreshes.
+    _ = show.index.update()
+    return report_without_update(*arguments)
+
+
+def report_without_update(*arguments: str) -> tuple[int, str, str]:
     output = io.StringIO()
     errors = io.StringIO()
-    with redirect_stdout(output), redirect_stderr(errors):
+    with redirect_stdout(output), redirect_stderr(errors), mock.patch.object(show, "refresh_after_report"):
         status = show.main(list(arguments))
     return status, output.getvalue(), errors.getvalue()
 
@@ -157,6 +210,268 @@ class TestTimesTests(unittest.TestCase):
         self.assertEqual(status, 0, output + errors)
         return output
 
+    @contextmanager
+    def report_process(self, changed_table: str = "", *arguments: str,
+                       wait_for_refresh: bool = True) -> Generator[tuple[subprocess.Popen[bytes], socket.socket]]:
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        process = subprocess.Popen(
+            [sys.executable, "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
+             str(self.repo), changed_table, str(child_event.fileno()),
+             *(arguments or ("top", "--repo", str(self.repo)))],
+            cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(child_event.fileno(),),
+        )
+        child_event.close()
+        try:
+            if wait_for_refresh:
+                self.assertEqual(event.recv(1), b"S")
+            yield process, event
+        finally:
+            try:
+                event.sendall(b"F")
+            except BrokenPipeError:
+                pass
+            event.close()
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0)
+
+    def report_pipe(self, pipe: BinaryIO) -> str:
+        chunks: list[bytes] = []
+        while True:
+            ready, _, _ = select.select([pipe], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ready, "The report pipe stayed open during the refresh")
+            chunk = os.read(pipe.fileno(), 65536)
+            if not chunk:
+                return b"".join(chunks).decode()
+            chunks.append(chunk)
+
+    def test_first_report_closes_its_pipe_before_refresh_and_later_report_has_new_rows(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(EPOCH),)).close()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process() as (process, event):
+            first = self.report_pipe(cast(BinaryIO, process.stdout))
+            errors = self.report_pipe(cast(BinaryIO, process.stderr))
+            self.assertIn("tools/test_alpha.py", first)
+            self.assertNotIn("tools/test_beta.py", first.split("unmeasured:")[0])
+            self.assertEqual(errors, "rows as of 11-03 09:30 EST\n")
+            self.assertIsNone(process.poll(), "The supervisor must still wait for its refresh child")
+            event.sendall(b"F")
+        with self.report_process() as (process, event):
+            later = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", later.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_reads_complete_rows_during_a_refresh_larger_than_five_mib(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        program = """
+import socket
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.buildlog import index
+with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
+    connection = index.open_for_update(index.index_path())
+    try:
+        connection.execute("BEGIN IMMEDIATE").close()
+        connection.execute("UPDATE gate_modules SET times_missing=?", ("x" * (6 * 1024 * 1024),)).close()
+        event.sendall(b"W")
+        event.recv(1)
+        connection.execute("ROLLBACK").close()
+    finally:
+        connection.close()
+"""
+        event, child_event = socket.socketpair()
+        with event, child_event:
+            event.settimeout(TEST_HANG_GUARD_SECS)
+            writer = subprocess.Popen(
+                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                 str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(event.recv(1), b"W")
+                with self.report_process(wait_for_refresh=False) as (process, refresh):
+                    try:
+                        ready, _, _ = select.select([cast(BinaryIO, process.stdout)], [], [], REPORT_PRINT_WAIT_SECS)
+                        self.assertTrue(ready, "The list must print while the refresh holds its changed rows")
+                        output = self.report_pipe(cast(BinaryIO, process.stdout))
+                        self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])
+                        self.assertEqual(refresh.recv(1), b"S")
+                    finally:
+                        event.sendall(b"F")
+                        output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(writer.returncode, 0, output + errors)
+            finally:
+                if writer.poll() is None:
+                    writer.terminate()
+                    _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_report_reads_an_older_index_while_a_non_gate_schema_builds(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("steps") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_alpha.py", output)
+            self.assertNotIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_keeps_index_only_rows_after_an_exclusive_lock_exceeds_the_read_wait(self) -> None:
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05")
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as connection, connection:
+            connection.execute("UPDATE gate_modules SET module='test_beta.py'").close()
+        program = """
+import socket
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.buildlog import index
+with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
+    connection = index.open_for_update(index.index_path())
+    try:
+        connection.execute("BEGIN EXCLUSIVE").close()
+        event.sendall(b'W')
+        event.recv(1)
+        connection.execute("COMMIT").close()
+    finally:
+        connection.close()
+"""
+        event, child_event = socket.socketpair()
+        with event, child_event:
+            event.settimeout(TEST_HANG_GUARD_SECS)
+            writer = subprocess.Popen(
+                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                 str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(event.recv(1), b"W")
+                with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
+                        self.report_process(wait_for_refresh=False) as (process, refresh):
+                    try:
+                        self.assertEqual(refresh.recv(1), b"U")
+                    finally:
+                        event.sendall(b"F")
+                        output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(writer.returncode, 0, output + errors)
+                    output = self.report_pipe(cast(BinaryIO, process.stdout))
+                    self.assertIn("tools/test_beta.py", output.split("unmeasured:")[0])
+                    self.assertEqual(refresh.recv(1), b"S")
+                with closing(show.index.read_only()) as reader:
+                    self.assertEqual(reader.execute("SELECT module FROM gate_modules").fetchall(),
+                                     [("test_beta.py",)])
+            finally:
+                if writer.poll() is None:
+                    writer.terminate()
+                    _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_report_waits_for_an_exclusive_lock_taken_after_index_selection(self) -> None:
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01")
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        select_index = show.index.complete_gate_index_in
+        selected = Event()
+        locked = Event()
+
+        def hold_lock_after_selection() -> None:
+            self.assertTrue(selected.wait(TEST_HANG_GUARD_SECS))
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("BEGIN EXCLUSIVE").close()
+                locked.set()
+                # Hold the lock longer than the selection timeout.
+                time.sleep(0.2)
+                writer.execute("COMMIT").close()
+
+        def select_before_writer(root: Path) -> Path | show.index.NoCompleteGateIndex:
+            path = select_index(root)
+            selected.set()
+            self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
+            return path
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            writer = pool.submit(hold_lock_after_selection)
+            try:
+                with mock.patch.object(show.index, "complete_gate_index_in", select_before_writer):
+                    status, output, errors = report_without_update("top")
+            finally:
+                selected.set()
+                writer.result(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(status, 0, errors)
+        self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])
+
+    def test_report_builds_before_reading_when_gate_sql_changes(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("gate_runs") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_keeps_its_rows_and_timestamp_from_the_same_update(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            _ = show.index.update()
+        self.write_run([module_run("test_alpha.py", 9.0)], epoch=EPOCH + 60)
+        report_module = show.module
+        committing = Event()
+        open_writer = show.index.open_for_update
+
+        def writer_with_commit_signal(path: Path) -> sqlite3.Connection:
+            writer = open_writer(path)
+            def trace(statement: str) -> None:
+                if statement == "COMMIT":
+                    committing.set()
+            writer.set_trace_callback(trace)
+            return writer
+
+        def publish_after_rows(connection: sqlite3.Connection, host: str, subject: str, runs: int) -> None:
+            report_module(connection, host, subject, runs)
+            _ = pool.submit(show.index.update)
+            self.assertTrue(committing.wait(TEST_HANG_GUARD_SECS))
+
+        with ThreadPoolExecutor(max_workers=1) as pool, \
+                mock.patch.object(time, "time", return_value=EPOCH + 60), \
+                mock.patch.object(show.index, "open_for_update", writer_with_commit_signal), \
+                mock.patch.object(show, "module", publish_after_rows):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertNotIn("11-03 09:31", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+        with closing(show.index.read_only()) as reader:
+            self.assertEqual(reader.execute("SELECT count(*) FROM gate_runs").fetchone(), (2,))
+            self.assertEqual(reader.execute("SELECT value FROM meta WHERE key='updated_at'").fetchone(),
+                             (str(EPOCH + 60),))
+
+    def test_report_replaces_an_invalid_current_completion_time(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value='invalid' WHERE key='updated_at'").close()
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+
+    def test_freshness_line_dates_updates_from_another_local_day(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        for completed, expected in ((EPOCH, "09:30 EST"), (EPOCH - 86400, "11-02 09:30 EST")):
+            with self.subTest(completed=completed):
+                with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+                    writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(completed),)).close()
+                status, output, errors = report_without_update("module", "tools/test_alpha.py")
+                self.assertEqual(status, 0, errors)
+                self.assertIn("11-03 09:30", output)
+                self.assertEqual(errors, f"rows as of {expected}\n")
+
     def line(self, output: str, subject: str) -> str:
         lines = [line for line in output.splitlines() if subject in line]
         self.assertEqual(len(lines), 1, output)
@@ -191,11 +506,13 @@ class TestTimesTests(unittest.TestCase):
             self.write_run([module_run("test_alpha.py", wall)], epoch=EPOCH + offset * 60)
         slow: TestTime = {"test": "Alpha.test_slow", "s": 1.25, "status": "pass"}
         types = type_job(3.0)
+        beta_run = module_run("test_beta.py", 1.0)
+        beta_run["cpu_s"] = 3.5
         self.write_run([
             module_run("test_alpha.py", 1000.0, restart="hold", status=-15),
             module_run("test_alpha.py", 2.0, attempt=2, tests=[slow]),
             module_run("test_alpha.py", 0.01, attempt=3),
-            module_run("test_beta.py", 7.0), module_run("test_removed.py", 999.0), types,
+            beta_run, module_run("test_removed.py", 999.0), types,
         ], epoch=EPOCH + 180)
         self.write_run([module_run("test_alpha.py", 9999.0)], host="other-host", epoch=EPOCH + 240)
 
@@ -209,8 +526,8 @@ class TestTimesTests(unittest.TestCase):
         self.assertNotIn("9999", output)
         self.assertIn("Alpha.test_slow", alpha)
         numbers = [float(match.group()) for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", alpha)]
-        self.assertEqual(numbers, [2, 4, 2, 2, 13, 1.25, 3], alpha)
-        self.assertRegex(self.line(output, "sum of medians"), r"3 modules; sum of medians 14(?:\.0+)? s")
+        self.assertEqual(numbers, [2, 2, 4, 2, 13, 1.25, 3], alpha)
+        self.assertRegex(self.line(output, "sum of median CPU"), r"3 modules; sum of median CPU 7(?:\.0+)? s")
         self.assertEqual(self.report(), output)
         limited = self.report("top", "--limit", "1", "--repo", str(self.repo))
         self.assertIn("tools/test_beta.py", limited)
@@ -555,14 +872,18 @@ class TestTimesTests(unittest.TestCase):
             "no gate runs recorded for module tools/test_alpha.py", "no tests recorded matching target",
         ), strict=True):
             with self.subTest(arguments=arguments):
-                self.assertEqual(self.report(*arguments), expected + "\n")
+                status, output, errors = report_without_update(*arguments)
+                self.assertEqual(status, 0, errors)
+                self.assertEqual(output, expected + "\n")
 
     def test_reports_rebuild_a_dropped_gate_table_from_recorded_runs(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
         before = self.report("module", "tools/test_alpha.py")
         with closing(sqlite3.connect(index_path_in(self.log))) as connection:
             _ = connection.execute("DROP TABLE gate_modules")
-        self.assertEqual(self.report("module", "tools/test_alpha.py"), before)
+        status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(output, before)
 
     def test_reports_name_a_missing_gate_table_without_a_traceback(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
@@ -571,7 +892,7 @@ class TestTimesTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE gate_modules")
         for arguments in REPORT_COMMANDS:
             with self.subTest(arguments=arguments), mock.patch.object(show.index, "update", return_value=0):
-                status, output, errors = run(*arguments)
+                status, output, errors = report_without_update(*arguments)
                 self.assertEqual(status, 1)
                 self.assertEqual(output, "")
                 self.assertEqual(errors.splitlines(), [
@@ -590,17 +911,25 @@ class TestTimesTests(unittest.TestCase):
 
         with mock.patch.object(show, "open_report_index", remove_table_after_probe), \
                 self.assertRaisesRegex(sqlite3.OperationalError, "no such table: gate_modules"):
-            _ = run("top", "--repo", str(self.repo))
+            _ = report_without_update("top", "--repo", str(self.repo))
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
-        completed = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
-            cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        try:
+            completed = subprocess.run(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
+                cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
+                pass_fds=(child_event.fileno(),), timeout=TEST_HANG_GUARD_SECS,
+            )
+            child_event.close()
+            self.assertEqual(event.recv(1), b"", "The refresh must end before fixture cleanup")
+        finally:
+            child_event.close()
+            event.close()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stderr, "")
+        self.assertRegex(completed.stderr, r"^rows as of \d\d:\d\d (EST|EDT)\n$")
         self.assertIn("11-03 09:30", completed.stdout)
 
 

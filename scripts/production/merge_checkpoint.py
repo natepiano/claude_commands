@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Merge, test, push, promote, and record one production checkpoint.
 
 A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
@@ -115,6 +115,7 @@ class Unit(NamedTuple):
     plan: Path
     worktree: Path
     branch: str
+    staff_id: staff.StaffId
 
 
 class UnitUnavailable(NamedTuple):
@@ -237,7 +238,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, config.reason)
     plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
             else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
-    return Unit(name, plan, location.path, branch.name)
+    return Unit(name, plan, location.path, branch.name, row.id)
 
 
 def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
@@ -435,7 +436,8 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 
 def record_publication_changes(production: ProductionDocument, *, report_unchanged: bool = True,
-                               record: staff.StaffSnapshot | None = None) -> None:
+                               record: staff.StaffSnapshot | None = None,
+                               known_producer: change_review.KnownMergeProducer | change_review.UnknownProducer = change_review.UNKNOWN_PRODUCER) -> None:
     """Scan published merges after every promotion step succeeds."""
     doc = change_review.list_path(production.doc, record=record)
     if doc is None:
@@ -443,7 +445,8 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
             report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
     try:
-        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record)
+        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record,
+                                        known_producer=known_producer)
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; retry after the repair")
         return
@@ -1346,7 +1349,8 @@ def run(request: MergeRequest) -> int:
             paths = changed_paths(request, f"{merge_head}^1")
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
-                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record)
+                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record,
+                                                       known_producer=request.unit.staff_id)
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
@@ -1400,7 +1404,8 @@ def run(request: MergeRequest) -> int:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
                 notify_published_style(request.production, merge_head, tip)
-        record_publication_changes(request.production, record=request.staff_record)
+        record_publication_changes(request.production, record=request.staff_record,
+                                   known_producer=change_review.KnownMergeProducer(merge_head, request.unit.staff_id))
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()
         record(request, merge_head, tests_green)

@@ -6,32 +6,32 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable
 from contextlib import AbstractContextManager
-import ctypes
 import errno
 import os
 from pathlib import Path
 import select
-import struct
 import sys
 import time
-from typing import cast, final, override
+from typing import final, override
 
 
+
+from scripts.lib import inotify
+
+
+RELEASE_CHANGES = (inotify.IN_CLOSE_WRITE | inotify.IN_MOVED_FROM | inotify.IN_MOVED_TO
+                   | inotify.IN_CREATE | inotify.IN_DELETE | inotify.IN_DELETE_SELF
+                   | inotify.IN_MOVE_SELF)
 
 
 @final
 class LocalReleaseEvents(AbstractContextManager["LocalReleaseEvents"]):
     """Own Linux directory watches for one local hold wait."""
 
-    def __init__(self, holders: Path, release: Path) -> None:
-        library = ctypes.CDLL(None, use_errno=True)
-        initialize = cast(Callable[[int], int], library.inotify_init1)
-        self.add_watch = cast(Callable[[int, bytes, int], int], library.inotify_add_watch)
-        self.descriptor = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
-        if self.descriptor < 0:
-            raise OSError(ctypes.get_errno(), "cannot watch local release state")
+    def __init__(self, holders: Path, release: Path, mask: int = RELEASE_CHANGES) -> None:
+        self.descriptor = inotify.open_watch()
+        self.mask = mask
         self.holders = holders
         self.directories = (holders, release)
         self.watched: set[Path] = set()
@@ -51,12 +51,12 @@ class LocalReleaseEvents(AbstractContextManager["LocalReleaseEvents"]):
         for path in paths - self.watched:
             if not path.is_dir():
                 continue
-            # CLOSE_WRITE, MOVED_FROM/TO, CREATE, DELETE, DELETE/MOVE_SELF.
-            watch = self.add_watch(self.descriptor, os.fsencode(path), 0x00000FC8)
-            if watch < 0:
+            try:
+                watch = inotify.add_watch(self.descriptor, path, self.mask)
+            except OSError:
                 if not path.is_dir():
                     continue
-                raise OSError(ctypes.get_errno(), f"cannot watch {path}")
+                raise
             self.watched.add(path)
             self.watch_paths[watch] = path
 
@@ -67,29 +67,25 @@ class LocalReleaseEvents(AbstractContextManager["LocalReleaseEvents"]):
             readable, _, _ = select.select([self.descriptor], [], [], remaining)
             if not readable:
                 return
-            data = os.read(self.descriptor, 65536)
-            offset = 0
             changed = False
-            while offset < len(data):
-                watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
-                name = os.fsdecode(data[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
-                offset += 16 + length
-                if mask & 0x4000:  # IN_Q_OVERFLOW: re-read state rather than miss a release.
+            for event in inotify.read_events(self.descriptor):
+                watch, mask, name = event.watch, event.mask, event.name
+                if mask & inotify.IN_Q_OVERFLOW:
                     changed = True
                     continue
                 if watch not in self.watch_paths:
                     continue
                 directory = self.watch_paths[watch]
-                if mask & 0x8C00:  # Invalidated/replaced directory; re-arm its replacement.
+                if mask & inotify.WATCH_REMOVED:  # Subscribe to the replacement directory.
                     self.watched.discard(directory)
                     changed = True
                 if not name or name.startswith("."):
                     continue
                 path = directory / name
                 if (directory == self.holders or name in {"current", "cycle.json"}
-                        or path in self.directories or mask & 0x40000000):
+                        or path in self.directories or mask & inotify.IN_ISDIR):
                     changed = True
-            if changed:
+            if changed or time.monotonic() >= deadline:
                 return
 
     @override
@@ -112,9 +108,10 @@ class IntervalReleasePolling(AbstractContextManager["IntervalReleasePolling"]):
         pass
 
 
-def local_release_waiter(holders: Path, release: Path) -> LocalReleaseEvents | IntervalReleasePolling:
+def local_release_waiter(holders: Path, release: Path,
+                         mask: int = RELEASE_CHANGES) -> LocalReleaseEvents | IntervalReleasePolling:
     try:
-        return LocalReleaseEvents(holders, release)
+        return LocalReleaseEvents(holders, release, mask)
     except AttributeError:
         # macOS libc has no inotify symbols.
         return IntervalReleasePolling()

@@ -319,14 +319,25 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
                 elif selected:
                     issue(node, "dynamic module name")
     try:
+        collapse_offsets = {
+            offsets[node.lineno - 1] + node.col_offset
+            for node in ast.walk(tree) if isinstance(node, ast.If)
+            and ast.dump(ast.Module(node.body, [])) != ast.dump(ast.Module(node.orelse, []))
+        }
         for start, end, replacement in sorted(edits, reverse=True):
+            collapse_offsets = {
+                position if position < start else position + len(replacement) - (end - start)
+                for position in collapse_offsets if position < start or position >= end
+            }
             data = data[:start] + replacement + data[end:]
         source = data.decode()
         if selected:
+            collapse_lines = {data[:position].count(b"\n") + 1 for position in collapse_offsets}
             tree = ast.parse(source)
             lines = source.splitlines(keepends=True)
             for node in ast.walk(tree):
-                if isinstance(node, ast.If) and ast.dump(ast.Module(node.body, [])) == ast.dump(ast.Module(node.orelse, [])):
+                if (isinstance(node, ast.If) and node.lineno in collapse_lines
+                        and ast.dump(ast.Module(node.body, [])) == ast.dump(ast.Module(node.orelse, []))):
                     removed_names.update(child.id for child in ast.walk(node.test) if isinstance(child, ast.Name))
                     first, last = node.body[0].lineno - 1, node.body[-1].end_lineno or node.body[-1].lineno
                     body = [line[:node.col_offset] + line[node.body[0].col_offset:] if line.strip() else line

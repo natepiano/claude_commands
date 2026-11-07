@@ -2350,7 +2350,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_render_keeps_a_stated_basis_inside_its_table_cell(self) -> None:
         zone = ZoneInfo("America/Los_Angeles")
-        basis = "lint | full tests\nthen the live check"
+        basis = "lint | targeted tests\nthen the live check"
 
         def epoch(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 8, hour, minute, tzinfo=zone).timestamp())
@@ -2385,7 +2385,7 @@ class PhaseTableTests(unittest.TestCase):
             )
 
         self.assertIn(
-            "| ETA from | stated 09:50: lint \\| full tests then the live check |",
+            "| ETA from | stated 09:50: lint \\| targeted tests then the live check |",
             rendered,
         )
         current_json = cast("dict[str, object]", parsed["current"])

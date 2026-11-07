@@ -351,7 +351,7 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
-                                     "alpha-branch")
+                                     "alpha-branch", unit_membership("showrunner-example", ALPHA).id)
         request = merge_checkpoint.MergeRequest(
             replace(production, log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),

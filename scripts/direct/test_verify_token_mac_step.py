@@ -169,7 +169,10 @@ exec bash "$TEST_REAL_BOARD" "$@"
         _ = probe.write_text(
             "import os, subprocess, sys\nfrom pathlib import Path\n"
             + "result = subprocess.run([sys.executable, os.environ['TEST_REAL_FREE_NOW'], *sys.argv[1:]], check=False)\n"
-            + "Path(os.environ['TEST_BLOCK_PROBE']).write_text(str(result.returncode))\n"
+            + "observed = Path(os.environ['TEST_BLOCK_PROBE'])\n"
+            + "pending = observed.with_suffix('.pending')\n"
+            + "pending.write_text(str(result.returncode))\n"
+            + "pending.replace(observed)\n"
             + "raise SystemExit(result.returncode)\n")
         observed = self.runner_state / "block-probe"
         process = self.start_verify("lint", "--check", "--no-cache", extra={
