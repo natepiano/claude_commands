@@ -13,7 +13,11 @@ Codex code review uses the unit's read-only `review` workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
-Phase cleanup ends turns and keeps threads. Unit pause, move, and end use staff membership and the worker ledger. Usage reports compare checkpointed phases through the usage store.
+After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
+Unit pause, move, and end use staff membership and the worker ledger.
+Usage reports compare checkpointed phases through the usage store.
 
 ## Unit code reviewers
 
@@ -326,7 +330,9 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore retains launcher recovery and shares dispatch reads across pane workers.
+Restore reopens only workers with active dispatches and retains launcher recovery.
+It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Account moves must preserve closed idle workers.
 
 ### Cleanup
 

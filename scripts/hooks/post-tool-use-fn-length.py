@@ -2,13 +2,17 @@
 """Tell an editing agent when a Rust function exceeds clippy's line limit."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
 
 TYPE_CHECKING = False
 
 if TYPE_CHECKING:
-    from fn_length_lib import AppliedRustEdits
+    from scripts.hooks.fn_length_lib import AppliedRustEdits
 
 
 def _log_block(
@@ -42,7 +46,7 @@ def main() -> None:
     raw = sys.stdin.read()
     if ".rs" not in raw and "\\u" not in raw:
         return
-    from fn_length_lib import IgnoredEdit, applied_rust_edits
+    from scripts.hooks.fn_length_lib import IgnoredEdit, applied_rust_edits
 
     try:
         edit = applied_rust_edits(raw)
@@ -55,7 +59,7 @@ def main() -> None:
         import os
 
         root = os.path.realpath(edit.cwd)
-        from fn_length_lib import long_functions
+        from scripts.hooks.fn_length_lib import long_functions
 
         descriptions: list[str] = []
         affected: list[tuple[str, int, int]] = []

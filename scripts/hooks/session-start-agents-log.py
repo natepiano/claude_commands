@@ -10,16 +10,11 @@ except FileNotFoundError:
 import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 
 def main() -> None:
-    if TYPE_CHECKING:
-        from ..usage import agents_log
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from scripts.usage import agents_log
+    from scripts.usage import agents_log
 
     value = cast(object, json.loads(sys.stdin.read()))
     if not isinstance(value, dict):
