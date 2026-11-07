@@ -721,9 +721,6 @@ class RoleTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("statusline.sh", "statusline.jq"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
-        library = scripts.parent / "lib"
-        library.mkdir()
-        _ = shutil.copy2(PROGRAM.parents[1] / "lib/py", library / "py")
         (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
         (scripts.parent / "lib").symlink_to(PROGRAM.parent.parent / "lib", target_is_directory=True)
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'

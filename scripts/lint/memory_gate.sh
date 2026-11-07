@@ -16,7 +16,7 @@ BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
 export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
 
 buildlog_memory_python() {
-    "${BASH_SOURCE[0]%/*}/../lib/py" "$@"
+    "$BUILDLOG_MEM_PY" "$@"
 }
 
 # Status 0 when the holder directory is missing or readable with no entry.

@@ -343,6 +343,7 @@ def main() -> None:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
     # Match the import path of python -m unittest from the current folder.
+    sys.path[0] = os.getcwd()
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
