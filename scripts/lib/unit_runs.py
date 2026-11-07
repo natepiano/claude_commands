@@ -122,6 +122,9 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
         except FileNotFoundError:
             selected = conf.read("direct").text("WORKER_TRANSPORT")
             selected = _transport(selected, run)
+            if selected == "mesh":
+                print("unit_runs: new runs require herdr; refusing a new mesh pin", file=sys.stderr)
+                raise SystemExit(2)
             write_text_atomic(pin, selected + "\n")
         return _transport(selected, pin)
 

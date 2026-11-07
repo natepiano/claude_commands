@@ -194,6 +194,15 @@ For an existing `mesh` pin, keep each worker's thread through the existing unit 
 Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
 A failed compaction keeps the thread available for its own compaction.
 Never create another reviewer while its retained thread exists.
+At the next phase start, the director of a run with a `mesh` pin must follow these steps:
+
+1. Finish the current pass, or record the unfinished work in the plan.
+2. Keep the run's history, saved launcher arguments, and durable design bindings.
+3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
+4. Confirm with one `ps` read that no process of that run remains.
+   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
+   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
+5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.

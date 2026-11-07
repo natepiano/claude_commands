@@ -270,6 +270,7 @@ class RosterTests(unittest.TestCase):
         server_pid: int | None = None,
     ) -> None:
         run.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(run / "worker_transport", "mesh\n")
         _ = (run / "mesh_server.json").write_text(json.dumps({
             "port": 45_678,
             "pid": os.getpid() if server_pid is None else server_pid,

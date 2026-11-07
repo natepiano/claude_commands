@@ -2804,7 +2804,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Ruled out:** changing the pin of an existing run, because the pin contract is immutable and worker state would mix two recovery paths.
 
-### Phase 16 — Prepare the cleanup  · status: todo
+### Phase 16 — Prepare the cleanup  · status: done
 
 **Depends on:** Phase 15.
 It lands before Phase 17, because both phases change `scripts/herdr/worker_panes.py`.
@@ -2830,6 +2830,8 @@ It goes to main fast: sdlc sends the handoff rule to every unit when this phase 
 - `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py` — Spec item 1.
 - `commands/unit/direct.md` — Spec item 2. Regenerate the command mirror with `scripts/claude_to_codex/sync.py`.
 - `scripts/direct/board.sh`, `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py`, `docs/direct/write_prompt_contract.md` — Spec item 3.
+- `scripts/direct/test_board_text.py`, `scripts/message/test_roster.py` — the folder-free board form and the mesh pin in the roster fixture.
+- `scripts/usage/activity.py`, `scripts/usage/test_activity.py`, `docs/as-built/usage-ledger.md` — the usage classifier reads the folder-free status post (review finding).
 
 **Workers:** `1 writer + 1 tester` — `impl`: the pin refusal, the folder reads and the command text; `test`: the consumer tests and negative cases, and a test that an existing mesh pin reads unchanged.
 

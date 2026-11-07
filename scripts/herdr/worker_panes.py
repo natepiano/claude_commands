@@ -729,7 +729,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
         if isinstance(matches, UncertainWorker):
             return matches
-        if matches:
+        same_run = True
+        if owner.kind == "unit" and matches and not passed:
+            try:
+                launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                return _uncertain(current.row, f"running launch environment is unproved: {error}")
+            same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+        if matches and same_run:
             _layout(owner.id, evidence)
             return current
         closable = can_close(current, lock=lock)
