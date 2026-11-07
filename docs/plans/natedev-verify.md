@@ -1331,7 +1331,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Spec:**
 
-1. A waiting call's wait time is `now` minus its step record's `updated` time. The record writes `updated` when its state changes, so a move from `waiting_hold` to `waiting_mac` starts a new wait.
+1. A waiting call's wait starts at the step record's `updated` time when the watch first sees the call in the set `waiting_calls` returns. The watch keeps that start in its state folder, keyed by call id and process start, while the call stays in that set. A rewrite of the state file does not move the start: a failed Mac attempt rewrites `waiting_mac` every 180 s, so the current `updated` time alone loses a long wait. The watch drops the start when the call leaves the set.
 2. Apply one filter in `watch_once`, right after `waiting_calls`: keep only calls whose wait time is at least `alert_seconds`. Every later step reads only the kept calls: the `waiting` count, the disk exclusion detail, the outage message, the push and the per-call causes.
 3. An `updated` time that does not parse counts as past the limit, so a bad record still alerts.
 4. Take the limit from `mac_idle_alert.read_idle_config()`. Add no new setting.
@@ -1350,6 +1350,8 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Acceptance gate:**
 - A call 4 seconds into `waiting_hold`, with the Mac idle for longer than `alert_seconds`, sends no outage message, no push and no `idle_with_waiter` message. This test fails on the old code.
 - The same call at `alert_seconds` plus 1 second sends the outage message.
+- A call first seen waiting longer ago than `alert_seconds`, whose state file was rewritten 10 seconds ago, sends the outage message. This test fails on the code that read only the current `updated` time.
+- A call that leaves the waiting set and comes back starts a new wait.
 - One fresh call and one call past the limit give a message that counts 1 waiting call.
 - `test_mac_idle.py` passes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
