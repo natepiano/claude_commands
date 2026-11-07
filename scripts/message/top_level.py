@@ -13,8 +13,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import roster
-import sessions
+from scripts.message import roster
+from scripts.message import sessions
 
 USAGE = "usage: top_level.py"
 

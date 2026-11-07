@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import fcntl
 import io
 import subprocess
-import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -16,17 +15,16 @@ from pathlib import Path
 from typing import IO, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import unit_plans
-import style_proposals
+from scripts.style import style_plan
+from scripts.style import unit_plans
+from scripts.style import style_proposals
 
-import berth_board
-import rules
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner, recorded_unit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -249,7 +247,7 @@ class StylePlanTests(StylePlanFixture):
         path = self.sources[0]
         finding = ledger.hold(rule, path, 1, "Keep this name", "rename", "value", "amount", blob, "outside")
         ledger.record(rule, path, self.tip, blob, "held", ticket="outside", input_scope=style_ledger.DeclaredInputScope.RULE)
-        result = subprocess.run([sys.executable, style_ledger.__file__, "held", "waive", "--repo", str(self.repo),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), style_ledger.__file__, "held", "waive", "--repo", str(self.repo),
                                  "--id", finding.finding_id, "--person", "nate"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.write(self.sources[1], "pub fn sibling_changed() {}\n")
@@ -259,7 +257,7 @@ class StylePlanTests(StylePlanFixture):
         for other in self.sources[1:]:
             self.record(rule, other, self.tip)
         self.assertEqual([ticket.files for ticket in self.candidates()], [(path,)])
-        refused = subprocess.run([sys.executable, style_ledger.__file__, "record", "--repo", str(self.repo),
+        refused = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), style_ledger.__file__, "record", "--repo", str(self.repo),
                                   "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob", blob,
                                   "--verdict", "held", "--ticket", "outside", "--worker", "test", "--input-scope", "rule"],
                                  capture_output=True, text=True, check=False)

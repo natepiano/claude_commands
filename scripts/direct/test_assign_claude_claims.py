@@ -5,11 +5,11 @@ import json
 import os
 import subprocess
 
-from scripts.direct.implement_launcher_test_support import ImplementLauncherFixture
+from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-class ImplementLauncherWorkerTests(ImplementLauncherFixture):
+class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
     def test_phase_launch_records_its_baseline_before_the_worker_opens(self) -> None:
         session = self.start_phase("first-baseline")
         head = subprocess.run(["git", "-C", str(self.working_dir), "rev-parse", "HEAD"], check=True,
@@ -27,7 +27,7 @@ class ImplementLauncherWorkerTests(ImplementLauncherFixture):
     def test_live_claim_refuses_a_second_claude_launcher_without_a_pass(self) -> None:
         session = self.start_phase("live-claim")
         _ = self.claude_worker(session)
-        claim = session / "impl_claim_impl.json"
+        claim = session / "impl_claim_fixture-impl.json"
         saved = json.dumps({"pid": os.getpid(), "worker": "fixture-impl"})
         _ = claim.write_text(saved)
         before = self.open_passes(session)
@@ -41,10 +41,10 @@ class ImplementLauncherWorkerTests(ImplementLauncherFixture):
     def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("stale-claim")
         _ = self.claude_worker(session)
-        claim = session / "impl_claim_impl.json"
+        claim = session / "impl_claim_fixture-impl.json"
         _ = claim.write_text(json.dumps({"pid": 99999999, "worker": "fixture-impl"}))
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session / "impl_status_impl").read_text(), "implemented\n")
+        self.assertEqual((session / "impl_status_fixture-impl").read_text(), "implemented\n")
         self.assertFalse(claim.exists())
         self.assertTrue((self.root / "delivered_message.txt").exists())

@@ -4,14 +4,14 @@ description: Record an X11 window as MP4.
 
 1. `$ARGUMENTS` is `'<window title substring>' <seconds> [name]`; quote a substring that holds spaces. This command runs on Linux (natedev). The Mac (`screencapture -v` or avfoundation) waits for a real consumer there.
 2. Launch the app before recording and shut it down afterward. The window must exist or appear within 10 s. On natedev's Wayland session, launch it as an X11 client with `env -u WAYLAND_DISPLAY`, then start the recorder right after launch.
-3. Run `python3 ~/.claude/scripts/screen_record/screen_record.py --window '<substring>' --seconds <N> [--name <label>]`. Stdout contains the clip path on one line when a clip is kept. Exit 0 means recorded; 1 means it could not record; 2 means the request was refused; 3 means a limit stopped the recording.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/screen_record/screen_record.py --window '<substring>' --seconds <N> [--name <label>]`. Stdout contains the clip path on one line when a clip is kept. Exit 0 means recorded; 1 means it could not record; 2 means the request was refused; 3 means a limit stopped the recording.
 4. Duration is required with no default. The ceiling is 60 s with no override; ask the user when a task needs longer. The outer timeout stops ffmpeg at duration + 15 s, and the file is capped at 500 MB. A refusal or stop names the limit it reached.
 5. For Hana, choose a port for this launch, never the user's 15702. Build the binary first so launch does not compile. Its debug window title contains `debug <port>`. Run this as one Bash call:
 
    ```bash
    env -u WAYLAND_DISPLAY BRP_EXTRAS_PORT=<port> RUST_LOG=info <worktree>/target/debug/hana > <scratchpad>/hana.log 2>&1 &
    pid=$!
-   clip=$(python3 ~/.claude/scripts/screen_record/screen_record.py --window "debug <port>" --seconds 7 --name startup)
+   clip=$(~/.claude/scripts/lib/py ~/.claude/scripts/screen_record/screen_record.py --window "debug <port>" --seconds 7 --name startup)
    curl -s -m 10 -X POST http://localhost:<port> -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"brp_extras/shutdown"}' > /dev/null
    wait "$pid"
    echo "$clip"

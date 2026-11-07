@@ -38,7 +38,7 @@ from scripts.lint import memory_admit as gate
 if TYPE_CHECKING:
     from scripts.buildlog import store
 else:
-    import store
+    from scripts.buildlog import store
 
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape

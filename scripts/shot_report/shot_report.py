@@ -11,7 +11,6 @@ import os
 import shlex
 import statistics
 import subprocess
-import sys
 import tempfile
 import time
 import zlib
@@ -22,30 +21,16 @@ from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, cast
 
-if __package__:
-    from .changes import Change, MeasurementChange, ProductChange, read_changes
-    from .episodes import (GAP_CATEGORIES, Episode, EpisodeTimeline, GapCategory,
-                           LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
-                           SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes,
-                           write_episodes)
-    from .transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
-                              AvailableTimingSource,
-                              CODEX_PREFILTER, PREFILTER, RELATED_WRITE, PersistentScanCache,
-                              UnavailableTimingSource, scan_calls, survey_counts)
-else:
-    from changes import Change, MeasurementChange, ProductChange, read_changes  # pyright: ignore[reportImplicitRelativeImport]
-    from episodes import (  # pyright: ignore[reportImplicitRelativeImport]
-        GAP_CATEGORIES, Episode, EpisodeTimeline, GapCategory, LegacyEvidenceUnavailable,
-        NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, SURVEY_SOURCES,
-        read_episodes, split_episodes, write_episodes,
-    )
-    from transcripts import (  # pyright: ignore[reportImplicitRelativeImport]
-        AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
-        AvailableTimingSource, CODEX_PREFILTER, PREFILTER, RELATED_WRITE,
-        PersistentScanCache, UnavailableTimingSource, scan_calls, survey_counts,
-    )
+from scripts.shot_report.changes import Change, MeasurementChange, ProductChange, read_changes
+from scripts.shot_report.episodes import (GAP_CATEGORIES, Episode, EpisodeTimeline, GapCategory,
+                       LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
+                       SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes,
+                       write_episodes)
+from scripts.shot_report.transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
+                          AvailableTimingSource,
+                          CODEX_PREFILTER, PREFILTER, RELATED_WRITE, PersistentScanCache,
+                          UnavailableTimingSource, scan_calls, survey_counts)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone, user_zone_name  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/screenshot-analysis"

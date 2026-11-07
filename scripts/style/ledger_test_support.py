@@ -19,12 +19,12 @@ from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-import style_plan
-import style_rules
-import declarations
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
+from scripts.style import style_plan
+from scripts.style import style_rules
+from scripts.style import declarations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -270,7 +270,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def cli_command(self, arguments: tuple[str, ...]) -> list[str]:
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
-        return [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
+        return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:

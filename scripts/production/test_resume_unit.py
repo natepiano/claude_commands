@@ -24,15 +24,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import resume_unit
-import add_unit
+from scripts.production import add_unit
 import retire_unit
-import sessions as retirement_sessions
+from scripts.message import sessions as retirement_sessions
 import unit_lookup
 import unit_move
 import test_retire_unit
 from scripts.production.production_doc import Production, read_production
 import pane_record
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
@@ -417,7 +417,7 @@ class ResumeUnitTests(unittest.TestCase):
             "import sys", "from unittest.mock import patch",
             f"sys.path.insert(0, {str(CHECKOUT / 'scripts/production')!r})",
             f"sys.path.insert(0, {str(CHECKOUT)!r})",
-            "import add_unit", "from scripts.production.production_doc import read_production",
+            "from scripts.production import add_unit", "from scripts.production.production_doc import read_production",
             "def launch(arguments):",
             "    name = arguments[arguments.index('--production') + 1]",
             "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",

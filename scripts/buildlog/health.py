@@ -19,8 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-import record
-import store
+from scripts.buildlog import record
+from scripts.buildlog import store
 
 SNAPSHOT_NAME = "recorder-health.json"
 SNAPSHOT_MAX_AGE_SECONDS = 2 * 60 * 60

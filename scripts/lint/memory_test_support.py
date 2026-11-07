@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 import os
-import sys
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..build_hold.override_guard import require_checkout
-    from .memory_admit import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
+    from scripts.build_hold.override_guard import require_checkout
+    from scripts.lint.memory_admit import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
 else:
     from scripts.build_hold.override_guard import require_checkout
     from scripts.lint.memory_admit import read_memory_config as read_fixture_config

@@ -7,11 +7,11 @@ from typing import Literal
 
 from scripts.lib import conf
 
-from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
-from . import questions
+from scripts.issue_score.client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
+from scripts.issue_score import questions
 from scripts.lib.conf import UseConfiguredValue
-from .questions import GOAL_LABELS, URGENCY_EVIDENCE
-from .questions import MinimumGap as MinimumGap, ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
+from scripts.issue_score.questions import GOAL_LABELS, URGENCY_EVIDENCE
+from scripts.issue_score.questions import MinimumGap as MinimumGap, ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
 
 
 @dataclass(frozen=True)

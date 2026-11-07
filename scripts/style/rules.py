@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Load and validate global and repository style rule metadata."""
 
 from __future__ import annotations
@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
-from git_process import GitReadFailed, run_git
+from scripts.style.git_process import GitReadFailed, run_git
 
-import style_rules
-from candidate_generators import CandidatesSpec
+from scripts.style import style_rules
+from scripts.style.candidate_generators import CandidatesSpec
 
 Tier = Literal["A", "B", "C", "D", "E"]
 Family = Literal["names", "values", "types", "modules"]

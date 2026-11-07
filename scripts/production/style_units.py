@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -13,15 +12,13 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-
-import live_units
-import rules
-import style_ledger
-import display_cells
+from scripts.production import live_units
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production import display_cells
 from scripts.production import staff, session_staff, unit_lookup
-from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
+from scripts.production.issues import Issue, frontmatter
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 

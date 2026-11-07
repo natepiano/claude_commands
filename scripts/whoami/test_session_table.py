@@ -20,9 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import roster
 
 from scripts.whoami import session_table
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import agent_accounts
-import five_hour
+from scripts.whoami import five_hour
 from scripts.whoami import note_file
 from scripts.accounts import accounts
 

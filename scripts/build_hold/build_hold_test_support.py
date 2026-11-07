@@ -20,14 +20,14 @@ from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-import build_hold
+from scripts.build_hold import build_hold
 if TYPE_CHECKING:
     from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
     from ..lib import test_hang_guard
 else:
     from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.lib import test_hang_guard
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

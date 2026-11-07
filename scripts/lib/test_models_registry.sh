@@ -4,7 +4,7 @@
 # matching Python's {"assignments": ExactRows({...})} override.
 TEST_MODELS_REGISTRY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 write_test_registry() {
-    MODELS_CONFIG_PUBLISH=0 python3 "$TEST_MODELS_REGISTRY_DIR/test_models_registry.py" "$@"
+    MODELS_CONFIG_PUBLISH=0 "$TEST_MODELS_REGISTRY_DIR/py" "$TEST_MODELS_REGISTRY_DIR/test_models_registry.py" "$@"
 }
 
 registry_read_probe() {

@@ -24,9 +24,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import cast
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.maintenance.settings import settings
 def git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     # Literal pathspecs: note names hold spaces and could hold glob characters.

@@ -11,7 +11,7 @@ If Rust changed, load the guide once for this phase, reusing a completed load
 in this thread on a retry: `zsh "$scripts/rust_style/load-rust-style.sh"`.
 Confirm its summary and walk every numbered checklist rule against the
 additions. Otherwise skip the Rust checklist with reason `no Rust change`.
-Run `python3 "$scripts/hooks/banned_words_lib.py" --diff < "$diff"`.
+Run `"$scripts/lib/py" "$scripts/hooks/banned_words_lib.py" --diff < "$diff"`.
 This mode scans additions without updating counters. Exit 0 is Pass, 1 is a
 violation; any other exit is Error. Do not recreate the scanner or rule list.
 

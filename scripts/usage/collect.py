@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Collect model turns and their role histories into an incremental SQLite ledger."""
 
 from __future__ import annotations
@@ -23,10 +23,6 @@ from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import BinaryIO, Literal, cast, override
-
-# Direct execution from any directory uses this checkout's modules.
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import unit_runs
 from scripts.usage.activity import (
@@ -1652,7 +1648,7 @@ def watch_waste(args: CommandLine) -> None:
     `waste_watch: <reason>` stderr line in place of the watch's own stderr.
     """
     script = os.environ.get("USAGE_WASTE_WATCH_SCRIPT") or str(Path(__file__).with_name("waste_watch.py"))
-    command = [sys.executable, script, "--db", str(args.db), "--production-docs", str(args.production_docs)]
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), script, "--db", str(args.db), "--production-docs", str(args.production_docs)]
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 timeout=WASTE_WATCH_TIMEOUT_SECONDS, check=False)
