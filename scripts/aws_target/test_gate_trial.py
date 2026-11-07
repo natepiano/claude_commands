@@ -307,7 +307,6 @@ class GateTrialTests(unittest.TestCase):
         _ = (self.root / 'trial.conf').write_text(trial_config())
         _ = (self.root / 'flake.lock').write_text(json.dumps({'root': 'host', 'nodes': {
             'host': {'inputs': {'nixpkgs': 'tools'}}, 'tools': {'locked': {'rev': 'f' * 40}}}}))
-        _ = self.enterContext(mock.patch.object(trial, 'host_basedpyright_version', return_value='1.39.10'))
 
     def run_trial(self, *, step: str = 'size', sizes: tuple[int, ...] = (16,), runs: int = 1, reserve: float = 4,
                   vcpus: int = 16, family: str = 'm7a') -> trial.GateTrial:
@@ -640,10 +639,12 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium', 'basedpyright'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
         self.assertNotIn('#google-chrome', data)
-        self.assertNotIn('#basedpyright', data)
+        self.assertNotIn('#nodejs', data)
+        self.assertNotIn('uv tool install', data)
+        self.assertNotIn('nodejs_wheel', data)
         self.assertNotIn('NIXPKGS_ALLOW_UNFREE', data)
         self.assertNotIn('--impure', data)
         self.assertIn('--command bash -ec', data)
@@ -671,16 +672,6 @@ class GateTrialTests(unittest.TestCase):
         self.assertGreater(len(tools), 20)
         self.assertTrue(all(word.startswith('github:NixOS/nixpkgs/' + 'f' * 40 + '#') for word in tools))
         self.assertNotIn('nixos-26.05#', self.fake.payloads[0])
-
-    def test_host_version_pins_basedpyright_before_the_gate_starts(self) -> None:
-        with mock.patch.object(trial, 'host_basedpyright_version', return_value='1.40.2') as version:
-            command = self.run_trial()
-        version.assert_called_once_with()
-        self.assertEqual(command.basedpyright_version, '1.40.2')
-        self.assertIn('Guest basedpyright version: 1.40.2', self.output)
-        data = self.fake.payloads[0]
-        self.assertIn('uv tool install basedpyright==1.40.2', data)
-        self.assertLess(data.index('uv tool install'), data.index('exec python3 /var/lib/gate-trial/guest.py'))
 
     def test_capacity_refusal_tries_next_public_zone_with_its_price(self) -> None:
         self.fake.capacity_zones = {'us-east-1a'}
@@ -1037,13 +1028,13 @@ class GuestTests(unittest.TestCase):
         url = prefix + 'a' * (400 - len(prefix))
         links = {'step': 'size', 'commit': 'a' * 40,
                  **dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
-        data = trial.user_data(links, 'f' * 40, '1.39.10', 30, 30, 600)
+        data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         self.assertLessEqual(len(data.encode()), 16384)
 
     def tool_session(self) -> str:
         links: dict[str, str] = dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
         links['step'] = 'size'
-        data = trial.user_data(links, 'f' * 40, '1.39.10', 30, 30, 600)
+        data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         return shlex.split(data[data.index('nix --extra-experimental-features'):])[-1]
 
     def test_tests_use_an_unprivileged_user_after_root_setup(self) -> None:
@@ -1063,13 +1054,9 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
-            uv = root / 'uv'
-            _ = uv.write_text('#!/bin/sh\n'
-                + 'printf "%s\\n" "$*" > "$HOME/uv-arguments"\n'
-                + 'mkdir -p "$HOME/.local/bin"\n'
-                + 'printf "#!/bin/sh\\necho basedpyright 1.39.10\\n" > "$HOME/.local/bin/basedpyright"\n'
-                + 'chmod +x "$HOME/.local/bin/basedpyright"\n')
-            uv.chmod(0o700)
+            basedpyright = root / 'basedpyright'
+            _ = basedpyright.write_text('#!/bin/sh\necho basedpyright fixture-version\n')
+            basedpyright.chmod(0o700)
             python = root / 'python3'
             _ = python.write_text('#!' + sys.executable + '\nimport json, os, subprocess\n'
                 + "print(json.dumps({'initialized':os.environ.get('__NIXOS_SET_ENVIRONMENT_DONE'),"
@@ -1084,8 +1071,26 @@ class GuestTests(unittest.TestCase):
             payload = ledger.mapping(cast(object, json.loads(result.stdout)))
             self.assertEqual(payload['initialized'], '1')
             self.assertEqual(payload['tool'], str(tool))
-            self.assertEqual(payload['basedpyright'], 'basedpyright 1.39.10')
-            self.assertEqual((root / 'uv-arguments').read_text(), 'tool install basedpyright==1.39.10\n')
+            self.assertEqual(payload['basedpyright'], 'basedpyright fixture-version')
+
+    def test_system_profile_copy_preserves_external_symlink_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            outside = root / 'outside'
+            _ = outside.write_text('fixture command')
+            source = root / 'source'
+            source.mkdir()
+            original = source / 'command'
+            original.symlink_to(outside)
+            destination = root / 'destination'
+            destination.mkdir()
+            command = shlex.split(next(line for line in self.tool_session().splitlines() if line.startswith('cp ')))
+            command[-2] = str(source) + '/.'
+            command[-1] = str(destination) + '/'
+            _ = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
+            copied_target = (destination / 'command').readlink()
+            self.assertEqual(copied_target, original.readlink())
+            self.assertNotIn(str(source), str(copied_target))
 
     def test_fixed_system_profile_path_resolves_the_tool_python(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -1111,11 +1116,6 @@ class GuestTests(unittest.TestCase):
             self.assertEqual((system / 'google-chrome').resolve(), (tools / 'chromium').resolve())
             session = self.tool_session()
             self.assertLess(session.index('/run/gate-trial-bin/google-chrome'), session.index('mount --bind'))
-
-    def test_host_basedpyright_version_reads_only_the_version_number(self) -> None:
-        with mock.patch.object(subprocess, 'check_output', return_value='basedpyright 1.39.10\nbased on pyright 1.1.409\n') as version:
-            self.assertEqual(trial.host_basedpyright_version(), '1.39.10')
-        version.assert_called_once_with(['basedpyright', '--version'], text=True)
 
     def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
         for present in (True, False):
@@ -1174,7 +1174,7 @@ class GuestTests(unittest.TestCase):
             self.assertEqual(uploads[1][0], links['ready-cold'])
             self.assertEqual(ledger.mapping(cast(object, json.loads(uploads[1][1])))['verdict'], 'error')
 
-    def test_guest_uses_whole_machine_with_types_timeout_and_counts(self) -> None:
+    def test_guest_uses_whole_machine_without_types_with_timeout_and_counts(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             repo = root / 'repo'
@@ -1217,10 +1217,11 @@ class GuestTests(unittest.TestCase):
             _ = (root / 'stat').write_text('cpu 100 0 100 10000 1000 0 0 0 9999 9999\n')
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
             original_run = merge_gate.run_suites
-            def run_suites(repo: Path, *, type_dirs: list[str], full: bool, machine: merge_gate.WholeMachine,
+            def run_suites(repo: Path, *, full: bool, machine: merge_gate.WholeMachine,
                            module_time_limit_s: float) -> merge_gate.GateRun:
+                self.assertEqual(os.environ['HERDR_BIN'], '/nonexistent/herdr')
                 self.assertEqual(machine.module_seconds, timings)
-                run = original_run(repo, type_dirs, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
+                run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
             with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable}),
@@ -1238,7 +1239,7 @@ class GuestTests(unittest.TestCase):
                   mock.patch.object(merge_gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
                   mock.patch.object(merge_gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
                   mock.patch.object(merge_gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
-                  mock.patch.object(merge_gate, 'typecheck_python', return_value=Path(sys.executable))):
+                  mock.patch.object(merge_gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
                 previous = Path.cwd()
                 try:
                     exec(compile(code, '<guest>', 'exec'), {})
@@ -1262,9 +1263,9 @@ class GuestTests(unittest.TestCase):
             self.assertEqual(payload['skips'], 1)
             self.assertEqual(set(cast(list[str], payload['failed_modules'])), {'fixture/test_broken.py', 'fixture/test_stuck.py'})
             measured = {str(row['module']): row for value in cast(list[object], payload['modules']) if (row := ledger.mapping(value))}
-            self.assertEqual(len(measured), 3)
+            self.assertEqual(len(measured), 2)
             self.assertEqual(measured['fixture/test_broken.py']['status'], 1)
-            self.assertEqual(measured['types/basedpyright']['status'], 0)
+            self.assertNotIn('types/basedpyright', measured)
             self.assertEqual(measured['fixture/test_stuck.py']['stopped'], True)
             self.assertEqual(measured['fixture/test_stuck.py']['status'], -signal.SIGTERM)
             self.assertIn('gate_started_at', payload)
@@ -1275,11 +1276,11 @@ class GuestTests(unittest.TestCase):
                 environment = ledger.mapping(call['env'])
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
-            self.assertEqual(cast(object, json.loads((root / 'types-args').read_text())), ['--pythonpath', sys.executable, 'scripts'])
+            self.assertFalse((root / 'types-args').exists())
             content = uploads[links['log']].decode()
             self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-15'))
             self.assertIn(' stopped', content)
-            self.assertIn('types/basedpyright exit=0', content)
+            self.assertNotIn('types/basedpyright', content)
             self.assertEqual(sum(line.startswith('fixture/test_broken.py exit=') for line in content.splitlines()), 1)
             self.assertEqual(sum(line.startswith('fixture/test_stuck.py exit=') for line in content.splitlines()), 1)
             self.assertIn('fixture tool preparation\n', content)
