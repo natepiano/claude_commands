@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Apply one approved names or values rule; test its clean workspace tree once on natedev.
 
 Each original decision keeps a normal proposal ticket. All tickets share one checkpoint.
 This command never sends messages or changes approvals.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -23,22 +27,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
-import style_sync
+from scripts.style import style_sync
 
-import bulk_constants as constants
-import bulk_rename as bulk
-import approved_renames
-import coverage_report
-import rules
-import style_ledger as ledger_api
-import style_proposals
-import style_footprint as rust
-from approved_renames import (BindingRename, NoBindingScope, NoMachineRenameRule, machine_rename_rule,
+from scripts.style import bulk_constants as constants
+from scripts.style import bulk_rename as bulk
+from scripts.style import approved_renames
+from scripts.style import coverage_report
+from scripts.style import rules
+from scripts.style import style_ledger as ledger_api
+from scripts.style import style_proposals
+from scripts.style import style_footprint as rust
+from scripts.style.approved_renames import (BindingRename, NoBindingScope, NoMachineRenameRule, machine_rename_rule,
                               refactor_rename, rename_declaration, type_named_parameter)
-from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
+from scripts.production.issues import Issue, frontmatter
+from scripts.production.proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
 
 
 @dataclass(frozen=True)
@@ -1045,7 +1048,7 @@ def require_test_tree(repo: Path, tree: str) -> None:
 
 
 def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float], *, owner: str = "") -> CommandResult:
-    with copies.standing(owner or style_sync.gate_owner(repo), repo, commit) as checkout:
+    with copies.standing(owner or style_sync.gate_owner(repo), repo, copies.CommittedSource(commit)) as checkout:
         require_test_tree(checkout, tree)
         result = tested_tree_proof(checkout, tree, runner, times)
         require_test_tree(checkout, tree)
@@ -1349,7 +1352,7 @@ def run_crates(repo: Path, packages: Sequence[str], run_id: str, rule: str, base
                runner: Runner = run_command,
                available: Callable[[Path, str], None] = bulk.check_available) -> int:
     """Enter the lifecycle through a deferred typed command; crate_run depends on this API."""
-    handler = cast(CrateCommand, getattr(importlib.import_module("crate_run"), "run_crates"))
+    handler = cast(CrateCommand, getattr(importlib.import_module("scripts.style.crate_run"), "run_crates"))
     return handler(repo, packages, run_id, rule, base_tree, destination, ledger, server, runner, available)
 
 
@@ -1391,7 +1394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             location = ledger_api.ledger_location(args.repo)
             with ledger_api.Ledger(location.repo, location.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger:
-                handler = cast(DryRunCommand, getattr(importlib.import_module("crate_run"), "dry_run_crates"))
+                handler = cast(DryRunCommand, getattr(importlib.import_module("scripts.style.crate_run"), "dry_run_crates"))
                 print(json.dumps(handler(args.repo, args.crate, args.rule, args.base_tree, ledger), indent=2))
                 return 0
         if socket.gethostname().split(".")[0] != "natedev":
@@ -1411,5 +1414,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     # crate_run imports this module: keep one class identity when entered as a script.
-    import bulk_run
+    from scripts.style import bulk_run
     raise SystemExit(bulk_run.main())

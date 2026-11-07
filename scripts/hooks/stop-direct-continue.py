@@ -4,12 +4,16 @@
 The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
 The guards permit declared waits, background tasks, and stops without context measurements.
-The hook repeats the wake above the threshold until compaction reduces the context.
+The hook wakes above the threshold only when the final line differs from the last wake.
 Paused status lines permit the stop without a wake.
 Exceptions permit the stop without output.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import re
@@ -90,6 +94,14 @@ def main() -> None:
     # heartbeat can be fresh even after its completion notice has arrived.
     if pending_background_tasks(payload):
         return
+
+    wake_line = session_dir / "compaction_wake_line"
+    try:
+        if wake_line.read_text(encoding="utf-8") == status:
+            return
+    except FileNotFoundError:
+        pass
+    _ = wake_line.write_text(status, encoding="utf-8")
 
     print(build_reason(tokens, trigger_tokens(window)), file=sys.stderr)
     raise SystemExit(2)

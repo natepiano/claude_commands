@@ -10,10 +10,6 @@ import unittest
 from unittest.mock import call, patch
 
 
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.production import roles_audit as audit, showrunners
 from scripts.lib.test_names import NAMES_TOML, fixture_names
 
@@ -789,8 +785,8 @@ other_names = []
             "docs/as-built/usage-ledger.md",
             "docs/as-built/build-memory-admission.md",
             "docs/production_format.md",
-            "scripts/production/rename_unit.py",
-            "scripts/direct/implement.sh",
+            "scripts/production/rename.py",
+            "scripts/direct/assign.sh",
             "scripts/usage/collect.py",
         )
         with tempfile.TemporaryDirectory() as directory:

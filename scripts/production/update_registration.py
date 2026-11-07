@@ -6,6 +6,10 @@ Fixed staff ids identify their askers.
 The JSON list stores ordinary reminders only.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -20,26 +24,20 @@ from pathlib import Path
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
-from merge_checkpoint import merged_checkpoints, report
+from scripts.production.merge_checkpoint import merged_checkpoints, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
-from proposals_folder import issues_folder
+from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
-from issues import Issue, frontmatter
-import urgency
-from urgency import Urgency, UrgencyError
-from atomic_file import write_text_atomic
+from scripts.production.issues import Issue, frontmatter
+from scripts.lib import urgency
+from scripts.lib.urgency import Urgency, UrgencyError
+from scripts.lib.atomic_file import write_text_atomic
 
-if TYPE_CHECKING:
-    from ..usage import agents_log
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.usage import agents_log
+from scripts.usage import agents_log
 
 from scripts.lib import names
 from scripts.lib.process_failure import failure_detail
@@ -1434,11 +1432,7 @@ AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-    if TYPE_CHECKING:
-        from ..notify import review
-    else:
-        import review
+    from scripts.notify import review
     outcome = review.review_question(review.QuestionKey(name, item.text), item.question)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)

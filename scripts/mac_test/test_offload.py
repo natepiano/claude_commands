@@ -24,20 +24,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 else:
-    from memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-import offload
+from scripts.mac_test import offload
 if TYPE_CHECKING:
     from ..build_targets import target_config
     from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
-    import target_config
-    import sync as buildlog_sync
-    import health as buildlog_health
-    import record as buildlog_record
-    import store as buildlog_store
-import conf
-from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+    from scripts.build_targets import target_config
+    from scripts.buildlog import sync as buildlog_sync
+    from scripts.buildlog import health as buildlog_health
+    from scripts.buildlog import record as buildlog_record
+    from scripts.buildlog import store as buildlog_store
+from scripts.lib import conf
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
+from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
@@ -104,7 +106,7 @@ class CompletedRunSyncTests(unittest.TestCase):
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "aws" else "macos", root / "target.conf")
         config = offload.OffloadConfig(True, offload.SshConnectionSettings("aws-build", 1, 1), 1, 1, 1, "1", {})
-        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target=target)
+        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
         output = io.StringIO()
 
@@ -161,6 +163,7 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = write_config_fixture(self.settings, "", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
+            **copies_environment(self.root),
             "MAC_TEST_CONFIG": str(self.settings), "CONF_DIR": str(Path(self.settings).parent),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
@@ -170,7 +173,7 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
         config = offload.read_config(self.settings)
-        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, ())
+        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
                 words = shlex.split(offload.remote_test_command(
@@ -377,6 +380,12 @@ class OffloadSettingsTests(unittest.TestCase):
                     self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
                 self.assertIn("leftover_timeout_s", warning.getvalue())
 
+    def test_probe_mirror_lease_stays_under_the_temporary_root(self) -> None:
+        request = offload.OffloadRequest(self.root, "hana", "probe-start", offload.NO_RESULT_FILE, (),
+                                         owner="verify", holder_session="fixture-session")
+        mirror = offload.request_mirror(offload.read_config(self.settings), request, offload.KnownRepository("hana"))
+        self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(self.root))
+
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
         destination = self.root / "result"
@@ -408,7 +417,7 @@ class OffloadSettingsTests(unittest.TestCase):
         expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "backoff"}
         for package, reason in expected.items():
             with self.subTest(package=package):
-                request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, ())
+                request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
                 with mock.patch.object(offload, "repository_identity",
                                        return_value=offload.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
@@ -905,11 +914,22 @@ class OffloadCommandTests(OffloadCommandFixture):
             for argument in copy["args"]
             if argument.startswith("--exclude-from=")
         )
+        session = (self.environment.get("CLAUDE_CODE_SESSION_ID")
+                   or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
+        receiver_argument = (
+            "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
+            + shlex.join(["--path", ".local/state/mac-test/mirror/hana", "--owner", "verify",
+                          "--repository", "hana", "--session", session, "--", "rsync"])
+        )
         self.assertEqual(
             copy["args"],
             [
                 "-rlpc",
                 "--delete",
+                receiver_argument,
+                "--exclude=/.mac-test-mirror",
+                "--exclude=/.copy-record.json",
+                "--exclude=/.copy-session",
                 exclude_argument,
                 "-e",
                 "ssh -o BatchMode=yes -o ConnectTimeout=6 "
@@ -918,7 +938,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/.mac-test-mirror\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)

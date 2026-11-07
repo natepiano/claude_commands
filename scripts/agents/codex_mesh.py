@@ -2,6 +2,10 @@
 """See docs/as-built/long-lived-workers.md for worker and server operations."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import base64
@@ -2966,9 +2970,9 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
 
-    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
-    cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
-    already have started this server. A run folder is known here, so the server names it itself.
+    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR.
+    assign.py can reach a server that another run started.
+    This server sets its run folder directly.
     A mesh directory outside the run roots keeps the caller's environment unchanged.
     """
     environment = staff.child_environment(os.environ)
@@ -6411,16 +6415,6 @@ def command_end(args: argparse.Namespace) -> int:
             if entry.get("status") != "ended":
                 return result
             remember_end()
-            # The design end operation publishes its lifecycle before retirement.
-            if not entry.get("held_design_id"):
-                native = _as_str(session_staff.worker_session(entry))
-                row = staff.by_current_session(native) if native else None
-                if row is not None and row.kind == "worker":
-                    try:
-                        _ = staff.retire(row.id)
-                    except staff.StaffRefused as error:
-                        print(f"codex_mesh: {target}: {error}", file=sys.stderr)
-                        return 1
         return result
 
 
@@ -6614,7 +6608,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         launcher = _as_int(record.get("launcher_pid"))
         revision = _roster_revision(record)
         reason = ""
-        if status not in ROSTER_LIVE | {"ended"}:
+        if status not in ROSTER_LIVE | {WAITING_CAPACITY, "ended"}:
             reason = "worker is not ended, running or starting"
         elif not thread_id:
             reason = "missing thread id"
@@ -6643,7 +6637,8 @@ def command_reopen(args: argparse.Namespace) -> int:
                 print(f"codex_mesh: {name}: worker changed during idle recovery; reopen refused", file=sys.stderr)
                 return 2
             _end_marker_path(session_dir, name).unlink(missing_ok=True)
-            entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended"})
+            entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended",
+                          "dead_launcher_recovery": True})
             if recovered_idle:
                 entry.update({"context_tokens": "not_measured_since_compaction", "paused_turn": False})
                 _ = entry.pop("turn_id", None)
@@ -8841,12 +8836,15 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             return 1
         retried = _interrupt_worker_for_account_move(
             session_dir, name, record, port, codex_home_role_label(workers_home()))
-        outcome = (_wait_account_move_resumes((retried,))[(session_dir, name)]
-                   if isinstance(retried, InterruptedWorkerMove) else retried.outcome)
-        if isinstance(outcome, (WorkerMoveResumeAvailable, WorkerMoveResumeRefused)):
-            print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
-            return 1
-        return 0
+        if isinstance(retried, InterruptedWorkerMove) and not _pid_alive(retried.launcher_pid):
+            marker = retried.marker
+        else:
+            outcome = (_wait_account_move_resumes((retried,))[(session_dir, name)]
+                       if isinstance(retried, InterruptedWorkerMove) else retried.outcome)
+            if isinstance(outcome, (WorkerMoveResumeAvailable, WorkerMoveResumeRefused)):
+                print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
+                return 1
+            return 0
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != record:
@@ -9013,8 +9011,17 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
         try:
             if not thread_id:
                 raise SystemExit("worker has no recorded thread")
-            client = Client(port, f"account-move-{name}", operation_deadline=deadline)
-            state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+            availability = _server_availability(session_dir)
+            if isinstance(availability, ServerRestartRequired) and availability.doubt:
+                raise SystemExit(f"no live server evidence: {availability.doubt}")
+            state: ThreadState = ThreadIdle()
+            for candidate in sorted(_run_servers(session_dir), key=lambda candidate: candidate != port):
+                client = Client(candidate, f"account-move-{name}", operation_deadline=deadline)
+                if thread_id in _loaded_thread_ids(client, deadline):
+                    state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+                    break
+                client.close()
+                client = None
             if isinstance(state, ThreadStateUnknown):
                 raise SystemExit(state.reason)
             if isinstance(state, ThreadActiveWithoutTurn):
@@ -9031,17 +9038,18 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
                 if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
                     raise SystemExit("worker ended or was replaced before interruption")
                 _write_account_move_json(_account_move_path(session_dir, name), stored)
-            with _pending_file(session_dir, name, deadline=deadline) as pending:
-                def park(message: str, submission: str) -> None:
-                    _park_submission(pending, message, submission)
-                _move_queue_to_pending(client, thread_id, park)
-            if isinstance(state, ThreadLive):
-                reply = _interrupt_turn(client, thread_id, state.turn_id)
-                if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
-                    _account_move_path(session_dir, name).unlink(missing_ok=True)
-                    _ = _require(reply, "turn/interrupt")
-            client.close()
-            client = None
+            if client is not None:
+                with _pending_file(session_dir, name, deadline=deadline) as pending:
+                    def park(message: str, submission: str) -> None:
+                        _park_submission(pending, message, submission)
+                    _move_queue_to_pending(client, thread_id, park)
+                if isinstance(state, ThreadLive):
+                    reply = _interrupt_turn(client, thread_id, state.turn_id)
+                    if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                        _account_move_path(session_dir, name).unlink(missing_ok=True)
+                        _ = _require(reply, "turn/interrupt")
+                client.close()
+                client = None
             return InterruptedWorkerMove(session_dir, name, marker, _as_int(entry.get("launcher_pid")))
         except worker_lifecycle.OperationDeadlineExpired:
             raise

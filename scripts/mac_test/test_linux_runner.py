@@ -16,23 +16,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast, override
+from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-if TYPE_CHECKING:
-    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-    from . import linux_runner, mac_test, offload, test_target_slots
-    from ..lint import sweep
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-    import linux_runner
-    import mac_test
-    import offload
-    import test_target_slots
-    import sweep
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test.offload_test_support import mirror_use_payload
+from scripts.lint import sweep
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -212,9 +204,8 @@ class LinuxShellTests(unittest.TestCase):
 
     def request(self, verb: offload.MacVerb = "nextest", words: tuple[str, ...] = ()) -> offload.OffloadRequest:
         return offload.OffloadRequest(
-            self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words,
-            verb=verb, target="aws", slot=2,
-        )
+            self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words, owner="verify",
+            verb=verb, target="aws", slot=2, holder_session="fixture-session")
 
     def command(self, request: offload.OffloadRequest) -> str:
         return offload.remote_test_command(
@@ -223,7 +214,7 @@ class LinuxShellTests(unittest.TestCase):
 
     def execute(self, request: offload.OffloadRequest, *, interrupt: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = shlex.split(self.command(request))
-        self.assertEqual(arguments[:3], ["python3", ".claude/scripts/mac_test/linux_runner.py", "run"])
+        self.assertEqual(arguments[:3], [".claude/scripts/lib/py", ".claude/scripts/mac_test/linux_runner.py", "run"])
         output, errors = io.StringIO(), io.StringIO()
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
@@ -236,7 +227,7 @@ class LinuxShellTests(unittest.TestCase):
 
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
                   capture_output: bool = False, text: bool = False, timeout: float = 5,
-                  env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                  env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
             if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
                 if not self.use_real_sweep:
@@ -253,7 +244,7 @@ class LinuxShellTests(unittest.TestCase):
                         status = 0
                 return subprocess.CompletedProcess(argv, status, "", "")
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
-                                 text=True, timeout=timeout, env=env)
+                                 text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
                 print(completed.stdout, end="")
                 print(completed.stderr, end="", file=sys.stderr)
@@ -594,9 +585,11 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5) -> subprocess.CompletedProcess[str]:
+                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            result = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout)
+            result = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
+                              text=True, timeout=timeout, pass_fds=pass_fds)
             if not capture_output:
                 print(result.stdout, end="")
             return result
@@ -730,9 +723,10 @@ class LinuxShellTests(unittest.TestCase):
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
                     capture_output: bool = False, text: bool = False, timeout: float = 5,
-                    env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    env: Mapping[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout, env=env)
+            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True,
+                             timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
                 print(reply.stdout, end="")
                 print(reply.stderr, end="", file=sys.stderr)
@@ -859,7 +853,7 @@ class LinuxProcessTests(unittest.TestCase):
 
     def selector_output(self) -> subprocess.CompletedProcess[str]:
         script = linux_runner.mirror_selector_script(str(self.mirror))
-        command = next(shlex.split(line) for line in script.splitlines() if line.strip().startswith("python3 "))
+        command = next(shlex.split(line) for line in script.splitlines() if " -c " in line)
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", ["-c", str(self.mirror)]), \
                 redirect_stdout(output), redirect_stderr(errors):
@@ -1078,6 +1072,8 @@ class LinuxProcessTests(unittest.TestCase):
         self.use_private_processes()
         kill_log = self.root / "kill-list"
         cleanups: list[subprocess.CompletedProcess[str]] = []
+        selector_runner = dispatch.fixture.root / ".claude/scripts/lib/py"
+        selector_runner.parent.mkdir(parents=True)
 
         def cleanup(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if argv[0] != "ssh":
@@ -1085,11 +1081,14 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.commands.append(argv)
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
-            stubs = (
-                "python3() { printf '%s' " + shlex.quote(selector.stdout)
+            _ = selector_runner.write_text(
+                "#!/bin/bash\nprintf '%s' " + shlex.quote(selector.stdout)
                 + "; printf '%s' " + shlex.quote(selector.stderr)
-                + " >&2; return " + str(selector.returncode) + "; }\n"
-                + "kill() { printf '%s\\n' \"$*\" >> " + shlex.quote(str(kill_log)) + "; }\n"
+                + " >&2; exit " + str(selector.returncode) + "\n"
+            )
+            selector_runner.chmod(0o755)
+            stubs = (
+                "kill() { printf '%s\\n' \"$*\" >> " + shlex.quote(str(kill_log)) + "; }\n"
                 + "sleep() { :; }\n"
             )
             with mock.patch.object(subprocess, "Popen", open_process):
@@ -1197,7 +1196,7 @@ class LinuxProcessTests(unittest.TestCase):
         cleanup_replies: list[subprocess.CompletedProcess[str]] = []
 
         def runner(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            argv = shlex.split(arguments[-1])
+            argv = shlex.split(mirror_use_payload(dispatch, arguments)[-1])
             output, errors = io.StringIO(), io.StringIO()
             with mock.patch.object(sys, "argv", argv[1:]), \
                     redirect_stdout(output), redirect_stderr(errors):
@@ -1449,15 +1448,17 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.write_source("src/lib.rs", "first source\n")
         remote_home = self.root / "remote-home"
         remote_home.mkdir()
+        (remote_home / ".claude").symlink_to(Path(__file__).resolve().parents[2], target_is_directory=True)
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
+                           + '[[ $1 == natedev ]] && exit 255\n'
                            + 'shift\ncd "$TEST_REMOTE_HOME" || exit 1\nexec bash -c "$*"\n')
         ssh.chmod(0o755)
         controller = offload.ProcessController()
-        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), target="aws")
+        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
         identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
         environment = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}",
-                       "TEST_REMOTE_HOME": str(remote_home)}
+                       "TEST_REMOTE_HOME": str(remote_home), "HOME": str(remote_home)}
         with mock.patch.dict(os.environ, environment):
             copied = offload.copy_tree_with_key(controller, self.config(), request, identity)
 
@@ -1475,7 +1476,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("add", ".gitignore", "tests/b.rs", "src/lib.rs")
         _ = self.git("commit", "-qm", "Fixture source")
         controller = offload.ProcessController()
-        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), target="aws")
+        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
         identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
         with mock.patch.object(controller, "capture", side_effect=self.capture):
             self.assertTrue(offload.copy_tree(controller, self.config(), request, identity))
@@ -1611,7 +1612,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def request(self, verb: offload.MacVerb = "nextest") -> offload.OffloadRequest:
         return offload.OffloadRequest(self.source, "hana", "call", offload.NO_RESULT_FILE,
-                                     ("-p", "hana"), verb=verb, target="aws")
+                                     ("-p", "hana"), owner="verify", verb=verb, target="aws", holder_session="fixture-session")
 
     def state_arguments(self, arguments: Sequence[str]) -> mac_test.CliArguments:
         return mac_test.parser().parse_args(list(arguments[2:]), namespace=mac_test.CliArguments())
@@ -1661,7 +1662,7 @@ class LinuxDispatchTests(unittest.TestCase):
         self.fail(f"Unexpected command: {argv}")
 
     def stream(self, arguments: Sequence[str]) -> offload.RemoteRunStatus:
-        self.commands.append(list(arguments))
+        self.commands.append(mirror_use_payload(self, arguments))
         self.actions.append("run")
         return self.stream_status
 
@@ -1790,7 +1791,7 @@ class LinuxDispatchTests(unittest.TestCase):
         ])
         source_copy = next(argv for argv in self.commands if argv[0] == "rsync" and any(word.startswith("--exclude-from=") for word in argv))
         self.assertIn("--delete", source_copy)
-        self.assertEqual(self.filters, ["/.git\n/target/\n/.mac-test-mirror\n/private/\n/.env\n"])
+        self.assertEqual(self.filters, ["/.git\n/target/\n/private/\n/.env\n"])
         self.assertNotIn("--copy-links", source_copy)
         identity = offload.repository_identity(self.source)
         if not isinstance(identity, offload.KnownRepository):

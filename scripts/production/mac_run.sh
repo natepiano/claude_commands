@@ -70,8 +70,8 @@ on_mac() {
 
 ssh -o ConnectTimeout=$connect_seconds -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 
-mac_test=$HOME/.claude/scripts/mac_test/mac_test.py
-claim_output=$(python3 $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
+mac_test=$lib/../mac_test/mac_test.py
+claim_output=$("$lib/py" "$mac_test" claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
 claim_status=$?
 if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
   print -r -- $claim_output
@@ -87,13 +87,19 @@ release_mac_claim() {
       if ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" >/dev/null; then
         print -u2 "mac_run: scratch cleanup failed; kept task $clone_task"
         cleanup_failed=1
+      elif ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" >/dev/null; then
+        print -u2 "mac_run: remote clone registry cleanup failed"
+        cleanup_failed=1
+      elif ! "$lib/py" $copies_script unregister-remote --host $host --path $clone; then
+        print -u2 "mac_run: local clone registry cleanup failed"
+        cleanup_failed=1
       fi
     else
       print -u2 "mac_run: process exit not confirmed; kept checkout $clone and task $clone_task${confirmation:+: $confirmation}"
       cleanup_failed=1
     fi
   fi
-  python3 $mac_test release --pid $$ >/dev/null 2>&1
+  "$lib/py" "$mac_test" release --pid $$ >/dev/null 2>&1
   mac_claimed=0
   return $cleanup_failed
 }
@@ -124,9 +130,19 @@ sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
 # When the source already holds the commit, no bundle is needed.
 clone_task=gate:mac-run-${sha}-$$
-clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana") || exit 4
+copies_script=$lib/../copies/copies.py
+copy_owner=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2])); from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' $copies_script $repo) || exit 4
+copy_owner_arg=${(q)copy_owner}
+copy_session=${owner:-pid-$$}
+copy_session_arg=${(q)copy_session}
+clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg") || exit 4
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
+registry_args=(--repository hana --owner $copy_owner --host $host --path $clone --session $copy_session)
+mirror_lease=$("$lib/py" $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
+exec 8>"$mirror_lease"
+flock 8
+"$lib/py" $copies_script register-remote "${registry_args[@]}" || exit 4
 base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
 if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
   ssh $host "git -C $clone_arg checkout -q --detach $sha"

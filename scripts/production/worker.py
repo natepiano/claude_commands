@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Select staff workers and dispatch work through their native conversations."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from contextlib import redirect_stderr
@@ -15,17 +19,15 @@ import subprocess
 import sys
 from typing import cast, final
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.direct import board_json, progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, unit_runs
+from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import staff, worker_admission
+from scripts.production import session_staff, staff, worker_admission
 
-import herdr
+from scripts.herdr import herdr
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName
@@ -412,6 +414,62 @@ def end(parent: StaffId, name: WorkerName, *,
         return ExitCode.OK
 
 
+def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch) -> ExitCode:
+    """Ask the restored director to run the saved launcher from its session shell."""
+    record = staff.snapshot()
+    parent = record.parent_of(row)
+    client = _client()
+    pane = next((item for item in client.tab_sessions()
+                 if parent is not None and item.session_id == parent.current_session), None)
+    if pane is None or parent is None:
+        print(f"anomaly: {row.name}: director session is unavailable", file=sys.stderr)
+        return ExitCode.UNCERTAIN
+    with worker_panes.worker_lock(parent.id, WorkerName.parse(row.name)) as hold:
+        kept = isinstance(hold, worker_panes.Kept)
+    if kept:
+        return ExitCode.OK
+    client.prompt(pane.pane_id, launcher_prompt(row.id, dispatch.instance_id, dispatch.launcher_command),
+                  target=str(parent.current_session))
+    return ExitCode.OK
+
+
+def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | NoOwnPass:
+    """Read the worker's active pass through its parent."""
+    try:
+        parent = record.parent_of(row)
+        if parent is None:
+            raise ValueError("worker parent is unavailable")
+        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(parent))
+        if isinstance(active, progress_history.ActiveDispatchUnavailable):
+            print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
+        elif isinstance(active, progress_history.ActiveDispatch):
+            return BusyPass(active.instance_id)
+    except (OSError, ValueError) as error:
+        print(f"anomaly: {row.name}: {error}", file=sys.stderr)
+    return NO_OWN_PASS
+
+
+def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
+    """Supply pane dispatch ids and retained mesh seats to the shared builder."""
+    from scripts.shutdown.inventory import worker_resumes
+
+    holder = record.by_id(parent)
+    if holder is None:
+        return ResumeWorkers()
+    runs = [Path(run) for run in unit_runs.held(str(holder.current_session),
+        os.environ.get("ROSTER_RUN_ROOT"), record=record)]
+    mesh = [run for run in runs if unit_runs.worker_transport(run) == "mesh"]
+    panes: list[PaneWorkerResume] = []
+    run = worker_panes.worker_run(holder)
+    for row in record.find(kind="worker", parent=parent) if not mesh else ():
+        active = progress_history.active_dispatch(row.id, run)
+        if isinstance(active, progress_history.ActiveDispatchUnavailable):
+            print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
+            continue
+        panes.append(PaneWorkerResume(row.id, BusyPass(active.instance_id)
+            if isinstance(active, progress_history.ActiveDispatch) else IdleWorker()))
+    return ResumeWorkers(worker_resumes(holder, record) if mesh else [], str(session_staff.worker_directory(record, parent)) if mesh else "", panes)
+
 @dataclass(frozen=True)
 class MeshWorkerRows:
     rows: list[dict[str, object]]
@@ -433,6 +491,7 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot) -> MeshWo
 
 def restore(parent: StaffId) -> ExitCode:
     record = staff.snapshot()
+    holder = record.by_id(parent)
     changed = False
     outcome = ExitCode.OK
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
@@ -441,23 +500,31 @@ def restore(parent: StaffId) -> ExitCode:
         return ExitCode.OK
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
-            if isinstance(state, worker_panes.OpenWorker):
-                continue
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                role = worker_panes.dispatch_role(state.row)
-                result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
-                code = _startup_result(WorkerName.parse(state.row.name), result)
-            except (herdr.HerdrFailure, OSError) as error:
+                if not isinstance(state, worker_panes.OpenWorker):
+                    role = worker_panes.dispatch_role(state.row)
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
+                    code = _startup_result(WorkerName.parse(state.row.name), result)
+                    if code != ExitCode.OK:
+                        outcome = code
+                        continue
+                    changed = True
+                if holder is not None:
+                    run = worker_panes.worker_run(holder)
+                    active = progress_history.active_dispatch(state.row.id, run)
+                    if isinstance(active, progress_history.ActiveDispatchUnavailable):
+                        print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
+                        outcome = ExitCode.UNCERTAIN
+                    elif isinstance(active, progress_history.ActiveDispatch):
+                        code = _resume_launcher(state.row, active)
+                        if code != ExitCode.OK:
+                            outcome = code
+            except (herdr.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
-                continue
-            if code != ExitCode.OK:
-                outcome = code
-            else:
-                changed = True
     if outcome == ExitCode.OK:
         print("done" if changed else "unchanged")
     return outcome

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Sample production waits and perform the mechanical work that clears them."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -274,8 +278,8 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
     passed = False
     try:
-        with copies.standing(production.name, production.checkout, unit.branch,
-                             merge=production.merge_branch) as worktree:
+        with copies.standing(production.name, production.checkout, copies.CommittedSource(unit.branch),
+                             merge=copies.MergeRevision(production.merge_branch)) as worktree:
             try:
                 with log.open("w", encoding="utf-8") as output:
                     test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,

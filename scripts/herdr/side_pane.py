@@ -1,5 +1,9 @@
 """Open, message, and close a consultation beside its caller."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import os
@@ -11,12 +15,7 @@ from threading import Event
 from time import monotonic
 from typing import Literal, cast, final, get_args
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import herdr
-from scripts.herdr import worker_panes
+from scripts.herdr import herdr, worker_panes
 from scripts.lib import conf, models_registry, nix_env
 from scripts.production import staff
 from scripts.shutdown import stop_resume
@@ -132,7 +131,7 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
         ratio = config.number("WORKER_SPLIT_RATIO")
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-        worker_panes.launch_arguments(policy, ""), herdr.NoOpeningPrompt(),
+        worker_panes.launch_arguments(policy, "", cwd), herdr.NoOpeningPrompt(),
         int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
@@ -146,8 +145,10 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
 
 def _policy() -> worker_panes.LaunchPolicy:
     settings = models_registry.launch_settings("ask_a_friend", "consultation")
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
-    return worker_panes.LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
+    try:
+        return worker_panes.worker_policy(settings)
+    except conf.Unusable as error:
+        raise SidePaneRefused(str(error)) from error
 
 
 def send(label: str, text: str) -> SidePane:
@@ -169,7 +170,7 @@ def close(label: str) -> SidePane | bool:
         if not herdr.check_target(process, action="signal"):
             return _note(client, current.pane, "agent process is unproved")
         os.kill(process.pid, signal.SIGTERM)
-        deadline = monotonic() + stop_resume.STOP_GRACE_SECONDS
+        deadline = monotonic() + stop_resume.stop_grace_seconds()
         while not isinstance(client.pane_activity(current.pane), herdr.PaneAtShell):
             remaining = deadline - monotonic()
             if remaining <= 0:

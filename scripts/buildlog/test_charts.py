@@ -14,26 +14,18 @@ from contextlib import closing
 from io import StringIO
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import charts
-import conf
-import costs
-import index
-import moments
-import record
-import test_moments as fixtures
-from test_holds import hold_event
-from test_index import Record, call, ci_job, ci_run
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import conf
+from scripts.buildlog import charts, costs, index, moments, record
+from scripts.buildlog import test_moments as fixtures
+from scripts.buildlog.test_holds import hold_event
+from scripts.buildlog.test_index import Record, call, ci_job, ci_run
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 REVIEW_HOST = "100.100.100.100"
@@ -767,7 +759,7 @@ if(document.getElementById('cause').viewBox.baseVal.width>1120)failures.push('Th
              mock.patch.dict(os.environ, {"USER_ZONE": "UTC", "TZ": "America/Los_Angeles"}), \
              mock.patch.object(moments, "MOMENTS", (event,)), \
              mock.patch.object(charts, "publish") as publication, \
-             mock.patch("charts.review_link.snapshot", return_value=[f"http://{REVIEW_HOST}/zone/latest.html"]), \
+             mock.patch("scripts.buildlog.charts.review_link.snapshot", return_value=[f"http://{REVIEW_HOST}/zone/latest.html"]), \
              mock.patch.object(sys, "stdout", StringIO()):
             self.assertEqual(charts.main(["--no-open"]), 0)
         series = cast(charts.ChartSet, publication.call_args.args[0])
@@ -838,7 +830,7 @@ class ChartOpenTests(ChartFixture):
                     if name not in ("SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY", "BUILDLOG_CHARTS_NO_OPEN")}
         settings.update({"XDG_CACHE_HOME": str(cache), **environment})
         with mock.patch.dict(os.environ, settings, clear=True), \
-             mock.patch("charts.sys.platform", "linux"), \
+             mock.patch("scripts.buildlog.charts.sys.platform", "linux"), \
              mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
              mock.patch.object(webbrowser, "open", browser), closing(self.fixture.connection()):
             self.assertEqual(charts.main(list(args)), 0)

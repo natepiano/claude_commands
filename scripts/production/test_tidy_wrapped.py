@@ -22,6 +22,8 @@ from scripts.production.staff_test_support import (
 from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.remote_test_support import local_remote_transport
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
@@ -42,11 +44,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
+            **copies_environment(self.root), "HERDR_BIN": "/nonexistent/herdr",
         }))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
@@ -97,12 +95,12 @@ class TidyWrappedTests(unittest.TestCase):
         _ = fixture_member("unit", name="beta", parent=owner.id,
                            worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
         state = self.state_files("done")
-        with copies.standing("alpha", source, "HEAD") as unit_tree:
-            with copies.standing("done", source, "HEAD") as production_tree:
+        with copies.standing("alpha", source, copies.CommittedSource("HEAD")) as unit_tree:
+            with copies.standing("done", source, copies.CommittedSource("HEAD")) as production_tree:
                 pass
-            with copies.standing("beta", source, "HEAD") as retired_tree:
+            with copies.standing("beta", source, copies.CommittedSource("HEAD")) as retired_tree:
                 pass
-            with copies.standing("live", source, "HEAD") as unrelated:
+            with copies.standing("live", source, copies.CommittedSource("HEAD")) as unrelated:
                 pass
             refused = self.run_tidy(doc)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
@@ -154,8 +152,8 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertTrue(all(path.exists() for path in other))
 
     def test_multiple_documents_share_one_question_staff_context(self) -> None:
-        import tidy_wrapped
-        from update_registration import QuestionStaff
+        from scripts.production import tidy_wrapped
+        from scripts.production.update_registration import QuestionStaff
 
         documents = [self.doc(production_name, "wrapped") for production_name in ("first", "second")]
         paths = [path for production_name in ("first", "second") for path in self.state_files(production_name)]
@@ -177,7 +175,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(any(path.exists() for path in paths))
 
     def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
-        import tidy_wrapped
+        from scripts.production import tidy_wrapped
 
         doc = self.doc("done", "wrapped")
         owner = staff.rename(self.owner("done").id, "renamed-owner")
@@ -209,7 +207,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(reminders.exists())
 
     def test_wrap_refuses_ambiguous_document_ownership_without_changing_any_file(self) -> None:
-        import tidy_wrapped
+        from scripts.production import tidy_wrapped
 
         checkout = self.root / "main"
         checkout.mkdir()
@@ -336,6 +334,39 @@ class TidyWrappedTests(unittest.TestCase):
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: no state files\n", ""))
 
+
+    def test_wrap_removes_only_the_owners_remote_mirrors(self) -> None:
+        from scripts.production import tidy_wrapped
+        doc = self.doc("done", "wrapped")
+        mine = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        other = copies.RemoteMirror("live", copies.SelectedRepository("hana"), "mac", "mirror/live", "live-session")
+        with fake_remote_removal((mine, other)) as remove:
+            _ = tidy_wrapped.tidy("done", doc)
+        remove.assert_called_once_with(mine)
+        self.assertEqual(copies.owned_remote_mirrors("live"), [other])
+
+    def test_wrap_refuses_a_busy_remote_mirror_with_holder_and_path(self) -> None:
+        from scripts.production import tidy_wrapped
+        doc = self.doc("done", "wrapped")
+        state = self.state_files("done")
+        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        copies.register_remote(mirror)
+        with copies.remote_lease(mirror):
+            with self.assertRaisesRegex(tidy_wrapped.TidyRefused, "mirror/done.*done-session"):
+                _ = tidy_wrapped.tidy("done", doc)
+        self.assertTrue(all(path.exists() for path in state))
+        self.assertTrue(copies.remote_record_path(mirror).exists())
+
+    def test_wrap_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
+        from scripts.production import tidy_wrapped
+        doc = self.doc("done", "wrapped")
+        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac",
+                                     str(self.root / "mirrors/done"), "done-session")
+        with local_remote_transport(self.root):
+            self.assertEqual(publish_mirror(mirror), 0)
+            _ = tidy_wrapped.tidy("done", doc)
+        self.assertFalse(Path(mirror.path).exists())
+        self.assertFalse(copies.remote_record_path(mirror).exists())
 
 
 if __name__ == "__main__":

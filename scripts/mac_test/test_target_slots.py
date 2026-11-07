@@ -16,35 +16,22 @@ import tempfile
 import threading
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..lib.git_test_support import commit_repository
-    from ..lib.process_start_test_support import process_reader
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.lib.git_test_support import commit_repository
-    from scripts.lib.process_start_test_support import process_reader
+from scripts.lib import process_start as process_identity
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_start_test_support import process_reader
+from scripts.copies.copies_test_support import copies_environment
 
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
-if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_hold import build_hold
-    from ..build_targets import targets
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    import mac_test
-    import offload
-    import build_hold
-    import targets
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import mac_test, offload
+from scripts.build_hold import build_hold
+from scripts.build_targets import targets
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class RepositoryKeyTests(unittest.TestCase):
@@ -76,8 +63,8 @@ class RepositoryKeyTests(unittest.TestCase):
 
     def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
         log_root = self.root.parent / "buildlog"
-        request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (),
-                                        target="aws")
+        request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (), owner="verify",
+                                        target="aws", holder_session="fixture-session")
         with mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(log_root), "BUILDLOG_MEM_WAIT_SINCE": "", "BUILDLOG_MEM_WAIT_FIRST_FILE": "",
         }):
@@ -133,6 +120,7 @@ class RepositorySlotTests(unittest.TestCase):
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
@@ -422,7 +410,7 @@ class RepositorySlotTests(unittest.TestCase):
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
         config = offload.read_config(self.root / "aws.conf")
-        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), target="aws", slot=2)
+        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", slot=2, holder_session="fixture-session")
 
         command = offload.remote_test_command(config, request, first_id)
 
@@ -574,7 +562,7 @@ class RepositorySlotTests(unittest.TestCase):
         )
         for words, expected in cases:
             with self.subTest(words=words):
-                request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words)
+                request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
 
                 command = offload.remote_test_command(offload.read_config(settings), request, identity)
 

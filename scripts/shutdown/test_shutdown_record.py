@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.shutdown import shutdown_record
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_support import ShutdownTestCase
 
 
 class ShutdownRecordTests(ShutdownTestCase):
@@ -30,6 +30,17 @@ class ShutdownRecordTests(ShutdownTestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": "/nonexistent/herdr"})))
+
+    def test_shutdown_rerun_after_first_worker_stop(self) -> None:
+        owner = fixture_member("showrunner", name="record-owner")
+        unit = fixture_member("unit", name="retained-unit", parent=owner.id)
+        first = fixture_member("worker", name="impl", parent=unit.id)
+        second = fixture_member("worker", name="test", parent=unit.id)
+        shutdown_record.update(started=[], pending=[unit.id, first.id, second.id, first.id])
+        shutdown_record.update(started=[first.id], pending=[unit.id, second.id])
+        shutdown_record.update(started=[first.id], pending=[unit.id, second.id])
+        self.assertEqual(shutdown_record.read(), [unit.id, second.id])
+        self.assertCountEqual(staff.snapshot().find(kind="worker", parent=unit.id), [first, second])
 
     def test_migration_resumes_after_first_file_and_finished_rerun_changes_nothing(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")

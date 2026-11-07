@@ -16,6 +16,8 @@ certified ancestor. --full forces all modules; --nightly validates a shared clon
 Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
+Each nightly exit sends a result push unless merge_gate.conf disables it.
+A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -24,6 +26,10 @@ The production is --production, else the calling showrunner's (its update timer)
 finds neither is refused before the merge, so no merge lands without its rows.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections import deque
@@ -51,13 +57,10 @@ import tempfile
 import time
 from typing import Literal, TextIO, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_group
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
-from scripts.production import change_review, staff  # noqa: E402
+from scripts.production import change_review  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -145,6 +148,11 @@ class GateArguments(argparse.Namespace):
 class GateJobKind(Enum):
     TEST_MODULE = auto()
     TYPE_CHECK = auto()
+    RUNNER_FAILURE = auto()
+
+
+class NightlyRunState(Enum):
+    NOT_STARTED = auto()
 
 
 @dataclass(frozen=True)
@@ -641,7 +649,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
-        process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
+        process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
@@ -659,7 +667,7 @@ def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str
     tools = root / "build-tool-tripwires"
     tools.mkdir()
     marker = root / "build-tool-calls.jsonl"
-    script = f"""#!{sys.executable}
+    script = f"""#!{Path(__file__).resolve().parents[1] / "lib/py"}
 import fcntl, json, sys
 with open({str(marker)!r}, "a") as output:
     fcntl.flock(output, fcntl.LOCK_EX)
@@ -905,6 +913,14 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     gate_record.write_gate_run(run)
 
 
+def python_shim(repo: Path) -> Path:
+    """Use the Python shim from the tested checkout."""
+    shim = repo / "scripts" / "lib" / "py"
+    if not shim.is_file():
+        raise GateRefused(f"Python shim not found: {shim}")
+    return shim
+
+
 def module_runner(repo: Path) -> Path:
     """Use the test runner from the tested checkout."""
     runner = repo / "scripts" / "test_times" / "module_run.py"
@@ -985,7 +1001,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     maximum_load = starting_load
     began = time.monotonic()
     started_at = datetime.now(UTC).timestamp()
-    python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
+    python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
 
@@ -1012,6 +1028,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
           gate_reservation(repo, temporary, hold, type_dirs=type_dirs) as reservation,
           shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
+        _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
         types_suite, types_module = gate_record.TYPE_CHECK_JOB
         if isinstance(types_python, Path):
@@ -1024,11 +1041,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         requests = {(job.kind, job.suite, job.module): job for job in pending}
         progress_total = len(pending)
         progress_done = 0
-        progress_phase = "suites:1"
         def publish_progress() -> None:
             if progress_total:
                 progress_profile.publish_counter(reservation.sidecar,
-                    progress_profile.ProgressCounter(progress_phase, progress_done, progress_total))
+                    progress_profile.ProgressCounter("suites:1", progress_done, progress_total))
 
         publish_progress()
         try:
@@ -1143,8 +1159,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         first_runs = {(result.suite, result.module): result for result in failed}
                         pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
                         if failed:
-                            progress_phase, progress_done, progress_total = "suites:2", 0, len(failed)
-                            publish_progress()
+                            progress_total = 0
+                            progress_profile.clear_counter(reservation.sidecar)
                 if running or pending:
                     time.sleep(0.05)
         finally:
@@ -1383,7 +1399,7 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
     try:
         script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
                   or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
-        python = shutil.which("python3") or sys.executable
+        python = str(Path(__file__).resolve().parents[1] / "lib/py")
         _ = sys.stdout.flush()
         result = subprocess.run(
             [python, script, "notify", "--repo-dir", str(repo), "--branch", branch, "--tip", tip],
@@ -1441,10 +1457,9 @@ def merge_checkpoint(args: GateArguments) -> int:
     if refused := change_review.missing(commits):
         raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
                           + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
-    changes: list[change_review.PublicationChange] = []
     if review_list is not None:
         try:
-            changes = change_review.publication_changes(commits, production)
+            _ = change_review.publication_changes(commits, production)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
@@ -1482,10 +1497,10 @@ def merge_checkpoint(args: GateArguments) -> int:
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
     notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
-    if review_list is not None:
-        record_changes(repo, review_list, production, changes, str(args.merge_branch))
     if args.promote:
         promote(args)
+    if review_list is not None:
+        record_changes(repo, review_list, production, str(args.merge_branch))
     return 0
 
 
@@ -1512,24 +1527,18 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     return production, found
 
 
-def record_changes(repo: Path, review_list: Path, production: Path, changes: list[change_review.PublicationChange],
-                   merge_branch: str) -> None:
-    """Add a row per visible change to the list, then name any landed merge still missing its rows."""
-    merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
+def record_changes(repo: Path, review_list: Path, production: Path, merge_branch: str) -> None:
+    """Scan published merges after every promotion step succeeds."""
     try:
-        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production, record=staff.snapshot())
-        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
-                                      change_review.foreign_units(production))
+        rows = change_review.list_ready(repo, production, merge_branch, review_list=review_list)
     except (change_review.ChangeReviewError, OSError) as error:
-        raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
+        raise GateRefused(f"change review list {review_list} not written: {error}") from error
     if rows:
         ids = [change_review.row_id(row) for row in rows]
         print(f"Change review: {len(rows)} row(s) added to {review_list}: "
               + (ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"), flush=True)
     for row in rows:
         print(f"Change review: {row}", flush=True)
-    for line in drifted:
-        print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
 def nightly_owner(args: GateArguments) -> str:
@@ -1552,6 +1561,53 @@ def nightly_owner(args: GateArguments) -> str:
     return unit_lookup.doc_owner(doc, staff.snapshot()).name
 
 
+def type_check_summaries(output: str) -> list[str]:
+    return [line for line in output.splitlines()
+            if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
+
+
+def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> None:
+    try:
+        from scripts.message import send_budget
+        from scripts.notify import push_texts, review
+        from scripts.notify.pushover import MESSAGE_MAX
+        config = conf.read("merge_gate")
+        if config.text("nightly_result_push") == "off":
+            return
+        values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
+        if isinstance(result, Exception):
+            values["action"] = "None. The next nightly run tries again."
+            values["reason"] = ""
+            empty = push_texts.render("nightly.not_run", **values)
+            reason = " ".join(str(result).split()).rstrip(".") or type(result).__name__
+            values["reason"] = reason[:max(0, MESSAGE_MAX - len(empty.message))].rstrip(".")
+            rendered = push_texts.render("nightly.not_run", **values)
+        else:
+            types = [job for job in result.jobs if job.kind is GateJobKind.TYPE_CHECK]
+            failed_types = [job for job in types if job.returncode]
+            summaries = type_check_summaries("\n".join(job.output for job in failed_types))
+            values["types"] = ("did not run" if not types else "passed" if not failed_types
+                               else "failed with " + summaries[-1] if summaries else "failed")
+            failed = [f"{job.suite}/{job.module}" for job in result.jobs
+                      if job.kind is GateJobKind.TEST_MODULE and job.returncode]
+            limit = config.whole("nightly_result_modules")
+            unfinished = (any(job.kind is GateJobKind.RUNNER_FAILURE for job in result.jobs)
+                          or not result.jobs and not result.passed)
+            values["tests"] = ("did not finish" if unfinished else "failed in " + ", ".join(failed[:limit])
+                               + (f" and {len(failed) - limit} more" if len(failed) > limit else "")
+                               if failed else "passed")
+            values["outcome"] = "passed" if result.passed else "failed"
+            rendered = push_texts.render("nightly.result", **values)
+        sent = subprocess.run(push_texts.user_send_argv(rendered, key="nightly-result"),
+                              capture_output=True, text=True, check=False,
+                              timeout=send_budget.user_seconds(review.user_send_seconds()))
+        if sent.returncode:
+            raise ValueError(failure_detail(sent))
+        print("Nightly result push: " + next(iter(sent.stdout.splitlines()), ""), flush=True)
+    except Exception as error:
+        print("Nightly result push could not be sent: " + " ".join(str(error).split()), flush=True)
+
+
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                      type_failures: Sequence[GateJobResult] = ()) -> None:
     from scripts.production import showrunners
@@ -1563,7 +1619,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                   if requires_full else "Tests passed. A type failure does not require full test runs.")
         if type_failures:
             lines = [line for job in type_failures for line in job.output.splitlines()]
-            summaries = [line for line in lines if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
+            summaries = type_check_summaries("\n".join(lines))
             diagnostics = [line for line in lines if line not in summaries]
             detail += "\nType check failed:\n" + "\n".join(diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
@@ -1588,41 +1644,54 @@ def nightly_git(repo: Path, *arguments: str) -> str:
 
 
 def nightly(args: GateArguments) -> int:
-    repo = Path(args.repo).expanduser().resolve()
-    _ = nightly_git(repo, "check-ref-format", f"refs/heads/{args.merge_branch}")
-    _ = nightly_git(repo, "fetch", "origin",
-                    f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
-    commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-    with copies.standing(nightly_owner(args), repo, commit) as clone:
-        tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
-        try:
-            run = run_suites(clone, args.type_dirs,
-                             module_time_limit_s=args.module_time_limit_s, full=True)
-        except (GateRefused, OSError, subprocess.SubprocessError) as error:
-            print(f"Nightly suite runner failed: {error}", flush=True)
-            run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
-        marker = gate_state_dir() / "full-required"
-        if run.passed:
-            marker.unlink(missing_ok=True)
-            return 0
-        type_failures = [job for job in run.jobs if job.returncode and job.kind is GateJobKind.TYPE_CHECK]
-        failed = [f"{job.suite}/{job.module}" for job in run.jobs
-                  if job.returncode and job.kind is not GateJobKind.TYPE_CHECK]
-        if failed or not type_failures:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
-                pending = Path(output.name)
-                try:
-                    _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
-                                                  "failed_modules": failed}) + "\n")
-                    output.close()
-                    _ = pending.replace(marker)
-                finally:
-                    pending.unlink(missing_ok=True)
-        else:
-            marker.unlink(missing_ok=True)
-        tell_nightly_red(args, tree, failed, type_failures=type_failures)
-        return 1
+    run: GateRun | NightlyRunState = NightlyRunState.NOT_STARTED
+    result_sent = False
+    try:
+        repo = Path(args.repo).expanduser().resolve()
+        _ = nightly_git(repo, "check-ref-format", f"refs/heads/{args.merge_branch}")
+        _ = nightly_git(repo, "fetch", "origin",
+                        f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
+        commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
+        with copies.standing(nightly_owner(args), repo, copies.CommittedSource(commit)) as clone:
+            tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
+            try:
+                run = run_suites(clone, args.type_dirs,
+                                 module_time_limit_s=args.module_time_limit_s, full=True)
+            except (GateRefused, OSError, subprocess.SubprocessError) as error:
+                print(f"Nightly suite runner failed: {error}", flush=True)
+                run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),
+                                            kind=GateJobKind.RUNNER_FAILURE),), 0, 0)
+            marker = gate_state_dir() / "full-required"
+            if run.passed:
+                marker.unlink(missing_ok=True)
+                result_sent = True
+                push_nightly_result(args, run)
+                return 0
+            type_failures = [job for job in run.jobs if job.returncode and job.kind is GateJobKind.TYPE_CHECK]
+            failed = [f"{job.suite}/{job.module}" for job in run.jobs
+                      if job.returncode and job.kind is not GateJobKind.TYPE_CHECK]
+            if failed or not type_failures:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
+                    pending = Path(output.name)
+                    try:
+                        _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
+                                                      "failed_modules": failed}) + "\n")
+                        output.close()
+                        _ = pending.replace(marker)
+                    finally:
+                        pending.unlink(missing_ok=True)
+            else:
+                marker.unlink(missing_ok=True)
+            tell_nightly_red(args, tree, failed, type_failures=type_failures)
+            result_sent = True
+            push_nightly_result(args, run)
+            return 1
+    except (Exception, KeyboardInterrupt) as error:
+        if not result_sent:
+            reason = GateRefused("interrupted by SIGINT") if isinstance(error, KeyboardInterrupt) else error
+            push_nightly_result(args, run if isinstance(run, GateRun) else reason)
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1671,6 +1740,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
+                production, review_list = change_review_list(args)
+                if review_list is not None:
+                    record_changes(Path(args.repo).expanduser().resolve(), review_list, production, args.merge_branch)
                 return 0
             return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:

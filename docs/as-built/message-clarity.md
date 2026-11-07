@@ -290,6 +290,15 @@ New escalate holds retain their registered template and values.
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
+- `nightly.result` reports the branch, finish time, type result and full test result.
+  `nightly.not_run` reports the reason that the checks could not start.
+  Both texts use sender `nightly`, need `note`, and key `nightly-result`.
+  The result requires no action. The failure text includes an action.
+  The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+  Silence keeps only the newest push and delivers it when silence ends.
+  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `merge_gate.conf` at use.
+  `off` disables both pushes. The module limit controls how many failed modules the result names.
+  A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.
   Title: `{sender}: {session} {noun} refused`. The first body line is `Session: {session}`.
   Action: `On {machine}, in the {session} pane, type: Go: run the refused {noun}`.
@@ -352,7 +361,7 @@ The notifier detaches one supervised notice job with explicit HOME, XDG, configu
 
 With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
 
-`python3 scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
+`scripts/lib/py scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
 
 ### Permission root cause: `scripts/message/rca.py`
 

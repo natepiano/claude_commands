@@ -2,6 +2,10 @@
 """Keep a terminal available while its Claude child stops and resumes."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -22,6 +26,7 @@ from scripts.shutdown import pane_record
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment
 from scripts.lib.resume_message import resume_message
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
 POLL_SECONDS = 0.5
@@ -42,6 +47,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
         return argv, environment
     entry = session_staff.record_membership(entry)
     restored = {**environment, **entry["environment"]}
+    restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
         argv = [*argv, resume_message("you were stopped and resumed")]
     return argv, restored

@@ -2,6 +2,10 @@
 """List Claude and Codex sessions on both workstations; --here reads only this one."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -25,11 +29,11 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
         sys.path.insert(0, str(_directory))
 
 from scripts.production import showrunners  # noqa: E402
-import unit_runs  # noqa: E402
-import herdr  # noqa: E402
-import codex_daemon  # noqa: E402
-import process_table  # noqa: E402
-import sessions  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
+from scripts.message import process_table  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, session_staff, worker_admission
 from scripts.usage import agents_log
@@ -60,7 +64,7 @@ else:
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
-from sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.message.sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]
@@ -1254,7 +1258,7 @@ def _unit_workers(
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=AccountUnread("worker account not read")))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, herdr.HerdrFailure) as error:
         _problem(problems, "pane workers", error)
     for run in runs:
         try:
@@ -1562,7 +1566,8 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
         name += " (you)"
     if context:
         name += " (context)"
-    details = [entry.kind, entry.status]
+    status = "background" if entry.kind == "claude" and entry.status == "shell" else entry.status
+    details = [entry.kind, status]
     if isinstance(shown.job, JobUnassigned):
         details.append(shown.job.reason)
     unit = _unit(entry)

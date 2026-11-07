@@ -219,7 +219,7 @@ class StandingTests(unittest.TestCase):
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:
         _ = self.git(self.source, "status", "--porcelain")
         before = self.snapshot(self.source)
-        with copies.standing("verify-unit", self.source, "HEAD") as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource("HEAD")) as tree:
             self.assertEqual(tree, self.gates / "verify-unit-gate")
             self.assertTrue((tree / ".git").is_dir())
             self.assertEqual(self.git(tree, "rev-parse", "--absolute-git-dir"), str(tree / ".git"))
@@ -234,7 +234,7 @@ class StandingTests(unittest.TestCase):
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/builds", self.published)
         origin = self.git(self.source, "remote", "get-url", "origin")
         with ExitStack() as stack:
-            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
                      stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
                                                          name="upstream", branch="worker")),
                      copies.clone(self.source, task="gate:upstream", word="upstream")]
@@ -255,7 +255,7 @@ class StandingTests(unittest.TestCase):
     def test_existing_copies_heal_local_origin_and_prune_local_branch_refs(self) -> None:
         _ = self.git(self.source, "branch", "builds", self.head)
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/builds", self.published)
-        with copies.standing("verify-unit", self.source, self.head) as standing:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as standing:
             pass
         with copies.workspace("verify-unit", self.source, self.head, name="heal", branch="worker") as workspace:
             pass
@@ -266,7 +266,7 @@ class StandingTests(unittest.TestCase):
             _ = self.git(tree, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/builds")
             _ = self.git(tree, "remote", "remove", "source")
         with ExitStack() as stack:
-            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
                      stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
                                                          name="heal", branch="worker"))]
             self.assertEqual(trees, [standing, workspace])
@@ -287,16 +287,16 @@ class StandingTests(unittest.TestCase):
 
     def test_origin_head_is_copied_only_when_the_source_records_it(self) -> None:
         _ = self.git(self.source, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "origin/HEAD"), self.published)
         _ = self.git(self.source, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "for-each-ref", "--format=%(refname)",
                                       "refs/remotes/origin/HEAD"), "")
 
     def test_end_of_use_refreshes_source_branches_for_the_copy_sweep(self) -> None:
         with ExitStack() as stack:
-            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
                      stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
                                                          name="saved", branch="worker"))]
             incoming = self.incoming()
@@ -308,14 +308,14 @@ class StandingTests(unittest.TestCase):
     def test_source_without_origin_keeps_local_url_and_branch_tracking(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
         _ = self.git(self.source, "branch", "builds", self.head)
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "remote", "get-url", "origin"), str(self.source))
             self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.head)
             self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
             self.assertEqual(self.git(tree, "rev-parse", "source/builds"), self.head)
 
     def test_new_commit_reuses_tree_keeps_unchanged_mtime_and_target(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             stable = tree / "stable.txt"
             os.utime(stable, ns=(1_500_000_000_000_000_000, 1_500_000_000_000_000_000))
             # Keep this an unchanged tracked file after arranging its sentinel timestamp.
@@ -328,7 +328,7 @@ class StandingTests(unittest.TestCase):
         _ = (self.source / "tracked.txt").write_text("new commit\n")
         _ = self.git(self.source, "commit", "-qam", "next source commit")
         next_commit = self.git(self.source, "rev-parse", "HEAD")
-        with copies.standing("verify-unit", self.source, "HEAD") as reused:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource("HEAD")) as reused:
             self.assertEqual(reused, tree)
             self.assertEqual(self.git(reused, "rev-parse", "HEAD"), next_commit)
             self.assertEqual(stable.stat().st_mtime_ns, unchanged_mtime)
@@ -339,8 +339,8 @@ class StandingTests(unittest.TestCase):
         self.assertTrue((tree / "target" / scratch.USE_STAMP).is_file())
 
     def test_held_first_tree_sends_second_caller_to_second_tree(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as first:
-            with copies.standing("verify-unit", self.source, self.head) as second:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as first:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as second:
                 self.assertEqual(second, first.with_name("verify-unit-gate-2"))
                 with scratch.busy_locks(first, create=False) as idle:
                     self.assertFalse(idle)
@@ -353,13 +353,13 @@ class StandingTests(unittest.TestCase):
         notice = WaitNotice()
 
         def third_use() -> Path:
-            with copies.standing("verify-unit", self.source, self.head) as tree:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
                 return tree
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             with ExitStack() as primary:
-                first = primary.enter_context(copies.standing("verify-unit", self.source, self.head))
-                with copies.standing("verify-unit", self.source, self.head):
+                first = primary.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)))
+                with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)):
                     with redirect_stderr(notice), redirect_stdout(notice):
                         third = executor.submit(third_use)
                         self.assertTrue(notice.noticed.wait(timeout=10), "third caller never announces its wait")
@@ -376,12 +376,12 @@ class StandingTests(unittest.TestCase):
         notice = WaitNotice()
 
         def third_use() -> Path:
-            with copies.standing("verify-unit", self.source, self.head) as tree:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
                 return tree
 
         with ThreadPoolExecutor(max_workers=1) as executor:
-            with copies.standing("verify-unit", self.source, self.head):
-                with copies.standing("verify-unit", self.source, self.head) as second:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)):
+                with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as second:
                     with redirect_stderr(notice):
                         third = executor.submit(third_use)
                         self.assertTrue(notice.noticed.wait(timeout=10))
@@ -391,8 +391,8 @@ class StandingTests(unittest.TestCase):
     def test_configured_root_contains_only_the_two_standing_checkouts(self) -> None:
         root = self.base / "another-root"
         self.write_config({**self.settings, "root": str(root)})
-        with copies.standing("verify-unit", self.source, self.head) as first:
-            with copies.standing("verify-unit", self.source, self.head) as second:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as first:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as second:
                 expected = root / self.source.name
                 self.assertEqual(first, expected / "verify-unit-gate")
                 self.assertEqual(second, expected / "verify-unit-gate-2")
@@ -419,7 +419,7 @@ class StandingTests(unittest.TestCase):
     def test_linked_source_uses_canonical_repository_folder_name(self) -> None:
         linked = self.base / "linked-worktree"
         _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.published)
-        with copies.standing("verify-unit", linked, "HEAD") as tree:
+        with copies.standing("verify-unit", linked, copies.CommittedSource("HEAD")) as tree:
             self.assertEqual(tree, self.gates / "verify-unit-gate")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertTrue((tree / ".git").is_dir())
@@ -558,17 +558,17 @@ class StandingTests(unittest.TestCase):
                 self.assertEqual((tree / "tracked.txt").read_text(), "keep these edits\n")
 
     def test_proof_reuses_its_held_standing_checkout(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
-            with copies.standing("verify-unit", tree, self.head) as proof:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
+            with copies.standing("verify-unit", tree, copies.CommittedSource(self.head)) as proof:
                 self.assertEqual(proof, tree)
                 with scratch.busy_locks(proof, create=False) as idle:
                     self.assertFalse(idle)
             self.assertEqual(list(self.gates.iterdir()), [tree])
 
     def test_worker_proof_uses_the_source_repository_gate_pool(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as frozen:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as frozen:
             with copies.workspace("verify-unit", self.source, self.head, name="package", branch="worker") as worker:
-                with copies.standing("verify-unit", worker, self.head) as proof:
+                with copies.standing("verify-unit", worker, copies.CommittedSource(self.head)) as proof:
                     self.assertEqual(proof, frozen.with_name("verify-unit-gate-2"))
 
     def test_apply_uncommitted_captures_staged_unstaged_and_untracked(self) -> None:
@@ -579,7 +579,7 @@ class StandingTests(unittest.TestCase):
         _ = (self.source / "ignored.txt").write_text("ignored\n")
         _ = self.git(self.source, "status", "--porcelain")
         before = self.snapshot(self.source)
-        with copies.standing("verify-unit", self.source, self.head, apply_uncommitted=self.source) as tree:
+        with copies.standing("verify-unit", self.source, copies.WorktreeSource(self.head, self.source)) as tree:
             self.assertEqual((tree / "tracked.txt").read_text(), "staged edit\n")
             self.assertEqual((tree / "stable.txt").read_text(), "unstaged edit\n")
             self.assertEqual((tree / "untracked.bin").read_bytes(), b"binary\x00payload")
@@ -592,7 +592,7 @@ class StandingTests(unittest.TestCase):
 
     def test_merge_fetches_source_ref_and_creates_a_merge_commit(self) -> None:
         incoming = self.incoming()
-        with copies.standing("verify-unit", self.source, self.head, merge="incoming") as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head), merge=copies.MergeRevision("incoming")) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD^1"), self.head)
             self.assertEqual(self.git(tree, "rev-parse", "HEAD^2"), incoming)
             self.assertEqual((tree / "incoming.txt").read_text(), "merged content\n")
@@ -601,8 +601,7 @@ class StandingTests(unittest.TestCase):
     def test_apply_precedes_merge(self) -> None:
         incoming = self.incoming()
         _ = (self.source / "untracked.txt").write_text("applied before merge\n")
-        with copies.standing("verify-unit", self.source, self.head,
-                             apply_uncommitted=self.source, merge="incoming") as tree:
+        with copies.standing("verify-unit", self.source, copies.WorktreeSource(self.head, self.source), merge=copies.MergeRevision("incoming")) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD^2"), incoming)
             self.assertTrue(self.git(tree, "log", "-1", "--format=%s", "HEAD^1").startswith("gate: uncommitted "))
             self.assertEqual((tree / "untracked.txt").read_text(), "applied before merge\n")
@@ -616,7 +615,7 @@ class StandingTests(unittest.TestCase):
         result = self.run_cli("--apply-uncommitted", str(self.source), "--merge", "conflict")
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("tracked.txt", result.stdout + result.stderr)
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(tree, self.gates / "verify-unit-gate")
             self.assertEqual((tree / "tracked.txt").read_text(), "source HEAD\n")
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
@@ -627,7 +626,7 @@ class StandingTests(unittest.TestCase):
         result = self.run_cli("--commit", self.published, "--apply-uncommitted", str(self.source))
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("tracked.txt", result.stdout + result.stderr)
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(tree, self.gates / "verify-unit-gate")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
@@ -644,7 +643,7 @@ class StandingTests(unittest.TestCase):
             self.assertTrue(idle)
 
     def test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             result = self.cli("list")
             self.assertEqual(result.returncode, 0, result.stderr)
             line = next(line for line in result.stdout.splitlines() if str(tree) in line)
@@ -657,8 +656,8 @@ class StandingTests(unittest.TestCase):
         self.assertRegex(line, r"\s\d+(?:\.\d+)?[KMGTPE]?B?\s*$")
 
     def test_remove_refuses_busy_tree_then_deletes_both_idle_trees_and_repeats(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as first:
-            with copies.standing("verify-unit", self.source, self.head) as second:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as first:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as second:
                 result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("busy", result.stderr)
@@ -674,9 +673,9 @@ class StandingTests(unittest.TestCase):
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
                                         "gate-tests@example.invalid", {"other.txt": "content"}).checkout
         other = other.rename(other.with_name("other-repository"))
-        with copies.standing("verify-unit", self.source, self.head) as first:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as first:
             pass
-        with copies.standing("verify-unit", other, "HEAD") as second:
+        with copies.standing("verify-unit", other, copies.CommittedSource("HEAD")) as second:
             pass
         with copies.workspace("verify-unit", self.source, self.head,
                               name="worker", branch="worker") as worker:
@@ -688,7 +687,7 @@ class StandingTests(unittest.TestCase):
         with copies.workspace("verify-unit", self.source, self.head, name="legacy", branch="legacy",
                               task="gate:legacy-run", path=legacy):
             pass
-        with copies.standing("other-unit", self.source, self.head) as kept:
+        with copies.standing("other-unit", self.source, copies.CommittedSource(self.head)) as kept:
             pass
         narrowed = self.cli("remove", "--owner", "verify-unit", "--repo", str(other))
         self.assertEqual(narrowed.returncode, 0, narrowed.stderr)
@@ -704,7 +703,7 @@ class StandingTests(unittest.TestCase):
         copies.remove_trees("verify-unit")
 
     def test_owner_removal_retries_busy_and_interrupted_trees_without_a_source(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             result = self.cli("remove", "--owner", "verify-unit")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("busy", result.stderr)
@@ -769,7 +768,7 @@ class StandingTests(unittest.TestCase):
         other = other.rename(other.with_name("unrelated-repository"))
         with copies.workspace("verify-unit", other, "HEAD", name="other-worker", branch="worker") as kept:
             pass
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             pass
         shutil.rmtree(other)
         result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
@@ -778,14 +777,14 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(kept.exists())
 
     def test_explicit_repository_scopes_select_only_the_requested_repository(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             pass
         copies.remove_trees("verify-unit", copies.SelectedRepository(self.source.name))
         self.assertFalse(tree.exists())
         copies.remove_trees("verify-unit", copies.AllRepositories())
 
     def test_owner_removal_requires_a_repository_scope_in_the_python_api(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             pass
         for value in ("", str(self.source), self.source):
             with self.subTest(value=value), self.assertRaisesRegex(copies.CopyError, "repository scope"):
@@ -913,14 +912,19 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(tree.exists())
 
     def test_invalid_owner_refuses_without_creating_a_tree(self) -> None:
-        for owner in ("../escape", "Verify", "unit/name", "-unit", "unit_name", ""):
+        for owner in ("../escape", "Verify", "unit/name", "-unit", ""):
             with self.subTest(owner=owner):
                 result = self.run_cli("--owner", owner)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
 
+    def test_underscore_owner_succeeds_and_creates_the_checkout(self) -> None:
+        result = self.run_cli("--owner", "unit_name")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.gates / "unit_name-gate").exists())
+
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
-        with copies.standing("verify-unit", str(self.source), self.head) as tree:
+        with copies.standing("verify-unit", str(self.source), copies.CommittedSource(self.head)) as tree:
             stable_mtime = (tree / "stable.txt").stat().st_mtime_ns
             record = self.record(tree)
             self.assertEqual(record["owner"], "verify-unit")
@@ -933,7 +937,7 @@ class StandingTests(unittest.TestCase):
             self.assertIn(os.getpid(), record.values())
             self.assertIn("/.gate.json", (tree / ".git/info/exclude").read_text())
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
-        with copies.standing("verify-unit", self.source, self.head) as reused:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as reused:
             self.assertEqual(reused, tree)
             self.assertEqual((tree / "stable.txt").stat().st_mtime_ns, stable_mtime)
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
@@ -951,7 +955,7 @@ def interrupt(source, destination):
         os._exit(19)
     return replace(source, destination)
 atomic_file.os.replace = interrupt
-with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
+with copies.standing('verify-unit', Path(sys.argv[1]), copies.CommittedSource('HEAD')):
     pass
 """
         interrupted = self.python_run(program, str(self.source))
@@ -959,13 +963,13 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         tree = self.gates / "verify-unit-gate"
         self.assertFalse((tree / ".gate.json").exists())
         self.assertTrue(list(tree.glob("..gate.json.*.tmp")))
-        with copies.standing("verify-unit", self.source, self.head) as recovered:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as recovered:
             self.assertEqual(recovered, tree)
             self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), self.head)
         self.assertEqual(list(tree.glob("..gate.json.*.tmp")), [])
 
     def test_interrupted_remove_finishes_even_after_record_is_deleted(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             pass
         def interrupt(path: Path) -> None:
             (path / ".gate.json").unlink()
@@ -978,17 +982,17 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(self.gates.iterdir()), [])
-        with copies.standing("verify-unit", self.source, self.head) as recovered:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as recovered:
             self.assertEqual(recovered, tree)
 
     def test_relocated_source_rebuilds_git_metadata_and_keeps_target(self) -> None:
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / "target/compiled"
             _ = cache.write_text("warm")
         relocated = self.base / "relocated" / self.source.name
         relocated.parent.mkdir()
         _ = self.source.rename(relocated)
-        with copies.standing("verify-unit", relocated, self.head) as reused:
+        with copies.standing("verify-unit", relocated, copies.CommittedSource(self.head)) as reused:
             self.assertEqual(reused, tree)
             self.assertEqual(cache.read_text(), "warm")
             self.assertEqual(self.record(tree)["source"], str(relocated))
@@ -999,13 +1003,13 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
 
     def test_deleted_borrowed_objects_are_recovered_from_replacement_source(self) -> None:
         origin = self.git(self.source, "remote", "get-url", "origin")
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / "target/compiled"
             _ = cache.write_text("warm")
         shutil.rmtree(self.source)
         _ = self.git(self.base, "clone", "-q", "--branch", "main", origin, str(self.source))
         self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), self.published)
-        with copies.standing("verify-unit", self.source, "HEAD") as reused:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource("HEAD")) as reused:
             self.assertEqual(reused, tree)
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertEqual(cache.read_text(), "warm")
@@ -1014,7 +1018,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
     def test_caller_oserror_passes_through_without_conversion(self) -> None:
         failure = OSError("caller failed writing its own output")
         with self.assertRaises(OSError) as raised:
-            with copies.standing("verify-unit", self.source, self.head):
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)):
                 raise failure
         self.assertIs(raised.exception, failure)
 
@@ -1033,7 +1037,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         tree = self.gates / "verify-unit-gate"
         with mock.patch.object(copies, "mark_target", side_effect=refresh):
             with self.assertRaises(copies.PostUseError) as raised:
-                with copies.standing("verify-unit", self.source, self.head):
+                with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)):
                     raise failure
         self.assertIs(raised.exception.caller_error, failure)
         with scratch.busy_locks(tree, create=False) as idle:
@@ -1048,7 +1052,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
             return git(repo, *arguments, data=data)
 
         with mock.patch.object(copies, "git", side_effect=check_before_clone):
-            with copies.standing("verify-unit", self.source, self.head) as tree:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
     def test_claim_state_distinguishes_owned_and_busy_checkout(self) -> None:
@@ -1065,13 +1069,13 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         notice = WaitNotice()
 
         def waiting_use() -> Path:
-            with copies.standing("verify-unit", self.source, self.head) as tree:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
                 return tree
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             with ExitStack() as primary:
-                first = primary.enter_context(copies.standing("verify-unit", self.source, self.head))
-                with copies.standing("verify-unit", self.source, self.head):
+                first = primary.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)))
+                with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)):
                     with redirect_stderr(notice):
                         future = executor.submit(waiting_use)
                         self.assertTrue(notice.noticed.wait(timeout=10))
@@ -1083,8 +1087,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         _ = source.write_text("new source contents")
         source.chmod(0o755)
         os.utime(source, (1, 1))
-        with copies.standing("verify-unit", self.source, self.head,
-                             apply_uncommitted=self.source) as tree:
+        with copies.standing("verify-unit", self.source, copies.WorktreeSource(self.head, self.source)) as tree:
             applied = tree / source.name
             self.assertEqual(applied.read_text(), "new source contents")
             self.assertGreater(applied.stat().st_mtime_ns, source.stat().st_mtime_ns)
@@ -1109,7 +1112,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
                     with self.assertRaisesRegex(copies.CopyError, f"git {step}.*timed out after 0.1"):
                         _ = copies.git(self.source, step)
         self.write_config(self.settings)
-        with copies.standing("verify-unit", self.source, self.head) as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
     def test_merge_origin_ref_fetches_upstream_even_when_source_tracking_is_stale(self) -> None:
@@ -1117,7 +1120,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
         _ = self.git(self.source, "push", "-q", "origin", "incoming")
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/incoming", self.published)
         before = self.git(self.source, "rev-parse", "origin/incoming")
-        with copies.standing("verify-unit", self.source, self.head, merge="origin/incoming") as tree:
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head), merge=copies.MergeRevision("origin/incoming")) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD^2"), incoming)
             self.assertEqual((tree / "incoming.txt").read_text(), "merged content\n")
         self.assertEqual(self.git(self.source, "rev-parse", "origin/incoming"), before)
@@ -1145,7 +1148,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
     def test_command_keeps_busy_lock_after_wrapper_is_killed(self) -> None:
         command = "import os,sys; print(os.getpid(), flush=True); sys.stdin.read(1)"
         process = subprocess.Popen(
-            [sys.executable, str(Path(copies.__file__)), "run", "--owner", "verify-unit",
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(copies.__file__)), "run", "--owner", "verify-unit",
              "--repo", str(self.source), "--commit", "HEAD", "--", sys.executable, "-c", command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -1159,7 +1162,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
             first = self.gates / "verify-unit-gate"
             with scratch.busy_locks(first, create=False) as idle:
                 self.assertFalse(idle, "wrapper death released a surviving command's checkout")
-            with copies.standing("verify-unit", self.source, self.head) as second:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as second:
                 self.assertEqual(second, first.with_name("verify-unit-gate-2"))
         finally:
             if process.stdin is not None:

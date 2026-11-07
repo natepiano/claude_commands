@@ -2,6 +2,10 @@
 """Report local CLI accounts and live weekly quotas without exposing credentials."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import asyncio
 import sys
@@ -15,7 +19,7 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             observe_workers_home as resolve_workers_home, NoWorkersHome)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
 def reset_time(value: datetime | None) -> str:

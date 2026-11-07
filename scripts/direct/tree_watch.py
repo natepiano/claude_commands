@@ -9,6 +9,10 @@ or the parent exits (3). Cargo metadata is supplied once on stdin.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -23,6 +27,7 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+from scripts.lib.git_blob import git_blob_id
 
 
 class Dependency(TypedDict, total=False):
@@ -102,7 +107,7 @@ def blob(path: bytes) -> bytes:
         mode = b"100755" if os.access(path, os.X_OK) else b"100644"
     else:
         return b""
-    return mode + b" blob " + hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
+    return mode + b" blob " + git_blob_id(data).encode()
 
 
 class TreeInputs:

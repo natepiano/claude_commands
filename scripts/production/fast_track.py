@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Check a small worktree patch, push main, and retain it for blind review."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import ast
@@ -681,7 +685,7 @@ def promote(production: str, repo: Path, commit: str, unit: str) -> None:
         promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The pull helper needs a local main ref at the published commit.
-            with copies.standing(unit, repo, commit) as source:
+            with copies.standing(unit, repo, copies.CommittedSource(commit)) as source:
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
@@ -698,7 +702,7 @@ def push_patch(repo: Path, production: str, unit: str, why: str, paths: list[str
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
         fetch_main(repo, settings_read)
-        with copies.standing(unit, repo, "origin/main") as copy:
+        with copies.standing(unit, repo, copies.CommittedSource("origin/main")) as copy:
             _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
             for key in ("user.name", "user.email"):
                 value = git(repo, "config", "--get", key).strip()

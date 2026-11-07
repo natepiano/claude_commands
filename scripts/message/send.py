@@ -4,7 +4,7 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
+  send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
@@ -19,6 +19,9 @@ every message follows are /message (~/.claude/commands/message.md).
                           also stop the emergency push sent with KEY (see below)
   send.py clear-check     retire each live emergency push whose --clears-when check passes
 
+Pane workers use worker:<unit>/<worker>.
+Workers in mesh-pinned runs use worker:<run id>/<worker>.
+
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
 headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
@@ -29,7 +32,8 @@ SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Mesh `worker:` addresses keep their existing queues.
-`codex:` addresses queue through the shared Codex daemon.
+Staff worker addresses use the run's pinned transport.
+Other `codex:` addresses queue through the shared Codex daemon.
 One staff snapshot selects each staff recipient.
 Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
@@ -111,6 +115,10 @@ Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_ST
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -133,11 +141,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import process_group
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
@@ -149,23 +153,23 @@ from scripts.message.send_result import (
     ConfirmedSendOutcome as ConfirmedSendOutcome, UnconfirmedSendOutcome as UnconfirmedSendOutcome,
     send_outcome as send_outcome,
 )
-import sessions  # noqa: E402
-from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
-import postmaster  # noqa: E402
-import codex_daemon  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message import postmaster  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
-    import roster
-    from ..accounts import accounts
-    from ..whoami.account import named_account_environment
-import push_texts  # noqa: E402
-import push_reference
-import rca  # noqa: E402
-import repeat_guard  # noqa: E402
-import review  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from probe_session import PROBE_ENV  # noqa: E402
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+    from scripts.message import roster
+    from scripts.accounts import accounts
+    from scripts.whoami.account import named_account_environment
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import push_reference
+from scripts.message import rca  # noqa: E402
+from scripts.message import repeat_guard  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
                          SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
@@ -237,10 +241,9 @@ AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it wit
 PERMISSION_MODE = "auto"
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
-RELAY_EXEC = f"""import os, sys
+RELAY_EXEC = """import os, sys
 from pathlib import Path
-sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-from relay_identity import publish_relay_identity
+from scripts.message.relay_identity import publish_relay_identity
 publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
@@ -1410,7 +1413,7 @@ def user_emergency_key(sender: str, title: str) -> str:
 def emergency_lifetime() -> timedelta:
     """How long Pushover repeats an emergency push that the user does not acknowledge."""
     # Imported here: only an emergency send reads it, and pushover's imports cost about 20 ms.
-    from pushover import EXPIRE_S
+    from scripts.notify.pushover import EXPIRE_S
     return timedelta(seconds=EXPIRE_S)
 
 
@@ -1785,7 +1788,7 @@ def _print_roster_problems(
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
-    import roster
+    from scripts.message import roster
 
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
@@ -1807,13 +1810,13 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     lines = [f"{name} matches {len(entries)} sessions:"]
     for entry in entries:
@@ -1833,7 +1836,7 @@ def resolve_staff_recipient(
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
     """Select one staff identity before any transport lookup."""
-    import roster
+    from scripts.message import roster
 
     reference = target
     if target.startswith("worker:"):
@@ -1905,7 +1908,7 @@ def resolve_staff_recipient(
 
 
 def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     return [entry for entry in entries if (
         isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id == member.current_session
@@ -1916,7 +1919,7 @@ def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.Roster
 
 
 def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
@@ -1927,7 +1930,7 @@ def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[ro
 def _matched_recipient(
     to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
 ) -> SessionRecipient | RemoteDelivery:
-    import roster
+    from scripts.message import roster
 
     if len(matches) > 1:
         _ambiguous_name(to, matches)
@@ -1944,7 +1947,7 @@ def matching_recipients(
     membership: staff.StaffSnapshot | None = None,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
     """Find rows without delivering or exiting; ask the peer only after a local miss."""
-    import roster
+    from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
@@ -1983,27 +1986,31 @@ def resolve_recipient(
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
+    from scripts.message import roster
+
     membership = staff.snapshot() if membership is None else membership
     problems = observed.diagnostics
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
-        if to.startswith("uds:"):
-            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
+        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
-        if (not isinstance(scope, NamedMachine) and to.startswith("worker:")
+        if (not isinstance(scope, NamedMachine)
                 and isinstance(member, staff.StaffRow) and member.kind == "worker"):
             from scripts.herdr import worker_panes
 
             holder = membership.parent_of(member)
-            if holder is not None:
-                run = worker_panes.worker_run(holder)
+            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                       or holder.worktree.machine == roster.remote.local_machine()):
+                run = worker_panes.worker_run(holder, record=membership)
                 if unit_runs.worker_transport(run) == "herdr":
                     return PaneWorkerRecipient(member)
-                if not _sender_label_matches(to, observed.entries):
+                if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
                     return CodexWorkerRecipient(to, member.name, str(run))
+        if to.startswith("uds:"):
+            return socket_recipient(to, socket_records, {}, membership=membership)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -2171,7 +2178,6 @@ def relay(message: Message, timeout: float) -> Result:
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
@@ -2369,7 +2375,7 @@ def template_fix_notice(record: dict[str, object]) -> None:
             except OSError:
                 pass
             text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
-            command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
+            command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
             # Delivery and its error record run in the detached child.
             _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
@@ -2645,8 +2651,9 @@ def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description=(
                                          "Send one message to a roster name, uds:<path>, "
-                                         "session:<id>, worker:<run id>/<worker name>, "
-                                         "codex:<thread id>, or user."
+                                         "session:<id>, codex:<thread id>, or user. "
+                                         "Use worker:<unit>/<worker> for a pane worker. "
+                                         "Use worker:<run id>/<worker name> for a run pinned to mesh."
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
@@ -2657,7 +2664,9 @@ def parse(argv: list[str]) -> Options:
         required=True,
         help=(
             "a roster name, uds:<path>, session:<id>, "
-            "worker:<run id>/<worker name>, codex:<thread id>, or user"
+            "codex:<thread id>, or user. "
+            "Use worker:<unit>/<worker> for a pane worker. "
+            "Use worker:<run id>/<worker name> for a run pinned to mesh."
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")
@@ -2724,7 +2733,7 @@ def parse(argv: list[str]) -> Options:
     if text_id:
         if to != USER:
             parser.error("--text-id goes with --to user")
-        import push_texts
+        from scripts.notify import push_texts
         values: dict[str, str] = {}
         for value in raw_values:
             key, separator, item = value.partition("=")
@@ -2874,7 +2883,7 @@ def body_text(options: Options) -> str:
 
 def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) -> str:
     """Resolve the display from the native id without changing reply addresses."""
-    import roster
+    from scripts.message import roster
 
     if isinstance(stamp, UnavailableSender):
         return sender
@@ -2886,7 +2895,7 @@ def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) 
 
 def sender_stamp() -> SenderStamp:
     """Read the native sender identity independently of the display name."""
-    import roster
+    from scripts.message import roster
 
     identity = roster.sender_identity(os.environ)
     if isinstance(identity, roster.ClaudeSession):
@@ -2991,7 +3000,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "") -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
-    import herdr
+    from scripts.herdr import herdr
 
     holder = membership.parent_of(worker)
     if holder is None:
@@ -3020,7 +3029,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
-    import roster
+    from scripts.message import roster
 
     if options.to == USER and not options.text_id:
         return Result("refused", push_texts.TEMPLATE_REQUIRED)

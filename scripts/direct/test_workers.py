@@ -132,7 +132,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
     def test_restarted_director_comes_from_its_current_unit_mark(self) -> None:
         from scripts.production import unit_lookup
         from scripts.message import sessions
-        from herdr import HerdrPlace
+        from scripts.herdr.herdr import HerdrPlace
 
         _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
         _ = (self.session_dir / "director").write_text("old-director")
@@ -319,6 +319,21 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(saved["task"], "mesh update")
         self.assertEqual(saved["assignment_id"], "accepted")
         self.assertEqual(saved["thread_id"], mesh_fixture.THREAD_ID)
+
+    def test_unit_retirement_removes_a_worker_staff_row_after_its_run_ends(self) -> None:
+        store = self.lifecycle_worker()
+        member = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert member is not None
+        owner = staff.local_snapshot().parent_of(member)
+        assert owner is not None
+        code, output, errors = self.run_mesh(["end", "--to", "w7"])
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(staff.local_snapshot().by_id(member.id), member)
+        with bounded_worker_change(), redirect_stdout(io.StringIO()):
+            workers.end_unit(owner)
+        self.assertIsNone(staff.local_snapshot().by_id(member.id))
+        with store.locked(write=False) as ledger:
+            self.assertNotIn("w7", ledger.workers)
 
     def test_end_unit_rerun_after_end_marker_retries_transport_cleanup(self) -> None:
         store = self.lifecycle_worker()
@@ -855,7 +870,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.open_worker()
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE
         original = roster_path.read_bytes()
-        script = ("from pathlib import Path; import sys; sys.path.insert(0, sys.argv[2]); "
+        script = ("from pathlib import Path; import sys; "
                   "from scripts.direct import workers; "
                   "print('reader-ready', flush=True); print(workers.resolve(Path(sys.argv[1]), 'impl'), flush=True)")
         with mesh_fixture.worker_state_lock_path(roster_path).open("a") as owner, roster_path.open("r+b") as roster:

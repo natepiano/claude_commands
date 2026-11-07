@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Count production CI points, verify their runs, and send one review alert."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -151,7 +155,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoints = merged_checkpoints(production)
     checkpoint = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase}" if checkpoints else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with copies.standing(production.name, production.checkout, tip) as checkout:
+    with copies.standing(production.name, production.checkout, copies.CommittedSource(tip)) as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
         settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):

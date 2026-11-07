@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for tmp_sweep.py on fabricated /tmp roots and a fabricated /proc. Times are two days ahead
 of the clock, so every file a test writes is old, ctime included, unless the test moves it."""
 

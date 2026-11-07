@@ -2,6 +2,10 @@
 """Find a live Claude session's socket, `SendMessage` address, session ID or transcript."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -16,15 +20,10 @@ from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.session_paths import sessions_directory
 
-if __package__:
-    from .process_identity import process_start as process_start
-    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
-else:
-    from process_identity import process_start as process_start
-    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+from scripts.message.process_identity import process_start as process_start
+from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -402,7 +401,6 @@ def member_target(target: str) -> str:
     """Resolve a retained staff reference to its current conversation at delivery."""
     if not target.startswith("session:"):
         return target
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     resolve = cast(Callable[[str], str], import_module("scripts.production.staff").current_session_target)
     return resolve(target)
 
@@ -417,7 +415,6 @@ def main(argv: list[str]) -> int:
 
     command, target = argv[1:]
     if command == "member-socket":
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         try:
             target = member_target(target)
         except (OSError, ValueError) as error:

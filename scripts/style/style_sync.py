@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Notify standing style productions and record workspace lint coverage."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -16,24 +20,21 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-import process_group
+from scripts.lib import process_group
 
-from add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
-import style_ledger
-from process_failure import failure_detail
-import scratch
+from scripts.style import style_ledger
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND_SECONDS = 10
@@ -363,7 +364,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:

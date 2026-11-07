@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-import postmaster
-import sessions
+from scripts.message import postmaster
+from scripts.message import sessions
 
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
 TEXT = "Message from Sender via postmaster: Question [01234567]\n\nQuestion"

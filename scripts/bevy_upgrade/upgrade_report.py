@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pins import Pin
-from upgrade_record import Announced, Entry, Record, on_target, target_fit
+from scripts.bevy_upgrade.pins import Pin
+from scripts.bevy_upgrade.upgrade_record import Announced, Entry, Record, on_target, target_fit
 
 State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]
 STATE_ORDER: tuple[State, ...] = (

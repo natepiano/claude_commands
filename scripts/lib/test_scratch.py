@@ -191,7 +191,7 @@ class ScratchTests(unittest.TestCase):
                                        {"source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
-            with copies.standing("style", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
@@ -947,8 +947,8 @@ print(scratch.target('gate:proof', 'tree', False))
             (repo / ".git").mkdir(parents=True)
         with (
             mock.patch.dict(os.environ, config_environment(self.base / "config")),
-            mock.patch("scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
-            mock.patch("scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
+            mock.patch("scripts.lib.scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
+            mock.patch("scripts.lib.scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
         ):
             self.assertEqual(scratch.repos(root), repositories)
         self.assertEqual(whole.call_args_list, [mock.call("repo_depth")])

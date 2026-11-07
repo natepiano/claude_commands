@@ -2,6 +2,10 @@
 """Show the recorded state of each configured build target."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Mapping
@@ -20,12 +24,11 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
+from typing import Literal, Protocol, TypedDict, cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
-import target_config
+from scripts.build_hold import override_guard
+from scripts.build_targets import target_config
+from scripts.message import roster
 
 
 class CliArguments(argparse.Namespace):
@@ -59,8 +62,6 @@ def positive_pid(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    platform = commands.add_parser("platform")
-    _ = platform.add_argument("--target", required=True)
     reserve = commands.add_parser("reserve")
     _ = reserve.add_argument("--repo-root", required=True)
     _ = reserve.add_argument("--package", default="")
@@ -95,19 +96,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def command_platform(target: str) -> int:
-    print(target_config.configured_ssh_target(target).platform)
-    return 0
-
-
-# A platform query needs configuration before any coordination imports.
-if __name__ == "__main__" and sys.argv[1:2] == ["platform"]:
-    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
-    platform_arguments = parser().parse_args(namespace=CliArguments())
-    raise SystemExit(command_platform(platform_arguments.target))
-
-
-from targets import (
+from scripts.build_targets.targets import (
     ANY_ELIGIBLE_TARGET,
     AwsStatusRow,
     RemovalPending,
@@ -134,24 +123,15 @@ from targets import (
     target_state,
     target_eligibility,
 )
-import offload
-import mac_test
-import conf
-from atomic_file import write_text_atomic
-import build_hold
-from user_zone import user_zone
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..direct.step_record import Pinned, ROUTED, TargetSelection
-    from ..buildlog import mac_idle_alert
-    from ..message import roster
-    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
-    from scripts.buildlog import mac_idle_alert
-    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
-
+from scripts.mac_test import mac_test, offload
+from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_hold import build_hold
+from scripts.lib.user_zone import user_zone
+from scripts.lib import process_start as process_identity
+from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+from scripts.buildlog import mac_idle_alert
+from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
 
 class ActiveWaitProcess(TypedDict):
@@ -254,7 +234,6 @@ def format_aws_status(row: AwsStatusRow) -> str:
 
 
 def command_status(probe: bool = False) -> int:
-    from scripts.message import roster
 
     try:
         targets = read_targets()
@@ -305,7 +284,8 @@ def print_eligible_target(result: EligibleTarget | ExcludedTarget) -> None:
     disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
     reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
     settings = str(target.settings) if isinstance(target, SshTarget) else "-"
-    print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+    platform = target.platform if isinstance(target, SshTarget) else "-"
+    print(f"{target.name}\t{disposition}\t{reason}\t{settings}\t{platform}")
 
 
 StepKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
@@ -893,8 +873,6 @@ def command_check_local(caller: str = "") -> int:
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
-    if args.command == "platform":
-        return command_platform(args.target)
     if args.command == "reserve":
         return command_reserve(args)
     if args.command == "release-wait":

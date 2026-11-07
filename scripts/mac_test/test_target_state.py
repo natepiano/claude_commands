@@ -35,14 +35,13 @@ if TYPE_CHECKING:
     from ..lib import conf
     from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
-    import mac_test
-    import offload
-    import targets
-    import build_hold
-    import record
-    import store
-    import conf
-    from memory_test_support import write_config_fixture, config_environment
+    from scripts.mac_test import mac_test, offload
+    from scripts.build_targets import targets
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.lib import conf
+    from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
 TARGET_NAMES = ("mac", "aws", "linux-two")
@@ -136,7 +135,7 @@ class IsolatedTargetState(unittest.TestCase):
 
     def record_command(self, arguments: list[str], **_options: object) -> mock.Mock:
         """Write hold events synchronously and refuse all other child commands."""
-        self.assertEqual(arguments[:3], [sys.executable, str(SCRIPTS / "buildlog/record.py"), "hold-event"])
+        self.assertEqual(arguments[:3], [str(SCRIPTS / "lib/py"), str(SCRIPTS / "buildlog/record.py"), "hold-event"])
         record.hold_event(arguments[3:])
         return mock.Mock(wait=mock.Mock(return_value=0))
 

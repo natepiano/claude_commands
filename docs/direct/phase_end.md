@@ -51,10 +51,9 @@ Run these steps in order for each completed loop or verbose phase:
    open: its `finish-phase` in step 5 waits until this review has finished,
    also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
-5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
-   `remove_workers.py`, helpers, launchers, and apps. Run it before the next
-   launch. Per <LongLivedWorkers/>, Codex turns finish but their threads remain
-   open until `end_session.sh`; Claude workers keep their existing cleanup.
+5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/> before the next launch.
+   Retain pane workers and their native conversations under <LongLivedWorkers/>.
+   Apply the compatibility cleanup only when the existing run's pin is `mesh`.
    Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,

@@ -239,6 +239,7 @@ These roles keep their staff row and current session in a pane.
 Held roles receive messages through `send.py`.
 An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
 `side_pane.py` serves ask-a-friend consultations without a staff row.
+The friend launches with the worker policy through `worker_panes.worker_policy`, so it replies with `send.py` and stops at no permission prompt.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
 The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
 The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
@@ -307,7 +308,7 @@ Invalid argument counts print usage and return 1.
 
 | Consumer | Configuration use |
 |---|---|
-| `assign.py`, `implement.sh`, `review.sh` | Share one launch configuration across allocation and delivery. |
+| `assign.py`, `assign_claude.py`, `review.sh` | Share one launch configuration across allocation and delivery. |
 | `workers.py` | Reads a configuration only when it opens a worker. |
 | `codex_mesh.py` | Uses one configuration for each turn submission. |
 | `agent_exec.sh`, `cli_agent.sh` | Resolve task values before removing the operation snapshot. |

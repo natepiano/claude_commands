@@ -21,7 +21,6 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
@@ -42,25 +41,22 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "direct"))
 
-import codex_daemon
-from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
-import process_table
-import roster
-import send
-import unit_lookup
-import unit_runs
-import herdr
-from fake_herdr import CommandResponse, herdr_listener
-import sessions
-from relay_identity import relay_session_name
-from relay_test_support import write_relay_record
+from scripts.message import codex_daemon
+from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
+from scripts.message import process_table
+from scripts.message import roster
+from scripts.message import send
+from scripts.production import unit_lookup
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
+from scripts.message import sessions
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 from scripts.production import showrunners
 if TYPE_CHECKING:
-    from ..whoami import account, agent_accounts
+    from scripts.whoami import account, agent_accounts
 else:
     account = roster.account
     agent_accounts = roster.agent_accounts
@@ -577,8 +573,6 @@ class RosterTests(unittest.TestCase):
         assert registered is not None
         started = send.now()
         targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
-        from scripts.message import sessions as runtime_sessions
-
         for target in targets:
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
@@ -589,7 +583,6 @@ class RosterTests(unittest.TestCase):
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
                       mock.patch.object(sessions, "read_registry", registry),
-                      mock.patch.object(runtime_sessions, "read_registry", registry),
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 registry.assert_called_once_with()
@@ -906,6 +899,29 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(orphan_worker.startswith("    "))
         self.assertTrue(any(line.strip() == "your Codex sessions" for line in lines))
         self.assertTrue(any("~/projects/unit-one" in line for line in lines))
+
+    def test_claude_shell_status_shows_background_and_keeps_raw_data(self) -> None:
+        session_id = "acd50bad-5afa-5d3d-b155-3766b7d113e0"
+        self._write_session(str(os.getpid()), "runner", session_id,
+                            self.home / "projects" / "runner", status="shell")
+        self.assertEqual(self._entries()["runner"].status, "shell")
+        for here in (True, False):
+            with self.subTest(here=here):
+                result, lines, errors = self._run_main(here=here)
+                self.assertEqual((result, errors), (0, []))
+                runner = next(line for line in lines if f"[session:{session_id}]" in line)
+                self.assertIn("claude, background", runner)
+                self.assertNotIn("shell", runner)
+                result, lines, errors = self._run_main("--json", here=here)
+                self.assertEqual((result, errors), (0, []))
+                report = cast(dict[str, object], json.loads("\n".join(lines)))
+                entries = cast(list[dict[str, object]], report["entries"])
+                entry = next(row for row in entries if row["address"] == f"session:{session_id}")
+                self.assertEqual(entry["status"], "shell")
+                result, lines, errors = self._run_main("--snapshot", here=here)
+                self.assertEqual((result, errors), (0, []))
+                snapshot = roster.RosterSnapshot.decode("\n".join(lines)).result
+                self.assertEqual(next(row for row in snapshot.entries if row.name == "runner").status, "shell")
 
     def test_socketless_director_keeps_worker_links_and_json_addresses(self) -> None:
         self._write_session(
@@ -2539,6 +2555,21 @@ class RosterTests(unittest.TestCase):
 
 
 class PaneRosterTests(StaffTestCase):
+    def test_missing_herdr_keeps_session_entries_and_reports_pane_workers(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.unit.current_session, "director")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(account, "process_config_dir", return_value=None), \
+             mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual([problem for problem in found.problems if problem.startswith("pane workers:")],
+            ["pane workers: herdr is not installed"])
+        self.assertIn("director", [entry.name for entry in found.entries])
+
     def test_pane_workers_keep_five_states_and_replace_native_session_entries(self) -> None:
         fixture = self.row_production()
         rows = [fixture_worker(name, fixture.unit.id,

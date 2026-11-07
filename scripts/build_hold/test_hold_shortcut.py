@@ -46,8 +46,12 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
             + 'exit "$TEST_STATUS"\n'
         )
         python.chmod(0o755)
+        cache = self.scratch / "cache" / "claude"
+        cache.mkdir(parents=True)
+        _ = (cache / "python3-3.12").write_text(str(python) + "\n")
         self.environment = {
             **os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "XDG_CACHE_HOME": str(cache.parent), "CLAUDE_PYTHON": "",
             "BUILDLOG_CALL_ID": "c1", "BUILDLOG_CALLER": "verify",
             "BUILDLOG_HOLD_PID": "12345", "BUILDLOG_HOLD_WAIT_FILE": str(self.wait_file),
             "TEST_STARTS": str(self.starts), "TEST_STATUS": "0", "GLOBIGNORE": "",

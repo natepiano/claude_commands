@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Select available style work and refill a unit's standing plan."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import io
@@ -26,35 +30,33 @@ from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from types import FrameType, MappingProxyType
 from typing import Literal, assert_never, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS / "production"))
 
-import berth_board
-import coverage_report
-import bulk_rename
-import finding_sites
-import mechanical_classes
-from approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
+from scripts.lib import berth_board
+from scripts.lib.git_blob import git_blob_id
+from scripts.style import coverage_report
+from scripts.style import bulk_rename
+from scripts.style import finding_sites
+from scripts.style import mechanical_classes
+from scripts.style.approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing,
                               file_rename, inline_modules)
-from add_style import StandingStyleProduction, standing_style_production
-import rules
-import style_ledger
-import approved_renames
-import style_footprint
-import style_proposals
-from issues import Issue, frontmatter
+from scripts.style.add_style import StandingStyleProduction, standing_style_production
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_proposals
+from scripts.production.issues import Issue, frontmatter
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
-from proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
-from unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
-from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
+from scripts.style.unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
+from scripts.style.unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
 
 FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
@@ -1209,7 +1211,7 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 approval_arguments = [argument for site in approved_documentation_sites(ledger, ticket_id, base)
                                       for argument in ("--approved-documentation-site", site.path, str(site.line), site.text)]
-                result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
+                result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree", *approval_arguments], check=False)
                 if result.returncode != 0:
                     return 2 if result.returncode == 2 else 1
@@ -2068,7 +2070,7 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     rule_paths = {pinned.rule_id: plan.parent.parent / "rules" / (pinned.blob + ".md") for pinned in texts}
     for pinned in texts:
         path = rule_paths[pinned.rule_id]
-        if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
+        if not path.exists() or git_blob_id(path.read_bytes()) != pinned.blob:
             atomic_write(path, pinned.text)
     waived = _waived_ticket_findings(ledger, ticket, rule_paths)
     review = ticket_review_scope(ledger.repo, ticket, held) if ticket["kind"] == "proposal" else ReviewScope.PRODUCTION

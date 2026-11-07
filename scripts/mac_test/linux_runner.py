@@ -2,6 +2,10 @@
 """Execute trusted source in a cached Linux development shell."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator, Mapping
@@ -29,12 +33,14 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..copies import copies
     from ..lib import build_folders
     from ..lib.boot_identity import boot_identity as boot_identity
     from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
+    from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
@@ -184,7 +190,7 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
+        copies.mirror_probe_setup(mirror),
         f'checkout="$HOME"/{shlex.quote(mirror)}',
         'if [[ -f "$checkout/Cargo.toml" ]]; then',
         "  capacity_code=" + shlex.quote("\n".join((
@@ -458,11 +464,10 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
 def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) -> str:
     """Select the runner and its children even outside the slot directory."""
     code = ("import sys; from pathlib import Path; "
-            + "sys.path.insert(0, str(Path.home()/'.claude/scripts/mac_test')); "
-            + "from linux_runner import print_slot_processes; "
+            + "from scripts.mac_test.linux_runner import print_slot_processes; "
             + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
     return ('select_leftovers() {\n'
-            + f'    python3 -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
+            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
             + '}\n')
 
 
@@ -492,7 +497,7 @@ def nextest_words_with_skip(
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
                    words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
-    arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
+    arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
@@ -502,7 +507,7 @@ def command_script(mirror: str, values: dict[str, str], repository: str, verb: s
 
 
 def probe_command_script(mirror: str, values: dict[str, str], repository: str) -> str:
-    return shlex.join(['python3', '.claude/scripts/mac_test/linux_runner.py', 'probe',
+    return shlex.join(['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'probe',
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
 
 
@@ -612,7 +617,8 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
                        + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
-            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False).returncode
+            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors()).returncode
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -766,7 +772,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         started = step_directory / 'started'
         command += (f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
-        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)
+        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
     try:

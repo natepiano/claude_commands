@@ -285,6 +285,55 @@ only I can bump
 
 **Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
+### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: todo
+
+**Depends on:** nothing. Source: builds showrunner, 2026-11-06, change C1145 returned. It follows 18a and goes ahead of 20b and 10v.
+
+#### Work Order
+
+**Goal:** A merge gate past 80% of its first pass keeps the memory of its remaining bins, also when old gate records hold a rerun phase.
+
+**Spec:**
+
+1. **Cause, measured.** Live gate at 86.3%: "full need: unmeasured progress window". The merged live profile has all 20 bins of `suites:1`, tail 0.23 GiB at 85%. 17 of its 42 records also hold a `suites:2` phase, from gates that ran code before phase 20a. `window_peak` at `scripts/build_queue/progress_profile.py:124` has 6.3% left after `suites:1`, crosses into `suites:2`, meets an unmeasured bin and refuses.
+2. **Fix.** A gate clears its counter before reruns, so its first pass is the last thing its counter describes. `window_peak` stops at the end of phase `suites:1`. Name the phase once, as a constant in `progress_profile.py`.
+3. **Other phases.** The `build:1` to `test:1` and `build:1` to `build:2` crossings stay as they are.
+4. **Live records.** No removal and no write to live state. Old `suites:2` phases stay on disk and have no effect on the first pass. A `suites:2` counter, which only code before phase 20a writes, follows the normal window rule, as before this phase.
+5. **Proof.** Tests with the live shape, each in a tempdir: records saved through `ProfileHistory`, some with `suites:1` only, some with `suites:1` and a `suites:2` holding bin 0 only. At 86% and at 99%, `window_peak` returns the peak of the remaining `suites:1` bins. `progress_memory` for a gate row gives that value, and `progress_text` does not read "full need". The existing crossing tests pass unchanged.
+
+**Files:**
+- `scripts/build_queue/progress_profile.py`
+- `scripts/build_queue/test_progress_profile.py`
+- `scripts/production/test_merge_gate_suites_admission.py`
+- `docs/as-built/build-memory-admission.md` — the look-ahead rule.
+
+**Workers:** `1 writer` — `impl3`, code, tests and docs.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
+
+**Change-Review:** none in the commit. Builds adds no row until a live gate past 85% shows under 1 GiB; I add the row at that time.
+
+### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
+
+#### As-built
+
+- `scripts/message/roster.py:1286` also catches `herdr.HerdrFailure`, so `send.py` keeps the session entries and delivers from a service with no herdr on its PATH.
+- `down_alert`'s phone push reads "The builds session did not take the message. Builds wait until the service answers."
+- A merge gate rerun sets `progress_total = 0`, so `publish_progress` publishes nothing, and `progress_profile.clear_counter` removes the counter file. The rerun keeps the full need. `progress_phase` is gone, and the first pass counter is `suites:1`.
+
+**Files:**
+- `scripts/message/roster.py`, `scripts/message/test_roster.py` — the catch
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py` — the push text, the proof with no herdr
+- `scripts/build_queue/progress_profile.py` — `clear_counter`
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — the rerun
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule
+
+**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send.py` requires it.
+
+**Gotchas:** the installed `merge_gate.py` runs for every `--checkout` gate, so `suites:2` records keep arriving until this phase is installed. Stored `suites:2` records stay until removed.
+
+**Ruled out:** a reader in main code that skips stored `suites:2` records.
+
 ### Phase 21 — Each moved admission name has one import path  · status: todo
 
 **Depends on:** 10o, and resources 0dfe65382 on the builds branch, because that branch conflicts in `memory_admit.py`. Source: builds showrunner, 2026-11-06 02:2x EST (design call).

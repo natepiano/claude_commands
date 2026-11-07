@@ -19,7 +19,7 @@ The reviewer does not write the ledger.
 
 For a run by hand, create an empty prompt file and a fresh output directory
 outside the reviewed repository,
-then run `python3 ~/.claude/scripts/lint/style_review.py prepare --working-dir
+then run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/style_review.py prepare --working-dir
 <repo> --since <ref> --phase-dir <output directory> --prompt <empty prompt>
 --directory-file <output directory>/input-directory`. Default `<ref>` is HEAD;
 add `--until <ref>` for a committed range, excluding working-tree changes.

@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from scripts.whoami.account_test_support import write_codex_auth
 from typing import cast
 
-from scripts.direct import implement_launcher_test_support as support
+from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import RegistryReadProbe
+from scripts.lib import models_registry
 from scripts.production import staff
 
 
@@ -26,14 +28,108 @@ def configure_pane_account(home: Path, notes: Path) -> None:
 
 
 
-class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+    def test_term_during_the_worker_wait_ends_the_agent_and_records_failure(self) -> None:
+        session = self.start_phase("term-during-wait")
+        stub = self.root / "claude-bin"
+        _ = stub.write_text(stub.read_text().replace(
+            "(root / 'worker_state').write_text('idle')",
+            "(root / 'worker-wait-ready').touch()"))
+        watcher = self.root / "scripts/agents/heartbeat_watch.sh"
+        _ = watcher.write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$3" > "$STUB_CLAUDE_ROOT/agent-pid"
+python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/worker-wait-ready"
+kill -TERM "$PPID"
+exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
+''')
+        result = self.worker_launch(session)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        agent_pid = int((self.root / "agent-pid").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(agent_pid, 0)
+        self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
+        self.assertEqual(self.open_passes(session)["impl"]["status"], "error")
+        finished, = self.launch_records(session, "pass_finished")
+        self.assertEqual(finished["status"], "error")
+        board = (session / "board.log").read_text()
+        self.assertIn("blocked:", board)
+        self.assertIn("this worker is down", board)
+        self.assertNotIn("done:", board)
+
+    def test_a_custom_launch_configuration_reaches_the_worker_as_a_file_path(self) -> None:
+        session = self.start_phase("custom-models-path")
+        environment = self.launch_environment(session)
+        custom = self.root / "custom-models.conf"
+        _ = custom.write_text(Path(environment.pop("MODELS_CONFIG_FILE")).read_text())
+        configuration = models_registry.launch_configuration({
+            "MODELS_LAUNCH_CONFIGURATION": json.dumps([str(custom), custom.read_text()]),
+        })
+        stub = self.root / "claude-bin"
+        _ = stub.write_text(stub.read_text().replace(
+            "    baseline = session / 'phases/3/phase_baseline'",
+            "    (root / 'worker-models-path').write_text(settings['MODELS_CONFIG_FILE'])\n"
+            + "    baseline = session / 'phases/3/phase_baseline'"))
+        result = subprocess.run(self.assign_command(session), env=configuration.environment(environment),
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "worker-models-path").read_text(), str(custom.resolve()))
+
+    def test_a_failed_claude_launch_ends_its_run_and_keeps_its_worker_row(self) -> None:
+        session = self.start_phase("failed-worker")
+        environment = self.launch_environment(session)
+        marker = Path(environment["UNIT_ACTIVE_DIR"]) / environment["CODEX_THREAD_ID"]
+        marker.parent.mkdir(parents=True)
+        _ = marker.write_text(str(session) + "\n")
+        registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
+        registry.mkdir(parents=True)
+        from scripts.message import sessions
+        _ = (registry / "director.json").write_text(json.dumps({
+            "sessionId": environment["CODEX_THREAD_ID"], "pid": os.getpid(),
+            "name": "fixture director", "procStart": sessions.process_start(os.getpid()),
+            "updatedAt": 1, "messagingSocketPath": "",
+        }))
+        sender = self.root / "opening-send.py"
+        _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
+        result = subprocess.run(self.assign_command(session), env=environment,
+                                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        self.assertEqual(state["status"], "error")
+        self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])
+        self.assertIn("run ended", result.stderr)
+        worker = self.recorded_worker(session)
+        self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
+        self.assertTrue(worker.current_session)
+
+    def test_agent_bg_has_assign_as_its_only_launcher_parent(self) -> None:
+        session = self.start_phase("one-launcher")
+        sender = self.root / "opening-send.py"
+        _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "\n".join((
+            "import subprocess",
+            "rows = subprocess.run(['ps', '-eo', 'pid=,ppid=,args='], check=True, capture_output=True, text=True).stdout",
+            "(root / 'launch-processes').write_text(rows)",
+            "print('SENT: fixture')",
+        ))))
+        result = self.worker_launch(session)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        processes = {int(pid): (int(parent), command) for line in (self.root / "launch-processes").read_text().splitlines()
+                     for pid, parent, command in [line.split(None, 2)]}
+        agent_pid, (launcher_pid, command) = next(
+            (pid, row) for pid, row in processes.items()
+            if str(self.root) in row[1] and "agent_bg.sh" in row[1])
+        self.assertIn("agent_bg.sh", command)
+        parent_pid, launcher_command = processes[launcher_pid]
+        self.assertIn(str(self.assign_script.with_suffix(".py")), launcher_command)
+        self.assertNotEqual(agent_pid, launcher_pid)
+        self.assertNotIn("agent_bg.sh", processes[parent_pid][1])
+
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.environment()
         probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
         result = subprocess.run(
-            ["bash", str(self.implement_script), str(session), str(self.working_dir), str(self.prompt_file),
-             "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            self.assign_command(session),
             env=probe.environment(environment), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(probe.reads()), 1, probe.reads())
@@ -44,8 +140,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         environment = self.environment()
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
         result = subprocess.run(
-            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            self.assign_command(session_dir),
             check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -78,37 +173,12 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("heartbeat watcher output", result.stdout)
 
-    def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
-        # What the incident actually looked like on the wire: a worker launched
-        # with the sixth argument dropped. It used to run the agent and record
-        # nothing; now nothing runs at all.
-        session_dir = self.start_phase("dropped")
-        result = subprocess.run(
-            [
-                "bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-                str(self.prompt_file), "test", "the retry tests", "",
-                "writing the retry tests", "0", "test",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("pass_kind must be impl, test, fix, or review", result.stderr)
-        # Refused before anything ran: no status file to be read as a live worker,
-        # and no register line for peers to answer.
-        self.assertFalse((session_dir / "impl_status_test").exists())
-        self.assertFalse((session_dir / "board.log").exists())
-
     def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
         # Two phases running the same role each name their own, so neither overwrites the
         # other's status, summary or log, and the name stays off the worker's address.
         session_dir = self.start_phase("phase-directory")
         result = subprocess.run(
-            ["bash", str(self.implement_script), "--phase", "3", str(session_dir), str(self.working_dir),
-             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            self.assign_command(session_dir, "--phase", "3"),
             check=False, capture_output=True, text=True, env=self.environment(), timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -118,12 +188,6 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(sorted(path.name for path in session_dir.glob("impl_status*")), [])
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertNotIn("3-impl", board)
-
-    def test_an_unknown_pass_kind_is_refused_by_the_same_check(self) -> None:
-        session_dir = self.start_phase("unknown")
-        result = self.launch(session_dir, "implementation", "impl")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("got 'implementation'", result.stderr)
 
     def test_launcher_passes_its_prompt_to_the_launch_check(self) -> None:
         session = self.start_phase("checked-launch")
@@ -136,45 +200,35 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                          ("3", "Retry handling", "matched"))
         self.assertTrue((session / "worker-started").exists())
 
-    def test_launcher_stops_on_stale_prompt_and_missing_phase_refusals(self) -> None:
-        for label, options, text in (
-            ("stale-prompt", ("--phase", "3"), "Phase 9 — Other work\n"),
-            ("missing-phase", (), "Write the retry.\n"),
-        ):
-            with self.subTest(label=label):
-                session = self.start_phase(f"refused-{label}")
-                _ = self.prompt_file.write_text(text)
-                result = self.checked_launch(session, *options)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((session / "worker-started").exists())
-                self.assertEqual(self.launch_records(session, "pass_started"), [])
-                refusal, = self.launch_records(session, "launch_refused")
-                self.assertEqual(refusal["prompt_file"], str(self.prompt_file))
-                self.assertTrue(refusal["reason"])
-                self.assertIn("prompt" if label == "stale-prompt" else "phase", result.stderr.lower())
+    def test_launcher_stops_on_a_stale_prompt(self) -> None:
+        session = self.start_phase("refused-stale-prompt")
+        _ = self.prompt_file.write_text("Phase 9 — Other work\n")
+        result = self.checked_launch(session, "--phase", "3")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((session / "worker-started").exists())
+        self.assertEqual(self.launch_records(session, "pass_started"), [])
+        refusal, = self.launch_records(session, "launch_refused")
+        self.assertEqual(refusal["prompt_file"], str(self.prompt_file))
+        self.assertTrue(refusal["reason"])
+        self.assertIn("prompt", result.stderr.lower())
 
-
-    def test_codex_workers_are_refused_before_artifacts_or_claims_change(self) -> None:
-        session = self.start_phase("codex-refused")
-        registry = self.root / ".claude/config/models.conf"
-        _ = registry.write_text(registry.read_text().replace("direct=claude", "direct=codex"))
-        summary = session / "impl_summary_impl.txt"
-        _ = summary.write_text("previous summary\n")
-        before = (session / "progress_history_state.json").read_bytes()
-        for options in ((), ("--to", "fixture-impl")):
-            with self.subTest(options=options):
-                result = self.checked_launch(session, *options)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(result.stderr, "implement.sh: Codex workers must use assign.sh.\n")
-                self.assertEqual(summary.read_text(), "previous summary\n")
-                self.assertEqual((session / "progress_history_state.json").read_bytes(), before)
-                self.assertFalse((session / "impl_claim_impl.json").exists())
-                self.assertFalse((self.root / "launch_args.json").exists())
+    def test_an_unopened_phase_records_a_refusal_without_starting_a_worker(self) -> None:
+        session = self.start_phase("unopened-phase")
+        _ = self.prompt_file.write_text("Phase 9 — Other work\n")
+        result = self.checked_launch(session, "--phase", "9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((session / "worker-started").exists())
+        self.assertFalse((self.root / "launch_args.json").exists())
+        self.assertEqual(self.launch_records(session, "pass_started"), [])
+        refusal, = self.launch_records(session, "launch_refused")
+        self.assertEqual(refusal["prompt_file"], str(self.prompt_file))
+        self.assertIn("Phase 9 is not open", str(refusal["reason"]))
+        self.assertIn("phase", result.stderr.lower())
 
     def test_phase_claim_precedes_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-before-open")
         environment, calls = self.claim_fixture(session, "clear")
-        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+        result = subprocess.run(self.assign_command(session, "--phase", "3"),
                                 capture_output=True, text=True, check=False, env=environment,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -186,7 +240,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
     def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-refused")
         environment, calls = self.claim_fixture(session, "blocked")
-        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+        result = subprocess.run(self.assign_command(session, "--phase", "3"),
                                 capture_output=True, text=True, check=False, env=environment,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -198,7 +252,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
     def test_unreadable_ledger_allows_the_worker_with_the_claim_pending(self) -> None:
         session = self.start_phase("claim-unreadable")
         environment, calls = self.claim_fixture(session, "ledger_unreadable")
-        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+        result = subprocess.run(self.assign_command(session, "--phase", "3"),
                                 capture_output=True, text=True, check=False, env=environment,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -228,6 +282,6 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         _ = registry.write_text("invalid configuration\n")
         before = (session / "progress_history_state.json").read_bytes()
         result = self.checked_launch(session)
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual((session / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.launch_records(session, "pass_started"), [])

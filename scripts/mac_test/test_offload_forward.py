@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, cast
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import offload
-from offload_test_support import HANA, OffloadCommandFixture
+from scripts.mac_test import offload
+from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -62,7 +62,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assert_wire("passed", "")
 
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
-        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",))
+        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = offload.read_config(self.config_path)
         expected = (
             'cd .local/state/mac-test/mirror/hana && PATH="$HOME/.cargo/bin:$PATH" '

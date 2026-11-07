@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Deterministic candidate enumeration for style-eval units.
 
 A guideline that admits mechanical enumeration declares a `candidates:` block

@@ -923,7 +923,8 @@ class CheckpointDocGateTests(unittest.TestCase):
 
     def test_verify_header_describes_the_stable_locked_checkout(self) -> None:
         header = HOOK.parents[1].joinpath("direct/verify.sh").read_text(encoding="utf-8").split("set -", 1)[0]
-        self.assertIn("stable, locked checkout under the repo's target directory", header)
+        self.assertIn("`copies.py hold` locks a standing checkout under the configured copies root.", header)
+        self.assertIn("Fill that checkout from the staged index. Exclude unstaged and untracked files.", header)
         self.assertNotIn("checked out in a temporary directory under /tmp", header)
 
     def test_message_file_after_another_command_cannot_hide_a_checkpoint(self) -> None:
