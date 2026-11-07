@@ -14,6 +14,7 @@ from typing import NoReturn, TypedDict, cast
 
 from scripts.direct import claude_worker, phase_reservation, worker_state
 from scripts.lib import models_registry
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import session_staff, staff, worker_admission
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -153,6 +154,24 @@ def run(launch: ClaudeLaunch) -> int:
             _ = signal.signal(sig, handler)
 
 
+def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
+                slot: str, env: dict[str, str]) -> bool:
+    """Claim the phase files before the worker opens."""
+    if phase:
+        with log.open("a") as output:
+            reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
+                "--session-dir", str(run), "--phase", phase, "--repo", str(cwd)],
+                env=env, stdout=output, stderr=subprocess.STDOUT)
+        if reserved.returncode:
+            print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
+            write_text_atomic(status, "error\n")
+            _ = subprocess.run(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
+                f"launcher: phase {phase} could not claim its files; its worker did not open"],
+                env=env, text=True, check=False)
+            return False
+    return True
+
+
 def _run(launch: ClaudeLaunch) -> int:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", launch.slot):
         print(f"ERROR: team_role must be alphanumeric/_- and 1-32 chars; got '{launch.slot}'.", file=sys.stderr)
@@ -202,16 +221,8 @@ def _run(launch: ClaudeLaunch) -> int:
         worker = NewClaudeWorker()
     if isinstance(worker, ClaudeFollowUp):
         _claim(launch, name, env)
-    if launch.phase:
-        with log.open("a") as output:
-            reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
-                "--session-dir", str(launch.run), "--phase", launch.phase, "--repo", str(launch.cwd)],
-                env=env, stdout=output, stderr=subprocess.STDOUT)
-        if reserved.returncode:
-            print(f"ERROR: phase {launch.phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
-            _ = status.write_text("error\n")
-            board("blocked", f"launcher: phase {launch.phase} could not claim its files; its worker did not open")
-            return 1
+    if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
+        return 1
     _ = summary.write_text("")
     _ = status.write_text("implementing\n")
     _ = (directory / f"impl_agent_{launch.slot}").write_text(
