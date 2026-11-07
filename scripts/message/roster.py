@@ -1265,7 +1265,11 @@ def _unit_workers(
         except (OSError, ValueError) as error:
             _problem(problems, f"worker transport {run.path}", error)
         server_homes = _run_server_homes(run)
-        place = _run_place(run, claude_entries, production_places, membership)
+        try:
+            place = _run_place(run, claude_entries, production_places, membership)
+        except staff.StaffUnreadable as error:
+            _problem(problems, str(run.path), error)
+            continue
         for name, record in sorted(_mesh_records(run, problems).items()):
             if not _listed_mesh_worker(record):
                 continue
