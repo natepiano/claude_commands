@@ -40,6 +40,14 @@ from test_pane_restore import FakeClient
 from test_support import conversation_liveness
 
 
+_REAL_CONFIRM_MOVE_START = stop_resume._confirm_move_start  # pyright: ignore[reportPrivateUsage]
+_REAL_TELL = showrunners.tell
+
+
+def confirmed_fixture_move(result: stop_resume.ClaudeUp, _requester: str, _why: str) -> stop_resume.ClaudeUp:
+    return result
+
+
 class ResumeClock(local):
     elapsed: float = 0.0
 
@@ -447,6 +455,7 @@ class StopResumeTests(unittest.TestCase):
         self.start = Mock(return_value="")
         self.seed = Mock(return_value=0)
         self.detach = Mock()
+        self.confirm = Mock(side_effect=confirmed_fixture_move)
         self.real_detach = stop_resume._detach  # pyright: ignore[reportPrivateUsage]
         self.clock = ResumeClock()
         self.launched: set[str] = set()
@@ -499,6 +508,11 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
+        _ = self.enterContext(patch.object(stop_resume, "_confirm_move_start", self.confirm))
+        import quota_alert
+        _ = self.enterContext(patch.object(quota_alert, "tell_user"))
+        _ = self.enterContext(patch.object(showrunners, "tell", return_value="fixture report"))
+
 
     def process_account(self, _pid: int) -> account.ConfiguredClaudeFolder:
         return account.ConfiguredClaudeFolder(self.root / (".claude4" if self.launched else ".claude3"))
@@ -1039,6 +1053,9 @@ class StopResumeTests(unittest.TestCase):
         assert isinstance(pending, stop_resume.ResumePending)
         self.assertEqual(accounts.move_result_line(pending),
                          "019b3a40-4250-7000-8000-000000000102: stopped, resume pending on claude4: registry temporarily unreadable")
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
+        self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
         self.start.side_effect = None
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
                          stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
@@ -1051,7 +1068,8 @@ class StopResumeTests(unittest.TestCase):
                              stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
         self.start.assert_not_called()
         self.seed.assert_not_called()
-        self.detach.assert_called_once()  # Only the successful resume's stay check, never a rerun handoff.
+        self.confirm.assert_called_once()
+        self.detach.assert_not_called()
         self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
 
 
@@ -1800,7 +1818,8 @@ class StopResumeTests(unittest.TestCase):
         import quota_alert
         self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1"
         pane_record.write("agents", self.entry)
-        with (patch.object(showrunners, "current_address", return_value="session:requester"),
+        with (patch.object(showrunners, "tell", _REAL_TELL),
+              patch.object(showrunners, "current_address", return_value="session:requester"),
               patch.object(showrunners, "send_to_address", return_value=showrunners.NoticeDelivery(("told requester",))) as send,
               patch.object(quota_alert, "tell_user") as push):
             result, log = self.run_stay_child(requester="requester")
@@ -1879,15 +1898,16 @@ class StopResumeTests(unittest.TestCase):
             broadcast.assert_not_called()
             push.assert_called_once()
 
-    def test_detached_self_move_keeps_the_requester_for_its_stay_child(self) -> None:
+    def test_detached_move_keeps_the_requester_for_its_stay_observation(self) -> None:
         log = self.root / "requested-batch.log"
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-requester"}):
             result = stop_resume.main(["batch", "--requester", "requester", "--target", "claude4",
                                        "--why", "limit", "--log", str(log), "alpha"])
             self.assertEqual(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "")
         self.assertEqual(result, 0)
-        arguments = cast(list[str], self.detach.call_args.args[0])
-        self.assertEqual(arguments[arguments.index("--requester") + 1], "requester")
+        self.confirm.assert_called_once_with(stop_resume.ClaudeUp(self.entry["session_id"], "w1:p2", "claude4"),
+                                             "requester", "limit")
+        self.detach.assert_not_called()
 
     def test_saved_entry_finds_an_unlabelled_pane_with_empty_or_stale_herdr_id(self) -> None:
         self.client.rows[0]["label"] = None
@@ -1961,6 +1981,82 @@ class StopResumeTests(unittest.TestCase):
         self.start.side_effect = herdr.HerdrFailure("pane run refused")
         self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "pane run refused"))
         self.assertEqual(self.client.closed, [])
+
+    def test_move_records_the_callers_process_account_instead_of_a_stale_source(self) -> None:
+        identity = self.entry["session_id"]
+        up = stop_resume.ClaudeUp(identity, "w1:p2", "claude4")
+        with (patch.object(stop_resume, "running_on_account", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude3")),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)),
+              patch.object(stop_resume, "resume", return_value=up) as resume,
+              patch.object(stop_resume, "_confirm_move_start", _REAL_CONFIRM_MOVE_START),
+              patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(456)),
+              patch.object(stop_resume, "_same_process", return_value=True)):
+            self.assertEqual(stop_resume.move_sessions([identity], "claude4", why="auto: head", cause="auto",
+                source_accounts={identity: "claude1"}), [up])
+        request = moves.read_moves()[0]
+        assert request["kind"] == "requested"
+        self.assertEqual((request["from"], request["to"]), ("claude1", "claude4"))
+        resume.assert_called_once_with(identity, why="auto: head", to="claude4")
+
+    def test_move_records_and_reports_an_immediate_resume_exit(self) -> None:
+        identity = self.entry["session_id"]
+        up = stop_resume.ClaudeUp(identity, "w1:p2", "claude4")
+        with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)),
+              patch.object(stop_resume, "resume", return_value=up),
+              patch.object(stop_resume, "_confirm_move_start", _REAL_CONFIRM_MOVE_START),
+              patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(456)),
+              patch.object(stop_resume, "_same_process", return_value=False),
+              patch.object(showrunners, "tell", return_value="told director") as tell):
+            result = stop_resume.move_sessions([identity], "claude4", why="auto: head", requester="director")
+        self.assertIsInstance(result[0], stop_resume.ResumePending)
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
+        failed = entries[-1]
+        assert failed["kind"] == "failed"
+        self.assertIn("stopped 0.0 s after its move or resume to claude4", failed["reason"])
+        tell.assert_called_once()
+        self.assertEqual(tell.call_args.args[0], "director")
+        self.assertIn("claude4", str(cast(object, tell.call_args.args[2])))
+
+    def test_move_records_and_reports_a_resume_failure(self) -> None:
+        identity = self.entry["session_id"]
+        with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)),
+              patch.object(stop_resume, "resume", return_value=stop_resume.ResumeFailed(identity, "launch failed")),
+              patch.object(showrunners, "tell", return_value="told director") as tell):
+            result = stop_resume.move_sessions([identity], "claude4", why="auto: head", requester="director")
+        self.assertIsInstance(result[0], stop_resume.ResumePending)
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
+        failed = entries[-1]
+        assert failed["kind"] == "failed"
+        self.assertEqual(failed["reason"], "launch failed")
+        tell.assert_called_once()
+        self.assertIn("resume on claude4 failed: launch failed", str(cast(object, tell.call_args.args[2])))
+
+    def test_each_stopped_unit_gets_the_target_or_a_reported_failed_outcome(self) -> None:
+        names = ["devtools", "fix-rounds", "style", "verify", "natest", "queue"]
+
+        def stop_unit(identity: str) -> stop_resume.Stopped:
+            return stop_resume.Stopped(identity, 123)
+
+        def resume_unit(identity: str, *, why: str, to: str, requester: str) -> stop_resume.ResumeFailed:
+            self.assertEqual((why, to, requester), ("auto: head", "claude5", "director"))
+            return stop_resume.ResumeFailed(identity, "session did not start")
+
+        with (patch.object(stop_resume, "_stop", side_effect=stop_unit),
+              patch.object(stop_resume, "resume", side_effect=resume_unit) as resumed,
+              patch.object(showrunners, "tell", return_value="fixture report") as tell):
+            results = stop_resume.move_sessions(names, "claude5", why="auto: head", requester="director", cause="auto")
+        self.assertEqual(resumed.call_count, len(names))
+        self.assertEqual(tell.call_count, len(names))
+        self.assertEqual(results, [stop_resume.ResumePending(name, "claude5", "session did not start") for name in names])
+        entries = moves.read_moves()
+        for name in names:
+            trail = [entry for entry in entries if entry["subject"] == name]
+            self.assertEqual([entry["kind"] for entry in trail], ["requested", "failed"])
+            self.assertEqual(trail[0]["move_id"], trail[1]["move_id"])
+        self.assertTrue(all("resume on claude5 failed" in str(cast(object, invocation.args[2]))
+                            for invocation in tell.call_args_list))
 
     def test_move_logs_the_live_source_and_final_account_with_its_cause(self) -> None:
         identity = self.entry["session_id"]

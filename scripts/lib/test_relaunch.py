@@ -172,6 +172,23 @@ class RelaunchTests(ShutdownTestCase):
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
+    def test_explicit_move_account_replaces_the_saved_launch_account(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.production import session_staff
+
+        entry = pane_record.launch("w1:p2", "session", str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2"), "ENABLE_TOOL_SEARCH": "true"}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p2", "RELAUNCH_PROMPT_DELIVERY": "pane",
+            "CLAUDE_CONFIG_DIR": str(self.root / ".claude5"),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / ".claude5/memory")}
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(session_staff, "record_membership", return_value=entry)):
+            _, restored = relaunch.restored_launch(["claude", "--resume", "session"], environment)
+        self.assertEqual(restored["CLAUDE_CONFIG_DIR"], environment["CLAUDE_CONFIG_DIR"])
+        self.assertEqual(restored["CLAUDE_CODE_REMOTE_MEMORY_DIR"], environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"])
+        self.assertEqual(restored["ENABLE_TOOL_SEARCH"], "true")
+
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
         from scripts.shutdown import pane_record
         from scripts.production import session_staff

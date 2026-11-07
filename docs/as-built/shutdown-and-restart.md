@@ -73,6 +73,13 @@ Handed-off callers and sessions already on the target write nothing.
 
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
+The notes timer delegates account moves to this detached batch before any stop.
+The supervisor needs a restart request; an exited child alone does not cause a restart.
+A saved launch keeps its conversation marks but cannot replace an explicit destination account.
+The batch includes the existing stay observation before it records a confirmed or failed move outcome.
+Each completed member records its outcome without waiting for other resumes.
+An early exit or failed resume uses the existing showrunner failure report.
+
 Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.

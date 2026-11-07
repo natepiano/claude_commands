@@ -538,6 +538,13 @@ A failed move keeps the entry queued and delays later entries.
 The watcher tells showrunners once when the failure reason changes.
 Automatic moves record cause `auto` and reason `auto: <id>` in the group history and the moves log.
 Each session attempt has its own `move_id`, with a request and one confirmed or failed outcome.
+The request uses the session process account as its source.
+Saved launch settings cannot replace the requested destination account.
+The notes timer delegates moves to a detached batch before it stops any session.
+The batch records each outcome when its resume and existing stay observation finish.
+A failed resume uses the existing move failure report to tell the showrunners.
+Blocked notices use the current queue head and target at delivery.
+Each notice addresses a session once, even when its name and ID both select it.
 
 A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest, else Claude.
 

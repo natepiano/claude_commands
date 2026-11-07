@@ -2033,7 +2033,8 @@ class AccountsTests(unittest.TestCase):
                 result = accounts.move(owner.session_id, "claude2", why="fixture move")
             self.assertIsInstance(result, accounts.MoveStarted)
             listing.assert_called_once_with()
-            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand")
+            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
+                                          source_accounts={owner.session_id: "claude1"} if live else {})
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
