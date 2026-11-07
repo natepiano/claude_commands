@@ -159,7 +159,7 @@ esac
         reader = self.root / "lint-config.sh"
         _ = reader.write_text('lint_config_enabled() { [ "$1" != sweep ]; }\n'
                               + 'lint_config_skip_notice() { :; }\n')
-        for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
+        for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup", "unit"):
             (self.root / name).mkdir()
         _ = (self.root / "Cargo.toml").write_text(
             '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n'
@@ -223,6 +223,9 @@ esac
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "ROSTER_RUN_ROOT": str(self.root / "unit"),
+            "UNIT_RUN_ROOT": str(self.root / "unit"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",

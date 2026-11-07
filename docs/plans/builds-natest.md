@@ -1606,7 +1606,7 @@ No code change. Both causes are named from evidence, and neither cause is in a t
 
 **Gotchas:** the Herdr tests own the waiting `start_command` behavior. They cover CLI completion, observation and deadline expiry, but not a `Popen` failure or `AgentExited`; the old add-unit tests did not force those cases either.
 
-### Phase 76 — Verify hold fixtures read their own run root  · status: todo
+### Phase 76 — Verify hold fixtures read their own run root  · status: done
 **Depends on:** none
 
 #### Work Order

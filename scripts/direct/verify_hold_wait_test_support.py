@@ -179,9 +179,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             if entry.name != "py":
                 (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
         builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "ROSTER_RUN_ROOT": str(builder.root / "unit"),
+            "UNIT_RUN_ROOT": str(builder.root / "unit"),
+            "SCRATCH_ROOT": str(builder.root / "scratch"),
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
