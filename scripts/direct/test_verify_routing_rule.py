@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-from scripts.build_targets import test_ssh_eligibility as eligibility_support
+from scripts.build_targets import build_targets, targets
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
+from scripts.direct.verify_mac_offload_test_support import (
+    CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
+)
+from scripts.direct.test_verify_result_environment import FIXED_ENVIRONMENT
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.direct.step_record import Pinned, ROUTED
-
-if TYPE_CHECKING:
-    from ..build_targets import build_targets, targets
-else:
-    build_targets = eligibility_support.build_targets
-    import targets
 
 
 class RoutingRuleTests(unittest.TestCase):
@@ -176,6 +176,111 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("binary: aws:/remote/cargo output/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
+
+
+class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        observe = f'''sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.mac_test import offload
+parsed = offload.parser().parse_args(namespace=offload.CliArguments())
+request = offload.request_from_arguments(parsed)
+config = offload.read_config(Path(parsed.settings))
+command = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as output:
+    output.write(json.dumps({{"verb": request.verb, "environment": dict(request.environment),
+                             "command": command, "copy": parsed.copy}}) + "\\n")
+'''
+        self.write_executable(self.runner, RUNNER_STUB.replace(
+            'arguments = sys.argv[1:]', observe + '\narguments = sys.argv[1:]', 1))
+        git = self.bin_directory / "git"
+        _ = git.write_text(git.read_text().replace("wanted=ls-files", "wanted=HEAD\n"
+            + "if has \"$@\"; then printf 'fixture-commit\\n'; exit 0; fi\nwanted=ls-files"))
+        self.environment.update({"NO_COLOR": "1", "RUST_LOG": "sample=trace",
+                                 **{name: "caller" for name in FIXED_ENVIRONMENT},
+                                 "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\n",
+                                 template="aws_target")
+        targets_file = self.root / "build_targets.conf"
+        _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
+            + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+
+    def assert_remote_environment(self, *, copied: bool) -> None:
+        rows = [cast(dict[str, object], json.loads(line))
+                for line in (self.runner_state / "remote-commands").read_text().splitlines()]
+        self.assertEqual([row["verb"] for row in rows], ["nextest"] if copied else ["check", "nextest"])
+        if not copied:
+            self.assertEqual(rows[0]["environment"], {})
+        self.assertEqual(rows[-1]["copy"], copied)
+        environment = cast(dict[str, str], rows[-1]["environment"])
+        words = shlex.split(cast(str, rows[-1]["command"]))
+        for name, value in {"NO_COLOR": "1", "RUST_LOG": "sample=trace", **FIXED_ENVIRONMENT}.items():
+            self.assertEqual(environment[name], value)
+            self.assertIn(name + "=" + value, words)
+            self.assertNotIn(name + "=caller", words)
+            if not copied:
+                self.assertNotIn(name + "=" + value, shlex.split(cast(str, rows[0]["command"])))
+
+    def test_pinned_final_forwards_the_test_environment_only_to_remote_nextest(self) -> None:
+        for target in ("mac", "peer"):
+            with self.subTest(target=target):
+                (self.runner_state / "remote-commands").unlink(missing_ok=True)
+                result = self.verify("final", "sample", "--target", target)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_remote_environment(copied=False)
+
+    def test_unpinned_final_runner_calls_forward_the_environment_only_to_nextest(self) -> None:
+        values = {"NO_COLOR": "1", "RUST_LOG": "sample=trace", **FIXED_ENVIRONMENT}
+        entries = " ".join(shlex.quote(name + "=" + value) for name, value in values.items())
+        for target, platform, settings in (("mac", "macos", self.environment["MAC_TEST_CONFIG"]),
+                                           ("peer", "linux", str(self.root / "linux.conf"))):
+            with self.subTest(target=target):
+                (self.runner_state / "remote-commands").unlink(missing_ok=True)
+                # Unpinned final stays local. Call its remote boundary without changing that rule.
+                result = self.call_mac_functions('CMD=final MAC_FINISH_CALL=0 CACHE_DIR=""\n'
+                    + f'VERIFY_TEST_ENVIRONMENT=({entries})\n'
+                    + '"$PY" "$BUILD_TARGETS_SCRIPT" eligible --kind final --repo-root "$PACKAGE_ROOT" '
+                    + '--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds" >/dev/null\n'
+                    + f'STEP_TARGET_TABLE=$(printf "{target}\\teligible\\t-\\t%s\\t{platform}" "$MAC_TEST_CONFIG")\n'
+                    + 'MAC_VERB=check\ntry_mac_test "$MAC_TEST_CONFIG"\n'
+                    + 'MAC_VERB=nextest\ntry_mac_test "$MAC_TEST_CONFIG"\n',
+                    extra={"MAC_TEST_CONFIG": settings})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_remote_environment(copied=False)
+
+    def test_final_exports_the_test_environment_to_a_copy_runner(self) -> None:
+        # The Cargo consumer starts a real copy runner with the final step's environment.
+        copy = f'''    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+    from scripts.mac_test import copy_watch
+    request = copy_watch.WatchRequest(
+        info=root / "info", result=root / "copy-result",
+        runner=Path(os.environ["VERIFY_MAC_RUNNER"]),
+        settings=Path(os.environ["MAC_TEST_CONFIG"]),
+        repo_root=Path(os.environ["PACKAGE_ROOT"]), package="sample",
+        call_id=os.environ["BUILDLOG_CALL_ID"], call_started=0,
+        filter_run=False, nextest_words=tuple(arguments[2:]))
+    running = copy_watch.start_copy(request, root / "copy-result")
+    raise SystemExit(running.process.wait())
+'''
+        source = CARGO_STUB.replace('if arguments[:1] == ["metadata"]:',
+            'root = Path(os.environ["TEST_RUNNER_STATE"])\n'
+            + 'if arguments[:1] == ["check"]:\n'
+            + '    (root / "check-environment").write_text(json.dumps(dict(os.environ)))\n'
+            + 'if arguments[:1] == ["metadata"]:', 1)
+        source = source.replace('if arguments[:2] == ["nextest", "run"]:\n',
+                                'if arguments[:2] == ["nextest", "run"]:\n' + copy, 1)
+        self.write_executable(self.bin_directory / "cargo", source)
+        for flags in ((), ("--target", "natedev")):
+            with self.subTest(flags=flags):
+                (self.runner_state / "remote-commands").unlink(missing_ok=True)
+                result = self.verify("final", "sample", *flags,
+                                     extra={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_remote_environment(copied=True)
+                checked = cast(dict[str, str], json.loads((self.runner_state / "check-environment").read_text()))
+                self.assertEqual({name: checked[name] for name in FIXED_ENVIRONMENT},
+                                 {name: "caller" for name in FIXED_ENVIRONMENT})
 
 
 class PinnedLintTests(VerifyStepRoutesFixture):

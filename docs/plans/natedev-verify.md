@@ -1337,7 +1337,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Gotchas:** a tree's `verify.sh` sources the installed `memory_gate.sh`, which sets `BUILD_TARGETS_SCRIPT` to the installed copy and refuses an override, so a tree cannot run its own routing for real. The Mac accepts only repositories that `mac_test.conf` lists with `linux_only.<repo>` (hana, cargo-liner).
 
-### Phase 41m — One tree holds the routing rule and the work of Phases 41i to 41l  · status: todo
+### Phase 41m — One tree holds the routing rule and the work of Phases 41i to 41l  · status: done
 
 **Depends on:** Phase 41h, and Phases 41i, 41j, 41k and 41l (branch `verify-env`, 7eaa9db49). Both branches are this unit's own.
 
@@ -1354,11 +1354,14 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 1. Resolve each conflict of the `verify-env` merge hunk by hunk. Keep the routing rule and `AnyTarget` (41h), the renewer trap `kill $(jobs -p)` then `wait` and the result environment (41i), descriptor 9 for `MAC_LOG_FILE` (41j), the disk probe fixtures (41k), and the waiter-age filter in `mac_idle.py` (41l).
 2. Each runner start that Phase 41h added or moved (`check`, `doc`, `example`, the `lint` judgment, `build` and `final`, on the Mac and on a Linux target) opens after the parent opens descriptor 9, and both tee processes append through `/dev/fd/9`. Each removal of the log closes descriptor 9.
 3. A remote nextest step of `final`, pinned or unpinned, carries the fixed values and the result variables that Phase 41i sets for `test` (`verify.sh`, near the `CMD == test` branch). A step that is not nextest carries none.
+4. `test_verify_routing_rule.py` imports `build_targets` and `targets` by package name only. Today its bare `import targets` makes a second `LocalRequired` class, so each `--local` subtest fails on the `1cff2c4fd` tree (the merge gate of 2026-11-07).
+5. `scripts/buildlog/record.py` imports `step_record` inside the function that uses it, not at module top. The top-level import that Phase 41h added loads `tempfile`, and `test_step_row.py` fails on it.
 
 **Files:**
 - `scripts/direct/verify.sh`
 - `scripts/mac_test/linux_runner.py`
 - `scripts/buildlog/test_mac_idle.py`
+- `scripts/buildlog/record.py`
 - `scripts/direct/test_verify_routing_rule.py`
 - `scripts/direct/test_verify_mac_signal_boundaries.py`
 
@@ -1374,5 +1377,5 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - No conflict marker remains.
 - For each runner start that Phase 41h added or moved, a stop leaves no Mac log file. Show it for `check` and `build` in `test_verify_mac_signal_boundaries.py`.
 - A pinned and an unpinned `final` on a fake Mac, a fake SSH and a copy route show the fixed values and the result variables in the remote nextest command, and none in the `check` step, in `test_verify_routing_rule.py`.
-- `test_verify_routing_rule.py`, `test_verify_result_environment.py`, `test_verify_token_reclaim.py`, `test_verify_tree_cancel_reacquire.py`, `test_verify_build_key.py`, `test_verify_mac_signal_boundaries.py`, `test_verify_mac_only.py`, `test_linux_runner.py`, `test_offload.py`, `test_offload_forward.py` and `test_mac_idle.py` pass, each run alone.
+- `test_verify_routing_rule.py`, `test_verify_result_environment.py`, `test_verify_token_reclaim.py`, `test_verify_tree_cancel_reacquire.py`, `test_verify_build_key.py`, `test_verify_mac_signal_boundaries.py`, `test_verify_mac_only.py`, `test_linux_runner.py`, `test_offload.py`, `test_offload_forward.py`, `test_mac_idle.py`, `test_step_row.py` and `test_record.py` pass, each run alone.
 - basedpyright 0/0/0 on the changed Python files. The merge gate `--tests-only` is green on the merged tree.

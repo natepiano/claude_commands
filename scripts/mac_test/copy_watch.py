@@ -346,6 +346,8 @@ def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     ]
     if request.filter_run:
         command.append("--filter-run")
+    for name in os.environ.get("VERIFY_TEST_ENV_NAMES", "").split():
+        command.extend(("--env", name))
     command += ["--", *request.nextest_words]
     return RunningCopy(subprocess.Popen(command, stdin=subprocess.DEVNULL), result, time.monotonic())
 

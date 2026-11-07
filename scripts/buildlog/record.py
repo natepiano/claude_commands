@@ -90,7 +90,6 @@ from scripts.buildlog.repository import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.direct.step_record import NamedPackage, WorkspacePackages
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
@@ -1117,6 +1116,8 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
 
 
 def call(args: list[str]) -> None:
+    from scripts.direct.step_record import NamedPackage, WorkspacePackages
+
     outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
     words = args[9:]
     package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")

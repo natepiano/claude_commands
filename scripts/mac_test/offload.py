@@ -33,6 +33,7 @@ from urllib.parse import quote
 from scripts.mac_test import cargo_manifest
 from scripts.build_hold import build_hold, override_guard
 from scripts.copies import copies
+from scripts.direct import result_environment
 from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.buildlog import treekey
@@ -1577,6 +1578,8 @@ def remote_test_command(
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
+    clear_environment = (result_environment.read_policy().clear_remote_environment()
+                         if request.verb == "nextest" and request.environment else "")
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
         from scripts.mac_test import linux_runner
         words = request.nextest_words
@@ -1585,7 +1588,7 @@ def remote_test_command(
             {**runner_values(config, request.target), "step_kind": request.kind or verb_kind(request.verb)},
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
-            repository.key,
+            repository.key, request.environment, clear_environment,
         )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -1618,9 +1621,10 @@ def remote_test_command(
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
+    clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{environment}"
+        f"{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -2390,8 +2394,10 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     cli = parser()
     arguments = cli.parse_args(namespace=CliArguments())
-    if (arguments.environment or arguments.fetch is not None) and (arguments.verb != "nextest" or arguments.copy):
-        cli.error("--env and --fetch apply only to non-copy nextest runs")
+    if arguments.environment and arguments.verb != "nextest":
+        cli.error("--env applies only to nextest runs")
+    if arguments.fetch is not None and (arguments.verb != "nextest" or arguments.copy):
+        cli.error("--fetch applies only to non-copy nextest runs")
     for name in arguments.environment:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             cli.error(f"--env {name}: not a variable name")

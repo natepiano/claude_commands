@@ -72,6 +72,8 @@
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
 # In that session, reuse a pass only when the tree and inputs still match.
 # Filtered runs have separate results. Failed tests always run again.
+# Test keys include configured result variables and each --env value.
+# Tests use fixed terminal values from direct.conf on every target.
 # --no-cache ignores saved results. --target also ignores saved results.
 # End help.
 #
@@ -193,6 +195,9 @@
 # Test keys cover package inputs. Lint keys include tool and policy versions.
 # Keys include arguments, rustc -vV, lint.conf, verify.sh and invoke.sh.
 # Keys also include the RUST*, CARGO_* and NEXTEST_* environment variables.
+# Test keys also include the result environment selected in direct.conf.
+# Fixed terminal values replace caller values locally and on remote targets.
+# New result inputs and --env values do not change the build key.
 # Lint keys include mend, nightly rustfmt, Clippy and Taplo versions.
 # Filter keys sort names and remove duplicate names.
 # Do not cache usage errors, sandbox failures or killed runs.
@@ -699,7 +704,7 @@ run_step() {
         export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     fi
     RUN_LAST_ATTEMPT_KILLED=0
-    step_log="$(mktemp)"
+    step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     for attempt in 1 2; do
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
         if buildlog_step_compiles "$@"; then
@@ -826,11 +831,18 @@ try:
     if not isinstance(features, list) or any(not isinstance(name, str) for name in features):
         raise ValueError("expected a list of strings")
 except FileNotFoundError:
-    sys.exit(0)
+    features = []
 except (OSError, ValueError):
     print("verify.sh: workspace.metadata.dev.features must be a list of strings", file=sys.stderr)
     sys.exit(2)
 print(",".join(features))
+if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
+    sys.path.insert(0, str(Path(sys.argv[3]).resolve().parents[2]))
+    from scripts.direct.result_environment import read_policy
+    policy = read_policy()
+    print(" ".join(policy.forwarded_names))
+    print(" ".join(policy.prefixes))
+    print(" ".join(name + "=" + value for name, value in policy.fixed))
 '
 
 # Workspace members with a file that differs from HEAD: staged, unstaged,
@@ -1302,7 +1314,34 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; final_pass_finish "$final_status"; exit "$final_status"' EXIT
 fi
-DEV_FEATURES="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
+VERIFY_SETUP="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD" "$VERIFY_START_DIR/result_environment.py")" || exit 2
+DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
+VERIFY_TEST_ENVIRONMENT=()
+VERIFY_USER_ENVIRONMENT=( ${VERIFY_MAC_ENVIRONMENT[@]+"${VERIFY_MAC_ENVIRONMENT[@]}"} )
+if [[ "$CMD" == test || "$CMD" == final ]]; then
+    {
+        IFS= read -r VERIFY_RESULT_ENV_NAMES || true
+        IFS= read -r VERIFY_RESULT_ENV_PREFIXES || true
+        IFS= read -r VERIFY_TEST_FIXED_ENV || true
+    } <<< "${VERIFY_SETUP#*$'\n'}"
+    for VERIFY_ENV_ENTRY in "${VERIFY_CALL_ENVIRONMENT[@]}"; do
+        VERIFY_ENV_NAME=${VERIFY_ENV_ENTRY%%=*}
+        VERIFY_ENV_SELECTED=0
+        for VERIFY_ENV_MATCH in $VERIFY_RESULT_ENV_NAMES; do
+            if [[ "$VERIFY_ENV_NAME" == "$VERIFY_ENV_MATCH" ]]; then VERIFY_ENV_SELECTED=1; fi
+        done
+        for VERIFY_ENV_MATCH in $VERIFY_RESULT_ENV_PREFIXES; do
+            if [[ "$VERIFY_ENV_NAME" == "$VERIFY_ENV_MATCH"* ]]; then VERIFY_ENV_SELECTED=1; fi
+        done
+        if [[ "$VERIFY_ENV_SELECTED" == 1 ]]; then VERIFY_TEST_ENVIRONMENT+=("$VERIFY_ENV_ENTRY"); fi
+    done
+    for VERIFY_ENV_ENTRY in $VERIFY_TEST_FIXED_ENV; do
+        VERIFY_TEST_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+    done
+fi
+if [[ "$CMD" == test ]]; then
+    for VERIFY_ENV_ENTRY in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do export "$VERIFY_ENV_ENTRY"; done
+fi
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
 else
@@ -1424,6 +1463,13 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
 if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
+if [[ "$CMD" == test ]]; then
+    for VERIFY_ENV_ENTRY in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do
+        MAC_ENV_NAMES+=("${VERIFY_ENV_ENTRY%%=*}")
+        VERIFY_MAC_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+    done
+    export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
+fi
 RUN_LOG=""
 RUN_LOG_PIDS=()
 VERDICT_KEY=""
@@ -1487,14 +1533,19 @@ tree_key() {
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
     if [[ "$CMD" == test ]]; then
+        for name in ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}; do
+            words+=(--env "${name%%=*}")
+        done
         # Keyed on the package's own build, read from the call's metadata.
         if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi
     fi
     if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
         key_options+=(--without-lint-versions)
     fi
+    VERIFY_RESULT_ENVIRONMENT_FD=3 \
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
+        3< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}) \
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
@@ -1548,6 +1599,7 @@ cancel_tree_run() {
     if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
         rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
     fi
+    exec 9>&-
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
     local changed_path=""
@@ -1751,6 +1803,7 @@ forward_mac_runner_signal() {
         fi
     fi
     if [[ -n "$MAC_LOG_FILE" ]]; then
+        exec 9>&-
         rm -f "$MAC_LOG_FILE"
     fi
     note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
@@ -1801,6 +1854,14 @@ try_mac_test() {
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
     fi
+    local MAC_ENV_NAMES=( ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"} )
+    local VERIFY_MAC_ENVIRONMENT=( ${VERIFY_MAC_ENVIRONMENT[@]+"${VERIFY_MAC_ENVIRONMENT[@]}"} )
+    if [[ "$CMD" == final && "$MAC_VERB" == nextest ]]; then
+        for name in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do
+            MAC_ENV_NAMES+=("${name%%=*}")
+            VERIFY_MAC_ENVIRONMENT+=("$name")
+        done
+    fi
     for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do runner_args+=(--env "$name"); done
     if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then runner_args+=(--fetch "$MAC_FETCH"); fi
     MAC_RESULT_FILE="$(mktemp)"
@@ -1824,6 +1885,8 @@ try_mac_test() {
         set_verdict_keys
     fi
     MAC_LOG_FILE="$(mktemp "$HOLD_WAIT_DIR/mac-output.XXXXXX")"
+    # Both tee processes inherit this descriptor before a signal removes the file.
+    exec 9>>"$MAC_LOG_FILE"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         step_state on_ssh "$selected_target"
     fi
@@ -1849,7 +1912,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         fi
         VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-    ) > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
+    ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
@@ -1899,6 +1962,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
         BUILDLOG_MAC_HOLDER=""
+        exec 9>&-
         rm -f "$MAC_LOG_FILE"
         MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
@@ -1923,6 +1987,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     case "$result_word" in
         declined|lost)
+            exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
@@ -1930,6 +1995,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed)
+            exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then return "$runner_status"; fi
@@ -1940,6 +2006,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
                 if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
                 printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
+                exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 note_event failed "$SECONDS" 0 "" 0 2
@@ -1947,6 +2014,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             fi
             MAC_PASSED=1
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then
+                exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 return 0
@@ -2776,6 +2844,7 @@ cache_record() {
 # seconds, what a reuse saves.
 record_mac_pass() {
     local log=$1 mac_seconds=${2%%.*}
+    exec 9>&-
     if [[ -z "${CACHE_DIR}" ]] || ! mkdir -p "${CACHE_DIR}"; then
         rm -f "$log" "${RUN_LOG}"
         RUN_LOG=""
@@ -3345,16 +3414,10 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
-        delay_pid=""
-        trap 'if [[ -n "$delay_pid" ]]; then
-            kill "$delay_pid" 2>/dev/null || true
-            wait "$delay_pid" 2>/dev/null || true
-        fi; exit 0' INT TERM HUP
+        trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP
         while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
             sleep "$TOKEN_RENEW_S" &
-            delay_pid=$!
-            wait "$delay_pid" || break
-            delay_pid=""
+            wait "$!" || break
             renew_token || break
         done
     ) &
@@ -3994,6 +4057,12 @@ clean_tree()
         run cargo check --workspace --all-targets "${FEATURE_FLAGS[@]}"
         FINAL_TEST_SELECTION=(--workspace --tests)
         if [[ -n "$VERIFY_PACKAGE" ]]; then FINAL_TEST_SELECTION+=(-E "package($VERIFY_PACKAGE)"); fi
+        VERIFY_TEST_ENV_NAMES=""
+        for VERIFY_ENV_ENTRY in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do
+            export "$VERIFY_ENV_ENTRY"
+            VERIFY_TEST_ENV_NAMES+="${VERIFY_TEST_ENV_NAMES:+ }${VERIFY_ENV_ENTRY%%=*}"
+        done
+        export VERIFY_TEST_ENV_NAMES
         run_nextest "${FINAL_TEST_SELECTION[@]}" "${FEATURE_FLAGS[@]}"
         ;;
     *)
