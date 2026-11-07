@@ -6411,17 +6411,16 @@ def command_end(args: argparse.Namespace) -> int:
     with unit_workers.ending_worker(Path(session_dir), target) as remember_end, worker_lifecycle.membership_operation(session_dir) as membership:
         with worker_lifecycle.lock_worker(session_dir, target):
             result = end_worker_locked(args)
-        if not result:
-            roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
-            entry = _as_dict(roster.get(target))
-            if entry.get("status") != "ended":
-                return result
-            remember_end()
-            if not entry.get("held_design_id"):
-                if all(_as_dict(worker).get("status") == "ended" for worker in roster.values()):
-                    with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
-                        with _bulk_workers(session_dir, deadline=deadline, membership=membership) as workers, _server_lock(session_dir, deadline=deadline):
-                            _reap_run_servers(session_dir, operation=workers)
+        roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+        entry = _as_dict(roster.get(target))
+        if entry.get("status") != "ended":
+            return result
+        remember_end()
+        if not entry.get("held_design_id"):
+            if all(_as_dict(worker).get("status") == "ended" for worker in roster.values()):
+                with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
+                    with _bulk_workers(session_dir, deadline=deadline, membership=membership) as workers, _server_lock(session_dir, deadline=deadline):
+                        _reap_run_servers(session_dir, operation=workers)
         return result
 
 

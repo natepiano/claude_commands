@@ -10628,10 +10628,15 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_a_second_end_retries_cleanup_on_the_ended_workers_thread(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
+        self.write_pool_roster({
+            "worker": self.worker_record(),
+            "peer": {"thread_id": fixture_runtime_id("end retry peer"), "status": "done"},
+        })
         self.read_failure = "error"
         code, output, errors = self.run_mesh(["end", "--to", "worker"])
         self.assertEqual(code, 1, output + errors)
         self.assertEqual(self.worker_record()["status"], "ended")
+        self.assertTrue((self.session_dir / codex_mesh.SERVER_FILE).exists())
         self.read_failure = ""
         self.live_turn = "unfinished-turn"
         code, output, errors = self.run_mesh(["end", "--to", "worker"])
@@ -10641,6 +10646,30 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(cast(dict[str, object], interrupt["params"]),
                          {"threadId": THREAD_ID, "turnId": "unfinished-turn"})
         self.assertEqual(session_staff.worker_session(self.stored_worker_record()), THREAD_ID)
+
+    def test_end_stops_the_last_workers_server_after_a_thread_read_refusal(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        row = session_staff.worker_row(self.worker_record())
+        assert row is not None
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        atomic_file.write_text_atomic(server, json.dumps({"port": self.server.port}))
+        self.read_failure = "error"
+        with owned_server_record(server) as process:
+            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            self.assertEqual(code, 1, output + errors)
+            self.assertIn("read refused", errors)
+            self.assertEqual(self.worker_record()["status"], "ended")
+            self.assertIn(f"stopped app-server {process.pid}", output)
+            self.assertIsNotNone(process.poll())
+            self.assertFalse(server.exists())
+            self.assertEqual(staff.by_id(row.id), row)
+
+            reads = len(self.methods("thread/read"))
+            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            self.assertEqual(code, 0, output + errors)
+            self.assertEqual(len(self.methods("thread/read")), reads)
+            self.assertFalse(server.exists())
+            self.assertEqual(staff.by_id(row.id), row)
 
     def test_end_stops_the_last_workers_server_and_keeps_the_staff_row(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
@@ -13950,7 +13979,10 @@ class GuardedWorkerEndTests(MeshCommandFixture):
         self.assertEqual(self.methods("turn/interrupt"), [])
 
     def test_retrying_end_finishes_queue_cleanup_after_its_budget_expires(self) -> None:
-        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl"}})
+        self.write_pool_roster({
+            "worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl"},
+            "peer": {"thread_id": fixture_runtime_id("queue cleanup peer"), "status": "done"},
+        })
         self.live_turn = "turn-before-end"
         self.queued = [{"id": "remaining-task", "input": [{"type": "text", "text": "must not open another turn"}]}]
         original_call = codex_mesh.Client.call
