@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import math
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -13,9 +12,6 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
@@ -24,8 +20,8 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.shutdown import pane_record
 from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-import herdr_tab_title  # noqa: E402
-from herdr_tab_title import StopPayload  # noqa: E402
+from scripts.hooks import herdr_tab_title  # noqa: E402
+from scripts.hooks.herdr_tab_title import StopPayload  # noqa: E402
 
 REAL_RETITLE = herdr.Herdr.retitle
 REAL_PANES = herdr.Herdr.panes

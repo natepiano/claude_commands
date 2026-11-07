@@ -45,11 +45,11 @@ from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
 import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
-import context_usage
+from scripts.hooks import context_usage
 from scripts.message import rca
 from scripts.production.cli_fixture import invoke_cli
 from test_showrunners import stalled_session_reader
-import unit_lookup
+from scripts.production import unit_lookup
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -761,7 +761,7 @@ always=natedev
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
         import stall_watch
         from scripts.production import showrunners
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         marked: dict[str, dict[str, lookup.LabeledSession]] = {}
         for production_name in ("first", "second"):

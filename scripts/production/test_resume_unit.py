@@ -27,7 +27,7 @@ import resume_unit
 from scripts.production import add_unit
 import retire_unit
 from scripts.message import sessions as retirement_sessions
-import unit_lookup
+from scripts.production import unit_lookup
 import unit_move
 import test_retire_unit
 from scripts.production.production_doc import Production, read_production

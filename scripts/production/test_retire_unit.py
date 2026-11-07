@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
 import retire_unit
-import unit_lookup
+from scripts.production import unit_lookup
 import unit_move
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Production, read_production

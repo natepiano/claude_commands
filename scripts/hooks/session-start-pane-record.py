@@ -14,11 +14,9 @@ except FileNotFoundError:
 import json
 import os
 import sys
-from pathlib import Path
 from typing import TypedDict, cast
 from collections.abc import Mapping
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.production import session_staff, staff  # noqa: E402
 from scripts.hooks import staff_session_identity  # noqa: E402

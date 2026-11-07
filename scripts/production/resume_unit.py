@@ -27,7 +27,7 @@ from scripts.message import sessions
 
 from scripts.production import add_unit
 import retire_unit
-import unit_lookup
+from scripts.production import unit_lookup
 import unit_names
 from scripts.shutdown import pane_record
 from scripts.production.production_doc import Production, Refusal
