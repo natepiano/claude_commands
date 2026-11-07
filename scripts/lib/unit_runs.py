@@ -36,7 +36,6 @@ if __name__ == "unit_runs":
 elif __name__ == "scripts.lib.unit_runs":
     _ = sys.modules.setdefault("unit_runs", sys.modules[__name__])
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from scripts.production import staff
 
@@ -91,9 +90,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
     identity = fields.get("main_agent")
     agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
     reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
     return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 
@@ -223,11 +220,7 @@ def marker_must_stay(path: Path) -> bool:
     The marker name is the session id; its age and target's existence say nothing
     about the owning process. Reuse the registry's process-identity check.
     """
-    if TYPE_CHECKING:
-        from ..message import sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from scripts.message import sessions
+    from scripts.message import sessions
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
@@ -425,11 +418,7 @@ def main(argv: list[str]) -> int:
         print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id> | worker-transport <run folder>",
               file=sys.stderr)
         return 2
-    if TYPE_CHECKING:
-        from ..message.sessions import running_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from scripts.message.sessions import running_sessions
+    from scripts.message.sessions import running_sessions
 
     return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
 

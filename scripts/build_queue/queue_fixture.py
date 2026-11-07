@@ -262,6 +262,7 @@ class QueueFixture(ExitStack):
 
     def __init__(self, *, captured: bool = True) -> None:
         super().__init__()
+        _ = self.enter_context(mock.patch.object(store, "host_name", return_value="fixture-host"))
         self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory()))
         self.directory: Path = self.root / "buildlog/admission"
         self.proc: Path = self.root / "proc"

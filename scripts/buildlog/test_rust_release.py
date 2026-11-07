@@ -13,23 +13,16 @@ import unittest
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from scripts.message import session_send
 from unittest import mock
 
 from scripts.buildlog import rust_release
-if TYPE_CHECKING:
-    from ..lib import cargo_output, scratch
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-    from ..notify import review
-    from ..notify.push_texts import RenderedPush, render, user_send_argv
-    from ..notify.user_action import ActionRequired
-else:
-    from scripts.lib import cargo_output, scratch
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-    from scripts.notify import review
-    from scripts.notify.push_texts import RenderedPush, render, user_send_argv
-    from scripts.notify.user_action import ActionRequired
+from scripts.lib import cargo_output, scratch
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.notify import review
+from scripts.notify.push_texts import RenderedPush, render, user_send_argv
+from scripts.notify.user_action import ActionRequired
 from scripts.buildlog.test_index import point_root_at
 
 
@@ -110,6 +103,7 @@ class RustReleaseTests(unittest.TestCase):
                           ("config", "user.email", "trial@example.invalid")):
             _ = subprocess.run(["git", "-C", str(source), *arguments], check=True, capture_output=True)
         _ = (source / ".gitignore").write_text("/target/\n/mend-target/\n/mend-root/\n")
+        _ = (source / "Cargo.toml").write_text("[workspace]\n")
         _ = subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(source), "commit", "-qm", "trial source"], check=True, capture_output=True)
         _ = self.enterContext(mock.patch.object(rust_release, "HANA", source))

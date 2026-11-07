@@ -154,7 +154,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoints = merged_checkpoints(production)
     checkpoint = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase}" if checkpoints else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with copies.standing(production.name, production.checkout, copies.CommittedSource(tip)) as checkout:
+    with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(tip)) as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
         settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):

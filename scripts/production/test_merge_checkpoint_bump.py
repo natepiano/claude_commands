@@ -7,12 +7,13 @@ import os
 import re
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import Literal, cast, final
 from unittest import mock
 
 from scripts.production import merge_checkpoint
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
+from scripts.production import staff
 from scripts.production.merge_checkpoint_test_support import (
     BumpGateObservation, MergeCheckpointFixture, STUB, configure_test_environment,
 )
@@ -59,6 +60,26 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         self.release_bump_gate()
         self.wait_bump_gate_exit(run)
         self.assertTrue((run.checkout / ".git").is_dir(), "the gate must retain its standing checkout")
+
+    def test_bump_without_a_build_cache_delivers_the_result_and_removes_its_copy(self) -> None:
+        self.prepare_bump_gate()
+        _ = self.git("rm", "Cargo.toml", cwd=self.unit)
+        checkpoint = self.checkpoint()
+        result = self.run_checkpoint(checkpoint, "--bump")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        tip = self.assert_pushed(checkpoint)
+        run, = self.wait_bump_gate_runs(1)
+        self.assertNotEqual(run.checkout, self.checkout)
+        self.assertTrue((run.checkout / ".git").is_dir())
+        self.assertEqual(run.head, tip)
+        self.release_bump_gate()
+        self.wait_bump_gate_exit(run)
+        self.assertFalse(run.checkout.exists())
+        self.assertEqual(self.bump_gate_record(tip)["result"], "green")
+        notice, = self.bump_notices()
+        self.assertEqual(self.notice_recipient(notice), "showrunner")
+        self.assertIn(tip, self.notice_text(notice))
+        self.assertNotIn(str(run.checkout), self.notice_text(notice))
 
     def test_red_gate_reports_both_recipients_after_the_merge_is_pushed(self) -> None:
         self.prepare_bump_gate(red=True)
@@ -182,6 +203,93 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         self.finish_gate(live)
         self.assertEqual(len(self.bump_notices()), 1)
         self.assertEqual(self.notice_recipient(self.bump_notices()[0]), "showrunner")
+
+    def test_a_pending_gate_runs_after_its_production_is_renamed(self) -> None:
+        self.prepare_bump_gate()
+        checkpoint = self.checkpoint()
+        result = self.run_checkpoint(checkpoint, "--bump")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        original, = self.wait_bump_gate_runs(1)
+        self.stop_bump_gate(original)
+        record = self.bump_gate_record(original.head)
+        self.assertEqual(record["result"], "pending")
+        owner = next(row for row in staff.local_snapshot().rows if row.kind == "showrunner" and row.name == "example")
+        self.assertEqual(record["owner_id"], str(owner.id))
+        _ = staff.rename(owner.id, "renamed-production")
+        self.move_bump_recipients()
+        resumed = self.launch_competing_bump_gate(original.head)
+        self.wait_competing_bump_gate(resumed)
+        runs = self.wait_bump_gate_runs(2)
+        current = next(run for run in runs if run != original)
+        self.assertEqual(current.head, original.head)
+        self.finish_gate(current)
+        self.assertEqual(self.bump_gate_record(original.head)["result"], "green")
+        self.assertEqual(record["name"], "example")
+        notice, = self.bump_notices()
+        self.assertEqual(self.notice_recipient(notice), "showrunner-moved")
+        self.assertEqual(notice[notice.index("--from") + 1], "renamed-production")
+
+    def assert_resumed_gate_delivery(self, renamed: Literal["unit", "showrunner"], *, red: bool) -> None:
+        self.prepare_bump_gate(red=red)
+        checkpoint = self.checkpoint()
+        result = self.run_checkpoint(checkpoint, "--bump")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        original, = self.wait_bump_gate_runs(1)
+        self.stop_bump_gate(original)
+        record = self.bump_gate_record(original.head)
+        self.assertEqual(record["result"], "pending")
+        members = staff.local_snapshot().rows_by_id
+        owner = members[staff.StaffId(cast(str, record["owner_id"]))]
+        unit = next(row for row in members.values() if row.kind == "unit" and row.name == "alpha"
+                    and row.reports_to(owner.id))
+        self.assertEqual(record["unit_id"], str(unit.id))
+        row = unit if renamed == "unit" else owner
+        _ = staff.rename(row.id, "renamed-" + renamed)
+        self.move_bump_recipients()
+        resumed = self.launch_competing_bump_gate(original.head)
+        self.wait_competing_bump_gate(resumed)
+        current = next(run for run in self.wait_bump_gate_runs(2) if run != original)
+        self.finish_gate(current)
+        self.assertEqual(self.bump_gate_record(original.head)["result"], "red" if red else "green")
+        notices = self.bump_notices()
+        self.assertEqual(len(notices), 2 if red else 1, notices)
+        self.assertEqual({self.notice_recipient(notice) for notice in notices},
+                         {"alpha-moved", "showrunner-moved"} if red else {"showrunner-moved"})
+        for notice in notices:
+            self.assertEqual(notice[notice.index("--from") + 1],
+                             "renamed-showrunner" if renamed == "showrunner" else "example")
+
+    def test_a_resumed_red_gate_notifies_current_sessions_after_a_production_rename(self) -> None:
+        self.assert_resumed_gate_delivery("showrunner", red=True)
+
+    def test_a_resumed_red_gate_notifies_current_sessions_after_a_unit_rename(self) -> None:
+        self.assert_resumed_gate_delivery("unit", red=True)
+
+    def test_a_resumed_green_gate_notifies_the_showrunner_after_a_unit_rename(self) -> None:
+        self.assert_resumed_gate_delivery("unit", red=False)
+
+    def test_a_pending_gate_runs_after_its_production_document_moves(self) -> None:
+        self.prepare_bump_gate()
+        checkpoint = self.checkpoint()
+        result = self.run_checkpoint(checkpoint, "--bump")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        original, = self.wait_bump_gate_runs(1)
+        self.stop_bump_gate(original)
+        record = self.bump_gate_record(original.head)
+        self.assertEqual(record["result"], "pending")
+        owner = next(row for row in staff.local_snapshot().rows if row.kind == "showrunner" and row.name == "example")
+        self.assertEqual(record["owner_id"], str(owner.id))
+        moved = self.doc.with_name("moved-production.md")
+        _ = self.doc.rename(moved)
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", moved))
+        resumed = self.launch_competing_bump_gate(original.head)
+        self.wait_competing_bump_gate(resumed)
+        runs = self.wait_bump_gate_runs(2)
+        current = next(run for run in runs if run != original)
+        self.assertEqual(current.head, original.head)
+        self.finish_gate(current)
+        self.assertEqual(self.bump_gate_record(original.head)["result"], "green")
+        self.assertEqual(record["production_doc"], str(self.doc))
 
     def test_bump_resumes_an_unpushed_merge_without_running_tests_first(self) -> None:
         self.prepare_bump_gate()
