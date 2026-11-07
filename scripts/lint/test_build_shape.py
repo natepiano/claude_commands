@@ -13,7 +13,7 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import final, override
 
-from build_shape import (AbsoluteRecordedRoot, CompileCountUnknown, CompiledCrates, NoBuildShape,
+from scripts.lint.build_shape import (AbsoluteRecordedRoot, CompileCountUnknown, CompiledCrates, NoBuildShape,
                          NoCratesCompiled, RecordedOutputPair, RecordedOutputRoots, RecordedRootsUnavailable,
                          RelativeRecordedRoot, StepEvidence, UnknownRecordedRoot, build_shape,
                          index_step_evidence, recorded_output_roots)

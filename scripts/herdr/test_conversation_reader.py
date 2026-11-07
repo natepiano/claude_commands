@@ -14,7 +14,7 @@ from unittest.mock import call, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import herdr
+from scripts.herdr import herdr
 from scripts.agents import codex_mesh
 from scripts.lib import unit_runs
 from scripts.lib import operation_deadline

@@ -30,16 +30,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.production import completion_receipt, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
-import herdr
+from scripts.herdr import herdr
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount

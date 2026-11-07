@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 SCRIPT = Path(__file__).with_name("exclude.sh")

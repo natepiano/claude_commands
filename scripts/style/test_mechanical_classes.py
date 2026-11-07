@@ -9,9 +9,9 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
-import mechanical_classes
-import style_footprint
-from approved_renames import BindingRename
+from scripts.style import mechanical_classes
+from scripts.style import style_footprint
+from scripts.style.approved_renames import BindingRename
 
 DOC = Path(__file__).resolve().parents[2] / "docs/style_production.md"
 ENTRY = 'name = "{name}"\nproof = "{proof}"\nrules = [{rules}]\nsummary = "{summary}"\n'

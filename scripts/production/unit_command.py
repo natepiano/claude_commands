@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.production import staff, unit_config
 from scripts.shutdown import remote
-import herdr
+from scripts.herdr import herdr
 
 
 NOT_APPLICABLE = "not applicable"

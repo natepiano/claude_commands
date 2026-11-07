@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """
 Bevy Dependency Compatibility Checker
 
@@ -23,9 +23,8 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
 
-import crates_io_pacer
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 class CrateVersion(TypedDict):

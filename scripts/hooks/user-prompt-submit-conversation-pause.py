@@ -30,7 +30,7 @@ class PromptPayload(TypedDict, total=False):
 def _record_typed_prompt() -> None:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-        import escalate
+        from scripts.message import escalate
 
         escalate.typed()
     except HookBudgetSpent:

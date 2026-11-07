@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
-from test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
-import remote
+from scripts.shutdown.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import remote
 
 
 class SshInvocation(TypedDict):

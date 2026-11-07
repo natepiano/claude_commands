@@ -61,7 +61,7 @@ def parse_arguments(main: Callable[[list[str]], int], arguments: list[str]) -> a
 @contextmanager
 def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     """Bind source readers to the same fixture paths for direct and CLI calls."""
-    import dailies_render
+    from scripts.production import dailies_render
     from scripts.production import showrunners
     from scripts.message import session_send
     from scripts.whoami import note_file
@@ -101,7 +101,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     # patch.object will then restore caller paths rather than fixture paths.
     if production_state:
         with patch.object(sys, "path", sys.path.copy()):
-            _ = import_module("dailies_render")
+            _ = import_module('scripts.production.dailies_render')
             _ = import_module("scripts.production.showrunners")
 
     before = vars(module).copy()

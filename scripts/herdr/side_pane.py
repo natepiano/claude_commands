@@ -11,12 +11,7 @@ from threading import Event
 from time import monotonic
 from typing import Literal, cast, final, get_args
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import herdr
-from scripts.herdr import worker_panes
+from scripts.herdr import herdr, worker_panes
 from scripts.lib import conf, models_registry, nix_env
 from scripts.production import staff
 from scripts.shutdown import stop_resume

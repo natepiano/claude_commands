@@ -8,7 +8,7 @@ from unittest.mock import patch
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
-import add_unit
+from scripts.production import add_unit
 from scripts.production.production_doc import read_production
 
 

@@ -16,15 +16,13 @@ from typing import cast, override
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.shutdown import pane_record, remote
-import herdr
+from scripts.herdr import herdr
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
 
@@ -637,7 +635,7 @@ class StaffSourcesTests(StaffTestCase):
                         self.assertEqual(grouped.units.get("sdlc", {}), {"models": marked})
 
     def test_current_session_parent_and_showrunner_follow_the_retained_launch_after_rename(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
         from scripts.production import session_staff
 
         parent, unit, _ = self.tree()

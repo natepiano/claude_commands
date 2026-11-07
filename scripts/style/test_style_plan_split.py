@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
 import re
 import signal
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -17,26 +16,24 @@ from contextlib import chdir, closing, nullcontext, redirect_stderr, redirect_st
 from datetime import UTC, datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import approved_renames
-import declarations
-import style_plan
+from scripts.style import approved_renames
+from scripts.style import declarations
+from scripts.style import style_plan
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
-import live_units
-import unit_plans
-import style_proposals
+from scripts.production import live_units
+from scripts.style import unit_plans
+from scripts.style import style_proposals
 
-import berth_board
-import rules
-import style_ledger
-import style_units
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production import style_units
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final

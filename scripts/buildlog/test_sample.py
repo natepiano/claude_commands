@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for fixture parsing and one isolated machine memory sample."""
 
 from __future__ import annotations
@@ -8,28 +8,21 @@ import os
 import re
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import cli
-import index
-import sample
-import store
-from cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
-from test_index import use_test_log
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import sample
+from scripts.buildlog import store
+from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
+from scripts.buildlog.test_index import use_test_log
+from scripts.lib import test_hang_guard
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 use_test_log()
 
@@ -83,8 +76,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(row["mem_used_bytes"], 12 * 1024)
 
     def test_default_filesystem_uses_resolved_intermediate_root(self) -> None:
-        import filesystem
-        from cargo_output import CargoOutputRoots
+        from scripts.buildlog import filesystem
+        from scripts.lib.cargo_output import CargoOutputRoots
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
@@ -100,14 +93,14 @@ class SampleTests(unittest.TestCase):
 
     def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
         command = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import sample; "
+            "import sys; from scripts.buildlog import sample; "
             "reading = sample.filesystem_reading(); "
             "assert reading['state'] == 'measured', reading; "
-            "assert 'disk' not in sys.modules, 'filesystem reading imported disk'; "
-            "assert 'sweep' not in sys.modules, 'filesystem reading imported sweep'"
+            "assert 'scripts.buildlog.disk' not in sys.modules, 'filesystem reading imported disk'; "
+            "assert 'scripts.buildlog.sweep' not in sys.modules, 'filesystem reading imported sweep'"
         )
         result = subprocess.run(
-            ["python3", "-c", command, str(CLI.parent)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command],
             cwd=CLI.parents[2],
             env={**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET_FILESYSTEM": str(self.root)},
             capture_output=True,
@@ -118,8 +111,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_failed_output_mapping_reports_unavailable(self) -> None:
-        import filesystem
-        from cargo_output import CargoOutputUnavailable
+        from scripts.buildlog import filesystem
+        from scripts.lib.cargo_output import CargoOutputUnavailable
 
         with patch.dict(os.environ, {}, clear=True), \
              patch.object(sample, "read_cargo_output_roots", return_value=CargoOutputUnavailable("no metadata")), \
@@ -152,7 +145,7 @@ class SampleTests(unittest.TestCase):
                 self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "unavailable"})
 
     def test_sample_shares_slice_capture_and_preserves_ci_when_builds_file_is_unreadable(self) -> None:
-        import cgroup_capture
+        from scripts.buildlog import cgroup_capture
 
         builds, ci = self.root / "builds.slice", self.root / "ci.slice"
         write_cgroup(builds, with_io=False)
@@ -171,7 +164,7 @@ class SampleTests(unittest.TestCase):
                                             "ci": {"state": "measured", "free_pool_tokens": 7}})
 
     def test_cli_sample_reads_each_slice_file_once(self) -> None:
-        import cgroup_capture
+        from scripts.buildlog import cgroup_capture
 
         builds, ci = self.root / "builds.slice", self.root / "ci.slice"
         write_cgroup(builds)
@@ -414,11 +407,11 @@ class SampleTests(unittest.TestCase):
         missing = self.root / "no-proc" / "meminfo"
         command = (
             "import sys; from pathlib import Path; "
-            "sys.path.insert(0, sys.argv[1]); import sample, cli; "
-            "sample.MEMINFO = Path(sys.argv[2]); sys.exit(cli.main(['sample']))"
+            "from scripts.buildlog import sample, cli; "
+            "sample.MEMINFO = Path(sys.argv[1]); sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(CLI.parent), str(missing)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(missing)],
             env={**os.environ, "BUILDLOG_DIR": str(self.root)},
             capture_output=True,
             text=True,
@@ -458,8 +451,8 @@ class SampleTests(unittest.TestCase):
         environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds),
                        "BUILDLOG_CI_CGROUP": str(ci), "BUILDLOG_ZRAM": str(zram)}
         command = (
-            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "import sample, cli; proc = Path(sys.argv[2]); "
+            "import sys; from pathlib import Path; "
+            "from scripts.buildlog import sample, cli; proc = Path(sys.argv[1]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
             "sample.BOOT_ID = proc / 'sys/kernel/random/boot_id'; "
             "from unittest.mock import patch; from contextlib import ExitStack; "
@@ -473,7 +466,7 @@ class SampleTests(unittest.TestCase):
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command, str(CLI.parent), str(proc)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(proc)],
             env=environment,
             capture_output=True,
             text=True,

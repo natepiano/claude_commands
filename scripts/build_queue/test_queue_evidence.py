@@ -32,7 +32,7 @@ from scripts.lint import memory_admit as gate
 if TYPE_CHECKING:
     from scripts.buildlog import store
 else:
-    import store
+    from scripts.buildlog import store
 
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
@@ -282,7 +282,7 @@ class QueueEvidenceTests(unittest.TestCase):
                           rule, gate.CappedAtBudget(30 * GIB, 19 * GIB)))
         zone = user_zone()
         with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
-             mock.patch("conf.read", side_effect=AssertionError("live configuration")):
+             mock.patch("scripts.lib.conf.read", side_effect=AssertionError("live configuration")):
             text = queue_evidence.need_text(source, zone=zone)
         for value in ("19.0 GiB", "30.0 GiB", "16.0 GiB", str(rule.factor), "14 days"):
             self.assertIn(value, text)

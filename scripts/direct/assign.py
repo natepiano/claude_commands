@@ -25,7 +25,7 @@ from scripts.astra import astra_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import phase_reservation, progress_history, simplify_daily, workers
+from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
@@ -751,8 +751,8 @@ def require_live_director() -> None:
 
 
 def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Path,
-                   env: dict[str, str]) -> int:
-    """Use the Claude launcher under the same assign parent."""
+                   env: dict[str, str], model: str, effort: str) -> int:
+    """Run the Claude pass inside the assign process."""
     options = ["--phase", phase]
     role = "impl" if args.role == "implement" else args.role
     slot = args.to or args.new_worker or role
@@ -761,17 +761,15 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
                             ("--style-until", args.style_until), ("--summary", args.summary)):
             if value:
                 options += [flag, value]
-        command = ["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
-                   "review", "review", "review", str(args.pass_number), args.lens, args.early_ready]
+        return subprocess.run(["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
+                   "review", "review", "review", str(args.pass_number), args.lens, args.early_ready],
+                   env=env, check=False).returncode
     else:
-        if args.to:
-            options += ["--to", args.to]
-        if args.fix_cause:
-            options += ["--fix-cause", args.fix_cause]
-        command = ["bash", str(SCRIPTS / "implement.sh"), *options, str(run), str(cwd), str(prompt),
-                   role, role, role, role, str(args.pass_number), slot]
-    result = subprocess.run(command, env=env, check=False).returncode
-    if args.summary and args.role != "review":
+        worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()
+        result = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot,
+            args.fix_cause, args.pass_number, model, effort, worker,
+            ("bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]), env))
+    if args.summary:
         artifact = run / "phases" / phase / f"impl_summary_{slot}.txt"
         if artifact.is_file():
             _ = Path(args.summary).write_text(artifact.read_text())
@@ -900,6 +898,61 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
     return result
 
 
+def recorded_passes(run: Path) -> list[dict[str, object]]:
+    state = read_object(run / unit_runs.STATE_FILE)
+    passes = [{**object_map(value), "team_slot": slot}
+              for slot, value in object_map(state.get("pass")).items()]
+    history = text(state.get("history_file"))
+    if history:
+        for line in Path(history).read_text().splitlines():
+            entry = object_map(cast(object, json.loads(line)))
+            if entry.get("event_type") in ("pass_started", "pass_finished"):
+                passes.append(entry)
+    return passes
+
+
+def pass_start_count(run: Path, slot: str) -> int:
+    return sum(entry.get("event_type") == "pass_started" and entry.get("team_slot") == slot
+               for entry in recorded_passes(run))
+
+
+def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
+    """End a sole failed dispatch without changing its exit code."""
+    try:
+        passes = recorded_passes(run)
+        if any(entry.get("status") == "completed" for entry in passes):
+            return
+        if any(entry.get("team_slot") != slot for entry in passes):
+            return
+        names = set(read_object(run / "mesh_roster.json"))
+        record = staff.local_snapshot()
+        for path in run.glob("impl_worker_*.json"):
+            row = record.by_id(staff.StaffId(text(read_object(path).get("staff_id"))))
+            if row is not None:
+                names.add(row.name)
+        if unit_runs.worker_transport(run) == "herdr":
+            parent = worker_admission.parent(record, run=run)
+            names.update(row.name for row in record.find(kind="worker", parent=parent.id))
+        own_names = {slot, *(text(entry.get("worker_name")) for entry in passes if entry.get("worker_name"))}
+        if names - own_names:
+            return
+        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), env.get("UNIT_ACTIVE_DIR"), record=record)
+        if {Path(folder).resolve() for folder in held} != {run}:
+            return
+        commands = ([PYTHON, PROGRESS, "finish-run", "--session-dir", str(run), "--status", "error"],
+                    ["bash", str(SCRIPTS / "end_session.sh")])
+        ended = True
+        for command in commands:
+            result = call(command, env, capture=True, check=False)
+            if result.returncode:
+                print(f"assign.sh: {failure_detail(result)}", file=sys.stderr)
+                ended = False
+        if ended:
+            print(f"assign.sh: run ended: {run}; its only worker failed at launch without a completed pass", file=sys.stderr)
+    except Exception as error:
+        print(f"assign.sh: unable to end failed run {run}: {error}", file=sys.stderr)
+
+
 def main() -> int:
     require_live_director()
     args = parse_arguments()
@@ -931,7 +984,10 @@ def main() -> int:
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
     if transport == "herdr":
-        return execute_herdr(args, run, phase, prompt, role, paths, env)
+        code = execute_herdr(args, run, phase, prompt, role, paths, env)
+        if code == 2:
+            end_failed_launch(run, args.to or args.new_worker or role, env)
+        return code
     family, model, effort, tier = resolve_model(args, role, env)
     worker = args.to
     reservation: dict[str, object] = {}
@@ -965,16 +1021,28 @@ def main() -> int:
     if family == "claude":
         if switches:
             args.to = worker
+        slot = ({"adversary": "test", "contract": "impl", "": ""}.get(args.lens, "review")
+                if args.role == "review" else worker)
+        started_before = pass_start_count(run, slot)
         try:
-            return execute_claude(args, run, phase, cwd, prompt, env)
+            code = execute_claude(args, run, phase, cwd, prompt, env, model, effort)
         finally:
             workers.release_allocation(run, worker, reservation)
+        try:
+            if code and pass_start_count(run, slot) > started_before:
+                end_failed_launch(run, slot, env)
+        except Exception as error:
+            print(f"assign.sh: unable to end failed run {run}: {error}", file=sys.stderr)
+        return code
     dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation,
                         switching=member if switches else None)
     try:
-        return execute(dispatch, paths)
+        code = execute(dispatch, paths)
     finally:
         dispatch.cleanup()
+    if code and dispatch.agent is not None and dispatch.agent.returncode:
+        end_failed_launch(run, worker, env)
+    return code
 
 
 if __name__ == "__main__":

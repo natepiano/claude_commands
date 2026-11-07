@@ -9,12 +9,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
+from scripts.style.git_process import GitExitAnswers, run_git
 
-from git_process import GitExitAnswers, run_git
-
-import style_ledger
+from scripts.style import style_ledger
 from scripts.production import session_staff, staff, unit_lookup
 
 

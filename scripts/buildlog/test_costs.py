@@ -16,13 +16,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import costs
-import index
-import moments
-import record
-import test_moments as fixtures
-from test_index import Record, call, ci_job, ci_run
-from test_holds import hold_event
+from scripts.buildlog import costs
+from scripts.buildlog import index
+from scripts.buildlog import moments
+from scripts.buildlog import record
+from scripts.buildlog import test_moments as fixtures
+from scripts.buildlog.test_index import Record, call, ci_job, ci_run
+from scripts.buildlog.test_holds import hold_event
 
 
 class CostTests(unittest.TestCase):
@@ -291,7 +291,7 @@ class CostTests(unittest.TestCase):
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Reruns after a pass"], [120])
 
     def test_both_window_options_reject_overflow_before_opening_the_index(self) -> None:
-        import mac_report
+        from scripts.buildlog import mac_report
 
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
