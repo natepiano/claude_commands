@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
@@ -139,13 +140,18 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         add(priority)
     add("Running:")
     running_steps = page_running_steps(model)
+    machine = store.host_name() if running_steps else ""
     for running in running_steps:
         selected = running in selected_running
         if (isinstance(running.step.measured, gate.UnownedSliceMemory)
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
-        add(prefix + queue_evidence.running_text(running, explanation, model.labels, model.zone))
+        text = queue_evidence.running_text(running, explanation, model.labels, model.zone)
+        if not isinstance(running.step.measured, (gate.CompilerServiceMemory, gate.UnownedSliceMemory)):
+            pid, separator, detail = text.partition(" · ")
+            text = pid + separator + machine + separator + detail
+        add(prefix + text)
     if not running_steps:
         add("None.")
     add(f"Total current use: {queue_evidence.gib(explanation.totals.measured)}")

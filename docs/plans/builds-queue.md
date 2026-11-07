@@ -408,6 +408,46 @@ only I can bump
 
 **Ruled out:** a separate `type_gate.py`, a promotion hook or a new timer; a client that sends the gate shape.
 
+### Phase 24 — Each running row names its machine  · status: todo
+
+**Depends on:** none. Source: the user, 2026-11-06 21:48: "add the machine that it is running on to be a new column in the queue and in the html page - on the html page it should come after duration and before unit in the running table."
+
+#### Work Order
+
+**Goal:** Each running row in `/build:queue` names the machine that runs it.
+
+**Spec:**
+
+1. **Source.** The admission service admits work only on the machine where it runs. Each running row therefore runs on the machine that reads the queue. The view takes the name from `scripts.buildlog.store.host_name()`, the one shared short host name. It adds no new name function and no hard-coded name.
+2. **Terminal column.** The run rows of `build_queue.py view` and the one-step card get a `machine` column after `min` and before `pid`. The header line carries `machine`. Waiting rows and the Services lines do not change.
+3. **Width.** At each golden width (60, 80, 100, 140) the rows keep their current fit rules. A narrow view drops the machine column before it cuts a name.
+4. **Proof.** The tests set the host name with a private value. They read no live host and no live service. Update each golden that shows run rows, and name each golden in the summary.
+5. **Later work.** Phase 10g places steps on other hosts. That phase carries the host on each row; this phase adds no per-row protocol field.
+
+**Files:**
+- `scripts/build_queue/queue_view.py`
+- `scripts/build_queue/queue_card.py`
+- `scripts/build_queue/queue_fixture.py`
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/test_queue_card.py`
+- `scripts/build_queue/golden/view_60.txt`
+- `scripts/build_queue/golden/view_80.txt`
+- `scripts/build_queue/golden/view_100.txt`
+- `scripts/build_queue/golden/view_140.txt`
+- `scripts/build_queue/golden/card_1.txt`
+- `scripts/build_queue/golden/card_4.txt`
+- `scripts/build_queue/golden/no_bump_100.txt`
+- `scripts/build_queue/golden/unit_override_card.txt`
+- `scripts/build_queue/golden/unit_override_view.txt`
+- `docs/as-built/build-memory-admission.md`
+- `commands/build/queue.md`
+
+**Workers:** `1 writer` — `impl3` owns the code, the tests, the goldens and the doc.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed file, adversary and contract reviews.
+
+**Change-Review:** `/build:queue` run rows show the machine | In any Claude session on natedev, type /build:queue | Each run row has a machine column after min, with natedev
+
 ### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: done
 
 #### As-built
