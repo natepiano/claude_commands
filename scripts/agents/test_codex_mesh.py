@@ -1067,8 +1067,7 @@ class MeshCommandFixture(unittest.TestCase):
         parent = unit_membership("natedev", "models")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
-        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
-            "production": "natedev", "unit": parent.name}))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = (self.session_dir / "prompt.txt").write_text("Original worker task", encoding="utf-8")
         self.outcomes = []
         self.turn_starts = 0
