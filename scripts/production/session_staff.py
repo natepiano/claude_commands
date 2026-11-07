@@ -29,7 +29,8 @@ from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
 from sessions import SessionRecord
 from place import HerdrPlace
-from pane_launch import PaneLaunch
+from pane_launch import PaneLaunch, agent_kind
+from scripts.lib import legacy_identity
 import unit_names
 
 
@@ -876,6 +877,8 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
+        if agent_kind(launch) == "codex":
+            return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)
         owner = self.record.by_member_reference(launch["session_id"])
         session_id = owner.current_session if owner is not None else launch["session_id"]
