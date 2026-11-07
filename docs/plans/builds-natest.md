@@ -1379,7 +1379,7 @@ Measure: `unassigned` was +0.0056 s of 2.599 CPU s on `message/test_process_test
 
 `show.py` reads the index first and refreshes after the print. A list holds every gate record that the last complete update read. A newer record appears on a later run.
 
-- `update_in()` writes the `meta` key `updated_at` inside its transaction. `open_for_update()` sets WAL, so a reader does not wait for a refresh.
+- `update_in()` writes the `meta` key `updated_at` inside its transaction, when rows changed or the key has no number. `open_for_update()` sets `cache_spill`, so a reader does not wait for an ordinary refresh.
 - `open_report_index()` opens the current schema's index when it has `updated_at`. Otherwise `index.py` finds the newest other index with the key and the same `CREATE TABLE` SQL for all four `GATE_TABLES`. When no index qualifies, it updates first. This path can take minutes.
 - One read transaction covers the report rows and the time, so both describe one update.
 - After the output, `show.py` closes its connection, flushes and forks one child, which calls `os.setsid()` and `index.update()`. The parent exits at once.
@@ -1390,7 +1390,7 @@ Measure: a first list on a scratch history took 0.116 CPU s and 0.166 s wall at 
 **Files:**
 - `scripts/test_times/show.py` — read first, the refresh, the time line
 - `scripts/test_times/test_show.py` — the real-process cases
-- `scripts/buildlog/index.py` — the key, WAL, the compatible index search; owner report-unit
+- `scripts/buildlog/index.py` — the key, `cache_spill`, the compatible index search; owner report-unit
 - `scripts/buildlog/test_index.py` — the index cases
 - `commands/test_times.md` — the time line and the rule
 
@@ -1558,43 +1558,26 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 ### Phase 71 — Index refreshes leave reads and unchanged indexes alone  · status: done
 **Depends on:** Phase 65
 
-#### Work Order
+#### As-built
 
-**Source:** the Phase 55 targeted test, 2026-11-06. Phase 65 aeaa5ad53 turned `buildlog/test_gate_index.py` line 147 and 16 tests in `buildlog/test_aws_report.py` red. Both pass on 5897bb390 and fail on 0b24c5375. The showrunner took Phases 65, 64 and 66 out of its chain until this fix passes.
+An unchanged index update writes nothing, a read leaves no side file, and a list reads during an ordinary refresh.
 
-**Goal:** an unchanged index update writes nothing, a read leaves no side file, and the first list still appears in under a second during a refresh.
-
-**Spec:**
-1. Remove `PRAGMA journal_mode = WAL` from `open_for_update()`. The index uses the rollback journal again, so a read leaves no side file.
-2. `open_for_update()` sets `PRAGMA cache_spill` from a new key `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. A transaction takes the exclusive lock only at commit up to that size, so a list reads during a normal refresh. A full build still spills, and its memory stays bounded.
-3. `update_in()` writes the `meta` key `updated_at` only when the transaction changed rows or the key is absent. Remove `previous_stamp`, `touch_due`'s restore and `data_changed`'s mtime path if the unchanged update no longer changes the file.
-4. `complete_gate_index_in()` and the `show.py` reader wait up to a new key `INDEX_READ_WAIT_SECONDS=1` on a lock, so a commit in progress does not drop the current index. After that wait the search continues as it does now.
-5. `rows as of` now names the last update that changed rows. Correct `commands/test_times.md` where the text differs.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+- `open_for_update()` uses the rollback journal and sets `PRAGMA cache_spill` from `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. A transaction up to about 256 MiB of changed pages takes the exclusive lock only at commit.
+- `update_in()` writes the `meta` key `updated_at` only when the transaction changed rows or `has_numeric_update_time()` is false. `rows as of` names the last update that changed rows.
+- `complete_gate_index_in()` waits up to `INDEX_READ_WAIT_SECONDS=1` while it selects an index. The `show.py` report connection waits `BUSY_TIMEOUT_MS`, 30 s, so a writer that takes the exclusive lock after selection does not stop the report.
+- A list during a refresh on a scratch index of 100 gates takes 0.111 CPU s, 0.187 wall s and 5 processes. That refresh peaks at 66.9 MiB RSS.
 
 **Files:**
-- `scripts/buildlog/index.py` — journal mode, spill size, the key write, the read wait; owner report-unit
+- `scripts/buildlog/index.py` — journal mode, spill size, the key write, the selection wait; owner report-unit
 - `scripts/buildlog/test_index.py` — the index cases
-- `scripts/test_times/show.py` — the read wait
+- `scripts/test_times/show.py` — the report connection
 - `scripts/test_times/test_show.py` — the real-process case
 - `commands/test_times.md` — the time line
 - `config/buildlog.conf` — the two keys
 
-**Workers:** 1 writer on slot `impl4` (one change)
-- `impl4` — all files above, role impl
+**Gotchas:** `cache_spill` is not a hard memory limit. A refresh above the spill size blocks readers from the first spill until commit, up to the 30 s wait. Memory for a full build at live scale is not measured.
 
-**Constraints from prior phases:**
-- Phase 65: `show.py` reads first and refreshes after the print. Its as-built names WAL. Correct that text at this phase's shrink.
-- The index is about 2.2 GB, so unbounded spill memory is not acceptable.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `buildlog/test_gate_index.py` and `buildlog/test_aws_report.py` pass with no edit to either file
-- a new real-process test: a writer holds an open transaction with more than 5 MiB of changed rows, and `show.py top` prints the old rows. It fails when the `cache_spill` line is removed on a tempdir copy
-- every accepted Phase 65 behavior stays: first list from the index, an older compatible index, one read transaction, the detached refresh
-- a list during a refresh on a scratch history keeps the Phase 65 result: about 0.12 CPU s and under 1 s wall
-- the targeted test green on the phase commit; only load flakes that pass alone on the base may differ
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** WAL, because an unchanged update and a read then change the index files; a 1 s wait on the report connection, because a commit after selection then stops the report.
 
 ### Phase 72 — Three gate tests stop failing from load and live staff  · status: todo
 **Depends on:** none
@@ -1632,6 +1615,43 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 
 **Acceptance gate:**
 - for each item, the quoted failing line, the source line and the named cause are in the summary, or the summary states that the cause stays open, with the evidence and the owner
+- a forced case fails before each fix and passes after it, on a tempdir copy
+- each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
+- the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 73 — Two stopped-call tests stop failing at random  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the showrunner, 2026-11-06, from queue's 18b gate; one case also from this unit's Phase 71 targeted test. Each test failed once and passed on rerun.
+
+**Goal:** each of the two tests has a named cause from evidence and passes under forced delay, with every checked behavior kept.
+
+**Spec:**
+1. `direct/test_verify_token_memory_history.py`, `test_cancel_during_memory_wait_releases_token_and_waiter`, line 110: `self.assertEqual(self.live_group_processes(process.pid), [])` gave `Lists differ: [2634236] != []`. The check reads once, directly after `process.wait()`. A member of the group that is still ending can give this result. Log: the `direct/test_verify_token_memory_history.py` section of the targeted test log.
+2. `direct/test_verify_mac_copy_ownership.py`, `test_a_stopped_call_leaves_no_step_or_copy_running`: the failure text is not known. Ask no one for it. Force delays and read which assertion fails. Lines 29-32 send SIGTERM, wait for the marker, then read the marker again.
+3. For each test, quote the failing line and the source line before any fix. Say which process stays and why, from `/proc` or `ps` evidence. A process that verify.sh leaves running is a defect in production: send the evidence to the director, and do not hide it with a longer wait.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_verify_token_memory_history.py`
+- `scripts/direct/verify_token_wait_test_support.py`
+- `scripts/direct/test_verify_mac_copy_ownership.py`
+- `scripts/direct/verify_mac_offload_test_support.py`
+
+**Workers:** 1 writer; the two tests share one kind of cause
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 63: a flake fix waits on events. A forced case fails before the fix and passes after it.
+- Phase 70: a hang that does not reproduce gets a report that names the wait, and the cause stays open.
+- Verify's forms: `test_verify_mac_copy_ownership.py` and `test_verify_token_memory_history.py` are not in Phase 41g's list.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- for each test, the quoted failing line, the source line and the named cause are in the summary, or the summary states that the cause stays open, with the evidence and the owner
 - a forced case fails before each fix and passes after it, on a tempdir copy
 - each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
 - the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
