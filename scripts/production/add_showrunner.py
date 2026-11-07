@@ -8,8 +8,8 @@ The parent showrunner runs it. The session is named for the child's staff name a
 checkout with `/showrunner:produce <doc>`, or `/showrunner:produce <doc> resume` with --resume. It
 carries no unit mark. New and resumed sessions use the configured showrunners account. Once the child's showrunner runs, with an update
 timer addressed to a live session, the child is attached to the caller's production. --check runs
-every refusal and starts nothing. The session must start in a folder the selected account's login
-already trusts, since a showrunner never answers Claude's folder-trust prompt.
+every refusal and starts nothing.
+The launch writes folder trust in the selected account before Claude starts.
 
 Exit 0 when the child is attached, or --check found nothing in the way; 1 when the prompt was sent
 but the showrunner did not appear or attach (the session is left running); 2 on a refusal;
@@ -24,7 +24,6 @@ except FileNotFoundError:
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 import time
@@ -114,19 +113,12 @@ def running(production_name: str) -> bool:
     return bool(showrunners.current_address(production_name))
 
 
-def claude_json(config_dir: Path) -> Path:
-    """The configuration of the account this launch will use."""
-    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
-
-
 def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path) -> None:
     """Check whether `child` can start; raise Refusal naming what is in the way.
 
     `ending` identifies the unit's tab that closes before launch, or says no tab ends.
-    `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import NamedAccount, account_dir, claude_config_label, trust_command
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
+    del start_in, config_dir
 
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.name} to")
@@ -140,17 +132,6 @@ def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDIN
         raise Refusal(str(error)) from error
     if taken:
         raise Refusal(f"{child.name} already has a running showrunner")
-    folder = start_in or child.checkout
-    folder_label = claude_config_label(config_dir)
-    label = (folder_label if re.fullmatch(r"claude[0-9]+", folder_label)
-             and config_dir == account_dir(folder_label) else str(config_dir))
-    selected = NamedAccount(label, config_dir)
-    trust = claude_trust(folder, claude_json(config_dir))
-    if isinstance(trust, UnreadableTrustFile):
-        raise Refusal(f"{child.name}: {trust}")
-    if isinstance(trust, Untrusted):
-        raise Refusal(f"{child.name}: Claude is not trusted in {folder} on {label}. "
-                      + f"Run: {trust_command(folder, selected)}")
     try:
         if herdr_tab_open(child.name, ending):
             raise Refusal(f"a tab named {child.name} is already open in herdr session {herdr.shared_session()}")
@@ -350,6 +331,8 @@ def _main(argv: list[str]) -> int:
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)
         return 2
+    if isinstance(outcome, herdr.ClaudeTrustNotWritten):
+        return SESSION_NOT_READY
     if isinstance(outcome, herdr.PromptNotSubmitted):
         print(f"add_showrunner: {child.name}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
         return SESSION_NOT_READY

@@ -116,3 +116,9 @@ Settings entry for the user, one more SessionEnd item:
 
 - Automatic boot restore is not installed on either machine.
 - Layout saving and detection-rule refresh run in `herdr-upkeep`.
+
+Claude launches write folder trust in the target account before the process starts.
+The write uses the repository trust key, or the folder itself outside a repository.
+A failed write prints one anomaly with the folder, account file, and error.
+The launch then returns its failure result without a process start.
+A composer with a draft waits until the deadline without changes to the draft.

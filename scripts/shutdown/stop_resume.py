@@ -411,6 +411,8 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
     kind = pane_launch.agent_kind(entry)
+    if kind == "claude":
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
         environment["CODEX_HOME"] = entry["config_dir"]
@@ -699,8 +701,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
-            trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
-            copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if original is not None and Path(original.entry["config_dir"]) != target_dir:

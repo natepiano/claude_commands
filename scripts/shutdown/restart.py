@@ -24,6 +24,10 @@ from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
 
 
+class ClaudeTrustWriteFailed(OSError):
+    """The shared launch already reported its failed trust write."""
+
+
 class WorkerRow(Protocol):
     row: staff.StaffRow
 
@@ -42,7 +46,6 @@ class WorkerRestore(Protocol):
 class MemberLifecycle(Protocol):
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
-    def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -183,8 +186,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):
-            _ = stop_resume.heal_account_trust(folder, selected.dir,
-                Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
             environment = named_account_environment(selected.dir)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
@@ -227,6 +228,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
             reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                               live.reason if isinstance(live, herdr.UnknownConversation) else ""))
+        if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
+            raise ClaudeTrustWriteFailed(result.outcome.reason)
         if isinstance(result.outcome, herdr.PromptNotSubmitted):
             if isinstance(target, herdr.ExistingPane) and not target.terminal:
                 return result.pane
@@ -398,6 +401,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []
     started: list[str] = []
+    exit_code = 0
     holders: dict[staff.StaffId, staff.StaffRow] = {}
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
@@ -438,6 +442,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _ = start_row(current, current_record, client, present=present, resolver=resolver)
             started.extend(members)
             present = False
+        except ClaudeTrustWriteFailed:
+            pending.extend(members)
+            exit_code = 1
         except staff.StaffRefused as error:
             _anomaly(holder, error)
         except errors as error:
@@ -450,4 +457,4 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             _ = client.sort_tabs()
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
-    return 0
+    return exit_code

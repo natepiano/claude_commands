@@ -282,11 +282,6 @@ class PromptInputNotReady:
 
 
 @dataclass(frozen=True)
-class PromptInputHoldsDraft:
-    screen: str
-
-
-@dataclass(frozen=True)
 class PromptInputTimedOut:
     """The destination did not become ready before the launch deadline."""
 
@@ -321,6 +316,11 @@ class PromptNotSubmitted:
 @dataclass(frozen=True)
 class AgentNotStarted(PromptNotSubmitted):
     """The start command failed, and no agent runs in the pane."""
+
+
+@dataclass(frozen=True)
+class ClaudeTrustNotWritten(AgentNotStarted):
+    """The launch cannot start because the target account trust write failed."""
 
 
 @dataclass(frozen=True)
@@ -2138,7 +2138,7 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2154,23 +2154,19 @@ class Herdr:
         composer = _composer_input(raw)
         if isinstance(composer, ComposerInput):
             if composer.text.strip():
-                return PromptInputHoldsDraft(screen)
+                return PromptInputNotReady("destination composer holds a draft", screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
     def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
-        draft_stashed = False
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
-            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
-                self._send_keys(pane, "ctrl+s")
-                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
@@ -2628,11 +2624,7 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
 
 
 def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | UnreadableTrustFile:
-    """Check exact folder, repository-root and main-checkout keys, never ancestors.
-
-    Before creating a worktree, callers check repository_trust_key(checkout)
-    instead of the missing folder, so only the main checkout can authorize it.
-    """
+    """Check exact folder, repository-root and main-checkout keys, never ancestors."""
     folder = folder.resolve()
     try:
         raw = cast(object, json.loads(claude_json.read_text(encoding="utf-8")))
@@ -2670,27 +2662,54 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
     granted = claude_trust(folder, source)
     if not isinstance(granted, Trusted):
         return granted
+    return _write_claude_trust(folder, target, granted.project_key)
+
+
+def _write_claude_trust(folder: Path, target: Path, project_key: Path) -> Trusted | UnreadableTrustFile:
+    """Lock the account file through its read and atomic trust update."""
+    from scripts.accounts.accounts import claude_config_lock
+
     try:
-        try:
-            raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            raw = {}
-        if not isinstance(raw, dict):
-            raise ValueError()
-        settings = cast(dict[str, object], raw)
-        projects = settings.setdefault("projects", {})
-        if not isinstance(projects, dict):
-            raise ValueError()
-        entry = cast(dict[str, object], projects).setdefault(str(granted.project_key), {})
-        if not isinstance(entry, dict):
-            raise ValueError()
-        cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
-        if target.exists():
-            target.chmod(0o600)
-        write_text_atomic(target, json.dumps(settings, indent=2), new_file_mode=0o600)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with claude_config_lock(target):
+            try:
+                raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                raw = {}
+            if not isinstance(raw, dict):
+                raise ValueError()
+            settings = cast(dict[str, object], raw)
+            projects = settings.setdefault("projects", {})
+            if not isinstance(projects, dict):
+                raise ValueError()
+            entry = cast(dict[str, object], projects).setdefault(str(project_key), {})
+            if not isinstance(entry, dict):
+                raise ValueError()
+            cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
+            if target.exists():
+                target.chmod(0o600)
+            write_text_atomic(target, json.dumps(settings, indent=2), new_file_mode=0o600)
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, target, type(error).__name__)
-    return Trusted(folder, target, granted.project_key)
+    return Trusted(folder, target, project_key)
+
+
+def trust_claude_launch(folder: Path, config_dir: Path) -> None:
+    """Write trust before either Claude launch path starts a process."""
+    from scripts.whoami.agent_accounts import claude_config_file
+
+    target = claude_config_file(config_dir)
+    try:
+        folder = folder.resolve()
+        result = _write_claude_trust(folder, target, repository_trust_key(folder))
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        reason = f"{folder}: trust anomaly: {target}: {error}"
+    else:
+        if isinstance(result, Trusted):
+            return
+        reason = f"{folder}: trust anomaly: {target}: {result.error_class}"
+    reason = " ".join(reason.splitlines())
+    raise HerdrFailure(reason)
 
 
 @dataclass(frozen=True)
@@ -2705,11 +2724,9 @@ class TrustCopied:
 def heal_claude_trust(
     folder: Path, target: Path, sources: Sequence[tuple[str, Path]], *, dry_run: bool,
 ) -> Trusted | TrustCopied | Untrusted | UnreadableTrustFile:
-    """Give the target account file the trust the first trusting source already gave this folder.
+    """Copy trust from the first source that trusts the folder.
 
-    `sources` pairs each account's label with its account file, in the order to try. The copy is
-    `copy_claude_trust`'s one key; a dry run copies nothing. With no trusting source, the target's
-    own `Untrusted` comes back, and the user accepts trust once.
+    A dry run reports the source without a write.
     """
     present = claude_trust(folder, target)
     if not isinstance(present, Untrusted):
@@ -4874,6 +4891,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
+    if kind == "claude":
+        try:
+            trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
+        except HerdrFailure as error:
+            print(str(error), file=sys.stderr)
+            return AgentLaunched("", ClaudeTrustNotWritten(str(error)))
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
     client = Herdr(name)
