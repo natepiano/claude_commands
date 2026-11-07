@@ -103,7 +103,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         session = "live-session"
         self.call = mac_idle.VerifyCall("v-call", 123, "456", str(self.root / "repo"), "sample", session,
             str(self.paths.session_root / session), str(self.root / "hold-waiter"), str(self.root / "token_waiters"),
-            str(self.root / "settings"), 900, True)
+            str(self.root / "settings"), 900, True, updated="1970-01-01T00:16:40Z")
         Path(self.call.temp_dir).mkdir(parents=True)
         self.process(123, 1, "456", ("bash", "/repo/scripts/direct/verify.sh", "test", "sample"))
         self.process(122, 1, "455", ("claude",))
@@ -123,12 +123,12 @@ class MacIdleTests(NotificationGuardedTestCase):
         _ = self.enterContext(mock.patch.object(mac_idle, "notify_outage", return_value=True))
 
     def step(self, kind: str = "test", state: step_record.StepState = step_record.StepState.WAITING_HOLD,
-             mac_allowed: bool = True) -> None:
+             mac_allowed: bool = True, updated: str = "1970-01-01T00:16:40Z") -> None:
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), kind,
             step_record.NamedPackage(self.call.package) if kind == "test" else step_record.WorkspacePackages(),
             step_record.MacAllowed() if mac_allowed else step_record.NatedevOnly("Linux only"),
-            state, "2026-10-28T22:00:00Z"))
+            state, updated))
 
     def process(self, pid: int, parent: int, start: str, argv: tuple[str, ...], env: dict[str, str] | None = None) -> None:
         path = self.paths.proc / str(pid)
@@ -150,6 +150,104 @@ class MacIdleTests(NotificationGuardedTestCase):
     def two_passes(self) -> None:
         mac_idle.watch_once(self.paths, 1180, 100)
         mac_idle.watch_once(self.paths, 1240, 160)
+
+    def test_alert_waits_for_the_call_limit_and_restarts_after_a_state_change(self) -> None:
+        self.call = replace(self.call, retry_after=0)
+        mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))
+        state = step_record.state_path(self.call.call_id)
+        _ = state.write_text("waiting_hold\n")
+        os.utime(state, (1596, 1596))
+        limit = mac_idle.mac_idle_alert.read_idle_config().alert_seconds
+        with mock.patch.object(mac_idle, "notify_outage", return_value=True) as outage, \
+             mock.patch.object(mac_idle, "push_outage", return_value=True) as push, \
+             mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as repair:
+            mac_idle.watch_once(self.paths, 1600, 100)
+            outage.assert_not_called()
+            push.assert_not_called()
+            repair.assert_not_called()
+            self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["waiting"], 0)
+            self.assertEqual(self.rows(), [])
+
+            _ = state.write_text("on_natedev\n")
+            os.utime(state, (1600, 1600))
+            mac_idle.watch_once(self.paths, 1600, 100)
+            _ = state.write_text("waiting_mac\n")
+            os.utime(state, (1600, 1600))
+            mac_idle.watch_once(self.paths, 1596 + limit, 200)
+            outage.assert_not_called()
+            push.assert_not_called()
+            repair.assert_not_called()
+
+            mac_idle.watch_once(self.paths, 1600 + limit + 1, 300)
+            outage.assert_called_once()
+            push.assert_called_once()
+            repair.assert_called_once()
+            self.assertEqual([row["cause"] for row in self.rows()], ["idle_with_waiter"])
+
+    def test_state_rewrite_keeps_the_first_seen_wait_start(self) -> None:
+        state = step_record.state_path(self.call.call_id)
+        _ = state.write_text("waiting_mac\n")
+        os.utime(state, (1596, 1596))
+        limit = mac_idle.mac_idle_alert.read_idle_config().alert_seconds
+        with mock.patch.object(mac_idle, "notify_outage", return_value=True) as outage, \
+             mock.patch.object(mac_idle, "push_outage", return_value=True):
+            mac_idle.watch_once(self.paths, 1600, 100)
+            outage.assert_not_called()
+            now = 1596 + limit + 1
+            _ = state.write_text("waiting_mac\n")
+            os.utime(state, (now - 10, now - 10))
+            mac_idle.watch_once(self.paths, now, 200)
+        outage.assert_called_once()
+        self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["waiting"], 1)
+
+    def test_call_that_leaves_the_waiting_set_starts_a_new_wait(self) -> None:
+        state = step_record.state_path(self.call.call_id)
+        _ = state.write_text("waiting_hold\n")
+        os.utime(state, (1596, 1596))
+        limit = mac_idle.mac_idle_alert.read_idle_config().alert_seconds
+        with mock.patch.object(mac_idle, "notify_outage", return_value=True) as outage, \
+             mock.patch.object(mac_idle, "push_outage", return_value=True):
+            mac_idle.watch_once(self.paths, 1600, 100)
+            _ = state.write_text("on_mac\n")
+            os.utime(state, (1601, 1601))
+            mac_idle.watch_once(self.paths, 1601, 101)
+            now = 1600 + limit + 1
+            _ = state.write_text("waiting_mac\n")
+            os.utime(state, (now - 4, now - 4))
+            mac_idle.watch_once(self.paths, now, 200)
+            outage.assert_not_called()
+            self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["waiting"], 0)
+            mac_idle.watch_once(self.paths, now - 4 + limit + 1, 400)
+        outage.assert_called_once()
+
+    def test_alert_counts_only_calls_past_the_limit(self) -> None:
+        self.waiting_steps(2)
+        self.step(updated=datetime.fromtimestamp(1596, timezone.utc).isoformat())
+        mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
+                              asdict(replace(self.call, local_reason="disk")))
+        with mock.patch.object(mac_idle, "notify_outage", side_effect=REAL_NOTIFY_OUTAGE), \
+             mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send, \
+             mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+            mac_idle.watch_once(self.paths, 1600, 100)
+        saved = mac_idle.read_record(self.paths.state / "alert.json")
+        self.assertEqual((saved["waiting"], saved["cause"], saved["detail"]), (1, "free", ""))
+        messages = [cast(str, call.args[0]) for call in send.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("1 steps wait for the Mac", messages[0])
+        self.assertIn("pid 125", messages[0])
+        self.assertNotIn("pid 123", messages[0])
+        self.assertNotIn("disk", messages[0])
+        push.assert_called_once()
+        self.assertEqual([row["call_id"] for row in self.rows()], ["waiting-125"])
+
+    def test_unparseable_wait_time_still_alerts(self) -> None:
+        self.step(updated="invalid-time")
+        with mock.patch.object(mac_idle, "notify_outage", return_value=True) as outage, \
+             mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+            mac_idle.watch_once(self.paths, 1600, 100)
+        outage.assert_called_once()
+        push.assert_called_once()
+        self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["waiting"], 1)
 
     def test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again(self) -> None:
         verify = mac_idle.SCRIPTS / "direct/verify.sh"
@@ -209,6 +307,7 @@ done
                     state = step_record.state_path(self.call.call_id)
                     if state_snapshot.exists():
                         _ = state.write_bytes(state_snapshot.read_bytes())
+                        os.utime(state, (1000, 1000))
                     else:
                         state.unlink(missing_ok=True)
                     record = step_record.read(self.call.call_id)
@@ -248,7 +347,7 @@ done
             self.process(pid, 1, str(pid), ("bash", "step"))
             step_record.write(step_record.StepRecord(
                 f"waiting-{pid}", pid, str(pid), Path(self.call.repo), "test", "sample",
-                step_record.MacAllowed(), step_record.StepState.WAITING_HOLD, "2026-10-28T22:00:00Z"))
+                step_record.MacAllowed(), step_record.StepState.WAITING_HOLD, "1970-01-01T00:16:40Z"))
 
     def claim(self, *, working: bool = False, remote: bool = True) -> Path:
         row: dict[str, object] = {"pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
@@ -406,6 +505,7 @@ done
         self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["state"], "busy")
 
     def test_busy_or_young_outage_with_steps_never_scans_all_processes(self) -> None:
+        self.step(updated="1970-01-01T00:15:00Z")
         with mock.patch.object(mac_idle, "processes", side_effect=AssertionError("unneeded proc scan")):
             mac_idle.watch_once(self.paths, 1100, 100)
             saved = mac_idle.read_record(self.paths.state / "alert.json")
@@ -570,7 +670,7 @@ done
             with self.subTest(state=state):
                 step_record.write(step_record.StepRecord(
                     self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
-                    self.call.package, step_record.NatedevOnly("disk"), state, "2026-11-03T18:00:00Z"))
+                    self.call.package, step_record.NatedevOnly("disk"), state, "1970-01-01T00:16:40Z"))
                 mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
                                       asdict(replace(self.call, local_reason="disk")))
                 (self.paths.state / "alert.json").unlink(missing_ok=True)
@@ -593,7 +693,7 @@ done
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
             self.call.package, step_record.NatedevOnly("disk"), step_record.StepState.ON_NATEDEV,
-            "2026-11-03T18:00:00Z"))
+            "1970-01-01T00:16:40Z"))
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
                               asdict(replace(self.call, local_reason="disk")))
         with mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
@@ -788,7 +888,7 @@ done
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
             step_record.NamedPackage("sample"), step_record.SshAllowed(("studio", "aws"), ("studio",)),
-            step_record.StepState.WAITING_HOLD, "2026-11-02T10:00:00Z"))
+            step_record.StepState.WAITING_HOLD, "1970-01-01T00:16:40Z"))
 
         self.two_passes()
 
