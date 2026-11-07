@@ -22,7 +22,7 @@ from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
-import fake_herdr
+from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
@@ -259,7 +259,6 @@ class FolderMoveFixture(StaffTestCase):
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
-        _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -450,7 +449,6 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     roots = tuple(Path(root) for root in environment.get(
         "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
     _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
-    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),

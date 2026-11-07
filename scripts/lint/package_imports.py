@@ -364,8 +364,6 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
                 source = "".join(lines)
                 if not deleted:
                     break
-            if source.startswith("#!/usr/bin/env python3\n"):
-                source = source.replace("#!/usr/bin/env python3\n", "#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py\n", 1)
         _ = ast.parse(source)
     except SyntaxError as error:
         problems.append(f"{file.relative_to(root)}:{error.lineno or 1}: path removal leaves invalid syntax: {error.msg}")

@@ -8,13 +8,10 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-if TYPE_CHECKING:
-    from . import decision_priority
-else:
-    from scripts.notify import decision_priority
+from scripts.notify import decision_priority
 from scripts.notify import silence
 from scripts.notify import pushover
 from scripts.notify import push_texts

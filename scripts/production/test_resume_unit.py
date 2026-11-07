@@ -31,7 +31,7 @@ import unit_lookup
 import unit_move
 import test_retire_unit
 from scripts.production.production_doc import Production, read_production
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.herdr.herdr import HerdrPlace
 
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase

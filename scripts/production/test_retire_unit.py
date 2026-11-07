@@ -40,7 +40,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume, restart
 from scripts.herdr import worker_panes
 from scripts.shutdown import pane_record as staff_pane_record
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.lib.conf import UseConfiguredValue
