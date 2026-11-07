@@ -1225,7 +1225,7 @@ The targeted test on the gate had three red modules, and none came from this pha
 **Goal:** `scripts/style/test_style_proposals.py` (60.8 CPU s, 112.7 s wall, 186 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of the setup that repeats: `setUp()` at `test_style_proposals.py:113` makes the rules repository, commits its rules, seeds staff and initializes the ledger, and `approved_decision()` and `decision_closed_as_built()` repeat completed setup before later checks. The workspace already has a shared seed. Keep the setup assertions in the behavior map.
 2. Cut in the Speed method's order, direct calls first.
 3. A cut in a production file goes to the director first, with the measured gain. Do not edit `scripts/style/style_sync.py` or `scripts/style/test_style_sync.py`: devtools holds them.
 4. devtools 3z holds this file and `style_proposals.py` for import lines only. Before the checkpoint, take 3z through builds when the showrunner says builds has it (showrunner, 2026-11-06).
@@ -1239,6 +1239,7 @@ The targeted test on the gate had three red modules, and none came from this pha
 - `impl` — all files above, role impl
 
 **Constraints from prior phases:**
+- Phase 55: look first for repeated first launches that are setup. A shared first run took one module from 62.3 to 33.0 CPU s.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Phase 56: an event wait uses one held descriptor and bounded reads. Same-load pairs run after the last repair lands.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
@@ -1443,6 +1444,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 2. Follow the Speed method. Measure CPU with `module_cost.py --commands 10` first: a process count does not rank CPU.
 3. Move the judgment and parser cases onto direct calls of the two new functions. Keep the real starts that prove what no direct call can.
 4. A further cut in `verify.sh` goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
+5. Read the importers of a shared Mac fixture before you change it, and take the owner's word for any file another unit holds.
 
 **Files:**
 - `scripts/direct/test_verify_lint_judgment.py`
@@ -1454,13 +1456,15 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 
 **Constraints from prior phases:**
 - Phase 61: `test_verify_lint_cache_versions.py` holds the harness form for lint functions. `test_verify_mac_only.py`'s `mac_result()` holds the form for result functions.
+- Verify's functions: `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` (7ea9b08ef), and `parse_routing_arguments` (0c855e894). Call them through `shell_functions`. The parser's arguments and globals are in `scripts/direct/test_verify_argument_parser.py`. After verify's 41g, new tests use the new forms: `final --saved`, `lint` with no package, `example --name` and `test --test`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
 - The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
 - The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+- the targeted test green on the phase commit merged with `origin/builds`, after both writers finish and the reviews converge
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 68 — The assign launcher tests use half their CPU  · status: todo
 **Depends on:** Phase 54
@@ -1490,13 +1494,14 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 55: `implement_launcher_test_support.py` repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in this phase.
+- Phase 55: `implement_launcher_test_support.py` repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in `assign_launcher_test_support.py` in this phase. Keep each fixture's own restoration: `first_assignment` restores server observations, and `first_worker_launch` restores `staff_parent`.
 - Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
 - each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- every importer of both fixtures green, in reverse test order, and each test of both fixture families green when run alone
 - CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
@@ -1539,33 +1544,16 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 ### Phase 70 — The token order test stops hanging  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-06. In its queue 20c gate at about 18:00 EST, `test_the_token_goes_to_the_call_that_waited_longest` hit its hang guard at 609 s and passed on the rerun alone. The module median is 14 s.
+The goal was not reached: the hang is not fixed and its cause stays open. The hang did not reproduce in ten runs and five forced stops.
 
-**Goal:** `scripts/direct/test_verify_token_fifo.py` passes at gate load with no hang, and the cause is named from evidence, with every checked behavior kept.
-
-**Spec:**
-1. Reproduce first, at gate load and with forced delays on a tempdir copy. Quote the failing line and the source line before any fix. The gate log holds the traceback only, because the hang raises before `output.read_text()` is printed.
-2. Name what the call waits on when it hangs: the token queue, the memory queue, or another wait.
-3. A cause in the test is fixed in the test. A cause in `verify.sh` or another production file goes to verify, with the failing line, the source line and a reproduction.
-4. Add no guard, refusal or check (user rule, 2026-11-05).
-5. The hang did not reproduce in ten runs and five forced stops, so the cause stays open. A hang now reports the call's output and the queue files, so the next one names the wait.
+`test_the_token_goes_to_the_call_that_waited_longest` now reports the call output and the queue file names when its guard ends the wait. A forced hang on a tempdir copy shows both.
 
 **Files:**
-- `scripts/direct/test_verify_token_fifo.py` — the module
+- `scripts/direct/test_verify_token_fifo.py` — the hang report
 
-**Workers:** 1 writer on slot `test` (one module)
-- `test` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 63: a flake fix states what is proved and what is not. A forced case fails before the fix and passes after it.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module passes 5 runs under `module_run.py`; a forced hang on a tempdir copy prints the call's output and the queue files
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:** one unproved condition is PID reuse at `verify.sh:2953-2956`. The gate deletes its temporary log, so the report stays readable only in a log that the gate's caller keeps. The next recurrence names the wait.
 
 ### Phase 71 — Index refreshes leave reads and unchanged indexes alone  · status: todo
 **Depends on:** Phase 65
@@ -1606,4 +1594,44 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - every accepted Phase 65 behavior stays: first list from the index, an older compatible index, one read transaction, the detached refresh
 - a list during a refresh on a scratch history keeps the Phase 65 result: about 0.12 CPU s and under 1 s wall
 - the targeted test green on the phase commit; only load flakes that pass alone on the base may differ
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 72 — Three gate tests stop failing from load and live staff  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the showrunner and two targeted test runs, 2026-11-06. Each item has its own cause and proof.
+
+**Goal:** `direct/test_findings_simplify.py` uses its own staff file, and the lifecycle teardown and the admission hang each have a named cause from evidence, with a fix or a named owner, with every checked behavior kept.
+
+**Spec:**
+1. `direct/test_findings_simplify.py`, `test_held_finding_survives_a_repair_round_and_phase_end`: `progress_history` start-run reads the live staff file through `staff.initial_snapshot`. On a tree with an older `staff.py` it fails with `StaffUnreadable`. `FindingsLedgerFixture.environment()` at `findings_test_support.py:101` copies `os.environ`, so it inherits `STAFF_FILE`. Use `isolated_staff_file` from `scripts/production/staff_test_support.py` around the recorder sequence. Prove it: run the test with `STAFF_FILE` set to an unreadable file, and show that it fails before the fix and passes after.
+2. `production/test_production_lifecycle.py`: the first failure is `OSError: [Errno 39] Directory not empty: '.../lifecycle-test-cz0_xeap/case/origin.git/objects'` in the `shutil.rmtree` cleanup. The next 16 tests then fail with `FileExistsError` at `production_lifecycle_test_support.py:119`, because `LifecycleFixture` reuses one directory. Find the process that writes to `origin.git/objects` after its test ends, before you select a teardown fix. A retry in `rmtree` hides that process, so do not use one unless the evidence shows the writer ends by itself. Keep one failure from turning into 17.
+3. `production/test_merge_gate_suites_admission.py`: the hang is in `admission_client._line` at load 140, and the module passes alone on the base in 12.7 s. No cause is proved. Capture the blocked stack, the admission state and the child processes under forced load or a forced delay, before you select a fix. A cause in `scripts/build_queue/` goes to queue-unit, with the failing line, the source line and a reproduction.
+4. Quote the failing line and the source line before any fix. Reproduce with a forced delay or at gate load. State what is proved and what is not.
+5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time. A cut in a production file goes to the director first.
+
+**Files:**
+- `scripts/direct/test_findings_simplify.py`
+- `scripts/direct/findings_test_support.py`
+- `scripts/production/test_production_lifecycle.py`
+- `scripts/production/production_lifecycle_test_support.py`
+- `scripts/production/test_merge_gate_suites_admission.py`
+- `scripts/production/merge_gate_suites_test_support.py`
+
+**Workers:** 2 writers; the admission fixture has no shared file with the other two
+- `impl3` — `test_findings_simplify.py`, `findings_test_support.py`, `test_production_lifecycle.py`, `production_lifecycle_test_support.py`, role impl
+- `impl4` — `test_merge_gate_suites_admission.py`, `merge_gate_suites_test_support.py`, role impl
+
+**Constraints from prior phases:**
+- Phase 63: a flake fix publishes a file atomically and waits on events. A forced case fails before the fix and passes after it.
+- Phase 70: a hang that does not reproduce gets a report that names the wait, and the cause stays open.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- for each item, the quoted failing line, the source line and the named cause are in the summary, or the summary states that the cause stays open, with the evidence and the owner
+- a forced case fails before each fix and passes after it, on a tempdir copy
+- each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
+- the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
