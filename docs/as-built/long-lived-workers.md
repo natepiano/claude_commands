@@ -618,6 +618,7 @@ Reopen probes without a roster flock, then rechecks the revision and launcher un
 Compact does not recover a dead launcher; its refusal directs the caller to follow or reopen.
 Without a live server, reopen starts a server and proves the recorded thread idle.
 `end` keeps the staff row and thread id for recovery. Permanent removal retires the row.
+`assign.py` ends an Astra reviewer, releases its role, and retires its staff row after the review.
 The unit ledger keeps ended workers so unit retirement can find and retire their rows.
 
 

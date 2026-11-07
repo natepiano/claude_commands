@@ -899,8 +899,16 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
             ended = call([PYTHON, MESH, "end", *context, "--to", args.new_worker], env, check=False).returncode
             if ended:
                 result = 1
-            elif held:
-                astra_roles.release(held)
+            else:
+                if held:
+                    astra_roles.release(held)
+                row = session_staff.worker_row(read_roster(run, args.new_worker))
+                if row is not None and row.kind == "worker":
+                    try:
+                        _ = staff.retire(row.id)
+                    except staff.StaffRefused as error:
+                        print(f"codex_mesh: {args.new_worker}: {error}", file=sys.stderr)
+                        result = 1
     return result
 
 
