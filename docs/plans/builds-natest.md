@@ -1325,37 +1325,20 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 ### Phase 63 — Three verify test files stop failing at random  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** verify-unit and the showrunner, 2026-11-06. Each failed once, then passed on a rerun.
+Each random failure form is reproduced with a forced delay, and each fix passes it.
 
-**Goal:** each of the three tests has one cause named and removed, or a measured reason that the failure is not in the test.
-
-**Spec:**
-1. No failure log exists: the gate prints the failure to its caller's shell, and its record keeps only the failed test name (queue-unit, 2026-11-06). Reproduce each failure at the load of its gate. Quote the failing line and the source line before any fix.
-2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30 (record natedev-20261106T162938-718feb) and 14f4644ef (record natedev-20261106T162943-34348c), one minute apart under load, and once at load 59 on 11-05. One candidate: the fixture writes `block-probe` with `write_text`, but `wait_for_path` observes only that the file exists before the test reads its contents. Force a pause after the file is created, and see if the read is empty. Atomic publication can keep the existing assertion. Do not state that this explains the gate failures without evidence.
-3. `test_verify_mac_copy_ownership.py`, `test_a_stopped_call_leaves_no_step_or_copy_running`: gate 735747766 (record natedev-20261106T133609-c0e02e).
-4. `test_verify_example_edits.py`, `test_edit_during_the_test_run_records_no_pass`: gate aa0e60d56 (record natedev-20261106T154319-4912ce). The first run of that gate, natedev-20261106T140052-6ac435, passed this module.
-5. A flaky file's fixed wait goes first. Move a check onto a direct call only when it needs no live process. Copy cleanup and edits during a run need live processes and the real caller order, so `test_a_stopped_call_leaves_no_step_or_copy_running` and `test_edit_during_the_test_run_records_no_pass` stay process tests. Observe cleanup before `module_run.py` ends, because Phase 62 then ends the remaining descendants independently.
-6. A cut in `verify.sh` or another production file goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
+- `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: the read found `''` because the file exists before its content. The probe writes `<name>.pending`, then renames it.
+- `test_a_stopped_call_leaves_no_step_or_copy_running`: the read found an empty `cargo-compiling`. The test now uses `wait_for_pid`, sends SIGTERM to the verify process only, and waits with `wait_for_marker_exit` before the unchanged empty-set assertion. Removing the body of `stop_copy` in `scripts/mac_test/copy_watch.py` fails it.
+- `test_edit_during_the_test_run_records_no_pass` got rc 77 when the edit came before the watcher's first read. Two tests now fix each order: the cancel test uses the real watcher at a 0.01 s interval and a held Cargo stub. The recording test keeps a first-read hook. Changing the `tree_watch.py` signal fails the cancel test.
 
 **Files:**
-- `scripts/direct/test_verify_token_mac_step.py`
-- `scripts/direct/test_verify_mac_copy_ownership.py`
-- `scripts/direct/test_verify_example_edits.py`
+- `scripts/direct/test_verify_token_mac_step.py` — the atomic probe
+- `scripts/direct/test_verify_mac_copy_ownership.py` — the cleanup wait
+- `scripts/direct/test_verify_example_edits.py` — two fixed orders
 
-**Workers:** 1 writer on slot `impl4` (three small files; one writer does all the reproductions)
-- `impl4` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 56: an event wait uses one held descriptor and bounded reads.
-- Verify's batch a36296ed2, with its changes to `verify_mac_offload_test_support.py` and `verify_token_wait_test_support.py`, is on builds.
-
-**Acceptance gate:**
-- For each file, the quoted failing line and the named cause are in the summary.
-- A cause in the test: a forced reproduction, such as a held delay on a tempdir copy, fails before the fix and passes after it.
-- A cause outside the test: the summary gives the reproduction evidence, the owner and the condition that closes the follow-up.
-- Each file green in 5 runs at normal load. basedpyright 0/0/0 on the changed files. Lint and the tests of the changed files only.
+**Gotchas:** the historical gates kept no logs, so their exact causes stay unproved. The origin of a marked process seen in one copy ownership run stays unproved. If it recurs, capture its command and parent at the failing scan.
 
 ### Phase 64 — `module_cost.py` names the tests with the most CPU  · status: done
 **Depends on:** Phase 60, Phase 62
