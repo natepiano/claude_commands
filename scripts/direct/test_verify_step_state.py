@@ -18,10 +18,8 @@ def read_step_row(call_id: str) -> dict[str, object]:
         raise AssertionError(f"The live record is invalid: {record}")
     location: dict[str, object]
     match record.runs_on:
-        case step_record.MacAllowed():
-            location = {"kind": "mac_allowed"}
-        case step_record.SshAllowed(_, mac_targets):
-            location = {"kind": "ssh_allowed", "mac_targets": list(mac_targets)}
+        case step_record.AnyTarget(_, mac_targets):
+            location = {"kind": "any_target", "mac_targets": list(mac_targets)}
         case step_record.NatedevOnly(reason):
             location = {"kind": "natedev_only", "reason": reason}
     return dict(kind=record.kind, state=record.state.value, selected_target=record.selected_target,
@@ -119,7 +117,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     import subprocess
     subprocess.run([sys.executable, os.environ["TEST_STATE_OBSERVER"], "tree"], check=True)
 '''))
-        result = self.run_verify("lint", "--workspace", "--no-cache")
+        result = self.run_verify("lint", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.observations()
         initial = rows[0]
@@ -137,8 +135,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         _ = self.observe()
         self.fixture.environment["TEST_STATE_SEQUENCE"] = "1"
         targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-        _ = targets.write_text(TARGETS.replace('print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")',
-                                               'print("ssh_allowed" if allowed else "natedev_only makes natedev artifacts")')
+        _ = targets.write_text(TARGETS
                               + 'if command == "reserve":\n'
                               + '    Path(sys.argv[sys.argv.index("--reservation-file") + 1]).write_text("mac\\t" + os.environ["MAC_TEST_CONFIG"] + "\\n")\n')
         result = self.run_verify("test", "sample", "--target", "mac")
@@ -158,9 +155,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     def test_initial_ssh_record_lists_only_macos_targets_as_mac_targets(self) -> None:
         _ = self.observe()
         targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-        _ = targets.write_text(TARGETS.replace(
-            'print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")',
-            'print("ssh_allowed" if allowed else "natedev_only makes natedev artifacts")')
+        _ = targets.write_text(TARGETS
             + 'if command == "eligible":\n'
             + '    print("linux-box\\teligible\\t-\\t/tmp/linux.conf\\tlinux")\n'
             + 'if command == "reserve":\n'
@@ -168,7 +163,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         result = self.run_verify("test", "sample", "--target", "mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         initial = next(row for row in self.observations() if row["event"] == "initialize_step_record")
-        self.assertEqual(initial["runs_on"], {"kind": "ssh_allowed", "mac_targets": ["mac"]})
+        self.assertEqual(initial["runs_on"], {"kind": "any_target", "mac_targets": ["mac"]})
 
     def test_removed_or_foreign_record_refuses_before_the_step(self) -> None:
         for damage in ("removed", "foreign", "nul"):

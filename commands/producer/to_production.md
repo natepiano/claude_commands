@@ -101,9 +101,9 @@ Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
 - **Hub files** are copied from the greenlight result.
-- **Merge tests:** the command that runs the app package's tests, which catch
-  cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,
-  never a bare package name.
+- **Merge tests:** give the command for the app package's tests, if one exists.
+  Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
+  These tests find failures across packages. Give a command, never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.
 - **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,

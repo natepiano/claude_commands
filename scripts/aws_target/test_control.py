@@ -72,7 +72,7 @@ class ControlTests(ControlFixture):
             offload.KnownRepository("hana", "https://example.invalid/team/hana"))
         pid = os.getpid()
         step_record.write(step_record.StepRecord("pinned", pid, step_record.process_start(pid), self.root,
-            kind, "hana", step_record.SshAllowed((target,)), step_record.StepState.WAITING_SSH,
+            kind, step_record.NamedPackage("hana"), step_record.AnyTarget((target,)), step_record.StepState.WAITING_SSH,
             "2026-01-15T12:00:00Z", selection=step_record.Pinned(target)))
 
     def test_one_new_pinned_step_starts_capacity_without_local_queue_demand(self) -> None:
@@ -81,6 +81,24 @@ class ControlTests(ControlFixture):
         self.assertEqual(self.aws.count("start-instances"), 1)
         decision = ledger.CostLedger(self.state).read_snapshot().decision
         self.assertEqual(decision["status"], "allowed")
+
+    def test_pinned_final_starts_capacity_for_check_and_test(self) -> None:
+        self.pinned_step(kind="final")
+        self.assertEqual(self.controller().tick().state, "starting")
+        self.assertEqual(self.aws.count("start-instances"), 1)
+
+    def test_pinned_final_requires_both_remote_kinds(self) -> None:
+        self.pinned_step(kind="final")
+        for kinds in ("check", "test"):
+            with self.subTest(kinds=kinds):
+                self.replace("kinds", kinds)
+                self.assertEqual(self.controller().tick().state, "stopped")
+                self.assertEqual(self.aws.count("start-instances"), 0)
+
+    def test_unpinned_build_waiters_do_not_start_capacity_with_default_kinds(self) -> None:
+        self.snapshot(self.waiter(101, step="build"), self.waiter(102, step="build"))
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.assertEqual(self.aws.count("start-instances"), 0)
 
     def test_queue_repository_hold_controls_whether_a_stopped_box_starts(self) -> None:
         self.replace("start_after_wait_s", "1")
@@ -137,7 +155,8 @@ class ControlTests(ControlFixture):
                 self.assertEqual(self.aws.count("start-instances"), 0)
                 self.replace(key, "20" if key == "daily_limit_usd" else "400")
 
-    def test_foreign_completed_and_local_only_pins_do_not_start_aws(self) -> None:
+    def test_foreign_completed_and_disallowed_pins_do_not_start_aws(self) -> None:
+        self.replace("kinds", "test,check,doc")
         self.pinned_step("spare")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.pinned_step(kind="build")
@@ -458,7 +477,8 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         _ = self.controller().tick()
         self.assertEqual(self.aws.count("start-instances"), 0)
 
-    def test_local_only_kinds_unknown_repositories_and_token_waiters_do_not_supply_demand(self) -> None:
+    def test_disallowed_kinds_unknown_repositories_and_token_waiters_do_not_supply_demand(self) -> None:
+        self.replace("kinds", "test,check,doc")
         token = self.waiter(104)
         token["token_left_at"] = self.clock.now - 300
         self.snapshot(self.waiter(101, step="build"), self.waiter(102, step="lint"),

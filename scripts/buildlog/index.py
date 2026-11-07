@@ -18,25 +18,19 @@ import os
 import re
 import sqlite3
 import time
-import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
+from typing import BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
 from scripts.buildlog import store, parse
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib import conf
-    from ..test_times.gate_record import TYPE_CHECK_JOB
-else:
-    from scripts.lib import conf
-    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.lib import conf
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 SCHEMA_VERSION = 33
 
@@ -258,7 +252,7 @@ CALL_COLUMNS: list[Column] = [
     ("caller", "TEXT", "verify for verify.sh (NULL before 2026-10-02), cargo-port for port-lint"),
     ("command", "TEXT", "'lint hana', 'test hana_diegetic', 'port-lint clippy', ..."),
     ("verb", "TEXT", "verify.sh: check, test, lint, fmt, example, example-test, final; port-lint: clippy, mend, sweep"),
-    ("package", "TEXT", "the package named"),
+    ("package", "TEXT", "the named package, or workspace"),
     (
         "outcome",
         "TEXT",

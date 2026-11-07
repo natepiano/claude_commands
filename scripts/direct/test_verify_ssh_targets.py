@@ -213,7 +213,7 @@ import sys
 words = sys.argv[1:]
 settings = str(Path(os.environ["CONF_DIR"]) / "aws_target.conf")
 if words[0] == "eligible":
-    print("ssh_allowed")
+    print("any_target")
     print("aws\teligible\t-\t" + settings + "\tlinux")
 elif words[0] == "reserve":
     Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")

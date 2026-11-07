@@ -46,7 +46,7 @@ class Commands:
         self.calls.append(tuple(arguments))
         if arguments[0] == "bash" and self.failure and self.failure in str(repo):
             return run.CommandResult(1, "FAIL crate test")
-        if arguments[0] == "bash" and arguments[2] == "final-pass" and self.move is not None:
+        if arguments[0] == "bash" and tuple(arguments[2:4]) == ("final", "--saved") and self.move is not None:
             canonical, destination, commit = self.move
             _ = run.git(canonical, "update-ref", destination, commit)
             self.move = None
@@ -962,8 +962,8 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.git("merge-base", commit, self.destination), commit)
         self.assertEqual(self.git("rev-parse", record["branch"]), commit)
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual([args[2] for args in self.commands.calls if args[0] == "bash"],
-                         ["final", "lint", "final-pass"] * 2)
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for args in self.commands.calls if args[0] == "bash"],
+                         ["final", "lint", "final --saved"] * 2)
         self.assertTrue(all(args[2:4] == ("--workspace", "--all-targets")
                             for args in self.commands.calls if args[0] == "cargo" and args[1] in {"check", "clippy"}))
         for ticket in set(record["tickets"].values()):
@@ -1200,8 +1200,8 @@ class CrateRunTests(CargoProjectTests):
             result = resumed.advance("bulk_sample", cast(crates.Planner, mock.Mock(side_effect=AssertionError("planning"))),
                                      self.commands, available, fixture_execute)
         self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
-        self.assertEqual([args[2] for args in self.commands.calls[before:] if args[0] == "bash"],
-                         ["final", "lint", "final-pass"])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for args in self.commands.calls[before:] if args[0] == "bash"],
+                         ["final", "lint", "final --saved"])
 
     def test_destination_moving_during_combined_validation_refuses_cas_and_keeps_pending_claims(self) -> None:
         self.freeze()

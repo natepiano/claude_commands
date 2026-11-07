@@ -27,7 +27,7 @@ class FinalPassTests(FinalPassFixture):
         metadata_count = self.metadata_count()
         self.environment.update({"BUILD_TARGETS_SCRIPT": "/missing-checker", "IN_NIX_SHELL": "",
                                  "BUILD_HOLD_DIR": "/missing-hold-root"})
-        for args in (("final-pass",), ("final-pass", tree)):
+        for args in (("final", "--saved",), ("final", "--saved", "--tree", tree)):
             with self.subTest(args=args):
                 answer = self.verify(*args)
                 self.assertEqual(answer.returncode, 0, answer.stderr)
