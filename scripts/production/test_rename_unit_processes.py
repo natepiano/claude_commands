@@ -95,7 +95,7 @@ class RunProcessTests(StaffTestCase):
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
         parent = recorded_showrunner("demo", self.root / "demo-production.md")
         member = fixture_unit_location(parent, worktree.name, worktree)
-        _ = (folder / "progress_history_state.json").write_text(json.dumps({"production": parent.name, "unit": member.name}))
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
