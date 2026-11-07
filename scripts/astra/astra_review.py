@@ -190,6 +190,8 @@ def main(arguments: list[str]) -> int:
         said = tail(log.read_text(encoding="utf-8"))
         print(f"astra_review: the {MODEL} review of {document} failed on workers account {label} ({why}).",
               f"Codex said:\n{said}", f"Log: {log}", sep="\n", file=sys.stderr)
+        if written:
+            print(f"Saved: {review}", file=sys.stderr)
         return 2 if returncode == 2 else 1
     print(f"# {MODEL} review of {document} (workers account {label})\n")
     print(written)
