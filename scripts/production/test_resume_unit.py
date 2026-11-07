@@ -3,6 +3,8 @@
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
@@ -48,6 +50,7 @@ DIRECTOR = "11111111-1111-1111-1111-111111111111"
 
 
 def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
