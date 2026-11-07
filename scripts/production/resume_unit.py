@@ -29,7 +29,7 @@ from scripts.production import add_unit
 import retire_unit
 import unit_lookup
 import unit_names
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.production.production_doc import Production, Refusal
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"

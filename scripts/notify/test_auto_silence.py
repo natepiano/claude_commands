@@ -14,26 +14,18 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.notify import auto_silence
 from scripts.notify import silence
 
-if TYPE_CHECKING:
-    from ..lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
-    from ..lib import relaunch
-    from ..lib import resume_message
-    from ..production import session_staff, staff
-    from ..shutdown import pane_record
-    from ..hooks import conversation_pause
-else:
-    from scripts.lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
-    from scripts.lib import relaunch
-    from scripts.lib import resume_message
-    from scripts.production import session_staff, staff
-    from scripts.shutdown import pane_record
-    from scripts.hooks import conversation_pause
+from scripts.lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
+from scripts.lib import relaunch
+from scripts.lib import resume_message
+from scripts.production import session_staff, staff
+from scripts.shutdown import pane_record
+from scripts.hooks import conversation_pause
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "The build passed.", "detail": "", "key": "", "text_id": ""}

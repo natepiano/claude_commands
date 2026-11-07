@@ -441,7 +441,7 @@ def check():
             self.assertNotIn("import sys", converted)
             self.assertNotIn("from pathlib import Path", converted)
             self.assertNotIn("ROOT =", converted)
-            self.assertTrue(converted.startswith("#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py\n"))
+            self.assertTrue(converted.startswith("#!/usr/bin/env python3\n"))
             self.assertIn("outside: scripts/beta/consumer.py", report.getvalue())
             self.assertIn("sys.path.insert", (beta / "consumer.py").read_text())
             result = subprocess.run([sys.executable, "-c", '''from scripts.alpha import caller

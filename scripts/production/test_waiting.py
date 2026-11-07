@@ -40,7 +40,7 @@ from fake_showrunner import write_timer
 from scripts.production import update_registration
 import waiting
 from scripts.production.cli_fixture import invoke_cli, production_paths
-from fake_herdr import CommandResponse
+from scripts.herdr.fake_herdr import CommandResponse
 import fake_unit_host
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 

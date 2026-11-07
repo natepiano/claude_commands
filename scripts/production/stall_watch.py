@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
-import rca  # noqa: E402
+from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
 from scripts.herdr import herdr  # noqa: E402

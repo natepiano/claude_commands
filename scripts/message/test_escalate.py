@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.message import escalate
@@ -20,10 +20,7 @@ from scripts.message import send
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
-if TYPE_CHECKING:
-    from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-else:
-    from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
+from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from scripts.notify.user_action import ActionRequired, NoActionRequired
 
 SCRIPT = Path(__file__).with_name("escalate.py")

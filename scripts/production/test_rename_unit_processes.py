@@ -26,7 +26,7 @@ from scripts.lint.memory_test_support import config_environment
 if TYPE_CHECKING:
     from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 else:
-    from unit_staff_test_support import PARENTS, isolated_parents
+    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
