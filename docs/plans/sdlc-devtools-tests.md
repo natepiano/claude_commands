@@ -1352,3 +1352,38 @@ The order stays: admit, `worker_state.py`, switch check, claim, `phase_reservati
 **Gotchas:** `git grep implement.sh` also prints `scripts/notify/` (the approved phone sample; a changed sample voids the user's approval), `docs/direct_footprint_review.md` (a dated review), `settings.json` and a negative assertion in `scripts/lib/test_relaunch.py`. A `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree.
 
 **Ruled out:** a compatibility shim for saved `implement.sh` commands; 0 of 20 records held one.
+
+### Phase 8j — A worker claim belongs to the process that made it  · status: todo
+
+Source: sdlc [3512fc77]: two older defects, after 4a. A wrong result goes first among next items. (1) `assign_claude.py` trusts any live PID as the claim owner, with no start-time check. (2) `remove_workers.py` printed `unit director is not live` for a live director.
+
+**Depends on:** 8i
+
+#### Work Order
+
+**Goal:** a reused process id does not block a worker launch, and `remove_workers.py` prints the real reason for each removal.
+
+**Spec:**
+1. **The claim holds its start.** `impl_claim_<slot>.json` holds `pid`, `started` and `worker`. `started` is the launcher's own start from `scripts/lib/process_start.py` (`process_start(os.getpid())`, its `Started` value). Both writers set it: `assign_claude._claim` and `assign.claim_worker`.
+2. **One reader.** `scripts/direct/worker_state.py` holds one function that reads a claim file and returns a named result: the claim is held by a live launcher, or the claim has ended. Held: `process_start(pid)` is `Started` with the recorded value, or `Unreadable`. Ended: `Gone`, `Zombie`, or `Started` with another value. `assign_claude._claim` and `assign.claim_worker` call it and lose their `os.kill` blocks. The refusal text `<name> is claimed by launcher <pid>` and the ended path (remove the file, write `error` to a status that reads `implementing`) stay as they are.
+3. **The removal reason.** `remove_workers.removal_targets` gives the reason `unit director is not live` only to a sweep with no own run, where the parent is proved not live. A worker of an own run gets `its run finished this phase`. Name both as module constants. Which worker goes does not change.
+4. **Out of scope.** `launcher_pid` in the worker roster (`assign.py` near `already implementing`) has the same weakness and holds no start: leave it, and the director reports it to sdlc. Add no new refusal. Each change narrows an existing refusal or corrects text.
+
+**Acceptance:**
+- Real path through `bash scripts/direct/assign.sh` with the fixture Claude binary in `scripts/direct/test_assign_claude_claims.py`: a claim with a live pid and another start recovers and the launch runs; a claim with a live pid and the same start refuses with the same text and writes no pass; a claim with a dead pid recovers as today.
+- `scripts/direct/test_worker_state.py`: one test for each result of the new function: `Started` same, `Started` other, `Gone`, `Zombie`, `Unreadable`.
+- `scripts/direct/test_remove_workers.py`, through `main`: a worker of an own run with a live director prints `its run finished this phase`; a sweep with a dead director prints `unit director is not live`.
+- Existing assertions hold. A fixture that writes a live claim adds its `started` value.
+- basedpyright `0 errors, 0 warnings, 0 notes` on each worker's files. The full gate passes.
+
+**Files:**
+- `scripts/direct/worker_state.py`, `scripts/direct/assign.py`, `scripts/direct/assign_claude.py`, `scripts/direct/test_worker_state.py`, `scripts/direct/test_assign_claude_claims.py` — the claim.
+- `scripts/direct/remove_workers.py`, `scripts/direct/test_remove_workers.py` — the removal reason.
+
+**Workers:** `2 writers`
+- `claim` — the claim files above.
+- `removal` — the removal files above.
+
+**State:** `impl_claim_<slot>.json` gains `started`. A claim lasts one launcher life, so there is no conversion. A claim from a launcher that runs across the landing reads as ended; its worker is busy, so `assign_claude._claim` refuses at its idle check and `assign.claim_worker` refuses at its `launcher_pid` check.
+
+**Constraints from prior phases:** Phase 8i: `assign_claude.py` has no `__main__` and runs in the assign process; the claim holds `os.getpid()`; `run` releases it in `finally`. `_release` and `assign.py`'s interrupted path compare only `pid` with `os.getpid()`, and they stay. The import rule: `from scripts.<folder> import <module>`, no `sys.path` line.
