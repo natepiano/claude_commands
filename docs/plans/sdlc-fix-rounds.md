@@ -248,3 +248,60 @@ The user, 2026-11-02 19:4x EST, relayed by the sdlc showrunner, on `/module_revi
 - `scripts/agents/agent_exec.sh` and the phase review path did not change.
 
 **Files:** the three commands; `commands/agent.md`; `config/agents.conf`; `docs/as-built/agent-registry.md`; `docs/direct_footprint_review.md`; `scripts/agents/agent_admin.sh`; `scripts/direct/test_phase_process.py`; `scripts/lib/test_agents_registry.conf`, `scripts/lib/test_agents_registry_fixture.py`; `scripts/whoami/quota_alert_test_support.py` and ten `scripts/whoami/test_*` files.
+
+### Phase 9 — `/showrunner:units` shows only units, with a status column and anomaly lines  · status: done
+
+The user, 2026-11-05, relayed by hana and the sdlc showrunner: "we should show the units for a producer - we shouldn't show anything else but the anomalies sould show because they are not accounted for either in the script (like morty - which should be accounted for and not shown) or if there ar orphan units they are indicators of a bug or an actual orphan and need to be addressed" (allow-banned: user quote). And: "you need to show a status column for a unit as to whether it is paused or active - that should be added to the command also".
+
+#### Work Order
+
+Design from the sdlc showrunner:
+
+1. The table shows only the production's staff units. Every process that `unit_phases.py` cannot place is an anomaly line under the table, on stdout. Today these lines go to stderr from `scripts/production/session_staff.py:665`, above the table. When a run has anomaly lines, the script sends one message per run with those lines through `send.py --to <target>`. The target is `sdlc`, read from a key in `config/production.conf`.
+2. Morty is placed and is not an anomaly. Match its Codex thread with `MORTY_NATIVE_ID` in `config/send.conf`, the value that `send.py` uses for `Authority: morty`. Read the value from that config. Do not copy it. A Codex process that is not Morty stays an anomaly.
+3. The tables get a Status column, `paused` or `active`, in the plain table and the style table. The pause record is one field on the staff row: `paused = {since, by, why}`. No field means active. There is no new store.
+4. One command sets and clears the field, in the existing staff command:
+   - `staff.py pause <unit> --why "<why>"`
+   - `staff.py pause --production <slug> [--except <unit>...] --why "<why>"`
+   - `staff.py resume <unit>`
+   - `staff.py resume --production <slug>`
+5. A pause is a record only. It stops nothing. A rerun of pause or resume succeeds.
+6. Add no other check.
+
+**Files:** `scripts/production/unit_phases.py`, `live_units.py`, `session_staff.py`, `staff_sources.py`, `unit_lookup.py`, `display_cells.py`, `style_units.py`, `staff.py`; `config/production.conf`; `commands/showrunner/units.md`; `docs/as-built/staff-accessors.md`, `docs/as-built/showrunner-automation.md`; and their test files.
+
+**Workers:** `2 writers`
+- `impl` — the source, config and doc files.
+- `test` — the test files, written at the same time, with the callers' existing tests in each edit round.
+
+**Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
+
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: in progress
+
+From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
+
+- `codex_mesh end` stops the run's servers before `staff.retire`, so a retire fault can never leave a server running.
+- `_release_source_servers` and `stop_worker_for_switch` lose their refusals. A release prints one `anomaly:` line for an invalid record or a server that fails to answer, and goes on.
+- One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
+- `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
+- After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
+
+From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` does not merge.
+
+Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
+
+### Phase 9v — A production pause keeps each unit named in --except  · status: done
+
+From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. One matcher, unit_match, limited to the production's own members. A refusal for an unmatched value is a new check, and it waits for the user's answer.
+
+### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
+
+From the sdlc showrunner, 2026-11-06. Devtools 7u replaced the production slug with the showrunner's staff name. Merge sdlc into this branch. Keep that name, and keep the Status column, pause records and anomaly lines from Phase 9. Add no new check.
+
+### Phase 9t — A commit that exists is not reported as failed  · status: done
+
+From the sdlc showrunner, 2026-11-06, rca 261106-1. Separate hash, on branch `sdlc-fix-rounds-publish`, from sdlc. Add no new check.
+
+`scripts/lib/main_publish.commit` runs `git commit --only`. A stale `.git/MERGE_RR.lock` made git exit nonzero after it wrote the commit, because rerere runs after the commit. `commit` took that as no commit, restored the old file text and said the value was unchanged. HEAD held `SIMPLIFY_LENS=off`, the live file said on, the commit was not pushed, and every main promotion refused. The fix compares HEAD before and after: when HEAD moved, the commit exists, so the new file stays and the push goes on.

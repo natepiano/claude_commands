@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, cast, override
 
 if TYPE_CHECKING:
     from ..lib import process_start as process_identity
+    from ..copies.copies_test_support import copies_environment
     from ..lib.git_test_support import commit_repository
     from ..lib.process_start_test_support import process_reader
 else:
     from scripts.lib import process_start as process_identity
+    from scripts.copies.copies_test_support import copies_environment
     from scripts.lib.git_test_support import commit_repository
     from scripts.lib.process_start_test_support import process_reader
 
@@ -133,6 +135,7 @@ class RepositorySlotTests(unittest.TestCase):
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),

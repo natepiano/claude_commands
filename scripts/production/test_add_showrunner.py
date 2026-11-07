@@ -497,7 +497,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
               patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
               patch.object(runtime.Herdr, "start_command", side_effect=started),
-              patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
+              patch.object(runtime.Herdr, "readiness", return_value={"agent_status": runtime.AgentStatus.IDLE, "interactive_ready": True}) as readiness,
               patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(runtime.Herdr, "run", side_effect=visible),
               patch.object(runtime.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
