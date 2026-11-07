@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
-from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
@@ -63,6 +63,13 @@ HARNESS_NOTICE = re.compile(r"^\[Cross-session [a-z]+ notice\]")
 USAGE_RESET = "Your claude.ai usage limit has reset."
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
+WHOLE_PASTE = re.compile(
+    r'<pasted_content id="(?P<id>[^"]+)">'
+    + rf'(?P<text>\s*{re.escape(SCRIPT_ENVELOPE_START)}'
+    + rf'(?:(?!{re.escape(SCRIPT_ENVELOPE_END)}).)*{re.escape(SCRIPT_ENVELOPE_END)}\s*'
+    + r'|(?:(?!</?pasted_content\b).)*)'
+    + r'</pasted_content(?: id="(?P=id)")?>\s*', re.DOTALL,
+)
 
 type ScheduledSenderLookup = Callable[[], frozenset[str]]
 type ScheduledPromptLookup = Callable[[], tuple[str, ...]]
@@ -373,9 +380,12 @@ def prompt_source(
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
-    if text.startswith(SCRIPT_ENVELOPE_START):
+    # A complete script envelope can contain literal paste tags.
+    paste = WHOLE_PASTE.fullmatch(text)
+    script_text = paste.group("text").lstrip() if paste is not None else text
+    if script_text.startswith(SCRIPT_ENVELOPE_START):
         return PromptSource.SCHEDULED
-    recorded_script = typed_by_script(text)
+    recorded_script = typed_by_script(script_text)
     if CROSS_SESSION_TAG.match(text) is not None:
         opening_tag = text.partition(">")[0]
         match = FROM_NAME.search(opening_tag)
