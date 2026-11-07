@@ -329,8 +329,8 @@ From the sdlc showrunner, 2026-11-06. Codex worker merge16 (verify-unit) stopped
 
 Cause: the worker's turn never ended. Each stall began at an `rm -f` of a run log, which Codex holds for approval under `on-request`. merge16's turns all ran `on-request`: `_start_turn` named `sandboxPolicy` on each turn but no `approvalPolicy`, and the server keeps a thread's last turn policy. The launcher does not answer server requests, so the approval waited until an interrupt. `_start_turn` now names `approvalPolicy: never` on every turn. sdlc kept the fix to `_start_turn`.
 
-### Phase 10 — A relaunch of the same work adds no repair round  · status: in progress
+### Phase 10 — A relaunch of the same work adds no repair round  · status: done
 
 From the sdlc showrunner, 2026-11-06. In cargo-liner, a worker relaunch after a launcher fault counted as repair rounds: the ledger showed 4 rounds for 1 repair and asked for two extra Astra reviews. direct.md says: "Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round." This unit shows the same defect: phase 9x had 2 ledger batches, and its Astra record says repair round 4. Add no new check.
 
-Cause: `findings._repair_round` counted every group from `history/rounds.phase_rounds`. A fix pass with no ledger batch (a gate run sent as a fix, a relaunch with no ledger number, a follow-up) makes its own group, so it added a round. It now counts only the groups that hold a ledger batch. `phase_rounds` and `history.py rounds` keep the other groups.
+Cause: `findings._repair_round` counted every group from `history/rounds.phase_rounds`. A fix pass with no ledger batch (a gate run sent as a fix, a relaunch with no ledger number, a follow-up) makes its own group, so it added a round. It now counts the distinct ledger batch numbers that the groups hold, less the refunded batches that never land. One batch split across two groups counts once. `phase_rounds` and `history.py rounds` keep the other groups.
