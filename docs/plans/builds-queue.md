@@ -602,7 +602,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 **Goal:** `copies.py list` answers who holds a mirror.
 
 **Spec:**
-1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
 2. **Holder states (architect review of 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through 18c's row id), idle, or unavailable.
 3. **Proof.** List tests for remote-only records and mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name.
 
@@ -655,6 +655,25 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 11. **Browser proof (architect review of 18, 2026-11-06).** The browser proof today is `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/adhoc/memory_page7/verify.mjs`: Machine column order, a first read with no answer, a kept reading, and the stale-reading messages. It moves with the page, and the tester owns it.
 12. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The page command restarts the feed when the installed admission code changes. Test: a feed that started before a schema update reads the new record after the restart.
 
+13. **Project names.** The feed prints each running and waiting step with `queue_lines.step_text`, not the raw step (`memory_feed.py:398` and `:471` today). Feed tests: a known project, a missing project, and an absolute path repository that shows the step alone.
+14. **Progress line and row list.** The running rows keep the thin progress line. A browser test keeps a walk whose row list shrinks between two readings.
+15. **Page defects from the design checks of 2026-11-06.**
+    1. The unit shows twice in a row: remove the second line of the name.
+    2. "not recorded / 25%" and "not recorded / 5%" wrap: keep them on one line.
+    3. The swap list's second label sits 3 px above the main baseline.
+    4. The swap list has 31 rows: show the large rows and sum the rest in one line.
+    5. Swap use shows three times: keep the Swap used bar with its limit, put the GiB figures on its line, and remove the purple bar.
+    6. Hatched "Reserved, not used yet" blocks reach 2.06:1 in light and 2.61:1 in dark; the floor is 3:1.
+    7. Small grey swap tags reach 4.18:1 in light; the floor is 4.5:1.
+    8. Rows sit 6 px inside the card edges: align them with the card text.
+    9. A queued reservation value ends at x=351 against x=302 above: use the dim style.
+    10. A missing unit shows a bare dash: remove the dash and the dot.
+    11. The Unit and Pid columns move 39 px when a step queues: reserve the Duration width.
+    12. The lower axis runs past the cap: end it at the last tick before the cap.
+    13. "0.2 GiB · 1.1 GiB" has no header: add "Used · reserved".
+    14. Open Legend values sit about 850 px from their labels: put them in a column near the longest label.
+    15. "Next step room" puts its value on a second line: keep it on the first line, right-aligned to the label column end.
+
 **Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
 ### Phase 10n — /build:queue retires when the build page covers it  · status: todo
@@ -662,28 +681,23 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 **Depends on:** 10m.
 
 1. **The ask.** C959 (above): retire /build:queue once the page covers it.
-2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the view routes and the view code that only they use. `build_queue.py` also carries the `bump`, `clear` and `admit-head` controls, which the page does not have: these routes stay until the user approves a replacement (architect review of 18, 2026-11-06). Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). The queue card and the unit-board queue pane stay unless the user says otherwise.
+2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the view routes and the view code that only they use. `build_queue.py` also carries the `bump`, `clear` and `admit-head` controls, which the page does not have: these routes stay until the user approves a replacement (architect review of 18, 2026-11-06). Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). Keep `queue_lines.step_text`: the card and the build page use it. The queue card and the unit-board queue pane stay unless the user says otherwise.
 3. **Proof.** No caller of the removed code remains; the suites pass.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
 
 ### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: not landing
 
-**Not landing (user, 2026-11-06):** "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue". A unit's local Python test runs start at once. Cargo steps and gates keep their queue places. Detached Python runs move to `builds-detached.slice` in Phase 23. The text below is the old Work Order, kept for its findings.
+**Not landing (user, 2026-11-06):** "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue". A unit's local Python test runs start at once. Cargo steps and gates keep their queue places. Detached Python runs move to `builds-detached.slice` in Phase 23.
 
-**Depends on:** 10z and 10x (same admission files; 10v's code starts after 10x is checkpointed).
+#### As-built
 
-1. **The ask (user, 2026-11-04; builds assigned it to queue-unit).** "do they actually still follow the queue rules and they just get in because they're so small? i don't recall ever seeing one waiting in line." They do not: Python test runs and scripts in `builds.slice` never ask the queue. The queue counts them only after they start.
-2. **Evidence.** At 11:30 EST on 2026-11-04 the memory page showed 56 such runs holding 3.1 GiB, 27.0 of a 24.0 GiB budget taken, while startup's nextest waited.
-3. **The change.** One entry point starts every run in `builds.slice`, and it asks the queue first. A small run gets in at once when room exists and waits when it does not. No other code starts a `builds.slice` scope.
-4. **Callers.** Find each place that starts a run in `builds.slice` (today: `mesh_runs.py`, `merge_gate.py`, `lint/invoke.sh`, `build_hold/cargo`, `QueuePlace.popen` (`queue_place.py:270`), and others the design finds). Switch every caller in the same change. Name each outside owner in the notice's also-touches line; `merge_gate.py` is sdlc devtools-unit's.
-5. **Full tests (user, 2026-11-04: "seems like they deserve different names - the one that unit runs is not the merge gate"; "go full tests").** `merge_gate.py --tests-only`, a unit's run on its own copy, is one caller of the entry point with step `full-tests`, shown as "full tests". A showrunner's merge, test and push stays `merge-gate`. Every place keyed by the `merge-gate` kind (config keys, build folder prefixes, need history, views, reports) handles `full-tests`; `program_peak_estimate` takes a merge gate's first need from config and never from history (`step_estimator.py:256`, moved by Phase 10o; architect review of 15 and 10o, 2026-11-06), so extend that first-peak branch: `full-tests` gets the same branch and a new key `program_first_peak_gib.full-tests`, at 4 GiB; a new key needs no user go. `reservation_profile_key` (`memory_admit.py:1862`) gives `merge-gate` its own key form with the gate shape (`merge_gate_shape`, `memory_admit.py:289`, reads `--type-dirs` in the argv), and `full-tests` takes the same form. No profile moves to `full-tests` (director call, one-line revert): until a `full-tests` profile has samples, the run keeps the full need. Tests: a first `full-tests` run gets the configured need; a `merge-gate` profile does not size a `full-tests` run; a test-only run and a run with types keep separate profiles. Renaming or deleting a `merge-gate` config key needs the user's approval, so `program_first_peak_gib.merge-gate` and `peak_hold_seconds.merge-gate` stay. A default gate has no type job; `--nightly` runs it. Builds, 2026-11-04: build it on sdlc devtools-unit Phase 7p once 7p is on main, and trial-merge origin/sdlc before the notice.
-6. **Nested calls.** Some callers are wrappers around programs that already ask the queue. A nested call reuses the reservation of the call around it: one run gets one charge and never waits on its own request.
-7. **Proof.** Tests: with another admitted run or a held slot present, a run with no room waits in line and shows on the queue (on an empty host an oversized run starts alone, so that case proves nothing); a small run with room starts at once; a nested call gets no second charge and does not block itself; no caller starts a `builds.slice` scope outside the entry point. Live check: the memory page shows no "worker background runs" row that skipped the line.
+- No entry point exists. A plain Python run in `builds.slice` does not ask the queue, and its memory lowers the cap and the room through Other.
+- The `targeted test` name for a unit's own full run is in natest's work: `program_first_peak_gib.targeted-test=4`, `peak_hold_seconds.targeted-test=180`.
 
-8. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
+**Binds later work:** the detached run group phase keeps detached Python runs outside the queue. Do not route a plain Python run through the queue.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the entry point, `memory_admit.py`, `scripts/build_queue/step_estimator.py`, `scripts/agents/mesh_runs.py` and the shared `scripts/build_queue/queue_place.py` entry path; outside callers by owner: sdlc devtools-unit (`merge_gate.py`), verify-unit (`verify.sh` paths), aws-unit (target paths); `test` owns the tests.
+**Ruled out:** one entry point that every `builds.slice` run must pass. User, 2026-11-06: "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue".
 
 ### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: done
 
@@ -1167,9 +1181,9 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Spec:**
 
 1. **The wait.** natedev confirms the runner activation. builds asks the user, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `MemoryConfig`. `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
 3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
-4. **Proof.** Tests: registered jobs have no keep-aside; an unregistered job counts once in the cap and takes no margin. Remove the tests of the mixed rule only with an approved assertion change.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
 
 **Files:**
 - `config/build_admission.conf`
@@ -1183,7 +1197,54 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
 
-**Change-Review:** none — the queue view shows the same rows; the room rises by the margin while a registered CI job runs.
+**Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
+
+### Phase 23 — Detached Python runs have their own group and count in Other  · status: todo
+
+**Depends on:** Phase 18 of the herdr worker-panes plan on GitHub builds. That phase renames `scripts/agents/mesh_runs.py` and its config. Source: user, 2026-11-06.
+
+#### Work Order
+
+**Goal:** A detached Python run stays outside the build queue and shows under Other on the memory page. A cargo or lint step inside a detached run still asks the queue and counts as a build.
+
+**Spec:**
+
+1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc."
+2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the line that is `mesh_runs.py:647` today. The limits of `builds.slice` still hold it.
+3. **Reader.** The scope reader in `memory_admit.py` (line 2648 today) treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
+4. **Page.** `memory_feed.py` makes no row for the group (line 419 today in the session prototype; `scripts/build_page/` after the build page moves). Its memory reads as Other.
+5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
+6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
+
+**Files:**
+- `scripts/agents/mesh_runs.py` — renamed by the herdr phase; use the new name.
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/test_queue_view.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Workers:** `1 writer + 1 tester` — `impl` owns the launcher line, the reader and the feed; `test` owns their tests.
+
+**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** Detached Python runs count in Other | On natedev, open the memory page while a worker's detached Python tests run | The runs show no row, and Other holds their memory.
+
+### Phase 20d — A queue row names the project of its step  · status: done
+
+#### As-built
+
+- `queue_lines.step_text(step)` prints `<project> <step>`, or the step alone when no project is known. The Step column in `/build:queue`, its card and every other person-facing line use it. Matching and history keep `step.step`.
+- `RunningStep` and `WaitingStep` have `project=""`. `memory_admit.step_project(repository_name, repo)` fills it and returns empty for an absolute path, so a gate stays `merge-gate`.
+- `/build:queue` hides every `UnownedSliceMemory` row. `queue_card.py` still prints that row for a person who selects it, and the memory page shows the memory as Other.
+- `test_admission_client.py::test_import_does_not_load_memory_admission` holds the client import boundary.
+
+**Files:** `scripts/build_queue/queue_lines.py`, `scripts/build_queue/admission_records.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py`, `scripts/lint/memory_admit.py`, `scripts/build_queue/golden/`, `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** the build page feed prints `queue_lines.step_text`. The service restart after landing puts the new text in the snapshot.
+
+**Gotchas:** `queue_lines.py` holds the function because `queue_evidence.py` loads `memory_admit`, which the client must not load.
+
+**Ruled out:** a row for runs outside the queue in `/build:queue`.
 
 ### Phase 23 — Detached Python runs show under Other  · status: todo
 

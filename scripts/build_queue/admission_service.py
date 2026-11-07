@@ -1231,6 +1231,7 @@ class AdmissionServer:
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
             "need_basis": gate.need_basis_record(profile.peak.basis), "test_scope": profile.scope,
+            "repository_name": profile.repo,
         }
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
@@ -1240,7 +1241,7 @@ class AdmissionServer:
                 row["token_back_at"] = request.token_back_at
         if isinstance(profile.repository, gate.RepositoryIdentity):
             row["repo_identity"] = profile.repository.key
-            row["repository_name"] = profile.repository.name
+            row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
         if isinstance(request, wire.AdmitRequest):
             row["package"] = gate.test_package(list(request.argv))

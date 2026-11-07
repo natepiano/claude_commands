@@ -51,6 +51,12 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_import_does_not_load_memory_admission(self) -> None:
+        result = subprocess.run([sys.executable, "-c",
+            "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True)
+        self.assertNotIn("scripts.lint.memory_admit", result.stdout.splitlines())
+
     def test_outage_message_reaches_builds_without_herdr_on_path(self) -> None:
         with short_socket_directory() as directory:
             root = Path(directory)

@@ -6,6 +6,7 @@ from scripts.lint.memory_test_support import write_pressure_reading, admission_p
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+import json
 import os
 import unittest
 from typing import Self, cast, override
@@ -80,6 +81,78 @@ class QueueViewTests(QueueFixtureTests):
                          [row.split()[:5] for row in after_rows])
         self.assertIn("metrics-gathering", text)
         self.assertIn("metrics-gathering", baseline)
+
+    def test_project_step_text_sets_the_column_width_and_keeps_rows_aligned(self) -> None:
+        model = self.fixture.cap_model()
+        first, second = model.reading.view.waiting[:2]
+        model = with_waiting(model, [replace(first, project="nateroids", step="nextest"),
+            replace(second, project="long-project-name", step="nextest")])
+        for columns in (60, 80, 100, 140):
+            with self.subTest(columns=columns):
+                lines = queue_view.render_view(model, columns)
+                rows = waiting_rows(lines)
+                self.assertIn("nateroids nextest", rows[0])
+                for marker in ("pid ",):
+                    self.assertEqual(terminal_width(rows[0][:rows[0].index(marker)]),
+                                     terminal_width(rows[1][:rows[1].index(marker)]))
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+        self.assertEqual(model.reading.view.waiting[0].step, "nextest")
+
+    def test_snapshot_without_project_fields_reads_with_empty_projects(self) -> None:
+        reservation = cast(dict[str, object], json.loads(self.fixture.reservation.read_text()))
+        reservation["repo"] = ""
+        self.fixture.write_json(self.fixture.reservation, reservation)
+        reading = self.fixture.model().reading
+        encoded = wire.encode_reply(wire.ViewReply(reading))
+        # Remove only the new optional field from the complete service reply.
+        def without_project(value: object) -> object:
+            if isinstance(value, dict):
+                return {key: without_project(item) for key, item in cast(dict[str, object], value).items()
+                        if key != "project"}
+            if isinstance(value, list):
+                return [without_project(item) for item in cast(list[object], value)]
+            return value
+        reply = wire.parse_reply(json.dumps(without_project(cast(object, json.loads(encoded)))))
+        self.assertIsInstance(reply, wire.ViewReply)
+        if isinstance(reply, wire.ViewReply):
+            self.assertEqual(reply.reading, reading)
+            self.assertTrue(all(not step.project for step in reply.reading.view.waiting))
+            self.assertTrue(all(not step.project for step in reply.reading.view.running))
+
+    def test_service_rows_show_the_repository_project_in_the_view_and_cards(self) -> None:
+        cases = (
+            ("checkout-alias", gate.RepositoryIdentity("repo-key", "nateroids"), "nextest", "nateroids"),
+            ("nateroids", gate.UnknownRepository(), "nextest", "nateroids"),
+            ("/home/natepiano/.claude", gate.UnknownRepository(), "merge-gate", ""),
+        )
+        for repo, repository, step, project in cases:
+            with self.subTest(repo=repo), AdmissionFixture() as fixture:
+                running = fixture.request(need=gate.GIB, step=step)
+                running = replace(running, profile=replace(running.profile, repo=repo, repository=repository),
+                                  sidecar=str(fixture.scope(running.owner)))
+                grant = only_admitted(fixture.server.handle_request(running))
+                waiting = fixture.request(need=60 * gate.GIB, step=step)
+                waiting = replace(waiting, profile=replace(waiting.profile, repo=repo, repository=repository))
+                replies = fixture.server.handle_request(waiting)
+                self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies))
+                _ = fixture.run_pass()
+                model = self.service_model(fixture)
+                active, = [row for row in model.reading.view.running if row.pid == running.owner.pid]
+                queued, = model.reading.view.waiting
+                self.assertEqual((active.project, queued.project), (project, project))
+                self.assertEqual((active.step, queued.step), (step, step))
+                shown = f"{project} {step}" if project else step
+                lines = queue_view.render_view(model, 140)
+                active_line, = [plain([line]) for line in lines if f"pid {running.owner.pid}" in plain([line])]
+                waiting_line, = waiting_rows(lines)
+                self.assertIn(shown, active_line)
+                self.assertIn(shown, waiting_line)
+                self.assertIn(shown, plain(queue_card.render_card(model, [1], 140)))
+                self.assertIn(shown, plain(queue_card.render_selection(model, active.session_id, 140)))
+                if not project:
+                    self.assertNotIn(repo, active_line)
+                    self.assertNotIn(repo, waiting_line)
+                fixture.release(grant)
 
     def test_ci_reservation_label_comes_from_configuration_and_runner_identity(self) -> None:
         with AdmissionFixture() as admission:
@@ -601,7 +674,7 @@ class QueueViewTests(QueueFixtureTests):
                 self.assertIn("8.0", queued)
                 self.assertIn("░", row)
 
-    def test_live_verify_run_between_steps_has_use_without_a_grant(self) -> None:
+    def test_live_scope_without_a_reservation_or_hold_has_no_queue_row(self) -> None:
         with AdmissionFixture() as fixture:
             owner = fixture.fixture_owner(700001, "100")
             process = fixture.proc.path / str(owner.pid)
@@ -619,13 +692,53 @@ class QueueViewTests(QueueFixtureTests):
             _ = fixture.server.run_pass()
             model = replace(self.service_model(fixture), labels={"between-owner": UnitLabels("worker", "hana", "hana")})
             text = plain(queue_view.render_view(model, 140))
-            running = "\n".join(line for line in text.splitlines() if line.startswith("run"))
-            row, = [line for line in running.splitlines() if "between steps" in line]
-            self.assertIn("hana", row)
-            self.assertIn("1.0", row)
-            self.assertIn("12", row.split())
-            self.assertIn("0.0 / 1.0", row)
+            self.assertFalse(fixture.server.reservations)
+            room = model.reading.explanation.room
+            assert isinstance(room, gate.MemoryRoom)
+            self.assertFalse(room.runs)
+            self.assertTrue(any(isinstance(step.measured, gate.UnownedSliceMemory)
+                                and isinstance(step.measured.activity, ScopeProcesses)
+                                and isinstance(step.measured.activity.run, LiveBuildRun)
+                                for step in model.reading.view.running))
+            self.assertFalse(queue_view.running_builds(model))
+            self.assertNotIn("between steps", text)
+            self.assertFalse(any(line.startswith("run") for line in text.splitlines()))
             self.assertNotIn("Still running after their build ended", text)
+
+    def test_live_scope_with_a_hold_shows_one_between_steps_row(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            child = fixture.fixture_owner(700002, "200")
+            _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
+                f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
+            sidecar = fixture.scope(child)
+            scope = Path(sidecar.read_text())
+            builds = fixture.root / "builds.slice"
+            builds.mkdir(exist_ok=True)
+            scope = scope.rename(builds / "held.scope")
+            _ = sidecar.write_text(str(scope))
+            request = replace(fixture.request(owner=child, run=wire.RunIdentity(owner.pid, owner.start_time)),
+                              sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.release(grant)
+            _ = fixture.run_pass()
+            model = self.service_model(fixture)
+            self.assertFalse(fixture.server.reservations)
+            room = model.reading.explanation.room
+            assert isinstance(room, gate.MemoryRoom)
+            hold, = room.runs
+            self.assertGreater(hold.bytes, 0)
+            self.assertTrue(any(isinstance(step.measured, gate.UnownedSliceMemory)
+                                and isinstance(step.measured.activity, ScopeProcesses)
+                                and isinstance(step.measured.activity.run, LiveBuildRun)
+                                for step in model.reading.view.running))
+            row, = queue_view.running_builds(model)
+            self.assertEqual(row.kept, hold.bytes)
+            self.assertEqual(row.step.run, hold.memory.run)
+            text = plain(queue_view.render_view(model, 140))
+            line, = [line for line in text.splitlines() if line.startswith("run")]
+            self.assertIn("between steps", line)
+            self.assertIn(f"pid {owner.pid}", line)
 
     def test_ended_run_scope_names_its_process_owner_program_and_age(self) -> None:
         with AdmissionFixture() as fixture:
