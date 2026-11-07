@@ -343,6 +343,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
         producer = self.review_producer(doc)
+        member = staff.snapshot().by_id(producer)
+        assert member is not None and isinstance(member.parent, staff.ReportsTo)
+        production = member.parent.id
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: none — the gate script")
@@ -354,7 +357,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {producer} | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {production} | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -529,7 +532,8 @@ class MergeGateProducerTests(ProducerFixture):
         _ = self.merge()
         merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.id)
+        assert isinstance(self.unit.parent, staff.ReportsTo)
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.parent.id)
 
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         _ = self.merge()

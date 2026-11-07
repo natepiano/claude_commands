@@ -390,7 +390,7 @@ The moved groups:
 
 As built: the core is 45 KB, not 30-40 KB. The five largest core sections are needed by every run, so they stay. Each moved group has one stub and one `<TagReferenceContract/>` row, so `_contract_revision` and `tag_inventory.py` cover every new file. After compaction, the hooks say to read the core in full, then each stub file whose moment is live.
 
-### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: todo
+### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: done
 **Depends on:** Phase 10c
 
 From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges main, `merge_checkpoint` adds a row for every Change-Review line in the merged commits, with builds as Producer. So rows C1179-C1183 (merge 429d1528) show the builds session, and the user asks builds about sdlc work.
@@ -403,6 +403,8 @@ Fix where the rows are made:
 The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not natedev - it got renamed but whatever - the fix needs to keep changes in the production that made them based on the id of the showruner for that production". So a merged row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint, not the production that merges it. Example: shutdown's 9e8e10895 (subject natedev-shutdown), rows C1195-C1197, landed in builds; they belong to sdlc.
 
 Add no new check.
+
+As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone.
 
 ### Phase 10e — Two test rules in the direct contract  · status: done
 **Depends on:** Phase 10c (it moves FixDispatch)

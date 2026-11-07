@@ -26,7 +26,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Collection, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -237,7 +237,8 @@ def common_git_directory(repo: Path) -> Path:
     return (repo / directory).resolve()
 
 
-def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -> list[str]:
+def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]], *,
+                        record: staff.StaffSnapshot | None = None) -> list[str]:
     """Origin branches whose readable productions in this repository already write review rows."""
     try:
         common = common_git_directory(repo)
@@ -249,7 +250,7 @@ def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -
     for doc in docs:
         try:
             lines = doc.read_text(encoding="utf-8").splitlines()
-            if list_path(doc) is None:
+            if list_path(doc, record=record) is None:
                 continue
             where = Path(production_field(lines, "Repository")).expanduser()
             if common_git_directory(where) != common:
@@ -616,8 +617,10 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     row_producers = [change.producer if isinstance(change, PublicationChange)
                      else producers[index] if producers else UnknownProducer() for index, change in enumerate(changes)]
 
-    identities = [str(producer) if isinstance(producer, str) else row_production(owner, record)
-                  for owner, producer in zip(row_owners, row_producers)]
+    identities = [str(unit_lookup.doc_owner(owner, record).id)
+                  if isinstance(change, PublicationChange)
+                  else str(producer) if isinstance(producer, str) else row_production(owner, record)
+                  for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
 
     def write(lines: list[str]) -> list[str]:
@@ -1077,20 +1080,21 @@ def publication_changes(commits: list[Commit], production: Path, *,
     for commit, item in _checkpoint_entries(commits):
         match = _CHECKPOINT.match(commit.subject)
         source = branches.get(match["branch"]) if match is not None else None
-        producer = known_producer
-        if isinstance(producer, UnknownProducer) and source is not None:
-            producer = producer_for(source, record, machine)
+        producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
+        if isinstance(known_producer, str) and (source is None or source.producer == known_producer):
+            producer = known_producer
         name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
         changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
     return changes
 
 
-def merge_commits(repo: Path, merge: str) -> list[Commit]:
+def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
+    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}",
+                   *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     for record in records.split("\x1e")[1:]:
         sha, message = record.split("\x1f", 1)
@@ -1530,6 +1534,22 @@ class CompletedStep:
 _READINESS_SCAN = ReadinessScan()
 
 
+def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list[str]:
+    """Exclude foreign history before each branch imports this merge."""
+    merge = _git(repo, "rev-parse", merge).strip()
+    excluded: set[str] = set()
+    for ref in refs:
+        path = [line.split() for line in _git(
+            repo, "rev-list", "--ancestry-path", "--parents", f"{merge}..{ref}").splitlines()]
+        if not path:
+            if _git(repo, "rev-parse", ref).strip() != merge:
+                excluded.add(ref)
+            continue
+        descendants = {merge, *(commit[0] for commit in path)}
+        excluded.update(parent for commit in path for parent in commit[1:] if parent not in descendants)
+    return sorted(excluded)
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -1548,18 +1568,24 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         return []
     if isinstance(selection, CompletedStep):
         _require_main(repo, selection.merged)
-        merges = [selection.merged]
+        merges = _git(repo, "log", "-1", "--format=%H%x09%s", selection.merged, "--").splitlines()
     else:
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
-                      "--format=%H", f"origin/{merge_branch}", "--").splitlines()
+                      "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
     record = staff.snapshot() if record is None else record
-    foreign = foreign_units(production, record=record)
+    scoped = set(_publication_docs(production, record))
+    outside_docs = [row.doc.path for row in record.find(kind="showrunner")
+                    if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path not in scoped]
+    outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
     rows: list[str] = []
     matched_step = False
-    for merge in merges:
+    for entry in merges:
+        merge, subject = entry.split("\t", 1)
+        if not subject.endswith(f" into {merge_branch}"):
+            continue
         if not on_main(repo, merge):
             continue
-        commits = [commit for commit in merge_commits(repo, merge) if not _named_in(commit, foreign)]
+        commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
         routed: dict[tuple[Path, Path], list[PublicationChange]] = {}
         merge_changes: dict[Path, list[PublicationChange]] = {}
@@ -1603,31 +1629,6 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
-
-
-def _named_in(commit: Commit, names: Collection[str]) -> bool:
-    """Whether the commit is a checkpoint named for one of `names`."""
-    found = _CHECKPOINT.match(commit.subject)
-    return found is not None and found["branch"] in names
-
-
-def foreign_units(production: Path, *,
-                  record: staff.StaffSnapshot | None = None
-                  ) -> set[str]:
-    """The checkpoint names of the units of every production outside the tree of `production`'s root.
-
-    Return an empty set when the productions cannot be read.
-    """
-    from scripts.production import showrunners
-    try:
-        record = staff.snapshot() if record is None else record
-        docs_by_name = showrunners.timer_docs()
-        root = showrunner_of(production, record=record)
-        top = docs_by_name.get(root, production)
-        return {name for name, source in _unit_branches(docs_by_name.values(), record).items()
-                if source.production not in set(_publication_docs(top, record))}
-    except (OSError, ValueError, Refusal):
-        return set()
 
 
 def _changes(text: str) -> list[dict[str, str]]:
