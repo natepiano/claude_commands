@@ -19,19 +19,12 @@ except FileNotFoundError:
     pass
 
 import json
-import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    from ..lib import unit_runs
-    from ..direct.worker_state import worker_status_paths
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from scripts.lib import unit_runs
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
-    from worker_state import worker_status_paths
+from scripts.lib import unit_runs
+from scripts.direct.worker_state import worker_status_paths
 
 # A test's own marker folder; unset, the marker is under either run-folder name.
 ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None

@@ -42,7 +42,6 @@ def export_line(path: Path) -> str:
 
 
 def main() -> int:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib import build_folders
 
     try:

@@ -18,10 +18,8 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import conversation_pause as conversation_pause
+from scripts.hooks import conversation_pause as conversation_pause
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
@@ -591,10 +589,9 @@ print("SENT: delivered")
 
         # The hook's imported alert module has one import-time path. Rebind it
         # under the temporary home, and restore the caller's alarm and stdin.
-        with patch.dict(os.environ, environment, clear=True), patch.object(sys, "path", sys.path.copy()):
-            sys.path.insert(0, str(LIBRARY.parents[1] / "message"))
+        with patch.dict(os.environ, environment, clear=True):
             from scripts.message import escalate
-            import direct_run
+            from scripts.hooks import direct_run
 
         with patch.object(sys, "stdin", io.StringIO(stdin)), patch.object(
             escalate, "STATE", Path(environment["ESCALATE_STATE_DIR"]),
