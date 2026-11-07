@@ -1705,94 +1705,33 @@ The verify hold and token wait fixtures keep every run root inside the test root
 **Ruled out:** a retry, a sleep or `ignore_cleanup_errors` in cleanup.
 
 ### Phase 82 — The branch takes builds with its package imports  · status: done
-**Depends on:** Phase 77, Phase 79, Phase 80
 
-#### Work Order
+#### As-built
 
-**Goal:** one merge commit puts builds 756c9a6eb (main a9cf78be1, sdlc 3z package imports) into this branch, so the showrunner can merge phases 35 to 81 with one hash.
+Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its parents are the Phase 83 checkpoint and the builds tip. Entry files run through `scripts/lib/py`, and imports use the package form (`from scripts.<package>.<module> import ...`).
 
-**Spec:** The showrunner approved this phase on 2026-11-07.
-1. In a private clone at this branch's tip, run `git merge --no-ff origin/builds`. Git names 30 conflicted files. Enable `rerere` in the clone, so the merge can be made again on a later tip with the same resolutions.
-2. Resolve each conflict. Keep both sides' changes. Builds' change moves imports to the package form (`from scripts.<package>.<module> import ...`) and runs entry files through `scripts/lib/py`. Apply that form to this branch's added lines too: run `python3 scripts/lint/package_imports.py <clone> <paths>` on each Python file this branch changed since the merge base.
-3. For a file where this branch has no natest change since the merge base, take the builds side.
-4. After the conflicts are settled, run `python3 scripts/lint/package_imports.py bootstrap <clone>`.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
-6. After the conflicts, run `package_imports.py bootstrap <checkout>`, then `env -C <checkout> python3 scripts/lint/package_imports.py <checkout> <changed .py files>`. The converter from devtools 314fa11a4 refuses `scripts/test_times/module_run.py` and leaves it unchanged; keep its `sys.path[0] = os.getcwd()`. Run `lint/test_memory_gate_wait.py`, `statusline/test_statusline.py` and `test_times/test_module_run.py` on the merge before the targeted test.
-7. Read every non-import line of the converter diff. Restore any control-flow change (showrunner, 2026-11-07: the converter once collapsed an if/elif). Restore `scripts/build_hold/build_hold.py` after the converter: it is frozen.
-8. `scripts/production/merge_gate.py` keeps this branch's mode (`SuiteMode`) and the aws machine (`SharedMachine | WholeMachine`). Bind `required: FullSuite | NoFullRunRequired = NoFullRunRequired()` before `if shared:`.
-9. Natest Phase 62 stops a timed-out module with TERM first. In `scripts/aws_target/test_gate_trial.py` (owner aws-unit), the stuck fixture expects exit `-signal.SIGTERM` and the log text `exit=-15`.
+- `queue_lines.step_text(step, names)` and `queue_lines.step_prose(step, names)` show the project with the step's shown or sentence name from `StepNames`. `queue_card`, `queue_evidence` and `queue_view` pass the model's names.
+- `build_steps.RECORDED_STEP_NAMES` shows each step as the queue records it. `admission_client` uses it and reads no configuration.
+- `merge_gate.py` keeps the suite mode (`SuiteMode`) and the aws machine (`SharedMachine | WholeMachine`). `required: FullSuite | NoFullRunRequired` is bound to `NoFullRunRequired()` before `if shared:`.
+- `aws_target/test_gate_trial.py` expects the stuck fixture to end on TERM: exit `-signal.SIGTERM` and the log text `exit=-15`.
+- `direct/test_verify_mac_only.py` gives the target table its fifth field, the platform (`macos`).
 
 **Files:**
-- `docs/as-built/gate-checkouts.md` — conflicted in the merge
-- `scripts/agents/test_agent_exec.sh` — conflicted in the merge
-- `scripts/berth_fix/capture.sh` — conflicted in the merge
-- `scripts/berth_fix/launch.sh` — conflicted in the merge
-- `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh` — conflicted in the merge
-- `scripts/build_hold/hold_enforcer.py` — conflicted in the merge
-- `scripts/build_hold/test_hold_shortcut.py` — conflicted in the merge
-- `scripts/buildlog/mac_idle.py` — conflicted in the merge
-- `scripts/direct/assign_claude_test_support.py` — conflicted in the merge
-- `scripts/direct/board.sh` — conflicted in the merge
-- `scripts/direct/test_assign_claude_records.py` — conflicted in the merge
-- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — conflicted in the merge
-- `scripts/hooks/test_brp_launch_gate.py` — conflicted in the merge
-- `scripts/lint/memory_gate.sh` — conflicted in the merge
-- `scripts/lint/test_memory_admit.py` — conflicted in the merge
-- `scripts/mac_test/test_offload.py` — conflicted in the merge
-- `scripts/production/change_review.py` — conflicted in the merge
-- `scripts/production/mac_run.sh` — conflicted in the merge
-- `scripts/production/merge_checkpoint.py` — conflicted in the merge
-- `scripts/production/merge_gate.py` — conflicted in the merge
-- `scripts/production/merge_gate_test_support.py` — conflicted in the merge
-- `scripts/production/test_change_review.py` — conflicted in the merge
-- `scripts/production/test_merge_checkpoint_rerun.py` — conflicted in the merge
-- `scripts/statusline/statusline.sh` — conflicted in the merge
-- `scripts/style/rules.py` — conflicted in the merge
-- `scripts/style/style_ledger.py` — conflicted in the merge
-- `scripts/style/test_crate_run.py` — conflicted in the merge
-- `scripts/style/test_git_process.py` — conflicted in the merge
-- `scripts/style/unit_files.py` — conflicted in the merge
-- `scripts/test_times/test_show.py` — conflicted in the merge
-- `scripts/aws_target/test_gate_trial.py` — the TERM exit expectation (owner aws-unit)
-- `scripts/` — entry files that `package_imports.py bootstrap` changes
+- `scripts/build_queue/queue_lines.py`, `queue_card.py`, `queue_evidence.py`, `queue_view.py` — project and step names
+- `scripts/build_queue/admission_client.py`, `scripts/lib/build_steps.py` — recorded step names
+- `scripts/production/merge_gate.py` — mode and machine
+- `scripts/aws_target/test_gate_trial.py`, `scripts/direct/test_verify_mac_only.py`, `scripts/build_queue/test_queue_card.py` — test expectations
 
-**Workers:** 1 writer on slot `impl` (one merge; it does not split)
-- `impl` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phases 77 and 79 are checkpointed under the merge.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- no conflict marker in the merged tree; a second `package_imports.py <clone> <paths>` run on the changed Python files prints `converted: 0 files`
-- `basedpyright` on each conflicted Python file prints `0 errors, 0 warnings, 0 notes`
-- the targeted test green on the merge commit
+**Gotchas:**
+- The package-import converter refuses `scripts/test_times/module_run.py`; that file keeps `sys.path[0] = os.getcwd()`.
+- `scripts/build_hold/build_hold.py` is frozen and equals builds' copy.
+- `direct/test_claude_worker.py` can fail once with `BrokenPipeError` at `delivery.sendall` and pass alone.
 
 ### Phase 83 — The gate tests need no real type checker  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** no test module in `scripts/production/test_merge_gate_suites_types.py` runs the real `basedpyright`, so a gate host needs no type checker install to run the gate tests.
-
-**Spec:** User request, 2026-11-07, through aws-unit: "if basedpyright is not there the nightly check would fail and we would just fix that - i don't want to test these kinds of things ... it is wasted time - you should ask natest to remove it". The showrunner accepted this phase in the Phase 82 hash.
-1. Delete `MergeGateTypesTests.test_real_basedpyright_exits_zero_without_a_checkout_venv`.
-2. Delete `MergeGateTypesTests.test_type_check_uses_pinned_packages_when_the_checkout_has_a_venv`.
-3. Remove each import that only those two tests use (`import venv`). Keep `shutil`: another test uses it.
-4. Change no other test and no production code. Add no guard, refusal or check (user rule, 2026-11-05).
+`scripts/production/test_merge_gate_suites_types.py` holds 23 tests. None runs the real `basedpyright`, and the module does not import `venv`. A gate host needs no type checker install to run the gate tests.
 
 **Files:**
-- `scripts/production/test_merge_gate_suites_types.py` — the two tests and their unused import
-
-**Workers:** 1 writer on slot `impl` (two deletions in one file; it does not split)
-- `impl` — `scripts/production/test_merge_gate_suites_types.py`, role impl
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Run Python test modules with `python3 scripts/test_times/module_run.py scripts/<dir> <file>` from the tree.
-
-**Acceptance gate:**
-- `grep -n "shutil.which(\"basedpyright\")" scripts/production/test_merge_gate_suites_types.py` prints nothing
-- `python3 scripts/test_times/module_run.py scripts/production test_merge_gate_suites_types.py` passes
-- `basedpyright scripts/production/test_merge_gate_suites_types.py` prints `0 errors, 0 warnings, 0 notes`
-- the targeted test green
+- `scripts/production/test_merge_gate_suites_types.py` — merge gate type-check tests with stubs only
