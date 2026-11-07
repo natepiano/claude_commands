@@ -16,14 +16,12 @@ from pathlib import Path
 from unittest import mock
 from typing import cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import fake_fmt
-from style_child_test_support import style_cli_command
-import mechanical_classes
-import style_ledger
-from style_plan_test_support import private_class_catalog, unit_staff_id
-import style_rules
+from scripts.style import fake_fmt
+from scripts.style.style_child_test_support import style_cli_command
+from scripts.style import mechanical_classes
+from scripts.style import style_ledger
+from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
+from scripts.style import style_rules
 from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 

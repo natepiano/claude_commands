@@ -17,16 +17,13 @@ from pathlib import Path
 from typing import cast, final
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
 
-# Importable once merge_checkpoint has put scripts/lib on the path.
-import scratch
+from scripts.lib import scratch
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, configure_test_environment
 
@@ -247,7 +244,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
 
     def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
         self.write(self.other, "crates/alpha/imported.txt", "other production\n")
         _ = self.git("add", "crates/alpha/imported.txt", cwd=self.other)
@@ -356,6 +353,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertTrue(later.is_dir())
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
         self.production_doc(merge_tests_line=REAL_MERGE_TESTS)
+        self.env["CLAUDE_PYTHON"] = sys.executable
         for name in ("python3", "basedpyright"):
             self.executable(self.bin / name, STUB)
         sha = self.checkpoint()
@@ -363,7 +361,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertEqual(self.events("python3"), [
             ["-m", "unittest", "discover", "-s", "scripts/buildlog", "-p", "test_*.py"],
-            [str(self.bin / "style_sync.py"), "notify", "--repo-dir", str(self.checkout),
+        ])
+        self.assertEqual(self.events("style_sync.py"), [
+            ["notify", "--repo-dir", str(self.checkout),
              "--branch", "production", "--tip", self.git("rev-parse", "HEAD")],
         ])
         self.assertEqual(self.events("basedpyright"), [["scripts/buildlog"]])
@@ -517,7 +517,7 @@ class MacPromotionPathTests(unittest.TestCase):
         assert isinstance(promotion, production_doc.PromoteTo)
         assert isinstance(promotion.mac, production_doc.MacCheckout)
         done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
-        with mock.patch("merge_checkpoint.subprocess.run", return_value=done) as run:
+        with mock.patch("scripts.production.merge_checkpoint.subprocess.run", return_value=done) as run:
             merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
         argv = cast(list[str], run.call_args.args[0])
         self.assertEqual(argv[:2], ["ssh", "mac"])

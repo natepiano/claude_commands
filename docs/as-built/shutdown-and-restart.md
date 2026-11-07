@@ -21,18 +21,27 @@ The executable is `scripts/shutdown/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
 The lookup accepts a short name, a staff id, or a current session id.
+An exact Codex thread name resolves through the shared `session_index.jsonl`.
+A raw session id takes priority over a thread name.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
 A remote member returns status 1 with its machine name.
 A running session returns status 0 with an `unchanged` line that names its current account.
 Resume does not stop or move a running session.
+Unknown Codex process evidence prints an anomaly and does not block resume.
+A pane with the session id and a foreground program counts as already running.
+Without process evidence, its account remains unknown.
+A pane at its shell does not prevent resume.
 The default reason is `resumed by name`.
 
-The shared resume path reads the saved account, environment, arguments, and folder.
-Claude units and showrunners use their group's configured account unless `--to` supplies an account.
-This rule also applies when no pane launch record exists.
-Ad hoc sessions keep their saved account.
+The shared resume path reads the saved environment, arguments, and folder.
+A named Codex resume uses the configured `workers` account, with or without a staff row.
+Claude units and showrunners use their configured role account, even without a pane launch record.
+Other Claude sessions keep their saved account.
+`--to ACCOUNT` overrides the account for either family.
+Restart and folder moves use the role account.
+A herdr server restore keeps the saved account for both families.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
@@ -73,10 +82,18 @@ Handed-off callers and sessions already on the target write nothing.
 
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
+The notes timer delegates account moves to this detached batch before any stop.
+The supervisor needs a restart request; an exited child alone does not cause a restart.
+A saved launch keeps its conversation marks but cannot replace an explicit destination account.
+The batch includes the existing stay observation before it records a confirmed or failed move outcome.
+Each completed member records its outcome without waiting for other resumes.
+An early exit or failed resume uses the existing showrunner failure report.
+
 Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
+A unit with no pane launch record stays down.
 The watchdog does not read shutdown session records.
 
 ## Worker resume results

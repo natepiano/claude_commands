@@ -14,18 +14,17 @@ from datetime import timedelta
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
 from scripts.shutdown import remote
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
-import review
-from push_texts import render
-import agent_notes
+from scripts.whoami import quota_alert
+from scripts.notify import review
+from scripts.notify.push_texts import render
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule

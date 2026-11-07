@@ -5,7 +5,7 @@ description: Control Hana views and screenshots.
 1. One line launches a test Hana, shoots, and shuts it down. Run it from the Hana worktree; build first (`cargo build -p hana`):
 
    ```bash
-   python3 ~/.claude/scripts/hana_shot/hana_shot.py shot --port 15791 --launch --purpose "home and log panel views" --view home --view log-panel-front --out <scratchpad>/shots --shutdown
+   ~/.claude/scripts/lib/py ~/.claude/scripts/hana_shot/hana_shot.py shot --port 15791 --launch --purpose "home and log panel views" --view home --view log-panel-front --out <scratchpad>/shots --shutdown
    ```
 
    Take every view you need in one call: repeat `--view`, or `--view all`. Stdout prints one PNG path per shot. Stderr prints the time per phase. Exit 0 means every shot was saved; 1 means a shot failed; 2 means refused; 3 means a screenshot timed out.

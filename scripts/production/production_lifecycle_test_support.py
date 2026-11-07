@@ -16,13 +16,11 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import fake_unit_host
-import production_lifecycle
+from scripts.production import fake_unit_host
+from scripts.production import production_lifecycle
 from scripts.production import showrunners, staff, unit_config
-import unit_lookup
-import tidy_wrapped
+from scripts.production import unit_lookup
+from scripts.production import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 

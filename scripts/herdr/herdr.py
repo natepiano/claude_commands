@@ -14,6 +14,10 @@ All caller-supplied timeouts are integer milliseconds.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import ctypes
@@ -38,12 +42,8 @@ from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
 from scripts.lib import operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
@@ -53,10 +53,10 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
-from process_failure import failure_detail
-import nix_env as nix_env
-from place import HerdrPlace as HerdrPlace
-from pane_launch import RecordedLabels, StaffLabelsRead
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import nix_env as nix_env
+from scripts.herdr.place import HerdrPlace as HerdrPlace
+from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
 
 NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
@@ -537,7 +537,7 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
 
 def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
     """Identify the process receiving input, including before its socket opens."""
-    import sessions
+    from scripts.message import sessions
 
     try:
         identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
@@ -614,6 +614,10 @@ class AgentStatus(StrEnum):
     STOPPED = "stopped"
     DEAD = "dead"
     NONE = "none"
+
+    @property
+    def idle(self) -> bool:
+        return self in {AgentStatus.IDLE, AgentStatus.DONE}
 
     @classmethod
     def decode(cls, value: object) -> AgentStatus:
@@ -1483,7 +1487,7 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str) -> NewTab | SplitPane | ExistingPane:
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
         """Find the saved row position and reuse only its terminal's shell."""
         saved = saved_layout(self.session)
         for space in saved["workspaces"]:
@@ -1506,7 +1510,7 @@ class Herdr:
                 if sibling is not None:
                     return SplitPane(json_text(sibling.get("pane_id"), "pane id"), "right", 0.5, title)
                 return NewTab(space["name"], title)
-        return NewTab(shared_session(), title)
+        return NewTab(fallback_workspace, title)
 
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
@@ -2091,8 +2095,9 @@ class Herdr:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
-            idle = observation["agent_status"] == AgentStatus.IDLE
-            ready = observation["agent_status"] in {AgentStatus.WORKING, AgentStatus.IDLE} and observation["interactive_ready"]
+            status = observation["agent_status"]
+            idle = status.idle
+            ready = observation["interactive_ready"] and (status == AgentStatus.WORKING or idle)
         except (OSError, subprocess.SubprocessError, HerdrFailure):
             pass
         if not ready:
@@ -2179,6 +2184,8 @@ class Herdr:
             ready = self.wait_for_prompt_input(pane, timeout_ms)
             screen = ready.screen
             if isinstance(ready, PromptInputTimedOut):
+                if isinstance(cursor, TranscriptCursor):
+                    _ = cursor.read_turns()
                 if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
                     return deadline_failure()
                 return failure("destination never became ready for input")
@@ -2289,10 +2296,10 @@ class Herdr:
                         continue
                     if composer.text.strip():
                         return failure("destination input contains other text")
-                    # Working can mean queued input, even with an empty box. Only
-                    # an idle recipient after a quiet settle window may be re-typed.
+                    # Working can mean queued input, even with an empty composer.
+                    # Retype only when the recipient is idle after the settle time.
                     observation = self.readiness(pane)
-                    if (observation["agent_status"] != AgentStatus.IDLE
+                    if (not observation["agent_status"].idle
                             or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
                         continue
                     if typings == 3:
@@ -2330,7 +2337,7 @@ class Herdr:
         self._prompt(pane, text)
 
     def _prompt(self, pane: str, text: str) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
@@ -2838,7 +2845,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+    from scripts.lib.detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + operation_deadline.remaining(min(10.0, timeout_ms / 1000))
     try:
@@ -2979,6 +2986,15 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
     except FileNotFoundError:
         return SHARED_SESSION
     return name
+
+
+def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
+    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    while isinstance(row, staff.StaffRow):
+        if row.kind == "showrunner":
+            return row.name
+        row = record.parent_of(row) or staff.STAFF_ROOT
+    return name or shared_session()
 
 
 def attach_hint(space: str, tab: str) -> str:
@@ -3462,8 +3478,16 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
+    server_pids: set[int] = set()
+    for run in runs:
+        try:
+            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
+            if isinstance(pid, int):
+                server_pids.add(pid)
+        except (OSError, ValueError):
+            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
@@ -3493,7 +3517,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                 pass
             if environment is not None:
                 if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR"):
+                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
                         # The run read below resolves a server with no open rollout.
                         continue
                 elif no_rollout and "--no-daemon" not in arguments:

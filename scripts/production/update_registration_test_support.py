@@ -22,11 +22,11 @@ from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import update_registration
+from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
 from scripts.production import staff, unit_names
-import dailies_render as dailies_render
+from scripts.production import dailies_render as dailies_render
 from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from scripts.notify import review as review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review as review
+    from scripts.notify import review as review
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 

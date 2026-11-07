@@ -9,33 +9,22 @@ import contextlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
-else:
-    from memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment
 
-import index
-import memory
-import record
-import scratch
-import sweep
-from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
-import store
-from test_index import Record, call, encode, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.buildlog import index, memory, store
+from scripts.lib import scratch
+from scripts.lint import sweep
+from scripts.buildlog.cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
+from scripts.lib import test_hang_guard
+from scripts.buildlog import record
 
 CLI = Path(__file__).with_name("cli.py")
 START = "2026-10-04T23:30-07:00"
@@ -52,11 +41,10 @@ def configured_local_host() -> str:
 
 def configured_host_cli(script: Path, *arguments: str) -> list[str]:
     """Use the configured record host in the child process."""
-    return [sys.executable, "-c",
-            "import runpy, sys; from pathlib import Path; "
+    return [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
+            "import runpy, sys; "
             + "script = sys.argv.pop(1); sys.argv[0] = script; "
-            + "sys.path.insert(0, str(Path(script).resolve().parent)); "
-            + "import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; "
+            + "from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; "
             + "runpy.run_path(script, run_name='__main__')", str(script), *arguments]
 
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
@@ -589,7 +577,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("kernel OOM kills: 0", empty.stdout)
 
     def test_missing_journal_command_is_unavailable(self) -> None:
-        with patch("memory.subprocess.run", side_effect=FileNotFoundError):
+        with patch("scripts.buildlog.memory.subprocess.run", side_effect=FileNotFoundError):
             result = memory.journal_messages([], datetime.fromisoformat(START), datetime.fromisoformat(END))
         self.assertIs(result, memory.JournalUnavailable.VALUE)
 

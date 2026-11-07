@@ -14,7 +14,7 @@ from unittest import mock
 from typing import cast
 
 from scripts.hooks import showrunner_footer
-from update_registration import QuestionStaff
+from scripts.production.update_registration import QuestionStaff
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,

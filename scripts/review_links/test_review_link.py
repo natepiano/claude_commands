@@ -20,7 +20,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import review_link, serve
 
@@ -135,6 +134,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "HOME": str(home),
+            "CLAUDE_PYTHON": sys.executable,
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
             "CLAUDE_CODE_SESSION_ID": "12345678-abcd-4321-abcd-123456789abc",
         }
@@ -148,7 +148,7 @@ class ReviewLinkTests(unittest.TestCase):
 
     def run_link(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments], env=self.env,
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.env,
             text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -156,7 +156,7 @@ class ReviewLinkTests(unittest.TestCase):
         environment = dict(self.env)
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "--help"], env=environment, cwd=self.root,
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), "--help"], env=environment, cwd=self.root,
             text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

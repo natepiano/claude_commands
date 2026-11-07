@@ -17,7 +17,7 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import rename_unit, session_staff, staff, showrunners
+from scripts.production import rename, session_staff, staff, showrunners
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
@@ -309,11 +309,11 @@ class QuestionIdentityTests(RegistrationFixture):
         displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
               displays.installed(), redirect_stdout(io.StringIO())):
-            _ = rename_unit.apply("example", "alpha", "renamed")
+            _ = rename.apply(str(self.asker_id), "renamed")
             renamed = staff.by_id(self.asker_id)
             assert renamed is not None
             self.assertEqual((renamed.id, renamed.name), (self.asker_id, "renamed"))
-            _ = rename_unit.apply("example", "renamed", "renamed")
+            _ = rename.apply(str(self.asker_id), "renamed")
         self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
         self.assertEqual(self.question_rows()[0]["asked_by"], self.asker_id)
 

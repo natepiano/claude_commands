@@ -2,6 +2,10 @@
 """Run one read-only Cargo judgment on an idle Mac mirror when it is available."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
@@ -23,38 +27,20 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, NewType, TextIO, TypedDict, cast, final
+from typing import Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import cargo_manifest
-import override_guard
-import build_hold
-import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-import treekey
-if TYPE_CHECKING:
-    from ..copies import copies
-    from ..lib import build_folders
-    from .mirror_root import MacMirrorRoot
-else:
-    from scripts.copies import copies
-    from scripts.lib import build_folders
-    from scripts.mac_test.mirror_root import MacMirrorRoot
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-if TYPE_CHECKING:
-    from ..buildlog import record, repository, store
-    from ..build_targets import target_config
-else:
-    import record
-    import repository
-    import store
-    import target_config
+from scripts.mac_test import cargo_manifest
+from scripts.build_hold import build_hold, override_guard
+from scripts.copies import copies
+from scripts.lint import sweep
+from scripts.lib import conf
+from scripts.buildlog import treekey
+from scripts.mac_test.mirror_root import MacMirrorRoot
+from scripts.buildlog import record, repository, store
+from scripts.build_targets import target_config
+from scripts.lib import build_folders
 
 
 # Version the mirrored repository's development shell exports on the Mac.
@@ -1151,10 +1137,7 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
-        if TYPE_CHECKING:
-            from . import linux_runner
-        else:
-            import linux_runner
+        from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
     return "\n".join(
         (
@@ -1190,7 +1173,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
     return [
-        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).with_name("mac_test.py")),
         "claim",
         "--pid",
@@ -1211,7 +1194,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 def release_claim(controller: ProcessController, target: str = "") -> None:
     _ = controller.capture(
         [
-            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "lib/py"),
             str(Path(__file__).with_name("mac_test.py")),
             "release",
             "--pid",
@@ -1258,10 +1241,7 @@ def probe_reachability(
 
 def trusted_linux_source(root: Path) -> bool:
     """Keep the local shell approval boundary before remote evaluation."""
-    if TYPE_CHECKING:
-        from ..lib import nix_env
-    else:
-        from scripts.lib import nix_env
+    from scripts.lib import nix_env
     envrc = nix_env.nearest_envrc(root)
     if envrc is not None:
         if nix_env.trusted_envrc(envrc):
@@ -1284,10 +1264,7 @@ class UnavailableToolParity:
 
 def expected_linux_parity(controller: ProcessController, config: OffloadConfig) -> PublicToolParity | UnavailableToolParity:
     """Compare public tools with configured pins or the sender's versions."""
-    if TYPE_CHECKING:
-        from .linux_runner import normalize_tool_version
-    else:
-        from linux_runner import normalize_tool_version
+    from scripts.mac_test.linux_runner import normalize_tool_version
     expected: dict[str, str] = {}
     commands = (("rustc", ["rustc", "-V"]),
                 ("nextest", ["cargo", "nextest", "--version"]),
@@ -1308,10 +1285,7 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
 def recorded_linux_version_mismatch(controller: ProcessController, config: OffloadConfig,
                                     target: str) -> str:
     """Compare the tree with the tools recorded by deployment without contacting the box."""
-    if TYPE_CHECKING:
-        from . import linux_runner
-    else:
-        import linux_runner
+    from scripts.mac_test import linux_runner
     try:
         raw = cast(object, json.loads((target_config.ssh_target_state_directory(target) / "box-tools.json").read_text()))
         if not isinstance(raw, dict):
@@ -1401,10 +1375,7 @@ def probe_mac(
 ) -> ProbeResult:
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform)
     if linux:
-        if TYPE_CHECKING:
-            from . import linux_runner
-        else:
-            import linux_runner
+        from scripts.mac_test import linux_runner
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
         if isinstance(probe_reachability(controller, config), UnreachableHost):
@@ -1442,10 +1413,7 @@ def probe_mac(
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
             if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
                 return probe
-            if TYPE_CHECKING:
-                from . import linux_runner
-            else:
-                import linux_runner
+            from scripts.mac_test import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
                       {"nextest": expected["nextest"], "mend": expected["mend"]},
                       config.values.get("version_pin_file", ""))
@@ -1618,10 +1586,7 @@ def nextest_words_with_skip(
 ) -> tuple[str, ...]:
     if not skip_expression:
         return words
-    if TYPE_CHECKING:
-        from . import linux_runner
-    else:
-        import linux_runner
+    from scripts.mac_test import linux_runner
     return linux_runner.nextest_words_with_skip(words, skip_expression, insert_filter=insert_filter)
 
 
@@ -1643,10 +1608,7 @@ def remote_test_command(
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
-        if TYPE_CHECKING:
-            from . import linux_runner
-        else:
-            import linux_runner
+        from scripts.mac_test import linux_runner
         words = request.nextest_words
         return linux_runner.command_script(
             remote_mirror(repository, request.target, request.slot), runner_values(config, request.target),
@@ -1829,10 +1791,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         if not isinstance(scope, KnownRepository):
             raise ValueError("Linux cleanup requires a repository and slot")
-        if TYPE_CHECKING:
-            from . import linux_runner
-        else:
-            import linux_runner
+        from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=target_config.is_aws_target(configured_ssh_target(target)))
     root = mac_mirror_root().relative
@@ -1911,10 +1870,7 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
         return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
     if result.returncode != 0:
         if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
-            if TYPE_CHECKING:
-                from . import linux_runner
-            else:
-                import linux_runner
+            from scripts.mac_test import linux_runner
             if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
                 return LeftoversRemain(UnresolvedLeftoverCount())
         return LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}")
@@ -2131,10 +2087,7 @@ def claimed_run(
         if release_allowed:
             release_claim(controller, request.target)
             if sync_after_release:
-                if TYPE_CHECKING:
-                    from ..buildlog import sync as buildlog_sync
-                else:
-                    import sync as buildlog_sync
+                from scripts.buildlog import sync as buildlog_sync
                 buildlog_sync.sync_target(request.target)
 
 

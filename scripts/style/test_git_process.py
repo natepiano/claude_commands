@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import errno
 import subprocess
-import sys
 import tempfile
 import unittest
-from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from git_process import GitExitAnswers, GitReadFailed, run_git
+from scripts.style.git_process import GitExitAnswers, GitReadFailed, run_git
 
 
 class GitProcessTests(unittest.TestCase):

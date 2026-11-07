@@ -19,16 +19,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import ci
-import cli
-import index
-import health
-import record
-import rust_release
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
+from scripts.buildlog import ci, cli
+from scripts.buildlog import index
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import rust_release
+from scripts.buildlog import store
+from scripts.buildlog import sync, vault_pull
+from scripts.buildlog.test_index import point_root_at
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
     from ..lint.memory_test_support import config_environment

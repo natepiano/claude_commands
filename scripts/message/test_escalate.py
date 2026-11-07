@@ -13,20 +13,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import escalate
-import push_texts
-import push_reference
-import send
-import sessions
+from scripts.message import escalate
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.message import send
+from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 else:
     from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from user_action import ActionRequired, NoActionRequired
+from scripts.notify.user_action import ActionRequired, NoActionRequired
 
 SCRIPT = Path(__file__).with_name("escalate.py")
 NOTIFIER_STUB = 'print -r -- "notifier $*" >> "$LOG"\n'

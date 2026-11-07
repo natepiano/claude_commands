@@ -8,28 +8,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
-else:
-    from memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from test_index import Record, call, encode, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
+from scripts.lib import test_hang_guard
 
 HERE = Path(__file__).parent
 CLI = HERE / "cli.py"
@@ -61,7 +50,7 @@ class MemoryRecordTests(unittest.TestCase):
 
     def run_script(self, script: Path, *args: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(script), *args],
+            [str(HERE.parent / "lib/py"), str(script), *args],
             cwd=self.base,
             env=self.env(**(extra or {})),
             capture_output=True,
@@ -94,8 +83,8 @@ class MemoryRecordTests(unittest.TestCase):
         service.mkdir(parents=True)
         _ = (service / "cgroup.procs").write_text("123\n")
         command = (
-            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "import sample, cli; proc = Path(sys.argv[2]); "
+            "import sys; from pathlib import Path; "
+            "from scripts.buildlog import sample, cli; proc = Path(sys.argv[1]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
             "sample.CPU_PRESSURE = proc / 'cpu_pressure'; sample.IO_PRESSURE = proc / 'io_pressure'; "
             "sample.STAT = proc / 'stat'; "
@@ -105,7 +94,7 @@ class MemoryRecordTests(unittest.TestCase):
                        BUILDLOG_ZRAM=str(self.base / "absent-zram"))
         def take_sample() -> None:
             result = subprocess.run(
-                [sys.executable, "-c", command, str(HERE), str(proc)],
+                [str(HERE.parent / "lib/py"), "-c", command, str(proc)],
                 env=env, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

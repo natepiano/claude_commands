@@ -103,7 +103,10 @@ The six merge flags are required unless `--tests-only`, `--promote-only`, or `--
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
-After the push, it prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
+After the last promotion step, it adds rows only for merges on `origin/main`.
+It prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
+A line with `after <step>` waits for the completed `live` step.
+The session runs `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
 `--type-dirs` (alias `--type-dir`) defaults to no folders.
 A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 `GateArguments(argparse.Namespace)` defines the arguments; each refusal raises `GateRefused`.
@@ -342,15 +345,22 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
-**Python import root.** `scripts/lib/py` resolves its own repository root with shell operations.
+**Python import root.** The gate starts each test run through the checked tree's `scripts/lib/py`.
+The gate removes the caller's `PYTHONPATH` from each child environment.
+The shim sets the checked tree's root in `PYTHONPATH`.
+Tests and their Python children can import packages from that tree.
+The gate refuses a tree without the shim.
+`MERGE_GATE_PYTHON` still selects the test interpreter.
+
+The shim resolves its repository root with shell operations.
 For stdin, `-c`, and `-m`, it puts that root first in `PYTHONPATH` and passes `-P` first.
-It preserves inherited Python paths after that root.
+Outside the gate, it preserves inherited Python paths after that root.
 Options such as `-B` and `-u` can precede the program mode.
-File scripts keep their existing import path behavior.
+File scripts keep their folder first in the import path.
 The shim resolves relative paths and parent segments without another process or a directory change.
 `test_py_shim.py` tests local package collisions, old modules, cached interpreters, module mode, and file scripts.
 
-**Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `implement.sh` run.
+**Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
 **Stub app-server shutdown** (`scripts/agents/test_codex_mesh.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
@@ -359,8 +369,8 @@ The shim resolves relative paths and parent segments without another process or 
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
 | `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `UNIT_WORKER_POLL_SECS` | `scripts/direct/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
-| `UNIT_WORKER_WAIT_ATTEMPTS` | `scripts/direct/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/assign_claude.py` (worker and turn probes) | `1` (s) | `0.01` |
+| `UNIT_WORKER_WAIT_ATTEMPTS` | `scripts/direct/assign_claude.py` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
 | `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
@@ -373,7 +383,7 @@ The shim resolves relative paths and parent segments without another process or 
 
 `UNIT_ACTIVE_DIR` and its former name `PLAN_DELEGATE_ACTIVE_DIR` are on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when one of them, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
 
-Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN_DIR` was `PLAN_DELEGATE_BOARD_DIR`. A run that started before the rename still exports the former names, so each reader also reads them while such a run can be open. The bash scripts (`implement.sh`, `review.sh`, `verify.sh`, `board.sh`, `end_session.sh`, `agent_bg.sh`, `memory_gate.sh`) source `scripts/lib/unit_env.sh`, which exports each unset `UNIT_*` name from its former name. Python readers use `unit_runs.environ(<name>)` or read the former name after the new one; `unit_status.sh` does the same inline. The status line now reads assignments from staff rows rather than either set of environment names (`showrunner-automation.md`).
+Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN_DIR` was `PLAN_DELEGATE_BOARD_DIR`. A run that started before the rename still exports the former names, so each reader also reads them while such a run can be open. The bash scripts (`review.sh`, `verify.sh`, `board.sh`, `end_session.sh`, `agent_bg.sh`, `memory_gate.sh`) source `scripts/lib/unit_env.sh`, which exports each unset `UNIT_*` name from its former name. Python readers use `unit_runs.environ(<name>)` or read the former name after the new one; `unit_status.sh` does the same inline. The status line now reads assignments from staff rows rather than either set of environment names (`showrunner-automation.md`).
 
 ## Invariants
 
@@ -386,7 +396,7 @@ Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN
 
 - **Selection requires certification.** Unaffected modules may be omitted only by the dependency selector against a full certified ancestor. Full runs still cover every module; no test is disabled, no assertion weakened and no tier removed from the full gate. A red under load is fixed at its source: an event-driven wait, a drained pipe, an injected `TimeoutExpired`, a hang guard.
 
-- **The gate finds test modules recursively.** Every `scripts/**/test_*.py` file outside `__pycache__` is part of discovery. Checks that require an installed system use a different file name. After an install, run the installed-hook check with `cd ~/.claude/scripts && python3 -m unittest berth.tests.check_installed_hooks`.
+- **The gate finds test modules recursively.** Every `scripts/**/test_*.py` file outside `__pycache__` is part of discovery. Checks that require an installed system use a different file name. After an install, run the installed-hook check with `cd ~/.claude/scripts && ~/.claude/scripts/lib/py -m unittest berth.tests.check_installed_hooks`.
 
 - **Override defaults stay as they are.** Each default is pinned by a test that runs the real script or module with the override unset and observes the default through behavior: the sleep argument, the attempt count, the clock source, the fsync/PRAGMA call, the computed module value. No test reads a literal from source. A new override needs the same pin.
 

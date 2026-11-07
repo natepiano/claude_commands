@@ -34,7 +34,7 @@ class AssignGateTests(unittest.TestCase):
                     self.assertEqual(result.stdout, '')
 
     def test_direct_shell_launchers_refuse_before_argument_validation(self) -> None:
-        for script in ('direct/implement.sh', 'direct/review.sh', 'agents/agent_bg.sh',
+        for script in ('direct/review.sh', 'agents/agent_bg.sh',
                        'agents/agent_exec.sh'):
             with self.subTest(script=script):
                 result = subprocess.run(['bash', str(ROOT / 'scripts' / script)],

@@ -2,6 +2,10 @@
 """Move a unit's staff parent and its running herdr tab together."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
@@ -11,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources  # noqa: E402
-import herdr  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
 
 
 @dataclass(frozen=True)

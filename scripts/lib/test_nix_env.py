@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import copy_record, nix_env, scratch
-from scripts.lib.nix_env_test_support import HELPER, NixFixture
+from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -144,7 +144,7 @@ class EnsureTests(NixFixture):
         self.assertEqual(self.direnv_calls(), [])
 
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
+        return subprocess.run([str(ROOT / "scripts/lib/py"), str(HELPER), *arguments], cwd=self.work,
                               env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
@@ -208,7 +208,7 @@ class EnsureTests(NixFixture):
 
     def test_no_envrc_cli_import_budget(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
+            [str(ROOT / "scripts/lib/py"), "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
             cwd=self.work, env=self.env, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -371,7 +371,7 @@ class RegisteredCopyTests(GitNixFixture):
         # The standalone helper must find scratch even when started in the copy.
         Path(self.env["DIRENV_APPROVAL"]).unlink()
         result = subprocess.run(
-            [sys.executable, "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
+            [str(ROOT / "scripts/lib/py"), "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
             env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)

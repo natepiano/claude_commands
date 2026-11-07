@@ -32,7 +32,7 @@ those to the showrunner as before.
    `alpha: keep the old key binding?`).
 3. **File it.** Run
    ```sh
-   python3 ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> --unit <your unit> --text "<one line>" --question "<the full question>" [--urgency blocks]
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> --unit <your unit> --text "<one line>" --question "<the full question>" [--urgency blocks]
    ```
    Pass `--urgency blocks` when the phase cannot go on without the answer. The
    question review runs as it does for a showrunner's question.

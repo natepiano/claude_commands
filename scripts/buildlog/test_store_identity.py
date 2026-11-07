@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_index import use_test_log
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
@@ -43,7 +43,7 @@ sys.path.insert(0, str(root / 'scripts' / sys.argv[2]))
 check = unittest.TestCase()
 ''' + imports + checks
         result = subprocess.run(
-            [sys.executable, "-c", source, str(REPOSITORY_ROOT), directory], cwd=cwd,
+            [str(REPOSITORY_ROOT / "scripts/lib/py"), "-c", source, str(REPOSITORY_ROOT), directory], cwd=cwd,
             env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
             capture_output=True, text=True, timeout=30,
         )
@@ -84,7 +84,7 @@ check.assertIs(sweep.store, sys.modules["store"])
         with tempfile.TemporaryDirectory(prefix="store-index-") as directory:
             self.check_imports("buildlog", '''
 import index
-check.assertNotIn("scripts.buildlog", sys.modules)
+check.assertIn("scripts.buildlog", sys.modules)
 import scripts.buildlog.store
 check.assertIs(scripts.buildlog.store, sys.modules["store"])
 ''', cwd=Path(directory))

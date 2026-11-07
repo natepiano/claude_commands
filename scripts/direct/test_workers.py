@@ -134,7 +134,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
     def test_restarted_director_comes_from_its_current_unit_mark(self) -> None:
         from scripts.production import unit_lookup
         from scripts.message import sessions
-        from herdr import HerdrPlace
+        from scripts.herdr.herdr import HerdrPlace
 
         _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
         _ = (self.session_dir / "director").write_text("old-director")
@@ -857,7 +857,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.open_worker()
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE
         original = roster_path.read_bytes()
-        script = ("from pathlib import Path; import sys; sys.path.insert(0, sys.argv[2]); "
+        script = ("from pathlib import Path; import sys; "
                   "from scripts.direct import workers; "
                   "print('reader-ready', flush=True); print(workers.resolve(Path(sys.argv[1]), 'impl'), flush=True)")
         with mesh_fixture.worker_state_lock_path(roster_path).open("a") as owner, roster_path.open("r+b") as roster:

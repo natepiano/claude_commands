@@ -16,6 +16,10 @@ Nothing offers the proposals: the ledger's queue grows until the user asks for /
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import subprocess
@@ -208,7 +212,7 @@ def messages(since: datetime) -> list[str]:
     if TYPE_CHECKING:
         from scripts.notify import review
     else:
-        import review
+        from scripts.notify import review
 
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]

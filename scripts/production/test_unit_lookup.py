@@ -5,7 +5,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -13,23 +12,21 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import fake_unit_host
+from scripts.production import fake_unit_host
 from scripts.production import showrunners
-import unit_lookup
-import herdr
-import sessions
-from fake_unit_host import HostedUnit, labeled
-from sessions import SessionRecord
-from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production.fake_unit_host import HostedUnit, labeled
+from scripts.message.sessions import SessionRecord
+from scripts.production.unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
@@ -288,10 +285,9 @@ class UnitLookupTests(unittest.TestCase):
     def test_lookup_and_source_import_orders_resolve_the_same_transferred_member(self) -> None:
         row = unit_membership("receiving", "alpha")
         program = """import importlib, sys
-sys.path.insert(0, sys.argv[1])
-for module in sys.argv[2:]:
-    importlib.import_module(module)
-import staff_sources, unit_lookup
+for module in sys.argv[1:]:
+    importlib.import_module("scripts.production." + module)
+from scripts.production import staff_sources, unit_lookup
 from scripts.production import staff
 record = staff.snapshot()
 found = staff_sources.member(staff_sources.UnitMember('old', 'alpha'), record)
@@ -308,7 +304,7 @@ print(observed.row.id)
 """
         for order in (("unit_lookup", "staff_sources"), ("staff_sources", "unit_lookup")):
             with self.subTest(order=order):
-                result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(SCRIPT.parent), *order],
+                result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, *order],
                                         env=self.environment, capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, row.id + "\n")
@@ -358,7 +354,7 @@ print(observed.row.id)
     def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
         from scripts.shutdown import pane_record
         from scripts.production import session_staff
-        import session_pane
+        from scripts.production import session_pane
 
         owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
@@ -381,7 +377,7 @@ print(observed.row.id)
     def test_live_staffed_session_without_any_launch_agrees_across_readers_and_worker_queue(self) -> None:
         from scripts.production import session_staff
         from scripts.message import unit_labels
-        import session_pane
+        from scripts.production import session_pane
 
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")
@@ -530,7 +526,7 @@ print(observed.row.id)
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = self.environment
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment, capture_output=True,
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=environment, capture_output=True,
                               text=True, check=False)
 
 

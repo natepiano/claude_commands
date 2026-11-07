@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff_sources
 import io
@@ -19,12 +17,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
-import inventory
-import sessions
+from scripts.shutdown import inventory
+from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production.staff_test_support import recorded_showrunner
 from scripts.whoami import account
@@ -33,8 +30,8 @@ from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from test_restart import showrunner, top_level, unit
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_restart import showrunner, top_level, unit
+from scripts.shutdown.test_support import ShutdownTestCase
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300
@@ -186,7 +183,8 @@ class AccountMoveTests(ShutdownTestCase):
             status, output, error = self.cli(session="remote-only")
         self.assertEqual((status, output), (0, ""))
         self.assertEqual(error, "accounts: anomaly: remote-only: no saved session was found\n")
-        moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move", cause="by hand")
+        moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move", cause="by hand",
+                                      source_accounts={})
 
     def test_stopped_move_keeps_pending_outcome_then_rerun_reaches_resume(self) -> None:
         with (patch.object(inventory, "listing", return_value=[]),
@@ -218,7 +216,7 @@ class AccountMoveTests(ShutdownTestCase):
         }
         before = self.disk_state()
         result = subprocess.run(
-            [sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
+            [str(accounts.SCRIPTS / "lib" / "py"), str(accounts.SCRIPTS / "accounts" / "accounts.py"),
              "move", "showrunners", "claude3", "--dry-run"],
             env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_SECONDS,
         )
@@ -295,7 +293,8 @@ class AccountMoveTests(ShutdownTestCase):
                   stop_resume.ClaudeUp("worker", "w1:p1", "claude3"),
                   stop_resume.SessionNotFound("missing")]) as batch):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
-        batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry", cause="by hand")
+        batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry", cause="by hand",
+                                      source_accounts={"failed": "claude1", "ok": "claude1", "worker": "claude1"})
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
             "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
             "worker: Claude is up on claude3 in w1:p1 (0.0 s)"])

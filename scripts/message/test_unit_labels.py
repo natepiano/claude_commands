@@ -266,7 +266,7 @@ with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
     })
 print(json.dumps({
     "labels": {key: dataclasses.asdict(value) for key, value in labels.items()},
-    "herdr_modules": [name for name in sys.modules if name.rsplit(".", 1)[-1] == "herdr"],
+    "herdr_modules": [name for name in sys.modules if name in {"herdr", "scripts.herdr.herdr"}],
 }))
 """
         with tempfile.TemporaryDirectory() as directory:

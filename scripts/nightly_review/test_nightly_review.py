@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from scripts.notify import review
     from scripts.production.unit_lookup import LiveClaude
 else:
-    import review
+    from scripts.notify import review
     from unit_lookup import LiveClaude
 
 NIGHT = date(2026, 9, 29)

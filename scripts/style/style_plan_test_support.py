@@ -17,23 +17,22 @@ from typing import ClassVar, cast, override
 from collections.abc import Generator
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
-import approved_renames
-import style_footprint
-import style_plan
-import style_proposals
-import proposal_issue
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.production import proposal_issue
 
-import berth_board
-import fake_fmt
-from style_child_test_support import style_cli_command, unqueued_style_children
-import mechanical_classes
-import rules
-import style_ledger
-import style_rules
+from scripts.lib import berth_board
+from scripts.style import fake_fmt
+from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
+from scripts.style import mechanical_classes
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import style_rules
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
@@ -182,7 +181,7 @@ class StylePlanFixture(unittest.TestCase):
         directory = Path.cwd() if cwd is None else Path(cwd)
         module = None
         arguments = command[2:]
-        if command[0] == sys.executable and len(command) > 1:
+        if command[0] == str(Path(__file__).resolve().parents[1] / "lib/py") and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
         if module is style_plan and process_boundary_for_case(self):

@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Show repository test times and gate module times for the current host."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections import defaultdict
@@ -14,19 +18,17 @@ import statistics
 import sys
 from typing import TYPE_CHECKING, Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index as index, parse, store, treekey
-    from ..buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    from scripts.buildlog import index as index, parse, store, treekey
+    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 else:
-    import index
-    import parse
-    import store
-    import treekey
-    from mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    from scripts.buildlog import index
+    from scripts.buildlog import parse
+    from scripts.buildlog import store
+    from scripts.buildlog import treekey
+    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
 TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(TOOL_REPOSITORY))
 from scripts.lib import conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
@@ -424,10 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         host = store.host_name()
         match request.command:
             case "top":
-                if TYPE_CHECKING:
-                    from ..buildlog import repository
-                else:
-                    import repository
+                from scripts.buildlog import repository
 
                 repo = request.repo.expanduser().resolve()
                 repo = Path(treekey.worktree(str(repo)) or str(repo))

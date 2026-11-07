@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.shutdown import remote
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
 import errno
@@ -22,19 +22,19 @@ from datetime import datetime, timezone
 from dataclasses import replace
 from typing import cast, final
 from unittest import mock
-import rules
-import style_ledger
-import style_plan
-import mechanical_classes
-import berth_board
-import coverage_report
-import style_proposals
-import unit_files
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import style_plan
+from scripts.style import mechanical_classes
+from scripts.lib import berth_board
+from scripts.style import coverage_report
+from scripts.style import style_proposals
+from scripts.style import unit_files
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
 
-from ledger_test_support import (remove_finding_anchor_schema, remove_generation_schema, LedgerTestCase, LedgerStatus, style_unit_id)
+from scripts.style.ledger_test_support import (remove_finding_anchor_schema, remove_generation_schema, LedgerTestCase, LedgerStatus, style_unit_id)
 
 
 @final

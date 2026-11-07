@@ -342,7 +342,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_page_and_footer_count_an_unrouted_orphan_under_unrouted(self) -> None:
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
-        import change_review as cli_review
+        from scripts.production import change_review as cli_review
 
         doc = self.configured_root_document()
         listing = self.root / "change-review - orphan.md"
@@ -381,7 +381,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_page_and_footer_count_each_producer_state_the_same_way(self) -> None:
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
-        import change_review as cli_review
+        from scripts.production import change_review as cli_review
 
         docs = {name: self.root / f"{name}-production.md" for name in ("top", "child")}
         listing = self.root / "change-review - top.md"
@@ -475,7 +475,7 @@ class StaffRoutingTests(unittest.TestCase):
                     written[0].replace("| C2 |", "| C777 |"),
                     written[0].replace("| C2 |", "| C777 |").replace(str(runner.id), "builds")))
                 _ = staff.move(runner.id, staff.ReportsTo(parent.id))
-                import change_review as cli_review
+                from scripts.production import change_review as cli_review
                 with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),
                       mock.patch.object(showrunners, "timer_docs", return_value=docs)):
                     browser = change_page.ReviewBrowser("secret")
@@ -511,11 +511,8 @@ class MergeWriterRoutingTests(ProducerFixture):
         from scripts.production import merge_gate
         from scripts.review_links import change_page
 
-        merged = self.merge()
-        commits = change_review.merge_commits(self.repo, merged)
-        with mock.patch.object(change_review, "drift", return_value=[]):
-            merge_gate.record_changes(self.repo, self.listing, self.doc,
-                                      change_review.publication_changes(commits, self.doc), "main")
+        _ = self.merge()
+        merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
         row = change_review.pending(self.listing)[0]
         owner = change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.listing)
         self.assertIsInstance(owner, change_routing.StaffRoutedChange)
