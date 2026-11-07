@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Add a Claude or Codex account and wire it into everything that names accounts.
 
 `new_account.py claude claude4 [login]` or `new_account.py codex codex3 [login]`.
@@ -28,7 +28,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402

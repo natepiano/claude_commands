@@ -9,9 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, refusals

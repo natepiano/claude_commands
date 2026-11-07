@@ -69,8 +69,9 @@ def add_bootstrap(file: Path) -> bool:
     return True
 
 
-def _bootstrap_tree(root: Path) -> int:
-    return sum(add_bootstrap(file) for file in sorted((root / "scripts").rglob("*.py")))
+def _bootstrap_tree(root: Path, excluded: Sequence[Path] = ()) -> int:
+    return sum(add_bootstrap(file) for file in sorted((root / "scripts").rglob("*.py"))
+               if file not in excluded)
 
 
 def module_name(root: Path, path: Path) -> str:
@@ -101,7 +102,7 @@ def path_value(node: ast.AST, names: dict[str, Path], file: Path) -> Path:
 
 def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bool,
             tied: set[Path]) -> tuple[str, set[Path], list[str]]:
-    source = file.read_text()
+    original_source = source = file.read_text()
     if file == root / "scripts/lib/package_root.py":
         return source, set(), []
     tree = ast.parse(source)
@@ -157,10 +158,74 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
             removed_names.update(child.id for child in ast.walk(node) if isinstance(child, ast.Name))
             path_changes.append(node)
     if selected:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If) and not node.orelse and all(child in path_changes for child in node.body):
-                path_changes = [child for child in path_changes if child not in node.body] + [node]
+        statements = [child for child in ast.walk(tree) if isinstance(child, ast.stmt)]
+        str_bound = any(
+            isinstance(child, ast.Name) and child.id == "str" and isinstance(child.ctx, (ast.Store, ast.Del))
+            or isinstance(child, ast.arg) and child.arg == "str"
+            or isinstance(child, ast.alias) and (child.asname or child.name.split(".")[0]) in {"str", "*"}
+            or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name == "str"
+            or isinstance(child, ast.ExceptHandler) and child.name == "str"
+            or isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name == "str"
+            or isinstance(child, ast.MatchMapping) and child.rest == "str"
+            for child in ast.walk(tree))
+
+        def path_guard(test: ast.expr) -> bool:
+            if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.NotIn) and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Attribute)
+                    and isinstance(test.comparators[0].value, ast.Name)
+                    and test.comparators[0].value.id == "sys" and test.comparators[0].attr == "path"):
+                return False
+            path = test.left
+            if (isinstance(path, ast.Call) and isinstance(path.func, ast.Name) and path.func.id == "str"
+                    and not str_bound and len(path.args) == 1 and not path.keywords):
+                path = path.args[0]
+            return isinstance(path, ast.Name) and path.id in names
+
+        for node in reversed(statements):
+            if not isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar)):
+                continue
+            bodies = [node.body]
+            bodies += [node.orelse] if node.orelse else []
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                bodies += [node.finalbody] if node.finalbody else []
+                bodies += [handler.body for handler in node.handlers]
+            empty = [body for body in bodies if all(child in path_changes for child in body)]
+            if not empty:
+                continue
+            if len(empty) != len(bodies):
+                issue(node, "path removal empties a compound body that has another body with code")
+                return source, set(), problems
+            headers = [child for child in ast.iter_child_nodes(node)
+                       if not isinstance(child, (ast.stmt, ast.ExceptHandler))]
+            if isinstance(node, ast.If) and path_guard(node.test):
+                headers = []
+            bound = {child.id for header in headers for child in ast.walk(header)
+                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                headers += [handler.type for handler in node.handlers if handler.type is not None]
+                bound.update(handler.name for handler in node.handlers if handler.name is not None)
+            inside = set(ast.walk(node))
+            if (any(isinstance(child, ast.Call) for header in headers for child in ast.walk(header))
+                    or any(isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                           and child.id in bound and child not in inside for child in ast.walk(tree))):
+                issue(node, "path removal would delete a header call or a binding used outside the compound")
+                return source, set(), problems
+            removed_names.update(child.id for child in inside if isinstance(child, ast.Name))
+            path_changes = [child for child in path_changes if all(child not in body for body in bodies)] + [node]
+        deleted_statements = {child for node in path_changes for child in ast.walk(node) if isinstance(child, ast.stmt)}
         for node in path_changes:
+            for other in statements:
+                if other in deleted_statements:
+                    continue
+                if node in ast.walk(other):
+                    shared = other.lineno == node.lineno
+                else:
+                    shared = max(node.lineno, other.lineno) <= min(
+                        node.end_lineno or node.lineno, other.end_lineno or other.lineno)
+                if shared:
+                    issue(node, "path removal shares a line with a retained statement or header")
+                    return source, set(), problems
             replace(node, "", True)
 
     bindings = {target.id: node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
@@ -242,53 +307,58 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
                             replace(argument, repr(name))
                 elif selected:
                     issue(node, "dynamic module name")
-    for start, end, replacement in sorted(edits, reverse=True):
-        data = data[:start] + replacement + data[end:]
-    source = data.decode()
-    if selected:
-        tree = ast.parse(source)
-        lines = source.splitlines(keepends=True)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If) and ast.dump(ast.Module(node.body, [])) == ast.dump(ast.Module(node.orelse, [])):
-                removed_names.update(child.id for child in ast.walk(node.test) if isinstance(child, ast.Name))
-                first, last = node.body[0].lineno - 1, node.body[-1].end_lineno or node.body[-1].lineno
-                body = [line[:node.col_offset] + line[node.body[0].col_offset:] if line.strip() else line
-                        for line in lines[first:last]]
-                lines[node.lineno - 1:node.end_lineno] = body + [""] * ((node.end_lineno or node.lineno) - node.lineno + 1 - len(body))
-        source = "".join(lines)
-        # Remove only bindings that the deleted path changes used.
-        while True:
+    try:
+        for start, end, replacement in sorted(edits, reverse=True):
+            data = data[:start] + replacement + data[end:]
+        source = data.decode()
+        if selected:
             tree = ast.parse(source)
-            used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
             lines = source.splitlines(keepends=True)
-            deleted = False
             for node in ast.walk(tree):
-                if isinstance(node, ast.Assign) and all(isinstance(target, ast.Name) and target.id in removed_names - used for target in node.targets):
-                    removed_names.update(child.id for child in ast.walk(node.value) if isinstance(child, ast.Name))
-                elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                    unused = [alias for alias in node.names if (alias.asname or alias.name) in removed_names - used]
-                    if not unused:
-                        continue
-                    if len(unused) != len(node.names):
-                        last = node.end_lineno or node.lineno
-                        original = "".join(lines[node.lineno - 1:last])
-                        for alias in unused:
-                            name = re.escape(ast.unparse(alias))
-                            changed = re.sub(name + r"\s*,[ \t]*", "", original, count=1)
-                            original = re.sub(r",[ \t]*" + name, "", original, count=1) if changed == original else changed
-                        lines[node.lineno - 1:last] = [original] + [""] * (last - node.lineno)
-                        deleted = True
-                        continue
-                else:
-                    continue
-                last = node.end_lineno or node.lineno
-                lines[node.lineno - 1:last] = [""] * (last - node.lineno + 1)
-                deleted = True
+                if isinstance(node, ast.If) and ast.dump(ast.Module(node.body, [])) == ast.dump(ast.Module(node.orelse, [])):
+                    removed_names.update(child.id for child in ast.walk(node.test) if isinstance(child, ast.Name))
+                    first, last = node.body[0].lineno - 1, node.body[-1].end_lineno or node.body[-1].lineno
+                    body = [line[:node.col_offset] + line[node.body[0].col_offset:] if line.strip() else line
+                            for line in lines[first:last]]
+                    lines[node.lineno - 1:node.end_lineno] = body + [""] * ((node.end_lineno or node.lineno) - node.lineno + 1 - len(body))
             source = "".join(lines)
-            if not deleted:
-                break
-        if source.startswith("#!/usr/bin/env python3\n"):
-            source = source.replace("#!/usr/bin/env python3\n", "#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py\n", 1)
+            # Remove only bindings that the deleted path changes used.
+            while True:
+                tree = ast.parse(source)
+                used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+                lines = source.splitlines(keepends=True)
+                deleted = False
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Assign) and all(isinstance(target, ast.Name) and target.id in removed_names - used for target in node.targets):
+                        removed_names.update(child.id for child in ast.walk(node.value) if isinstance(child, ast.Name))
+                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                        unused = [alias for alias in node.names if (alias.asname or alias.name) in removed_names - used]
+                        if not unused:
+                            continue
+                        if len(unused) != len(node.names):
+                            last = node.end_lineno or node.lineno
+                            original = "".join(lines[node.lineno - 1:last])
+                            for alias in unused:
+                                name = re.escape(ast.unparse(alias))
+                                changed = re.sub(name + r"\s*,[ \t]*", "", original, count=1)
+                                original = re.sub(r",[ \t]*" + name, "", original, count=1) if changed == original else changed
+                            lines[node.lineno - 1:last] = [original] + [""] * (last - node.lineno)
+                            deleted = True
+                            continue
+                    else:
+                        continue
+                    last = node.end_lineno or node.lineno
+                    lines[node.lineno - 1:last] = [""] * (last - node.lineno + 1)
+                    deleted = True
+                source = "".join(lines)
+                if not deleted:
+                    break
+            if source.startswith("#!/usr/bin/env python3\n"):
+                source = source.replace("#!/usr/bin/env python3\n", "#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py\n", 1)
+        _ = ast.parse(source)
+    except SyntaxError as error:
+        problems.append(f"{file.relative_to(root)}:{error.lineno or 1}: path removal leaves invalid syntax: {error.msg}")
+        return original_source, set(), problems
     return source, converted, problems
 
 
@@ -304,22 +374,27 @@ def convert(root: Path, paths: Sequence[Path], excluded: Sequence[Path] = ()) ->
     tied = set(selected)
     pending: dict[Path, str] = {}
     problems: list[str] = []
+    refused: set[Path] = set()
     for file in sorted(selected):
         source, converted, issues = rewrite(root, file, modules, True, tied)
         pending[file] = source
+        if issues and not converted and source == file.read_text():
+            refused.add(file)
         tied.update(converted)
         problems.extend(issues)
     for file in files:
         if file not in selected and file not in excluded:
             source, converted, issues = rewrite(root, file, modules, False, tied)
             pending[file] = source
+            if issues and not converted and source == file.read_text():
+                refused.add(file)
             problems.extend(issues)
     changed = [file for file, source in pending.items() if source != file.read_text()]
     for file in changed:
         _ = file.write_text(pending[file])
         if file not in selected:
             print(f"outside: {file.relative_to(root)}")
-    _ = _bootstrap_tree(root)
+    _ = _bootstrap_tree(root, tuple(refused))
     print(f"converted: {len(changed)} files; {len(tied)} modules; {len(set(changed) - selected)} outside files")
     for problem in sorted(set(problems)):
         print(problem)
