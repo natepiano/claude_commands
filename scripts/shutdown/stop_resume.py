@@ -901,8 +901,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             next_step = f"watchdog could not recover it: {error}"
     else:
-        command = shlex.join(["agents", "resume", name,
-                              "--to", account, "--why", why or "retry after early exit"])
+        command = "agents resume " + shlex.join([name, "--to", account, "--why", why or "retry after early exit"])
         next_step = f"resume it: {command}"
     cause = (f"{name}: resume on {account} failed: {failure}; {next_step}" if failure else
              f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}")
