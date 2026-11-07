@@ -660,8 +660,10 @@ The guest uses that revision for Python, SQLite, Chromium, and the other Nix pac
 The guest links `google-chrome` to Chromium for headless chart tests.
 The host reads and prints its basedpyright version at trial start.
 The guest installs that version through `uv tool install basedpyright==<version>` and adds the installation directory to PATH.
+The guest replaces the wheel's Node executable with a link to Nix Node from the tool shell.
 The tool shell also includes `taplo`, `zsh`, `bash`, `gh`, and Git.
 Root prepares `/bin/bash`, `/bin/zsh`, and Python at `/run/current-system/sw/bin/python3` through a temporary bind mount.
+Before the bind mount, `cp -a` copies the system profile links and preserves their targets in `/nix/store`.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
 Its shell reads `/etc/profile` before tests start, then restores the tool PATH.
 The exported NixOS environment marker prevents child zsh shells from replacing fixture paths.

@@ -249,12 +249,12 @@ def user_data(links: dict[str, str], revision: str, basedpyright_version: str, l
     """Run directly in amazon-init on each boot."""
     packages = ('git', 'python3', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
                 'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux',
-                'taplo', 'zsh', 'bash', 'gh', 'sqlite', 'chromium', 'util-linux')
+                'taplo', 'zsh', 'bash', 'gh', 'sqlite', 'chromium', 'util-linux', 'nodejs')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     session = f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
 mkdir -p /run/gate-trial-bin
-cp -as /run/current-system/sw/bin/. /run/gate-trial-bin/
+cp -a /run/current-system/sw/bin/. /run/gate-trial-bin/
 ln -sf "$(command -v python3)" /run/gate-trial-bin/python3
 ln -sf "$(command -v chromium)" /run/gate-trial-bin/google-chrome
 mount --bind /run/gate-trial-bin /run/current-system/sw/bin
@@ -265,6 +265,7 @@ unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$HOME/.local/bin:$tool_path:$PATH"
 uv tool install {shlex.quote('basedpyright==' + basedpyright_version)}
+ln -sf "$(command -v node)" "$(uv tool dir)"/basedpyright/lib/python3*/site-packages/nodejs_wheel/bin/node
 exec python3 /var/lib/gate-trial/guest.py'
 '''
     return f'''#!/bin/sh

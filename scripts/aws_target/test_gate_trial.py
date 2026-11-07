@@ -1063,9 +1063,19 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
+            node = root / 'node'
+            _ = node.write_text('#!/bin/sh\nexit 0\n')
+            node.chmod(0o700)
             uv = root / 'uv'
             _ = uv.write_text('#!/bin/sh\n'
+                + 'if [ "$*" = "tool dir" ]; then\n'
+                + '  printf "%s\\n" "$HOME/.local/share/uv/tools"\n'
+                + '  exit 0\n'
+                + 'fi\n'
                 + 'printf "%s\\n" "$*" > "$HOME/uv-arguments"\n'
+                + 'wheel="$HOME/.local/share/uv/tools/basedpyright/lib/python3.13/site-packages/nodejs_wheel/bin"\n'
+                + 'mkdir -p "$wheel"\n'
+                + 'printf "#!/bin/sh\\nexit 1\\n" > "$wheel/node"\n'
                 + 'mkdir -p "$HOME/.local/bin"\n'
                 + 'printf "#!/bin/sh\\necho basedpyright 1.39.10\\n" > "$HOME/.local/bin/basedpyright"\n'
                 + 'chmod +x "$HOME/.local/bin/basedpyright"\n')
@@ -1086,6 +1096,27 @@ class GuestTests(unittest.TestCase):
             self.assertEqual(payload['tool'], str(tool))
             self.assertEqual(payload['basedpyright'], 'basedpyright 1.39.10')
             self.assertEqual((root / 'uv-arguments').read_text(), 'tool install basedpyright==1.39.10\n')
+            wheel_node = root / '.local/share/uv/tools/basedpyright/lib/python3.13/site-packages/nodejs_wheel/bin/node'
+            self.assertEqual(wheel_node.readlink(), node)
+
+    def test_system_profile_copy_preserves_external_symlink_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            outside = root / 'outside'
+            _ = outside.write_text('fixture command')
+            source = root / 'source'
+            source.mkdir()
+            original = source / 'command'
+            original.symlink_to(outside)
+            destination = root / 'destination'
+            destination.mkdir()
+            command = shlex.split(next(line for line in self.tool_session().splitlines() if line.startswith('cp ')))
+            command[-2] = str(source) + '/.'
+            command[-1] = str(destination) + '/'
+            _ = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
+            copied_target = (destination / 'command').readlink()
+            self.assertEqual(copied_target, original.readlink())
+            self.assertNotIn(str(source), str(copied_target))
 
     def test_fixed_system_profile_path_resolves_the_tool_python(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
