@@ -39,7 +39,6 @@ from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class DiscardedTextWrite(io.StringIO):
@@ -136,8 +135,6 @@ class NotesPass:
 
 
 def load_pass() -> NotesPass:
-    # Keep the timer modules on their existing sibling import names.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     notes = import_module('scripts.whoami.agent_notes')
     watch = import_module("scripts.accounts.refusal_watch")
     watchdog = import_module("scripts.accounts.unit_watchdog")

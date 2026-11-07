@@ -1,7 +1,6 @@
 """Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
-import sys
 import io
 from contextlib import redirect_stdout
 import tempfile
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
