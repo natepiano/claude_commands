@@ -17,13 +17,13 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
-from typing import TextIO, cast, final, override
+from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
 from scripts.copies import copies
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
-from scripts.copies.remote_test_support import local_remote_transport
+from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.lib import process_start as process_identity
@@ -32,12 +32,23 @@ from scripts.lib.process_group import send_process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import offload
 from scripts.mac_test import mac_test
+from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 @final
 class RemoteEntryTests(unittest.TestCase):
+    source_seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory())).resolve()
+        with local_remote_transport(root):
+            cls.source_seed = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",
+                                                     {"source.txt": "content\n"})
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -48,9 +59,10 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
+        self.enterContext(warm_claim_servers())
         _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
-        self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
-                                             {"source.txt": "content\n"}).checkout
+        self.source = self.root / "checkout"
+        self.source_seed.copy_to(self.source, self.root / "origin.git")
         self.mirror = self.root / "mirrors/repository"
 
     def mirror_record(self, owner: str = "alpha", path: Path | None = None) -> copies.RemoteMirror:
@@ -177,7 +189,6 @@ class RemoteEntryTests(unittest.TestCase):
         payload = tree / "old-payload"
         payload.mkdir()
         _ = (payload / "file").write_text("old content")
-        _ = (tree / "leftover").write_text("partly removed content")
         remove, unlink = shutil.rmtree, Path.unlink
 
         def remove_payload(path: Path) -> None:
@@ -193,6 +204,7 @@ class RemoteEntryTests(unittest.TestCase):
                  else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
         with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
             _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+        _ = (tree / "leftover").write_text("partly removed content")
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
         self.assertTrue(authority.exists())
         self.assertEqual((tree / ".copy-record.json").exists(), moment == "payload")
@@ -668,7 +680,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertTrue(cancel.wait(timeout=10))
             raise InterruptedError("cancelled sweep")
 
-        with mock.patch.object(sweep, "hold_floor", side_effect=hold), ThreadPoolExecutor(max_workers=2) as executor:
+        with (mock.patch.object(floor_claims, "subprocess", subprocess),
+              mock.patch.object(sweep, "hold_floor", side_effect=hold),
+              ThreadPoolExecutor(max_workers=2) as executor):
             pending = executor.submit(sweep.main, ["--floor-only", "--host", "mac"])
             try:
                 self.assertTrue(entered.wait(timeout=10))

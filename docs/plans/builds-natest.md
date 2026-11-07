@@ -1506,7 +1506,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 69 — The remote copies review test uses half its CPU  · status: todo
+### Phase 69 — The remote copies review test uses half its CPU  · status: done
 **Depends on:** Phase 64
 
 #### Work Order
@@ -1655,4 +1655,66 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 - a forced case fails before each fix and passes after it, on a tempdir copy
 - each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
 - the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 74 — `copies/test_copy_guard.py` uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/copies/test_copy_guard.py` (64.0 CPU s per gate, 51 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. The slowest kept tests in the records are `test_repository_scripts_use_the_single_checkout...` and `test_repository_build_copy_makers_have_no_tran...`: read what each one scans, and how often.
+2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/copies/test_copy_guard.py` — the module
+
+**Workers:** 1 writer on slot `impl` (one module; the file does not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 59: a complete fixture seed copied per test took one module from 53.7 to 28.5 CPU s. Check each copied file for the seed's root path.
+- Phase 55: look first for repeated first launches that are setup.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 75 — `production/test_add_unit.py` uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_add_unit.py` (59.8 CPU s per gate) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of the setup that repeats, and of each real launch of the add-unit command.
+2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/production/test_add_unit.py` — the module
+
+**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 59: a complete fixture seed copied per test took one module from 53.7 to 28.5 CPU s. Check each copied file for the seed's root path.
+- Phase 55: look first for repeated first launches that are setup.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
