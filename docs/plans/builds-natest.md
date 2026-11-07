@@ -1689,7 +1689,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 80 — Claim tests catch a reply with no mirrors and a server with no admission lock  · status: todo
+### Phase 80 — Claim tests catch a reply with no mirrors and a server with no admission lock  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1714,6 +1714,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
 - Phase 47: runs use `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`. An inherited `UNIT_RUN_DIR` must not move it outside the root.
 
 **Acceptance gate:**
 - the module passes under `scripts/test_times/module_run.py`
@@ -1736,7 +1737,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 **Ruled out:** a retry, a sleep or `ignore_cleanup_errors` in cleanup.
 
 ### Phase 82 — The branch takes builds with its package imports  · status: todo
-**Depends on:** Phase 77, Phase 79
+**Depends on:** Phase 77, Phase 79, Phase 80
 
 #### Work Order
 

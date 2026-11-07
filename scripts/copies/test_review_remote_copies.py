@@ -5,10 +5,12 @@ from collections.abc import Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+from queue import Queue
 import select
 import shlex
 import shutil
@@ -29,6 +31,7 @@ from scripts.lib import conf
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import offload
 from scripts.mac_test import mac_test
@@ -59,6 +62,7 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
+        self.enterContext(mock.patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(self.root / "active")}))
         self.enterContext(warm_claim_servers())
         _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
         self.source = self.root / "checkout"
@@ -75,12 +79,46 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(publish_mirror(mine), 0)
         self.assertEqual(publish_mirror(other), 0)
         with copies.remote_lease(other):
+            with floor_claims.locked_claims(TEST_HANG_GUARD_SECS) as claims:
+                identity = floor_claims.MirrorIdentity(other.host, other.path)
+                self.assertIn(floor_claims.HeldMirror(identity, other.session), claims.mirrors)
+                self.assertTrue(claims.holds(other.path, self.mirror.parent))
+                self.assertFalse(claims.holds(other.path, self.mirror.parent, exemption=identity))
             copies.remove_trees("alpha")
             self.assertFalse(self.mirror.exists())
             with self.assertRaisesRegex(copies.CopyError, "other.*holder-session"):
                 copies.remove_trees("beta")
         self.assertEqual(copies.owned_remote_mirrors("beta"), [other])
         self.assertTrue(Path(other.path).exists())
+
+    def test_claim_server_keeps_a_second_admission_waiting_until_release(self) -> None:
+        paths = mac_test.state_paths()
+        args = mac_test.CliArguments()
+        args.pid, args.worktree, args.what = os.getpid(), str(self.source), "second admission"
+        turns: Queue[str] = Queue()
+        flock = fcntl.flock
+
+        def observe_lock(descriptor: int, operation: int) -> None:
+            if operation == fcntl.LOCK_EX:
+                try:
+                    flock(descriptor, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # Report the kernel conflict before the real blocking request.
+                    turns.put("waiting")
+                else:
+                    turns.put("admitted")
+                    return
+            flock(descriptor, operation)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with floor_claims.locked_claims(TEST_HANG_GUARD_SECS):
+                with mock.patch.object(fcntl, "flock", side_effect=observe_lock):
+                    admission = executor.submit(mac_test.command_claim, args, paths, watch_claim=False)
+                    self.assertEqual(turns.get(timeout=TEST_HANG_GUARD_SECS), "waiting")
+            self.assertEqual(admission.result(timeout=TEST_HANG_GUARD_SECS), 0)
+        claim, = mac_test.read_claims(paths)
+        self.assertEqual(claim.record["what"], args.what)
+        self.assertEqual(claim.record["worktree"], args.worktree)
 
     def test_removal_keeps_a_live_claim_despite_its_lease_exemption(self) -> None:
         mirror = self.mirror_record()
