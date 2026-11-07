@@ -334,3 +334,12 @@ Cause: the worker's turn never ended. Each stall began at an `rm -f` of a run lo
 From the sdlc showrunner, 2026-11-06. In cargo-liner, a worker relaunch after a launcher fault counted as repair rounds: the ledger showed 4 rounds for 1 repair and asked for two extra Astra reviews. direct.md says: "Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round." This unit shows the same defect: phase 9x had 2 ledger batches, and its Astra record says repair round 4. Add no new check.
 
 Cause: `findings._repair_round` counted every group from `history/rounds.phase_rounds`. A fix pass with no ledger batch (a gate run sent as a fix, a relaunch with no ledger number, a follow-up) makes its own group, so it added a round. It now counts the distinct ledger batch numbers that the groups hold, less the refunded batches that never land. One batch split across two groups counts once. `phase_rounds` and `history.py rounds` keep the other groups.
+
+### Phase 10a — Branch tests stay green on the merge with sdlc  · status: in progress
+
+From the sdlc merge gate, 2026-11-07. Hash 2b1b216e7 merged into sdlc a8123acd4 turned two tests red, in the batch and alone. Both pass on a8123acd4 without this branch.
+
+1. `shutdown/test_restart.py` `test_live_rows_scans_codex_once_for_members_and_unassigned_candidates` reads a live Codex id into its anomaly list.
+2. `ask_a_friend/test_end_friend.py` `test_a_staff_retirement_refusal_still_stops_the_consultation_server`: the consultation server survives the retirement refusal.
+
+The branch changes neither folder. The cause is a shared path the branch changes: the Codex process scan in `staff_sources.py` or the retire path. Tests must not read live units.

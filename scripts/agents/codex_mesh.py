@@ -7157,9 +7157,16 @@ def _collect_exited_child(pid: int) -> None:
 def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     """Stop one app-server; success requires confirmed exit within the budget."""
     deadline = worker_lifecycle.effective_deadline(deadline)
-    if not _pid_alive(pid):
-        if worker_lifecycle.is_process_pid(pid):
-            _collect_exited_child(pid)
+
+    def exited() -> bool:
+        # A child can report zombie state before waitpid can collect it.
+        # Only waitpid confirms a child's exit. Other processes use liveness.
+        try:
+            return os.waitpid(pid, os.WNOHANG)[0] == pid
+        except OSError:
+            return not _pid_alive(pid)
+
+    if not worker_lifecycle.is_process_pid(pid) or exited():
         return False
     if time.monotonic() >= deadline:
         return False
@@ -7168,19 +7175,6 @@ def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     except OSError as exc:
         print(f"could not signal app-server {pid}: {exc}")
         return False
-    def exited() -> bool:
-        # Our child can be a zombie until reaped; kill(pid, 0) alone cannot
-        # distinguish that confirmed exit from a still executing process.
-        try:
-            waited = os.waitpid(pid, os.WNOHANG)[0]
-            if waited == pid:
-                return True
-        except OSError:
-            pass  # A server started by another launcher is not our child.
-        if _pid_alive(pid):
-            return False
-        _collect_exited_child(pid)
-        return True
 
     term_until = min(deadline, time.monotonic() + REAP_WAIT_SECS)
     while not exited() and time.monotonic() < term_until:

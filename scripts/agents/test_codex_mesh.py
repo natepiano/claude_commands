@@ -18834,6 +18834,23 @@ class ServerRecordTests(unittest.TestCase):
                 with self.assertRaises(ChildProcessError):
                     _ = os.waitpid(pid, os.WNOHANG)
 
+    @unittest.skipUnless(sys.platform == "linux", "The zombie check uses Linux process evidence.")
+    def test_reap_collects_a_child_when_zombie_state_precedes_waitable_exit(self) -> None:
+        pid = self.sleeper()
+        os.kill(pid, signal.SIGTERM)
+        _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        waitpid = os.waitpid
+        uncollectable = deque([(0, 0), (0, 0), (0, 0)])
+
+        def collect(observed: int, options: int) -> tuple[int, int]:
+            self.assertEqual(observed, pid)
+            return uncollectable.popleft() if uncollectable else waitpid(observed, options)
+
+        with (patch.object(os, "waitpid", side_effect=collect),
+              patch.object(codex_mesh, "_pid_alive", return_value=False)):
+            self.assertTrue(codex_mesh._reap(pid))  # pyright: ignore[reportPrivateUsage]
+            self.assertIsNotNone(self.spawned[-1].poll())
+
     def test_loaded_threads_reads_current_and_retired_pages_under_one_deadline(self) -> None:
         current = self.session_dir / codex_mesh.SERVER_FILE
         _ = current.write_text(json.dumps({"pid": os.getpid(), "port": 12345}))
