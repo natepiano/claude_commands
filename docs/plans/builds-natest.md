@@ -1657,7 +1657,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 **Gotchas:** `staff.py pause` finds its caller through `runtime_id()`, which walks the parent processes. An in-process call has no such parent, so `pause` keeps `self.script(STAFF_SCRIPT, "pause", ...)`.
 
-### Phase 79 — `style/test_add_style.py` uses half its CPU  · status: todo
+### Phase 79 — `style/test_add_style.py` uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
