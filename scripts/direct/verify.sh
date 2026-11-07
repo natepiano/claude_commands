@@ -836,7 +836,7 @@ except (OSError, ValueError):
     sys.exit(2)
 print(",".join(features))
 if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    sys.path.insert(0, str(Path(sys.argv[3]).resolve().parents[2]))
+    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.result_environment import read_policy
     policy = read_policy()
     print(" ".join(policy.forwarded_names))
@@ -1380,7 +1380,7 @@ import sys
 from uuid import UUID
 
 kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-sys.path.insert(0, str(Path(recorder).resolve().parents[2]))
+with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 
 
 def text(value):
@@ -4234,9 +4234,10 @@ case "$CMD" in
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
             VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[1])
-from final_pass import clean_tree
+with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.final_pass import clean_tree
 clean_tree()
 ' "${FINAL_PASS_SCRIPT%/*}" || exit 2
         fi
