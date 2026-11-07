@@ -1204,7 +1204,7 @@ The targeted test on the gate had three red modules, and none came from this pha
 
 **Ruled out:** A proof that appends to the real shared log: it puts false rows in a log other tools read.
 
-### Phase 59 — `style/test_style_proposals.py` uses half its CPU  · status: todo
+### Phase 59 — `style/test_style_proposals.py` uses half its CPU  · status: done
 **Depends on:** Phase 61, Phase 64
 
 #### Work Order
