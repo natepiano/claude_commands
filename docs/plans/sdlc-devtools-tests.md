@@ -1410,114 +1410,68 @@ Recount on the 8j tree, CPU of one start: `agent_bg.sh:7` `assign_gate` 32 ms; `
 
 ### Phase 8l — A worker whose launcher and server died recovers on its own thread  · status: done
 
-Source: sdlc, cargo-liner handler unit's lost work. A watchdog restart left `cargo-liner-handler-enh-impl` at roster status `running`, with a dead launcher and a dead app-server. `assign.sh --to` refused: "launcher died; no live server can prove the thread idle; pending work kept; use reopen to recover". `codex_mesh.py reopen` runs only through `assign.sh` (`assign_gate.require_assign`), and `assign.py:463` calls `reopen` only at status `ended`. The director then ran `codex_mesh.py end`. `command_end` retires the staff row (`codex_mesh.py:6420`), and the row is the only record of the thread id (`session_staff.worker_session`), so `reopen` then refused "missing thread id". The user's codex-mesh rule allows this fix because work was lost.
+#### As-built
 
-**Depends on:** none. It stands on the main sync merge (origin/sdlc 123de793a + origin/main aa63173e5), not on 8j or 8k.
+A Codex worker whose launcher and app-server died recovers on its recorded thread through one more `assign.sh --to` dispatch.
 
-#### Work Order
-
-**Goal:** a worker whose launcher died recovers on its recorded thread through one more `assign.sh --to` dispatch, and `codex_mesh.py end` keeps the thread id that `reopen` needs, and an account move resumes with no live server to interrupt.
-
-**Spec:**
-1. **Assign recovers a dead launcher.** In `assign.py`, a roster record whose status is live (`running`, `starting` or `waiting_capacity`) and whose recorded `launcher_pid` is not alive goes through `dispatch.mesh_call("reopen")` before `claim_follow`, the same as an `ended` record. `reopen` already proves the thread idle on a recorded server, or starts a server and resumes that exact thread. A `reopen` refusal refuses the dispatch with `reopen`'s own line. A live launcher still refuses with "already implementing". Use the existing `codex_mesh` names for the live statuses and for the launcher check; add no copy of them.
-2. **End keeps the staff row.** `codex_mesh.command_end` does not call `staff.retire`. The roster entry keeps `status: ended` and its `staff_id`, so `reopen` reads the thread id from the staff row. A second `end` on an ended worker retries the cleanup, as `docs/as-built/long-lived-workers.md` says.
-3. **Permanent removal retires.** The callers that remove a worker for good keep their own retire: unit retirement in `workers.py`, `remove_workers.py` and `worker.py end`. `worker_fill.end_friend` ends a consultation for good, so it retires the friend's row after `command_end` succeeds, with the same `staff.StaffRefused` handling that `command_end` has today. `assign.py` `execute_astra_review` ends its one-turn Astra reviewer for good, so it retires that reviewer's row in the same way after `end` succeeds.
-4. **An account move resumes without a live server.** Source: sdlc [b9133698], hana's fastest-unit after a watchdog restart: `assign.sh --operation resume-account-move` failed with "interrupt failed: Connection refused" (`codex_mesh.py:9039`), because `_interrupt_worker_for_account_move` connects to the recorded port of a dead server. When no recorded server of the run is live for that thread (the same evidence `reopen` uses), the turn stopped with its server: the move writes its marker from the roster's last `turn_id`, sends no queue move and no interrupt, and goes on to the resume on a new server. A live server keeps today's interrupt path.
-5. **Out of scope.** No new check, guard or refusal. No change to the refusal texts. No change to the herdr transport.
-
-**Acceptance:**
-- A real-path test through `bash scripts/direct/assign.sh --to <worker>` with the fixture server: a roster record at `running` with a dead `launcher_pid` and no live server dispatches, and the follow-up goes to the same thread id.
-- A test: `end`, then a dispatch through `assign.sh --to`, returns the worker on its same thread id.
-- A test: `end-friend` retires the friend's staff row.
-- A test: `resume-account-move` on a `running` worker whose recorded server is dead resumes on a new server on the same thread id, with no interrupt call.
-- Spec item 2 approves one kind of assertion change: a test that expected `end` to remove the worker's staff row now expects the row to stay. The summary lists each changed assertion.
-- basedpyright `0 errors, 0 warnings, 0 notes` on each worker's files. The full gate passes.
+- `assign.py` `claim_worker` calls `codex_mesh.py reopen` for an `ended` worker, and for a worker in `ROSTER_LIVE` or `WAITING_CAPACITY` whose launcher is not attached (`codex_mesh.worker_launcher_attached`).
+- `command_reopen` accepts `WAITING_CAPACITY` and sets `dead_launcher_recovery` on the paused entry. A follow-up with that mark refuses a replacement thread when `thread/resume` fails.
+- `codex_mesh.command_end` keeps the staff row and thread id; a second `end` on an ended worker retries the cleanup. `workers.ending_worker` records the end and keeps the worker in the unit ledger.
+- Each caller that removes a worker for good retires the row itself: unit retirement (`workers.end_unit`), `remove_workers.py`, `worker.py end`, `worker_fill.end_friend` (after `command_end` returns 0; on `staff.StaffRefused` it stops the server, then returns 1) and `assign.py` `execute_astra_review` (end, release the role, then retire through `session_staff.worker_row`).
+- The account move tries each recorded server, the recorded port first, and uses the one that has the thread loaded. When `_server_availability` cannot prove that no server holds the thread, it refuses.
 
 **Files:**
-- `scripts/direct/assign.py`, `scripts/agents/codex_mesh.py`, `scripts/production/worker_fill.py`, `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — the source and docs.
-- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py` — the tests.
+- `scripts/direct/assign.py` — reopen on a dead launcher; the Astra reviewer retire.
+- `scripts/agents/codex_mesh.py` — end keeps the row; the recovery mark; the account move server choice.
+- `scripts/direct/workers.py` — the unit ledger keeps ended workers.
+- `scripts/production/worker_fill.py` — the end-friend retire.
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — end, reopen and retire rules.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the source and doc files.
-- `test` — the test files.
+**Binds later work:** `codex_mesh.py end` never retires a staff row; a new caller that ends a worker for good retires it after `end` exits 0.
 
-**State:** none. Rows that `end` already retired stay retired; a lost thread starts a fresh worker on the same tree.
+**Gotchas:** find permanent-removal callers by their `end` calls, not by `staff.retire` calls. Look up a worker's row by its staff id (`session_staff.worker_row`); a lookup by session id can match an unrelated row when the session is empty.
 
-**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line. Phase 4a: run owners are staff ids.
+**Ruled out:** a second recovery mark beside `dead_launcher_recovery`.
 
-### Phase 8m — The end-session test does not read the live session  · status: todo
+### Phase 8m — The end-session test does not read the live session  · status: done
 
-Source: sdlc [1225326b]. `direct/test_end_session` went red in the fix-rounds gate with "No active unit run marker for this session", then passed. `EndSessionTests.environment` (`scripts/direct/test_end_session.py:90`) copies `os.environ`. `end_session.sh` takes `DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"`, so a caller's `CODEX_THREAD_ID` overrides the fixture's `CLAUDE_CODE_SESSION_ID` and the script looks for a marker the fixture never wrote. Measured on 3664b48c3: with `CODEX_THREAD_ID=live-thread-x` set, the module fails (1 failure, 3 errors) with that line.
+#### As-built
 
-**Depends on:** none. It stacks on 8l 3664b48c3 for the tree, not for its code.
-
-#### Work Order
-
-**Goal:** `direct.test_end_session` gives the same result whatever session identity its caller has.
-
-**Spec:**
-1. **The fixture owns the session identity.** `EndSessionTests.environment` removes each session-identity variable that `end_session.sh` and the scripts it runs read from the caller and the fixture does not set: `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` name. Read `end_session.sh`, `scripts/lib/unit_env.sh` and `scripts/lib/unit_runs.py` `environ` to confirm the list, and name each removed variable in the summary. The fixture keeps its own `CLAUDE_CODE_SESSION_ID`.
-2. The test that uses `patch.dict(os.environ, environment)` (`test_end_session.py:237`) gets the same environment, so its in-process staff reads see the same identity.
-3. **Out of scope.** No change to `end_session.sh` or any other source file. No new check. No assertion changes.
-
-**Acceptance:**
-- `direct.test_end_session` is green with and without `CODEX_THREAD_ID=live-thread-x` in the caller's environment, through the 3z runner.
-- basedpyright `0 errors, 0 warnings, 0 notes` on `scripts/direct/test_end_session.py`. The full gate passes.
+`direct.test_end_session` gives the same result whatever session identity its caller has. `EndSessionTests.environment` removes `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` name from the environment it gives `end_session.sh`, and keeps its own `CLAUDE_CODE_SESSION_ID`. The in-process test patches `os.environ` with `clear=True` to that same environment.
 
 **Files:**
 - `scripts/direct/test_end_session.py` — the fixture.
 
-**Workers:** `1 tester`
-- `test` — the test file.
+**Gotchas:** `unit_runs.environ` and `unit_env.sh` read every `PLAN_DELEGATE_*` suffix, so a fixture that removes only the known names leaks the rest.
 
-**State:** none.
+### Phase 8n — Entry scripts run under bare python3  · status: done
 
-**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line.
+#### As-built
 
-### Phase 8n — Entry scripts run under bare python3  · status: todo
+Every entry script under `scripts/` runs under bare `python3 <path>` from any working directory, with no change to a doc or a caller.
 
-Source: sdlc [9c7948fb], [1690c7b8]. Main 2271a9572 brought 3z and 8i. After it, every `python3 ~/.claude/scripts/<x>.py` call failed with `ModuleNotFoundError: No module named 'scripts'` (measured: `send.py`, `update_registration.py`, `change_review.py`, `style_sync.py`). Cause: 3z converted imports to `from scripts.<folder> import <module>`, and only `scripts/lib/py` puts the checkout root on `sys.path`. Bare `python3 <path>` puts only the script's own folder there. sdlc reverted main to 0a1794c67's tree as c2852a093. This phase reverts that revert and adds the fix, so 8i, 3z and the `test_new_account` fix land again.
+- `scripts/lib/package_root.py` puts the checkout root (the folder above `scripts/`, from its own resolved `__file__`) on `sys.path` directly after the entry script's folder. It adds nothing when an entry already resolves to that root. It imports only the standard library and defines no public names.
+- Each entry file with a `scripts.` import (a statement, `__import__` or `importlib.import_module`) and a `__main__` block or shebang loads it after its docstring and `from __future__` imports, with one `../` for each folder level below `scripts/`:
 
-**Depends on:** none. It branches from origin/sdlc c2852a093. 8l and 8m stack on it after it lands.
+  ```python
+  try:
+      with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+  except FileNotFoundError:
+      pass
+  ```
 
-#### Work Order
-
-**Goal:** every entry script runs under bare `python3 <path>` from any working directory, with no change to a doc or a caller.
-
-**Spec:**
-1. **One shared bootstrap.** Add `scripts/lib/package_root.py`. When it runs, it puts the checkout root (the folder above `scripts/`, from its own resolved `__file__`) on `sys.path` directly after the script's own folder, the same place the shim's `PYTHONPATH` gives it. It adds nothing when an entry of `sys.path` already resolves to that root. It imports only the standard library and defines no public names. It is the one file that changes `sys.path` for the package root.
-2. **One line in each entry file.** Every non-test Python file under `scripts/` that runs as a program (a `__name__ == "__main__"` block or a shebang) and has a `scripts.` import anywhere loads the bootstrap by path in one block, before its first import other than `from __future__`:
-
-   ```python
-   try:
-       with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
-   except FileNotFoundError:
-       pass
-   ```
-
-   with one `../` for each folder level below `scripts/`. The path also works when `__file__` has no folder part, as under `runpy.run_path("send.py")`. A copy of an entry file outside the checkout (a test fixture, a launcher runtime) finds no bootstrap and runs as it did before this phase, with the root from `PYTHONPATH`. The block has no `sys.path` text, returns no value and costs under 2 ms for each start (measured 0.9 ms; a `runpy` and `pathlib` form cost 15 ms). A file still has its old `sys.path` lines if its folder is not converted; leave them.
-3. **The rewrite script keeps it.** `scripts/lint/package_imports.py` gets one function that adds the line to an entry file that lacks it and changes nothing else. A `scripts.` import counts when it is an `import` statement or a call of `__import__` or `importlib.import_module` with a `scripts.` string. The function replaces an older form of the block. `convert` runs it over every entry file under `scripts/`, so a rerun after an interrupted conversion adds each missing block, and one command runs it over a tree. Run that command once over this tree to add the line.
-4. **The import rule.** The rule check, wherever it is, accepts `scripts/lib/package_root.py` and the bootstrap line, and refuses every other `sys.path` change as before. Phase 3z Spec item 3 names the exception.
-5. **Out of scope.** No change to a command doc, hook command, `settings.json` line or other caller. No change to `scripts/lib/py`. No conversion of a folder that 3z has not converted.
-
-**Acceptance:**
-- A new test runs a sample of entry scripts with bare `python3 <tree>/scripts/<folder>/<file>.py --help`, from a working directory outside the tree and with no `PYTHONPATH`: `message/send.py`, `production/update_registration.py`, `production/change_review.py`, `style/style_sync.py`, and one entry from each of `direct`, `agents`, `hooks`, `accounts`, `whoami` and `lib`. Each exits 0 and prints no `ModuleNotFoundError`.
-- `scripts/lint/test_package_imports.py` covers the new function and `convert`'s use of it.
-- The bootstrap costs under 2 ms for each start, measured with `python3 -X importtime` or a timer around the line.
-- basedpyright reports no new diagnostic on a changed file, compared with the same file at 84fb8bd01, and `0 errors, 0 warnings, 0 notes` on each new file. The full gate passes.
+  A copy outside the checkout finds no file and runs with the root from `PYTHONPATH`. The block costs under 2 ms for each start.
+- `scripts/lint/package_imports.py`: `add_bootstrap(file: Path) -> bool` adds the block, replaces an older one-line form, keeps CRLF and skips `test_*` and `*_test_support.py`. `_bootstrap_tree(root) -> int` runs it over `scripts/**/*.py`; `convert` and the `bootstrap <checkout>` command both call it.
 
 **Files:**
 - `scripts/lib/package_root.py` — the bootstrap.
-- `scripts/lint/package_imports.py` — the line function and its command.
-- `scripts/` — the one line in every entry file (written by the command), and the import rule check.
-- `scripts/lib/test_package_root.py` — the bare-run test.
-- `scripts/lint/test_package_imports.py` — the rewrite tests.
-- `docs/plans/sdlc-devtools-tests.md` — 3z Spec item 3 names the exception.
+- `scripts/lint/package_imports.py` — the block function, the tree helper and the `bootstrap` command.
+- `scripts/lib/test_package_root.py` — bare, relative-path (`runpy.run_path` under `-I`) and copied-entry runs.
+- `scripts/lint/test_package_imports.py` — block insertion, old-form replacement, dynamic imports and convert reruns.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the bootstrap, the rewrite script, the line in every entry file, the rule check.
-- `test` — `scripts/lib/test_package_root.py`, `scripts/lint/test_package_imports.py`.
+**Binds later work:** `scripts/lib/package_root.py` is the one allowed `sys.path` change; the 4-line block holds no `sys.path` text. `package_imports.py bootstrap <checkout>` adds a missing block over a tree and stays when the import conversion is deleted.
 
-**State:** none.
+**Gotchas:** `__file__.rpartition("/")[0]` is empty for a `__file__` with no folder part and gives `/../lib/...`; the block uses `rfind`. A `runpy` or `pathlib` form costs about 15 ms for each start; `open` + `exec` costs under 1 ms.
 
-**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`. Phase 3t: run test modules alone or in small groups, through `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>`. Phase 8e: `staff.py` defers its imports into functions; keep each deferred import where it is.
+**Ruled out:** hand-written blocks after the converter goes — they drift.

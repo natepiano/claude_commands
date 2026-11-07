@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Admit and publish workers through staff."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from pathlib import Path
@@ -102,13 +106,21 @@ def end_friend(run: Path) -> int:
     family = "" if isinstance(backend, staff.BackendUnavailable) else backend.family
     if family == "codex" or row is None:
         from scripts.agents import codex_mesh
+        retirement_code = 0
         if row is not None:
             try:
-                _ = codex_mesh.command_end(argparse.Namespace(session_dir=str(run), to=row.name))
+                if codex_mesh.command_end(argparse.Namespace(session_dir=str(run), to=row.name)) == 0:
+                    try:
+                        _ = staff.retire(row.id)
+                    except staff.StaffRefused as error:
+                        print(f"codex_mesh: {row.name}: {error}", file=sys.stderr)
+                        retirement_code = 1
             except SystemExit as error:
                 print(str(error), file=sys.stderr)
         if (row is not None or (run / "mesh_server.json").exists()) and (stopped := codex_mesh.command_stop(argparse.Namespace(session_dir=str(run)))):
-            return stopped
+            return retirement_code or stopped
+        if retirement_code:
+            return retirement_code
     elif family == "claude":
         from scripts.shutdown import stop_resume, stop_results
         result = stop_resume.stop(row.id)

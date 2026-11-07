@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Claim a unit worker and watch one named dispatch through completion."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -26,7 +30,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
+from scripts.direct.worker_state import ROSTER_LIVE, worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -460,7 +464,9 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 dispatch.board(slot, "status", f"launcher: compaction failed for {dispatch.worker}: {detail}; continuing follow-up")
             else:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")
-        if record.get("status") == "ended":
+        if record.get("status") == "ended" or (
+                record.get("status") in ROSTER_LIVE | {codex_mesh.WAITING_CAPACITY}
+                and not codex_mesh.worker_launcher_attached(record)):
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker}))
@@ -893,8 +899,16 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
             ended = call([PYTHON, MESH, "end", *context, "--to", args.new_worker], env, check=False).returncode
             if ended:
                 result = 1
-            elif held:
-                astra_roles.release(held)
+            else:
+                if held:
+                    astra_roles.release(held)
+                row = session_staff.worker_row(read_roster(run, args.new_worker))
+                if row is not None and row.kind == "worker":
+                    try:
+                        _ = staff.retire(row.id)
+                    except staff.StaffRefused as error:
+                        print(f"codex_mesh: {args.new_worker}: {error}", file=sys.stderr)
+                        result = 1
     return result
 
 

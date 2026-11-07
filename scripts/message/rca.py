@@ -38,6 +38,10 @@ Each case is one JSON file in STATE, which is $XDG_STATE_HOME/message/rca or ~/.
 `open` never fails its caller: the alert already went out, so an error prints to stderr and it exits 0.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl

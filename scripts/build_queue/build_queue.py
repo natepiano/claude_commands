@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Show the build queue, or one step's place and why it waits."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from dataclasses import dataclass
 
