@@ -2972,6 +2972,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 18: an unproved consultation close exits 1, keeps the report and prints `Saved: <report path>` and `assign.sh: consultation close unproved: <reason>; pane <pane id> (<label>) stays open` to stderr. Keep both lines and `test_unproved_consultation_close_fails_and_preserves_the_report` when the mesh Astra branch goes.
 - sdlc merge 2fc784207: `write_mesh_server_record` and `owned_server_record` start a real process and stop it at cleanup. In `test_astra_review.py` the record exits through the worker fixture, after the `PaneWorld` `os.kill` guard ends; keep that order when the mesh server record goes.
 - Phase 21: every Codex pane launch passes `-c notice.hide_rate_limit_model_nudge=true` (`worker_panes._policy_arguments`), and `send.deliver_worker_text` submits with `Herdr.prompt(..., proof=SubmitStarts(...))`; a stall goes to the holder. Keep both when the mesh goes.
+- Phase 22: `worker._dispatch_turn` completes a DONE dispatch whose only pending runs are finished, with one `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` line per run. Keep it and its two `test_worker.py` tests when `mesh_runs.py` becomes `detached_runs.py`.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3082,38 +3083,23 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 
 **Ruled out:** `submit_opening_prompt` for Codex workers (Claude-only proof); a retry or a transcript wait loop in the message path (sdlc: no new check).
 
-### Phase 22 — A lost detached result does not hold a finished pass  · status: todo
+### Phase 22 — A lost detached result does not hold a finished pass  · status: done
 
-**Depends on:** Phase 21. Phase 19 waits for this phase.
+#### As-built
 
-sdlc ordered it (2026-11-07): "a finished detached run whose result line is missing must not hold a pass forever. Read the run's own finished record. Add no new check." The fastest unit's worker `hana_catalyst-build-speed-tests-impl2` wrote `DONE 31c4086f-…`, but each launcher rerun exited 3. Its run `20261107T083017-444209-2a25` finished and records `sent: worker … at w14:pW`. The Codex model popup took that delivery before Phase 21, so the `Detached run:` line never reached the transcript. `worker.dispatch_receipt` counts every finished run that records a pane delivery as pending until its marker is in the transcript, so the receipt stays `DispatchWaitingForRuns` and every quiet wait returns `NO_DONE`.
-
-#### Work Order
-
-**Goal:** a dispatch whose worker wrote its DONE reply and is idle completes when its only pending runs are finished. One anomaly line names each finished run whose result is not in the transcript. A live run still holds the pass.
-
-**Spec:**
-
-1. `DispatchWaitingForRuns` (`scripts/production/worker.py:59`) gains `reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply`, the transcript receipt. `dispatch_receipt` (`:165`) fills it.
-2. In `_dispatch_turn` (`:319`), at the quiet-wait return (`:374`): when the receipt is `DispatchWaitingForRuns` with `has_live_run` false, its `reply` is `DispatchComplete`, and the worker is idle or done, print `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` once per run to stderr, then return the reply. Every other case keeps `ExitCode.NO_DONE`.
-   The finished record is the evidence that the run ended. The quiet wait comes first, so a result that is still on its way reaches the transcript before this decision.
-3. Do not change `transcript_receipt`, `mesh_runs.deliver`, `delivered_worker_results` or `live_runs`. Add no check, refusal, validation, retry or new wait.
+- `worker.DispatchWaitingForRuns` carries `reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply`, the transcript receipt that `dispatch_receipt` read beside the pending runs.
+- `_dispatch_turn`, at the quiet-wait return: when the receipt waits only on finished runs (`has_live_run` false), its `reply` is `DispatchComplete` and the worker is idle or done, it prints `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` once per run to stderr and returns the reply. Every other case keeps `ExitCode.NO_DONE`. A live run still holds the pass.
+- `transcript_receipt`, `mesh_runs.deliver`, `delivered_worker_results` and `live_runs` do not change.
 
 **Files:**
-- `scripts/production/worker.py` — Spec items 1 and 2.
-- `scripts/production/test_worker.py` — `test_a_delivered_result_absent_from_the_transcript_waits_only_while_its_run_is_live` (`:694`) now pins the new outcome. Rename it for the behavior. For both subtests the dispatch returns `ExitCode.OK`, prints the anomaly line once with the run id, submits no prompt and keeps the DONE reply. The live subtest still waits until its run finishes. Add one test: a worker reply without DONE and a finished run absent from the transcript still returns `NO_DONE`. Keep every other test in the module.
+- `scripts/production/worker.py` — the receipt field and the quiet-wait completion.
+- `scripts/production/test_worker.py` — `test_done_with_a_result_absent_from_the_transcript_completes_after_its_run_finishes` (both subtests return OK with one anomaly line; the live subtest waits until its run finishes) and `test_a_reply_without_done_with_a_finished_run_absent_from_the_transcript_returns_no_done`.
 
-**Workers:** `1 writer` — `impl`: both files.
+**Binds later work:** the mesh deletion keeps the finished-run completion and its anomaly line when `mesh_runs.py` becomes `detached_runs.py`.
 
-**State:** none.
+**Gotchas:** the decision comes after one quiet wait, so a result that is still on its way reaches the transcript first. A worker reply without DONE still returns `NO_DONE` with no anomaly line.
 
-**Constraints from prior phases:** Phase 21: `send.deliver_worker_text` proves the turn start with `SubmitStarts`, and a stall goes to the holder, so a `sent` record after Phase 21 means the turn started. Keep the Phase 15 settle and busy tests and the detached dispatch tests in `test_worker.py`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_worker.py'` passes.
-- `-s scripts/herdr -p 'test_worker_panes.py'` and `-s scripts/agents -p 'test_mesh_runs.py'` pass.
-- basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
+**Ruled out:** a new check, retry or wait (sdlc: "Add no new check"); hand edits of run records.
 
 ### Phase 23 — A draft in the composer does not block an opening prompt  · status: todo
 
