@@ -21,6 +21,7 @@ hold_before_repair() {
             ;;
     esac
 }
+set -o functrace
 trap hold_before_repair DEBUG
 ''')
         self.fixture.environment["BASH_ENV"] = str(shell)
