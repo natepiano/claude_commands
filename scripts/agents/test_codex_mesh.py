@@ -2009,6 +2009,7 @@ class MeshCommandFixture(unittest.TestCase):
         parent = unit_membership("sdlc", "roles")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         yield
 
 
@@ -13950,6 +13951,7 @@ class WorkerPauseTests(MeshCommandFixture):
         parent = unit_membership("demo", "builders")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         session_staff.inbox_path(parent.id).parent.mkdir(parents=True, exist_ok=True)
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session})))
         respond = self.server.respond
         @bounded_fixture
