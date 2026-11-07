@@ -219,8 +219,8 @@ class StepProgressTests(unittest.TestCase):
                 "VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc"),
             }):
                 cases = (
-                    (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_HOLD, ""),
-                    (step_record.SshAllowed(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+                    (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_HOLD, ""),
+                    (step_record.AnyTarget(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
                 )
                 for permission, state, selected in cases:
                     with self.subTest(state=state):

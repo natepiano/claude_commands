@@ -1305,7 +1305,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** measuring the wait from the current `updated` time — a retry every 180 s resets it, so a long outage never alerts.
 
-### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
+### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: done
 
 **Depends on:** Phase 41g, Phase 41j and Phase 41k.
 

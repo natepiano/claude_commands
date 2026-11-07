@@ -691,11 +691,11 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
 
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
-    if verb not in ('nextest', 'check', 'doc'):
-        raise ValueError('Linux targets accept only test, check and doc')
+    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
+        raise ValueError('unsupported remote verb')
     if verb == 'nextest':
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = 'test' if verb == 'nextest' else verb
+    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)

@@ -35,7 +35,7 @@ printf '%s\\n' "$MAC_ONLY" "$MAC_REASON" "$LOCAL_ONLY" "$NO_CACHE" "$PINNED_TARG
             self.assertEqual(refused.returncode, 2)
             self.assertEqual(refused.stdout, "")
             self.assertEqual(refused.stderr,
-                             'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".\n')
+                             'verify.sh: --mac needs a reason: --mac "<why this command must run on macOS>".\n')
 
 
 if __name__ == "__main__":

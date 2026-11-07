@@ -33,32 +33,32 @@ class VerifyTargetPlatformTests(unittest.TestCase):
 
     def test_macos_row_supplies_the_platform_without_an_interpreter(self) -> None:
         result = self.platform("linux-box\teligible\t-\t/linux.conf\tlinux\n"
-                               + "mac-box\teligible\t-\t/mac.conf\tmacos", "ssh_allowed", "mac-box")
+                               + "mac-box\teligible\t-\t/mac.conf\tmacos", "any_target", "mac-box")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "macos\n")
         self.assertEqual(result.stderr, "")
 
     def test_linux_row_supplies_the_platform_without_an_interpreter(self) -> None:
         result = self.platform("mac-box\texcluded\tbusy\t/mac.conf\tmacos\n"
-                               + "linux-box\teligible\t-\t/linux.conf\tlinux", "ssh_allowed", "linux-box")
+                               + "linux-box\teligible\t-\t/linux.conf\tlinux", "any_target", "linux-box")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "linux\n")
         self.assertEqual(result.stderr, "")
 
     def test_local_row_supplies_no_remote_platform(self) -> None:
-        result = self.platform("natedev\teligible\t-\t-\t-", "ssh_allowed", "natedev")
+        result = self.platform("natedev\teligible\t-\t-\t-", "any_target", "natedev")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
-    def test_missing_mac_row_keeps_the_mac_allowed_fallback(self) -> None:
-        result = self.platform("", "mac_allowed", "mac")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "macos\n")
+    def test_missing_mac_row_has_no_platform(self) -> None:
+        result = self.platform("", "any_target", "mac")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
-    def test_missing_row_has_no_ssh_allowed_fallback(self) -> None:
-        result = self.platform("", "ssh_allowed", "mac")
+    def test_missing_linux_row_has_no_platform(self) -> None:
+        result = self.platform("", "any_target", "aws")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")

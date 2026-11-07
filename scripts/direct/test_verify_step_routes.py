@@ -17,7 +17,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         self.assertEqual(len(rows), 1)
         record = cast(dict[str, object], rows[0]["record"])
         self.assertEqual((record["kind"], record["state"]), ("check", "on_mac"))
-        self.assertEqual(record["runs_on"], {"kind": "mac_allowed"})
+        self.assertEqual(record["runs_on"], {"kind": "any_target", "mac_targets": ["mac"]})
         self.assertEqual([event for event in self.fixture.cargo_events()
                           if event["args"][:1] != ["metadata"]], [])
         decisions = [cast(dict[str, object], json.loads(line)) for line in self.events.read_text().splitlines()

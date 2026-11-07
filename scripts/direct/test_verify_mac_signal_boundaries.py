@@ -11,13 +11,13 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
-    def test_other_verbs_never_call_runner(self) -> None:
-        for arguments in (("check", "sample"), ("lint", "sample"), ("final",)):
+    def test_each_verb_uses_its_first_step_route(self) -> None:
+        for arguments, attempts in ((("check", "sample"), 1), (("lint", "sample"), 0), (("final",), 0)):
             with self.subTest(arguments=arguments):
                 self.clear_observations()
                 result = self.verify(*arguments)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(self.runner_events(), [])
+                self.assertEqual(len(self.runner_events()), attempts)
 
     def test_signal_before_runner_start_removes_result_without_local_work(self) -> None:
         marker = self.runner_state / "before-runner"

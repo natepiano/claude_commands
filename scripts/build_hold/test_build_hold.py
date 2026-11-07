@@ -2331,7 +2331,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     "VERIFY_PROC_ROOT": str(self.proc), "VERIFY_STEPS_DIR": str(self.scratch / "steps"),
                 }):
                     step_record.write(step_record.StepRecord(
-                        "kept-step", 90, "900", self.scratch, "test", None,
+                        "kept-step", 90, "900", self.scratch, "test", step_record.WorkspacePackages(),
                         step_record.NatedevOnly("fixture"), step_record.StepState.ON_NATEDEV,
                         "2026-10-28T12:00:00+00:00",
                     ))

@@ -184,7 +184,8 @@ class Controller:
             return 0
         values = configuration.values()
         return sum(1 for _, row in snapshot.inputs.ordered
-                   if offload.linux_kind_permitted(values, str(row.get('step', ''))) and row.get('repo_identity')
+                   if row.get('step') not in ('build', 'final')
+                   and offload.linux_kind_permitted(values, str(row.get('step', ''))) and row.get('repo_identity')
                    and row.get('repository_name') and 'token_left_at' not in row
                    and now - row['since'] >= settings.start_after_wait_s)
 

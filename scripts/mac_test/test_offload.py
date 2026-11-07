@@ -48,6 +48,77 @@ START_SUBPROCESS = subprocess.Popen
 
 
 class LintVerbTests(unittest.TestCase):
+    def test_build_reports_the_cargo_target_directory_after_success(self) -> None:
+        lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invoke = root / ".claude/scripts/lint/invoke.sh"
+            invoke.parent.mkdir(parents=True)
+            _ = invoke.write_text('run() { "$@"; }\n')
+            cargo = root / "cargo"
+            output = str(root / "cargo output")
+            _ = cargo.write_text(f'#!{sys.executable}\nimport json, sys\n'
+                + 'if sys.argv[1:] == ["build", "--workspace", "--bins"]:\n    raise SystemExit(0)\n'
+                + 'assert sys.argv[1:] == ["metadata", "--no-deps", "--format-version", "1"]\n'
+                + f'print(json.dumps({{"target_directory": {output!r}}}))\n')
+            cargo.chmod(0o755)
+            environment = {**os.environ, "HOME": str(root), "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            result = subprocess.run(["bash", str(lint), "build", "--workspace", "--bins"],
+                cwd=root, env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "build_target_directory=" + output + "\n")
+
+    def test_build_metadata_receives_the_manifest_path_outside_the_workspace(self) -> None:
+        for equals in (False, True):
+            with self.subTest(equals=equals):
+                self.check_build_metadata_option("--manifest-path", equals=equals)
+
+    def test_build_metadata_uses_the_requested_target_directory(self) -> None:
+        for equals in (False, True):
+            for relative in (False, True):
+                with self.subTest(equals=equals, relative=relative):
+                    self.check_build_metadata_option("--target-dir", equals=equals, relative=relative)
+
+    def check_build_metadata_option(self, option: str, *, equals: bool, relative: bool = False) -> None:
+        lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invoke = root / ".claude/scripts/lint/invoke.sh"
+            invoke.parent.mkdir(parents=True)
+            _ = invoke.write_text('run() { "$@"; }\n')
+            workspace = root / "other workspace"
+            workspace.mkdir()
+            manifest = workspace / "Cargo.toml"
+            _ = manifest.write_text('[workspace]\nmembers = []\n')
+            output = workspace / "target"
+            value = str(manifest)
+            if option == "--target-dir":
+                value = "relative output" if relative else str(root / "cargo output")
+                output = (root / value).resolve()
+            arguments = [f"{option}={value}"] if equals else [option, value]
+            metadata_arguments = arguments if option == "--manifest-path" else []
+            calls = root / "calls"
+            cargo = root / "cargo"
+            _ = cargo.write_text(
+                f'#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n'
+                + f'with Path({str(calls)!r}).open("a") as calls:\n'
+                + '    calls.write(json.dumps({"args": sys.argv[1:], "target_dir": os.environ.get("CARGO_TARGET_DIR")}) + "\\n")\n'
+                + 'if sys.argv[1] == "metadata":\n'
+                + f'    output = Path(os.environ.get("CARGO_TARGET_DIR", {str(workspace / "target")!r})).resolve()\n'
+                + '    print(json.dumps({"target_directory": str(output)}))\n')
+            cargo.chmod(0o755)
+            environment = {**os.environ, "HOME": str(root), "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            _ = environment.pop("CARGO_TARGET_DIR", None)
+            result = subprocess.run(["bash", str(lint), "build", "--workspace", *arguments],
+                cwd=root, env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), [
+                json.dumps({"args": ["build", "--workspace", *arguments], "target_dir": None}),
+                json.dumps({"args": ["metadata", "--no-deps", "--format-version", "1", *metadata_arguments],
+                            "target_dir": value if option == "--target-dir" else None}),
+            ])
+            self.assertEqual(result.stdout, "build_target_directory=" + str(output) + "\n")
+
     def test_check_and_mend_check_use_the_public_lint_command_without_rewrites(self) -> None:
         lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
         with tempfile.TemporaryDirectory() as directory:
@@ -453,6 +524,17 @@ class BusyHolderTests(unittest.TestCase):
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def test_remote_build_target_directory_reaches_the_result_file(self) -> None:
+        self.write_portable_workspace()
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace("$remote == *'lint doc'*",
+            "$remote == *'lint doc'* || $remote == *'lint build'*"))
+        self.fixture["run_status_line"] = "build_target_directory=/remote/cargo output\nmac_exit=0"
+        self.sync_fixture()
+        result = self.command("--workspace", "--bins", verb="build")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("build_target_directory=/remote/cargo output\n", self.result_path.read_text())
+
     def test_configuration_declines_before_claiming(self) -> None:
         self.config["offload"] = "off"
         self.sync_config()
@@ -806,7 +888,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.write_portable_workspace()
         self.config["linux_only.hana"] = "portable"
         self.sync_config()
-        for verb in ("check", "clippy", "mend-check", "doc"):
+        for verb in ("check", "clippy", "mend-check", "doc", "build"):
             with self.subTest(verb=verb):
                 self.assert_declined(self.command("--workspace", verb=verb), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])

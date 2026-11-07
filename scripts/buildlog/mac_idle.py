@@ -233,7 +233,8 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        disk_excluded = isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk"
+        disk_excluded = (isinstance(record.runs_on, step_record.AnyTarget) and bool(record.mac_disk_exclusions)) or (
+            isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk")
         if disk_excluded:
             if record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
                                     step_record.StepState.ON_NATEDEV):

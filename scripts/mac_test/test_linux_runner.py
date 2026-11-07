@@ -752,6 +752,20 @@ class LinuxShellTests(unittest.TestCase):
                          + "natedev=rustc required; move the box pins in nixos hosts/builder.nix\n")
         self.assertFalse(self.events("lint"))
 
+    def test_remote_build_and_judgments_receive_their_verbs_and_kinds(self) -> None:
+        _ = self.settings.write_text(self.settings.read_text().replace(
+            "kinds=test,check,doc", "kinds=test,check,doc,lint,example,build"))
+        cases: tuple[tuple[offload.MacVerb, str, tuple[str, ...]], ...] = (
+            ("build", "build", ("--workspace", "--bins")),
+            ("clippy", "lint", ("--workspace", "--all-features")),
+            ("mend-check", "lint", ("--workspace",)),
+            ("clippy", "example", ("--workspace", "--example", "demo")),
+        )
+        for verb, kind, words in cases:
+            with self.subTest(verb=verb, kind=kind):
+                event = self.assert_ran(replace(self.request(verb, words), kind=kind))
+                self.assertEqual(event["args"], [verb, *words])
+
     def test_check_and_staged_doc_keep_their_arguments_and_document_policy(self) -> None:
         check = self.assert_ran(self.request("check", ("--workspace", "--all-features")))
         self.assertEqual(check["args"], ["check", "--workspace", "--all-features"])

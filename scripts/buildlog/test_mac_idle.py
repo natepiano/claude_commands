@@ -53,6 +53,7 @@ else:
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.message import send
 from test_index import use_test_log
+from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 if TYPE_CHECKING:
     from ..lib.process_group import send_process_group
 else:
@@ -127,7 +128,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), kind,
             step_record.NamedPackage(self.call.package) if kind == "test" else step_record.WorkspacePackages(),
-            step_record.MacAllowed() if mac_allowed else step_record.NatedevOnly("Linux only"),
+            step_record.AnyTarget(("mac", "natedev"), ("mac",)) if mac_allowed else step_record.NatedevOnly("Linux only"),
             state, "2026-10-28T22:00:00Z"))
 
     def process(self, pid: int, parent: int, start: str, argv: tuple[str, ...], env: dict[str, str] | None = None) -> None:
@@ -161,7 +162,7 @@ class MacIdleTests(NotificationGuardedTestCase):
             functions.append(source[start:end])
         script = "\n".join(functions) + r'''
 set -uo pipefail
-STEP_RECORD_ACTIVE=1; STEP_RUNS_ON=mac_allowed; CMD=lint
+STEP_RECORD_ACTIVE=1; STEP_RUNS_ON=any_target; CMD=lint
 TOKEN_USED=0; TOKEN_HELD=0; TOKEN_WAITED=0; LINT_LEFT_QUEUE_STATUS=75
 STEP_RECORD_PATH=$TEST_RECORD
 STEP_STATE_PATH=${TEST_RECORD%.json}.state
@@ -215,7 +216,7 @@ done
                     self.assertIsInstance(record, step_record.StepRecord)
                     assert isinstance(record, step_record.StepRecord)
                     if stage == "judgment":
-                        self.assertIsInstance(record.runs_on, step_record.MacAllowed)
+                        self.assertIsInstance(record.runs_on, step_record.AnyTarget)
                         self.assertEqual(len(mac_idle.waiting_calls(self.paths, live)), 1)
                         mac_idle.call_path(self.paths, self.call.call_id).with_suffix(".cases").unlink(missing_ok=True)
                         with mock.patch.object(mac_idle, "record_case") as report:
@@ -247,8 +248,8 @@ done
         for pid in range(125, 125 + total - 1):
             self.process(pid, 1, str(pid), ("bash", "step"))
             step_record.write(step_record.StepRecord(
-                f"waiting-{pid}", pid, str(pid), Path(self.call.repo), "test", "sample",
-                step_record.MacAllowed(), step_record.StepState.WAITING_HOLD, "2026-10-28T22:00:00Z"))
+                f"waiting-{pid}", pid, str(pid), Path(self.call.repo), "test", step_record.NamedPackage("sample"),
+                step_record.AnyTarget(("mac", "natedev"), ("mac",)), step_record.StepState.WAITING_HOLD, "2026-10-28T22:00:00Z"))
 
     def claim(self, *, working: bool = False, remote: bool = True) -> Path:
         row: dict[str, object] = {"pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
@@ -570,7 +571,7 @@ done
             with self.subTest(state=state):
                 step_record.write(step_record.StepRecord(
                     self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
-                    self.call.package, step_record.NatedevOnly("disk"), state, "2026-11-03T18:00:00Z"))
+                    step_record.NamedPackage(self.call.package), step_record.NatedevOnly("disk"), state, "2026-11-03T18:00:00Z"))
                 mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
                                       asdict(replace(self.call, local_reason="disk")))
                 (self.paths.state / "alert.json").unlink(missing_ok=True)
@@ -589,10 +590,80 @@ done
                 self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
                 self.assertEqual(self.rows(), [])
 
+    def test_eligibility_disk_exclusion_survives_local_compilation_and_alerts(self) -> None:
+        environment = dict(os.environ)
+        fixture = VerifyMacMemoryRetryFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.environment["VERIFY_PROC_ROOT"] = "/proc"
+        _ = fixture.hold_memory()
+        fixture.write_executable(fixture.bin_directory / "ssh",
+                                 "#!/bin/sh\nprintf 'free_gib=0\\nhost=test-mac\\nrc=0\\n'\n")
+        process = fixture.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(fixture.runner_state / "mac-free"),
+            "TEST_RUNNER_BUSY_REASON": "disk"})
+        self.addCleanup(fixture.stop_verify, process)
+        fixture.wait_for_memory_wait(process)
+        records = list((fixture.root / "verify-steps").glob("*.json"))
+        self.assertEqual(len(records), 1)
+        with mock.patch.dict(os.environ, {
+            "VERIFY_STEPS_DIR": str(records[0].parent), "VERIFY_PROC_ROOT": "/proc"}):
+            record = step_record.read(records[0].stem)
+        if not isinstance(record, step_record.StepRecord):
+            self.fail(f"Expected a live step record, got {record!r}")
+        self.assertEqual(record.mac_disk_exclusions, ("mac",))
+        self.assertIsInstance(record.runs_on, step_record.AnyTarget)
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        step_record.record_path(self.call.call_id).unlink()
+        destination = step_record.record_path(record.call_id)
+        _ = destination.write_bytes(records[0].read_bytes())
+        self.process(record.pid, 1, record.proc_start, ("bash", "verify.sh", "test", "sample"))
+        for state in ("waiting_hold", "waiting_mac", "on_natedev", "writes_tree on_natedev"):
+            with self.subTest(state=state):
+                _ = step_record.state_path(record.call_id).write_text(state + "\n")
+                decoded = step_record.read(record.call_id)
+                if not isinstance(decoded, step_record.StepRecord):
+                    self.fail(f"Expected a live step record, got {decoded!r}")
+                self.assertEqual(decoded.mac_disk_exclusions, ("mac",))
+                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                with mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as notify, \
+                     mock.patch.object(mac_idle, "notify_outage", side_effect=REAL_NOTIFY_OUTAGE), \
+                     mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+                    mac_idle.watch_once(self.paths, 1600, 100)
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                if state == "writes_tree on_natedev":
+                    self.assertEqual((saved["waiting"], saved["cause"]), (0, "free"))
+                    self.assertIsNone(mac_idle.mac_idle_alert.alert_line(
+                        self.paths.state / "alert.json", 1600, ZoneInfo("UTC")))
+                    notify.assert_not_called()
+                    push.assert_not_called()
+                else:
+                    self.assertEqual((saved["waiting"], saved["cause"]), (1, "disk"))
+                    self.assertIn("disk", mac_idle.mac_idle_alert.alert_line(
+                        self.paths.state / "alert.json", 1600, ZoneInfo("UTC")) or "")
+                    notify.assert_called_once()
+                    push.assert_called_once()
+
+    def test_disk_evidence_does_not_make_natedev_only_steps_wait_for_the_mac(self) -> None:
+        for kind, reason in (("lint", "step writes the tree"), ("test", "local files"),
+                             ("build", "makes natedev artifacts"), ("final", "full gate runs on natedev")):
+            with self.subTest(kind=kind, reason=reason):
+                step_record.write(step_record.StepRecord(
+                    self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), kind,
+                    step_record.NamedPackage(self.call.package), step_record.NatedevOnly(reason),
+                    step_record.StepState.ON_NATEDEV, "2026-11-03T18:00:00Z", mac_disk_exclusions=("mac",)))
+                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                with mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as notify, \
+                     mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+                    mac_idle.watch_once(self.paths, 1600, 100)
+                self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["waiting"], 0)
+                notify.assert_not_called()
+                push.assert_not_called()
+
     def test_disk_alert_clears_when_the_floor_sweep_allows_the_step(self) -> None:
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
-            self.call.package, step_record.NatedevOnly("disk"), step_record.StepState.ON_NATEDEV,
+            step_record.NamedPackage(self.call.package), step_record.NatedevOnly("disk"), step_record.StepState.ON_NATEDEV,
             "2026-11-03T18:00:00Z"))
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
                               asdict(replace(self.call, local_reason="disk")))
@@ -766,9 +837,9 @@ done
 
     def test_linux_only_waits_and_linux_execution_never_trigger_mac_repairs(self) -> None:
         cases = (
-            (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_HOLD, ""),
-            (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_SSH, ""),
-            (step_record.SshAllowed(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+            (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_HOLD, ""),
+            (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_SSH, ""),
+            (step_record.AnyTarget(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
         )
         for permission, state, selected in cases:
             with self.subTest(state=state, selected=selected):
@@ -787,7 +858,7 @@ done
     def test_mixed_target_record_keeps_mac_wait_observation_after_decoding(self) -> None:
         step_record.write(step_record.StepRecord(
             self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
-            step_record.NamedPackage("sample"), step_record.SshAllowed(("studio", "aws"), ("studio",)),
+            step_record.NamedPackage("sample"), step_record.AnyTarget(("studio", "aws"), ("studio",)),
             step_record.StepState.WAITING_HOLD, "2026-11-02T10:00:00Z"))
 
         self.two_passes()
@@ -799,7 +870,7 @@ done
 
     def test_unreadable_and_stale_records_are_named_without_hiding_a_live_waiter(self) -> None:
         step_record.write(step_record.StepRecord("stale-call", 123, "old-start", Path(self.call.repo),
-            "check", None, step_record.MacAllowed(), step_record.StepState.WAITING_MAC, "2026-10-28T22:00:00Z"))
+            "check", step_record.WorkspacePackages(), step_record.AnyTarget(("mac", "natedev"), ("mac",)), step_record.StepState.WAITING_MAC, "2026-10-28T22:00:00Z"))
         damaged = step_record.record_path("damaged-call")
         _ = damaged.write_text("{")
         errors = io.StringIO()

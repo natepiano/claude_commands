@@ -9,7 +9,7 @@
 #   test [<package>]       run package tests; try the Mac, else natedev
 #   lint [<package>]       repair and format code; check TOML and run Clippy
 #   doc [<package>]        document the staged workspace; deny warnings
-#   example [<package>]    run Clippy on examples on natedev
+#   example [<package>]    run Clippy on examples on an eligible target
 #   build [<package>]      build binaries on natedev and print their paths
 #   final [<package>]      check workspace targets; run tests on natedev
 #   help <command>       show details for one command
@@ -23,9 +23,9 @@
 #   --filter <name>      test: select names; repeat to select more names
 #   --features <list>    check, test, doc, build: enable Cargo features
 #   --no-cache           test, lint: ignore saved results
-#   --target <name>      test, check, doc: use one configured SSH target
-#   --mac "<reason>"     test: wait for the Mac; never use natedev
-#   --local "<reason>"   test: use natedev when the test cannot pass on macOS
+#   --target <name>      pin movable steps to one configured target
+#   --mac "<reason>"     pin movable steps to the Mac
+#   --local "<reason>"   pin steps to natedev
 #   --session-dir <dir>  use a worker session; put this before the command
 # End usage.
 #
@@ -38,8 +38,8 @@
 # Names without a slash in --features belong to the named package.
 # Without a package, pass feature names unchanged.
 # Add workspace.metadata.dev.features to the requested features.
-# Normally run on natedev. Eligible SSH targets can run compiling steps
-# when natedev must wait. --target selects one configured SSH target.
+# Try eligible targets in config/build_targets.conf order.
+# --target, --mac and --local pin movable steps to one target.
 # Always run this check; do not reuse a saved result.
 # End help.
 #
@@ -65,7 +65,8 @@
 # With --mac, repeat --env NAME to forward named environment variables.
 # --fetch <folder> retrieves one ignored folder from the Mac.
 # --local "<reason>" runs on natedev for a test that cannot pass on macOS.
-# --target <name> selects one configured SSH target without a local fallback.
+# --target <name> selects one configured target, including natedev.
+# The command waits for that target without a fallback.
 #
 # A manual run without a worker session always runs the tests.
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
@@ -87,8 +88,8 @@
 # Format the named package and members that differ from HEAD.
 # No package formats all members.
 # --check reports findings without applying fixes.
-# Tree writes stay on natedev. Eligible SSH targets can judge code
-# when natedev must wait. A natedev hold keeps formatting local.
+# Tree writes stay on natedev under every routing flag.
+# Judgment uses the configured target order, or the pinned target.
 #
 # A manual run without a worker session always runs lint.
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
@@ -106,8 +107,8 @@
 # Fill that checkout from the staged index. Exclude unstaged and untracked files.
 # Keep the real index unchanged.
 # Always run rustdoc, even with doc=off in config/lint.conf.
-# Normally run on natedev. Eligible SSH targets can run the rustdoc step
-# when natedev must wait. --target selects one configured SSH target.
+# Try eligible targets in config/build_targets.conf order.
+# --target, --mac and --local pin movable steps to one target.
 # A named package owns feature names without a slash.
 # Also add workspace.metadata.dev.features.
 #
@@ -120,7 +121,8 @@
 # Help example:
 # Usage: verify example [<package>] [--name <name>]
 #
-# Run Clippy on examples on natedev. Deny warnings.
+# Run Clippy on examples on the first eligible target. Deny warnings.
+# --target, --mac and --local pin movable steps to one target.
 # Without --name, check all examples in the selection.
 # Enable the example's required features for the named package.
 # Cargo resolves features for the whole workspace.
@@ -132,7 +134,8 @@
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
 #                     [--release] [--features <list>]
 #
-# Build the selected binaries on natedev.
+# Build binaries on natedev unless --target or --mac pins the step.
+# --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
 # --release selects the release profile.
@@ -140,7 +143,8 @@
 # Without a package, pass feature names unchanged.
 # For a debug build, also add workspace.metadata.dev.features.
 # Cargo resolves features for the whole workspace.
-# Print each executable as binary: <path> for a smoke run or a live view.
+# Print local executables as binary: <path>.
+# Print remote executables as binary: <target>:<path>.
 # Always build; do not reuse a saved result.
 # End help.
 #
@@ -155,6 +159,9 @@
 # The unit director uses this command for the final workspace gate.
 # A clean, unchanged workspace gets a saved pass when both steps succeed.
 # A named package runs its tests and saves no pass.
+# --target or --mac pins both steps and saves no pass.
+# --local pins both steps to natedev and saves no pass.
+# A pinned final still requires a clean tree.
 # --saved reads a saved workspace pass; --tree selects its tree.
 # Return 0 for a matching pass, or 1 when the pass is absent or differs.
 # Save it under ~/.local/state/verify/final_pass/<tree>.json.
@@ -236,7 +243,7 @@ parse_routing_arguments() {
         case "$1" in
             --target)
                 if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* || -n "$PINNED_TARGET" ]]; then
-                    echo 'verify.sh: --target needs one configured SSH target.' >&2
+                    echo 'verify.sh: --target needs one configured target, including natedev.' >&2
                     exit 2
                 fi
                 PINNED_TARGET=$2
@@ -248,7 +255,7 @@ parse_routing_arguments() {
                 ;;
             --mac)
                 if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                    echo 'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".' >&2
+                    echo 'verify.sh: --mac needs a reason: --mac "<why this command must run on macOS>".' >&2
                     exit 2
                 fi
                 MAC_ONLY=1 MAC_REASON=$2
@@ -277,7 +284,7 @@ parse_routing_arguments() {
                 ;;
             --local)
                 if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                    echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
+                    echo 'verify.sh: --local needs a reason: --local "<why this command must run on natedev>". Leave it off to run on the Mac.' >&2
                     exit 2
                 fi
                 # A reservation used as a --local reason never ends.
@@ -296,10 +303,6 @@ parse_routing_arguments() {
                 ;;
         esac
     done
-    if [[ "$MAC_ONLY" == 1 && "$CMD" != test ]]; then
-        echo 'verify.sh: --mac applies only to test.' >&2
-        exit 2
-    fi
     if [[ "$MAC_ONLY" == 1 && "$LOCAL_ONLY" == 1 ]]; then
         echo 'verify.sh: --mac and --local cannot be used together.' >&2
         exit 2
@@ -339,8 +342,8 @@ parse_routing_arguments() {
         fi
     fi
     if [[ -n "$PINNED_TARGET" ]]; then
-        if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
-            echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
+        if [[ "$LOCAL_ONLY" == 1 || "$MAC_ONLY" == 1 ]]; then
+            echo 'verify.sh: --target cannot combine with --local or --mac.' >&2
             exit 2
         fi
         NO_CACHE=1
@@ -1156,7 +1159,9 @@ print_built_binaries() {
     local binary path
     for binary in "${BUILD_BINARIES[@]}"; do
         path="${BUILD_TARGET_DIR}/${BUILD_PROFILE_DIR}/${binary}"
-        if [[ -x "$path" ]]; then
+        if [[ "$STEP_RAN_ON_MAC" == 1 ]]; then
+            printf 'binary: %s:%s/%s/%s\n' "$BUILDLOG_TARGET" "$REMOTE_BUILD_TARGET_DIR" "$BUILD_PROFILE_DIR" "$binary"
+        elif [[ -x "$path" ]]; then
             echo "binary: $path"
         else
             echo "verify.sh: cargo build passed but made no ${path}" >&2
@@ -1293,7 +1298,7 @@ fi
 parse_routing_arguments "$@"
 parse_command_arguments "${ARGS[@]}"
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
-if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" ]]; then
+if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ONLY" == 0 && "$LOCAL_ONLY" == 0 ]]; then
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; final_pass_finish "$final_status"; exit "$final_status"' EXIT
 fi
@@ -1699,7 +1704,9 @@ SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_bus
 
 step_can_retry() {
     [[ "${STEP_WRITES_TREE:-0}" == 0 && "$LOCAL_ONLY" == 0 ]] || return 1
-    case "$CMD" in test|check|lint|doc) ;; *) return 1 ;; esac
+    case "$CMD" in
+        build|final) [[ "$STEP_RUNS_ON" == any_target ]] || return 1 ;;
+    esac
     local name eligibility reason settings platform
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$settings" != - && -n "$settings" && ( "$eligibility" == eligible ||
@@ -1750,6 +1757,14 @@ forward_mac_runner_signal() {
     exit "$exit_status"
 }
 
+remote_step_kind() {
+    if [[ "$CMD" != final ]]; then printf '%s\n' "$CMD"; return; fi
+    local verb kind
+    while IFS=$'\t' read -r verb kind; do
+        if [[ "$verb" == "$MAC_VERB" ]]; then printf '%s\n' "$kind"; return; fi
+    done < "$HOLD_WAIT_DIR/remote-step-kinds"
+}
+
 try_mac_test() {
     local selected_target selected_is_mac=0
     LAST_TARGET_OUTCOME="" LAST_TARGET_REASON=""
@@ -1763,6 +1778,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal INT 130' INT
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
+    REMOTE_BUILD_TARGET_DIR=""
     local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
     local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
@@ -1778,6 +1794,9 @@ try_mac_test() {
     fi
     if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
+    local remote_kind
+    remote_kind=$(remote_step_kind)
+    runner_args+=(--kind "$remote_kind")
     if [[ -n "$MAC_SOURCE_ROOT" ]]; then runner_args+=(--source-root "$MAC_SOURCE_ROOT"); fi
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
@@ -1804,7 +1823,7 @@ try_mac_test() {
     elif [[ -n "${CACHE_DIR}" && -z "$TREE_WATCH_PID" ]]; then
         set_verdict_keys
     fi
-    MAC_LOG_FILE="$(mktemp)"
+    MAC_LOG_FILE="$(mktemp "$HOLD_WAIT_DIR/mac-output.XXXXXX")"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         step_state on_ssh "$selected_target"
     fi
@@ -1861,6 +1880,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 seconds=*) result_seconds="${line#seconds=}" ;;
                 holder=*) result_holder="${line#holder=}" ;;
                 fetch=*) result_fetch="${line#fetch=}" ;;
+                build_target_directory=*) REMOTE_BUILD_TARGET_DIR="${line#build_target_directory=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -1971,11 +1991,13 @@ check_routing_hold() {
 }
 
 initialize_step_record() {
-    local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target" mac_targets=0
-    local eligible_names="" mac_names=""
+    local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target"
+    local eligible_names="" mac_names="" mac_disk_exclusions=""
     local arguments=(eligible --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
+    if [[ "$CMD" == final ]]; then arguments+=(--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds"); fi
     PKG="${ARGS[0]:-}"
-    if [[ "$CMD" == test ]]; then arguments+=(--package "$PKG"); fi
+    arguments+=(--package "$PKG")
+    if [[ "$MAC_ONLY" == 1 ]]; then arguments+=(--mac); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
     answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
@@ -1985,8 +2007,7 @@ initialize_step_record() {
     fi
     line=${answer%%$'\n'*}
     case "$line" in
-        mac_allowed) STEP_RUNS_ON=mac_allowed; table=${answer#*$'\n'} ;;
-        ssh_allowed) STEP_RUNS_ON=ssh_allowed; table=${answer#*$'\n'} ;;
+        any_target) STEP_RUNS_ON=any_target; table=${answer#*$'\n'} ;;
         natedev_only\ *) decision_reason=${line#natedev_only }; table=${answer#*$'\n'} ;;
         *)
             printf 'verify.sh: target eligibility check returned no decision; step refused\n' >&2
@@ -2001,27 +2022,26 @@ initialize_step_record() {
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
+        if [[ "$eligibility" == excluded && "$reason" == disk && "$platform" == macos ]]; then
+            mac_disk_exclusions+="${mac_disk_exclusions:+,}$name"
+        fi
         if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON || ( -n "$PINNED_TARGET" && "$reason" == starting ) ) ]]; then
             if [[ "$eligibility" == eligible && "$STEP_RUNS_ON" == natedev_only && "$decision_reason" != disk ]]; then
                 printf 'verify.sh: target eligibility answer differs from its targets; step refused\n' >&2
                 exit 2
             fi
-            (( mac_targets += 1 ))
             eligible_names+="${eligible_names:+,}$name"
             if [[ "$platform" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
         elif [[ "$eligibility" == eligible && "$settings" == - ]]; then
             eligible_names+="${eligible_names:+,}$name"
         fi
     done <<< "$table"
-    if [[ "$STEP_RUNS_ON" != natedev_only && "$mac_targets" == 0 ]]; then
-        printf 'verify.sh: target eligibility check allowed no Mac target; step refused\n' >&2
-        exit 2
-    fi
     STEP_TARGET_TABLE=$table
-    if [[ -n "$PINNED_TARGET" ]]; then
-        STEP_DEFER_LOCAL=1
-    fi
     if step_can_retry; then
+        case "$CMD" in
+            check|doc|example|build|final) STEP_DEFER_LOCAL=1 ;;
+            lint) [[ "${COMMAND_ARGS[0]:-}" != --check ]] || STEP_DEFER_LOCAL=1 ;;
+        esac
         while IFS=$'\t' read -r name eligibility reason settings platform; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]]; then
                 MAC_LEAVE_SETTINGS="$settings"
@@ -2031,8 +2051,9 @@ initialize_step_record() {
     fi
     local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
-        --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
-    if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
+        --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold
+        --mac-disk-exclusions "$mac_disk_exclusions")
+    if [[ "$STEP_RUNS_ON" == any_target ]]; then
         record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
     fi
     if [[ -n "$PINNED_TARGET" ]]; then record_args+=(--pinned-target "$PINNED_TARGET"); fi
@@ -2053,7 +2074,7 @@ initialize_step_record() {
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
     if [[ "$MAC_ONLY" == 1 ]]; then
-        printf 'verify.sh: Mac only (%s): route this test to the Mac.\n' "$MAC_REASON" >&2
+        printf 'verify.sh: Mac only (%s): route movable steps to the Mac.\n' "$MAC_REASON" >&2
         local mac_eligible=0 refusal=state
         while IFS=$'\t' read -r name eligibility reason settings platform; do
             [[ "$settings" != - && "$platform" == macos ]] || continue
@@ -2084,8 +2105,9 @@ initialize_step_record() {
 route_compiling_step() {
     local admission=0 command=$1
     STEP_RAN_ON_MAC=0
+    MAC_PASSED=0
     step_state waiting_hold
-    if [[ -z "$PINNED_TARGET" ]]; then check_routing_hold || admission=$?; fi
+    if [[ -z "$PINNED_TARGET" || "$PINNED_TARGET" == natedev || "${STEP_WRITES_TREE:-0}" == 1 ]]; then check_routing_hold || admission=$?; fi
     if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
         case "$admission" in
             0) return 0 ;;
@@ -2095,7 +2117,7 @@ route_compiling_step() {
     fi
     case "$admission" in
         0)
-            if [[ "$STEP_RUNS_ON" != ssh_allowed && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
+            if [[ "$STEP_RUNS_ON" != any_target && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
             ;;
         10) ;;
         *) return "$admission" ;;
@@ -2118,7 +2140,7 @@ route_compiling_step() {
         MAC_VERB=${1:-}
         shift || true
         if [[ "$MAC_VERB" == mend ]]; then MAC_VERB=mend-check; fi
-        if [[ "$command" != cargo || ( "$MAC_VERB" != check && "$MAC_VERB" != doc && "$MAC_VERB" != clippy && "$MAC_VERB" != mend-check ) ]]; then
+        if [[ "$command" != cargo || ( "$MAC_VERB" != check && "$MAC_VERB" != doc && "$MAC_VERB" != clippy && "$MAC_VERB" != mend-check && "$MAC_VERB" != build && "$MAC_VERB" != nextest ) ]]; then
             build_check_stop 2 'cannot route this compiling step to the Mac'
             return 2
         fi
@@ -2131,6 +2153,10 @@ route_compiling_step() {
                 *) MAC_VERB_ARGS+=("$1"); shift ;;
             esac
         done
+        if [[ "$MAC_VERB" == nextest ]]; then
+            if [[ "${MAC_VERB_ARGS[0]:-}" == run ]]; then MAC_VERB_ARGS=("${MAC_VERB_ARGS[@]:1}"); fi
+            NEXTEST_ARGS=("${MAC_VERB_ARGS[@]}")
+        fi
         MAC_FINISH_CALL=0
         local route_status=0
         if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
@@ -2215,7 +2241,7 @@ target_platform() {
             macos|linux) printf '%s\n' "$platform"; return ;;
         esac
     done <<< "$STEP_TARGET_TABLE"
-    [[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos
+    return 1
 }
 
 target_for_settings() {
@@ -2243,16 +2269,18 @@ ssh_reserve_hook() {
         fi
     done
     if [[ "$MAC_LEAVE_SETTINGS" == "$settings" ]]; then deadline=$MAC_RETRY_AFTER; fi
-    if [[ "$deadline" != 0 && "$STEP_RUNS_ON" != mac_allowed ]]; then
+    if [[ "$deadline" != 0 && "$(target_platform "$name")" != macos ]]; then
         # The retry hook expands the clock when it runs.
         # shellcheck disable=SC2016
         printf 'test "$(( ${EPOCHREALTIME/./} - %q ))" -ge %q' \
             "$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"
         printf ' && '
     fi
+    local remote_kind
+    remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
-        --kind "$CMD" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
-    if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
+        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+    if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }
 
 ssh_retry_hook() {
@@ -2267,7 +2295,7 @@ ssh_retry_hook() {
     # Finish this pass before retrying targets from the previous pass.
     for ((index=pivot+1; index<${#candidates[@]}; index++)); do
         printf '{ '
-        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+        if [[ "$(target_platform "${names[$index]}")" == macos ]]; then
             mac_retry_hook "${candidates[$index]}" "$MAC_RETRY_AFTER" reserve
             printf ' && '
         fi
@@ -2276,7 +2304,7 @@ ssh_retry_hook() {
     done
     for ((index=0; index<=pivot; index++)); do
         printf '{ '
-        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+        if [[ "$(target_platform "${names[$index]}")" == macos ]]; then
             mac_retry_hook "${candidates[$index]}" "$MAC_RETRY_AFTER" reserve
             printf ' && '
         fi
@@ -2290,7 +2318,7 @@ try_reserved_target() {
     local target settings
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         IFS=$'\t' read -r target settings < "$HOLD_WAIT_DIR/ssh-reservation"
-    elif [[ "$STEP_RUNS_ON" == mac_allowed && -n "$MAC_LEAVE_SETTINGS" ]]; then
+    elif [[ -n "$MAC_LEAVE_SETTINGS" && "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" == macos ]]; then
         settings=$MAC_LEAVE_SETTINGS
     else
         return 0
@@ -2343,7 +2371,11 @@ mac_only_refuse() {
         *) text=$reason ;;
     esac
     export BUILDLOG_TARGET=""
-    printf 'verify.sh: test --mac refused: %s; nothing ran on natedev.\n' "$text" >&2
+    if [[ "$CMD" == lint ]]; then
+        printf 'verify.sh: %s --mac refused: %s.\n' "$CMD" "$text" >&2
+    else
+        printf 'verify.sh: %s --mac refused: %s; nothing ran on natedev.\n' "$CMD" "$text" >&2
+    fi
     note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
@@ -2369,14 +2401,15 @@ route_test() {
         fi
     done <<< "$STEP_TARGET_TABLE"
     while true; do
-        if [[ -n "$PINNED_TARGET" ]]; then
+        if [[ -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ]]; then
             local pinned_answer
             pinned_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" eligible --kind "$CMD" \
                 --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG" --target "$PINNED_TARGET") || return $?
             STEP_TARGET_TABLE=${pinned_answer#*$'\n'}
             step_state waiting_ssh
         fi
-        if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
+        if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" &&
+              "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" != macos ]]; then
             admission=0
             check_routing_hold || admission=$?
             case "$admission" in
@@ -2396,7 +2429,12 @@ route_test() {
                 check_routing_hold || admission=$?
                 case "$admission" in
                     0) collect_routing_wait; return 0 ;;
-                    10) continue ;;
+                    10)
+                        if [[ "$PINNED_TARGET" == natedev ]]; then
+                            build_hold_wait_local
+                            return $?
+                        fi
+                        continue ;;
                     *) return "$admission" ;;
                 esac
             fi
@@ -2409,7 +2447,7 @@ route_test() {
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
-            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$platform" == macos ]]; then
                 retry_ready=0
                 eval "$(mac_retry_hook "$settings" "$MAC_RETRY_AFTER" reserve)" >/dev/null 2>&1 || retry_ready=$?
                 if [[ "$retry_ready" != 0 ]]; then
@@ -2429,10 +2467,10 @@ route_test() {
                 echo "verify.sh: target $PINNED_TARGET refused: admission changed." >&2
                 return 2
             fi
-            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$reservation_status" == 11 && "$platform" == macos ]]; then
                 continue
             fi
-            if [[ "$reservation_status" == 0 || "$MAC_ONLY" == 1 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
+            if [[ "$reservation_status" == 0 || "$MAC_ONLY" == 1 || ( "$reservation_status" == 11 && "$platform" == macos ) ]]; then
                 if [[ "$retry" == 1 ]]; then collect_routing_wait; fi
                 MAC_LEAVE_SETTINGS=$settings
                 try_reserved_target || return $?
@@ -2447,6 +2485,10 @@ route_test() {
             fi
         done <<< "$STEP_TARGET_TABLE"
         if [[ "$remote_candidates" == 0 ]]; then
+            if [[ "$MAC_ONLY" == 1 ]]; then
+                BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=${BUILDLOG_MAC_REASON:-runner}
+                mac_only_refuse "$BUILDLOG_MAC_REASON"
+            fi
             [[ -z "$PINNED_TARGET" ]] || { echo "verify.sh: target $PINNED_TARGET refused: no capacity" >&2; return 2; }
             return 0
         fi
@@ -2473,7 +2515,7 @@ route_test() {
                 echo 'verify.sh: waiting for the Mac (busy); natedev runs nothing for this call.' >&2
                 announced_reason=busy
             fi
-        elif [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+        elif [[ -n "$MAC_LEAVE_SETTINGS" && "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" == macos ]]; then
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason=$BUILDLOG_MAC_REASON
@@ -2659,7 +2701,7 @@ cache_lookup() {
         return 0
     fi
     echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
-    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
+    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
     fi
     if [[ "${outcome}" == reused ]]; then
@@ -2718,7 +2760,7 @@ cache_record() {
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
     {
         printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
-            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(user_clock)" \
+            "$CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}" "${verb}" "$(user_clock)" \
             "${UNIT_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
         if [[ "${host}" == mac ]]; then
             printf 'host=mac\n'
@@ -3193,7 +3235,7 @@ acquire_token() {
     TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
     (( noted < 0 )) || token_wait_note taken $(( TOKEN_WAITED / 60 ))
 }
-if [[ -z "$PINNED_TARGET" && -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
+if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_USED=1
     TOKEN_WAITERS_DIR="${BOARD_DIR}/token_waiters"
     TOKEN_WAITER_PREFIX="${BOARD_SLOT}.$(token_waiters_key)"
@@ -3935,6 +3977,14 @@ case "$CMD" in
         fi
         ;;
     final)
+        if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
+            VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from final_pass import clean_tree
+clean_tree()
+' "${FINAL_PASS_SCRIPT%/*}" || exit 2
+        fi
         [[ $# -eq 0 ]] || { command_help final >&2; exit 2; }
         FINAL_FEATURES="$(merge_dev_features "")"
         if [[ -n "$VERIFY_PACKAGE" ]]; then require_member "$VERIFY_PACKAGE"; fi

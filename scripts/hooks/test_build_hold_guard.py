@@ -138,7 +138,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                 _ = record.write_text(json.dumps({
                     "v": 1, "call_id": "verify-call", "pid": 10, "proc_start": "11000",
                     "repo": str(self.root), "kind": "check", "package": None,
-                    "runs_on": {"kind": "mac_allowed"}, "state": state,
+                    "eligible_targets": ["mac", "natedev"], "runs_on": {"kind": "any_target", "mac_targets": ["mac"]}, "state": state,
                     "updated": "2026-10-28T12:00:00+00:00",
                 }))
             for verb in ("check", "lint", "build", "doc", "clippy", "test", "example", "final"):

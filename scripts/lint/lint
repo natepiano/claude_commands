@@ -12,6 +12,7 @@ source "$HOME/.claude/scripts/lint/invoke.sh"
 usage() {
   cat <<EOF
 Usage:
+  lint build [args...]            cargo build
   lint check [args...]            cargo check
   lint mend-check [args...]       cargo mend --fail-on-warn
   lint mend [args...]             cargo mend --all-targets
@@ -92,6 +93,26 @@ CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
 case "$CMD" in
+  build)        resolve_scope "$@"
+                run cargo build ${SCOPE[@]+"${SCOPE[@]}"} "$@"
+                BUILD_METADATA_ARGS=()
+                BUILD_METADATA_ENV=()
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --manifest-path)
+                            BUILD_METADATA_ARGS+=("$1" "$2"); shift ;;
+                        --manifest-path=*)
+                            BUILD_METADATA_ARGS+=("$1") ;;
+                        --target-dir)
+                            BUILD_METADATA_ENV=("CARGO_TARGET_DIR=$2"); shift ;;
+                        --target-dir=*)
+                            BUILD_METADATA_ENV=("CARGO_TARGET_DIR=${1#*=}") ;;
+                    esac
+                    shift
+                done
+                env ${BUILD_METADATA_ENV[@]+"${BUILD_METADATA_ENV[@]}"} \
+                  cargo metadata --no-deps --format-version 1 ${BUILD_METADATA_ARGS[@]+"${BUILD_METADATA_ARGS[@]}"} | python3 -c \
+                  'import json, sys; print("build_target_directory=" + json.load(sys.stdin)["target_directory"])' ;;
   check)        resolve_scope "$@"
                 run cargo check ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   mend-check)   resolve_scope "$@"
@@ -99,7 +120,11 @@ case "$CMD" in
   mend)         resolve_scope "$@"
                 invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   clippy)       resolve_scope "$@"
-                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets "$@" ;;
+                CLIPPY_TARGETS=(--all-targets)
+                for word in "$@"; do
+                    case "$word" in --example|--examples) CLIPPY_TARGETS=(); break ;; esac
+                done
+                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} ${CLIPPY_TARGETS[@]+"${CLIPPY_TARGETS[@]}"} "$@" ;;
   clippy-tests) resolve_scope "$@"
                 invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --tests "$@" ;;
   doc)          resolve_scope "$@"

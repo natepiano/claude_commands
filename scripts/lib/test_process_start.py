@@ -66,8 +66,8 @@ class ProcessStartTests(unittest.TestCase):
     def test_step_record_policies_agree_on_both_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"VERIFY_STEPS_DIR": directory}):
             for platform, start in (("linux", "123"), ("darwin", "Tue Nov  3 23:00:00 2026")):
-                record = step_record.StepRecord("call", 42, start, Path(directory), "check", None,
-                    step_record.MacAllowed(), step_record.StepState.WAITING_HOLD, "now")
+                record = step_record.StepRecord("call", 42, start, Path(directory), "check", step_record.WorkspacePackages(),
+                    step_record.AnyTarget(("mac", "natedev"), ("mac",)), step_record.StepState.WAITING_HOLD, "now")
                 step_record.write(record)
                 cases = ((identity.Started(start), step_record.StepRecord),
                          (identity.Started("different"), step_record.StaleRecord),
@@ -87,7 +87,7 @@ class ProcessStartTests(unittest.TestCase):
                 mock.patch.object(sys, "platform", "darwin"), \
                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, start + " S\n", "")), \
                 mock.patch("sys.argv", ["step_record.py", "write", "--call-id", "mac", "--pid", "42",
-                    "--kind", "check", "--runs-on", "mac_allowed", "--state", "waiting_hold"]):
+                    "--kind", "check", "--runs-on", "any_target", "--state", "waiting_hold"]):
             self.assertEqual(step_record.main(), 0)
             record = step_record.read("mac")
             self.assertIs(type(record), step_record.StepRecord)

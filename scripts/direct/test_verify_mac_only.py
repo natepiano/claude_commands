@@ -112,10 +112,9 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def test_policy_refusals_start_nothing(self) -> None:
         cases = (
-            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("check", "sample", "--mac", "why"), '--mac applies only to test.'),
+            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
             (("test", "sample", "--mac", "why", "--local", "requires Linux"), '--mac and --local cannot be used together.'),
             (("test", "sample", "--env", "SHOTS"), '--env and --fetch need --mac "<why>".'),
             (("test", "sample", "--fetch", "target/shots"), '--env and --fetch need --mac "<why>".'),

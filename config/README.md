@@ -275,7 +275,9 @@ The user completes deployment before target activation.
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
-`kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds.
+A build or final uses AWS only when a flag pins the command.
+An empty `ci_repo` disables GitHub calls.
 
 `monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
@@ -579,7 +581,7 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 
 Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
 The source directory name still selects the legacy Mac mirror and claim.
-`kinds=test,check,doc` selects Linux commands without Mac `linux_only.*` keys.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
 
 `devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
 `shell_cache` gives the cache path relative to the remote home.

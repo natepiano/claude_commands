@@ -75,12 +75,13 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
                         directory=self.runner_state)
         self.wait_for_memory_wait(process)
         self.assertEqual(self.local_mend(), [])
+        self.set_mac_answer("passed", "", 0)
         self.release_memory()
         _ = self.finish_lint(process)
-        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy"])
+        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy", "clippy"])
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
         local = [row["args"] for row in self.cargo_events()]
-        self.assertTrue(any(arguments[:1] == ["clippy"] for arguments in local), local)
+        self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
 
     def test_busy_mac_keeps_the_lint_in_the_local_memory_queue(self) -> None:
         self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
@@ -90,7 +91,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertEqual(self.local_mend(), [])
         self.release_memory()
         _ = self.finish_lint(process)
-        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.mac_verbs(), ["clippy"])
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
 
     def test_linux_only_workspace_never_leaves_the_local_memory_queue(self) -> None:
