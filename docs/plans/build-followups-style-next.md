@@ -25,3 +25,9 @@
   - Why needed: three cargo-liner rows (`impl Subscriber for GitStatusTrace` inside checkout.rs `mod tests`, which has `use super::*`) stay "trait identity uncertain" after phase 34, because a block glob can bind the trait name. Resolving the glob from the parent module's proved items and imports would let them follow.
   - Completion condition: a dry-run follow on a copy of cargo-liner's ledger shows those three rows in place; a glob whose parent cannot be fully read still keeps the row.
   - Revealed by: Phase 34 (showrunner disposition next, 2026-10-20)
+
+- [ ] **A crate run's integrate step reuses the held validated checkout instead of making a new one**
+  - Target: scripts/style/crate_run.py (`CrateRun.integrate`)
+  - Why needed: integrate makes a new checkout although the run already holds a validated one. Measured upper bound of the saving: 5.0 CPU s per gate (natest, via builds and natedev, 2026-11-07).
+  - Completion condition: integrate reuses the held checkout only when the integration candidate's tree is the tree that checkout validated: the destination tip did not move and no published path overlaps. When the destination moved, it makes a new checkout as now. A test proves both cases.
+  - Revealed by: sdlc backlog ask, 2026-11-07
