@@ -1574,7 +1574,7 @@ No code change. Both causes are named from evidence, and neither cause is in a t
 
 **Ruled out:** a longer wait or a retry in the test, because it hides a process that `verify.sh` leaves running.
 
-### Phase 74 — `copies/test_copy_guard.py` uses half its CPU  · status: todo
+### Phase 74 — `copies/test_copy_guard.py` uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order

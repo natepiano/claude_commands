@@ -4,6 +4,8 @@ from __future__ import annotations
 import ast
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
+import io
 import json
 import os
 from pathlib import Path
@@ -12,10 +14,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import cast, override
+from typing import ClassVar, cast, override
+from unittest.mock import patch
 
 from scripts.copies import copies, copy_guard
-from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
 @dataclass(frozen=True)
@@ -218,13 +221,30 @@ def repair_policy_cases() -> tuple[RecordedPolicyCase, ...]:
 class CopyGuardTests(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
+    seed: ClassVar[ImmutableGitSeed]
+    transitional: ClassVar[frozenset[str]] = frozenset({"mac_test/offload.py", "production/mac_run.sh", "direct/verify.sh"})
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory())).resolve()
+        cls.seed = ImmutableGitSeed.create(root, "main", "Guard Tests", "guard@example.invalid",
+                                           {"tracked": "source\n"})
+
+    @classmethod
+    @cache
+    def repository_findings(cls) -> tuple[copy_guard.TreeCreation, ...]:
+        """Share the strict scan of the unchanged repository between both policy tests."""
+        scripts = Path(__file__).resolve().parents[1]
+        settings = copies.load_config()
+        return tuple(copy_guard.scan_scripts(scripts, allow_list={
+            path: reason for path, reason in settings.allow_list.items() if path not in cls.transitional}))
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        seed = ImmutableGitSeed.create(self.root, "main", "Guard Tests", "guard@example.invalid",
-                                       {"tracked": "source\n"})
-        self.repo = seed.checkout
+        self.repo = self.root / "checkout"
+        self.seed.copy_to(self.repo, self.root / "origin.git")
 
     def test_hook_refuses_each_repository_tree_making_form(self) -> None:
         source = shlex.quote(str(self.repo))
@@ -940,9 +960,18 @@ git_at(repo, "show", "clone")
                 payload = payload.replace(str(ordinary), shlex.quote(str(ordinary)))
                 if "rsync -a --exclude" in payload and source == self.repo:
                     continue  # Discovery selects the Git route for this input.
-                result = subprocess.run(["python3", str(scripts / "copies/copy_guard.py")],
-                    input=json.dumps({"tool_name": "Bash", "tool_input": {"command": payload}, "cwd": str(self.root)}),
-                    text=True, capture_output=True, check=False, timeout=copies.load_config().guard_timeout_seconds)
+                tool_input = json.dumps({"tool_name": "Bash", "tool_input": {"command": payload}, "cwd": str(self.root)})
+                if checked == 0:
+                    result = subprocess.run(["python3", str(scripts / "copies/copy_guard.py")],
+                        input=tool_input, text=True, capture_output=True, check=False,
+                        timeout=copies.load_config().guard_timeout_seconds)
+                else:
+                    def main() -> int:
+                        copy_guard.main()
+                        return 0
+
+                    with patch.object(sys, "stdin", io.StringIO(tool_input)):
+                        result = invoke_cli(copy_guard, main, [], dict(os.environ), self.root)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 checked += 1
         self.assertGreater(checked, 4)
@@ -1009,15 +1038,14 @@ git_at(repo, "show", "clone")
         scripts = Path(__file__).resolve().parents[1]
         # The shared service loader owns both gate settings and the allow-list data.
         settings = copies.load_config()
-        findings = copy_guard.scan_scripts(scripts, allow_list=settings.allow_list)
+        findings = [finding for finding in self.repository_findings()
+                    if finding.path.relative_to(scripts).as_posix() not in settings.allow_list]
         self.assertEqual(findings, [], "\n".join(str(finding) for finding in findings))
 
     def test_repository_build_copy_makers_have_no_transitional_exemptions(self) -> None:
-        scripts = Path(__file__).resolve().parents[1]
         settings = copies.load_config()
-        transitional = {"mac_test/offload.py", "production/mac_run.sh", "direct/verify.sh"}
-        findings = copy_guard.scan_scripts(scripts, allow_list={
-            path: reason for path, reason in settings.allow_list.items() if path not in transitional})
+        transitional = self.transitional
+        findings = list(self.repository_findings())
         self.assertEqual(findings, [], "\n".join(str(finding) for finding in findings))
         self.assertEqual(set(settings.allow_list) & transitional, set())
 
