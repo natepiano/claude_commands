@@ -138,6 +138,10 @@ The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
+The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+Requests use each session's observed process account, including members outside their selected group account.
+Blocked notices check the queue head and target again before delivery.
+Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
 
 A group move validates the destination before changing the selection or stopping members.
