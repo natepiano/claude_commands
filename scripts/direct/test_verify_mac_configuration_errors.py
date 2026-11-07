@@ -4,13 +4,14 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import final
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 
 
 @final
 class VerifyMacConfigurationErrorsTests(VerifyMacOffloadFixture):
     def test_unreadable_local_first_route_refuses_before_either_machine_starts(self) -> None:
-        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
         damaged = self.root / "damaged-holders"
         _ = damaged.write_text("a file cannot be a hold directory\n")
@@ -28,9 +29,9 @@ class VerifyMacConfigurationErrorsTests(VerifyMacOffloadFixture):
                 self.assertIn("natedev's hold state cannot be read", result.stderr)
 
     def test_unreadable_local_first_route_without_eligible_mac_exits_twelve(self) -> None:
-        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        _ = Path(self.environment["MAC_TEST_CONFIG"]).write_text(f"linux_only.{self.root.name}=sample\n")
+        _ = write_config_fixture(Path(self.environment["MAC_TEST_CONFIG"]), f"linux_only.{self.root.name}=sample\n", template="mac_test")
         damaged = self.root / "damaged-holders"
         _ = damaged.write_text("a file cannot be a hold directory\n")
         self.environment["BUILD_HOLD_DIR"] = str(damaged)

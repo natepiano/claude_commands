@@ -11,10 +11,10 @@ cargo new/init, and tar extraction (-C or the working folder); a Write or Notebo
 file's path. A command is refused when it makes a folder directly in one of the roots that does not
 exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
 /tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session) and the two
-scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session temp root or a run
-folder is the session's or run's own, so it is no root, and mktemp -d there is allowed; this hook
-also restores the session temp folder from the hook input's session id. ~/worktrees is no root, and a
-make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
+scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session or run root still permits ordinary temporary files.
+Repository copies under those roots require `build_folders.py run`.
+The hook restores the session temp folder from the hook input's session id.
+~/worktrees is no root, and a make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
 than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed: the
 hourly tmp sweep is the backstop.
 
@@ -23,16 +23,24 @@ from a PreToolUse hook, so an allow is an exit 0 with no output.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-import importlib
+import io
 import json
 import os
 import re
 import shlex
 import sys
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Protocol, TypedDict, cast, override
+
+
+from scripts.lib.file_module import load_file_module
 
 
 class SessionTempPaths(Protocol):
@@ -43,7 +51,8 @@ class SessionTempPaths(Protocol):
     def temp_root(self, session_id: str) -> Path: ...
 
 
-SESSION_TEMP = cast(SessionTempPaths, cast(object, importlib.import_module("session-start-temp-root")))
+SESSION_TEMP = cast(SessionTempPaths, cast(object, load_file_module(
+    "session_start_temp_root", Path(__file__).with_name("session-start-temp-root.py"))))
 
 PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -60,6 +69,18 @@ CLONE_VALUE_OPTIONS = frozenset({"-b", "--branch", "-o", "--origin", "--depth", 
                                  "--bundle-uri", "--server-option", "--reference-if-able"})
 WORKTREE_VALUE_OPTIONS = frozenset({"-b", "-B", "--reason"})
 CARGO_VALUE_OPTIONS = frozenset({"--name", "--vcs", "--edition", "--registry", "--config", "-Z"})
+RSYNC_VALUE_OPTIONS = frozenset({
+    "--info", "--debug", "--stderr", "--backup-dir", "--suffix", "--confine-root", "--chmod",
+    "--checksum-choice", "--cc", "--block-size", "-B", "--rsh", "-e", "--rsync-path",
+    "--max-delete", "--max-size", "--min-size", "--max-alloc", "--partial-dir", "--usermap",
+    "--groupmap", "--chown", "--timeout", "--contimeout", "--modify-window", "-@", "--temp-dir", "-T",
+    "--compare-dest", "--copy-dest", "--link-dest", "--compress-choice", "--zc", "--compress-level", "--zl",
+    "--compress-threads", "--zt", "--skip-compress", "--filter", "-f", "--exclude", "--exclude-from",
+    "--include", "--include-from", "--files-from", "--copy-as", "--address", "--port", "--sockopts",
+    "--outbuf", "--remote-option", "-M", "--out-format", "--log-file", "--log-file-format",
+    "--password-file", "--early-input", "--bwlimit", "--stop-after", "--stop-at", "--write-batch",
+    "--only-write-batch", "--read-batch", "--protocol", "--iconv", "--checksum-seed",
+})
 
 
 class BashInput(TypedDict, total=False):
@@ -143,16 +164,61 @@ def without_heredoc_bodies(text: str) -> str:
     return "\n".join(kept)
 
 
+def without_line_continuations(text: str) -> str:
+    """Delete backslash-newline pairs outside single quotes before splitting words."""
+    if "\\\n" not in text:
+        return text
+    kept: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and quote != "'" and index + 1 < len(text):
+            if text[index + 1] != "\n":
+                kept.append(text[index:index + 2])
+            index += 2
+            continue
+        if char == quote:
+            quote = ""
+        elif not quote and char in "'\"":
+            quote = char
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+class CommandLexer(shlex.shlex):
+    """Keep the source spelling that distinguishes an operator from a word."""
+
+    operator: bool = False
+
+    def __init__(self, text: str) -> None:
+        self.text: str = text
+        self.stream: io.StringIO = io.StringIO(text)
+        super().__init__(self.stream, posix=True, punctuation_chars=PUNCTUATION)
+        self._pushback_chars: deque[str] = deque()
+
+    @override
+    def read_token(self) -> str | None:
+        # shlex can read one character ahead and keep it for the next token.
+        start = self.stream.tell() - len(self._pushback_chars)
+        token = super().read_token()
+        end = self.stream.tell() - len(self._pushback_chars)
+        self.operator = (token is not None and bool(token) and set(token) <= set(PUNCTUATION)
+                         and self.text[start:end].strip(self.whitespace) == token)
+        return token
+
+
 def commands(text: str) -> Iterator[list[str]]:
     """Each simple command of `text` as words; nothing when the text cannot be split."""
-    lexer = shlex.shlex(without_heredoc_bodies(text), posix=True, punctuation_chars=PUNCTUATION)
+    lexer = CommandLexer(without_line_continuations(without_heredoc_bodies(text)))
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""  # a comment's words start with `#`, which is no command
     words: list[str] = []
     try:
         for token in lexer:
-            if set(token) <= set(PUNCTUATION):
+            if lexer.operator:
                 if words:
                     yield words
                 words = []
@@ -181,12 +247,24 @@ def operands(words: list[str], value_options: frozenset[str]) -> list[str]:
     return found
 
 
-def copy_targets(words: list[str], cwd: Path) -> list[Path | None]:
-    """The folders a recursive cp or an rsync makes: the target, or each source's name inside it."""
-    target_folder = next((words[index + 1] for index, word in enumerate(words[:-1])
-                          if word in ("-t", "--target-directory")), None)
-    names = operands(words, frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude",
-                                       "--include", "--filter", "-f"}))
+def copy_target_directory(words: list[str]) -> str | None:
+    """Read the copy destination from either target-directory option form."""
+    return next((words[index + 1] for index, word in enumerate(words[:-1])
+                 if word in ("-t", "--target-directory")),
+                next((word.split("=", 1)[1] for word in words if word.startswith("--target-directory=")), None))
+
+
+def copy_arguments(words: list[str], *, rsync: bool) -> tuple[list[str], str | None]:
+    """Apply the copy tool's option rules to its operands and destination."""
+    if rsync:
+        return operands(words, RSYNC_VALUE_OPTIONS), None
+    return (operands(words, frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude",
+                                      "--include", "--filter", "-f"})), copy_target_directory(words))
+
+
+def copy_targets(words: list[str], cwd: Path, *, rsync: bool = False) -> list[Path | None]:
+    """Return the destination folders of a recursive copy."""
+    names, target_folder = copy_arguments(words, rsync=rsync)
     if target_folder is None:
         if len(names) < 2:
             return []
@@ -258,6 +336,28 @@ def git_targets(words: list[str], cwd: Path) -> list[Path | None]:
     return []
 
 
+def rsync_preview(words: list[str]) -> bool:
+    """Find preview flags without treating option values as flags."""
+    arguments = iter(words)
+    for word in arguments:
+        if word == "--":
+            break
+        if word == "--dry-run":
+            return True
+        if word.startswith("--"):
+            if "=" not in word and word in RSYNC_VALUE_OPTIONS:
+                _ = next(arguments, "")
+        elif word.startswith("-"):
+            for index, flag in enumerate(word[1:], start=1):
+                if f"-{flag}" in RSYNC_VALUE_OPTIONS:
+                    if index == len(word) - 1:
+                        _ = next(arguments, "")
+                    break
+                if flag == "n":
+                    return True
+    return False
+
+
 def targets(words: list[str], cwd: Path) -> list[Path | None]:
     """The folders the command makes; None for one this hook cannot follow."""
     verb, arguments = Path(words[0]).name, words[1:]
@@ -271,13 +371,41 @@ def targets(words: list[str], cwd: Path) -> list[Path | None]:
                             for word in arguments):
         return copy_targets(arguments, cwd)
     if verb == "rsync":
-        return copy_targets(arguments, cwd) if not any(":" in word.split("/", 1)[0] for word in arguments[-1:]) else []
+        if rsync_preview(arguments):
+            return []
+        return copy_targets(arguments, cwd, rsync=True) if not any(":" in word.split("/", 1)[0] for word in arguments[-1:]) else []
     if verb == "cargo" and arguments[:1] in (["new"], ["init"]):
         names = operands(arguments[1:], CARGO_VALUE_OPTIONS)
         return [expanded(names[0], cwd)] if names else []
     if verb in ("tar", "gtar", "bsdtar"):
         return tar_targets(arguments, cwd)
     return []
+
+
+def repository_copy(words: list[str], cwd: Path) -> bool:
+    """Identify repository creation without changing ordinary temporary-file rules."""
+    verb = Path(words[0]).name
+    if verb == "git":
+        return bool(git_targets(words[1:], cwd))
+    if verb not in ("cp", "rsync") or not targets(words, cwd):
+        return False
+    names, target_folder = copy_arguments(words[1:], rsync=verb == "rsync")
+    sources = names if target_folder is not None else names[:-1]
+    for source in sources:
+        path = expanded(source, cwd)
+        if path is not None and ((path / ".git").exists() or ((path / "HEAD").is_file() and (path / "objects").is_dir())):
+            return True
+    return False
+
+
+def nested_build_copy(path: Path) -> bool:
+    """Refuse repository copies below unit and session temporary roots."""
+    parents = [real(parent) for parent in OWN_TEMP_PARENTS]
+    configured_session = os.environ.get("SESSION_TEMP_ROOT")
+    if configured_session:
+        parents.append(real(configured_session))
+    return any(parent in path.parents for parent in parents) or any(
+        SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts[:-1])
 
 
 def loose_folders(text: str, cwd: Path) -> list[Path]:
@@ -297,8 +425,9 @@ def loose_folders(text: str, cwd: Path) -> list[Path]:
                 return found
             cwd = moved
             continue
+        copying = repository_copy(words, cwd)
         for path in targets(words, cwd):
-            top = loose_folder(path) if path is not None else None
+            top = (path if copying and nested_build_copy(path) else loose_folder(path)) if path is not None else None
             if top is not None and top not in found:
                 found.append(top)
     return found
@@ -309,6 +438,7 @@ def refusal(folders: list[Path]) -> str:
     return (
         f"Refused: this makes a new loose folder ({shown}). Nothing removes a loose folder in "
         + "/tmp, /tmp/claude, ~/rust or ~/rust/scratch, so they piled up.\n"
+        + "For a build experiment, use build_folders.py run --owner O --name N -- CMD...; it removes the build folder.\n"
         + "Make scratch that belongs to a task, and it goes when the task ends:\n"
         + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new [--task <run:<id> | "
         + "phase:<unit>/<phase> | gate:<id> | row:<showrunner>-C<n>> | --until <YYYY-MM-DD [HH:MM]>] "

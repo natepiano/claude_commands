@@ -82,11 +82,6 @@ reason = "Filename placeholder for the account-move marker."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/shutdown-and-restart.md"
-text = "`codex_mesh.py reopen --session-dir <D> --to <seat>`"
-reason = "Command placeholder for the existing transport argument."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
 text = "`reopened <seat>; send its next turn with --to <seat>`"
 reason = "Recorded command output with transport placeholders."
 
@@ -104,11 +99,6 @@ reason = "Resume command output placeholder."
 path = "docs/as-built/shutdown-and-restart.md"
 text = "`<seat> (<role>, idle): paused on its thread; nothing to run now. Your next dispatch with --to <seat> resumes it.`"
 reason = "Idle resume output placeholders; preserve the transport argument."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
-text = "- Resume workers, natedev, 2026-10-16, about 21:30 EDT, on the installed `build-followups` merge `ba27d7b9`. A probe `rwprobe` (`accounts.py exec --probe`, claude2) in tmux, before herdr replaced it, held one real Codex seat, `tmp-rwseat`, in a scratch run dir under `/tmp/claude/delegate/` mapped to the probe through `active/<probe session id>`. `accounts.py move <probe id> claude3 --no-alert` finished at 21:31: the seat read `paused` (`paused_from` `done`, `paused_turn` false) on thread `01a14775-e8c5-7cd2-9d63-176e065faa06`, the probe was back on claude3, and the message log held the `resume-workers-<probe id>` message. Its `implement.sh --to tmp-rwseat` command replied `resumed` on the same thread. The run found that the message went only to unit sessions; it now goes to any session with recorded seats. The complete-command form of each seat line landed after this run and is held by `test_restart.py`. `reopen` was seen on real seats: units had returned six ended seats to `paused`."
-reason = "Dated 2026-10-16 probe history; preserve its wording and worker identity."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/message-clarity.md"
@@ -131,88 +121,10 @@ text = "DELETE FROM account_role_changes WHERE role = 'seats'"
 reason = "Legacy SQL migration input value removed after copying rows."
 
 [[terms]]
-name = "review pool"
-kind = "record"
-defined_in = "docs/as-built/review-pool.md"
-other_names = []
-retired = ["review pool"]
-
-
-
-
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool-probes.md"
-text = "# Review pool mesh probes"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool.md"
-text = "# Review pool"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool.md"
-text = "`**Review pool:** code` (or `code, ui`) in a production doc's Production Context switches the pool on for that production; the first review of each type primes it. Every code review of every unit then goes to the unit's reviewer with `--pool code --lease <slug>/<unit>/<phase>`; the UI pool is used on every design check. Without the line, reviews go to the unit's own workers with `--to`."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool.md"
-text = "With `ui` on the production's `**Review pool:**` line, every design check in <UXReview/> (steps 3, 5 and 6, rechecks and notice checks included) also runs the pooled UI reviewer on the same shots with its own prompt file (Prompts), after the unit director writes the shot paths to `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`:"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool.md"
-text = "- With no `**Review pool:**` line in the production doc, and outside a production, every command behaves as it did without the pool. `review.sh`'s `--slot` and fresh paths are unchanged; `--to` gains only the turn record and the signal traps that mark it `canceled`."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/message/roster.py"
-text = "review pool "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/production/rename.py"
-text = "6. review pool "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/production/retire_unit.py"
-text = "cannot read the review pool: "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/production/transfer_unit.py"
-text = "review pool: "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/production/transfer_unit.py"
-text = "(the review pool is unreadable: "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "scripts/production/transfer_unit.py"
-text = "review pool "
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms]]
 name = "reviewer"
 kind = "role"
 defined_in = "docs/production_format.md#Words"
-other_names = ["pooled reviewer"]
-
-[[terms]]
-name = "template"
-kind = "record"
-defined_in = "docs/production_format.md#Words"
-other_names = ["review template"]
-
-[[terms]]
-name = "lease"
-kind = "record"
-defined_in = "docs/production_format.md#Words"
-other_names = ["review lease"]
+other_names = []
 
 [[terms]]
 name = "merge branch"

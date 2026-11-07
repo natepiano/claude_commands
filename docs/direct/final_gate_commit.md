@@ -38,7 +38,7 @@ phase review, so the run leaves no uncommitted work behind.
 
 6. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/> (`commands/unit/checkpoint.md`), then
-   report `Final gate <short hash> — style review and closing repairs.` with its
+   report `Final gate <short hash> — closing repairs.` with its
    push note, if any.
 </FinalGateCommit>
 

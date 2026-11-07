@@ -1,5 +1,5 @@
 ---
-description: Write the report for a /unit:direct phase that finished without one, or whose report was thin.
+description: Write a missing or incomplete phase report.
 ---
 
 # Direct — phase report
@@ -97,7 +97,7 @@ owns the ask.
 
 **Count.** Read it from
 
-`python3 ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>"`
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>"`
 
 and report its `todo` and `total`. Never count phases by hand or by grep: a
 heading takes three forms over its life and any pattern keyed on `status:`

@@ -4,33 +4,19 @@
 
 ## Production Context
 
-- **Source plans:** none yet. The user set up this production on 2026-10-20, via the showrunner, in their own words; /producer:to_production did not split it. Each unit writes its first plan, and its row below then names it.
+- **Source plans:** none yet. The user set up this production on 2026-10-20, via the showrunner, in their own words; /producer:to_production did not split it. Each unit records its plan in `.unit.toml`.
 - **Repository:** `/home/natepiano/.claude`
 - **Merge branch:** `sdlc` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-sdlc` — the sdlc session's worktree, where `/showrunner:promote_showrunner` resumes it; on `sdlc` from launch
 - **Showrunner session:** sdlc
 - **Log:** `docs/plans/sdlc-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
-- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/direct scripts/production` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` and `basedpyright scripts/direct scripts/production`, run in the showrunner checkout (basedpyright passes on its `0 errors, 0 warnings` line)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — sdlc reports to natedev, so new rows go to the root list with Production `sdlc`; rows before 2026-10-29 stay in `change-review - sdlc.md`
 - **Proposals:** `~/rust/hanadocs/issues`
-
-## Units
-
-| Unit | Plan | Worktree | Branch | Port | Owns |
-| --- | --- | --- | --- | --- | --- |
-| guild-process-unit | (retired 2026-10-29, worktree removed, session 842c2149-c59b-4abd-934c-ba61d14944ad) `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/as-built/guilds.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
-| phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
-| fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
-| roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
-| hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
-| models-unit | `docs/as-built/usage-ledger.md` (run done; the user 2026-10-11 10:02 PDT via hana, start confirmed 10:21 PDT; follow-ups: `docs/plans/build-followups-usage-ledger-next.md`; earlier runs: `docs/as-built/long-lived-workers.md`, `docs/as-built/director-model-study.md`) | `/home/natepiano/worktrees/claude-natedev-models` | `natedev-models` | — | `docs/plans/build-followups-model-study.md`; `docs/as-built/long-lived-workers.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md`; `scripts/delegate/` (seat launcher); `scripts/agents/codex_mesh.py`; `commands/unit/direct.md`; `commands/unit/delegate.md`; `docs/production_format.md`; `docs/as-built/usage-ledger.md`; `scripts/usage/`; also touches `review.sh`, `commands/showrunner/produce.md` (hub; the showrunner-start call) and `settings.json` (SessionStart hook; the user's go before main) |
-| devtools-unit | `docs/plans/sdlc-devtools-tests.md` | /home/natepiano/worktrees/claude-build-followups-sdlc-devtools | sdlc-devtools | — | idempotency (rerun safety) of tools that change shared state in steps |
-| qprobe2-unit | (retired 2026-10-31, worktree removed, session 1161c633-2484-4417-82db-c5eb4ac1ca53) standby | /home/natepiano/worktrees/claude-build-followups-sdlc-qprobe2 | sdlc-qprobe2 | — | — |
-| namecheck-unit | standby | /home/natepiano/worktrees/namecheck | namecheck | — | — |
 
 Scope of each unit:
 
@@ -54,14 +40,6 @@ State is in `~/.local/state/astra/design-roles/` and `~/.local/state/astra/desig
 | `commands/showrunner/produce.md` | roles-unit | guild-process-unit (the designer and reviewer roles under a showrunner) |
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
-
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
-
-When a plan needs another unit's checkpoint, the gate goes here.
 
 ## Close-out
 

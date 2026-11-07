@@ -6,12 +6,13 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 import math
-import os
 from pathlib import Path
 import signal
 import subprocess
 import threading
 import time
+
+from scripts.lib import process_group
 
 
 STARTUP_SIGNAL_ENV = "DETACHED_STARTUP_SIGNAL"
@@ -56,14 +57,14 @@ class DetachedChildExited(DetachedStartFailure):
 def _terminate_group(child: subprocess.Popen[bytes]) -> None:
     """Reap our child and stop descendants that share its private group."""
     try:
-        os.killpg(child.pid, signal.SIGTERM)
+        process_group.send_process_group(child.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
         _ = child.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(child.pid, signal.SIGKILL)
+            process_group.send_process_group(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = child.wait(timeout=0.5)

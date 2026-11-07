@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """File style decisions and track their answers and builds."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -22,30 +26,29 @@ from typing import Protocol, cast
 from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
 
-import coverage_report
-import rules
-import style_footprint
-import style_ledger
-import style_rules
-from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
+from scripts.style import coverage_report
+from scripts.style import rules
+from scripts.style import style_footprint
+from scripts.style import style_ledger
+from scripts.style import style_rules
+from scripts.style.approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
                               approved_rename, binding_rename, BindingScopeReader)
-from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
-from declarations import declaration_line
-from issues import Issue, frontmatter, open_issues, plain
-from production_units import cell_value, plan_cell_is_retired, unit_table
-from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
-                            UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
-from unit_files import file_text, git, unit_file_holders
-from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
-from process_failure import failure_detail
-from user_zone import user_zone
+from scripts.style.add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
+from scripts.style.declarations import declaration_line
+from scripts.production.issues import Issue, frontmatter, open_issues, plain
+from scripts.production import session_staff, staff, unit_config, unit_lookup
+from scripts.production.proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
+                            UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
+from scripts.style.unit_files import file_text, git, unit_file_holders
+from scripts.style.unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
 
 
 def proposal_command(*arguments: str) -> None:
     result = subprocess.run(
-        [sys.executable, str(SCRIPTS / "production/proposal_issue.py"), *arguments],
+        [str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/proposal_issue.py"), *arguments],
         capture_output=True, text=True, check=False,
     )
     if result.returncode:
@@ -53,7 +56,7 @@ def proposal_command(*arguments: str) -> None:
 
 
 def renumber() -> None:
-    result = subprocess.run([sys.executable, str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
+    result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
                             capture_output=True, text=True, check=False)
     if result.returncode:
         raise style_ledger.LedgerError(failure_detail(result))
@@ -67,7 +70,7 @@ def is_decision(issue: Issue) -> bool:
 def approved_decisions(folder: Path, unit: str) -> tuple[Issue, ...]:
     return tuple(sorted((issue for issue in open_issues(folder, "style")
                          if is_decision(issue) and isinstance(decision_answer(issue), ApprovedDecision)
-                         and issue.value("unit") == unit),
+                         and issue.value("unit") == staff_reference(unit, "unit").id),
                         key=lambda issue: (issue.value("date_created"), issue.path.name)))
 
 
@@ -117,10 +120,6 @@ def repository_name(repo: Path) -> str:
     if result.returncode:
         raise style_ledger.LedgerError(result.stderr.strip())
     return Path(result.stdout.strip()).parent.name
-
-
-def style_slug(repo: Path) -> str:
-    return repository_name(repo) + "-style"
 
 
 def workspace_directories(ledger: style_ledger.Ledger) -> tuple[str, ...]:
@@ -293,19 +292,24 @@ def decision_kind(findings: tuple[style_ledger.HeldFinding, ...],
     return "restructure" if "restructure" in kinds else "type" if "type" in kinds else "rename"
 
 
-@dataclass(frozen=True)
-class FamilyUnit:
-    """The live unit of the standing style production that builds one family's decisions, with its Plan cell."""
-    unit: str
-    plan: str
-
-
-def family_units(doc: Path) -> dict[rules.Family, FamilyUnit]:
-    units: dict[rules.Family, FamilyUnit] = {}
-    for row in unit_table(doc.read_text().splitlines()):
-        family = rules.style_family(cell_value(row["Unit"]))
-        if not isinstance(family, rules.NotStyleUnit) and not plan_cell_is_retired(row.get("Plan", "")):
-            units[family] = FamilyUnit(cell_value(row["Unit"]), cell_value(row["Plan"]))
+def family_units(doc: Path) -> dict[rules.Family, staff.StaffId]:
+    record = staff.snapshot()
+    resolver = session_staff.RowResolver(record)
+    try:
+        rows = unit_lookup.doc_units(doc, record)
+    except staff.StaffUnreadable as error:
+        raise style_ledger.LedgerError(str(error)) from error
+    units: dict[rules.Family, staff.StaffId] = {}
+    for row in rows:
+        unit = row.name
+        family = rules.style_family(unit)
+        if isinstance(family, rules.NotStyleUnit) or isinstance(row.worktree, staff.RemovedWorktree):
+            continue
+        match resolver.unit_config(row):
+            case unit_config.UnitConfig(plan=unit_config.PlanFile()):
+                units[family] = row.id
+            case _:
+                continue
     return units
 
 
@@ -361,9 +365,8 @@ class DecisionWriter:
         unit = units.get(definition.approval.family)
         if unit is None:
             raise style_ledger.LedgerError(f"rule {key.rule} is always approved, but no {definition.approval.family} unit builds it")
-        slug = style_slug(self.ledger.repo)
-        return {"showrunner": slug, "unit": unit.unit, "plan": unit.plan, "approved_by": f"rule {key.rule}",
-                "approved_in": slug}
+        return {"unit": unit, "approved_by": f"rule {key.rule}",
+                "approved_in": staff_reference(self.standing.name, "showrunner").id}
 
     def approve_by_rule(self, decision: Issue) -> None:
         """Approve an open decision still waiting for the user when its rule, whatever the blob, is always approved."""
@@ -373,7 +376,7 @@ class DecisionWriter:
         approval = self.rule_approval(DecisionKey(rule, decision.value("style_crate"), decision.value("style_rule_blob")), {})
         if approval:
             # The answer is read again under the issue lock, so an approval written since the read above is kept.
-            if approve_unanswered(decision.path, {name: approval[name] for name in ("showrunner", "unit", "plan")},
+            if approve_unanswered(decision.path, {"unit": approval["unit"]},
                                   approval["approved_by"], approval["approved_in"], datetime.now(user_zone()).date()):
                     print(f"approved {decision.path}: rule {rule} is always approved")
 
@@ -387,7 +390,7 @@ class DecisionWriter:
             body = Path(scratch) / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", style_slug(self.ledger.repo), "--extra-tags", "style",
+                             "--proposed-by", self.standing.name, "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
                              "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
@@ -572,8 +575,9 @@ _DEFAULT_PROPOSAL_READS = DefaultProposalReads()
 
 
 def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
-    """Whether the shared declaration evidence retains this finding's source site."""
-    return isinstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+    """Whether the shared evidence permits filing, including existing untracked findings."""
+    return isinstance(ledger.finding_site(finding, tip),
+                      (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))
 
 
 def print_finding_waits(issue: Path, waits: Mapping[tuple[str, str], int]) -> None:
@@ -600,12 +604,13 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
     for cell in cells:
         if cell.family is not None and cell.state in OPEN_CELL_STATES and counts(cell.family, cell.crate):
             work[cell.path].add(cell.family)
+    families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
     findings = tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
-                     if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled))
+                     if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled)
+                     and families.get(finding.rule.removesuffix("#uncovered")) in scopes)
     if findings:
         if isinstance(reader, DefaultProposalReads):
             reader = GitProposalReader(ledger)
-        families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
         tip = ledger.synced_commit()
         directories = reader.crate_directories(tip)
         eligible = tuple(finding for finding in findings
@@ -616,7 +621,8 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
             family = families.get(finding.rule.removesuffix("#uncovered"))
             if family is not None and counts(family, crate_for(directories, finding.path)) and (
                     isinstance(finding.state, style_ledger.Filed)
-                    or isinstance(evidence[finding.finding_id], style_ledger.UnchangedSite)):
+                    or isinstance(evidence[finding.finding_id],
+                                  (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))):
                 work[finding.path].add(family)
     return RankedWork({path: frozenset(present) for path, present in work.items()})
 
@@ -832,12 +838,12 @@ class MovedSites:
             text = finding.text.strip()
             if len(text.splitlines()) != 1 or any(text in line for line in self.lines_at(self.tip, finding.path)):
                 continue
-            judged = self.ledger.judged_commit(finding)
-            if isinstance(judged, style_ledger.NoJudgedCommit):
+            anchor = self.ledger.finding_anchor(finding)
+            if isinstance(anchor, style_ledger.NeedsJudgment):
                 continue
-            gained = [path for path in self.changed_since(judged.commit)
+            gained = [path for path in self.changed_since(anchor.commit)
                       if path != finding.path and text in self.lines_at(self.tip, path)
-                      and text not in self.lines_at(judged.commit, path)]
+                      and text not in self.lines_at(anchor.commit, path)]
             if len(gained) == 1:
                 moved[finding.finding_id] = gained[0]
         return moved
@@ -943,10 +949,18 @@ def candidates(ledger: style_ledger.Ledger) -> None:
     groups: dict[str, list[style_ledger.RuleCandidate]] = defaultdict(list)
     for candidate in ledger.rule_candidates():
         groups[candidate.idea].append(candidate)
+    unavailable: set[str] = set()
     for idea, items in sorted(groups.items()):
         print(idea)
         for item in items:
-            print(f"  {item.path}:{item.line} — {item.ticket} ({item.unit})")
+            try:
+                owner = ledger.unit_name(item.unit)
+            except style_ledger.LedgerError as error:
+                if item.ticket not in unavailable:
+                    print(f"anomaly: ticket {item.ticket}: " + " ".join(str(error).splitlines()))
+                    unavailable.add(item.ticket)
+                continue
+            print(f"  {item.path}:{item.line} — {item.ticket} ({owner})")
 
 
 def drop_candidate(ledger: style_ledger.Ledger, idea: str) -> None:
@@ -962,13 +976,13 @@ class LegacyIssue:
 
 def off_rule_issues(ledger: style_ledger.Ledger, proposals: Path) -> tuple[Path, ...]:
     """The open issues that a style unit filed by hand through `/issue`, by name. Migrate never writes them."""
-    proposer = style_slug(ledger.repo)
-    # A unit files as `<unit> (<style slug>)`; the filing code files as the slug alone.
-    filers = frozenset((proposer, f"({proposer})"))
+    proposer = standing_style_production(ledger.repo).name
+    owner = staff_reference(proposer, "showrunner")
+    filers = {owner.id, *(row.id for row in staff.snapshot().find(kind="unit", parent=owner.id))}
     named = frozenset(ledger.proposal_paths())
     # An issue that lists findings is an old style issue, and migrate takes it.
     return tuple(issue.path for issue in open_issues(proposals, "issue")
-                 if issue.value("proposed_by").rsplit(" ", 1)[-1] in filers and not issue.path.name.startswith("style ")
+                 if issue.value("proposed_by") in filers and not issue.path.name.startswith("style ")
                  and not issue.fields.get("style_findings") and issue.path not in named)
 
 
@@ -1641,6 +1655,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
                 return f"follow {site} -> {path}:{line}: unchanged source site"
             case style_ledger.NeedsJudgment(reason):
                 return f"left {site}: needs judgment: {reason}"
+            case style_ledger.FilingEligibleWithoutHistory():
+                return f"left {site}: eligible for filing without source history"
     suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
               if isinstance(outcome, (style_ledger.DeclarationRemoved, style_ledger.DeclarationGoneFromFile,
                                       style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))
@@ -1704,7 +1720,7 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
     skipped: list[Path] = []
     for issue in sorted({outcome.finding.state.proposal for outcome in planned.outcomes
                          if (isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
-                             or isinstance(outcome, style_ledger.FindingSite) and not isinstance(outcome.evidence, style_ledger.NeedsJudgment))
+                             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite))
                          and isinstance(outcome.finding.state, style_ledger.Filed)}):
         if not open_decision(issue):
             continue

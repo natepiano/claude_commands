@@ -1,10 +1,19 @@
 # Quiet defaults: no timer or footer unless asked, and phase-note pruning on the snapshot timer
 
+Current maintenance: snapshot-removal replaces the historical snapshot-timer wiring below with `agent-notes` (`scripts/maintenance/agent_notes_job.py`, runtime schedules and limits in `config/agent_notes.toml`). `herdr-upkeep` owns layout saves and detection-rule refreshes, using `config/herdr_upkeep.toml`. The desktop note and shutdown recovery snapshots are deleted. Historical phase notes below describe the earlier implementation.
+
+> Scheduler update (2026-10-31): the agent-notes job in
+> `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
+> pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
+> and its vault commit. Runtime schedules and limits are in
+> `config/agent_notes.toml`. Earlier snapshot-timer descriptions below record
+> the previous implementation; the watchdog no longer sends notices or pushes.
+
+
 > **Status: IMPLEMENTATION PLAN — both phases built; the nix change waits on the showrunner and the user's rebuild.**
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`, `docs/as-built/session-notifier.md`, `docs/as-built/phase-tables.md`
 
-> **Production: build-followups** — unit `enh-showrunner-unit`; production doc `docs/plans/build-followups-production.md`
 
 ## Source
 

@@ -1,49 +1,34 @@
 # Write a worker prompt
 
-Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
-`<PhaseTeam/>`, `<CoordinationBoard/>`, `<PhaseMesh/>`, `<BuildTokenContract/>`,
-`<TeamFilePartition/>`, and `<RoleReassignment/>` in full.
-
-**Read when:** writing any implementation, fix, or review prompt.
+Use from `/unit:direct` for implementation, fix, test, and review prompts.
 
 <WritePromptContract>
-Every implementation or fix prompt sent to a worker contains sections 1–9.
-Compaction can replace earlier prompt text with a summary, so a follow-up or
-repair is complete on its own. Section 7 may use its follow-up pointer; section
-9 is always inline. Never abbreviate the new Project Context, Work
-Specification, team partition, boundaries, or verification on the strength of
-earlier work.
+Include sections 1–10 in every implementation, test, and repair prompt.
+Make each prompt complete after compaction. Keep sections 9 and 10 inline.
+A follow-up may use the section 7 pointer.
+Review prompts include sections 7 and 9 and the <ReviewPromptContract/> opening.
+Codex review prompts also include section 3's command block.
 
-Every review prompt carries sections 7 and 9 the same way, plus the role-switch
-opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
-3's `## Builds and tests` section verbatim.
-
-1. Role: write the requested code directly; do not ask questions. Name the
-   slot this prompt is for and the role assigned by the Work Order's **Workers**
-   field per <PhaseTeam/>. A new-phase continuation begins: `You are slot
-   <slot>, continuing into phase <N> as <role>. Your earlier work is
-   committed.` A replacement thread uses opening wording instead.
-2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
-   reasons, and deviations when done, and **write that summary to this slot's
-   `${PHASE_DIR}/impl_summary_<slot>.txt`, its path written out in full, as the
-   last act before finishing** — a background
-   session has no output redirect, so a summary left only in the reply is a
-   summary the unit director never sees. State this slot's file set and the
-   peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
-   rather than merged. The summary also carries the three things no reader can
-   recover from the diff: **what this slot is unsure about, what it could not
-   verify, and what it touched outside its file set**. No reviewer receives a
-   summary, so a doubt left unstated arrives at review as a line of code that
-   looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
-   `load-rust-style.sh`; the unit director runs the style review in its main
-   review each phase." Codex lists `rust_style` to every worker, which loads
-   it unless told not to.
-3. Narration: when the activity changes — a new piece of work, or a run
-   started — run
-   `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
-   Use short present-tense text and never read the heartbeat file. Post
-   nothing while the activity stays the same. Every prompt to a Codex worker
-   carries this section verbatim, after section 2:
+1. Role: instruct the worker to write code directly without questions.
+   Name its slot and Work Order role under <PhaseTeam/>.
+   For a retained conversation, state its slot, current phase, and assigned role.
+   Use opening wording for a replacement conversation.
+2. Boundaries: prohibit commits, branches, and unrelated edits.
+   State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
+   For an existing `mesh` pin, require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
+   For `herdr`, require the summary in the final reply, because the launcher saves that reply as the summary.
+   Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
+   Implementation, fix and test prompts carry verbatim:
+   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
+   Review prompts use
+   <ReviewPromptContract/>'s style assignment instead.
+3. Narration: require this command when a herdr pane worker's activity changes:
+   `bash ~/.claude/scripts/direct/board.sh post <slot> status "<activity>"`.
+   For an existing `mesh` pin, insert the concrete run folder after `post`.
+   For a read-only pane reviewer, require short output lines instead of board posts.
+   Assign its required suites to the director or a writer.
+   Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
+   Include this command block verbatim after section 2 in every Codex prompt:
 
    ```
    ## Builds and tests
@@ -52,8 +37,12 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    write_stdin poll, for any command, build or not. Anything longer runs
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
-   `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
-   Either returns at once with one line naming the run, its pid and its log.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
+   A successful start returns at once with the run, its pid and its log.
+   A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
+   Exit 4 refuses a new run at that limit and names the live runs.
+   Wait for a run's result, or put more files in one run. Never run attached after exit 4.
+   Exit 3 means the caller has no registered worker route; run attached only for that exit.
    Keep working if you have other work; otherwise end your turn. The result
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
@@ -67,75 +56,42 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    `kill -TERM -- -<pid>`.
    ```
 
-   Every model call resends the worker's whole context, and on 2026-10-15
-   68% of worker calls were waits, sleeps and status posts. The unit
-   director's side is <WorkerRuns/> in `/unit:direct`. A Claude worker
-   gets no such section: it runs its commands with `run_in_background: true`
-   and ends its turn until the task notification arrives. Role
-   changes: **before the first tool call in a new role** — taking a slice of
-   the test work, standing down — run
-   `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
-   written out with the real path and this slot's name. A `status` sentence
-   saying the same thing does not count: the table reads the `role=` field,
-   and a move that is not posted is a row the run never shows.
-
-   **The slot in every one of these commands is this prompt's slot.** Composing
-   both prompts from one draft carries the first slot into both, and the board
-   then reads as one worker doing the whole round while the other sits silent —
-   the attribution the required argument exists to keep. Nothing downstream can
-   catch it, because each post is well-formed. Before dispatch, check that the
-   two prompts name different slots.
-4. `## Team` — state the assignment from Workers (`1 writer + 1 tester` or
-   `2 writers`, and the role each slot takes), then name both slots and who
-   holds which files, each hub file with its one owner. Copy
-   the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
-   pause while a peer finishes its own. Copy <BuildTokenContract/>'s
-   worker-facing prohibition: never mention, request, or acquire the cargo
-   token. State the one rule plainly: **a question to a peer is a message, a
-   decision is a board post**, and the board has no `ask` kind to fall back on.
-   State too: **say where anything you pass to a peer came from**; only the unit
-   director relays the user's words, labelled as the user's. User, 2026-10-04.
-   Give this slot its own mesh name, its peer's name, the call that reaches
-   it, and — on the claude path — the unit director's name from
-   `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
-   one it will not use, and a codex peer needs the literal `codex_mesh.py`
-   command line with the concrete `--session-dir` already filled in, not a
-   description of it. A slot whose register line says `mesh=none` has no peer
-   channel at all: say so, and tell it to read the board rather than wait on a
-   reply. A repair worker per <FixDispatch/> has no peer: its `## Team` carries
-   its file set, the other repair workers' files as read only, and the token
-   prohibition.
-
-5. `## Project Context`.
-6. `## Work Specification`.
-   Every implementation, test and repair prompt carries verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why." The unit director answers a blocked post in the next work order: it rejects the change, or it adds the ruling line `Assertion-Change: <path>::<test> — <why>`, which `assertion_guard.py` reads from the run's work orders and from the commit message. Without that line, `verify.sh lint` and the checkpoint commit refuse a removed, weaker or turned-off assertion or test. In cargo-liner-tile checkpoint e21d5b93 a worker changed an `assert_eq!` to a bound `assert!` to make its change pass, and no review saw it (user, 2026-10-28).
-
-   For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
-
-   Every repair prompt's Work Specification also carries these fixing rules inline:
-
-   - Remove dead code; do not mark it as dead to silence a warning.
-   - Remove an unused binding; do not prefix its name with `_`.
-   - Before a rename or signature change, use LSP `findReferences` to find
-     every reference and update each affected reference. Reread the changed
-     body afterwards.
-   - Before fixing a clippy lint, find its governing style rule with:
-
-     ```bash
-     grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md
-     ```
-
-     Read each matching rule, apply it, and cite its file in the fix summary.
-     If none matches, report that no style-guide rule governs the lint and
-     choose the fix from the finding and surrounding code.
-   - On a `cargo mend --fix` rollback, stop and keep the tree for inspection.
-7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
-   opening prompt. A follow-up may instead say: `Read
-   ~/.claude/docs/type_design.md in full and apply its Type Design Contract to
-   this work.`
-8. `## Verification` per <VerificationContract/>, exactly as listed and with
-   nothing added around it.
-9. `## Three Gods`, always inline; item 2's `rust_style` line still holds:
+   Claude workers use `run_in_background: true` and end the turn until the result arrives.
+   Before a role change, require this command from herdr pane writers:
+   `bash ~/.claude/scripts/direct/board.sh role <slot> <impl|fix|test|review> "<why>"`.
+   For existing mesh-pinned writers and reviewers, insert the concrete run folder after `role`.
+   The director records a pane reviewer's role change.
+   Use the prompt's slot. Check that different prompts name different slots.
+   Omit the run folder from pane worker board commands. They read `UNIT_RUN_DIR`.
+4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
+   Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
+   Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
+   Send questions by message. Record decisions on the board. State each source when passing information.
+   Label the user's words only when the unit director relays them.
+   Include each worker address and its concrete contact command under <PhaseMesh/>.
+   For an existing mesh-pinned run, use its registered names and contact route.
+   If a member has no message route, require it to read the board.
+   For repairs, list the file set, other workers' files as read-only, and the token prohibition under <FixDispatch/>.
+5. `## Project Context`: include the current context. Omit plan **Style** metadata.
+6. `## Work Specification`: include the following instructions verbatim.
+   "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
+   For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
+   For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
+   Include these repair rules:
+   - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
+   - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
+   - Before a clippy repair, run `grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md`.
+   - Read matching rules, apply them, and cite them in the summary.
+   - If no rule matches, report that fact and use the finding and nearby code.
+   - After a `cargo mend --fix` rollback, stop and keep the tree for inspection.
+7. `## Type Design Contract`: copy <TypeDesignContract/> verbatim in opening prompts.
+   A follow-up may say: `Read ~/.claude/docs/type_design.md in full and apply its Type Design Contract to this work.`
+8. `## Verification`: copy <VerificationContract/> commands and worker rules without extra requirements.
+   Do not require lint before tests. Permit only listed commands, with the sandbox disabled, and prohibit raw Cargo.
+   Require every result and its output before the final report. For Codex, require results from section 3's runs.
+   Read the named log for `PASS (recorded)`. Add `--no-cache` only for an intentional repeat, such as a flake investigation.
+   Add the package's scoped `verify.sh test` when an edited package has no listed test command. Report the addition.
+9. Include this section verbatim:
 
    ```
    ## Three Gods
@@ -143,27 +99,25 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    We believe in three gods, Simple, Fast and Beautiful, with correctness as the
    floor beneath them.
    ```
+10. Include this section inline in every implementation, test, and repair prompt:
 
-The Verification section carries the applicable command lines and every
-worker-facing rule from <VerificationContract/>, with nothing added around
-them. Command-list order must not make lint a precondition for test. It must
-also say: run only its listed commands, never raw Cargo; run each
-with the sandbox disabled; do not report until every command has exited and its
-output has been read. For a Codex worker, the final report waits for the
-results item 3's runs send. Status 77 means cancelled because the tree changed:
-resubmit after your edits are done; it is not a test failure. A run that prints
-`PASS (recorded)` is that gate's result, and the log it names is the output to read; add `--no-cache` only to re-run a
-passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
-package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
+    ```
+    ## Build rules
+
+    1. Fix every visible failure before you rerun. Finish the edit round. Then run once.
+    2. After a pass, do not run again until your edits are done.
+    3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
+    ```
+
+    Run the phase and merge gates in full. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <PhaseTeam>
 Every phase's implementation dispatch assigns **two workers at once**; a
 repair assigns one per disjoint file set under <FixDispatch/>. They share
 `${SESSION_DIR}` and `${WORKING_DIR}`, and each occupies a fixed **slot** that
-names its artifacts and board identity. Under <LongLivedWorkers/>, the first
-phase opens the Codex threads and later phases continue each thread that remains
-open; a replacement starts fresh with an opening prompt. The **default
+names its artifacts and board identity. Under <LongLivedWorkers/>, later phases reuse each retained worker and native conversation.
+A replacement receives an opening prompt. The **default
 assignment**:
 
 | Slot | Opens as | Owns |
@@ -188,144 +142,99 @@ A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
 the board, the progress table, every artifact name — reads the slot for identity
 and the role for activity, so keep the two distinct: `test` doing
-implementation work is still slot `test`. Its Codex thread stays open across
-phase boundaries. Keep its role when the next Work Order fits, otherwise move
-it under <RoleReassignment/>. Open another thread only when no open worker can
-take the assignment, including when every open worker is busy; name its slot for
-its work (`review`, `fix2`), keep it for reuse, and end it only with
-`end_session.sh`.
+implementation work is still slot `test`. Keep its native conversation across phase boundaries.
+Keep its role when the next Work Order fits; otherwise apply <RoleReassignment/>.
+Open another worker only when no retained worker can take the assignment.
+Name its slot for its work (`review`, `fix2`) and keep it for reuse.
+Use <PhaseCleanup/> for removal.
 
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
+In each edit round, `test` also runs the existing tests of the callers of the
+changed code, so a caller red shows before the full gate.
 
 **Every worker carries its own pass kind, which is its assigned role**, so a team
 phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;
-<LaunchImplementation/> step 5 owns the argument positions.
+<LaunchImplementation/> step 5 owns the launch options.
 
-Launch both in **one message** so they run concurrently, each with its own
-prompt file and its slot as the ninth argument to `implement.sh`; continue an
-open Codex worker with `--to <full-worker-name>`, then apply
-<DispatchContract/> once for the team: the run's one notifier instance covers
-the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
-the rest of the procedure.
+Run both workers through `assign.sh` in separate background shells of the director session.
+Give each worker its own `--prompt`, `--paths`, and `--role`.
+Use `--to <short name>` for a retained pane worker.
+For an existing mesh pin, use the full registered name with `--to`.
+Apply <DispatchContract/> once for the team.
+See <LaunchImplementation/> for the command format.
 
-The phase is complete only when every slot has a terminal `${PHASE_DIR}/impl_status_<slot>`,
-not when the first one lands. Reading one slot's `implemented` as the phase's
-result is the same defect as reading a completion notification as a finished
-assignment. Completion ends the turns, not their Codex threads.
+Complete the phase only when every dispatch has a terminal status at its returned path.
+An existing mesh pin uses `${PHASE_DIR}/impl_status_<slot>`.
+Completion ends the turns and retains the worker conversations.
 </PhaseTeam>
 
 <CoordinationBoard>
-The team coordinates through `${SESSION_DIR}/board.log`, written only with
-`bash ~/.claude/scripts/direct/board.sh`.
+The team uses the run's `board.log`. Write it only through `bash ~/.claude/scripts/direct/board.sh`.
+The board keeps decisions and activity across stops and restarts. Send questions by message under <PhaseMesh/>.
 
-**Why a file even when messages work.** Every member is reachable by name on
-both paths — see <PhaseMesh/> — but the board is the durable broadcast record
-and the token owner, where messages are addressed and transient. One post
-reaches the peer and the wrapper at once; a member resumed hours later reads
-the whole history rather than what arrived while it listened; and only the
-token, taken with `mkdir`, makes anything mutually exclusive. With
-`[direct.options] codex_mesh=0` a codex member is unaddressable and the board
-is its only channel, since the unit director is asleep between progress ticks and
-cannot relay. Each `register` line says which case holds, in its `mesh=` field.
+Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
+Directors and workers with an existing `mesh` pin insert `<session_dir>` after the verb.
 
-- `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
-  Kinds are a closed set: `register`, `claim`, `release`, `status`, `blocked`,
-  `handoff`, `done`. There is no `ask` and no `answer`, and the command rejects
-  both: a question to a peer is a message, per <PhaseMesh/>.
-- `board.sh read <session_dir> --since <cursor>` — everything new. Each line is
-  numbered; keep the last number as the cursor. Read after acquiring a token,
-  and whenever you need what a peer has recorded rather than what it would say
-  if asked — the role it holds now, whether it has posted `done`.
-- `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call this
-  the moment your slot starts doing something other than what it is named
-  for.** A slot is a fixed identity and its role is not: a writer that takes a
-  slice of the remaining test work is doing `test`. The launcher stamps the opening role, so
-  the table is never blank;
-  after that only this command keeps it true, and saying it in a `status`
-  sentence does not count — the table reads the field, not prose. **Every call
-  adds a row**, so a change you do not post is a shape the run never shows, and
-  the row above it silently claims your old role held the whole time.
-- **One way to do each thing.** A question goes by message; a decision goes on
-  the board. A decision that is not on the board did not happen, however plainly
-  it was settled in messages — the board is what a peer resuming later, and the
-  unit director at its next tick, actually read.
+- `board.sh post <slot> <kind> <message>` adds one board line.
+  Kinds are `register`, `claim`, `release`, `status`, `blocked`, `handoff`, and `done`.
+  The command rejects `ask` and `answer`.
+- `board.sh read --since <cursor>` reads new lines.
+  Keep the last line number as the cursor. Read after acquiring a token or when you need a peer's record.
+- `board.sh role <slot> <impl|fix|test|review> [note]` records a role change.
+  Record each role change when it starts. A writer that starts test work takes the `test` role.
+  The launcher records the opening role. Every role call adds a row.
+  A `status` post does not change the role field.
 
-Narration goes through the board too: `board.sh post` takes the slot as a
-required argument, so attribution cannot be dropped, where a name an agent is
-merely asked to prefix onto a heartbeat line reliably goes missing.
+Record decisions on the board. Keep the slot argument in every post.
 </CoordinationBoard>
 
 <PhaseMesh>
-A member launched into the mesh is **addressable**: peers reach each other, the
-unit director reaches any of them, and a claude member reaches the unit director —
-mid-run, without waiting for a phase to end.
+Use the transport selected under <LongLivedWorkers/>.
 
-- **Addresses** are `<project>-<slot>`, the project being the working tree's
-  directory name: `hana_catalyst-impl`, `-test`; a repair worker is `-fix`. The
-  slot, never the role: a `test` worker writing code is still `-test`. Get each
-  name from `bash ~/.claude/scripts/direct/worker_name.sh "${WORKING_DIR}"
-  <slot> <kind>`, the launcher's own rule; never compose one. A member is told
-  its peer's name in its prompt, and every `register` line on the board repeats
-  the names in its `mesh=` field, so a member that missed the launch can still
-  look one up.
-- **How you reach a name depends on its family**, and the register line says
-  which in its `reach=` field. Using the wrong call fails silently: the message
-  goes nowhere and the sender waits on a reply that was never queued.
-  - `reach=SendMessage` — a claude member, running as a named background
-    session. Address the bare name; `ListAgents` confirms who is live.
-  - `reach=codex_mesh.py` — a codex member, running as a thread on the run's
-    `codex app-server`. Two calls, both with
-    `--session-dir <concrete SESSION_DIR> --to <name>`:
-    `python3 ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
-    queues the message and it lands at the start of that worker's next turn;
-    `… steer --message "<text>"` interrupts the turn it is running right now.
-    Send by default. Steer only when the work in flight is work you need
-    stopped — it costs the worker whatever it was mid-way through.
-    `… list --session-dir <dir>` prints the roster; each entry carries `role`,
-    `status` (including terminal `"ended"`), and `context_tokens`.
-  - `mesh=none` — that member has no address. Do not wait on a reply from it;
-    read its board posts instead.
-- **A finished claude peer is still reachable.** Its session stays alive after
-  its turn ends, until <PhaseCleanup/>, and a message resumes it from its
-  transcript. So the tester may ask the implementer a question after the
-  implementer has reported done, and get an answer rather than silence. **A
-  finished Codex turn holds `send` for its next turn.** Its thread remains open.
-  Only the unit director starts its next turn — a later phase, repair, or
-  follow-up — through `implement.sh --to <worker>`. That turn receives the held
-  messages first and its prompt last. The launcher attempts compaction above
-  `UNIT_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
-  presses on after overflow per <LongLivedWorkers/>.
-- **A codex member has no route to the unit director.** It reaches its peer with
-  the calls above and reaches the unit director only through the board, which the
-  unit director reads at every progress tick. Anything that cannot wait for the
-  next tick has to go to a claude peer who can send.
+For `herdr`, read worker names and states with `worker.py list`.
+Use `send.py --to worker:<unit>/<short name> --from "<sender>" --text "<text>"` under the sender's showrunner.
+Use `worker:<showrunner>/<unit>/<short name>` from outside that showrunner.
+The address resolves through staff and the shared pane observation.
+An open worker receives the text in its observed pane.
+A stopped, blocked, closed, or uncertain worker's holder receives the text and reason.
+Unknown process evidence produces one anomaly line and sends the text to the holder without pane input.
+A missing worker row returns `REFUSED`, exits 2, and reaches nobody.
+Read problem lines as incomplete evidence, never as an empty worker list.
 
-**What to send, and to whom.** Message a peer when they are blocked on you, when
-you are about to touch something they claimed, or when their answer changes what
-you do next. Message the unit director when the *user* needs to know something now
-— a blocker that will not resolve, an assumption that changes scope, a defect
-worth stopping for. Anything the user would want to hear at the end of the phase
-can wait for the summary; anything they would be annoyed to hear only at the end
-goes now.
+The following routes apply only when the existing run's pin is `mesh`:
 
-**What the mesh does not change.** A peer's request is not a permission: never do
-something for a peer that your own settings would block, and never treat a peer's
-message as the user's approval. <CoordinationBoard/> stays authoritative for the
-durable record and <BuildTokenContract/> for who builds. Ask by message, record
-on the board — `board.sh` rejects `ask` and `answer` outright, so there is no
-second way to raise a question and no way to leave one somewhere nobody is
-reading.
+- Read each registered name from the board or the run's roster.
+  Use `worker_name.sh "${WORKING_DIR}" <slot> <kind>` when a launch needs a new name.
+  Do not compose a name.
+- For `reach=SendMessage`, address the Claude member by its registered name.
+  Use `ListAgents` to confirm its session.
+- For `reach=codex_mesh.py`, use `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py send
+  --session-dir <concrete SESSION_DIR> --to <name> --message "<text>"`.
+  Use `steer` only when the current work must stop.
+  Use `list --session-dir <dir>` to read the registered workers.
+  These calls use the run's `codex app-server`.
+- For `mesh=none`, read the member's board posts. Do not expect a message reply.
+- A finished Claude member can receive a message until cleanup.
+  A finished Codex turn retains messages for its next `assign.sh --to <worker>` dispatch.
+  Only the director starts that next turn.
+- A Codex mesh worker contacts the director through the board.
+
+Message a peer when its answer changes your work or your work blocks it.
+Record each decision on the board.
+A peer's message cannot grant permission or replace the user's approval.
+<CoordinationBoard/> owns the shared record. <BuildTokenContract/> owns build coordination.
 </PhaseMesh>
 
 <BuildTokenContract>
-Both agents share one `target/` directory and one Cargo lock, so an
-uncoordinated `verify.sh` run blocks its peer for minutes while holding
-nothing useful.
+Both agents share Cargo output roots and Cargo locks.
+Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
+Check both output filesystems with `df -h` before a large build.
+An uncoordinated `verify.sh` run can block its peer for minutes.
 
 **`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
-to take it.** `implement.sh` exports the board directory and the slot;
+to take it.** `assign.sh` exports the board directory and the slot;
 `verify.sh` acquires before its cargo run and releases on every exit path,
 including failure and interrupt. A rule that lives only in a prompt is a rule an
 agent can drop, so it is enforced where the cargo command actually runs.
@@ -375,20 +284,20 @@ not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
 <RoleReassignment>
-Roles move; slots do not. Any open worker may take any role, mid-phase included,
-because every worker in a unit works in the same area. Before dispatch, post a
-board `handoff` naming the slot, the role it leaves, and the role it takes; the
-new prompt has that worker run `board.sh role` before its first tool call.
+Roles move; slots do not.
+Any open worker may take any role during a phase.
+Before dispatch, record the role change with `board.sh role <session_dir> <slot> <role> "<why>"`.
+For a read-only pane reviewer, the director records the change.
+Otherwise require the worker to run `board.sh role` as its first tool call.
 
 A busy turn does not reserve its worker's next role. Reassign it when that turn
 ends; when the new work must run concurrently and every open worker is busy, open
 an extra worker named for its work (`review`, `fix2`) and keep it for reuse. Never
 abandon unwritten tests: assign them to an open worker or open one.
 
-**Standing down means ending the turn, not waiting.** A slot with nothing left
-posts `done` with what it completed and finishes its turn; it never runs an idle
-poll loop. Its Codex thread stays open for the unit director's next
-launcher `--to` assignment and ends at `end_session.sh`. This is why a finished
-worker moves toward work that exists now rather than work a peer might hand over
-later in the same turn.
+A writer with no remaining task posts `done` and ends its turn.
+Apply <ReviewPromptContract/> to a reviewer's completion.
+Never poll while idle.
+Keep the native conversation for the director's next assignment under <LongLivedWorkers/>.
+Use <PhaseCleanup/> for permanent removal.
 </RoleReassignment>

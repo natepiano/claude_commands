@@ -1,5 +1,5 @@
 ---
-description: Split greenlit phased plans into one direct-ready plan per unit plus a production doc, so /showrunner:produce can launch the unit directors.
+description: Split plans into production units.
 ---
 
 # To Production
@@ -84,11 +84,10 @@ and merged units.
 3. **Links between units.** In every unit plan, including the kept source:
    - a fact in **Constraints from prior phases** that comes from a phase now in
      another unit names that unit and phase, for example "from
-     geometry-material-unit phase 2, on `<merge branch>` before this phase
+     geometry-material phase 2, on `<merge branch>` before this phase
      starts";
-   - a phase that waits on another unit gets its gate line directly under its
-     heading: `**Blocked by:** G<k> — <unit> phase <M> merged into
-     \`<merge branch>\``;
+   - record a start-order wait as an owed action in the showrunner's notes;
+   - use `cargo-berth sequence` for merge order;
    - every phase number mentioned in moved text is rewritten to its new number,
      or to the other unit's name and number. Substitute highest-first.
 4. **Header line.** Add the Production line to the kept source plan too, and
@@ -101,16 +100,7 @@ and merged units.
 Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
-- **Units:**
-  - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
-    same name.
-  - **Session:** the unit name. If a herdr session with that name already
-    exists, add the production name as a prefix.
-  - **Port:** a distinct app port per unit, only when the project launches an
-    app for smoke tests. Never the user's default port. The repository's
-    memory names the default.
-  - **Owns:** the files greenlight gave the unit.
-- **Hub files** and **Gates** are copied from the greenlight result.
+- **Hub files** are copied from the greenlight result.
 - **Merge tests:** the command that runs the app package's tests, which catch
   cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,
   never a bare package name.
@@ -118,7 +108,7 @@ production format, with status `planned`:
 - **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
   named for the top-level showrunner that will run it (a child production uses
-  its root's list); `change_review.py showrunner --production <doc>` prints the
+  its root's list); `change_review.py showrunner --production <showrunner name>` prints the
   name once the showrunner runs.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
@@ -134,15 +124,14 @@ production format, with status `planned`:
 Validate every `todo` phase in every unit plan:
 
 ```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+~/.claude/scripts/lib/py -m scripts.berth.work_order \
   --repository-root "${REPO}" validate --document "<unit plan>" --phase <N>
 ```
 
 Then check by hand:
 - no two units own the same file;
 - each hub file has one owner;
-- every gate in the production doc appears as a `**Blocked by:**` line in its
-  waiting phase, and the gates form no cycle.
+- record each start-order wait as an owed action in the showrunner's notes.
 
 Fix any failure before reporting.
 </Validate>
@@ -157,7 +146,6 @@ Fix any failure before reporting.
 | Units | <unit>: <plan path>, <n> phases (source phases <list>); one row per unit |
 | Merge branch | `<branch>` (<exists | produce creates it from <base>>) |
 | Hub files | <file> → <owner>; or None |
-| Gates | G<k>: <unit> phase <N> waits on <unit> phase <M>; or None |
 | Source plan | <kept by <unit>; <n> phases moved out; resequenced <old→new>> |
 | Next | In a checkout of `${REPO}` on `<merge branch>`: `/showrunner:produce <production doc>` |
 ```
@@ -171,7 +159,6 @@ Then stop.
 
 - Plan docs only; no code, commits, branches or worktrees.
 - Never rewrite a `done` phase and never renumber one.
-- A Work Order moves whole. The only edits are cross-unit references and gate
-  lines. Its Spec stays verbatim (worker plan format rule 3).
+- A Work Order moves whole. Change only cross-unit references. Keep its Spec verbatim.
 - Splitting is packaging under `<DecisionEconomy/>`: decide it and state it.
   The user decides anything that changes what ships.

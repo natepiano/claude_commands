@@ -1,5 +1,5 @@
 ---
-description: Adversarial review of the current topic — two agents take opposing sides (for and against), answer each other once, and a neutral third agent judges. Any role, any time.
+description: Review a topic with opposing agents.
 ---
 
 `$ARGUMENTS` — optional clarifications: the exact question, the sides, the metric, what evidence counts, whether experiments are allowed. Empty means the topic under discussion now.
@@ -21,7 +21,7 @@ Two `Agent` calls in one message: `subagent_type: general-purpose`, `run_in_back
 - **Side:** "Show that <claim>." / "Show that <claim> does not hold, or costs more than it gives." Then: "Another agent argues the opposite side. If, after real effort, the evidence does not support your side, say so plainly."
 - **Frame:** `frame.md` verbatim.
 - **Look for, among others:** a list fitted to that side: confounds, baselines, noise, comparability, the cost side, the other machine.
-- **Rules:** read-only; no edits, no `git stash`, no `cd`, no credentials; read `~/rust/nate_style/rust/forbidden-words.md` before writing; report exit codes as they are. An experiment runs only when `$ARGUMENTS` allows it, in a `git clone --local` under `/tmp`, and states its cost.
+- **Rules:** read-only; no edits, no `git stash`, no `cd`, no credentials; read `~/rust/nate_style/rust/forbidden-words.md` before writing; report exit codes as they are. An experiment runs only when `$ARGUMENTS` allows it, through `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner <unit-or-production> --repo <source> --commit HEAD -- <experiment>`, and states its cost.
 - **Return,** in short plain words: (1) the verdict in the metric, with a range; (2) each point, with the exact command, query or `file:line` that shows it; (3) the strongest point against its own side that it could not knock down; (4) when the metric is a proxy, a better proxy if it found one, and why.
 
 ## 3. Rebuttal

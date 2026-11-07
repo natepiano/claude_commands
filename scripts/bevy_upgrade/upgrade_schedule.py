@@ -8,19 +8,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.lib.process_failure import failure_detail
-from scripts.production import showrunners
-from upgrade_record import Record
+from scripts.production import staff
+from scripts.message import session_send
+from scripts.bevy_upgrade.upgrade_record import Record
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 
-def instance(slug: str) -> str:
-    return f"bevy-upgrade-{slug}"
+def instance(staff_id: str) -> str:
+    return f"bevy-upgrade-{staff_id}"
 
 
 def _notifier(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -28,24 +27,28 @@ def _notifier(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["zsh", notifier, *arguments], capture_output=True, text=True, check=False)
 
 
+def command(staff_id: str) -> str:
+    """Build the notifier command with its fixed owner reference."""
+    return shlex.join([str(SCRIPTS / "lib/py"), str(SCRIPTS / "bevy_upgrade/bevy_upgrade.py"),
+                       "--staff-id", staff_id, "check", "--scheduled"])
+
+
 def ensure_job(record: Record) -> None:
-    words = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "bevy_upgrade/bevy_upgrade.py"),
-             "--production", record["production"], "check", "--scheduled"]
-    result = _notifier("new", instance(record["slug"]), "--every", "240", "--timeout", "300",
-                       "--run", " ".join(shlex.quote(word) for word in words))
+    result = _notifier("new", instance(record["staff_id"]), "--every", "240", "--timeout", "300",
+                       "--run", command(record["staff_id"]))
     if result.returncode:
         print(f"bevy_upgrade: could not schedule check: {failure_detail(result)}", file=sys.stderr)
 
 
-def remove_job(slug: str) -> None:
-    result = _notifier("remove", instance(slug))
+def remove_job(staff_id: str) -> None:
+    result = _notifier("remove", instance(staff_id))
     if result.returncode:
         print(f"bevy_upgrade: could not remove check: {failure_detail(result)}", file=sys.stderr)
 
 
-def next_check(slug: str) -> datetime | None:
+def next_check(staff_id: str) -> datetime | None:
     """None means the notifier has no such job."""
-    result = _notifier("status", instance(slug))
+    result = _notifier("status", instance(staff_id))
     if result.returncode == 1:
         return None
     for line in result.stdout.splitlines():
@@ -54,14 +57,15 @@ def next_check(slug: str) -> datetime | None:
     raise ValueError("notifier status has no next_due line")
 
 
-def tell_showrunner(slug: str, summary: str, text: str) -> bool:
-    address = showrunners.current_address(slug)
+def tell_showrunner(staff_id: str, summary: str, text: str) -> bool:
+    row = staff.snapshot().by_id(staff.StaffId(staff_id))
+    address = f"session:{row.current_session}" if row is not None else ""
     outcome = "no showrunner session"
     if address:
-        sender = os.environ.get("BEVY_UPGRADE_SEND", str(SCRIPTS / "message/send.py"))
+        sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
         try:
             result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "--to", address,
-                                     "--from", "bevy-upgrade", "--key", instance(slug),
+                                     "--from", "bevy-upgrade", "--key", instance(staff_id),
                                      "--summary", summary, "--text", text],
                                     capture_output=True, text=True, check=False)
         except OSError as error:
@@ -74,14 +78,15 @@ def tell_showrunner(slug: str, summary: str, text: str) -> bool:
     return False
 
 
-def retire_message(slug: str) -> None:
+def retire_message(staff_id: str) -> None:
     try:
-        address = showrunners.current_address(slug)
+        row = staff.snapshot().by_id(staff.StaffId(staff_id))
+        address = f"session:{row.current_session}" if row is not None else ""
         if not address:
             return
-        sender = os.environ.get("BEVY_UPGRADE_SEND", str(SCRIPTS / "message/send.py"))
+        sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
         result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "retire", "--to", address,
-                                 "--from", "bevy-upgrade", "--key", instance(slug)],
+                                 "--from", "bevy-upgrade", "--key", instance(staff_id)],
                                 capture_output=True, text=True, check=False)
     except OSError as error:
         outcome = str(error)

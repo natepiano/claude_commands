@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Store style judgments and derive coverage at a repository's synced tip."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -28,23 +32,47 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
-from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
+from scripts.production.issues import Issue, frontmatter
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_blob import git_blob_id
+from scripts.production import staff, session_staff
+
+from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
                          LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
 
-import rules as rule_catalog
-import style_footprint
-import declarations
-import finding_sites
-from finding_sites import (NeedsJudgment as NeedsJudgment,
+from scripts.style import rules as rule_catalog
+from scripts.style import style_footprint
+from scripts.style import declarations
+from scripts.style import finding_sites
+from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
+                           FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
+                           RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
-import style_rules
-from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
-                              NoAppliedCheck, RenameNotApplied, applied_check, approved_rename, binding_rename, binding_rename_check, file_rename)
-from candidate_generators import enumerate_candidates
-from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+from scripts.style import style_rules
+from scripts.style import approved_renames
+from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
+                              NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
+                              approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
+from scripts.style.candidate_generators import enumerate_candidates
+from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
-from rules import Family, InputScope, MemberReach, Rule, Tier
+from scripts.style.rules import Family, InputScope, MemberReach, Rule, Tier
+
+
+@dataclass(frozen=True)
+class BuiltEntryEvidence:
+    """Separate edit/person-reading result and mandatory current local-admission capability."""
+
+    applied: AppliedCheck
+    admission: approved_renames.RenameAdmission
+
+    @property
+    def outcome(self) -> AppliedCheck:
+        if isinstance(self.admission, OuterBindingBlocked | OuterBindingUnproved):
+            return self.admission
+        return self.applied
+
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
 # `removed` closes a ticket cell whose file the ticket's own commits deleted; it is not a verdict on code.
@@ -54,6 +82,7 @@ LintTool = Literal["clippy", "mend", "rustfmt"]
 ProcessedTipReason = Literal["linted", "own hand-off"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
+TICKET_NUMBER = re.compile(r"[1-9][0-9]*")
 FINDING_REPLACEMENT_GUIDANCE = (
     "The After text replaces the whole Before span. Supply the full replacement, never the old wording with a new line added. "
     + "Rewrite a comment to name the constructs and keep every reason."
@@ -166,12 +195,6 @@ def retry_on_change[T](attempt: Callable[[], T]) -> T:
         except ChangedBeforeLock:
             continue
     return attempt()
-
-
-@dataclass(frozen=True)
-class UnitRenamed:
-    tickets: int
-    waits: int
 
 
 @dataclass(frozen=True)
@@ -510,6 +533,15 @@ LinkedTicket = tuple[str, TicketState, str]
 JudgingTicket = tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class FindingSourceHistory:
+    """Original judgment and the commit preceding the last recorded follow."""
+
+    anchor_commit: str
+    previous_site_commit: str
+    judging: JudgingTicket
+
+
 def _refuse_open_ticket(finding_id: str, ticket: str, state: TicketState) -> None:
     if state not in FINAL_TICKET_STATES:
         raise LedgerError(f"{finding_id}: build ticket {ticket} still holds the finding")
@@ -632,6 +664,7 @@ class HeldFinding:
     follow: FollowState
     waive_provenance: WaiveProvenance
     waive_actor: WaiveActor | NoRecordedWaiveActor
+    rename_disposition: OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock = NoOuterBindingBlock()
 
 
 @dataclass(frozen=True)
@@ -652,7 +685,7 @@ def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Ru
 
 @dataclass(frozen=True)
 class JudgedCommit:
-    """The commit a finding was judged at: its judging ticket's checkpoint, or the ticket's start before one."""
+    """The judging ticket's checkpoint, else its start; merge evidence, not a source coordinate."""
 
     commit: str
 
@@ -1188,7 +1221,7 @@ class FindingNotBuilt:
     """A merged ticket's finding that stays filed for a later ticket."""
 
     finding_id: str
-    cause: RenameNotApplied | NoAppliedCheck
+    cause: RenameNotApplied | NoAppliedCheck | OuterBindingBlocked | OuterBindingUnproved
 
 
 @dataclass(frozen=True)
@@ -1216,6 +1249,34 @@ class TicketJudgment:
     verdict: Verdict
     declared_scope: DeclaredInputScope
     reads: ReadFiles | NoReadFiles = NO_READ_FILES
+
+
+class HeldCellCorrectionMode(StrEnum):
+    PREVIEW = "preview"
+    APPLY = "apply"
+
+
+class HeldCellCorrectionState(StrEnum):
+    WOULD_CORRECT = "would correct"
+    CORRECTED = "corrected"
+    ALREADY_CORRECTED = "already corrected"
+
+
+@dataclass(frozen=True)
+class CleanCellHeldCorrection:
+    """A merged ticket's clean cell, with the live findings that prove it must be held."""
+
+    ticket: str
+    rule: str
+    path: str
+    judgment_id: int
+    finding_ids: tuple[str, ...]
+    state: HeldCellCorrectionState
+
+
+def held_cell_correction_line(correction: CleanCellHeldCorrection) -> str:
+    return (f"{correction.state}: {correction.ticket}: {correction.rule} {correction.path}: clean -> held; "
+            + "open rows: " + ", ".join(correction.finding_ids))
 
 
 @dataclass(frozen=True)
@@ -1290,6 +1351,8 @@ StyleBranch = StoredStyleBranch | NoStoredStyleBranch
 
 
 def not_built_line(repo: Path, item: FindingNotBuilt) -> str:
+    if isinstance(item.cause, OuterBindingBlocked | OuterBindingUnproved):
+        return f"not built {item.finding_id}: {item.cause.reason}"
     if isinstance(item.cause, RenameNotApplied):
         return f"not built {item.finding_id}: rename not applied in {item.cause.path}"
     return (f"not built {item.finding_id}: {item.cause.kind} has no applied check; mark it built with "
@@ -1538,6 +1601,53 @@ class UnreadPathAttribute:
     reason: str
 
 
+class PathAttributeMode(StrEnum):
+    DIRECT = "direct"
+    CONDITIONAL = "conditional"
+
+
+@dataclass(frozen=True)
+class PathAttributeMeta:
+    """A path attribute meta item, excluding cfg predicates and unrelated attribute arguments."""
+    begin: int
+    index: int
+    end: int
+    mode: PathAttributeMode
+
+
+def path_attribute_metas(words: tuple[str, ...]) -> tuple[PathAttributeMeta, ...]:
+    """Interpret attribute roles once: only cfg_attr payloads recursively contain attributes."""
+    words = tuple(word.removeprefix("r#") for word in words)
+    ends = style_footprint.delimiter_ends(words)
+    result: list[PathAttributeMeta] = []
+
+    def meta(begin: int, start: int, stop: int, mode: PathAttributeMode) -> None:
+        if words[start:start + 1] == ("path",) and words[start + 1:start + 2] != ("::",):
+            result.append(PathAttributeMeta(begin, start, stop, mode))
+        elif words[start:start + 2] == ("cfg_attr", "("):
+            finish = ends.get(start + 1, stop)
+            cursor = start + 2
+            # The first comma-delimited argument is a predicate, never an attribute.
+            parts: list[tuple[int, int]] = []
+            part = cursor
+            while cursor < finish:
+                if words[cursor] in {"(", "[", "{"}:
+                    cursor = ends.get(cursor, finish)
+                elif words[cursor] == ",":
+                    parts.append((part, cursor))
+                    part = cursor + 1
+                cursor += 1
+            parts.append((part, finish))
+            for part, end in parts[1:]:
+                if part < end:
+                    meta(begin, part, end, PathAttributeMode.CONDITIONAL)
+
+    for begin, end in style_footprint.attribute_spans(words):
+        opening = begin + (2 if words[begin + 1] == "!" else 1)
+        meta(begin, opening + 1, end - 1, PathAttributeMode.DIRECT)
+    return tuple(result)
+
+
 def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFolder | UnreadPathAttribute, ...]:
     """The `path` attributes of a Rust file, also those inside `cfg_attr`, read from its code words.
 
@@ -1561,16 +1671,18 @@ def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFo
     owners = style_footprint.attribute_owners(words)
     file = PurePosixPath(path)
     read: list[tuple[int, tuple[int, ...], str | UnreadPathAttribute]] = []
-    for begin, end in style_footprint.attribute_spans(words):
-        for index in (index for index in range(begin, end) if words[index] == "path"):
-            literal = PLAIN_STRING.fullmatch(words[index + 2]) if words[index + 1:index + 2] == ("=",) else None
-            chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
-            if any(start < index < stop for start, stop in macros):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
-            elif literal is None or literal.group(1).startswith("/"):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
-            else:
-                read.append((begin, chain, literal.group(1)))
+    for attribute in path_attribute_metas(words):
+        begin, index = attribute.begin, attribute.index
+        literal = (PLAIN_STRING.fullmatch(words[index + 2])
+                   if words[index + 1:attribute.end][:1] == ("=",)
+                   and attribute.end == index + 3 else None)
+        chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
+        if any(start < index < stop for start, stop in macros):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
+        elif literal is None or literal.group(1).startswith("/"):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
+        else:
+            read.append((begin, chain, literal.group(1)))
     # The `{` of each inline module whose outer path attribute names its folder.
     inline_owner = {begin: owners[begin] + 2 for begin, _, _ in read
                     if owners.get(begin) is not None and words[owners[begin]] == "mod" and owners[begin] + 2 in blocks}
@@ -2153,6 +2265,37 @@ MIGRATIONS = {
         );
         INSERT OR IGNORE INTO ticket_proposals SELECT id,proposal FROM tickets WHERE kind='proposal';
     """,
+    32: ("ALTER TABLE held_findings ADD COLUMN anchor_commit TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE held_findings ADD COLUMN followed_from_commit TEXT NOT NULL DEFAULT '';"),
+    34: """
+        CREATE TABLE IF NOT EXISTS rename_dispositions (
+            finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL,
+            kind TEXT NOT NULL, reason TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO rename_dispositions
+            SELECT finding_id,name,line,text,'blocked','' FROM rename_outer_binding_blocks;
+    """,
+    35: """
+        CREATE TABLE IF NOT EXISTS held_cell_corrections (
+            judgment_id INTEGER PRIMARY KEY REFERENCES judgments(id), ticket TEXT NOT NULL,
+            rule TEXT NOT NULL, path TEXT NOT NULL,
+            old_outcome TEXT NOT NULL CHECK(old_outcome='clean'),
+            new_outcome TEXT NOT NULL CHECK(new_outcome='held'),
+            finding_ids TEXT NOT NULL, corrected_at TEXT NOT NULL
+        );
+    """,
+    36: """
+        CREATE TABLE ticket_counter (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+        INSERT INTO ticket_counter SELECT 1,coalesce(max(cast(id AS INTEGER)),0) FROM tickets
+            WHERE id NOT GLOB '*[^0-9]*' AND id!='';
+    """,
+    # Assignment checks hold the write lock; batch tickets can share their showrunner.
+    37: "DROP INDEX IF EXISTS tickets_one_assigned;",
+    33: """
+        CREATE TABLE IF NOT EXISTS rename_outer_binding_blocks (
+            finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
+        );
+    """,
 }
 
 
@@ -2221,13 +2364,59 @@ class NoGitReadCache:
 _NO_GIT_READ_CACHE = NoGitReadCache()
 
 
+@dataclass(frozen=True)
+class UnloadedRuleCatalog:
+    """Rule metadata is read on first use from the active execution checkout."""
+
+
+class LedgerAccess(StrEnum):
+    READ_WRITE = "read and migrate"
+    READ_ONLY = "inspect without migration or writes"
+    HELD_CORRECTION_PREVIEW = "preview clean-to-held correction without migration or writes"
+
+
+def ticket_holder(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """Resolve a ticket's fixed staff id without matching a name or current session."""
+    row = record.by_id(staff.StaffId(reference))
+    if row is None or row.kind not in ("unit", "showrunner"):
+        raise LedgerError(f"{reference}: staff ticket ownership is unavailable")
+    return row
+
+
+def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
+    """Resolve a command name inside this ledger's style production."""
+    record = ledger.staff_resolver().record
+    row = record.by_id(staff.StaffId(reference))
+    if row is not None:
+        return ticket_holder(reference, record)
+    from scripts.shutdown import remote
+
+    context = record.by_worktree(remote.local_machine(), ledger.repo)
+    if context is None:
+        owner = ledger.bulk_holder()
+    elif context.kind == "showrunner":
+        owner = context
+    else:
+        owner = record.parent_of(context)
+        if owner is None or owner.kind != "showrunner":
+            raise LedgerError(f"{reference}: the command worktree's production ownership is unavailable")
+    found = session_staff.unit_match(session_staff.UnitMember(owner.name, reference), record,
+                                    parent=session_staff.RequiredParent(owner))
+    if not isinstance(found, session_staff.MemberFound):
+        raise LedgerError(f"{reference}: staff ticket ownership is unavailable under {owner.name}")
+    return found.row
+
+
 class Ledger:
-    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
+    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
+                 access: LedgerAccess = LedgerAccess.READ_WRITE,
+                 resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
         self.git_cache: GitReadCache | NoGitReadCache = git_cache
-        self._catalog: tuple[Rule, ...] = self._load_rules()
+        self._rule_checkouts: list[Path] = []
+        self._loaded_catalog: tuple[Rule, ...] | UnloadedRuleCatalog = UnloadedRuleCatalog()
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
@@ -2244,6 +2433,8 @@ class Ledger:
         self._binding_proofs: dict[tuple[str, str, str], BindingProof] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
         self._site_sources: dict[str, finding_sites.SourceSites] = {}
+        self._finding_histories: dict[str, FindingSourceHistory] = {}
+        self._finding_anchors: dict[HeldFinding, FindingAnchor | NeedsJudgment] = {}
         self._site_maps: dict[tuple[str, str, str], dict[int, int]] = {}
         self._site_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
         self._follow_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
@@ -2259,8 +2450,35 @@ class Ledger:
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
-        database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
+        if access == LedgerAccess.READ_WRITE:
+            database.parent.mkdir(parents=True, exist_ok=True)
+        self._staff_resolver: session_staff.RowResolver | None = resolver
+        self._connection: sqlite3.Connection = (
+            sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_SECONDS)
+            if access != LedgerAccess.READ_WRITE else sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS))
+        if access != LedgerAccess.READ_WRITE:
+            try:
+                versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
+                supported = {max(MIGRATIONS)}
+                if access == LedgerAccess.HELD_CORRECTION_PREVIEW:
+                    supported.update(range(32, max(MIGRATIONS)))
+                if len(versions) != 1 or versions[0][0] not in supported:
+                    raise LedgerError("read-only admission requires the current ledger schema; migrate separately")
+                if access == LedgerAccess.HELD_CORRECTION_PREVIEW:
+                    # Apply normal migrations to a memory copy. Keep the source connection read-only.
+                    preview = sqlite3.connect(":memory:", timeout=BUSY_TIMEOUT_SECONDS)
+                    try:
+                        self._connection.backup(preview)
+                    except BaseException:
+                        preview.close()
+                        raise
+                    self._connection.close()
+                    self._connection = preview
+            except BaseException:
+                self.close()
+                raise
+            if access == LedgerAccess.READ_ONLY:
+                return
         try:
             _ = self._connection.execute("PRAGMA foreign_keys=ON")
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -2277,6 +2495,8 @@ class Ledger:
                     _ = self._connection.execute("DELETE FROM schema_version")
                     _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
             self._connection.commit()
+            if access == LedgerAccess.HELD_CORRECTION_PREVIEW:
+                _ = self._connection.execute("PRAGMA query_only=ON")
         except BaseException:
             # A locked or newer ledger fails here; close so the caller holds no connection.
             self.close()
@@ -2297,8 +2517,35 @@ class Ledger:
         finally:
             self._git_operation_depth -= 1
 
+    @property
+    def _catalog(self) -> tuple[Rule, ...]:
+        if isinstance(self._loaded_catalog, UnloadedRuleCatalog):
+            self._loaded_catalog = self._load_rules()
+        return self._loaded_catalog
+
+    @_catalog.setter
+    def _catalog(self, catalog: tuple[Rule, ...]) -> None:
+        self._loaded_catalog = catalog
+
     def _load_rules(self) -> tuple[Rule, ...]:
-        return rule_catalog.load_rules(self.repo)
+        checkout = self._rule_checkouts[-1] if self._rule_checkouts else self.repo
+        return rule_catalog.load_rules(checkout)
+
+    @contextmanager
+    def rules_from_checkout(self, checkout: Path) -> Generator[None]:
+        """Scope rule reads to an execution checkout; Git, SQL and claims stay canonical.
+
+        Restore the prior derived catalog even on interruption, without rereading a mutable
+        checkout. Nested scopes retain the caller's rule source and catalog.
+        """
+        previous = self._loaded_catalog
+        self._rule_checkouts.append(checkout)
+        self._loaded_catalog = UnloadedRuleCatalog()
+        try:
+            yield
+        finally:
+            _ = self._rule_checkouts.pop()
+            self._loaded_catalog = previous
 
     def close(self) -> None:
         self._connection.close()
@@ -2453,6 +2700,10 @@ class Ledger:
             "removed": tuple(removed_cell(ticket_id, rule, path, commit) for rule, path, commit in removed),
         }
 
+    def ticket_get(self, ticket_id: str) -> TicketRecord:
+        """Read a ticket by its global id."""
+        return self._ticket(ticket_id)
+
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
         rows = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT rule_blobs,state FROM tickets WHERE id=?", (ticket,)).fetchall())
@@ -2484,6 +2735,10 @@ class Ledger:
         *, batch_owner: BatchOwner | UnbatchedTicket = UNBATCHED_TICKET,
         proposals: tuple[Path, ...] = (),
     ) -> None:
+        holder = self.unit_row(unit)
+        if holder.kind == "showrunner" and (kind != "proposal" or not isinstance(batch_owner, BatchOwner)):
+            raise LedgerError("a showrunner holds only bulk proposal tickets")
+        unit = str(holder.id)
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
         if kind != "listed" and rule:
@@ -2514,8 +2769,10 @@ class Ledger:
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
-            if not re.fullmatch(re.escape(unit) + r"-\d+", id):
-                raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
+            if not TICKET_NUMBER.fullmatch(id):
+                raise LedgerError(f"{id}: ticket id must be a positive decimal number")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE id GLOB '*[^0-9]*' LIMIT 1").fetchone():
+                raise LedgerError("legacy ticket ids remain; run migrate-staff-ids before creating tickets")
             if kind == "proposal":
                 findings = tuple(self._held(finding_id) for finding_id in finding_ids)
                 if not proposal or not findings:
@@ -2549,8 +2806,7 @@ class Ledger:
             texts: list[PinnedRuleText] = []
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                result = _git_bytes(self.repo, "hash-object", "--stdin", input=text)
-                hashed = result.stdout.decode().strip()
+                hashed = git_blob_id(text)
                 if hashed != definition.blob:
                     raise ChangedBeforeLock(f"{rule_id}: rule changed while pinning; rerun")
                 texts.append(PinnedRuleText(rule_id, hashed, text))
@@ -2602,18 +2858,235 @@ class Ledger:
         return tuple(texts)
 
     def queued_tickets(self, unit: str) -> tuple[TicketRecord, ...]:
+        unit = str(self.unit_row(unit).id)
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE unit=? AND state='queued' ORDER BY created_at,id", (unit,),
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
 
-    def next_ticket_id(self, unit: str) -> str:
-        rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE substr(id,1,?)=?", (len(unit) + 1, unit + "-"),
+    def staff_resolver(self) -> session_staff.RowResolver:
+        """Share one staff snapshot across the ledger command."""
+        if self._staff_resolver is None:
+            self._staff_resolver = session_staff.RowResolver(staff.snapshot())
+        return self._staff_resolver
+
+    def unit_row(self, reference: str) -> staff.StaffRow:
+        """Resolve a ticket holder through the staff join."""
+        return ticket_holder(reference, self.staff_resolver().record)
+
+    def bulk_holder(self) -> staff.StaffRow:
+        """Resolve the style production's showrunner through the command's staff resolver."""
+        from scripts.production.production_doc import Refusal, production_field
+        from scripts.shutdown import remote
+
+        resolver = self.staff_resolver()
+        common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        holders: list[staff.StaffRow] = []
+        for row in resolver.record.find(kind="showrunner"):
+            if not isinstance(row.doc, staff.LiveDoc) or row.doc.machine != remote.local_machine():
+                continue
+            document = resolver.production_doc(row)
+            if not isinstance(document, session_staff.ProductionDoc):
+                raise LedgerError(f"{row.name}: the production document is unavailable")
+            try:
+                kind = production_field(document.path.read_text().splitlines(), "Kind")
+            except Refusal:
+                continue
+            if kind == "style" and _git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+                holders.append(row)
+        if len(holders) != 1:
+            raise LedgerError("the style production's showrunner ownership is unavailable or ambiguous")
+        return holders[0]
+
+    def unit_name(self, reference: str) -> str:
+        return self.unit_row(reference).name
+
+    def migrate_staff_ids(self, *, references: tuple[Path, ...] = (),
+                          stop_after_first: bool = False) -> tuple[str, ...]:
+        """Publish ticket references before replacing ledger keys; never change staff."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            return self._migrate_staff_ids(references, stop_after_first)
+
+    def _migration_owners(self, *, report: bool = True) -> dict[str, str]:
+        """Resolve proven legacy owners and keep unavailable owner text unchanged."""
+        record = self.staff_resolver().record
+        owners: dict[str, str] = {}
+        rows = cast(list[tuple[str, int, int]], self._connection.execute(
+            "SELECT t.unit,count(*),count(b.ticket) FROM tickets t "
+            + "LEFT JOIN ticket_batch_owners b ON b.ticket=t.id GROUP BY t.unit",
         ).fetchall())
-        highest = max((int(row[0][len(unit) + 1:]) for row in rows
-                       if re.fullmatch(re.escape(unit) + r"-\d+", row[0])), default=0)
-        return f"{unit}-{highest + 1}"
+        references = {reference: count == batched for reference, count, batched in rows}
+        for table in ("sync_waits", "rule_candidates"):
+            for (reference,) in cast(list[tuple[str]], self._connection.execute(
+                    f'SELECT DISTINCT unit FROM "{table}"').fetchall()):
+                _ = references.setdefault(reference, False)
+        for reference, bulk_label in references.items():
+            row = record.by_member_reference(reference)
+            try:
+                if row is None:
+                    found = session_staff.unit_match(session_staff.ObservedUnit(reference), record)
+                    row = found.row if isinstance(found, session_staff.MemberFound) else None
+                if row is None and bulk_label:
+                    row = self.bulk_holder()
+                if row is None or row.kind not in ("unit", "showrunner"):
+                    raise LedgerError(f"{reference}: staff ticket ownership is unavailable")
+            except (LedgerError, staff.StaffUnreadable) as error:
+                owners[reference] = reference
+                if report:
+                    print(f"anomaly: {reference}: " + " ".join(str(error).splitlines()))
+            else:
+                owners[reference] = str(row.id)
+        return owners
+
+    def _migrate_staff_ids(self, references: tuple[Path, ...], stop_after_first: bool) -> tuple[str, ...]:
+        # A migration cannot reuse ownership from before a clear or a rename.
+        self._staff_resolver = None
+        tickets = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT id,unit FROM tickets ORDER BY created_at,id",
+        ).fetchall())
+        highest = max((int(ticket[0]) for ticket in tickets if TICKET_NUMBER.fullmatch(ticket[0])), default=0)
+        counter = cast(tuple[int], self._connection.execute("SELECT value FROM ticket_counter WHERE id=1").fetchone())
+        highest = max(highest, counter[0])
+        identities: dict[str, str] = {}
+        owners = self._migration_owners()
+        for identity, _owner in tickets:
+            if not TICKET_NUMBER.fullmatch(identity):
+                highest += 1
+                identities[identity] = str(highest)
+        groups: dict[str, list[str]] = {}
+        for ticket, batch in cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT ticket,batch FROM bulk_workspace_tickets").fetchall()):
+            groups.setdefault(batch, []).append(ticket)
+        batches = {batch: min(identities.get(ticket, ticket) for ticket in members)
+                   for batch, members in groups.items()}
+        if (not identities and all(old == new for old, new in owners.items())
+                and all(old == new for old, new in batches.items())):
+            return ()
+        changes: list[str] = []
+        paths = set(references)
+        if identities:
+            from scripts.direct import phase_reservation
+
+            for session_dir, phase in cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT DISTINCT reservation_session_dir,reservation_phase FROM tickets "
+                    + "WHERE reservation_session_dir!=''").fetchall()):
+                path = phase_reservation.phase_directory(Path(session_dir), phase) / phase_reservation.STATE_FILE
+                if path.exists():
+                    paths.add(path)
+            # These files belong to this ledger, rather than a guessed unit folder.
+            paths.update((self.database.parent / "bulk_review").glob("*.json"))
+            if not references:
+                from scripts.shutdown import remote
+                from scripts.production import unit_config
+
+                for identity in sorted(set(owners.values())):
+                    if self.staff_resolver().record.by_id(staff.StaffId(identity)) is None:
+                        continue
+                    row = self.unit_row(identity)
+                    resolver = self.staff_resolver()
+                    if row.kind == "showrunner":
+                        document = resolver.production_doc(row)
+                        if not isinstance(document, session_staff.ProductionDoc):
+                            raise LedgerError(f"{row.name}: migration references unavailable: {document}")
+                        if document.machine != remote.local_machine():
+                            raise LedgerError(f"{row.name}: migrate references on {document.machine}")
+                        paths.add(document.path)
+                        for line in _git(self.repo, "worktree", "list", "--porcelain").splitlines():
+                            if line.startswith("worktree "):
+                                intent = Path(_git(Path(line.removeprefix("worktree ")), "rev-parse",
+                                                   "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+                                if intent.exists():
+                                    paths.add(intent)
+                        continue
+                    tree = resolver.unit_worktree(row)
+                    config = resolver.unit_config(row)
+                    if not isinstance(tree, (staff.PresentWorktree, staff.RemovedWorktree)):
+                        raise LedgerError(f"{row.name}: migration references unavailable: no worktree")
+                    if tree.machine != remote.local_machine():
+                        raise LedgerError(f"{row.name}: migrate references on {tree.machine}")
+                    if not isinstance(config, unit_config.UnitConfig):
+                        raise LedgerError(f"{row.name}: migration references unavailable: {config}")
+                    if isinstance(config.plan, unit_config.PlanFile):
+                        paths.add(tree.path / config.plan.path)
+                    intent = Path(_git(tree.path, "rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+                    if intent.exists():
+                        paths.add(intent)
+        pattern = (re.compile(r"(?<![\w-])(?:" + "|".join(re.escape(key) for key in sorted(identities, key=len, reverse=True))
+                              + r")(?![\w-])") if identities else None)
+        for path in sorted(paths):
+            original = path.read_text(encoding="utf-8")
+            content = pattern.sub(lambda match: identities[match.group()], original) if pattern is not None else original
+            target = path
+            if path.parent == self.database.parent / "bulk_review" and path.stem in identities:
+                target = path.with_stem(identities[path.stem])
+            if content != original or target != path:
+                # Check the current owner before each reference publication.
+                self._check_migration_owners(owners)
+                if target != path and target.exists() and target.read_text(encoding="utf-8") != content:
+                    raise LedgerError(f"{target}: migration target has different content")
+                if not target.exists() or target.read_text(encoding="utf-8") != content:
+                    write_text_atomic(target, content)
+                if target != path:
+                    from scripts.lib.atomic_file import sync_folder
+
+                    path.unlink()
+                    sync_folder(path.parent)
+                changes.append(str(path))
+                if stop_after_first:
+                    return tuple(changes)
+        self._check_migration_owners(owners)
+        with self._connection:
+            _ = self._connection.execute("PRAGMA defer_foreign_keys=ON")
+            if cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT id,unit FROM tickets ORDER BY created_at,id").fetchall()) != tickets:
+                raise LedgerError("tickets changed; rerun the migration")
+            tables = cast(list[tuple[str]], self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            ).fetchall())
+            for (table,) in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                columns = cast(list[tuple[int, str]], self._connection.execute(f"PRAGMA table_info({quoted})").fetchall())
+                for column in (entry[1] for entry in columns):
+                    if column == "unit" and table in ("tickets", "sync_waits", "rule_candidates"):
+                        mapping = owners
+                    elif (column in ("ticket", "build_ticket", "predecessor", "successor")
+                          or (table == "tickets" and column == "id")
+                          or (table == "bulk_workspace_tickets" and column == "batch")):
+                        mapping = identities
+                    else:
+                        continue
+                    for old, new in mapping.items():
+                        if old != new:
+                            _ = self._connection.execute(f'UPDATE {quoted} SET "{column}"=? WHERE "{column}"=?', (new, old))
+            for batch, members in groups.items():
+                for ticket in members:
+                    _ = self._connection.execute("UPDATE bulk_workspace_tickets SET batch=? WHERE ticket=? AND batch!=?",
+                        (batches[batch], identities.get(ticket, ticket), batches[batch]))
+            _ = self._connection.execute("UPDATE ticket_counter SET value=max(value,?) WHERE id=1", (highest,))
+            for old, new in identities.items():
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET waived_by=? WHERE waived_by=? AND waive_provenance='unit'", (new, old),
+                )
+        changes.append(str(self.database))
+        return tuple(changes)
+
+    def _check_migration_owners(self, owners: Mapping[str, str]) -> None:
+        self._staff_resolver = None
+        if self._migration_owners(report=False) != owners:
+            raise LedgerError("staff ownership changed; rerun the migration")
+
+    def next_ticket_id(self) -> str:
+        """Reserve one number across every unit in this ledger."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE id GLOB '*[^0-9]*' LIMIT 1").fetchone():
+                raise LedgerError("legacy ticket ids remain; run migrate-staff-ids before creating tickets")
+            row = cast(tuple[int], self._connection.execute(
+                "UPDATE ticket_counter SET value=max(value,coalesce((SELECT max(cast(id AS INTEGER)) "
+                + "FROM tickets WHERE id NOT GLOB '*[^0-9]*' AND id!=''),0))+1 WHERE id=1 RETURNING value",
+            ).fetchone())
+        return str(row[0])
 
     def _ticket_cells(self, ticket: TicketRecord) -> frozenset[tuple[str, str]]:
         """The rule and path cells the ticket owns, less the paths it yielded."""
@@ -2775,29 +3248,66 @@ class Ledger:
         return tuple(pair for kind, before, after, line, text in rows
                      if isinstance(pair := binding_rename(kind, before, after, line, text), BindingRename))
 
-    def bulk_release(self, id: str, reasons: Mapping[str, str]) -> tuple[BulkRefusal, ...]:
+    def ticket_refuse(self, id: str, findings: Sequence[str], by: str, reason: str) -> tuple[BulkRefusal, ...]:
+        """Release a person's named findings while keeping every contributing decision buildable."""
+        if not by.strip() or not reason.strip():
+            raise LedgerError("ticket refuse requires a non-empty --by and --reason")
+        if not findings:
+            raise LedgerError("ticket refuse requires at least one finding")
+        return self.bulk_release(id, dict.fromkeys(findings, reason), keep_decisions=True)
+
+    def bulk_release(self, id: str, reasons: Mapping[str, str | OuterBindingBlocked | OuterBindingUnproved], *, keep_decisions: bool = False) -> tuple[BulkRefusal, ...]:
         """Record refusals and release only those findings, atomically; repeated refusals change nothing.
 
-        Each finding stays filed under its decision. Removing ticket membership prevents merge-time checks from
-        counting it as part of this batch, and clearing build_ticket makes it available to an ordinary ticket.
+        Each finding keeps its filed or waived state. Removing ticket membership prevents merge-time checks from
+        counting it as part of this batch, and clearing build_ticket makes filed findings available to an ordinary
+        ticket. A person's refusal must leave a filed finding of each decision's rule in the ticket.
         """
-        if any(not reason.strip() for reason in reasons.values()):
+        supplied = {identity: cause for identity, cause in reasons.items()
+                    if isinstance(cause, OuterBindingBlocked | OuterBindingUnproved)}
+        messages = {identity: cause.reason if isinstance(cause, OuterBindingBlocked | OuterBindingUnproved) else cause
+                    for identity, cause in reasons.items()}
+        if any(not reason.strip() for reason in messages.values()):
             raise LedgerError("bulk refusal requires a reason")
+        # Reuse the syntax proof for released renames; a scope block has a structured disposition too.
+        blocks: dict[str, OuterBindingBlocked | OuterBindingUnproved] = dict(supplied)
+        for identity in messages:
+            if identity in blocks:
+                continue
+            finding = self._held(identity)
+            if not isinstance(approved_renames.refactor_rename(finding.kind, finding.before, finding.after,
+                                             finding.line, finding.text), BindingRename):
+                continue
+            source = self._file_at(_git(self.repo, "rev-parse", "HEAD"), finding.path)
+            check = self.local_rename_admission(finding, finding.path, source.decode(errors="replace") if isinstance(source, bytes) else approved_renames.CurrentRenameSourceUnavailable())
+            if isinstance(check, OuterBindingBlocked | OuterBindingUnproved):
+                blocks[identity] = check
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            ticket = self.bulk_ticket(id)
+            ticket = self._ticket(id)
+            if ticket["kind"] != "proposal" or ticket["state"] not in ("assigned", "checkpointed"):
+                raise LedgerError(f"{id}: refusal requires an assigned or checkpointed proposal ticket")
             recorded = self.bulk_refusals(id)
             known = {row.finding_id for row in recorded}
-            pending = {identity: reason for identity, reason in reasons.items() if identity not in known}
+            pending = {identity: reason for identity, reason in messages.items() if identity not in known}
             if not pending:
                 return recorded
             for identity in pending:
                 finding = self._held(identity)
                 if (identity not in ticket["finding_ids"] or finding.build_ticket != BuildTicket(id)
-                        or not isinstance(finding.state, Filed)):
-                    raise LedgerError(f"{identity}: finding is not filed under bulk ticket {id}")
+                        or not isinstance(finding.state, Filed | Waived)):
+                    raise LedgerError(f"{identity}: finding does not belong to ticket {id}")
+            if keep_decisions:
+                remaining = self.named_held(tuple(identity for identity in ticket["finding_ids"] if identity not in pending))
+                for issue in self.ticket_proposals(id):
+                    rule = Issue(issue, frontmatter(issue)).value("style_rule")
+                    if not any(isinstance(finding.state, Filed) and finding.state.proposal == issue
+                               and base_rule(finding.rule) == rule for finding in remaining):
+                        raise LedgerError(f"{id}: refusal leaves issue {issue} without a finding of its rule {rule}")
             now = _now()
             for identity, reason in pending.items():
+                if identity in blocks:
+                    self._record_rename_block(identity, blocks[identity])
                 _ = self._connection.execute("INSERT INTO bulk_refusals VALUES (?,?,?,?)", (identity, id, reason, now))
                 _ = self._connection.execute(
                     "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?", (now, identity),
@@ -3089,26 +3599,102 @@ class Ledger:
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             raise LedgerError(f"{successor['id']}: waiting for merge: {predecessor['id']}; footprint check: {error}") from error
 
+    def _binding_proof_tickets(self, finding: HeldFinding, commit: str) -> tuple[str, ...]:
+        """Tickets whose saved base can prove this finding's rename at commit."""
+        return ((finding.build_ticket.ticket,) if isinstance(finding.build_ticket, BuildTicket) else
+                tuple(id for id, state, checkpoint in self._linked_tickets(finding)
+                      if state == "merged" and checkpoint == commit))
+
     def applied_check(self, finding: HeldFinding, commit: str) -> AppliedCheck:
         """Whether the finding's change is in the code at commit."""
         rename = binding_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
-        if isinstance(rename, BindingRename) and isinstance(finding.build_ticket, BuildTicket):
-            key = (finding.build_ticket.ticket, finding.path, commit)
-            if key in self._binding_proofs:
-                return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
-            ticket = self._ticket(finding.build_ticket.ticket)
-            if ticket["base"]:
-                before, after = self._file_at(ticket["base"], finding.path), self._file_at(commit, finding.path)
-                if not isinstance(before, bytes) or not isinstance(after, bytes):
-                    self._binding_proofs[key] = BindingProof({}, {}, False, {})
-                    return NoAppliedCheck("rename")
-                # Read ticket membership rather than state: the same proof serves findings already marked built.
-                renames = self._binding_renames(ticket, finding.path, commit)
-                self._binding_proofs[key] = binding_rename_check(
-                    finding.path, before.decode(errors="replace"), after.decode(errors="replace"), renames)
-                return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
+        if isinstance(rename, BindingRename):
+            # Releasing a blocked finding's claim does not discard the merged ticket's
+            # scoped proof. A companion rename can have changed its stored line text.
+            for id in self._binding_proof_tickets(finding, commit):
+                key = (id, finding.path, commit)
+                if key in self._binding_proofs:
+                    return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
+                ticket = self._ticket(id)
+                if ticket["base"]:
+                    before, after = self._file_at(ticket["base"], finding.path), self._file_at(commit, finding.path)
+                    if not isinstance(before, bytes) or not isinstance(after, bytes):
+                        renames = self._binding_renames(ticket, finding.path, commit)
+                        unchecked = BindingProof({pair: NoAppliedCheck("rename") for pair in renames}, {}, False, {})
+                        source = before.decode(errors="replace") if isinstance(before, bytes) else ""
+                        self._binding_proofs[key] = binding_admission_check(source, renames, unchecked, current=after.decode(errors="replace") if isinstance(after, bytes) else "")
+                        return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
+                    # Read ticket membership rather than state: the same proof serves findings already marked built.
+                    renames = self._binding_renames(ticket, finding.path, commit)
+                    source = before.decode(errors="replace")
+                    proof = binding_rename_check(finding.path, source, after.decode(errors="replace"), renames)
+                    self._binding_proofs[key] = binding_admission_check(source, renames, proof, current=after.decode(errors="replace"))
+                    return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
         return applied_check(finding.kind, finding.before, finding.after, finding.path,
                              lambda path: self._file_at(commit, path))
+
+    def rename_authority(self, finding: HeldFinding) -> approved_renames.AnchoredRenameSource | approved_renames.RenameAnchorUnavailable:
+        """The ledger alone resolves the judgment/follow anchor; build bases never replace it."""
+        anchor = self.finding_anchor(finding)
+        if isinstance(anchor, NeedsJudgment):
+            return approved_renames.RenameAnchorUnavailable(anchor.reason)
+        source = self._file_at(anchor.commit, anchor.path)
+        if not isinstance(source, bytes):
+            return approved_renames.RenameAnchorUnavailable("source anchor file is missing")
+        try:
+            return approved_renames.AnchoredRenameSource(anchor.commit, anchor.path, anchor.line, source.decode())
+        except UnicodeDecodeError:
+            return approved_renames.RenameAnchorUnavailable("source anchor file is not UTF-8")
+
+    def local_rename_admission(self, finding: HeldFinding, path: str, source: str | approved_renames.CurrentRenameSourceUnavailable, *,
+                               companions: tuple[BindingRename, ...] = ()) -> approved_renames.RenameAdmission:
+        """A positive capability or terminal typed refusal, independent of the applied parser."""
+        if isinstance(approved_rename(finding.kind, finding.before, finding.after), ApprovedRename):
+            return approved_renames.NonLocalReferenceCompanion()
+        rename = approved_renames.refactor_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
+        if not isinstance(rename, BindingRename):
+            # Qualified item/file operations retain their existing applied-check contract.
+            return approved_renames.NonLocalReferenceCompanion()
+        return approved_renames.admit_anchored_rename(self.rename_authority(finding), finding.finding_id + ":" + self.finding_input_identity(finding),
+                                                      rename, path, source, companions=companions)
+
+    def _built_check(self, finding: HeldFinding, commit: str) -> BuiltEntryEvidence:
+        """A built boundary requires current-snapshot admission beside the applied/person proof."""
+        check = self.applied_check(finding, commit)
+        source = self._file_at(commit, finding.path)
+        companions: tuple[BindingRename, ...] = ()
+        for identity in self._binding_proof_tickets(finding, commit):
+            key = (identity, finding.path, commit)
+            if key in self._binding_proofs:
+                proof = self._binding_proofs[key]
+                companions = tuple(pair for pair, outcome in proof.checks.items() if isinstance(outcome, AppliedInCode))
+            if companions:
+                break
+        current = source.decode(errors="replace") if isinstance(source, bytes) else approved_renames.CurrentRenameSourceUnavailable()
+        admission = self.local_rename_admission(finding, finding.path, current, companions=companions)
+        if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+            return BuiltEntryEvidence(check, admission)
+        if isinstance(admission, approved_renames.AdmittedLocalRename):
+            if not isinstance(current, str) or not admission.covers(finding.finding_id + ":" + self.finding_input_identity(finding), admission.rename, finding.path, current):
+                return BuiltEntryEvidence(check, OuterBindingUnproved("local admission snapshot changed", finding.line, finding.text))
+        return BuiltEntryEvidence(check, admission)
+
+    def _record_rename_block(self, finding_id: str, block: OuterBindingBlocked | OuterBindingUnproved) -> None:
+        """Idempotent structured evidence; the finding remains filed, never built or waived."""
+        _ = self._connection.execute(
+            "INSERT INTO rename_dispositions(finding_id,name,line,text,kind,reason) VALUES (?,?,?,?,?,?) "
+            + "ON CONFLICT(finding_id) DO UPDATE SET name=excluded.name,line=excluded.line,text=excluded.text,"
+            + "kind=excluded.kind,reason=excluded.reason "
+            + "WHERE name!=excluded.name OR line!=excluded.line OR text!=excluded.text "
+            + "OR kind!=excluded.kind OR reason!=excluded.reason",
+            (finding_id, block.name if isinstance(block, OuterBindingBlocked) else "", block.line, block.text,
+             "blocked" if isinstance(block, OuterBindingBlocked) else "unproved", block.reason),
+        )
+
+    def record_rename_block(self, finding_id: str, block: OuterBindingBlocked | OuterBindingUnproved) -> None:
+        """Record the shared proof's blocker without changing ticket membership or finding state."""
+        with self._connection:
+            self._record_rename_block(finding_id, block)
 
     def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
         """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
@@ -3143,7 +3729,7 @@ class Ledger:
         if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
             raise LedgerError(f"{ticket['id']}: cannot become {target} from {state}")
         if target == "assigned":
-            active = self.ticket_open(ticket["unit"])
+            active = self._assignment_predecessors(ticket)
             if active and (len(active) != 1 or active[0]["state"] != "checkpointed"):
                 raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
         if target == "merged":
@@ -3154,6 +3740,13 @@ class Ledger:
             if rows:
                 raise LedgerError(f"{ticket['id']}: waiting for predecessor {rows[0][0]} to merge")
         return False
+
+    def _assignment_predecessors(self, ticket: TicketRecord) -> tuple[TicketRecord, ...]:
+        """Bulk tickets share a holder; ordinary tickets keep the unit's assignment order."""
+        if (isinstance(self.ticket_batch_owner(ticket["id"]), BatchOwner)
+                and self.unit_row(ticket["unit"]).kind == "showrunner"):
+            return ()
+        return self.ticket_open(ticket["unit"])
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "",
                            reservation: tuple[str, str] = ("", ""), *,
@@ -3193,7 +3786,7 @@ class Ledger:
                     raise
                 except LedgerError as error:
                     raise LedgerError(f"{id}: cannot assign: invalid branch {branch}") from error
-                active = self.ticket_open(ticket["unit"])
+                active = self._assignment_predecessors(ticket)
                 if active:
                     try:
                         assignment_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
@@ -3218,7 +3811,7 @@ class Ledger:
             restamps = self.checkpoint_restamps(ticket, checkpoint) if target in ("checkpointed", "merged") else NoRestamps()
             building = target == "merged" and ticket["kind"] == "proposal"
             findings = self.filed_build_findings(id) if building else ()
-            checks = tuple((finding.finding_id, self.applied_check(finding, checkpoint)) for finding in findings)
+            checks = tuple((finding.finding_id, self._built_check(finding, checkpoint)) for finding in findings)
             carry = self.binding_carry_forward(ticket, checkpoint) if building else BindingCarryForward()
             not_built: list[FindingNotBuilt] = []
             with self._connection:
@@ -3245,21 +3838,25 @@ class Ledger:
                     )
                 for moved in carry.findings:
                     _ = self._connection.execute(
-                        "UPDATE held_findings SET path=?,line=?,text=?,followed_from=?,followed_from_line=?,followed_at=?,updated_at=? "
+                        "UPDATE held_findings SET path=?,line=?,text=?,followed_from=?,followed_from_line=?,followed_from_commit=?,followed_at=?,updated_at=? "
                         + "WHERE finding_id=?",
                         (moved.finding.path, moved.line, moved.text, moved.finding.path, moved.finding.line,
-                         checkpoint, _now(), moved.finding.finding_id),
+                         self._coordinate_commit(moved.finding), checkpoint, _now(), moved.finding.finding_id),
                     )
                 if building:
                     now = _now()
-                    for finding_id, check in checks:
+                    for finding_id, evidence in checks:
+                        check = evidence.outcome
                         if isinstance(check, AppliedInCode):
+                            _ = self._connection.execute("DELETE FROM rename_dispositions WHERE finding_id=?", (finding_id,))
                             # A person's reading was of the old build, so a new build clears it.
                             _ = self._connection.execute(
                                 "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?", (now, now, finding_id),
                             )
                             continue
-                        if isinstance(check, RenameNotApplied):
+                        if isinstance(check, OuterBindingBlocked | OuterBindingUnproved):
+                            self._record_rename_block(finding_id, check)
+                        if isinstance(check, RenameNotApplied | OuterBindingBlocked | OuterBindingUnproved):
                             # The next refill takes the finding into a new ticket.
                             _ = self._connection.execute(
                                 "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
@@ -3272,7 +3869,7 @@ class Ledger:
                         (_now(), id),
                     )
                 if target == "assigned":
-                    active = self.ticket_open(ticket["unit"])
+                    active = self._assignment_predecessors(ticket)
                     if active:
                         _ = self._connection.execute("INSERT INTO ticket_predecessors VALUES (?,?)", (id, active[0]["id"]))
                         _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (assignment_tip, id))
@@ -3343,7 +3940,7 @@ class Ledger:
         if not renames:
             return BindingCarryForward()
         base, tip = self._tip(ticket["base"]), self._tip(checkpoint)
-        definitions = {rule.rule_id: rule for rule in rule_catalog.load_rules(self.repo) if rule.family == "types"}
+        definitions = {rule.rule_id: rule for rule in self._load_rules() if rule.family == "types"}
         if not definitions:
             return BindingCarryForward()
         open_types = tuple(f for f in self.held_findings(AllHeldFindings())
@@ -3361,8 +3958,9 @@ class Ledger:
                 before, after = self._file_at(base.commit, path), self._file_at(checkpoint, path)
                 if not isinstance(before, bytes) or not isinstance(after, bytes):
                     continue
-                self._binding_proofs[key] = binding_rename_check(path, before.decode(errors="replace"),
-                                                                after.decode(errors="replace"), pairs)
+                source = before.decode(errors="replace")
+                proof = binding_rename_check(path, source, after.decode(errors="replace"), pairs)
+                self._binding_proofs[key] = binding_admission_check(source, pairs, proof, current=after.decode(errors="replace"))
             proof = self._binding_proofs[key]
             if not proof.explained or not any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
                 continue
@@ -3412,9 +4010,8 @@ class Ledger:
             for finding in open_types:
                 if finding.path != path or finding.rule in blocked or rule_changed_since_judged(finding, definitions):
                     continue
-                judged = self.judged_commit(finding)
-                read = finding.follow.commit if isinstance(finding.follow, FollowedDeclaration) else (
-                    judged.commit if isinstance(judged, JudgedCommit) else "")
+                anchor = self.finding_anchor(finding)
+                read = anchor.commit if isinstance(anchor, FindingAnchor) else ""
                 if not read or self._tip(read).blobs.get(path) != base.blobs[path]:
                     continue
                 line = proof.line_map.get(finding.line, 0)
@@ -3593,39 +4190,15 @@ class Ledger:
         return HeldReservationRelease(f"ticket {id}: {answer or f'phase_reservation.py exited {result.returncode}'}",
                                       result.returncode != 0)
 
-    def rename_unit(self, old: str, new: str) -> UnitRenamed:
-        family = rule_catalog.style_family(old)
-        if isinstance(family, rule_catalog.NotStyleUnit) or family != rule_catalog.style_family(new):
-            raise LedgerError(f"{old} -> {new}: units must name the same style family")
-        if old == new:
-            return UnitRenamed(0, 0)
-        with self._connection:
-            _ = self._connection.execute("BEGIN IMMEDIATE")
-            source = cast(tuple[int, int], self._connection.execute(
-                "SELECT (SELECT count(*) FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
-                + "(SELECT count(*) FROM sync_waits WHERE unit=?)", (old, old),
-            ).fetchone())
-            if not any(source):
-                return UnitRenamed(0, 0)
-            target = cast(tuple[int, int], self._connection.execute(
-                "SELECT EXISTS(SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
-                + "EXISTS(SELECT 1 FROM sync_waits WHERE unit=?)", (new, new),
-            ).fetchone())
-            if any(target):
-                raise LedgerError(f"{new}: target unit already owns a current ticket or sync wait")
-            _ = self._connection.execute(
-                "UPDATE tickets SET unit=? WHERE unit=? AND state IN ('queued','assigned','checkpointed')", (new, old),
-            )
-            _ = self._connection.execute("UPDATE sync_waits SET unit=? WHERE unit=?", (new, old))
-            return UnitRenamed(*source)
-
     def wait_for_sync(self, unit: str) -> None:
+        unit = str(self.unit_row(unit).id)
         with self._connection:
             _ = self._connection.execute(
                 "INSERT INTO sync_waits VALUES (?,?,?) ON CONFLICT(unit) DO NOTHING", (unit, _now(), uuid.uuid4().hex),
             )
 
     def clear_sync_wait(self, unit: str) -> None:
+        unit = str(self.unit_row(unit).id)
         with self._connection:
             _ = self._connection.execute("DELETE FROM sync_waits WHERE unit=?", (unit,))
 
@@ -3693,7 +4266,15 @@ class Ledger:
             return
         _ = self._ticket_transition(id, "dropped", required_owner=owner)
 
+    def open_tickets(self) -> tuple[TicketRecord, ...]:
+        """Read all assigned and checkpointed tickets without requiring an owner filter."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY created_at,id",
+        ).fetchall())
+        return tuple(self._ticket(row[0]) for row in rows)
+
     def ticket_open(self, unit: str) -> tuple[TicketRecord, ...]:
+        unit = str(self.unit_row(unit).id)
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE unit=? AND state IN ('assigned','checkpointed') ORDER BY created_at,id", (unit,),
         ).fetchall())
@@ -3825,8 +4406,20 @@ class Ledger:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             _ = self._check_pin(ticket, rule, rule_blob)
-            take_over = ("UPDATE held_findings SET ticket=?,updated_at=? WHERE finding_id=? AND state IN ('unfiled','filed') "
-                         + "AND ticket!=?")
+            judging = self._judging_ticket(ticket)
+            # A new judgment reads its ticket's base, including when it takes over an existing finding.
+            anchor = judging[0][1] if judging else ""
+            judgment_values: tuple[str | int, ...]
+            if anchor:
+                take_over = ("UPDATE held_findings SET ticket=?,anchor_commit=?,path=?,line=?,text=?,"
+                             + "followed_from='',followed_from_line=0,followed_at='',followed_from_commit='',updated_at=? "
+                             + "WHERE finding_id=? AND state IN ('unfiled','filed') AND ticket!=?")
+                judgment_values = (ticket, anchor, path, line, text)
+            else:
+                # An untracked hold supplies no source revision; keep the proved followed coordinate.
+                take_over = ("UPDATE held_findings SET ticket=?,updated_at=? "
+                             + "WHERE finding_id=? AND state IN ('unfiled','filed') AND ticket!=?")
+                judgment_values = (ticket,)
             while True:
                 rows = cast(list[tuple[str, str, str, str, int]], self._connection.execute(
                     "SELECT h.finding_id,h.kind,h.before,h.after,EXISTS "
@@ -3842,7 +4435,7 @@ class Ledger:
                     finding_ids = (_finding_id((*site, *change, same[0])),
                                    _finding_id((*site, *change, same[0], "replacement")))
                     continue
-                _ = self._connection.execute(take_over, (ticket, _now(), same[0], ticket))
+                _ = self._connection.execute(take_over, (*judgment_values, _now(), same[0], ticket))
                 return self._held(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
             # again, so that change returns the followed finding, the one with the nearest line.
@@ -3852,7 +4445,7 @@ class Ledger:
             ).fetchall())
             if followed:
                 nearest = min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0]
-                _ = self._connection.execute(take_over, (ticket, _now(), nearest, ticket))
+                _ = self._connection.execute(take_over, (*judgment_values, _now(), nearest, ticket))
                 return self._held(nearest)
             free = [finding_id for finding_id in finding_ids if finding_id not in changes]
             if not free:
@@ -3860,8 +4453,9 @@ class Ledger:
             now = _now()
             _ = self._connection.execute(
                 "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
-                + "proposal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?)",
-                (free[0], rule, path, line, text, kind, before, after, rule_blob, ticket, now, now),
+                + "proposal,created_at,updated_at,anchor_commit) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?,?)",
+                (free[0], rule, path, line, text, kind, before, after, rule_blob, ticket, now, now,
+                 anchor),
             )
             # Every return reads its row before the commit, so a write after the commit cannot change what it returns.
             return self._held(free[0])
@@ -3903,10 +4497,72 @@ class Ledger:
                 actor = WaiveByLedger()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
                            ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo(),
-                           FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor)
+                           FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor,
+                           self.rename_disposition(finding_id))
+
+    def rename_disposition(self, finding_id: str) -> OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock:
+        rows = cast(list[tuple[str, int, str, str, str]], self._connection.execute(
+            "SELECT name,line,text,kind,reason FROM rename_dispositions WHERE finding_id=?", (finding_id,),
+        ).fetchall())
+        if not rows:
+            return NoOuterBindingBlock()
+        name, line, text, kind, reason = rows[0]
+        if kind == "unproved":
+            return OuterBindingUnproved(reason, line, text)
+        return OuterBindingBlocked(f"rename blocked by outer binding {name!r} at line {line}", name, line, text)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
+        """Judging-ticket completion for merge checks; use finding_anchor to read source coordinates."""
         return self._judged_from(self._judging_ticket(finding.ticket))
+
+    def _anchor_candidates(self, finding: HeldFinding) -> tuple[str, ...]:
+        history = self._finding_histories[finding.finding_id]
+        candidates = ((finding.follow.commit,) if isinstance(finding.follow, FollowedDeclaration)
+                      else (history.anchor_commit,) if history.anchor_commit else history.judging[0] if history.judging else ())
+        return tuple(dict.fromkeys(resolved.commit for candidate in candidates if candidate
+                                  if isinstance(resolved := self._judged_from(((candidate, ""),)), JudgedCommit)))
+
+    def finding_anchor(self, finding: HeldFinding) -> FindingAnchor | NeedsJudgment:
+        """Prove the coordinate once per finding row; a new row or ticket invalidates its evidence."""
+        self._refresh_site_rows()
+        if finding not in self._finding_anchors:
+            self._finding_anchors[finding] = self._prove_finding_anchor(finding)
+        return self._finding_anchors[finding]
+
+    def _prove_finding_anchor(self, finding: HeldFinding) -> FindingAnchor | NeedsJudgment:
+        history = self._finding_histories[finding.finding_id]
+        candidates = self._anchor_candidates(finding)
+        if isinstance(finding.follow, FollowedDeclaration) or history.anchor_commit:
+            if not candidates:
+                return NeedsJudgment("last follow commit is missing" if isinstance(finding.follow, FollowedDeclaration)
+                                     else "recorded anchor commit is missing")
+            return FindingAnchor(candidates[0], finding.path, finding.line)
+        if not history.judging:
+            return NeedsJudgment("no judging ticket for source anchor")
+        # Identical blobs give the same coordinate at either commit, even for descriptive legacy text.
+        if len(candidates) == 2:
+            checkpoint, base = candidates
+            blob = self._tip(base).blobs.get(finding.path)
+            if blob and blob == self._tip(checkpoint).blobs.get(finding.path):
+                return FindingAnchor(base, finding.path, finding.line)
+        matches: list[str] = []
+        for candidate in candidates:
+            try:
+                source = self._site_source(self._tip(candidate), finding.path)
+            except UnicodeDecodeError:
+                continue
+            if (1 <= finding.line <= len(source.lines) and source.lines[finding.line - 1].strip()
+                    and source.lines[finding.line - 1].strip() == finding.text.strip()):
+                matches.append(candidate)
+        if not matches:
+            return NeedsJudgment("no source anchor matches the stored coordinate")
+        if len(matches) == 2:
+            checkpoint, base = matches
+            if (not self._is_ancestor(base, checkpoint)
+                    or self._unchanged_site_lines(base, checkpoint, finding.path).get(finding.line) != finding.line):
+                return NeedsJudgment("source anchor is ambiguous between base and checkpoint")
+            return FindingAnchor(base, finding.path, finding.line)
+        return FindingAnchor(matches[0], finding.path, finding.line)
 
     def judged_again_without(self, finding: HeldFinding, definition: Rule) -> SupersedingJudgment | NotJudgedAgain:
         """The judgment that read the finding's changed file again and did not hold it, as withdrawal reads it."""
@@ -3944,15 +4600,53 @@ class Ledger:
         rows = cast(list[tuple[str]], query.fetchall())
         return tuple(self._held(row[0]) for row in rows)
 
-    def _cell_findings(self, rule: str, path: str, commit: str) -> tuple[HeldFinding, ...]:
-        """Every finding whose site maps to this rule's cell at the commit, in any state."""
+    def _cell_finding_states(self, rule: str, path: str, commit: str) -> tuple[tuple[str, HeldStateName], ...]:
+        """Map each finding to its rule cell without loading unrelated finding evidence."""
         definition = self._component_rule(rule)
         tip = self._tip(commit)
-        rows = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT finding_id,path FROM held_findings WHERE rule=? ORDER BY created_at,finding_id", (rule,),
+        rows = cast(list[tuple[str, str, HeldStateName]], self._connection.execute(
+            "SELECT finding_id,path,state FROM held_findings WHERE rule=? ORDER BY created_at,finding_id", (rule,),
         ).fetchall())
-        return tuple(self._held(finding_id) for finding_id, site in rows
+        return tuple((finding_id, state) for finding_id, site, state in rows
                      if _finding_cell(definition, site, tip) == path)
+
+    def _cell_findings(self, rule: str, path: str, commit: str) -> tuple[HeldFinding, ...]:
+        """Every finding whose site maps to this rule's cell at the commit, in any state."""
+        return tuple(self._held(finding_id) for finding_id, _ in self._cell_finding_states(rule, path, commit))
+
+    def _open_cell_finding_ids(self, rule: str, path: str, commit: str) -> tuple[str, ...]:
+        """Use the held-verdict rule to select live findings for a cell."""
+        return tuple(finding_id for finding_id, state in self._cell_finding_states(rule, path, commit)
+                     if state in ("unfiled", "filed"))
+
+    def _same_input_open_findings(self, rule: str, path: str, tip: RepositoryTip, rule_blob: str) -> tuple[str, ...]:
+        """Prove that a live finding and a clean judgment read the same rule and cell inputs."""
+        definition = self._component_rule(rule)
+        scope = _cell_scope(definition, path, tip)
+        contradictions: list[str] = []
+        for finding_id in self._open_cell_finding_ids(rule, path, tip.commit):
+            finding = self._held(finding_id)
+            if not rule_catalog.judged_text_unchanged(finding.rule_blob, definition, compared_blob=rule_blob):
+                continue
+            self._refresh_site_rows()
+            judged_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
+            judgments = [(cell, row) for cell, row in self._site_holding_rows.get((rule, finding.ticket), ())
+                         if _under(judged_path, cell)
+                         and rule_catalog.judged_text_unchanged(row.rule_blob, definition, compared_blob=finding.rule_blob)]
+            if judgments:
+                _, row = max(judgments, key=lambda judgment: len(judgment[0]))
+                if self._judgment_inputs_match(row, tip, scope, path, None):
+                    contradictions.append(finding.finding_id)
+                continue
+            anchor = self.finding_anchor(finding)
+            if not isinstance(anchor, FindingAnchor):
+                continue
+            original = self._tip(anchor.commit)
+            if _finding_cell(definition, anchor.path, original) != path:
+                continue
+            if self._fingerprint(original, scope, path) == self._fingerprint(tip, scope, path):
+                contradictions.append(finding.finding_id)
+        return tuple(contradictions)
 
     def proposal_findings(self, proposal: Path) -> tuple[HeldFinding, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
@@ -5084,6 +5778,13 @@ class Ledger:
             return
         self._site_rows_version = version
         self._site_evidence.clear()
+        self._finding_anchors.clear()
+        histories = cast(list[tuple[str, str, str, str, str]], self._connection.execute(
+            "SELECT h.finding_id,h.anchor_commit,h.followed_from_commit,COALESCE(t.checkpoint,''),COALESCE(t.base,'') "
+            + "FROM held_findings h LEFT JOIN tickets t ON t.id=h.ticket").fetchall())
+        self._finding_histories = {
+            identity: FindingSourceHistory(anchor, previous, ((checkpoint, base),) if checkpoint or base else ())
+            for identity, anchor, previous, checkpoint, base in histories}
         self._follow_evidence.clear()
         self._built_rename_evidence.clear()
         pinned = cast(list[tuple[str, bytes]], self._connection.execute("SELECT blob,text FROM rule_texts").fetchall())
@@ -5094,8 +5795,9 @@ class Ledger:
             except UnicodeDecodeError:
                 self._site_rule_families[blob] = "unreadable"
                 continue
-            if match := re.search(r"(?m)^family:[ \t]*(names|values|types|modules)[ \t]*$", source):
-                self._site_rule_families[blob] = match[1]
+            family = rule_catalog.pinned_family(source)
+            if isinstance(family, str):
+                self._site_rule_families[blob] = family
         grouped: dict[tuple[str, str], list[Judgment]] = {}
         self._site_holding_rows.clear()
         self._inactive_site_holders = set(cast(list[tuple[str, str]], self._connection.execute(
@@ -5112,14 +5814,11 @@ class Ledger:
 
     def _prepare_sites(self, findings: tuple[HeldFinding, ...], tip: RepositoryTip) -> None:
         """Read each needed immutable blob once, using Git's existing batch reader."""
+        self._refresh_site_rows()
         wanted: dict[str, str] = {}
         for finding in findings:
-            judged = self.judged_commit(finding)
-            if isinstance(judged, NoJudgedCommit):
-                continue
-            read = finding.follow.commit if isinstance(finding.follow, FollowedDeclaration) else judged.commit
-            before = self._tip(read)
-            for tree in (before, tip):
+            # Collect both legacy candidates before proving any anchor, so all source reads share one batch.
+            for tree in (*(self._tip(commit) for commit in self._anchor_candidates(finding)), tip):
                 blob = tree.blobs.get(finding.path, "")
                 if blob and blob not in self._site_sources:
                     wanted[blob] = blob
@@ -5148,6 +5847,19 @@ class Ledger:
                 content = next(blob_contents(self.repo, {path: blob}))[1]
             self._site_sources[blob] = finding_sites.SourceSites(content.decode())
         return self._site_sources[blob]
+
+    def _unchanged_site_lines(self, before: str, after: str, path: str) -> dict[int, int]:
+        key = (before, after, path)
+        if key not in self._site_maps:
+            proof = self._binding_proofs.get(key)
+            if proof is not None and proof.explained and any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
+                self._site_maps[key] = dict(proof.line_map)
+            else:
+                patch = _git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+                             "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=0", before, after, "--", path)
+                self._site_maps[key] = finding_sites.unchanged_lines(
+                    patch, self._site_source(self._tip(before), path), self._site_source(self._tip(after), path))
+        return self._site_maps[key]
 
     def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip,
                               *, line_local: bool = False) -> bool:
@@ -5205,7 +5917,7 @@ class Ledger:
 
     def _site_after_refusal(self, outcome: DeclarationNotRead | DeclarationInPlace, tip: RepositoryTip) -> DeclarationOutcome:
         evidence = self._site_proof(outcome.finding, tip.commit)
-        if not isinstance(evidence, NeedsJudgment):
+        if isinstance(evidence, UnchangedSite):
             return FindingSite(outcome.finding, evidence)
         return outcome
 
@@ -5229,17 +5941,23 @@ class Ledger:
         if ((finding.rule, finding.ticket) in self._inactive_site_holders
                 and not self._site_holding_rows.get((finding.rule, finding.ticket))):
             return NeedsJudgment("judgment belongs to an inactive rule generation")
-        judged = self.judged_commit(finding)
-        if isinstance(judged, NoJudgedCommit):
-            return NeedsJudgment("no judged commit")
-        read = finding.follow.commit if isinstance(finding.follow, FollowedDeclaration) else judged.commit
+        anchor = self.finding_anchor(finding)
+        if isinstance(anchor, NeedsJudgment):
+            return anchor
+        read = anchor.commit
         rows = self._site_rows.get((finding.rule, finding.path), ())
         # Share the removal rule with coverage. Include the site's commit as a candidate even if
         # this legacy finding has no matching cell row.
         site_row = Judgment(finding.rule_blob, "", read, "held", CellInputScope.FILE, DeclaredInputScope.FILE)
         eligible = self._rows_after_removals((site_row, *rows), tip.commit)
-        original_row = replace(site_row, commit=judged.commit)
-        if (not self._is_ancestor(judged.commit, read) or not self._is_ancestor(read, tip.commit)
+        history = self._finding_histories[finding.finding_id]
+        # Following changes the coordinate, never the original judgment's ancestry or removal barrier.
+        original_anchor = history.anchor_commit or (anchor.commit if isinstance(finding.follow, NotFollowed) else "")
+        original = self._judged_from(((original_anchor, ""),)) if original_anchor else self._judged_from(history.judging)
+        if isinstance(original, NoJudgedCommit):
+            return NeedsJudgment("no original judgment commit")
+        original_row = replace(site_row, commit=original.commit)
+        if (not self._is_ancestor(original.commit, read) or not self._is_ancestor(read, tip.commit)
                 or site_row not in eligible
                 or original_row not in self._rows_after_removals((original_row, *rows), tip.commit)):
             return NeedsJudgment("judgment crossed ancestry or removal boundary")
@@ -5259,11 +5977,11 @@ class Ledger:
             return NeedsJudgment("original context inputs changed or missing")
         old = self._site_source(before, finding.path)
         new = self._site_source(tip, finding.path)
+        # The unchanged-file carry retains descriptive legacy findings; bulk still compares physical bytes.
         # Reject an unproved owner before accepting an unchanged file.
         _ = old.owner_chain(finding.line), new.items
         if before.blobs.get(finding.path) == tip.blobs.get(finding.path) and finding.path in tip.blobs:
-            # The file gate itself is satisfied; context rules also retain their original external inputs.
-            return UnchangedSite(finding.path, finding.line)
+            return UnchangedSite(finding.path, finding.line, anchor)
         if not (1 <= finding.line <= len(old.lines)):
             return NeedsJudgment("old source coordinate unreadable")
         line = old.lines[finding.line - 1]
@@ -5271,25 +5989,55 @@ class Ledger:
             return NeedsJudgment("finding text is not its old source line")
         if finding.kind == "type" and not old.locates_subject(finding.line, finding.before):
             return NeedsJudgment("proposed type subject is not located in its original item")
-        key = (read, tip.commit, finding.path)
-        if key not in self._site_maps:
-            # A proven binding rename already supplies this alignment; never run a second checker.
-            proof = self._binding_proofs.get(key)
-            if proof is not None and proof.explained and any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
-                self._site_maps[key] = dict(proof.line_map)
-            else:
-                patch = _git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
-                             "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=0", read, tip.commit, "--", finding.path)
-                self._site_maps[key] = finding_sites.unchanged_lines(patch, old, new)
-        mapped = self._site_maps[key].get(finding.line, 0)
+        mapped = self._unchanged_site_lines(read, tip.commit, finding.path).get(finding.line, 0)
         if (mapped and mapped <= len(new.lines) and line == new.lines[mapped - 1]
                 and old.same_owner(finding.line, new, mapped)):
             if family in ("names", "values"):
-                return UnchangedSite(finding.path, mapped)
+                return UnchangedSite(finding.path, mapped, anchor)
             if old.same_item(finding.line, new, mapped):
-                return UnchangedSite(finding.path, mapped)
+                return UnchangedSite(finding.path, mapped, anchor)
             return NeedsJudgment("enclosing item, owner, imports or original inputs changed")
         return NeedsJudgment("unchanged source site not proved")
+
+    def finding_input_identity(self, finding: HeldFinding) -> str:
+        """The judgment row and source history; execution ownership is deliberately separate."""
+        self._refresh_site_rows()
+        fields = (finding.rule, finding.rule_blob, finding.path, finding.line, finding.text,
+                  finding.kind, finding.before, finding.after, finding.ticket,
+                  asdict(finding.follow), asdict(self._finding_histories[finding.finding_id]))
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+    def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
+        """Offer only changed owners/lines for a fresh proof, preserving every history barrier.
+
+        This does not judge a rename. The shared executor must still prove rule applicability,
+        references and all safety constraints before publishing fresh evidence.
+        """
+        evidence = self._site_proof(finding, at)
+        if not isinstance(evidence, NeedsJudgment):
+            return NeedsJudgment("site does not require a fresh judgment")
+        if evidence.reason not in {"unchanged source site not proved",
+                                   "enclosing item, owner, imports or original inputs changed"}:
+            return evidence
+        definition = next((rule for rule in self._load_rules() if rule.rule_id == base_rule(finding.rule)), None)
+        if definition is None or definition.blob != finding.rule_blob:
+            return NeedsJudgment("rule changed since judged")
+        if definition.name != "prefer-type-named-fields-and-bindings" or finding.kind != "rename":
+            return NeedsJudgment("rule applicability is not machine-checkable")
+        tip = self._tip(at)
+        try:
+            self._check_cell_path(definition, finding.path, tip)
+        except LedgerError as error:
+            return NeedsJudgment(str(error))
+        anchor = self.finding_anchor(finding)
+        if isinstance(anchor, NeedsJudgment):
+            return anchor
+        # Use the shared diff mapper, including replacement hunks. A location is only a
+        # candidate: no coordinate mapping by itself licenses changed code.
+        mapped = self._outside_mapping(anchor.commit, tip.commit, finding.path, anchor.line)
+        if not isinstance(mapped, declarations.MappedDeclaration):
+            return NeedsJudgment("current declaration location is unproved")
+        return RenameJudgmentSite(FindingAnchor(tip.commit, mapped.path, mapped.line))
 
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
@@ -5301,14 +6049,10 @@ class Ledger:
                 "SELECT state FROM tickets WHERE id=?", (finding.ticket,)).fetchall())
             if judging and judging[0][0] in ("assigned", "checkpointed"):
                 return DeclarationNotRead(finding)
-        # A followed finding's path and line are at the commit of its last follow.
-        if isinstance(finding.follow, FollowedDeclaration):
-            read = finding.follow.commit
-        else:
-            judged = self.judged_commit(finding)
-            if isinstance(judged, NoJudgedCommit):
-                return DeclarationNotRead(finding)
-            read = judged.commit
+        anchor = self.finding_anchor(finding)
+        if isinstance(anchor, NeedsJudgment):
+            return DeclarationNotRead(finding)
+        read = anchor.commit
         if not self._is_ancestor(read, tip.commit):
             return DeclarationNotRead(finding)
         changed = self._changed_since(read, tip.commit)
@@ -5676,15 +6420,19 @@ class Ledger:
                     continue
                 read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
                 before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
+                before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
+                history = self._finding_histories[finding.finding_id]
+                # The preceding coordinate belongs to the preceding follow, not the first judgment.
+                previous = (history.previous_site_commit or judged.commit) if isinstance(finding.follow, FollowedDeclaration) else history.anchor_commit or judged.commit
+                anchor = FindingAnchor(previous, before_path, before_line)
                 if isinstance(rename.scope, SelfQualified):
                     item = self._declared_file(read.commit, finding.path).declaration_at(finding.line)
                     if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
                         continue
                     rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
-                before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
                 built_renames.append(BuiltRename(
-                    rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal,
-                    self._trait_site_position(judged.commit, before_path, before_line, finding.before),
+                    rename, finding.path, read.commit, before_path, anchor.commit, finding.state.proposal,
+                    self._trait_site_position(anchor.commit, before_path, before_line, finding.before),
                     self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         evidence = BuiltRenameEvidence(built_findings, tuple(built_renames))
         self._built_rename_evidence[tip.commit] = evidence
@@ -5703,12 +6451,14 @@ class Ledger:
             if isinstance(outcome, FindingSite):
                 evidence = outcome.evidence
             elif isinstance(outcome, DeclarationMoved):
-                evidence = UnchangedSite(outcome.path, outcome.line)
+                anchor = self.finding_anchor(finding)
+                evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
+                            if isinstance(anchor, FindingAnchor) else anchor)
             elif isinstance(outcome, DeclarationRemoved):
                 evidence = NeedsJudgment("no source site after proved declaration removal")
-            elif isinstance(outcome, DeclarationNotRead) and isinstance(self.judged_commit(finding), NoJudgedCommit):
-                # Existing untracked findings are eligible for filing; this is not a new carry.
-                evidence = UnchangedSite(finding.path, finding.line)
+            elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                # Existing untracked findings are eligible for filing; this asserts no historical carry.
+                evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
             elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
                 evidence = self._site_proof(finding, tip.commit)
             else:
@@ -5722,6 +6472,10 @@ class Ledger:
         approved tells whether the user approved the decision at a path.
         """
         return self._declaration_reading(tuple(finding_ids), self._synced_tip(), approved)
+
+    def _coordinate_commit(self, finding: HeldFinding) -> str:
+        anchor = self.finding_anchor(finding)
+        return anchor.commit if isinstance(anchor, FindingAnchor) else ""
 
     def follow_declarations(self, finding_ids: Iterable[str], at: str, approved: Callable[[Path], bool]) -> DeclarationReading:
         """Move each finding whose declaration moved to one other file, or whose item a built rename renamed, there,
@@ -5758,17 +6512,17 @@ class Ledger:
                     raise ChangedBeforeLock("the findings or their decisions changed while their declarations were read; rerun")
                 now = _now()
                 _ = self._connection.executemany(
-                    "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_at=?,updated_at=? WHERE finding_id=?",
-                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
-                     for item in moves] + [(site.path, site.line, finding.path, finding.line, tip.commit, now, finding.finding_id)
+                    "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_from_commit=?,followed_at=?,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, self._coordinate_commit(item.finding), tip.commit, now, item.finding.finding_id)
+                     for item in moves] + [(site.path, site.line, finding.path, finding.line, self._coordinate_commit(finding), tip.commit, now, finding.finding_id)
                                          for finding, site in follows],
                 )
                 # A person's reading was of an old build, so the new build clears it. A rename follows to its new
                 # declaration, in its own file too, so reopen checks that site and its line reads at the tip.
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='built',person_read_by='',path=?,line=?,followed_from=?,followed_from_line=?,"
-                    + "followed_at=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
-                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, now, item.finding.finding_id)
+                    + "followed_from_commit=?,followed_at=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, self._coordinate_commit(item.finding), tip.commit, now, now, item.finding.finding_id)
                      for item in renames],
                 )
                 _ = self._connection.executemany(
@@ -5805,7 +6559,11 @@ class Ledger:
             if isinstance(finding.state, Built):
                 return
             ticket = merged_build_ticket(finding)
-            check = self.applied_check(finding, ticket["checkpoint"])
+            evidence = self._built_check(finding, ticket["checkpoint"])
+            check = evidence.outcome
+            if isinstance(check, OuterBindingBlocked | OuterBindingUnproved):
+                self.record_rename_block(finding_id, check)
+                raise LedgerError(f"{finding_id}: {check.reason}")
             if isinstance(check, RenameNotApplied):
                 raise LedgerError(f"{finding_id}: rename not applied in {check.path} at {ticket['id']} checkpoint")
             with self._connection:
@@ -5817,6 +6575,7 @@ class Ledger:
                     raise ChangedBeforeLock(f"{finding_id}: the finding changed while it was marked built; rerun")
                 # A person's reading was of the old build, so a new build clears it.
                 now = _now()
+                _ = self._connection.execute("DELETE FROM rename_dispositions WHERE finding_id=?", (finding_id,))
                 _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
                                              (now, now, finding_id))
 
@@ -5858,8 +6617,15 @@ class Ledger:
                 if isinstance(judged, JudgedCommit) and judged.commit != commit and self._is_ancestor(commit, judged.commit):
                     raise LedgerError(f"{finding_id}: {merge} is older than {judged.commit[:7]}, where the finding was judged")
                 self._refuse_merge_without_checkpoints(finding_id, rows.linked, commit, merge)
-                check = self.applied_check(finding, commit)
+                evidence = self._built_check(finding, commit)
+                check = evidence.outcome
                 match check:
+                    case OuterBindingBlocked():
+                        self.record_rename_block(finding_id, check)
+                        raise LedgerError(f"{finding_id}: {check.reason}")
+                    case OuterBindingUnproved():
+                        self.record_rename_block(finding_id, check)
+                        raise LedgerError(f"{finding_id}: {check.reason}")
                     case AppliedInCode():
                         built.append(BuiltAtMerge(finding_id, commit, NotReadByPerson()))
                     case RenameNotApplied():
@@ -5877,6 +6643,7 @@ class Ledger:
                                             + "while it was marked built; rerun")
                 now = _now()
                 for item in built:
+                    _ = self._connection.execute("DELETE FROM rename_dispositions WHERE finding_id=?", (item.finding_id,))
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
                     _ = self._connection.execute(
                         "UPDATE held_findings SET state='built',person_read_by=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
@@ -6080,7 +6847,7 @@ class Ledger:
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') "
             + "ORDER BY EXISTS(SELECT 1 FROM ticket_predecessors p JOIN tickets prev ON prev.id=p.predecessor "
-            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),unit,length(id),id",
+            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),state,unit,length(id),id",
         ).fetchall())
         for id, branch, state, checkpoint in tickets:
             with self.git_operation(f"ticket {id} reconcile"):
@@ -6362,9 +7129,15 @@ class Ledger:
         fingerprint = (_read_fingerprint(tip, path, read_files) if isinstance(read_files, ReadFiles)
                        else self._fingerprint(tip, scope, path))
         with self._record_write(ticket, rule, path, rule_blob) as generation:
-            if verdict == "held":
-                findings = self._cell_findings(rule, path, tip.commit)
-                if not any(isinstance(finding.state, (Unfiled, Filed)) for finding in findings):
+            if verdict in ("clean", "held"):
+                open_findings = self._open_cell_finding_ids(rule, path, tip.commit)
+                if verdict == "clean":
+                    contradictions = self._same_input_open_findings(rule, path, tip, rule_blob)
+                    if contradictions:
+                        identities = ", ".join(contradictions)
+                        raise LedgerError(f"{rule}: {path}: cannot record clean with open held rows: {identities}")
+                if verdict == "held" and not open_findings:
+                    findings = self._cell_findings(rule, path, tip.commit)
                     inactive = "".join(f"\n{finding.finding_id}: {held_state_name(finding.state)}" for finding in findings)
                     raise LedgerError(
                         f"{rule}: {path}: cannot record held without a live held finding.{inactive}\n"
@@ -6378,6 +7151,43 @@ class Ledger:
                  datetime.now(timezone.utc).isoformat(), input_scope,
                  json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None), generation),
             )
+
+    def correct_clean_to_held(
+        self, ticket: str, rule: str, path: str, *, mode: HeldCellCorrectionMode = HeldCellCorrectionMode.APPLY,
+    ) -> CleanCellHeldCorrection:
+        """Correct one merged ticket cell without changing its input evidence or ticket state."""
+        path = self._path(path)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE" if mode == HeldCellCorrectionMode.APPLY else "BEGIN")
+            if self._ticket(ticket)["state"] != "merged":
+                raise LedgerError(f"{ticket}: clean-to-held correction requires a merged ticket")
+            rows = cast(list[tuple[int, Verdict]], self._connection.execute(
+                "SELECT id,verdict FROM judgments WHERE ticket=? AND rule=? AND path=? "
+                + "ORDER BY recorded_at DESC,id DESC LIMIT 1", (ticket, rule, path)).fetchall())
+            if not rows:
+                raise LedgerError(f"{ticket}: no recorded cell for {rule} {path}")
+            judgment_id, verdict = rows[0]
+            if verdict == "held":
+                event = cast(list[tuple[str]], self._connection.execute(
+                    "SELECT finding_ids FROM held_cell_corrections WHERE judgment_id=?", (judgment_id,)).fetchall())
+                if event:
+                    return CleanCellHeldCorrection(ticket, rule, path, judgment_id,
+                                                   tuple(_json_strings(event[0][0])), HeldCellCorrectionState.ALREADY_CORRECTED)
+            if verdict != "clean":
+                raise LedgerError(f"{ticket}: {rule} {path}: correction requires clean, found {verdict}")
+            identities = self._open_cell_finding_ids(rule, path, self.synced_commit())
+            if not identities:
+                raise LedgerError(f"{ticket}: {rule} {path}: cannot correct clean to held without open held rows")
+            state = HeldCellCorrectionState.WOULD_CORRECT
+            if mode == HeldCellCorrectionMode.APPLY:
+                _ = self._connection.execute("UPDATE judgments SET verdict='held' WHERE id=?", (judgment_id,))
+                _ = self._connection.execute(
+                    "INSERT INTO held_cell_corrections "
+                    + "(judgment_id,ticket,rule,path,old_outcome,new_outcome,finding_ids,corrected_at) "
+                    + "VALUES (?,?,?,?,'clean','held',?,?)",
+                    (judgment_id, ticket, rule, path, json.dumps(identities), _now()))
+                state = HeldCellCorrectionState.CORRECTED
+            return CleanCellHeldCorrection(ticket, rule, path, judgment_id, identities, state)
 
     def record_removed(
         self, rule: str, path: str, commit: str, rule_blob: str, detail: str, ticket_id: str, worker: str, *,
@@ -6756,9 +7566,10 @@ def ledger_location(repo: Path) -> LedgerLocation:
     return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite")
 
 
-def open_ledger(repo: Path) -> Ledger:
+def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE,
+                resolver: session_staff.RowResolver | None = None) -> Ledger:
     location = ledger_location(repo)
-    return Ledger(location.repo, location.database)
+    return Ledger(location.repo, location.database, access=access, resolver=resolver)
 
 
 def record_refill(repo: Path, unit: str, outcome: str) -> None:
@@ -6843,6 +7654,9 @@ def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO
 
 class LedgerArguments(argparse.Namespace):
     command: str = ""
+    dry_run: bool = False
+    stop_after_first: bool = False
+    references: list[Path] = []
     repo: str = ""
     rule: str = ""
     path: str = ""
@@ -6864,7 +7678,6 @@ class LedgerArguments(argparse.Namespace):
     action: str = ""
     id: str = ""
     unit: str = ""
-    from_unit: str = ""
     branch: str = ""
     kind: str = ""
     family: str = ""
@@ -6883,6 +7696,8 @@ class LedgerArguments(argparse.Namespace):
     proposal: str = ""
     state: HeldStateName | None = None
     finding_ids: str = "[]"
+    finding: list[str] = []
+    reason: str = ""
     site: str = ""
     idea: str = ""
     # `held built` takes more than one --id only with --commit.
@@ -6965,6 +7780,10 @@ def _wake_sync_waiters(repo: Path, ticket_id: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    migrate = commands.add_parser("migrate-staff-ids")
+    _ = migrate.add_argument("--repo", required=True)
+    _ = migrate.add_argument("--reference", dest="references", type=Path, action="append", default=[])
+    _ = migrate.add_argument("--stop-after-first", action="store_true")
     record = commands.add_parser("record")
     for field in ("rule", "path", "commit", "ticket", "worker"):
         _ = record.add_argument(f"--{field}", required=True)
@@ -6973,6 +7792,10 @@ def main() -> None:
     _ = record.add_argument("--detail", default="")
     _ = record.add_argument("--input-scope", choices=tuple(DeclaredInputScope), type=DeclaredInputScope, default=UNDECLARED_INPUT_SCOPE)
     _ = record.add_argument("--reads", nargs="+", default=NO_READ_FILES)
+    correction = commands.add_parser("correct-clean-to-held")
+    for field in ("ticket", "rule", "path"):
+        _ = correction.add_argument(f"--{field}", required=True)
+    _ = correction.add_argument("--dry-run", action="store_true")
     candidate = commands.add_parser("candidate")
     for field in ("ticket", "site", "idea"):
         _ = candidate.add_argument(f"--{field}", required=True)
@@ -6993,11 +7816,10 @@ def main() -> None:
     reconcile = commands.add_parser("reconcile")
     _ = reconcile.add_argument("--branch-point", required=True)
     _ = reconcile.add_argument("--style-branch", required=True)
-    for command in (record, candidate, lint, sync, status, summary, reconcile):
+    for command in (record, correction, candidate, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("unit", ("rename",)),
-        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "replace", "file", "waive", "built", "list")),
@@ -7008,10 +7830,7 @@ def main() -> None:
         for action in actions:
             command = children.add_parser(action)
             _ = command.add_argument("--repo", default=argparse.SUPPRESS)
-            if name == "unit":
-                _ = command.add_argument("--from", dest="from_unit", required=True)
-                _ = command.add_argument("--to", required=True)
-            elif name == "ticket":
+            if name == "ticket":
                 if action == "open":
                     _ = command.add_argument("--unit", required=True)
                 else:
@@ -7033,6 +7852,10 @@ def main() -> None:
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
                     _ = command.add_argument("--path", required=True)
+                elif action == "refuse":
+                    _ = command.add_argument("--finding", action="append", required=True)
+                    _ = command.add_argument("--by", required=True)
+                    _ = command.add_argument("--reason", required=True)
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
@@ -7083,10 +7906,15 @@ def main() -> None:
     if args.command == "ticket" and args.action == "checkpoint" and bool(args.session_dir) != bool(args.phase):
         parser.error("ticket checkpoint takes --session-dir and --phase together")
     try:
-        with open_ledger(Path(args.repo)) as ledger:
-            if args.command == "unit":
-                renamed = ledger.rename_unit(args.from_unit, args.to)
-                print(f"moved {renamed.tickets} tickets and {renamed.waits} sync waits")
+        access = (LedgerAccess.HELD_CORRECTION_PREVIEW
+                  if args.command == "correct-clean-to-held" and args.dry_run else LedgerAccess.READ_WRITE)
+        with open_ledger(Path(args.repo), access=access) as ledger:
+            if args.command == "migrate-staff-ids":
+                changes = ledger.migrate_staff_ids(references=tuple(args.references), stop_after_first=args.stop_after_first)
+                print("\n".join(changes) if changes else "unchanged")
+            elif args.command == "correct-clean-to-held":
+                mode = HeldCellCorrectionMode.PREVIEW if args.dry_run else HeldCellCorrectionMode.APPLY
+                print(held_cell_correction_line(ledger.correct_clean_to_held(args.ticket, args.rule, args.path, mode=mode)))
             elif args.command == "set-tip":
                 ledger.set_tip(args.tip, args.style_branch)
             elif args.command == "record" and args.verdict == "removed":
@@ -7121,7 +7949,7 @@ def main() -> None:
                     print(change)
             elif args.command == "ticket":
                 if args.action == "add":
-                    ledger.ticket_add(args.id, args.unit, cast(TicketKind, args.kind), args.family, args.crate,
+                    ledger.ticket_add(args.id, str(command_ticket_holder(args.unit, ledger).id), cast(TicketKind, args.kind), args.family, args.crate,
                                       _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal, _json_cells(args.cells), tuple(_json_strings(args.finding_ids)))
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
@@ -7144,8 +7972,11 @@ def main() -> None:
                 elif args.action == "yield":
                     for finding_id in ledger.ticket_yield(args.id, args.path):
                         print(f"yielded {finding_id}: it stays filed for a later ticket")
+                elif args.action == "refuse":
+                    _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
+                    print(f"{args.id}: named findings refused; remaining findings kept")
                 else:
-                    for ticket in ledger.ticket_open(args.unit):
+                    for ticket in ledger.ticket_open(str(command_ticket_holder(args.unit, ledger).id)):
                         print(json.dumps(ticket, sort_keys=True))
             elif args.command == "handoff":
                 if args.action == "add":

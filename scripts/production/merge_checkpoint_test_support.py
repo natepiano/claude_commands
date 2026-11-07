@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from scripts.shutdown import remote
+
+from scripts.production.fake_unit_host import labeled as labeled_host
+
+from scripts.lint.memory_test_support import config_environment
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import closing, contextmanager
+import fcntl
 import json
 import os
+import select
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -14,16 +24,22 @@ from types import ModuleType
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import ClassVar, NamedTuple, cast, override
+from typing import IO, ClassVar, NamedTuple, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
-import change_review
+from scripts.lib import process_group
+
+from scripts.production import merge_checkpoint
+from scripts.production import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.production import staff
-from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import fake_unit_host, staff
+from scripts.message import sessions
+from scripts.herdr.herdr import NATIVE_ID_MARKS
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -33,7 +49,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
-            cwd: Path | str | None = None, stdout: int | None = None,
+            cwd: Path | str | None = None, stdin: int | None = None, stdout: int | None = None,
             stderr: int | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
         child_env = dict(os.environ) if env is None else env
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
@@ -53,40 +69,24 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
         if script == Path(progress_history.__file__):
             return invoke_recorder(args, child_env, child_cwd)
         return real_run(command, capture_output=capture_output, text=text, check=check,
-                        timeout=timeout, env=env, cwd=cwd, stdout=stdout, stderr=stderr, input=input)
+                        timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
-        change_review, "LISTS", Path(environment["HOME"]) / "rust/hanadocs/change-review",
+        change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
     ):
         return invoke_cli(merge_checkpoint, merge_checkpoint.main, arguments, environment, cwd,
                           production_state=True)
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
 TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14, "
          "ux check minutes 4, ux repair minutes 1")
-SIMPLE_OWNS = "`src/alpha.txt`, `crates/alpha/`, `docs/plans/alpha.md`, `docs/plans/alpha-next.md`"
-REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/production/add_unit.py`, "
-             "`test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; "
-             "`commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: "
-             "`commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, "
-             "`scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests "
-             "(hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): "
-             "`commands/unit/direct.md`, `commands/unit/checkpoint.md`, "
-             "`docs/direct/run_phase_review.md`, `docs/production_format.md`, "
-             "`commands/unit/add_ons.md`, `commands/plan/shrink.md`, "
-             "`commands/plan/phase_review.md`, `docs/direct/phase_end.md`, "
-             "`docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, "
-             "`docs/direct/final_gate_commit.md`")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
-                    "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
-                    "because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout")
+                    "and `basedpyright scripts/buildlog` (status zero and a clean summary), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
 PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
@@ -98,6 +98,7 @@ import sys
 state = Path(os.environ["CHECKPOINT_TEST_STATE"])
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+TEST_HANG_GUARD_SECS = __HANG_GUARD__
 with (state / "events.jsonl").open("a") as output:
     output.write(json.dumps({"command": name, "args": args}) + "\\n")
 if name == "ssh":
@@ -108,7 +109,7 @@ if name == "style_sync.py":
     repo = args[args.index("--repo-dir") + 1]
     branch = args[args.index("--branch") + 1]
     observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
-                              capture_output=True, text=True, check=True).stdout.split()[0]
+                              capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
     fail_rows = state / "fail-rows"
@@ -136,18 +137,86 @@ if (state / ("fail-" + name)).exists():
 if name == "basedpyright":
     print("0 errors, 0 warnings, 0 notes", flush=True)
     print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
-    raise SystemExit(3)
-'''
+    raise SystemExit(0)
+'''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+
+
+BUMP_TEST_STUB = STUB + '''
+import subprocess
+sys.path.insert(0, __TEST_REPOSITORY__)
+from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.message import sessions
+from scripts.herdr.herdr import NATIVE_ID_MARKS
+
+def git(*arguments):
+    return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+
+gate_pid = os.getppid()
+run = {"cwd": str(Path.cwd()), "head": git("rev-parse", "HEAD"),
+       "origin": git("ls-remote", os.environ["BUMP_TEST_ORIGIN"], "refs/heads/production").split()[0],
+       "branch": subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip(),
+       "gate_pid": gate_pid, "gate_start": sessions.process_start(gate_pid),
+       "session": os.getsid(0), "stdin_closed": os.read(0, 1) == b""}
+# A red command is retried inside the same gate. Observe runners, not attempts.
+path = state / "gate-runs" / f"{gate_pid}-{run['gate_start']}.json"
+temporary = path.with_suffix(".pending")
+temporary.write_text(json.dumps(run))
+temporary.replace(path)
+if (state / "gate-blocked").exists():
+    wait_for_file(state / "gate-release")
+fail_once = state / "gate-fail-once"
+if fail_once.exists():
+    fail_once.unlink()
+    raise SystemExit(1)
+if (state / "gate-red").exists() and "-E" not in args:
+    print("    FAIL [  0.1s] (1/1) fixture bump_contract_failed", flush=True)
+    raise SystemExit(1)
+'''.replace("__TEST_REPOSITORY__", repr(str(Path(__file__).resolve().parents[2])))
+
+BUMP_SEND_STUB = STUB + '''
+import uuid
+if (state / "slow-delivery").exists():
+    sys.path.insert(0, __TEST_REPOSITORY__)
+    from scripts.direct.wait_for_test_state import wait_for_file
+    (state / "delivery-started").touch()
+    wait_for_file(state / "delivery-release")
+if (state / "stop-before-showrunner-notice").exists() and "showrunner" in args[args.index("--to") + 1]:
+    import signal
+    os.kill(os.getppid(), signal.SIGKILL)
+    raise SystemExit(1)
+retry = state / "send-fail-once"
+if retry.exists():
+    retry.unlink()
+    print("fixture send failed", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+path = state / "gate-notices" / (uuid.uuid4().hex + ".json")
+temporary = path.with_suffix(".pending")
+temporary.write_text(json.dumps(args))
+temporary.replace(path)
+print("SENT: fixture", flush=True)
+'''.replace("__TEST_REPOSITORY__", repr(str(Path(__file__).resolve().parents[2])))
+
+
+class BumpGateObservation(NamedTuple):
+    checkout: Path
+    head: str
+    origin: str
+    branch: str
+    gate_pid: int
+    gate_start: str
+    session: int
+    stdin_closed: bool
 
 
 def configure_test_environment() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them. The
-    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    """Use Pacific time and private scratch and registry folders for each module."""
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        **config_environment(Path(folder.name) / "config"),
         "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
         "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
+    _ = unittest.enterModuleContext(isolated_staff_file(Path(folder.name) / "staff.json", {}))
 
 
 class MergeResult(NamedTuple):
@@ -173,7 +242,6 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.promotions: str = ""
         self.known_flakes: str = ""
         self.known_flaky_tests: str = ""
-        self.gate: bool = True
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
@@ -187,7 +255,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
         builder = cls()
         builder.bind_fixture(cls.fixture_root)
-        builder.build_fixture()
+        with isolated_staff_file(Path(builder.env["STAFF_FILE"]), builder.env):
+            builder.build_fixture()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
         shutil.rmtree(cls.fixture_root)
 
@@ -207,6 +276,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
         self.addCleanup(cleanup)
         self.bind_fixture(self.fixture_root)
+        _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -215,12 +285,12 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.unit = self.root / "alpha"
         self.other = self.root / "beta"
         self.promote = self.root / "installed"
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "tool-based-ui-production.md"
         self.log = self.checkout / "production.log"
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        self.env = {**os.environ, "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        self.env = {**os.environ, "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -236,6 +306,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def build_fixture(self) -> None:
         self.root.mkdir()
+        _ = config_environment(self.root)
         self.bin.mkdir()
         self.state.mkdir()
         self.checkout.mkdir()
@@ -245,7 +316,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
         self.write(self.checkout, "README.md", "base\n")
-        self.write(self.checkout, ".gitignore", "production.log\n")
+        self.write(self.checkout, ".gitignore", "production.log\n.unit.toml\n")
         self.write(self.checkout, "src/alpha.txt", "alpha base\n")
         self.write(self.checkout, "src/beta.txt", "beta base\n")
         _ = self.git("add", ".", cwd=self.checkout)
@@ -267,6 +338,7 @@ class MergeCheckpointFixture(unittest.TestCase):
                      "style_sync.py", "style_ledger.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
+        (home / "rust/hanadocs/change-review").mkdir(parents=True)
         for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
@@ -274,12 +346,17 @@ class MergeCheckpointFixture(unittest.TestCase):
             directory.mkdir(parents=True)
             self.executable(directory / name, STUB)
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            _ = staff.ensure("showrunner", name="example")
+            _ = fixture_member("showrunner", name="example")
         self.production_doc()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(remote.local_machine(), self.doc))
+            for name, folder in (("alpha", self.unit), ("beta", self.other)):
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                                   worktree=staff.PresentWorktree(remote.local_machine(), folder))
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
-                                capture_output=True, text=True, check=False)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
@@ -293,9 +370,12 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
 
-    def production_doc(self, *, owns_cell: str = SIMPLE_OWNS,
-                       merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
-                       hub_files: bool = True, change_review: Path | None = None) -> None:
+    def production_doc(self, *, merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
+                       change_review: Path | None = None) -> None:
+        for folder, plan in ((self.unit, "alpha"), (self.other, "beta")):
+            (folder / "docs/plans").mkdir(parents=True, exist_ok=True)
+            _ = (folder / ".unit.toml").write_text(
+                f'plan = "docs/plans/{plan}.md"\nresponsibilities = []\n', encoding="utf-8")
         rows = [
             "# Production — example", "", "## Production Context", "",
             f"- **Repository:** `{self.checkout}`",
@@ -316,26 +396,6 @@ class MergeCheckpointFixture(unittest.TestCase):
             rows.append(f"- **Known flakes:** {self.known_flakes}")
         if self.known_flaky_tests:
             rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
-        rows.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/plans/alpha.md` | `{self.unit}` | `alpha-branch` | alpha | — | {owns_cell} |",
-            f"| `beta-unit` | `docs/plans/beta.md` | `{self.other}` | `beta-branch` | beta | — | `src/beta.txt` |",
-            "", "## Gates", "",
-            "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-        ])
-        if hub_files:
-            hub_start = rows.index("## Gates") - 1
-            rows[hub_start:hub_start] = [
-                "## Hub files", "",
-                "| File | Owner unit | Other units that touch it |",
-                "| --- | --- | --- |",
-                "| `shared.txt` | beta-unit | alpha-unit |", "",
-            ]
-        if self.gate:
-            rows.append("| G1 | beta-unit Phase 4 | alpha-unit Phase 2 | checkpoint merged |")
         rows.extend(["", "## Production rules", "", "- Merge each phase and push the merge branch."])
         _ = self.doc.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
@@ -349,11 +409,32 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return sha
 
+    def push_main_change(self, relative: str, content: str) -> str:
+        """Push an independent main fix through the fixture's private origin."""
+        writer = self.root / "main-fix-writer"
+        _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
+        _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
+        self.write(writer, relative, content)
+        _ = self.git("add", relative, cwd=writer)
+        _ = self.git("commit", "-m", "independent main fix", cwd=writer)
+        _ = self.git("push", "origin", "main", cwd=writer)
+        return self.git("rev-parse", "HEAD", cwd=writer)
+
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
                        delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
-        arguments = ["--production", str(self.doc), "alpha-unit", phase, sha,
+        runs = self.root / "history/runs"
+        fixture_records = runs / "fixture.jsonl"
+        if "--shrink" not in extra and "--as-built" not in extra and not any(
+                path != fixture_records for path in runs.glob("*.jsonl")):
+            runs.mkdir(parents=True, exist_ok=True)
+            with fixture_records.open("a") as output:
+                _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(self.unit), "checkpoint_commit": sha,
+                    "phase_id": phase, "timestamp_epoch": fixture_records.stat().st_size}) + "\n")
+        arguments = ["--production", "example", "alpha", phase, sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
@@ -365,6 +446,193 @@ class MergeCheckpointFixture(unittest.TestCase):
         arguments.extend(extra)
         process = self.invoke(arguments)
         return MergeResult(process, before)
+
+    def prepare_bump_gate(self, *, red: bool = False, blocked: bool = True) -> None:
+        """Use the normal merge fixture with file handshakes and private recipients."""
+        for name in ("gate-runs", "gate-notices"):
+            (self.state / name).mkdir()
+        for enabled, marker in ((red, "gate-red"), (blocked, "gate-blocked")):
+            if enabled:
+                (self.state / marker).touch()
+        self.executable(self.bin / "checkpoint-test", BUMP_TEST_STUB)
+        self.executable(self.bin / "send.py", BUMP_SEND_STUB)
+        self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
+        self.env["BUMP_TEST_ORIGIN"] = str(self.origin)
+        self.env.update(fake_unit_host.environment(self.state))
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            production_membership("example", "alpha")
+            runner = fixture_member("showrunner", name="example")
+            director = unit_membership("example", "alpha")
+            fake_unit_host.write(self.env, [labeled_host("fixture", "w1:p1", "alpha", production_name="example")])
+        records = self.root / "sessions"
+        records.mkdir()
+        self.env["NOTIFIER_SESSIONS_DIR"] = str(records)
+        sockets = Path(self.enterContext(short_socket_directory()))
+        for name, pid in (("alpha", os.getpid()), ("showrunner", fake_unit_host.live_pid(self))):
+            address = sockets / (name + ".sock")
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(address))
+            self.addCleanup(held.close)
+            if name == "alpha":
+                fake_unit_host.place_process(self.env, pid, "w1:p1")
+            _ = (records / (str(pid) + ".json")).write_text(json.dumps({
+                "pid": pid, "sessionId": director.id if name == "alpha" else runner.id, "name": name,
+                "messagingSocketPath": str(address), "updatedAt": 1,
+                "procStart": sessions.process_start(pid), "tmux": "",
+            }))
+        timer = self.root / f"notifier/showrunner-{runner.id}"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_text(
+            f"TARGET=session:{runner.id}\nCHECK=zsh /fixture/production_check.sh {runner.id}\n"
+        )
+        self.addCleanup(self.stop_bump_gates)
+
+    def refuse_bump_clone(self) -> None:
+        git = shutil.which("git")
+        assert git is not None
+        self.executable(self.bin / "git", "#!/usr/bin/env python3\nimport os, sys\n"
+                        + "arguments = sys.argv[1:]\n"
+                        + "while arguments[:1] in (['-c'], ['-C']): arguments = arguments[2:]\n"
+                        + "if arguments[:1] == ['clone']:\n"
+                        + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
+                        + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
+
+    @contextmanager
+    def refuse_bump_gate_launch(self) -> Generator[None]:
+        original = subprocess.Popen
+
+        def launch(command: Sequence[str], *, stdin: int | None = None,
+                   stdout: int | IO[str] | None = None, stderr: int | IO[str] | None = None,
+                   cwd: str | Path | None = None, env: Mapping[str, str] | None = None,
+                   text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
+            if any(Path(word).name == "bump_gate.py" for word in command):
+                raise OSError("fixture gate launch refused")
+            return original(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
+                            text=text, start_new_session=start_new_session)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=launch):
+            yield
+
+    def move_bump_recipients(self) -> None:
+        timer = next((self.root / "notifier").glob("showrunner-*/conf"))
+        timer_text = timer.read_text()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            for path in (self.root / "sessions").glob("*.json"):
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                old_id = staff.native_id(cast(str, row["sessionId"]))
+                new_id = staff.native_id(fixture_runtime_id("moved-recipient:" + old_id))
+                _ = staff.update_current_session(old_id, new_id)
+                for environment in Path(self.env["HERDR_PROC"]).glob("*/environ"):
+                    parts = environment.read_bytes().split(b"\0")
+                    for index, part in enumerate(parts):
+                        key, separator, value = part.partition(b"=")
+                        if key.decode() in NATIVE_ID_MARKS and value.decode() == old_id:
+                            parts[index] = key + separator + new_id.encode()
+                    _ = environment.write_bytes(b"\0".join(parts))
+                row["sessionId"] = new_id
+                row["name"] = cast(str, row["name"]) + "-moved"
+                _ = path.write_text(json.dumps(row))
+        _ = timer.write_text(timer_text)
+
+    def launch_competing_bump_gate(self, tip: str) -> subprocess.Popen[bytes]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        output = self.enterContext((self.state / "competing-gate.log").open("wb"))
+        process = subprocess.Popen(
+            [sys.executable, str(SCRIPT.with_name("bump_gate.py")), "--record", str(path)],
+            cwd=self.checkout, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+
+        def cleanup() -> None:
+            if process.poll() is None:
+                process_group.send_process_group(process.pid, signal.SIGKILL)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def wait_competing_bump_gate(self, process: subprocess.Popen[bytes]) -> None:
+        wait_until(lambda: process.poll() is not None or len(self.bump_gate_runs()) > 1,
+                   self.state / "gate-runs", processes=(process,))
+
+    def bump_gate_record(self, tip: str) -> dict[str, object]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        return cast(dict[str, object], json.loads(path.read_text()))
+
+    def assert_main_push_lock_available(self) -> None:
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        with (common / "main-push.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def wait_bump_result(self, tip: str) -> dict[str, object]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        return self.wait_bump_result_at(path)
+
+    def wait_bump_result_at(self, path: Path) -> dict[str, object]:
+        wait_until(lambda: path.exists() and merge_checkpoint.read_record(path)["result"] in ("red", "green"), path.parent)
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        pid = cast(int, record["pid"])
+        if pid:
+            self.wait_bump_process_exit(pid)
+        return record
+
+    def bump_gate_runs(self) -> list[BumpGateObservation]:
+        runs: list[BumpGateObservation] = []
+        for path in sorted((self.state / "gate-runs").glob("*.json")):
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            runs.append(BumpGateObservation(
+                Path(cast(str, row["cwd"])), cast(str, row["head"]), cast(str, row["origin"]),
+                cast(str, row["branch"]), cast(int, row["gate_pid"]), cast(str, row["gate_start"]),
+                cast(int, row["session"]), cast(bool, row["stdin_closed"]),
+            ))
+        return runs
+
+    def wait_bump_gate_runs(self, count: int) -> list[BumpGateObservation]:
+        wait_until(lambda: len(self.bump_gate_runs()) >= count, self.state / "gate-runs")
+        return self.bump_gate_runs()
+
+    def bump_notices(self) -> list[list[str]]:
+        return [cast(list[str], json.loads(path.read_text()))
+                for path in sorted((self.state / "gate-notices").glob("*.json"))]
+
+    def release_bump_gate(self) -> None:
+        (self.state / "gate-release").touch()
+
+    def wait_bump_gate_exit(self, run: BumpGateObservation) -> None:
+        self.wait_bump_process_exit(run.gate_pid)
+
+    def wait_bump_process_exit(self, pid: int) -> None:
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "background gate did not finish")
+        finally:
+            os.close(descriptor)
+        try:
+            _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+    def stop_bump_gate(self, run: BumpGateObservation) -> None:
+        if run.checkout == self.checkout:
+            return
+        if isinstance(sessions.process_liveness(run.gate_pid, run.gate_start), sessions.LiveSessionProcess):
+            self.assertEqual(os.getsid(run.gate_pid), run.gate_pid, "fixture gate must own its session")
+            process_group.send_process_group(run.gate_pid, signal.SIGKILL)
+            try:
+                _ = os.waitpid(run.gate_pid, 0)
+            except ChildProcessError:
+                pass
+        if run.checkout.exists():
+            shutil.rmtree(run.checkout)
+
+    def stop_bump_gates(self) -> None:
+        for run in self.bump_gate_runs():
+            self.stop_bump_gate(run)
 
     def events(self, command: str) -> list[list[str]]:
         path = self.state / "events.jsonl"
@@ -380,7 +648,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.events("review_regime.py"), [])
-        self.assertIn("send alpha-unit:", result.process.stdout)
+        self.assertIn("send alpha:", result.process.stdout)
 
     def receipts(self) -> list[dict[str, object]]:
         path = self.root / "history" / "merge_receipts.jsonl"
@@ -432,19 +700,12 @@ class MergeCheckpointFixture(unittest.TestCase):
                 self.assertTrue(phase["reason"])
                 self.assertTrue(phase["candidates"])
 
-    def assert_real_owns_path_allowed(self, relative: str) -> None:
-        self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
-        sha = self.checkpoint(relative, relative + "\n", subject="own " + relative)
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scope: ok", result.process.stdout)
-
     def dated_checkpoint(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
         self.write(self.unit, "src/alpha.txt", message)
         _ = self.git("add", "src/alpha.txt", cwd=self.unit)
         _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,
-                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"})
+                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"}, timeout=TEST_HANG_GUARD_SECS)
         _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return self.git("rev-parse", "HEAD", cwd=self.unit)
 
@@ -467,7 +728,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = doc.write_text("\n".join([
             "# Style production", "- **Kind:** style", "- **Branch point:** production",
             "- **Merge branch:** alpha-branch", f"- **Showrunner checkout:** {self.unit}",
-            "- **Log:** style.log", "", "## Units", "",
+            "- **Log:** style.log", "",
         ]))
         _ = (self.state / "child-parent").write_text(parent)
         registry = self.bin / "showrunners.py"
@@ -480,13 +741,17 @@ class MergeCheckpointFixture(unittest.TestCase):
             "else: raise SystemExit(2)", "",
         ]))
         self.executable(self.bin / "send.py", STUB)
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            relationship = fixture_member("showrunner", name=parent).id if parent else staff.StaffRoot()
+            _ = fixture_member("showrunner", name="example-style", parent=relationship,
+                               doc=staff.LiveDoc(remote.local_machine(), doc))
         self.env["MERGE_CHECKPOINT_SHOWRUNNERS"] = str(registry)
         self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
         return doc
 
     def run_handoff(self, checkpoint: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return self.invoke(["--from-child", "example-style", "--checkpoint", checkpoint,
-                            "--production", str(self.doc), "--started", STARTED, *extra])
+                            "--production", "example", "--started", STARTED, *extra])
 
     def prepare_handoff_ledger(self, checkpoint: str, *, add_handoff: bool = True) -> None:
         ledger = Path(__file__).resolve().parents[1] / "style/style_ledger.py"
@@ -518,11 +783,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         return rows[0]
 
     def invoke(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        # Keep real executable coverage for both the unit and child entry paths.
-        if self._testMethodName in (
-            "test_checkpoint_receipt_names_pushed_merge_and_source_once_on_retry",
-            "test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push",
-        ):
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
                                   env=self.env, capture_output=True, text=True, check=False,
                                   timeout=TEST_HANG_GUARD_SECS)

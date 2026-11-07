@@ -1,5 +1,5 @@
 ---
-description: Query stage, phase, and run timings across skill run history
+description: Report skill run, stage, and phase times.
 ---
 
 # history
@@ -10,7 +10,7 @@ description: Query stage, phase, and run timings across skill run history
 Run:
 
 ```bash
-python3 ~/.claude/scripts/history/history.py $ARGUMENTS
+~/.claude/scripts/lib/py ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
 Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the nine
@@ -55,7 +55,7 @@ unconverted.
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
-- `rounds` — repair rounds and causes per phase instance; median and shares cover phases with a recorded review start; lists unreviewed phases separately in the summary; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
+- `rounds` reports repair rounds and causes per phase instance. A round requires a started fix pass. Relaunches of one ledger batch count as one round. A refunded batch adds no round unless it later lands. A dispatch alone adds no round. Median and shares cover phases with a recorded review start. The summary lists unreviewed phases separately. Options include `--top N` (default 25), `--plan <substring>`, `--status`, and `--until` (same forms as `--since`). The report marks mixed phase records.
 - `routed [--open] [--since <time>] [--format text|json]` — routed findings, owners, Work Orders, due checkpoints, age and closure; read-only (the user, 2026-10-28)
 - `runs` — one row per run
 - `tests` — verification and smoke history
@@ -72,7 +72,7 @@ table|json|csv`. Beyond those:
 - `--stage`, `--label`, `--agent` substring filters on `stages` and `runs`
 - `--group slot` — which worker of the phase team (`impl`, `impl2`, `test`,
   `review`) recorded the pass. **Empty on every pass before 2026-08-31**, and on
-  any recorder outside `implement.sh`, where it groups as `-`. A worker, not a
+  recorders that omit the slot, where it groups as `-`. A worker, not a
   role: a worker's role changes within a run — all three implementing, then all
   three testing, any mix — so this names the chair, and `stage` names the work.
   It does not yet make a team phase visible. The recorder can now hold one open
@@ -110,7 +110,7 @@ store. `unit-history` is the only one.
   assignment off the data instead of reconstructing it.
 - **`task` and `stage` say the same thing for a worker pass**, so group on one
   or the other, not both, unless a second skill is in the window. Worker tasks
-  are the four kinds — `impl`, `test`, `fix`, `review` — and `agents.conf` holds
+  are the four kinds — `impl`, `test`, `fix`, `review` — and `models.conf` holds
   one row per kind. It used to hold five keys where three (`architect`,
   `mechanical`, `escalation`) named an agent tier rather than a job, and on
   2026-08-30 the tier axis was removed and 6141 stored events were rewritten to

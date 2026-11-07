@@ -1,7 +1,9 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+import importlib.util
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -18,22 +20,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-from typing import TYPE_CHECKING, cast
+from typing import cast, override
 
 
-if TYPE_CHECKING:
-    from typing import override
-else:
-    from typing import TypeVar
-
-    OverriddenMethod = TypeVar("OverriddenMethod")
-
-    def override(method: OverriddenMethod) -> OverriddenMethod:
-        return method
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from scripts.review_links import serve
+from scripts.review_links import change_page, serve
+from scripts.lib import atomic_file, conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @dataclass(frozen=True)
@@ -41,6 +33,13 @@ class HttpReply:
     status: int
     content_type: str
     body: bytes
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    for stem in ("review_links", "change_review"):
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -64,7 +63,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
 
     def request(self, path: str) -> HttpReply:
-        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             connection.request("GET", path)
             response = connection.getresponse()
@@ -109,7 +108,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 # handle_request serves one disposable connection without a background service.
                 thread = threading.Thread(target=server.handle_request)
                 thread.start()
-                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
                 try:
                     connection.request("GET", "/bbbbbb/draft.txt")
                     response = connection.getresponse()
@@ -117,7 +116,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(response.read(), b"still served")
                 finally:
                     connection.close()
-                    thread.join(5)
+                    thread.join(TEST_HANG_GUARD_SECS)
         self.assertTrue(expired.exists())
         self.assertIn("cannot delete snapshot", errors.getvalue())
         self.assertIn("aaaaaa", errors.getvalue())
@@ -164,7 +163,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                             self.assertEqual(reply.status, 200)
                             self.assertEqual(reply.body, b"still served")
                         finally:
-                            thread.join(5)
+                            thread.join(TEST_HANG_GUARD_SECS)
                 self.assertTrue(symlink.is_symlink())
                 self.assertTrue(target.is_dir())
                 if inaccessible == unreadable:
@@ -211,6 +210,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                 reply = self.request(f"/{folder}/draft.html")
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b"<title>Review snapshot</title>")
+
+    def test_an_atomic_index_temporary_is_not_served_before_publication(self) -> None:
+        private = b"private index source paths and page tokens"
+        publish = os.replace
+        requested: list[str] = []
+
+        def replace_file(source: Path, destination: Path) -> None:
+            requested.append(source.name)
+            self.assertEqual(source.read_bytes(), private)
+            reply = self.request("/" + source.name)
+            self.assertEqual(reply.status, 404)
+            self.assertNotIn(private, reply.body)
+            publish(source, destination)
+
+        with patch.object(os, "replace", side_effect=replace_file):
+            atomic_file.write_bytes_atomic(self.root / ".index.json", private, mode=0o600)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual((self.root / ".index.json").read_bytes(), private)
 
     def test_index_and_unfinished_writes_are_not_served(self) -> None:
         for filename in (".index.json", ".review-link-unfinished"):
@@ -468,6 +485,193 @@ class ServerAddressHealthTests(unittest.TestCase):
         self.assertEqual(self.stderr.getvalue(), "")
 
 
+class ServerCodeHealthTests(unittest.TestCase):
+    checkout: Path = Path()
+    elapsed: float = 100.0
+    module_file: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-code-test-")))
+        server_file = self.checkout / "scripts/review_links/serve.py"
+        server_file.parent.mkdir(parents=True)
+        _ = server_file.write_text("# The server uses this temporary checkout.\n")
+        os.utime(server_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        _ = self.enterContext(patch.object(serve, "__file__", str(server_file)))
+        self.elapsed = 100.0
+        _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
+        self.module_file = self.checkout / "review_code_fixture.py"
+        _ = self.module_file.write_text("VALUE = 'before'\n")
+        os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        self.load_module(self.module_file)
+
+    def start_server(self) -> serve.ReviewLinksServer:
+        return self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.checkout / "snapshots"))
+
+    def load_module(self, path: Path) -> None:
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        _ = cast(object, self.enterContext(patch.dict(sys.modules, {path.stem: module})))
+        spec.loader.exec_module(module)
+
+    def test_unchanged_code_keeps_serving_and_reads_settings_only_when_the_check_is_due(self) -> None:
+        server = self.start_server()
+        with patch.object(conf, "read", wraps=conf.read) as read:
+            self.elapsed = 104.0
+            server.service_actions()
+            server.service_actions()
+            read.assert_not_called()
+            self.elapsed = 105.0
+            server.service_actions()
+            read.assert_called_once_with("review_links")
+            self.elapsed = 109.0
+            server.service_actions()
+            read.assert_called_once_with("review_links")
+            self.elapsed = 110.0
+            server.service_actions()
+            self.assertEqual(read.call_count, 2)
+
+    def test_a_deleted_loaded_module_requires_a_restart(self) -> None:
+        server = self.start_server()
+        self.module_file.unlink()
+        self.elapsed = 105.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            server.service_actions()
+        self.assertIn(str(self.module_file), str(changed.exception))
+
+    def test_a_module_loaded_after_start_joins_the_checks_without_a_restart(self) -> None:
+        server = self.start_server()
+        late_module = self.checkout / "late_review_code_fixture.py"
+        _ = late_module.write_text("VALUE = 'first'\n")
+        os.utime(late_module, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        self.load_module(late_module)
+        self.elapsed = 105.0
+        server.service_actions()
+        _ = late_module.write_text("VALUE = 'changed later'\n")
+        self.elapsed = 110.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            server.service_actions()
+        self.assertIn(str(late_module), str(changed.exception))
+
+    def test_a_newly_seen_module_modified_after_process_start_requires_a_restart(self) -> None:
+        server = self.start_server()
+        late_module = self.checkout / "late_review_code_fixture.py"
+        _ = late_module.write_text("VALUE = 'promoted before its first check'\n")
+        os.utime(late_module, ns=(serve.STARTED_NS + 1_000_000_000, serve.STARTED_NS + 1_000_000_000))
+        self.load_module(late_module)
+        self.elapsed = 105.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            server.service_actions()
+        self.assertIn(str(late_module), str(changed.exception))
+
+    def test_an_active_verdict_defers_restart_and_keeps_the_recorded_stamps(self) -> None:
+        server = self.start_server()
+        stamps = dict(server.module_stamps)
+        page = change_page.ReviewPage(self.checkout / "changes.md", self.checkout / "production.md", ("C1",), "token")
+        status = server.delivery_status
+        attempt = status.begin(page, "C1", "verdict")
+        _ = self.module_file.write_text("VALUE = 'changed during the verdict'\n")
+        os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        self.elapsed = 105.0
+        server.service_actions()
+        self.assertEqual(server.module_stamps, stamps)
+        status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
+        self.elapsed = 110.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            server.service_actions()
+        self.assertIn(str(self.module_file), str(changed.exception))
+
+
+class ServerCodeRestartTests(unittest.TestCase):
+    def test_a_changed_module_restarts_the_same_process_and_keeps_serving_http(self) -> None:
+        checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
+        server_file = checkout / "scripts/review_links/serve.py"
+        server_file.parent.mkdir(parents=True)
+        _ = server_file.write_text("# The server uses this temporary checkout.\n")
+        module_file = checkout / "review_restart_fixture.py"
+        _ = module_file.write_text("VALUE = 'before'\n")
+        settings = (Path(__file__).resolve().parents[2] / "config/review_links.conf").read_text()
+        _ = (checkout / "review_links.conf").write_text(settings.replace("code_check_seconds=5", "code_check_seconds=0.05"))
+        root = checkout / "snapshots"
+        root.mkdir()
+        _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
+        driver = checkout / "driver.py"
+        _ = driver.write_text('''import importlib.util
+import os
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+from scripts.review_links import serve
+
+checkout = Path(__file__).parent
+serve.__file__ = str(checkout / "scripts/review_links/serve.py")
+serve.tailscale_ip = lambda: "127.0.0.1"
+spec = importlib.util.spec_from_file_location("review_restart_fixture", checkout / "review_restart_fixture.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+class ObservedServer(serve.ReviewLinksServer):
+    def __init__(self, address, root):
+        super().__init__(address, root)
+        os.environ["REVIEW_TEST_PORT"] = str(self.server_port)
+        line = f"{os.getpid()} {module.VALUE} {self.server_port}"
+        with (checkout / "starts.txt").open("a") as output:
+            output.write(line + "\\n")
+        print(line, file=sys.__stdout__, flush=True)
+
+serve.ReviewLinksServer = ObservedServer
+with redirect_stdout(sys.stderr):
+    raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
+''')
+        errors_path = checkout / "errors.txt"
+        errors = self.enterContext(errors_path.open("w"))
+        child: subprocess.Popen[str] = subprocess.Popen(
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-P", "-B", str(driver)],
+            cwd=checkout, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
+                               "CLAUDE_PYTHON": sys.executable},
+            stdout=subprocess.PIPE, stderr=errors, text=True,
+        )
+
+        def stop_child() -> None:
+            child.terminate()
+            try:
+                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        self.addCleanup(stop_child)
+
+        def read_start() -> tuple[int, str, int]:
+            assert child.stdout is not None
+            ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
+            self.assertEqual(ready, [child.stdout], errors_path.read_text())
+            line = cast(str, child.stdout.readline())
+            self.assertTrue(line, errors_path.read_text())
+            pid, value, port = line.split()
+            return int(pid), value, int(port)
+
+        first = read_start()
+        self.assertEqual(first[0], child.pid)
+        self.assertEqual(first[1], "before")
+        _ = module_file.write_text("VALUE = 'after_code_change'\n")
+        second = read_start()
+        self.assertEqual(second, (first[0], "after_code_change", first[2]))
+        self.assertEqual((checkout / "starts.txt").read_text().splitlines(),
+                         [f"{pid} {value} {port}" for pid, value, port in (first, second)])
+        connection = HTTPConnection("127.0.0.1", second[2], timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("GET", "/answer.txt")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        finally:
+            connection.close()
+        self.assertIn(f"review-links: code changed: {module_file}", errors_path.read_text())
+
+
 class ServerStartupTests(unittest.TestCase):
     def test_server_exits_nonzero_when_tailscale_ipv4_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="review-startup-test-") as directory:
@@ -476,13 +680,74 @@ class ServerStartupTests(unittest.TestCase):
             _ = tailscale.write_text("#!/bin/sh\necho 'Tailscale is down' >&2\nexit 1\n", encoding="utf-8")
             tailscale.chmod(0o755)
             result = subprocess.run(
-                [sys.executable, str(Path(__file__).with_name("serve.py")), "--port", "0"],
-                env={**os.environ, "PATH": str(root), "REVIEW_LINKS_ROOT": str(root / "snapshots")},
-                text=True, capture_output=True, check=False, timeout=5,
+                ["/bin/bash", str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("serve.py")), "--port", "0"],
+                env={**os.environ, "PATH": str(root), "CLAUDE_PYTHON": sys.executable,
+                     "REVIEW_LINKS_ROOT": str(root / "snapshots")},
+                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("tailscale", result.stderr.lower())
 
+
+class ReviewLinksConfigTests(unittest.TestCase):
+    def test_service_polls_read_settings_only_when_a_check_is_due(self) -> None:
+        server = serve.ReviewLinksServer.__new__(serve.ReviewLinksServer)
+        server.next_tailscale_check = 200.0
+        server.next_sweep = 300.0
+        server.next_code_check = 400.0
+        server.bound_address = "127.0.0.1"
+        server.root = Path("unused")
+        with (patch.object(time, "monotonic", return_value=100.0) as elapsed,
+              patch.object(conf, "read", wraps=conf.read) as read,
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1") as address,
+              patch.object(serve, "sweep_snapshots", return_value=0) as sweep):
+            server.service_actions()
+            server.service_actions()
+            read.assert_not_called()
+            address.assert_not_called()
+            sweep.assert_not_called()
+            elapsed.return_value = 200.0
+            server.service_actions()
+            read.assert_called_once_with("review_links")
+            address.assert_called_once_with()
+            sweep.assert_not_called()
+            self.assertEqual(server.next_tailscale_check, 260.0)
+            server.next_tailscale_check = 1000.0
+            elapsed.return_value = 300.0
+            server.service_actions()
+            self.assertEqual(read.call_count, 2)
+            sweep.assert_called_once()
+            self.assertEqual(server.next_sweep, 3900.0)
+
+    def test_snapshot_sweeps_read_the_retention_setting_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "review_links.conf"
+            snapshot = root / "abc123"
+            snapshot.mkdir()
+            _ = (snapshot / "draft.txt").write_text("keep me")
+            os.utime(snapshot, (10, 10))
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                _ = settings.write_text("# range: 0..\nsnapshot_retention_seconds=100\n")
+                self.assertEqual(serve.sweep_snapshots(root, 50), 0)
+                self.assertTrue(snapshot.is_dir())
+                _ = settings.write_text("# range: 0..\nsnapshot_retention_seconds=1\n")
+                self.assertEqual(serve.sweep_snapshots(root, 50), 1)
+                self.assertFalse(snapshot.exists())
+
+    def test_config_keeps_the_existing_values(self) -> None:
+        from scripts.lib import conf
+
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
+        for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.text(key), expected)
+        for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.whole(key), expected)
+        for key, expected in {'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.number(key), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

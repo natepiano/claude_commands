@@ -1,5 +1,5 @@
 ---
-description: Set a machine's credential idle timeout end to end — edit, commit, then close the stale ssh masters and chase the other machine.
+description: Set the credential idle timeout.
 ---
 
 **Arguments**: $ARGUMENTS — a duration. Empty means the default, 60 minutes. Accepts a bare number (minutes), or a number with a unit: `1`, `30m`, `90 minutes`, `2h`, `37 hours`, `1 day`, `1d`.

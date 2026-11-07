@@ -17,12 +17,11 @@ import tempfile
 from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-checkpoint-doc-gate.py")
 CHECKPOINT = 'git commit -m "checkpoint(efficiency): phase 1"'
 DOC_COMMAND = "~/.claude/scripts/direct/verify.sh doc"
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 DECIDE = cast(Callable[[str], str], runpy.run_path(str(HOOK))["decide"])
 
 
@@ -112,6 +111,45 @@ class CheckpointDocGateTests(unittest.TestCase):
         reason = decision.get("permissionDecisionReason", "")
         self.assertIn(DOC_COMMAND, reason)
         return reason
+
+    def test_help_passes_before_repository_and_message_checks(self) -> None:
+        from scripts.hooks import checkpoint_gate
+        for cwd in (self.repo, self.root):
+            for merging in (False, True):
+                if merging:
+                    _ = (self.repo / ".git/MERGE_HEAD").write_text("unknown\n")
+                for subcommand in ("commit", "merge"):
+                    for option in ("-h", "--help"):
+                        with self.subTest(cwd=cwd, merging=merging, subcommand=subcommand, option=option):
+                            with mock.patch.object(checkpoint_gate, "commit_directory", side_effect=AssertionError("read repository")):
+                                self.assert_allowed("git " + subcommand + " " + option, cwd=cwd)
+                if merging:
+                    (self.repo / ".git/MERGE_HEAD").unlink()
+        _ = self.assert_denied("git commit -h; " + CHECKPOINT)
+        _ = self.assert_denied(CHECKPOINT + " -m '-h'")
+        for option in ("--abort", "--quit"):
+            self.assert_allowed("git status && GIT_DIR=missing git merge " + option)
+
+    def test_trailer_options_refuse_without_changing_the_base_message(self) -> None:
+        from scripts.hooks import checkpoint_gate
+        _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                     "commit", "--amend", "--no-verify", "-q", "-m", "checkpoint(x): previous")
+        for option in ("--trailer ", "--trailer="):
+            for trailer in ("Reviewed-by: Person", "Change-Review=Visible | Try | See"):
+                argument = option + shlex.quote(trailer)
+                for message in ("-m 'checkpoint(x): current'", "--amend", "-C HEAD", "--reuse-message=HEAD"):
+                    for arguments in (argument + " " + message, message + " " + argument):
+                        with self.subTest(arguments=arguments):
+                            decision = self.decision("git commit " + arguments)
+                            self.assertEqual(decision["permissionDecision"], "deny")
+                            self.assertEqual(decision["permissionDecisionReason"], checkpoint_gate.TRAILER_FIX)
+        self.assert_allowed("git commit -m 'fix: ordinary' --trailer 'Reviewed-by: Person'")
+        for command in ('git commit -m "$MSG"', "git merge topic", "git -C missing commit -m 'fix: ordinary'"):
+            decision = self.decision(command + " --trailer 'Reviewed-by: Person'")
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertEqual(decision["permissionDecisionReason"], checkpoint_gate.TRAILER_FIX)
+        _ = self.record()
+        self.assert_allowed(CHECKPOINT + " -m 'Change-Review: none — tests only'")
 
     def test_other_commits_and_commands_bypass_broken_record_storage(self) -> None:
         self.records.rmdir()
@@ -885,7 +923,8 @@ class CheckpointDocGateTests(unittest.TestCase):
 
     def test_verify_header_describes_the_stable_locked_checkout(self) -> None:
         header = HOOK.parents[1].joinpath("direct/verify.sh").read_text(encoding="utf-8").split("set -", 1)[0]
-        self.assertIn("stable, locked checkout under the repo's target directory", header)
+        self.assertIn("`copies.py hold` locks a standing checkout under the configured copies root.", header)
+        self.assertIn("Fill that checkout from the staged index. Exclude unstaged and untracked files.", header)
         self.assertNotIn("checked out in a temporary directory under /tmp", header)
 
     def test_message_file_after_another_command_cannot_hide_a_checkpoint(self) -> None:
@@ -936,13 +975,69 @@ class CheckpointDocGateTests(unittest.TestCase):
         for command in ("ls", "echo commit", CHECKPOINT):
             payload = {"tool_name": "Bash", "cwd": str(self.root / "commit-cache"), "tool_input": {"command": command}}
             result = subprocess.run([sys.executable, str(isolated)], input=json.dumps(payload),
-                                    env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                                    env={**self.environment, "PYTHONPATH": str(self.root)},
+                                    capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             if command != CHECKPOINT:
                 self.assertEqual(result.stdout, "")
             else:
                 response = cast(dict[str, dict[str, str]], json.loads(result.stdout))
                 self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
-                self.assertIn("FileNotFoundError", response["hookSpecificOutput"]["permissionDecisionReason"])
+                self.assertIn("ModuleNotFoundError", response["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_parser_syntax_error_refuses_calls_that_may_commit_with_the_fix(self) -> None:
+        from scripts.hooks import checkpoint_gate
+        with mock.patch.object(checkpoint_gate, "decide", side_effect=SyntaxError("parser syntax")):
+            self.assertEqual(self.decision("echo commit"), {})
+            reason = self.assert_denied(CHECKPOINT)
+            self.assertIn("SyntaxError", reason)
+        isolated = self.root / "isolated-hook.py"
+        _ = shutil.copyfile(HOOK, isolated)
+        package = self.root / "scripts" / "hooks"
+        package.mkdir(parents=True)
+        _ = (package / "checkpoint_gate.py").write_text("this is invalid python!\n")
+        environment = {**self.environment, "PYTHONPATH": str(self.root)}
+        result = subprocess.run([sys.executable, str(isolated)], env=environment,
+                                input=json.dumps({"tool_name": "Bash", "cwd": str(self.repo),
+                                                  "tool_input": {"command": CHECKPOINT}}),
+                                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        response = cast(dict[str, dict[str, str]], json.loads(result.stdout))
+        self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("SyntaxError", response["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn(DOC_COMMAND, response["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_quoted_stdin_forms_and_merge_continue_use_the_judged_tree(self) -> None:
+        commands = ["git commit " + option + " " + delimiter + "\ncheckpoint(x): p\nEOF"
+                    for option in ("-F -", "--file -", "-F-", "-aF -")
+                    for delimiter in ("<<'EOF'", '<<"EOF"', "<<-'EOF'")]
+        _ = (self.repo / ".git/MERGE_MSG").write_text("checkpoint(x): p\n")
+        commands.append("git merge --continue")
+        for command in commands:
+            with self.subTest(command=command):
+                _ = self.assert_denied(command)
+        _ = self.record()
+        for command in commands:
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+        self.assert_allowed("echo $'it\\'s'")
+
+    def test_hook_imports_do_not_load_cli_or_owner_modules(self) -> None:
+        probe = """import runpy, sys
+runpy.run_path(sys.argv[1])
+heavy = {'argparse', 'scripts.lib.unit_runs', 'scripts.lib.copy_record',
+         'scripts.lib.scratch', 'herdr'}
+if sys.argv[2] == 'session':
+    heavy.add('scripts.lib.build_folders')
+loaded = sorted(heavy.intersection(sys.modules))
+assert not loaded, loaded
+"""
+        for path, kind in ((HOOK, "checkpoint"), (HOOK.with_name("session-start-temp-root.py"), "session")):
+            with self.subTest(hook=path.name):
+                result = subprocess.run([sys.executable, "-I", "-c", probe, str(path), kind],
+                                        cwd=self.root, env=self.environment, text=True,
+                                        capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
 
     def test_a_later_commits_all_flag_does_not_change_the_checkpoint_tree(self) -> None:
         _ = self.record()

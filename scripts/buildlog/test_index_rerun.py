@@ -15,8 +15,8 @@ from unittest import mock
 # Support both the package-qualified unittest command and directory discovery.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import index
-from test_index import Record, call, encode, point_root_at, step
+from scripts.buildlog import index
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, rows, step
 
 
 class IndexRerunTests(unittest.TestCase):
@@ -29,10 +29,6 @@ class IndexRerunTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.source = self.root / "natedev" / "2026-10.jsonl"
         self.source.parent.mkdir(parents=True)
-
-    def rows(self, sql: str) -> list[tuple[object, ...]]:
-        with closing(index.read_only()) as connection:
-            return cast(list[tuple[object, ...]], connection.execute(sql).fetchall())
 
     def row_without_id(self, table: str, record_id: str) -> dict[str, object]:
         with closing(index.read_only()) as connection:
@@ -69,21 +65,21 @@ class IndexRerunTests(unittest.TestCase):
 
         self.assertEqual(inserted, ["old-step"])
         self.assertEqual(self.source.read_bytes(), original)
-        self.assertEqual(self.rows("SELECT id FROM steps"), [])
-        self.assertEqual(self.rows("SELECT id FROM calls"), [])
-        self.assertEqual(self.rows("SELECT path FROM files"), [])
+        self.assertEqual(rows("SELECT id FROM steps"), [])
+        self.assertEqual(rows("SELECT id FROM calls"), [])
+        self.assertEqual(rows("SELECT path FROM files"), [])
 
         self.assertEqual(index.update(), len(records))
         expected_steps = [("new-step", "review", "new-unit"), ("old-step", "impl", "old-unit")]
         expected_calls = [("new-call", "fix", "new-call-unit"), ("old-call", "test", "call-unit")]
-        self.assertEqual(self.rows("SELECT id, worker, unit_session FROM steps ORDER BY id"), expected_steps)
-        self.assertEqual(self.rows("SELECT id, worker, unit_session FROM calls ORDER BY id"), expected_calls)
-        self.assertEqual(self.rows("SELECT offset FROM files"), [(len(original) - len(unfinished),)])
+        self.assertEqual(rows("SELECT id, worker, unit_session FROM steps ORDER BY id"), expected_steps)
+        self.assertEqual(rows("SELECT id, worker, unit_session FROM calls ORDER BY id"), expected_calls)
+        self.assertEqual(rows("SELECT offset FROM files"), [(len(original) - len(unfinished),)])
         self.assertEqual(self.source.read_bytes(), original)
 
         self.assertEqual(index.update(), 0)
-        self.assertEqual(self.rows("SELECT id, worker, unit_session FROM steps ORDER BY id"), expected_steps)
-        self.assertEqual(self.rows("SELECT id, worker, unit_session FROM calls ORDER BY id"), expected_calls)
+        self.assertEqual(rows("SELECT id, worker, unit_session FROM steps ORDER BY id"), expected_steps)
+        self.assertEqual(rows("SELECT id, worker, unit_session FROM calls ORDER BY id"), expected_calls)
         self.assertEqual(self.source.read_bytes(), original)
 
     def test_old_and_new_field_names_produce_equal_rows(self) -> None:
@@ -131,7 +127,7 @@ class IndexRerunTests(unittest.TestCase):
 
         for table in ("steps", "calls"):
             with self.subTest(table=table):
-                self.assertEqual(self.rows(f"SELECT id, worker, unit_session FROM {table} ORDER BY id"),
+                self.assertEqual(rows(f"SELECT id, worker, unit_session FROM {table} ORDER BY id"),
                                  sorted(expected))
         self.assertEqual(self.source.read_bytes(), original)
 

@@ -10,16 +10,18 @@
 # at once -- rather than N-1 point-to-point sends that can each fail.
 #
 # Usage:
-#   board.sh post    <session_dir> <agent> <kind> <message...>
-#   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
+#   board.sh post    [<session_dir>] <agent> <kind> <message...>
+#   board.sh read    [<session_dir>] [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
-#   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
-#   board.sh role    <session_dir> <slot> <role> [note...]
+#   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS] [--pid PID]
+#   board.sh role    [<session_dir>] <slot> <role> [note...]
 #   board.sh roles   <session_dir>
 #   board.sh locks   <session_dir>
+#
+# post, read, and role use UNIT_RUN_DIR when the first argument is not an absolute path.
 #
 # Post kinds (a closed set, so peers can scan for what concerns them):
 #   register  — "I am <slot>, opening in <role>". The launcher stamps the same
@@ -56,6 +58,8 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 
 die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 
@@ -168,7 +172,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if python3 -c 'import fcntl, sys
+  if "${BASH_SOURCE[0]%/*}/../lib/py" -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -179,6 +183,23 @@ except BlockingIOError:
   fi
   exec 9>&-
   [[ "$status" -eq 75 ]] && return 1
+  return 2
+}
+
+wait_lock_guard() {
+  local attempt status attempts delay_ms delay
+  attempts="$(conf_value direct TOKEN_GUARD_ATTEMPTS)" || return 2
+  delay_ms="$(conf_value direct TOKEN_GUARD_DELAY_MS)" || return 2
+  printf -v delay '%d.%03d' "$(( delay_ms / 1000 ))" "$(( delay_ms % 1000 ))"
+  for ((attempt=0; attempt<attempts; attempt++)); do
+    if lock_guard "$1"; then
+      return 0
+    else
+      status=$?
+    fi
+    (( status == 1 )) || return "$status"
+    sleep "$delay"
+  done
   return 2
 }
 
@@ -205,6 +226,38 @@ pid_is_gone() {
   fi
 }
 
+owned_group_matches() {
+  local dir="$1"
+  [[ -f "$dir/owned" ]] || return 1
+  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+from scripts.lib.process_start import Gone, Started, Unreadable, process_start, process_start_format
+try:
+    record = json.loads(Path(sys.argv[1]).read_text())
+    group, start = record["group"], record["start"]
+    if type(group) is not int or group <= 1 or not isinstance(start, str) or not start:
+        raise ValueError("invalid owner record")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+result = process_start(group)
+if record.get("start_format") != process_start_format():
+    # Retain a group with an unknown format unless the group is gone.
+    if not isinstance(result, Gone):
+        sys.exit(0)
+    from scripts.lib.process_group import send_process_group
+    try:
+        send_process_group(group, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    except PermissionError:
+        pass
+    sys.exit(0)
+sys.exit(0 if isinstance(result, Unreadable) or result == Started(start) else 1)
+PYTHON
+}
+
 lock_stale_reason() {
   local holder_pid
   holder_pid="$(cat "$1/holder_pid" 2>/dev/null || true)"
@@ -213,6 +266,7 @@ lock_stale_reason() {
     return 0
   fi
   if lock_is_expired "$1"; then
+    if owned_group_matches "$1"; then return 1; fi
     printf 'expired'
     return 0
   fi
@@ -231,31 +285,22 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" <<'PY'
+  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import time
 
 record = Path(sys.argv[1])
 
+from scripts.lib.process_start import Started, Zombie, process_start
+
 def identity(pid: int) -> str | None:
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        # A zombie leader still owns its PID, so its start time is safe to
-        # check while live children remain in the group.
-        return fields[19]
-    except (OSError, IndexError):
-        try:
-            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-        except subprocess.CalledProcessError:
-            return None
+    result = process_start(pid)
+    return result.start if isinstance(result, (Started, Zombie)) else None
 
 def live_group(group: int) -> bool:
     try:
@@ -282,7 +327,7 @@ if identity(group) != start:
     sys.exit(0)
 
 try:
-    os.killpg(group, signal.SIGKILL)
+    if (sent := subprocess.run([str(Path(sys.argv[2]).resolve() / "py"), str(Path(sys.argv[2]).resolve() / "process_group.py"), str(group), "KILL"], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("board.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
 except ProcessLookupError:
     pass
 
@@ -343,7 +388,9 @@ cmd_acquire() {
           previous="$(lock_holder "$dir")"
           previous_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
           reclaimed_holders="$(cat "$dir/reclaimed_holders" 2>/dev/null || true)"
-          if [[ "$reason" == pid\ * ]] && ! cleanup_owned_group "$dir"; then
+          # A stale same-slot claim can change holders without ending the old step.
+          # Other slots must retain a live group with a different start.
+          if [[ "$reason" != expired || "$previous" != "$agent" ]] && ! cleanup_owned_group "$dir"; then
             exec 9>&-
             return 1
           fi
@@ -394,18 +441,9 @@ cmd_release() {
   fi
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
   local guard="${session_dir}/locks/${resource}.guard"
-  local attempt lock_status guarded=0
+  local guarded=0
   if [[ -d "$dir" ]]; then
-    for ((attempt=0; attempt<200; attempt++)); do
-      if lock_guard "$guard"; then
-        guarded=1
-        break
-      else
-        lock_status=$?
-      fi
-      (( lock_status == 1 )) || break
-      sleep 0.05
-    done
+    if wait_lock_guard "$guard"; then guarded=1; fi
   fi
   if [[ ! -d "$dir" ]]; then
     (( guarded == 0 )) || exec 9>&-
@@ -478,22 +516,33 @@ cmd_renew() {
   local agent="${2:?renew needs <agent>}"
   local resource="${3:?renew needs <resource>}"
   shift 3
-  local hold="$DEFAULT_HOLD_SECONDS"
+  local hold="$DEFAULT_HOLD_SECONDS" holder_pid=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --hold) hold="${2:?--hold needs seconds}"; shift 2 ;;
+      --pid) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die "--pid must be a positive integer"
+             holder_pid="$2"; shift 2 ;;
       *) die "renew: unknown option '$1'" ;;
     esac
   done
   [[ "$hold" =~ ^[0-9]+$ ]] && (( hold > 0 )) || die "--hold must be a positive integer"
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
-  [[ -d "$dir" ]] || { printf 'board.sh: %s is not held\n' "$resource" >&2; return 1; }
+  mkdir -p "${session_dir}/locks"
+  wait_lock_guard "${session_dir}/locks/${resource}.guard" || return 2
+  [[ -d "$dir" ]] || { exec 9>&-; printf 'board.sh: %s is not held\n' "$resource" >&2; return 1; }
   local holder; holder="$(lock_holder "$dir")"
   [[ "$holder" == "$agent" ]] || {
     printf 'board.sh: %s does not hold %s (holder is %s)\n' "$agent" "$resource" "$holder" >&2
+    exec 9>&-
     return 1
   }
+  if [[ -n "$holder_pid" && "$(cat "$dir/holder_pid" 2>/dev/null)" != "$holder_pid" ]]; then
+    exec 9>&-
+    printf 'board.sh: %s pid %s does not hold %s\n' "$agent" "$holder_pid" "$resource" >&2
+    return 1
+  fi
   printf '%s' "$(( $(now_epoch) + hold ))" > "${dir}/expires"
+  exec 9>&-
   printf 'renewed %s\n' "$resource"
 }
 
@@ -568,6 +617,14 @@ main() {
   local command="${1:-}"
   [[ -n "$command" ]] || die "usage: board.sh {post|read|acquire|release|renew|role|roles|locks} <session_dir> ..."
   shift
+  case "$command" in
+    post|read|role)
+      if [[ "${1:-}" != /* ]]; then
+        [[ -n "${UNIT_RUN_DIR:-}" ]] || die "$command needs <session_dir> or UNIT_RUN_DIR"
+        set -- "$UNIT_RUN_DIR" "$@"
+      fi
+      ;;
+  esac
   case "$command" in
     post)    cmd_post "$@" ;;
     read)    cmd_read "$@" ;;

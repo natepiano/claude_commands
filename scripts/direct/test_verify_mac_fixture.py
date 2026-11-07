@@ -16,7 +16,8 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -88,13 +89,13 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
         try:
             with mock.patch.object(select, "select", side_effect=release_on_exit_wait):
                 self.assert_nothing_outlives()
-            output, errors = child.communicate(timeout=HANG_GUARD_S)
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertTrue(observed, "cleanup did not observe the live child's exit")
             self.assertEqual(child.returncode, 0, output + errors)
         finally:
             if child.poll() is None:
                 child.kill()
-            _ = child.communicate(timeout=HANG_GUARD_S)
+            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_build_tools_cannot_use_the_host_path(self) -> None:
         host_tools = self.root / "host-tools"
@@ -109,7 +110,7 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
         for name in ("cargo", "rustc", "nextest"):
             with self.subTest(tool=name):
                 result = subprocess.run([name, "--version"], env={**self.environment, "PATH": private_path},
-                                        capture_output=True, text=True, check=False, timeout=HANG_GUARD_S)
+                                        capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
         self.assertFalse(reached.exists())
 
@@ -119,15 +120,14 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
         tree = self.root / "record-tree/scripts"
         (tree / "build_hold").mkdir(parents=True)
         (tree / "buildlog").mkdir()
+        (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         release, completed = self.root / "recorder-release", self.root / "recorder-completed"
         self.write_executable(tree / "buildlog/record.py", f'''
 from pathlib import Path
 from scripts.direct.wait_for_test_state import wait_for_file
 wait_for_file(Path({str(release)!r}))
 Path({str(completed)!r}).touch()
-'''.replace("from scripts.direct.wait_for_test_state import wait_for_file",
-            "import sys\nsys.path.insert(0, " + repr(str(VERIFY.resolve().parents[2])) + ")\n"
-            + "from scripts.direct.wait_for_test_state import wait_for_file"))
+''')
         outside_release = threading.Event()
         outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
         outside.start()
@@ -158,13 +158,14 @@ Path({str(completed)!r}).touch()
             outside_release.set()
             for thread in threading.enumerate():
                 if thread is outside or (thread not in existing and thread.name == "hold-event-recorder"):
-                    original_join(thread, HANG_GUARD_S)
+                    original_join(thread, TEST_HANG_GUARD_SECS)
                     self.assertFalse(thread.is_alive())
 
     def test_hold_fixture_timeout_reaps_all_children_and_owned_threads_before_restoring_home(self) -> None:
         tree = self.root / "blocked-record-tree/scripts"
         (tree / "build_hold").mkdir(parents=True)
         (tree / "buildlog").mkdir()
+        (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         ready = self.root / "blocked-recorders"
         ready.mkdir()
         self.write_executable(tree / "buildlog/record.py", f'''
@@ -213,7 +214,7 @@ signal.pause()
                     child.kill()
                 _ = child.wait()
             for thread in threads:
-                thread.join(timeout=HANG_GUARD_S)
+                thread.join(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

@@ -1,22 +1,37 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+
+from scripts.lint import memory_admit as gate
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
+
+from collections.abc import Callable
+
 import json
 import os
 import signal
+import shlex
 import shutil
-import sys
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import ClassVar, cast, override
+from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -24,8 +39,6 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 BOARD = VERIFY.with_name("board.sh")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 Record = dict[str, object]
@@ -69,6 +82,7 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         home = self.root / "home"
@@ -159,12 +173,10 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
-        interpreter = self.root / "cache" / "claude" / "python3-3.11"
-        interpreter.parent.mkdir()
-        _ = interpreter.write_text(sys.executable + "\n")
+        seed_interpreter_cache(self.root / "cache")
         memory_event = self.root / "memory-event.py"
         _ = memory_event.write_text(
             "import os, sys\nfrom pathlib import Path\n"
@@ -175,13 +187,11 @@ esac
             + f"timeout={TEST_HANG_GUARD_SECS})\n")
         # Memory changes are events. Token retry tests may replace this stub
         # with their own acquisition marker or clock advancement.
-        _ = (stubs / "sleep").write_text(
-            '#!/bin/sh\n'
-            + 'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
+        self.write_wait_sleep(
+            'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
             + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
-        (stubs / "sleep").chmod(0o755)
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
@@ -207,10 +217,6 @@ esac
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
-            # Two 12 GiB fallback promises fit this 48 GiB fixture. The host's
-            # 21 GiB budget would add an unrelated 120-second ramp wait before
-            # the test can observe the token handoff.
-            "BUILDLOG_BUILD_BUDGET_GIB": "48",
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
@@ -229,7 +235,7 @@ esac
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
             "TEST_RUNNING": str(self.root / "running"),
             "TEST_RELEASE": str(self.root / "release"),
@@ -237,6 +243,19 @@ esac
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
             "TEST_MEMORY_EVENT": str(memory_event),
         }
+
+    def write_wait_sleep(self, body: str) -> None:
+        """Fake queue delays. Keep renewal and other delays on the real clock."""
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token fixture requires sleep on PATH")
+        path = self.root / "stubs" / "sleep"
+        _ = path.write_text(
+            '#!/bin/sh\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
+            + body)
+        path.chmod(0o755)
 
     @override
     def tearDown(self) -> None:
@@ -272,7 +291,7 @@ esac
 
     def end_group(self, group: int) -> None:
         try:
-            os.killpg(group, signal.SIGKILL)
+            send_process_group(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
@@ -304,14 +323,17 @@ esac
                     os.close(descriptor)
 
     def record_phase(self, session: Path) -> None:
+        record_wait_workers(self.root, session, self.environment,
+                            {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
-                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                  "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
         ):
             result = invoke_recorder(arguments, self.environment, self.root)
@@ -323,8 +345,6 @@ esac
             result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
 
     def phase_waits(self, session: Path) -> list[dict[str, object]]:
         return [row for row in (cast(dict[str, object], json.loads(line)) for line in
@@ -344,11 +364,32 @@ esac
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         self.assertTrue(path.exists(), "verify never reached its expected state")
 
+    def defer_memory_waiter_for_peer(self) -> Callable[[], None]:
+        """Keep the first waiter held while a peer uses the same host reading."""
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            waiting, = admission.server.waiters.values()
+            need = waiting.row["need"]
+            waiting.row["need"] = 60 * gate.GIB
+            admission.free(48 * gate.GIB)
+
+        def resume() -> None:
+            with admission.loop_turn():
+                waiting.row["need"] = need
+                admission.free(48 * gate.GIB)
+
+        self.addCleanup(resume)
+        return resume
+
     def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
         """Start a verify that takes the token and then waits on the held meminfo.
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            if not admission.server.reservations and not admission.server.slots:
+                _ = admission.occupy_host()
         with errors.open("wb") as stream:
             process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                        cwd=self.root, env=environment, stdout=stream,
@@ -414,7 +455,7 @@ from scripts.direct.wait_for_test_state import wait_until
 root = Path(os.environ["TEST_HOLD_ROOT"])
 if sys.argv[1] == "eligible":
     print("natedev_only test target")
-    print("natedev\teligible\t-\t-")
+    print("natedev\teligible\t-\t-\t-")
 if sys.argv[1] == "wait-local":
     calls = root / "wait-local-calls"
     count = len(calls.read_text().splitlines()) if calls.exists() else 0
@@ -437,6 +478,39 @@ if sys.argv[1] == "wait-local":
                                        stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
         self.wait_for_running(self.root / "hold-waiting", process)
+        return process
+
+    def start_owned_step(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+        """Run the real command guard and renewer with a real board lease."""
+        source = VERIFY.read_text()
+        start = source.index("STEP_OWNER_PY='\n")
+        end = source.index("\nrelease_token() {", start)
+        script = self.root / "owned-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + source[start:end] + shell_functions(VERIFY, "release_token") + '''
+BOARD_HELPER=$TEST_BOARD_HELPER BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=$UNIT_TEAM_ROLE
+STEP_RECORD_SCRIPT=$TEST_STEP_RECORD_SCRIPT
+PY=$TEST_REAL_PYTHON
+source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
+TOKEN_HOLD_S=$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)
+TOKEN_RENEW_S=$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)
+TOKEN_HELD=0 TOKEN_WAIT_FILE=""
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+trap 'status=$?; release_token || true; exit "$status"' EXIT
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S"
+TOKEN_HELD=1
+status=0
+buildlog_exec cargo check > "$HOLD_WAIT_DIR/command-output" 2>&1 || status=$?
+cat -- "$HOLD_WAIT_DIR/command-output"
+exit "$status"
+''')
+        process = subprocess.Popen(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
+            cwd=self.root, env={**environment, "TEST_BOARD_HELPER": str(BOARD),
+                "TEST_STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
+                "TEST_REAL_PYTHON": sys.executable, "TEST_HOLD_DIRECTORY": str(self.root / "owned-step-hold")},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.started_groups.add(process.pid)
         return process
 
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
@@ -475,7 +549,7 @@ if sys.argv[1] == "wait-local":
             step_group = cast(int, step_record["group"])
             self.started_groups.add(step_group)
 
-            os.killpg(first.pid, interruption)
+            send_process_group(first.pid, interruption)
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
             self.assertFalse(lock.exists(), "interrupted verify kept its token")

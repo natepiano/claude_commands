@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-import postmaster
-import sessions
+from scripts.message import postmaster
+from scripts.message import sessions
 
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
 TEXT = "Message from Sender via postmaster: Question [01234567]\n\nQuestion"
@@ -108,9 +108,40 @@ class PostmasterTests(unittest.TestCase):
                 self.result(outcome, matching=matching)
         self.clock.after_sleep = respond
 
+    def test_outbox_wait_reads_no_configuration_after_publication(self) -> None:
+        self.heartbeat()
+        original = Path.read_text
+        reads: list[Path] = []
+
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            if path.name == "postmaster.conf":
+                self.assertFalse(self.path("outbox").exists())
+                reads.append(path)
+            return original(path)
+
+        with patch.object(Path, "read_text", read):
+            answer = self.attempt()
+        self.assertIsInstance(answer, postmaster.RelayRequired)
+        self.assertGreater(len(reads), 0)
+        self.no_id_files()
+
+    def test_outbox_wait_uses_the_current_configuration(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        defaults = Path(postmaster.__file__).resolve().parents[2] / "config/postmaster.conf"
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for seconds in (0.15, 0.35):
+                _ = (config / "postmaster.conf").write_text(
+                    defaults.read_text().replace("wait_seconds=3.0", f"wait_seconds={seconds}"))
+                self.heartbeat()
+                answer = self.attempt()
+                self.assertIsInstance(answer, postmaster.RelayRequired)
+                self.assertAlmostEqual(answer.seconds, seconds, places=6)
+
     def test_constants_and_entry_ids(self) -> None:
-        self.assertEqual((postmaster.WAIT_SECONDS, postmaster.CLAIM_GRACE_SECONDS,
-            postmaster.HEARTBEAT_MAX_AGE_SECONDS, postmaster.POLL_SECONDS), (3.0, 2.0, 2.0, 0.05))
+        self.assertEqual((postmaster.wait_seconds(), postmaster.claim_grace_seconds(),
+            postmaster.heartbeat_max_age_seconds(), postmaster.poll_seconds()), (3.0, 2.0, 2.0, 0.05))
         ids = [postmaster.new_entry_id() for _ in range(2)]
         self.assertNotEqual(ids[0], ids[1])
         for identity in ids:
@@ -215,7 +246,7 @@ class PostmasterTests(unittest.TestCase):
         self.assertIsInstance(answer, postmaster.RelayRequired)
         assert isinstance(answer, postmaster.RelayRequired)
         self.assertEqual(answer.reason, "unclaimed")
-        self.assertAlmostEqual(answer.seconds, postmaster.WAIT_SECONDS, places=6)
+        self.assertAlmostEqual(answer.seconds, postmaster.wait_seconds(), places=6)
         self.no_id_files()
 
     def test_claim_grace_follows_late_delivery_withdrawal_or_missing_result(self) -> None:
@@ -225,7 +256,7 @@ class PostmasterTests(unittest.TestCase):
                 start = self.clock.elapsed
                 def mod() -> None:
                     self.claim()
-                    if self.clock.elapsed - start > postmaster.WAIT_SECONDS + 0.1 and outcome != "missing":
+                    if self.clock.elapsed - start > postmaster.wait_seconds() + 0.1 and outcome != "missing":
                         self.result("delivered" if outcome == "delivered" else "withdrawn")
                 self.clock.after_sleep = mod
                 answer = self.attempt()
@@ -274,7 +305,7 @@ class PostmasterTests(unittest.TestCase):
             with self.subTest(sender=sender):
                 self.heartbeat()
                 observed: list[postmaster.OutboxEntry] = []
-                deadline = int(self.clock.time() * 1000) + int(postmaster.WAIT_SECONDS * 1000)
+                deadline = int(self.clock.time() * 1000) + int(postmaster.wait_seconds() * 1000)
                 def mod() -> None:
                     value = cast(dict[str, object], json.loads(self.path("outbox").read_text()))
                     self.assertEqual(set(value), {"id", "session_id", "socket", "text", "sha256", "deadline_ms", "sender", "reply_to_session_id"})

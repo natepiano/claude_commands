@@ -8,15 +8,16 @@ import sqlite3
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from enum import Enum, auto
 from typing import Literal, TypeVar, cast
 
-import index
-import holds
-import store
-from offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
-from mac_outcome import (
+from scripts.buildlog import index
+from scripts.buildlog import holds
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.mac_test.offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
+from scripts.buildlog.mac_outcome import (
     COUNTED_AGAINST_SHARE, NOT_USABLE_REASONS, CacheReuse, LocalReasonNotRecorded,
     LocalRunRequested, MacRunCompleted, MacRunLost, MacRunMatchedNoTest,
     NoOffloadRecord, OffloadDeclined, OffloadDeclineReason, OffloadRecord,
@@ -26,7 +27,7 @@ from mac_outcome import (
 
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 LOCAL_MAC_UNAVAILABLE_PATTERNS = (
     r"\bmac\b.*\b(?:unavailable|busy|blocked|unreachable|offline|not available|not reachable)\b",
@@ -141,7 +142,7 @@ class MacFailureComparison:
 def read_test_tree_evidence(connection: sqlite3.Connection, start: str, end: str) -> TestTreeEvidence:
     """Read keyed nextest steps once in the range [start, end)."""
     rows = cast(list[tuple[object, ...]], connection.execute(
-        "SELECT s.call_id, s.caller, s.status, s.tree_key, c.package, c.command"
+        "SELECT s.call_id, s.caller, s.status, s.tree_key, c.package, c.command, s.target, s.host"
         + " FROM steps s JOIN calls c ON c.id = s.call_id"
         + " WHERE s.step = 'nextest' AND s.tree_key IS NOT NULL"
         + " AND s.started_at >= ? AND s.started_at < ?"
@@ -151,13 +152,15 @@ def read_test_tree_evidence(connection: sqlite3.Connection, start: str, end: str
     ).fetchall())
     mac_keys: dict[str, set[TestSelectionTree]] = {}
     local_passes: set[TestSelectionTree] = set()
-    for call_id, caller, status, tree_key, package, command in rows:
+    local_identity = record.local_step_identity()
+    for call_id, caller, status, tree_key, package, command, target, host in rows:
         if not isinstance(tree_key, str) or not tree_key or not isinstance(package, str) or not isinstance(command, str):
             continue
         key = TestSelectionTree(package, command, tree_key)
         if is_mac_step(caller):
             mac_keys.setdefault(str(call_id), set()).add(key)
-        elif status == 0:
+        elif status == 0 and record.is_local_step(target, host, caller,
+                                                targets=local_identity.targets, hosts=local_identity.hosts):
             local_passes.add(key)
     return TestTreeEvidence(mac_keys, local_passes)
 
@@ -449,20 +452,12 @@ def mac_report(connection: sqlite3.Connection, now: datetime, hours: float = 24)
 
 
 def main(args: list[str]) -> int:
-    hours = 24.0
-    try:
-        if args:
-            if len(args) != 2 or args[0] != "--hours":
-                raise ValueError
-            hours = float(args[1])
-            if not math.isfinite(hours) or hours <= 0:
-                raise ValueError
-        now = datetime.now(UTC)
-        # Validate the requested range before reading the index.
-        _ = report_windows(now, hours)
-    except (ValueError, OverflowError):
-        print("usage: buildlog mac-report [--hours N] (N must be a positive number)", file=sys.stderr)
+    from scripts.buildlog.number_option import positive_window
+
+    window = positive_window(args, "--hours", 24, "mac-report")
+    if window is None:
         return 2
+    now, hours = window[1:]
     _ = index.update()
     connection = index.read_only()
     try:

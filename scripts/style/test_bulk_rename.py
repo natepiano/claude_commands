@@ -4,6 +4,8 @@ Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the merge gate never s
 """
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import json
 import os
 import shutil
@@ -20,18 +22,19 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import bulk_rename as bulk
-import berth_board
-import rules
-import style_ledger
-from ledger_test_support import remove_generation_schema
-import style_rules
+from scripts.style import bulk_rename as bulk
+from scripts.style.style_child_test_support import StyleQueueFake, unqueued_style_children
+from scripts.style import approved_renames
+from scripts.style.approved_renames import OuterBindingBlocked, OuterBindingUnproved
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.ledger_test_support import remove_generation_schema, style_staff_fixture
+from scripts.style import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
-from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.style.approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:
@@ -61,14 +64,19 @@ class ScriptedServer:
         return bulk.WorkspaceRename((bulk.DocumentEdits(path, text, self.edit(text, offset, new)),))
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
-        spans = bulk.BindingText(text).spans
+        parsed = bulk.BindingText(text)
+        spans = parsed.spans
+        names = bulk.source_name_index(parsed)
         answers: list[bulk.DefinitionResolution] = []
         for offset in offsets:
-            token = next(span.token.value for span in spans if span.start == offset)
+            token = next((span.token.value for span in spans if span.start == offset), None)
+            if token is None:
+                # RA resolves format captures inside literals to their binding too.
+                token = next(name for name, points in names.items() if offset in points)
             if token in self.derive_origins:
                 answers.append(self.derive_origins[token])
                 continue
-            declaration = next(span for span in spans if span.token.value == token)
+            declaration = next(span for span in spans if span.token.value.removeprefix("r#") == token.removeprefix("r#"))
             begin, end = bulk.lsp_position(text, declaration.start), bulk.lsp_position(text, declaration.end)
             answers.append(bulk.DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
                                                 (end["line"], end["character"])))
@@ -82,6 +90,7 @@ def word_edits(source: str, old: str, new: str, *, macros: bool = True) -> tuple
 
 
 class CargoProjectTests(unittest.TestCase):
+    queue: StyleQueueFake = StyleQueueFake()
     repo: Path = Path()
     root: Path = Path()
 
@@ -89,6 +98,7 @@ class CargoProjectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="bulk-rename-test-")))
         self.set_up_tools()
+        self.queue = self.enterContext(unqueued_style_children())
         self.repo = self.root / "project"
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
@@ -99,6 +109,7 @@ class CargoProjectTests(unittest.TestCase):
         _ = self.git("config", "user.email", "bulk@example.invalid")
         _ = self.git("add", ".")
         _ = self.git("commit", "-qm", "fixture")
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
 
     def set_up_tools(self) -> None:
         tools = rust_tool_path(self.root / "tools")
@@ -115,8 +126,9 @@ class CargoProjectTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
 
     def finding(self, source: str, old: str = "old", new: str = "number", line: int = 2,
-                identity: str = "finding") -> bulk.RenameFinding:
-        return bulk.RenameFinding(identity, "src/lib.rs", BindingRename(line, source.splitlines()[line - 1], old, new))
+                identity: str = "finding", path: str = "src/lib.rs") -> bulk.RenameFinding:
+        return bulk.RenameFinding(identity, path, BindingRename(line, source.splitlines()[line - 1], old, new),
+                                  approved_renames.AnchoredRenameSource("immutable-fixture", path, line, source), identity)
 
     def rename(self, source: str, findings: tuple[bulk.RenameFinding, ...], server: ScriptedServer) -> bulk.FileRenames:
         return bulk.rename_file(server, self.repo / "src/lib.rs", "src/lib.rs", source, findings, bulk.repository_docs(self.repo))
@@ -148,19 +160,246 @@ class CargoProjectTests(unittest.TestCase):
         source = (self.repo / "src/lib.rs").read_text()
         issue = self.root / "decision.md"
         _ = issue.write_text("Approved names")
+        ledger.ticket_add("15001", ticket_owner_id("judging"), "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+        ledger.ticket_assign("15001", "main")
+        _ = ledger.ticket_base("15001")
         ids: list[str] = []
         for line, old, new in ((2, "old", "number"), (3, "missing", "replacement")):
             held = ledger.hold(definition.rule_id, "src/lib.rs", line, source.splitlines()[line - 1],
-                               "rename", old, new, definition.blob, "judging-1")
+                               "rename", old, new, definition.blob, "15001")
             ledger.file_held(held.finding_id, issue)
             ids.append(held.finding_id)
-        ledger.ticket_add("names-1", "names", "proposal", "names", ".", ["src/lib.rs"], [definition.rule_id],
+        ledger.ticket_drop("15001")
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", ".", ["src/lib.rs"], [definition.rule_id],
                           proposal=str(issue), finding_ids=tuple(ids))
-        ledger.ticket_assign("names-1", "main")
+        ledger.ticket_assign("1", "main")
         return ids[0], ids[1]
 
 
 class RenameTests(CargoProjectTests):
+    def test_bulk_rename_uses_current_parameters_instead_of_anchor_blockers(self) -> None:
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            with self.subTest(parameter=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                finding = self.finding(source, "g", "checkout_info", 2)
+                result = self.rename(current, (finding,), server)
+                if blocked:
+                    self.assertEqual(server.calls, [])
+                    self.assertEqual(result.kept, ())
+                    self.assertEqual(result.edited, current)
+                    refusal, = result.refusals
+                    self.assertIsInstance(refusal, bulk.BlockedRename)
+                    assert isinstance(refusal, bulk.BlockedRename)
+                    self.assertIsInstance(refusal.blocker, OuterBindingBlocked)
+                    assert isinstance(refusal.blocker, OuterBindingBlocked)
+                    self.assertEqual(refusal.blocker.text, current.splitlines()[0])
+                else:
+                    self.assertEqual(len(server.calls), 1)
+                    self.assertEqual(result.refusals, ())
+                    self.assertEqual(tuple(row.finding for row in result.kept), (finding,))
+                    self.assertEqual(result.edited, current.replace("|g| g", "|checkout_info| checkout_info"))
+
+    def test_unread_local_body_never_reaches_analyzer_after_a_signature_change(self) -> None:
+        from scripts.style.test_approved_renames import UNREAD_LOCAL_BODIES
+        for label, source in UNREAD_LOCAL_BODIES:
+            with self.subTest(body=label):
+                current = source.replace("label()", "label(extra: usize)")
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(current, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, current)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+                self.assertIn("containing item body unread", refusal.reason)
+
+    def test_proved_item_with_unread_body_reaches_the_bulk_rename_proof(self) -> None:
+        from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
+        for label, source in UNREAD_ITEM_BODIES:
+            with self.subTest(body=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(result.refusals, ())
+                self.assertEqual(len(server.calls), 1)
+                self.assertEqual(len(result.kept), 1)
+                self.assertEqual(result.edited, source.replace("fn g(", "fn checkout_info("))
+
+    def test_generic_parameters_refuse_before_any_bulk_rename_request(self) -> None:
+        from scripts.style.test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        self.assert_local_declarations_refuse_before_bulk_rename(GENERIC_PARAMETER_BINDINGS)
+
+    def assert_local_declarations_refuse_before_bulk_rename(self, forms: tuple[tuple[str, str], ...]) -> None:
+        for label, source in forms:
+            with self.subTest(form=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, source)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+
+    def test_field_expression_bindings_refuse_before_any_bulk_rename_request(self) -> None:
+        from scripts.style.test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        self.assert_local_declarations_refuse_before_bulk_rename(FIELD_EXPRESSION_BINDINGS)
+
+    def test_bulk_anchor_matrix_never_requests_a_rename_without_current_identity(self) -> None:
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
+        original = IDENTICAL_BINDING_ITEMS
+        for probe in ("missing_anchor", "later_base", "removed", "raw_pair"):
+            with self.subTest(probe=probe):
+                source = original.replace("|g| g", "|r#g| r#g", 1) if probe == "raw_pair" else original
+                pair = self.finding(source, "r#g" if probe == "raw_pair" else "g", "checkout_info", 2)
+                current = source.replace("first()", "first(checkout_info: usize)")
+                if probe == "missing_anchor":
+                    pair = replace(pair, authority=approved_renames.RenameAnchorUnavailable("no readable finding anchor"))
+                    current = source[source.index("fn second"):]+source[:source.index("fn second")]
+                if probe == "removed":
+                    current = source.replace("map(|g| g + 1)", "consume(42)", 1)
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(current, (pair,), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertIsInstance(result.refusals[0], bulk.BlockedRename)
+
+    def test_bulk_admission_never_substitutes_an_identical_sibling_for_a_renamed_target(self) -> None:
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
+        original = IDENTICAL_BINDING_ITEMS
+        current = original.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
+        finding = self.finding(original, "g", "checkout_info", 2)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(current, (finding,), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.kept, ())
+        self.assertEqual(result.edited, current)
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+        # The unblocked format-capture path retains the existing analyzer proof.
+        from scripts.style.test_approved_renames import CAPTURE_BINDING_ITEM
+        def capture_edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            begin = text.index("{g}") + 1
+            return (*word_edits(text, "g", new), bulk.SourceEdit(begin, begin + 1, new))
+        capture_server = ScriptedServer(capture_edits)
+        library = self.root / "library"
+        capture_server.derive_origins["println"] = bulk.DefinitionTarget((library / "std/src/macros.rs").as_uri(), (0, 0), (0, 7))
+        with mock.patch.object(bulk, "standard_library", return_value=library):
+            capture = self.rename(CAPTURE_BINDING_ITEM, (self.finding(CAPTURE_BINDING_ITEM, "g", "checkout_info", 2),), capture_server)
+        self.assertEqual(capture.refusals, ())
+        self.assertEqual(len(capture.kept), 1)
+        self.assertIn('println!("{checkout_info}")', capture.edited)
+
+    def test_bulk_admission_refuses_duplicate_recorded_item_paths(self) -> None:
+        from scripts.style.test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        source = DUPLICATE_BINDING_ITEM_PATH
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        self.assertIn("item path is not unique", refusal.reason)
+
+    def test_inner_attributes_in_every_enclosing_scope_refuse_before_analyzer_rename(self) -> None:
+        from scripts.style.test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        # The bulk entry point reads the source after a later outer parameter arrives too.
+        self.assert_outer_block_before_analyzer("fn label(checkout_info: usize) {\nmap(|g| g + 1)\n}\n")
+        for label, source in INHERITED_INNER_ATTRIBUTES:
+            with self.subTest(scope=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, source)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+                self.assertIn("unresolved attribute macro 'inject'", refusal.reason)
+
+    def test_item_presence_refusals_never_request_an_analyzer_rename(self) -> None:
+        from scripts.style.test_approved_renames import PRESENCE_REFUSALS
+        for label, source, line, expected in PRESENCE_REFUSALS:
+            with self.subTest(form=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                finding = self.finding(source, "g", "checkout_info", line)
+                result = self.rename(source, (finding,), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, expected)
+                self.assertEqual(result.edited, source)
+
+    def test_unread_enclosing_scopes_refuse_before_analyzer_rename(self) -> None:
+        for source, line in (
+                ("fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
+                 + "        map(|g| g + 1);\n    }\n}\n", 3),
+                ("fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n", 2)):
+            server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+            result = self.rename(source, (self.finding(source, "g", "checkout_info", line),), server)
+            with self.subTest(source=source):
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.edited, source)
+                self.assertEqual(result.kept, ())
+                refusal, = result.refusals
+                self.assertTrue(refusal.reason.startswith("outer binding visibility unproved:"), refusal.reason)
+
+    def test_stale_local_text_is_terminal_before_any_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        original = self.finding(source, "g", "checkout_info", 2)
+        finding = replace(original, rename=replace(original.rename, text=original.rename.text + " // stale"))
+        result = self.rename(source, (finding,), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        self.assertIsInstance(refusal.blocker, OuterBindingBlocked)
+        assert isinstance(refusal.blocker, OuterBindingBlocked)
+        self.assertEqual((refusal.blocker.name, refusal.blocker.line), ("checkout_info", 1))
+
+    def test_same_line_outer_bindings_refuse_before_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) { let checkout_info = 1;\n    map(|g| g + 1)\n}\n"
+        self.assert_outer_block_before_analyzer(source)
+
+    def test_raw_outer_binding_refuses_before_analyzer_rename(self) -> None:
+        source = "fn label(r#checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        self.assert_outer_block_before_analyzer(source)
+
+    def assert_outer_block_before_analyzer(self, source: str) -> None:
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal.blocker, OuterBindingBlocked)
+        self.assertEqual((refusal.blocker.name, refusal.blocker.line), ("checkout_info", 1))
+
+    def test_outer_binding_block_is_typed_and_never_requests_an_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) -> usize {\n    map(|g| g + 1)\n}\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        finding = self.finding(source, "g", "checkout_info", 2)
+        result = self.rename(source, (finding,), server)
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        self.assertEqual(server.calls, [])
+        blocked, = result.refusals
+        self.assertIsInstance(blocked, bulk.BlockedRename)
+        assert isinstance(blocked, bulk.BlockedRename)
+        assert isinstance(blocked.blocker, OuterBindingBlocked)
+        self.assertEqual((blocked.blocker.name, blocked.blocker.line), ("checkout_info", 1))
+
     def test_parameter_own_docs_are_coordinated_without_editing_external_or_neighbor_docs(self) -> None:
         source = ("/// Neighbor uses `old`.\nfn neighbor() {}\n"
                   "/// Add `old`; older is ordinary prose.\nfn run(old: usize) -> usize { old + 1 }\n")
@@ -359,7 +598,7 @@ class RenameTests(CargoProjectTests):
                 return definitions(path, text, offsets)
             with mock.patch.object(server, "definitions", side_effect=refuse):
                 rolled_back = bulk.rename_file(server, child, "src/child.rs", other,
-                                               (self.finding(other, "other", "count", 1),))
+                                               (self.finding(other, "other", "count", 1, path="src/child.rs"),))
             self.assertIn("test rollback", rolled_back.refusals[0].reason)
             self.assertEqual(server.documents[child], other)
             self.assertEqual(bulk.crate_name_documents(server, root, "count"), ())
@@ -918,6 +1157,17 @@ class ProtocolTests(CargoProjectTests):
         self.assertIsInstance(result, bulk.DefinitionUnavailable)
         self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
 
+    def test_batch_analyzer_keeps_build_admission(self) -> None:
+        analyzer = bulk.RustAnalyzer(self.repo, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            self.assertEqual(self.queue.calls, [("rust-analyzer", self.repo)])
+            self.assertEqual(self.queue.batch_calls, [(("rust-analyzer",), True)])
+            place, = self.queue.places
+            self.assertEqual(place.arguments, [("rust-analyzer",)])
+        finally:
+            analyzer.close()
+        self.assertTrue(place.closed)
+
     def test_stdio_handshake_enables_build_scripts_and_proc_macros_and_prepares_each_rename(self) -> None:
         folder = self.root / "bin"
         folder.mkdir()
@@ -971,6 +1221,11 @@ while True:
                 self.assertIn("let number", bulk.apply_edits(source, edits.documents[0].edits))
         messages = [bulk.object_fields(cast(object, json.loads(line))) for line in log.read_text().splitlines()]
         methods = [message.get("method") for message in messages]
+        self.assertEqual(self.queue.calls, [("rust-analyzer", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [("rust-analyzer",)])
+        self.assertTrue(place.closed)
+        self.assertTrue(all(process.returncode is not None for process in place.processes))
         self.assertEqual(methods.count("textDocument/prepareRename"), 2)
         self.assertEqual(methods.count("textDocument/rename"), 1)
         initialize = next(message for message in messages if message.get("method") == "initialize")
@@ -1065,6 +1320,16 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual({item.kind for item in sample}, {"let", "closure"})
         self.assertEqual(len(bulk.sample_findings(findings[:3])), 3)
 
+    def test_blocking_writer_availability_retains_every_holder_as_typed_evidence(self) -> None:
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        reader = replace(writer, reservation_id="reader", edit_blocking_status="clear")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reader, writer))):
+            with self.assertRaises(bulk.ReservationBlocked) as caught:
+                bulk.check_available(self.repo, "src/lib.rs")
+        self.assertEqual(caught.exception.path, "src/lib.rs")
+        self.assertEqual(caught.exception.holders, (writer,))
+
     def test_busy_path_or_unreadable_board_refuses_writes(self) -> None:
         reservation = berth_board.Reservation("other", "x", self.root / "other", "branch", ("src/lib.rs",), "active", "blocking")
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reservation,))):
@@ -1155,13 +1420,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
             with mock.patch.object(style_ledger.Ledger, "bulk_release", stopped):
-                stop_process(lambda: bulk.run_batch(self.repo, "names-1"))
-            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+                stop_process(lambda: bulk.run_batch(self.repo, "1"))
+            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("1")], [refused])
             with mock.patch("builtins.print") as output:
-                review = bulk.run_batch(self.repo, "names-1")
+                review = bulk.run_batch(self.repo, "1")
         payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
         self.assertEqual(payload["kept"], [kept])
-        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("names-1")[0].reason)])
+        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("1")[0].reason)])
         output.assert_called_once_with(f"bulk rename: 1 kept, 1 refused, 0 macro edits; review {review}")
 
     def test_batch_reruns_after_process_loss_on_first_edit(self) -> None:
@@ -1172,9 +1437,9 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
-            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "names-1"))
+            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "1"))
             self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
         self.assertEqual(payload["kept"], [kept])
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
@@ -1182,23 +1447,23 @@ class LedgerTests(CargoProjectTests):
     def test_migration_and_per_finding_release_are_atomic_idempotent_and_leave_decisions_filed(self) -> None:
         ledger = self.ledger()
         kept, refused = self.ticket(ledger)
-        _ = ledger.bulk_release("names-1", {refused: "not located"})
-        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("names-1")], [kept])
+        _ = ledger.bulk_release("1", {refused: "not located"})
+        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("1")], [kept])
         finding, = ledger.named_held((refused,))
         self.assertIsInstance(finding.state, style_ledger.Filed)
         self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
-        rows = ledger.bulk_refusals("names-1")
-        self.assertEqual((rows[0].finding_id, rows[0].ticket, rows[0].reason), (refused, "names-1", "not located"))
+        rows = ledger.bulk_refusals("1")
+        self.assertEqual((rows[0].finding_id, rows[0].ticket, rows[0].reason), (refused, "1", "not located"))
         self.assertTrue(rows[0].at)
-        ticket_before = ledger.bulk_ticket("names-1")
-        self.assertEqual(ledger.bulk_release("names-1", {refused: "different"}), rows)
-        self.assertEqual(ledger.bulk_ticket("names-1"), ticket_before)
+        ticket_before = ledger.bulk_ticket("1")
+        self.assertEqual(ledger.bulk_release("1", {refused: "different"}), rows)
+        self.assertEqual(ledger.bulk_ticket("1"), ticket_before)
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: "would release", "unknown": "not owned"})
-        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("names-1")], [kept])
-        self.assertEqual(ledger.bulk_refusals("names-1"), rows)
-        _ = ledger.bulk_release("names-1", {kept: "all refused"})
-        self.assertEqual(ledger.bulk_findings("names-1"), ())
+            _ = ledger.bulk_release("1", {kept: "would release", "unknown": "not owned"})
+        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("1")], [kept])
+        self.assertEqual(ledger.bulk_refusals("1"), rows)
+        _ = ledger.bulk_release("1", {kept: "all refused"})
+        self.assertEqual(ledger.bulk_findings("1"), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
                              max(style_ledger.MIGRATIONS))
@@ -1207,11 +1472,11 @@ class LedgerTests(CargoProjectTests):
         ledger = self.ledger()
         kept, _ = self.ticket(ledger)
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: " "})
-        ledger.ticket_drop("names-1")
+            _ = ledger.bulk_release("1", {kept: " "})
+        ledger.ticket_drop("1")
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: "stale"})
-        self.assertEqual(ledger.bulk_refusals("names-1"), ())
+            _ = ledger.bulk_release("1", {kept: "stale"})
+        self.assertEqual(ledger.bulk_refusals("1"), ())
 
     def test_batch_publishes_only_proven_verified_edits_and_writes_the_review_sample(self) -> None:
         ledger = self.ledger()
@@ -1221,13 +1486,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = cast(dict[str, object], json.loads(review.read_text()))
         self.assertEqual(payload["kept"], [kept])
         self.assertEqual(payload["macro_edits"], 0)
         self.assertEqual(len(cast(list[object], payload["sample"])), 1)
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
-        self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+        self.assertEqual([row.finding_id for row in ledger.bulk_refusals("1")], [refused])
         self.assertIsInstance(ledger.named_held((kept,))[0].state, style_ledger.Filed)
 
     def test_failed_crate_releases_its_renames_and_restores_the_file(self) -> None:
@@ -1242,13 +1507,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command", side_effect=verify)):
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = cast(dict[str, object], json.loads(review.read_text()))
         self.assertEqual(payload["kept"], [])
         self.assertEqual(payload["sample"], [])
         self.assertEqual((self.repo / "src/lib.rs").read_text(), source)
-        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("names-1")}, {kept, refused})
-        self.assertEqual(ledger.bulk_findings("names-1"), ())
+        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("1")}, {kept, refused})
+        self.assertEqual(ledger.bulk_findings("1"), ())
 
     def test_existing_database_gets_the_refusal_migration(self) -> None:
         ledger = self.ledger()
@@ -1260,7 +1525,7 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
-            self.assertEqual(upgraded.bulk_refusals("names-1"), ())
+            self.assertEqual(upgraded.bulk_refusals("1"), ())
         # The refusal migration also accepts an existing refusal table.
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("DROP TABLE refill_results")
@@ -1269,13 +1534,13 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as replayed:
-            self.assertEqual(replayed.bulk_refusals("names-1"), ())
+            self.assertEqual(replayed.bulk_refusals("1"), ())
 
     def test_dirty_batch_exits_before_starting_analyzer(self) -> None:
         _ = (self.repo / "src/lib.rs").write_text("dirty\n")
         with mock.patch.object(bulk, "RustAnalyzer") as analyzer:
             with self.assertRaisesRegex(bulk.BulkRenameError, "clean"):
-                _ = bulk.run_batch(self.repo, "names-1")
+                _ = bulk.run_batch(self.repo, "1")
             analyzer.assert_not_called()
 
 
@@ -1501,7 +1766,7 @@ pub fn run(parameter: usize) -> usize {
         self.assertIn("is exported by provider", result.refusals[0].reason)
 
     def test_real_refactor_hidden_clash_is_reverted_by_workspace_check(self) -> None:
-        import bulk_run
+        from scripts.style import bulk_run
         source = ('#![allow(dead_code, unused_imports, unexpected_cfgs)]\nmod provider { pub fn unused() {} }\n'
                   'use provider::*;\ninclude!("generated.rs");\nfn f() { let old = 1; let _ = old; }\n')
         _ = (self.repo / "src/lib.rs").write_text(source)
@@ -1599,7 +1864,7 @@ pub fn run(parameter: usize) -> usize {
         _ = (self.repo / "src/lib.rs").write_text(source)
         path = self.repo / "src/record.rs"
         _ = path.write_text(declaration)
-        finding = bulk.RenameFinding("field", "src/record.rs", BindingRename(1, declaration.strip(), "old", "number"))
+        finding = bulk.RenameFinding("field", "src/record.rs", BindingRename(1, declaration.strip(), "old", "number"), approved_renames.AnchoredRenameSource("immutable-fixture", "src/record.rs", 1, declaration), "field")
         with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
             result = bulk.rename_file(analyzer, path, "src/record.rs", declaration, (finding,))
         self.assertEqual(result.refusals, ())

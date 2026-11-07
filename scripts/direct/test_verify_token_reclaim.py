@@ -5,19 +5,17 @@ import json
 import subprocess
 from typing import cast
 from scripts.direct.verify_token_wait_test_support import VERIFY
-from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('''#!/bin/sh
-if [ "$1" = 3 ]; then
+        self.write_wait_sleep('''if [ "$1" = 3 ]; then
     printf '%s\\n' "$1" >> "$TEST_RECLAIM_POLLS"
 fi
 exit 0
 ''')
-        sleep.chmod(0o755)
         polls = self.root / "reclaim-polls"
         board = self.root / "board"
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),

@@ -1,43 +1,26 @@
-"""Move one unit between two disposable productions of one repository, against a local bare origin and isolated state."""
-
+"""Use private staff records and Git repositories for unit transfer tests."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import select
 import shlex
 import shutil
-from collections.abc import Callable
 import subprocess
-import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import fake_showrunner
-from scripts.production import fake_unit_host
-
 from scripts.herdr import fake_herdr
-from scripts.direct import review_pool
-from scripts.production import staff, showrunners as pool_showrunners
+from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
-import transfer_unit
-import retire_unit
-import pane_record
-import progress_history
-import tidy_wrapped
-import stall_watch
-from rename_state import RenameRefused
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import transfer_unit
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -52,9 +35,9 @@ class UnitTransferFixture(StaffTestCase):
         self.unit: Path = Path()
         self.env: dict[str, str] = {}
         self.commands: list[list[str]] = []
-        self.showrunner_addresses: dict[str, str] = {}
 
     fixture_root: ClassVar[Path]
+
     snapshot: ClassVar[Path]
 
     @classmethod
@@ -77,30 +60,22 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
-        row = unit_membership("demo", "alpha-unit")
-        self.pane("w1:p1", session_id="sid-alpha", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": row.id,
+        bind_staff_fixture(self, self.env, {"demo": ("alpha", "beta"), "other": ("gamma",)},
+                           locations={("demo", "alpha"): self.unit,
+                                      ("demo", "beta"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma"): self.root / "absent-gamma"})
+        row = unit_membership("demo", "alpha")
+        self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha", "CLAUDE_CODE_SESSION_ID": row.id,
         })
         self.write(self.root / "state/notifier/showrunner-other/conf",
-                   "TARGET=session:other-showrunner\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
-                   str(self.receiving / "docs/plans/other-production.md")]) + "\n")
-        self.showrunner_addresses = {slug: self.running_showrunner(slug, session_id)
-                                     for slug, session_id in (("demo", "test-showrunner"),
-                                                               ("other", "other-showrunner"))}
+                   "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
+                   fixture_runtime_id("showrunner::other")]) + "\n")
         for module, name, value in (
-            (pool_showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
-            (pool_showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
-            (pool_showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
-            (pool_showrunners, "SESSIONS_DIR", self.root / "state/sessions"),
-            (progress_history, "SESSION_ROOTS", (self.root / "sessions",)),
-            (pane_record, "RECORD_DIR", self.root / "home/.local/state/herdr-panes"),
-            (pane_record, "PROC", self.root / "proc"),
-            (tidy_wrapped, "STATE_DIR", self.root / "state/showrunner"),
-            (tidy_wrapped, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
-            (stall_watch, "STATE_DIR", self.root / "state/stall-watch"),
-            (stall_watch, "SESSIONS_DIR", self.root / "state/sessions"),
-            (stall_watch, "PROJECTS_DIR", self.root / "home/.claude/projects"),
+            (showrunners, "SEND", self.root / "fake_send.py"),
+            (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
+            (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
+            (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))
 
@@ -121,9 +96,7 @@ class UnitTransferFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
-            "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
             "TRANSFER_MESSAGE_LOG": str(self.root / "messages.jsonl"),
@@ -165,16 +138,10 @@ class UnitTransferFixture(StaffTestCase):
                            ("gc.auto", "0"), ("maintenance.auto", "false")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(origin))
-        self.write(self.giving / "docs/plans/demo-production.md", self.production_doc(
-            "demo", self.giving, "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.unit}` | demo-alpha |",
-            f"| beta-unit | docs/plans/beta.md | `{self.rust / 'claude-demo-beta'}` | demo-beta |"))
-        self.write(self.giving / "docs/plans/other-production.md", self.production_doc(
-            "other", self.receiving, "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |", "| gamma-unit | docs/plans/gamma.md | `/x` | other-gamma | — | — |"))
+        self.write(self.giving / "docs/plans/demo-production.md", self.production_doc("demo", self.giving))
+        self.write(self.giving / "docs/plans/other-production.md", self.production_doc("other", self.receiving))
         self.write(self.giving / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production: demo** — unit `alpha-unit`; production doc "
-                   + "`docs/plans/demo-production.md`\n\nalpha prose stays.\n")
+                   "# alpha\n\nalpha prose stays.\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("push", "-u", "origin", "demo")
@@ -184,148 +151,31 @@ class UnitTransferFixture(StaffTestCase):
         _ = self.git("worktree", "add", "-b", "demo-alpha", str(self.unit), "demo")
         _ = self.git("push", "origin", "demo-alpha")
         self.write(self.root / "state/notifier/showrunner-demo/conf",
-                   "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
+                   "EVERY=15\nTARGET=session:8f83b18e-2d35-5935-a408-9f483d34afff\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh",
-                                 str(self.giving / "docs/plans/demo-production.md")]) + "\n")
-        self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
-        # A reviewer with no thread retires without a Codex call.
-        self.write(self.root / "state/review-pool/demo/pool.json", json.dumps({"generation": 1, "reviewers": {
-            "r1": {"type": "codex", "thread_id": "", "prime_hash": "h", "lease": {"unit": "alpha-unit", "ordinal": 3},
-                   "busy_pid": None, "reviews": 2}}}))
+                                 fixture_runtime_id("showrunner::demo")]) + "\n")
 
-    def production_doc(self, slug: str, checkout: Path, *table: str) -> str:
-        return "\n".join(["# Production — " + slug, "", "## Production Context", "",
-                          f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
-                          "- **Log:** `production.log`", "", "## Units", "", *table, "",
-                          "## Production rules", "", "Rules.", ""])
+    def production_doc(self, production_name: str, checkout: Path) -> str:
+        return "\n".join(["# Production — " + production_name, "", "## Production Context", "",
+                          f"- **Merge branch:** `{production_name}`", f"- **Showrunner checkout:** `{checkout}`",
+                          "- **Log:** `production.log`", "", "## Production rules", "", "Rules.", ""])
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, content)
 
-    def add_destination(self, slug: str) -> Path:
-        checkout = self.rust / f"claude-{slug}-trunk"
-        _ = self.git("branch", slug)
-        _ = self.git("push", "origin", slug)
-        _ = self.git("worktree", "add", str(checkout), slug)
-        doc = checkout / f"docs/plans/{slug}-production.md"
-        self.write(doc, self.production_doc(slug, checkout, "| Unit | Plan | Worktree | Branch |",
-                                          "| --- | --- | --- | --- |"))
-        _ = self.git("add", str(doc), cwd=checkout)
-        _ = self.git("commit", "-m", f"fixture production {slug}", cwd=checkout)
-        _ = self.git("push", "origin", slug, cwd=checkout)
-        self.write(self.root / f"state/notifier/showrunner-{slug}/conf",
-                   f"TARGET=session:{slug}-showrunner\nCHECK=" + shlex.join([
-                       "zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
-        _ = staff.ensure("showrunner", name=slug)
-        return doc
-
-    def add_transfer_unit(self, stem: str) -> None:
-        plan = self.giving / f"docs/plans/{stem}.md"
-        self.write(plan, f"# {stem}\n\n> **Production: demo** — unit `{stem}-unit`; "
-                   + "production doc `docs/plans/demo-production.md`\n")
-        _ = self.git("add", str(plan))
-        _ = self.git("commit", "-m", f"fixture plan {stem}")
-        _ = self.git("push", "origin", "demo")
-        _ = self.git("worktree", "add", "-b", f"demo-{stem}", str(self.rust / f"claude-demo-{stem}"), "demo")
-        _ = self.git("push", "origin", f"demo-{stem}")
-
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *arguments], cwd=cwd or self.giving, env=self.env,
-                                capture_output=True, text=True, check=False)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def assert_refused(self, result: subprocess.CompletedProcess[str], text: str) -> None:
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(text, result.stderr)
-
-    def seed_record(self) -> Path:
-        """A prior shutdown record and a command log that exposes any forbidden stop or restart."""
-        home = self.root / "home"
-        saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
-            doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
-            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md")
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
-                  + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
-        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
-                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
-                                 check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(created.returncode, 0, created.stderr)
-        log = self.root / "shutdown-calls.jsonl"
-        stub = self.root / "fake_shutdown.py"
-        self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
-                   + "    _ = log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
-        self.env["RENAME_UNIT_SHUTDOWN"] = str(stub)
-        self.env["RENAME_UNIT_SHUTDOWN_LOG"] = str(log)
-        return log
-
-    def moved_unit_with_leftover_marks(self) -> None:
-        _ = self.seed_record()
-        self.assert_ok(self.transfer("apply"))
-        fake_unit_host.write(self.env, [
-            fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
-            fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit"})])
-        held = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "sid-alpha")
-        self.addCleanup(held.close)
-        fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
-        fake_unit_host.process(self.env, 991030, 991000, ["python3", "-m", "unittest"],
-                               {"HERDR_PANE_ID": "w3:p3Y", "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
-
-    def move_giving_checkout(self) -> None:
-        old = self.giving
-        self.giving = old.with_name("claude-demo-relocated")
-        _ = old.rename(self.giving)
-        _ = self.git("worktree", "repair")
-        doc = self.giving / "docs/plans/demo-production.md"
-        self.write(doc, doc.read_text().replace(str(old), str(self.giving)))
-        _ = self.git("add", str(doc))
-        _ = self.git("commit", "-m", "relocate giving checkout")
-        conf = self.root / "state/notifier/showrunner-demo/conf"
-        self.write(conf, conf.read_text().replace(str(old), str(self.giving)))
-        self.assertFalse(old.exists())
-
-    def assert_transfer_resumed(self, path: Path) -> None:
-        self.assert_ok(self.transfer("apply"))
-        saved = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertIs(saved["done"], True)
-        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
-        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
-        self.assert_ok(self.transfer("verify"))
-
-    def live_pid(self) -> int:
-        """Keep a registry holder alive until cleanup closes its input pipe."""
-        child = subprocess.Popen([sys.executable, "-c",
-            "import sys; print('ready', flush=True); sys.stdin.read()"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        def close() -> None:
-            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
-
-        self.addCleanup(close)
-        assert child.stdout is not None
-        ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
-        self.assertTrue(ready, "registry holder did not start")
-        self.assertEqual(child.stdout.readline(), b"ready\n")
-        return child.pid
-
-    def transfer_process(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        to_doc = to or self.receiving / "docs/plans/other-production.md"
-        return subprocess.run([sys.executable, str(SCRIPT), verb, "demo", unit, str(to_doc),
-                               "--scratch", str(self.root / "scratch")], cwd=self.giving, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-
-    def transfer(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        if self._testMethodName == "test_plan_lists_the_steps_and_changes_nothing":
-            return self.transfer_process(verb, unit, to)
-        arguments = [verb, "demo", unit, str(to or self.receiving / "docs/plans/other-production.md"),
+    def transfer(self, verb: str, unit: str = "alpha", to: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [verb, "demo", unit, to or "other",
                      "--scratch", str(self.root / "scratch")]
         return self.invoke(arguments)
 
@@ -338,83 +188,12 @@ class UnitTransferFixture(StaffTestCase):
             cwd = Path(cast(str, kwargs.get("cwd") or os.getcwd()))
             if command[0] == self.env["HERDR_BIN"]:
                 return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:], environment, cwd)
-            if command[:2] == [sys.executable, str(transfer_unit.POOL)]:
-                return invoke_cli(review_pool, review_pool.main, command[2:], environment, cwd, production_state=True)
             return original_run(command, *args, **kwargs)
 
-        with (mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "home/.local/state/mac-test/claims"),
-              mock.patch.object(subprocess, "run", run)):
+        with mock.patch.object(subprocess, "run", run):
             return invoke_cli(transfer_unit, lambda: transfer_unit.main(arguments), arguments,
                               self.env, self.giving, production_state=True)
-
-    def pause_before_source_commit(self) -> Path:
-        def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
-            del transfer, save
-            raise RenameRefused("fixture pause before source commit")
-
-        steps = tuple(step._replace(run=pause) if step.run.__name__ == "_commit_from" else step
-                      for step in transfer_unit.STEPS)
-        with mock.patch.object(transfer_unit, "STEPS", steps):
-            result = self.invoke(["apply", "demo", "alpha-unit", str(self.receiving / "docs/plans/other-production.md"),
-                                  "--scratch", str(self.root / "scratch")])
-        self.assert_refused(result, "fixture pause before source commit")
-        path = self.root / "state/showrunner/demo/transfer_unit.json"
-        saved = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertEqual((saved["step"], saved["done"]),
-                         (next(index for index, step in enumerate(transfer_unit.STEPS)
-                               if step.run.__name__ == "_commit_from"), False))
-        for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
-            self.assertNotIn(name, saved)
-        return path
 
     def messages(self) -> list[list[str]]:
         path = self.root / "messages.jsonl"
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
-
-    def running_showrunner(self, slug: str, session_id: str) -> str:
-        """Publish a real fixture socket for the shared sender's slug lookup."""
-        held = fake_showrunner.write_session(self.root / "state/sessions", slug, session_id, self.live_pid())
-        self.addCleanup(held.close)
-        return f"uds:{held.getsockname()}"
-
-    def remove_showrunner_session(self, session_id: str) -> None:
-        """Make a timer's recipient absent without changing the production's source."""
-        for path in (self.root / "state/sessions").glob("*.json"):
-            record = cast(dict[str, object], json.loads(path.read_text()))
-            if record["sessionId"] == session_id:
-                path.unlink()
-
-    def running_unit(self) -> int:
-        """Publish a running director through the existing host and session fixtures."""
-        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit("agents", "w1:p1", {
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
-        }, label="alpha")])
-        pid = self.live_pid()
-        socket = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "sid-alpha", pid)
-        self.addCleanup(socket.close)
-        fake_unit_host.place_process(self.env, pid, "w1:p1")
-        self.configure_tab_move()
-        return pid
-
-    def configure_tab_move(self) -> None:
-        """Publish source placement and the shared pane-move response."""
-        path = Path(self.env["FAKE_HERDR_RESPONSES"])
-        responses = cast(dict[str, object], json.loads(path.read_text()))
-        replies = {
-            "workspace list": {"workspaces": [{"workspace_id": "w1", "label": "demo"},
-                                                {"workspace_id": "w2", "label": "other"}]},
-            "pane list": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "alpha"}]},
-            "pane move w1:p1 --new-tab --workspace w2": {
-                "move_result": {"created_tab": {"tab_id": "w2:t1"}, "pane": {"pane_id": "w1:p1"}}},
-            "tab rename w2:t1 alpha": {},
-            "tab list --workspace w2": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
-            "tab list": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
-        }
-        for command, result in replies.items():
-            responses[f"--session agents {command}"] = {"stdout": json.dumps({"result": result}), "code": 0}
-        after = {**responses, "--session agents pane list": {"stdout": json.dumps({"result": {
-            "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t1", "label": "alpha"}],
-        }}), "code": 0}}
-        move = cast(dict[str, object], responses["--session agents pane move w1:p1 --new-tab --workspace w2"])
-        move["write_files"] = {str(path): json.dumps(after)}
-        self.write(path, json.dumps(responses))

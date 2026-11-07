@@ -8,9 +8,8 @@ import unittest
 from typing import cast, override
 
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 TARGETS = r'''
 import json
@@ -25,9 +24,9 @@ with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
 if command == "eligible":
     allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
     print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")
-    print("natedev\teligible\t-\t-")
+    print("natedev\teligible\t-\t-\t-")
     if allowed:
-        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")
 elif command in ("register-local", "check-local"):
     raise SystemExit(10 if any(holders.iterdir()) else 0)
 elif command == "wait-local":
@@ -44,7 +43,9 @@ import sys
 
 words = sys.argv[1:]
 call_id = words[words.index("--call-id") + 1]
-record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (call_id + ".json")).read_text())
+sys.path.insert(0, str(Path.home() / ".claude"))
+from scripts.direct.test_verify_step_state import read_step_row
+record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
     output.write(json.dumps({"args": words, "record": record}) + "\n")
 Path(words[words.index("--result") + 1]).write_text("mac=passed\nseconds=0\n")
@@ -70,9 +71,9 @@ class VerifyStepRouteTools(VerifyMacOffloadFixture):
             "CLAUDE_CODE_SESSION_ID": "", "TEST_MAC_ALLOWED": "1", "LINT_SKIP_SWEEP": "1",
         })
         reader = root / "enabled.sh"
-        _ = reader.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n")
+        _ = reader.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n_lint_config_raw() { :; }\n")
         self.environment["LINT_CONFIG_READER"] = str(reader)
-        self.write_executable(self.bin_directory / "taplo", 'raise SystemExit(0)\n')
+        self.write_executable(self.bin_directory / "taplo", "import sys\nif sys.argv[1:] == ['--version']:\n    print('taplo fixture 1.0')\n")
 
 
 class VerifyStepRoutesFixture(unittest.TestCase):
@@ -117,12 +118,18 @@ class VerifyStepRoutesFixture(unittest.TestCase):
 root = Path(os.environ["PACKAGE_ROOT"])
 finished = root / "mend-finished"
 if arguments[:1] == ["mend"]:
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (root / "mend-state").write_text(record["state"])
     finished.touch()
     raise SystemExit(int(os.environ["TEST_MEND_STATUS"]))
 if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (arguments[:1] == ["metadata"] or arguments == ["+nightly", "fmt", "--version"]):
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("hold after mend")
     with (root / "between-steps").open("a") as output:
         output.write(json.dumps({"args": arguments, "state": record["state"]}) + "\\n")
@@ -136,7 +143,8 @@ if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (a
         helpers = [cast(dict[str, object], json.loads(line)) for line in
                    (self.fixture.root / "between-steps").read_text().splitlines()]
         self.assertTrue(any(row["args"] == ["+nightly", "fmt", "--version"] for row in helpers))
-        self.assertTrue(any(cast(list[str], row["args"])[:1] == ["metadata"] for row in helpers))
+        self.assertEqual(len([event for event in self.fixture.cargo_events()
+                              if event["args"][:1] == ["metadata"]]), 1)
         self.assertTrue(all(row["state"] == "local_noncompiling" for row in helpers), helpers)
         self.assertTrue(any("clippy" in cast(list[str], row["args"]) for row in self.mac_rows()))
         self.assert_removed()

@@ -9,16 +9,14 @@ import json
 import math
 from pathlib import Path
 import stat
-import sys
 from typing import Literal, cast
 
-from . import client, decide, questions, vault
-from .records import ScoredIssue, STATE_DIR
+from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
 
-# renumber.py imports writer_lock by bare name, so its directory must be on sys.path.
-PRIORITIZE_DIR = str(Path(__file__).resolve().parents[1] / "prioritize")
-if PRIORITIZE_DIR not in sys.path:
-    sys.path.insert(0, PRIORITIZE_DIR)
+from scripts.issue_score import client, decide, questions, vault
+from scripts.issue_score.records import ScoredIssue, state_dir as configured_state_dir
+
 from scripts.prioritize import renumber
 
 Split = Literal["tune", "holdout", "all"]
@@ -54,6 +52,21 @@ class FieldObservation:
 class RunJudgments:
     scored: dict[str, ScoredIssue]
     failed: dict[str, str]
+
+
+def reliability_bucket_count(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.whole("reliability_bucket_count")
+
+
+def title_only_character_limit(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.whole("title_only_character_limit")
+
+
+def disagreement_count(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.whole("disagreement_count")
 
 
 def split_for(filename: str | Path) -> Literal["tune", "holdout"]:
@@ -269,7 +282,8 @@ def _table(headers: Sequence[object], rows: Sequence[Sequence[object]]) -> list[
             *("| " + " | ".join(_cell(value) for value in row) + " |" for row in rows), ""]
 
 
-def _field_report(field: str, observations: list[FieldObservation]) -> list[str]:
+def _field_report(field: str, observations: list[FieldObservation], *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     ordinal = field in ORDINAL_FIELDS
     probabilistic = [item for item in observations if isinstance(item.probabilities, dict)]
     exact = _mean([float(item.actual == item.predicted) for item in observations])
@@ -295,36 +309,40 @@ def _field_report(field: str, observations: list[FieldObservation]) -> list[str]
     lines += _table(["Label / Jev", *labels], [[label, *row] for label, row in zip(labels, matrix)])
     if not ordinal:
         rows: list[list[object]] = []
-        for bucket in range(5):
-            low, high = bucket / 5, (bucket + 1) / 5
+        bucket_count = reliability_bucket_count(scoring_config=scoring_config)
+        for bucket in range(bucket_count):
+            low, high = bucket / bucket_count, (bucket + 1) / bucket_count
             items = [item for item in probabilistic
                      if low <= cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0)
-                     and (cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) < high or bucket == 4)]
+                     and (cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) < high or bucket == bucket_count - 1)]
             # Confidence is read from the averaged API distribution, not from a
             # potentially incomplete synthetic decision distribution.
             confidences = [cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) for item in items]
-            rows.append([f"{low:.2f}–{high:.2f}" + (" (inclusive)" if bucket == 4 else ""), len(items),
+            rows.append([f"{low:.2f}–{high:.2f}" + (" (inclusive)" if bucket == bucket_count - 1 else ""), len(items),
                          _metric(_mean(confidences)), _metric(_mean([float(item.actual == item.predicted) for item in items]))])
-        lines += ["Reliability (five confidence buckets):", "", *_table(["Confidence", "N", "Mean confidence", "Accuracy"], rows)]
+        lines += [f"Reliability ({bucket_count} confidence buckets):", "", *_table(["Confidence", "N", "Mean confidence", "Accuracy"], rows)]
     return lines
 
 
-def _covered(field: str, observations: list[FieldObservation], threshold: float) -> list[FieldObservation]:
-    thresholds = dict(questions.THRESHOLDS)
+def _covered(field: str, observations: list[FieldObservation], threshold: float, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[FieldObservation]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    thresholds = dict(questions.thresholds(scoring_config=scoring_config))
     # Sweep this field even when production currently leaves it agent-only.
     thresholds[field] = (decide.MinimumGap(threshold) if isinstance(thresholds[field], decide.MinimumGap)
                          else decide.Supported(threshold))
     return [item for item in observations if decide.is_sure(field, item.decision, thresholds)]
 
 
-def _risk_thresholds(field: str) -> tuple[float, ...]:
-    return questions.RISK_GAPS if isinstance(questions.THRESHOLDS[field], decide.MinimumGap) else questions.RISK_THRESHOLDS
+def _risk_thresholds(field: str, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[float, ...]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return questions.RISK_GAPS if isinstance(questions.thresholds(scoring_config=scoring_config)[field], decide.MinimumGap) else questions.RISK_THRESHOLDS
 
 
-def _threshold_outcome(field: str, observations: list[FieldObservation], *, complete: bool) -> decide.ThresholdOutcome:
+def _threshold_outcome(field: str, observations: list[FieldObservation], *, complete: bool, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> decide.ThresholdOutcome:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     points: list[decide.RiskPoint] = []
-    for threshold in _risk_thresholds(field):
-        covered = _covered(field, observations, threshold)
+    for threshold in _risk_thresholds(field, scoring_config=scoring_config):
+        covered = _covered(field, observations, threshold, scoring_config=scoring_config)
         if not covered:
             continue
         if field in ("backlog_impact", "backlog_alignment"):
@@ -332,7 +350,7 @@ def _threshold_outcome(field: str, observations: list[FieldObservation], *, comp
         else:
             error = sum(item.actual != item.predicted for item in covered) / len(covered)
         points.append(decide.RiskPoint(threshold, len(covered) / len(observations), error))
-    return decide.select_threshold(field, points, complete=complete)
+    return decide.select_threshold(field, points, complete=complete, scoring_config=scoring_config)
 
 
 def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
@@ -345,13 +363,14 @@ def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
     return "report-only; agent proposes pending user verdict"
 
 
-def _heldout_validation(field: str, observations: list[FieldObservation], *, complete: bool) -> str:
-    policy = questions.THRESHOLDS[field]
+def _heldout_validation(field: str, observations: list[FieldObservation], *, complete: bool, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    policy = questions.thresholds(scoring_config=scoring_config)[field]
     if not isinstance(policy, (decide.Supported, decide.MinimumGap)):
         return _outcome_text(policy)
     threshold = policy.gap if isinstance(policy, decide.MinimumGap) else policy.threshold
     gate = "gap" if isinstance(policy, decide.MinimumGap) else "threshold"
-    covered = _covered(field, observations, threshold)
+    covered = _covered(field, observations, threshold, scoring_config=scoring_config)
     if field in ("backlog_impact", "backlog_alignment"):
         errors = [float(abs(int(item.actual) - int(item.predicted)) > 1) for item in covered]
         measure = "beyond-one error"
@@ -359,7 +378,7 @@ def _heldout_validation(field: str, observations: list[FieldObservation], *, com
         errors = [float(item.actual != item.predicted) for item in covered]
         measure = "exact error"
     error = _mean(errors)
-    target = questions.ERROR_TARGETS[field]
+    target = questions.error_targets(scoring_config=scoring_config)[field]
     passed = bool(covered) and isinstance(error, float) and error <= target + 1e-12
     status = "partial" if not complete else "pass" if passed else "fail"
     coverage = float(len(covered) / len(observations)) if observations else 0.0
@@ -368,32 +387,36 @@ def _heldout_validation(field: str, observations: list[FieldObservation], *, com
             f"coverage: {coverage:.4f}; {measure}: {_metric(error)}; target: ≤ {target:.4f}; {recommendation}")
 
 
-def _judgment_text(field: str, observations: list[FieldObservation], *, split: Split, complete: bool) -> str:
+def _judgment_text(field: str, observations: list[FieldObservation], *, split: Split, complete: bool, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     if split == "holdout":
-        return _heldout_validation(field, observations, complete=complete)
-    return _outcome_text(_threshold_outcome(field, observations, complete=complete and split == "tune"))
+        return _heldout_validation(field, observations, complete=complete, scoring_config=scoring_config)
+    return _outcome_text(_threshold_outcome(field, observations, complete=complete and split == "tune", scoring_config=scoring_config))
 
 
-def _routing_summary(field: str, observations: list[FieldObservation]) -> str:
-    policy = questions.THRESHOLDS[field]
+def _routing_summary(field: str, observations: list[FieldObservation], *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    thresholds = questions.thresholds(scoring_config=scoring_config)
+    policy = thresholds[field]
     if isinstance(policy, decide.Supported):
         configured = f"at configured threshold {policy.threshold:.2f}"
     elif isinstance(policy, decide.MinimumGap):
         configured = f"at configured gap {policy.gap:.2f}"
     else:
         configured = f"under configured {'unsupported' if isinstance(policy, decide.Unsupported) else 'report-only'} policy"
-    taken = _mean([float(decide.is_sure(field, item.decision)) for item in observations])
+    taken = _mean([float(decide.is_sure(field, item.decision, thresholds)) for item in observations])
     routed = 1.0 - taken if isinstance(taken, float) else taken
-    covered = [item for item in observations if decide.is_sure(field, item.decision)]
+    covered = [item for item in observations if decide.is_sure(field, item.decision, thresholds)]
     wrong = _mean([float(item.actual != item.predicted) for item in covered])
     return (f"Routing {configured}: taken (sure): {_metric(taken)}; "
             f"routed to the user (unsure): {_metric(routed)}; taken-wrong: {_metric(wrong)}.")
 
 
-def _risk_report(field: str, observations: list[FieldObservation], *, complete: bool, split: Split) -> list[str]:
+def _risk_report(field: str, observations: list[FieldObservation], *, complete: bool, split: Split, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     rows: list[list[object]] = []
-    for threshold in _risk_thresholds(field):
-        covered = _covered(field, observations, threshold)
+    for threshold in _risk_thresholds(field, scoring_config=scoring_config):
+        covered = _covered(field, observations, threshold, scoring_config=scoring_config)
         taken = float(len(covered) / len(observations)) if observations else UndefinedMetric("no observations")
         routed = 1.0 - taken if isinstance(taken, float) else taken
         row: list[object] = [f"{threshold:.2f}", len(covered), _metric(taken), _metric(routed),
@@ -402,15 +425,15 @@ def _risk_report(field: str, observations: list[FieldObservation], *, complete: 
             ordinal = [item for item in covered if isinstance(item.probabilities, dict)]
             row.append(_metric(_mean([float(abs(int(item.actual) - int(item.predicted)) > 1) for item in ordinal])))
         rows.append(row)
-    gap_policy = isinstance(questions.THRESHOLDS[field], decide.MinimumGap)
+    gap_policy = isinstance(questions.thresholds(scoring_config=scoring_config)[field], decide.MinimumGap)
     headers = ["Gap" if gap_policy else "Threshold", "Sure N", "Coverage", "Routed to user",
                "Taken-wrong" if gap_policy else "Exact error"]
     if field in ORDINAL_FIELDS:
         headers.append("Beyond-one error")
-    recommendation = _judgment_text(field, observations, split=split, complete=complete)
+    recommendation = _judgment_text(field, observations, split=split, complete=complete, scoring_config=scoring_config)
     label = "Held-out validation" if split == "holdout" else "Threshold outcome"
     return [f"### {field}", "", f"{label}: {recommendation}.", "",
-            _routing_summary(field, observations), "",
+            _routing_summary(field, observations, scoring_config=scoring_config), "",
             "Coverage is the share taken (sure); Routed to user is the share unsure.", "", *_table(headers, rows)]
 
 
@@ -472,7 +495,8 @@ def _high_priority(issues: Sequence[vault.Issue]) -> list[vault.Issue]:
     return result
 
 
-def _recommendations(observations: Mapping[str, list[FieldObservation]], high: Sequence[vault.Issue], *, complete: bool, split: Split) -> list[str]:
+def _recommendations(observations: Mapping[str, list[FieldObservation]], high: Sequence[vault.Issue], *, complete: bool, split: Split, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     paths = {issue.path for issue in high}
     rows: list[list[object]] = []
     for field, items in observations.items():
@@ -481,7 +505,7 @@ def _recommendations(observations: Mapping[str, list[FieldObservation]], high: S
         ordinal = [item for item in band if isinstance(item.probabilities, dict)] if field in ORDINAL_FIELDS else []
         within = _mean([float(abs(int(item.actual) - int(item.predicted)) <= 1) for item in ordinal])
         rows.append([field, len(band), _metric(exact), _metric(within) if field in ORDINAL_FIELDS else "N/A",
-                     _judgment_text(field, items, split=split, complete=complete)])
+                     _judgment_text(field, items, split=split, complete=complete, scoring_config=scoring_config)])
     urgency = observations["backlog_urgency"]
     rows_45 = [item for item in urgency if item.actual in (4, 5)]
     return ["## Per-field recommendations and score ≥ 20 results", "",
@@ -492,15 +516,19 @@ def _recommendations(observations: Mapping[str, list[FieldObservation]], high: S
 
 
 def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
-            issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-            goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md", baseline_run_id: str = "") -> Path:
+            issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+            goals_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, baseline_run_id: str = "", scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Write a report from saved answers; this function never contacts the API."""
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    issues_dir = vault.issue_directory(scoring_config=scoring_config) if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    state_dir = configured_state_dir(scoring_config=scoring_config) if isinstance(state_dir, UseConfiguredValue) else state_dir
+    goals_path = vault.vault_root(scoring_config=scoring_config) / "prioritization goals.md" if isinstance(goals_path, UseConfiguredValue) else goals_path
     state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+    if state_dir.is_relative_to(vault.vault_root(scoring_config=scoring_config).resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
         raise ValueError("Reports must be outside the issue vault")
     run_path = _run_path(run_id, state_dir)
     run = load_run(run_path)
-    rated = vault.load_rated_issues(issues_dir)
+    rated = vault.load_rated_issues(issues_dir, scoring_config=scoring_config)
     in_scope = [issue for issue in rated.issues if in_split(issue.path, split)]
     styles = [issue for issue in in_scope if issue.is_style]
     examples = [issue for issue in in_scope if not issue.is_style and issue.path.stem in questions.HISTORICAL_EFFORT_EXAMPLE_STEMS]
@@ -537,19 +565,19 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
                   f"Shared issues whose content/state hash changed between runs: {changed_content}. Interpret wording effects separately from state changes.", "",
                   f"Baseline scored: {sum(str(issue.path) in baseline.scored for issue in eligible)}; failed: {len(baseline_failed)}; unscored: {len(baseline_unscored)}.", "",
                   *(f"- Baseline missing: {_cell(issue.path)}" for issue in [*baseline_failed, *baseline_unscored]), ""]
-    groups = [("all", scored), ("title-only", [issue for issue in scored if len(vault.clean_body(issue.body)) < 200])]
+    groups = [("all", scored), ("title-only", [issue for issue in scored if len(vault.clean_body(issue.body, scoring_config=scoring_config)) < title_only_character_limit(scoring_config=scoring_config)])]
     high = _high_priority(scored)
     groups.append(("score ≥ 20", high))
     for name, issues in groups:
         lines += [f"## Group: {name} (N={len(issues)})", "", *_ordering(issues, run, goals)]
         paths = {issue.path for issue in issues}
         for field in FIELDS:
-            lines += _field_report(field, [item for item in observations[field] if item.issue.path in paths])
+            lines += _field_report(field, [item for item in observations[field] if item.issue.path in paths], scoring_config=scoring_config)
     lines += ["## Risk-coverage", "", "The production sure rule sweeps only this field's probability threshold or minimum gap; every other field keeps its configured threshold. Structural uncertainty remains unsure. Threshold selection requires a complete tuning run.", ""]
     for field in FIELDS:
-        lines += _risk_report(field, observations[field], complete=not partial, split=split)
-    lines += _recommendations(observations, high, complete=not partial, split=split)
-    lines += ["## Largest disagreements (up to 20 per field)", ""]
+        lines += _risk_report(field, observations[field], complete=not partial, split=split, scoring_config=scoring_config)
+    lines += _recommendations(observations, high, complete=not partial, split=split, scoring_config=scoring_config)
+    lines += [f"## Largest disagreements (up to {disagreement_count(scoring_config=scoring_config)} per field)", ""]
     for field in FIELDS:
         def gap(item: FieldObservation) -> float:
             if field in ORDINAL_FIELDS:
@@ -559,7 +587,7 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
             return 1 - item.probabilities.get(str(item.actual), 0.0)
 
         mismatches = sorted((item for item in observations[field] if item.actual != item.predicted),
-                            key=lambda item: (-gap(item), str(item.issue.path)))[:20]
+                            key=lambda item: (-gap(item), str(item.issue.path)))[:disagreement_count(scoring_config=scoring_config)]
         lines += [f"### {field}", "", *_table(["Issue", "Current", "Jev", "Gap"],
                   [[item.issue.title, item.actual, item.predicted, f"{gap(item):.4f}"] for item in mismatches])]
     if baseline_run_id:
@@ -570,11 +598,11 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
             lines += [f"## Baseline group: {name} (N={len(issues)})", "", *_ordering(issues, baseline, goals)]
             paths = {issue.path for issue in issues}
             for field in FIELDS:
-                lines += _field_report(field, [item for item in baseline_observations[field] if item.issue.path in paths])
+                lines += _field_report(field, [item for item in baseline_observations[field] if item.issue.path in paths], scoring_config=scoring_config)
         lines += ["## Baseline risk-coverage", ""]
         for field in FIELDS:
-            lines += _risk_report(field, baseline_observations[field], complete=not partial, split=split)
-        lines += _recommendations(baseline_observations, high, complete=not partial, split=split)
+            lines += _risk_report(field, baseline_observations[field], complete=not partial, split=split, scoring_config=scoring_config)
+        lines += _recommendations(baseline_observations, high, complete=not partial, split=split, scoring_config=scoring_config)
     if repeat_run_id:
         second = load_run(_run_path(repeat_run_id, state_dir))
         common = [issue for issue in scored if str(issue.path) in second.scored]

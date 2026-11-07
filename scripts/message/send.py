@@ -4,12 +4,10 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
+  send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --summary TITLE [--need note|decision|blocked]
-          (--action TEXT | --no-action) ...                              the user
   send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
                                                           the ones a session or script sends
   send.py ack KEY       later sends with KEY are skipped
@@ -21,21 +19,35 @@ every message follows are /message (~/.claude/commands/message.md).
                           also stop the emergency push sent with KEY (see below)
   send.py clear-check     retire each live emergency push whose --clears-when check passes
 
+Pane workers use worker:<unit>/<worker>.
+Workers in mesh-pinned runs use worker:<run id>/<worker>.
+
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
 headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
-removed, so it never passes for the session that ran this. It is named --from,
-which is the sender name the recipient sees. Delivery is read from the
+removed, so it never passes for the session that ran this. Its relay
+name is separate from the sender, who is named in the message. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
-the shared Codex daemon. A unique roster name resolves to either. `--codex`
-with `--session-dir` still selects codex_mesh.py directly. Names and addresses
-resolve here first, then on the peer. `--here` keeps resolution here; `--machine`
-runs this script on HOST over ssh, where ~/.claude is this repo.
+Staff `worker:` paths deliver through observed panes or their holders.
+Mesh `worker:` addresses keep their existing queues.
+Staff worker addresses use the run's pinned transport.
+Other `codex:` addresses queue through the shared Codex daemon.
+One staff snapshot selects each staff recipient.
+Unit names use the staff names. Ambiguous staff names stop delivery.
+A staff recipient uses its current_session, including for an explicit address.
+A non-staff name uses a unique live roster session, locally before the peer.
+A name without a staff row or live session is refused without a relay or queue.
+Explicit non-staff addresses keep their transport and queue behavior.
+Worker addresses use native IDs from the local or peer roster for staff lookup.
+`--codex` with `--session-dir` selects a run-scoped slot without staff lookup.
+Each message records its runtime sender ID separately from `--from`.
+Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
+Queues and SSH forwarding retain the original sender ID.
+`--here` checks only this machine. `--machine` runs this script on HOST over ssh.
 
-`--to user` reaches the user wherever they are; `--summary` is the title. `--need`
+`--to user` requires a registered `--text-id`. The template supplies the title and action. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
 `blocked` act before work can go on, repeated until they acknowledge it. How
 it reaches them is `user()`'s business: no caller names the channel.
@@ -60,7 +72,7 @@ An emergency push stops by itself when its cause is fixed. `--clears-when CMD` g
 command, run on this machine, that exits 0 when the cause is gone (`--clears-when github-warm-status`).
 A sent push with it is recorded in STATE/emergencies.json: key, sender, check, machine (the host
 that posted the push: this one, or --machine HOST), sent and expires (sent + pushover.EXPIRE_S).
-`clear-check` runs each record's check with no stdin and a CHECK_TIMEOUT_S limit. On exit 0 it
+`clear-check` runs each record's check with no stdin and a check_timeout() limit. On exit 0 it
 retires the push as `retire --to user` does (on the posting host over ssh when that is another
 host) and removes the record; it drops an expired record; it never pushes. It prints one line per
 record: `retired: KEY from SENDER: ...`, `kept: KEY from SENDER: ...`, `dropped: KEY from SENDER: ...`,
@@ -73,13 +85,15 @@ own push (stall_watch.py, escalate.py); sessions that send by hand give `--clear
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
+  RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
                  an emergency push with the key is still live
+  PENDING: why   an earlier send has not confirmed acceptance     exit 5
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
                  recipient's Claude session id, so a rename loses
-                 nothing; under the name as given when no live
-                 session answers to it, which the outcome says
+                 nothing. A known staff member without live transport
+                 keeps messages under its current session id.
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
   REPLACED: why  a newer version replaced this push; not sent     exit 0
@@ -101,6 +115,10 @@ Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_ST
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -115,30 +133,43 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import sessions  # noqa: E402
-import postmaster  # noqa: E402
-import codex_daemon  # noqa: E402
+from scripts.lib import process_group
+from scripts.production import staff, unit_names
+from scripts.lib import conf, models_registry, process_start, unit_runs
+from scripts.lib.atomic_file import write_text_atomic as write_atomic
+from scripts.notify import decision_priority
+from scripts.message import morty_identity, send_budget
+from scripts.message.send_result import (
+    Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
+    OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
+    ConfirmedSendOutcome as ConfirmedSendOutcome, UnconfirmedSendOutcome as UnconfirmedSendOutcome,
+    send_outcome as send_outcome,
+)
+from scripts.message import sessions  # noqa: E402
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message import postmaster  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
-    import roster
-    from ..accounts import accounts
-    from ..whoami.account import named_account_environment
-import push_texts  # noqa: E402
-import rca  # noqa: E402
-import review  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from probe_session import PROBE_ENV  # noqa: E402
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+    from scripts.message import roster
+    from scripts.accounts import accounts
+    from scripts.whoami.account import named_account_environment
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import push_reference
+from scripts.message import rca  # noqa: E402
+from scripts.message import repeat_guard  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
                          SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
@@ -159,8 +190,6 @@ AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
                   + ' [--value "rule=<the allow rule>"]')
 # The push shows a longer refused command cut to its first 89 characters and "…".
 REFUSED_COMMAND_LENGTH = 90
-# The cold-read review of an auto_mode.refused waits sentence holds the alert back at most this long.
-WAITS_REVIEW_SECONDS = 30
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -183,15 +212,20 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
                  + NEEDS_GO_CALL)
 # Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
-    AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
+    "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
+    "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
+    AUTO_MODE_TEXT: ("auto mode refused a command; the session continues its other work. "
+                     + "Send auto_mode.refused only when the refused step holds work and the user has no step for it yet. "
+                     + "If the user already has one, send nothing. "
+                     + "With other work to run, go on with it and leave out --need blocked. " + AUTO_MODE_CALL),
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
-    rca.STARTED_TEXT: ("a unit starts to fix why a session stopped for a permission. Sent by rca.py start;"
+    rca.STARTED_TEXT: ("a unit starts to fix the cause of a permission stop or refusal. Sent by rca.py start;"
                        + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
-    rca.FIXED_TEXT: ("the fix merged and the session does not stop for that permission again. Sent by rca.py fixed;"
+    rca.FIXED_TEXT: ("the fix merged; that permission does not stop or refuse the session again. Sent by rca.py fixed;"
                      + " sessions run rca.py, not this: " + rca.CALL
                      + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
     rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
@@ -200,66 +234,53 @@ SESSION_TEMPLATES = {
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
-# The rca.py pushes tell of a session that stopped, and a cause can say auto mode refused a command.
+# The rca.py pushes describe permission stops or refusals. A cause can name an auto-mode refusal.
 RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
-# One relay took 9 s when measured; quota_alert.py's budget is built on this.
-TIMEOUT = 40
-KILL_GRACE = 10
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
 RELAY_EXEC = """import os, sys
 from pathlib import Path
-directory = Path(sys.argv[1])
-directory.mkdir(parents=True, exist_ok=True)
-path = directory / str(os.getpid())
-temporary = path.with_name('.' + path.name + '.tmp')
-temporary.write_text(sys.argv[2], encoding='utf-8')
-os.replace(temporary, path)
+from scripts.message.relay_identity import publish_relay_identity
+publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
-# Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
-USER_CANCEL_TIMEOUT = 30
-# A --clears-when check that runs longer is stopped, and its push is kept.
-CHECK_TIMEOUT_S = 20
-# The far retire's cancel limit, the ssh connect timeout and its start-up.
-REMOTE_RETIRE_TIMEOUT = USER_CANCEL_TIMEOUT + 30
 EMERGENCIES = "emergencies.json"
 NO_CLEAR_STEP = ("an emergency push (--need blocked) repeats on the phone until it is cancelled, and this one has no"
                  + ' way to clear. Add --clears-when "<command that exits 0 when fixed>", such as'
                  + " --clears-when github-warm-status: send.py then cancels the push when that command exits 0")
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
+
+def waits_review_seconds() -> float:
+    """Push review budget in seconds."""
+    return conf.read("send").number("waits_review_seconds")
+
+
+def delivery_timeout() -> float:
+    """Default delivery budget in seconds."""
+    return conf.read("send").number("delivery_timeout")
+
+
+def kill_grace() -> float:
+    """Relay shutdown grace in seconds."""
+    return conf.read("send").number("kill_grace")
+
+
+def user_cancel_timeout() -> float:
+    """Emergency cancellation budget in seconds."""
+    return conf.read("send").number("user_cancel_timeout")
+
+
+def check_timeout() -> float:
+    """Emergency check budget in seconds."""
+    return conf.read("send").number("check_timeout")
+
+
 Need = Literal["note", "decision", "blocked"]
-CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
-OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
+CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "0", "blocked": "2"}
 _ACKNOWLEDGED_AT = " acknowledged at "
-
-
-@dataclass(frozen=True)
-class OutcomeHeader:
-    """The first send result and the payload that follows it."""
-    outcome: Outcome
-    detail: str
-    payload: str
-
-
-@dataclass(frozen=True)
-class NoOutcomeHeader:
-    """The command output contains no send result."""
-
-
-def parse_outcome(stdout: str) -> OutcomeHeader | NoOutcomeHeader:
-    """Read the first outcome header; later headers are payload text."""
-    lines = stdout.removesuffix("\n").split("\n")
-    for index, line in enumerate(lines):
-        word, _, detail = line.partition(": ")
-        if word in OUTCOME_HEADERS:
-            return OutcomeHeader(OUTCOME_HEADERS[word], detail, "\n".join(lines[index + 1:]))
-    return NoOutcomeHeader()
 
 
 def acknowledged_skip_reason(key: str, at: str) -> str:
@@ -275,7 +296,8 @@ LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to"
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
-                                  "seconds": NotRequired[float]})
+                                  "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
+                                  "sender_native_id": NotRequired[str]})
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -294,7 +316,10 @@ KeyedMessage = TypedDict(
         "text": str,
         "reason": str,
         "shown_sender": NotRequired[str],
+        "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
+        "stable_recipient": NotRequired[str],
+        "send_order": NotRequired[int],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -308,7 +333,10 @@ UnkeyedMessage = TypedDict(
         "text": str,
         "reason": str,
         "shown_sender": NotRequired[str],
+        "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
+        "stable_recipient": NotRequired[str],
+        "send_order": NotRequired[int],
     },
 )
 
@@ -316,13 +344,86 @@ UnkeyedMessage = TypedDict(
 QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
+class PendingDelivery(TypedDict):
+    started: str
+    limit_seconds: float
+    owner_pid: NotRequired[int]
+    owner_start: NotRequired[str]
+    clearing: NotRequired[Emergency]
+
+
 class KeyState(TypedDict):
-    # Recipient -> UTC ISO time of the claimed send; a failed send releases its claim.
+    # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
+    pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
+    clearing: NotRequired[Emergency]
 
 
 KeyStates = dict[str, KeyState]
+
+
+@dataclass(frozen=True)
+class ClaudeSender:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class CodexSender:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class UnavailableSender:
+    """The message has no recorded runtime identity."""
+
+
+SenderStamp = ClaudeSender | CodexSender | UnavailableSender
+
+
+@dataclass(frozen=True)
+class RuntimeSender:
+    """Read the sender identity from this process."""
+
+
+@dataclass(frozen=True)
+class ForwardedSender:
+    stamp: SenderStamp
+
+
+@dataclass(frozen=True)
+class QueueOrder:
+    """Order one send before its delivery can finish."""
+    value: int
+
+
+def new_queue_order() -> QueueOrder:
+    """Issue a shared sequence number under the queue lock."""
+    with locked():
+        path = STATE / "queue-order"
+        try:
+            previous = int(path.read_text(encoding="utf-8"))
+            if previous < 0:
+                raise ValueError("negative queue order")
+        except (OSError, ValueError):
+            previous = 0
+            for queue in (STATE / "queue").glob("*.jsonl"):
+                try:
+                    entries = read_queue(queue)
+                except UnicodeError:
+                    continue
+                previous = max(previous, max((entry.get("send_order", 0) for entry in entries), default=0))
+        order = QueueOrder(previous + 1)
+        write_atomic(path, str(order.value) + "\n")
+        return order
+
+
+@dataclass(frozen=True)
+class LegacyQueueOrder:
+    """Keep the queue rules for a caller without an attempt order."""
+
+
+LEGACY_QUEUE_ORDER = LegacyQueueOrder()
 
 
 @dataclass(frozen=True)
@@ -334,6 +435,8 @@ class Message:
     text: str
     key: str | None
     shown_sender: str = ""
+    human: bool = False
+    stamp: SenderStamp = UnavailableSender()
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -375,10 +478,13 @@ class FailedPush:
     reviewed: bool = False
     need: Need = "note"
     held: bool = False
+    text_id: str = ""
+    sender: str = ""
 
     @property
     def fallback_allowed(self) -> bool:
-        return (self.reviewed and not self.held) or self.need == "blocked"
+        return (self.reviewed and not self.held and self.need == "blocked"
+                and any(entry.id == self.text_id for entry in push_texts.catalog()))
 
     @property
     def message(self) -> str:
@@ -387,13 +493,8 @@ class FailedPush:
 
     @property
     def text(self) -> str:
-        line = " ".join((self.title + " — " + first_line(self.action, split_session(self.body)[0])).split())
-        if len(line) <= 200:
-            return line
-        shortened = line[:199]
-        if not line[199].isspace() and " " in shortened:
-            shortened = shortened.rsplit(" ", 1)[0]
-        return shortened.rstrip() + "…"
+        return (f"Title: {self.title}\n{self.message}\n\n"
+                + f"Sent by: {self.sender} · Template: {self.text_id}")
 
 
 @dataclass(frozen=True)
@@ -413,6 +514,8 @@ class ReviewedPushRecord(TypedDict):
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
     held_machine: NotRequired[str]
+    text_id: NotRequired[str]
+    sender: NotRequired[str]
 
 
 class FailedPushRecord(ReviewedPushRecord):
@@ -428,15 +531,15 @@ class FailedPushTransportRecord(ReviewedPushRecord):
     need: Need
 
 
-UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
-    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+UNREVIEWED_FALLBACK = ("Only a reviewed blocked push with a registered template can use a fallback. "
+    "Use send.py with a registered template after you repair the delivery failure.")
 
 
 HELD_FALLBACK = "This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed."
 
 
 def failure_detail(reason: str, failed: FailedPush) -> str:
-    if failed.held and failed.need != "blocked":
+    if failed.held:
         return reason.partition(" fallback text:")[0] + " " + HELD_FALLBACK
     reason = reason.partition(" fallback text:")[0].partition(" " + UNREVIEWED_FALLBACK)[0]
     return reason + (" fallback text:\n" + failed.text if failed.fallback_allowed else " " + UNREVIEWED_FALLBACK)
@@ -446,6 +549,11 @@ class Result(NamedTuple):
     outcome: Outcome
     detail: str
     failure: FailureText = NO_FAILED_PUSH
+    receiver: str = ""
+
+
+class PaneTextDelivered(Result):
+    """The observed worker pane accepted the text input."""
 
 
 @dataclass(frozen=True)
@@ -503,6 +611,11 @@ class CodexSessionRecipient:
     daemon: codex_daemon.CodexDaemon
 
 
+@dataclass(frozen=True)
+class PaneWorkerRecipient:
+    row: staff.StaffRow
+
+
 SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
 
 
@@ -522,7 +635,27 @@ class RecipientLookupFailed:
     reason: str
 
 
-DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+@dataclass(frozen=True)
+class NoStaffRecipient:
+    """The target keeps its transport resolution because no staff row matches."""
+
+
+@dataclass(frozen=True)
+class StableRecipient:
+    """Identify the recipient across changes to its transport address."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class TransportQueueOwner:
+    """Only the transport address identifies the queue owner."""
+
+
+TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
+
+
+DeliveryRoute = SessionRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -575,6 +708,17 @@ class MeshWorker:
 RecipientSelection = RosterLookup | MeshWorker
 
 
+@dataclass(frozen=True)
+class TransportRecipientIdentity:
+    """Keep the established per-address key identity."""
+
+
+@dataclass(frozen=True)
+class LogicalRecipientIdentity:
+    """A stable recipient whose transport address may change."""
+    name: str
+
+
 class Options(NamedTuple):
     selection: RecipientSelection
     sender: str | None
@@ -597,6 +741,14 @@ class Options(NamedTuple):
     # The sending script retires its own emergency push.
     self_clearing: bool = False
     shown_sender: ShownSender | SenderNotResolved = SenderNotResolved()
+    human: bool = False
+    no_accounting: bool = False
+    report_recipient: bool = False
+    sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    due: str = ""
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
+
+    recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
 
     @property
     def to(self) -> str:
@@ -641,12 +793,6 @@ def as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def write_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    _ = tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 @contextmanager
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
@@ -679,10 +825,10 @@ def session_key(session: sessions.SessionRecord) -> str:
 
 
 def queue_for(to: str) -> Path:
-    """Where a message that did not reach `to` is kept.
+    """Return the queue path for this address.
 
-    Under the Claude session id of the live session `to` means, so the session finds it whatever it
-    is called later. Under `to` itself when no live session answers to it: there is no id to look up.
+    Use the live session ID when available. Otherwise, use the original address.
+    Reject an unregistered socket address.
     """
     if to.startswith("session:") and len(to) > len("session:"):
         return queue_path(f"session-{to.removeprefix('session:')}")
@@ -700,6 +846,16 @@ def _queued_message(value: object) -> QueuedMessage | None:
     key = values.get("key")
     if "shown_sender" in values and not isinstance(values["shown_sender"], str):
         return None
+    if "stable_recipient" in values and not isinstance(values["stable_recipient"], str):
+        return None
+    order = values.get("send_order")
+    if "send_order" in values and (not isinstance(order, int) or isinstance(order, bool) or order < 0):
+        return None
+    if "sender_native_id" in values:
+        try:
+            _ = read_sender_stamp(values["sender_native_id"])
+        except ValueError:
+            return None
     if key is None:
         return cast(UnkeyedMessage, cast(object, values))
     if isinstance(key, str):
@@ -716,35 +872,82 @@ def read_queue(path: Path) -> list[QueuedMessage]:
     return [message for message in messages if message is not None]
 
 
-def enqueue(message: Message, reason: str, at: datetime) -> None:
-    """Keep a message that did not arrive; a later one with the same key replaces it."""
+def _matches_queued_key(entry: QueuedMessage, key: str,
+                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool) -> bool:
+    if entry["key"] != key:
+        return False
+    if "stable_recipient" in entry:
+        return isinstance(recipient, StableRecipient) and entry["stable_recipient"] == recipient.value
+    return own_path
+
+
+def _queued_not_newer(entry: QueuedMessage, order: QueueOrder | LegacyQueueOrder) -> bool:
+    """Keep legacy handling when either side has no attempt order."""
+    return isinstance(order, LegacyQueueOrder) or "send_order" not in entry or entry["send_order"] <= order.value
+
+
+def enqueue(message: Message, reason: str, at: datetime, *,
+            recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
+            order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER) -> None:
+    """Keep an undelivered message under its transport address.
+
+    Retain its stable recipient when known. Replace only older copies across queue files.
+    """
     path = queue_for(message.to)
     if message.key is None:
-        entry: QueuedMessage = UnkeyedMessage(
-            time=at.isoformat(),
-            to=message.to,
-            key=None,
-            summary=message.summary,
-            text=message.text,
-            reason=reason,
-            shown_sender=message.shown_sender,
-            **{"from": message.sender},
-        )
+        entry: QueuedMessage = {
+            "time": at.isoformat(),
+            "to": message.to,
+            "key": None,
+            "summary": message.summary,
+            "text": message.text,
+            "reason": reason,
+            "shown_sender": message.shown_sender,
+            "sender_native_id": sender_native_id(message.stamp),
+            "from": message.sender,
+        }
     else:
-        entry = KeyedMessage(
-            time=at.isoformat(),
-            to=message.to,
-            key=message.key,
-            summary=message.summary,
-            text=message.text,
-            reason=reason,
-            shown_sender=message.shown_sender,
-            **{"from": message.sender},
-        )
+        entry = {
+            "time": at.isoformat(),
+            "to": message.to,
+            "key": message.key,
+            "summary": message.summary,
+            "text": message.text,
+            "reason": reason,
+            "shown_sender": message.shown_sender,
+            "sender_native_id": sender_native_id(message.stamp),
+            "from": message.sender,
+        }
+    if isinstance(recipient, StableRecipient):
+        entry["stable_recipient"] = recipient.value
+    if isinstance(order, QueueOrder):
+        entry["send_order"] = order.value
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
-        kept = [old for old in read_queue(path) if message.key is None or old["key"] != message.key]
+        queues = [(path, read_queue(path))]
+        if message.key is not None and isinstance(recipient, StableRecipient):
+            for previous in path.parent.glob("*.jsonl"):
+                if previous == path:
+                    continue
+                try:
+                    queues.append((previous, read_queue(previous)))
+                except UnicodeError:
+                    continue
+        if message.key is not None and any(
+            _matches_queued_key(old, message.key, recipient, own_path=previous == path)
+            and not _queued_not_newer(old, order)
+            for previous, entries in queues for old in entries
+        ):
+            return
+        kept = [old for old in queues[0][1] if message.key is None
+                or not _matches_queued_key(old, message.key, recipient, own_path=True)]
         write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+        if message.key is not None and isinstance(recipient, StableRecipient):
+            for previous, entries in queues[1:]:
+                remaining = [old for old in entries
+                             if not _matches_queued_key(old, message.key, recipient, own_path=False)]
+                if len(remaining) != len(entries):
+                    _rewrite_queue(previous, remaining)
 
 
 def _rewrite_queue(path: Path, kept: list[QueuedMessage]) -> None:
@@ -763,15 +966,27 @@ def _queue_paths_for_address(to: str) -> list[Path]:
     return list(dict.fromkeys((destination, queue_path(to))))
 
 
-def remove_queued_key(to: str, key: str) -> int:
-    """Remove a delivered keyed message's queued predecessor."""
+def remove_queued_key(to: str, key: str, *,
+                      recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
+                      order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER) -> int:
+    """Remove matching copies no newer than the delivered send."""
     paths = _queue_paths_for_address(to)
     removed = 0
     with locked():
-        for path in paths:
-            entries = read_queue(path)
-            kept = [entry for entry in entries if entry["key"] != key]
-            _rewrite_queue(path, kept)
+        candidates = (list(dict.fromkeys([*paths, *(STATE / "queue").glob("*.jsonl")]))
+                      if isinstance(recipient, StableRecipient) else paths)
+        for path in candidates:
+            try:
+                entries = read_queue(path)
+            except UnicodeError:
+                if path in paths:
+                    raise
+                continue
+            kept = [entry for entry in entries
+                    if not (_matches_queued_key(entry, key, recipient, own_path=path in paths)
+                            and _queued_not_newer(entry, order))]
+            if len(kept) != len(entries):
+                _rewrite_queue(path, kept)
             removed += len(entries) - len(kept)
     return removed
 
@@ -799,7 +1014,7 @@ def retire(to: str, sender: str, key: str) -> int:
 def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
     """Stop the user's emergency push sent with key, through the same channel user() sends on."""
     code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
-                         USER_CANCEL_TIMEOUT)
+                         user_cancel_timeout())
     if code == 0 and "pushover: nothing to cancel" in out:
         return 0, f"nothing to cancel: no emergency push for {key} is repeating"
     if code == 0:
@@ -865,8 +1080,13 @@ def write_emergencies(records: list[Emergency]) -> None:
 def record_emergency(record: Emergency) -> None:
     """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
     with locked():
-        kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
-        write_emergencies([*kept, record])
+        _record_emergency_locked(record)
+
+
+def _record_emergency_locked(record: Emergency) -> None:
+    """Replace one clearing record while the caller holds the state lock."""
+    kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+    write_emergencies([*kept, record])
 
 
 def check_exit(command: str, timeout: float) -> int | None:
@@ -877,7 +1097,7 @@ def check_exit(command: str, timeout: float) -> int | None:
             return process.wait(timeout)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.wait()
@@ -893,7 +1113,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     forget_sent(record["key"], USER)
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
-    code, out, err = run(command, "", REMOTE_RETIRE_TIMEOUT)
+    code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     last = (out.strip().splitlines() or [""])[-1]
     if code == 0:
         return 0, f"on {record['machine']}: {last}"
@@ -914,11 +1134,16 @@ def clear_check_turn() -> Generator[bool]:
         yield True
 
 
-def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
+class ConfiguredCheckTimeout(Enum):
+    CURRENT = "current"
+
+
+def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout.CURRENT) -> tuple[int, list[str]]:
     """Retire each live emergency push whose check passes and drop the expired ones; never pushes.
 
     The lock is not held while checks and retires run: a retire takes it, and a send must not wait on a check.
     """
+    timeout = check_timeout() if isinstance(timeout, ConfiguredCheckTimeout) else timeout
     if not (STATE / EMERGENCIES).exists():
         return 0, []
     with clear_check_turn() as turn:
@@ -933,7 +1158,7 @@ def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
         for record in records:
             name = f"{record['key']} from {record['sender']}"
             expires = datetime.fromisoformat(record["expires"])
-            if now() >= expires:
+            if now() >= expires and not record["key"].startswith("github.keys_cold:"):
                 done.append(record)
                 lines.append(f"dropped: {name}: its push expired at {expires.astimezone(zone):%H:%M:%S %Z}")
                 continue
@@ -959,23 +1184,25 @@ def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
 
 def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
-    with locked(), path.open("a", encoding="utf-8") as handle:
-        _ = handle.write(json.dumps(entry) + "\n")
-        if durable:
-            handle.flush()
-            os.fsync(handle.fileno())
+    with locked():
+        repeat_guard.append_jsonl(path, entry, durable=durable)
 
 
 def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
-    entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": message.to,
+    entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": result.receiver or message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
                        else "", "text": message.text, "outcome": result.outcome, "detail": result.detail}
+    entry["sender_native_id"] = sender_native_id(message.stamp)
+    entry["human"] = message.human
     if isinstance(route, ClaudeRoute):
         entry["via"] = route.via
         entry["postmaster"] = route.postmaster
         entry["seconds"] = round(route.seconds, 3)
-    append_record(STATE / "log.jsonl", entry,
-                  durable=message.key is not None and message.key.startswith("socket-recovery:"))
+    try:
+        append_record(STATE / "log.jsonl", entry,
+                      durable=message.key is not None and message.key.startswith("socket-recovery:"))
+    except Exception as error:
+        repeat_guard.warn(f"message accounting: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -983,16 +1210,34 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
-def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
-    """Why this send is skipped, or None after recording it as the key's latest attempt.
+@contextmanager
+def delivery_turn(message: Message) -> Generator[bool]:
+    """Exclude only this key and recipient; never hold the global state lock during transport."""
+    if message.key is None:
+        yield True
+        return
+    directory = STATE / "delivery-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = json.dumps([message.key, message.to])
+    path = directory / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
-    Recording before delivery, under the lock, keeps two overlapping runs with
-    one key from both sending. `live`: the window is an emergency push's lifetime.
-    """
+
+def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
+    """Read prior acceptance under a delivery turn; a lock alone never means sent."""
     if message.key is None:
         return None
     with key_states() as states:
-        state = states.setdefault(message.key, {"last": {}})
+        state = states.get(message.key, {"last": {}})
         if "acknowledged" in state:
             return acknowledged_skip_reason(message.key, state["acknowledged"])
         last = state["last"].get(message.to)
@@ -1001,8 +1246,162 @@ def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: boo
                 return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
             minutes = repeat.total_seconds() / 60
             return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
-        state["last"][message.to] = at.isoformat()
     return None
+
+
+def record_acceptance(message: Message, at: datetime) -> None:
+    """Only a confirmed transport or recoverable queue/kept handoff enters the repeat window."""
+    if message.key is not None:
+        with key_states() as states:
+            state = states.setdefault(message.key, {"last": {}})
+            state["last"][message.to] = at.isoformat()
+
+
+@dataclass(frozen=True)
+class ClaimGranted:
+    """This attempt can deliver the message."""
+
+
+@dataclass(frozen=True)
+class RepeatAccepted:
+    """An earlier attempt already accepted the message."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class RepeatPending:
+    """An earlier attempt has not confirmed acceptance."""
+    reason: str
+
+
+def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
+    """Read legacy pending timestamps with the default delivery limit."""
+    return {recipient: PendingDelivery(started=mark, limit_seconds=delivery_timeout()) if isinstance(mark, str) else mark
+            for recipient, mark in state.get("pending", {}).items()}
+
+
+def _owner_released(record: Mapping[str, object]) -> bool:
+    """Reclaim only a gone process or a confirmed replacement."""
+    pid = record.get("owner_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return False
+    observed = process_start.process_start(pid)
+    if isinstance(observed, (process_start.Gone, process_start.Zombie)):
+        return True
+    saved = record.get("owner_start")
+    return isinstance(observed, process_start.Started) and isinstance(saved, str) and bool(saved) and observed.start != saved
+
+
+
+def _owns_attempt(record: PendingDelivery) -> bool:
+    """Only the original live process can complete its owned attempt."""
+    if "owner_pid" not in record:
+        return True
+    if record["owner_pid"] != os.getpid():
+        return False
+    observed = process_start.process_start(os.getpid())
+    return isinstance(observed, process_start.Started) and observed.start == record.get("owner_start")
+
+
+def _finish_clearing(state: KeyState) -> None:
+    """Project a clearing record while the caller holds the key lock."""
+    if "clearing" not in state:
+        return
+    _record_emergency_locked(state["clearing"])
+    del state["clearing"]
+
+
+def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
+          delivery_limit: float,
+          legacy_aliases: tuple[str, ...] = (), live: bool = False,
+          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
+    """Check acceptance before recording an attempt under the stable recipient.
+
+    The lock prevents overlapping sends with one key from both sending.
+    Known transport aliases contribute timestamps only to the window check.
+    With `live`, the window is the lifetime of an emergency push.
+    """
+    if message.key is None:
+        return ClaimGranted()
+    with key_states() as states:
+        state: KeyState = states.get(message.key, {"last": {}})
+        _finish_clearing(state)
+        if "acknowledged" in state:
+            return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
+        pending = pending_deliveries(state)
+        for alias in (recipient.value, *legacy_aliases):
+            attempt = pending.get(alias)
+            if attempt is None or "owner_pid" not in attempt or attempt["started"] != state["last"].get(alias):
+                continue
+            if not _owner_released(attempt):
+                return RepeatPending(f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted")
+            del state["last"][alias]
+            if "pending" in state:
+                _ = state["pending"].pop(alias, None)
+        # An abandoned delivery must not block a window with no end.
+        timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
+                      if alias in state["last"]
+                      and not (alias in pending and pending[alias]["started"] == state["last"][alias]
+                               and at - datetime.fromisoformat(state["last"][alias])
+                               >= timedelta(seconds=pending[alias]["limit_seconds"]))]
+        last = max(timestamps, key=datetime.fromisoformat) if timestamps else None
+        unaccepted = any(alias in pending and pending[alias]["started"] == last
+                         for alias in (recipient.value, *legacy_aliases)) if last is not None else False
+        pending_reason = f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted"
+        if last is not None and message.key.startswith("github.keys_cold:"):
+            if unaccepted:
+                return RepeatPending(pending_reason)
+            return RepeatAccepted(f"key {message.key!r}: GitHub keys still cold; this event already sent its push")
+        if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
+            if unaccepted:
+                return RepeatPending(pending_reason)
+            if live:
+                return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
+            minutes = repeat.total_seconds() / 60
+            return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
+        attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        if emergency:
+            owner = process_start.process_start(os.getpid())
+            if not isinstance(owner, process_start.Started):
+                return RepeatPending("emergency owner lifetime is unknown; not yet accepted")
+            attempt.update(owner_pid=os.getpid(), owner_start=owner.start)
+        if clears_when:
+            clearing = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
+                                 sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            if message.key.startswith("github.keys_cold:"):
+                # A warm-check command also clears an interrupted cold-key claim.
+                _record_emergency_locked(clearing)
+            elif emergency:
+                attempt["clearing"] = clearing
+            else:
+                _record_emergency_locked(clearing)
+        state["last"][recipient.value] = at.isoformat()
+        state.setdefault("pending", {})[recipient.value] = attempt
+        states[message.key] = state
+    return ClaimGranted()
+
+
+def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> None:
+    """Confirm only the claim owned by this accepted attempt."""
+    with key_states() as states:
+        state = states.get(key)
+        if state is None:
+            return
+        pending = state.get("pending", {})
+        owned = pending_deliveries(state).get(to)
+        if owned is None or owned["started"] != at.isoformat():
+            return
+        if not _owns_attempt(owned):
+            return
+        if delivered and "clearing" in owned:
+            state["clearing"] = owned["clearing"]
+        del pending[to]
+        if not pending:
+            del state["pending"]
+    with key_states() as states:
+        state = states.get(key)
+        if state is not None:
+            _finish_clearing(state)
 
 
 def user_emergency_key(sender: str, title: str) -> str:
@@ -1014,7 +1413,7 @@ def user_emergency_key(sender: str, title: str) -> str:
 def emergency_lifetime() -> timedelta:
     """How long Pushover repeats an emergency push that the user does not acknowledge."""
     # Imported here: only an emergency send reads it, and pushover's imports cost about 20 ms.
-    from pushover import EXPIRE_S
+    from scripts.notify.pushover import EXPIRE_S
     return timedelta(seconds=EXPIRE_S)
 
 
@@ -1028,13 +1427,22 @@ def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta) -> st
 
 
 def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
-    """Forget the key's last send to `to`, so the next send goes out at once. With `at`, only when that
-    send is the one at `at`: a later run's record stays."""
+    """Remove this recipient's claim after a failed send.
+
+    With `at`, keep the claim when a later attempt owns it.
+    """
     with key_states() as states:
         state = states.get(key)
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
             return
+        owned = pending_deliveries(state).get(to)
+        if at is not None and owned is not None and not _owns_attempt(owned):
+            return
         del state["last"][to]
+        if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
+            _ = state["pending"].pop(to, None)
+            if not state["pending"]:
+                del state["pending"]
         if not state["last"] and "acknowledged" not in state:
             del states[key]
 
@@ -1060,10 +1468,8 @@ def relay_sender(address: str) -> str:
     path = Path(address.removeprefix("uds:"))
     if path.parent.name != "cc-socks" or path.suffix != ".sock" or not path.stem.isdecimal():
         return ""
-    try:
-        return (STATE / "relay_senders" / path.stem).read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    identity = read_relay_sender(int(path.stem), STATE / "relay_senders")
+    return identity.sender if isinstance(identity, SavedRelaySender) else ""
 
 
 def socket_sender(address: str, metadata: dict[str, object]) -> str:
@@ -1080,8 +1486,22 @@ def dead_socket_reason(address: str, name: str = "") -> str:
 
 
 def socket_recipient(address: str, records: list[sessions.SessionRecord], metadata: dict[str, object], *,
-                     disconnected: bool = False) -> ClaudeRecipient | RecipientLookupFailed:
-    """Keep direct sockets until their one delivery connect fails, then resolve the saved name."""
+                     disconnected: bool = False, membership: staff.StaffSnapshot | None = None) -> ClaudeRecipient | RecipientLookupFailed:
+    """Use the staff current session, or retain direct socket transport."""
+    membership = staff.snapshot() if membership is None else membership
+    registered = any(f"uds:{record['messagingSocketPath']}" == address for record in records)
+    target = address if registered else socket_sender(address, metadata) or address
+    member = resolve_staff_recipient(target, membership, records=records)
+    if isinstance(member, RecipientLookupFailed):
+        return member
+    if isinstance(member, staff.StaffRow):
+        session = next((record for record in records if record["sessionId"] == member.current_session), None)
+        if session is None:
+            return ClaudeRecipient(f"session:{member.current_session}")
+        current_address = f"uds:{session['messagingSocketPath']}"
+        if disconnected and current_address == address:
+            return RecipientLookupFailed(dead_socket_reason(address, member.name))
+        return ClaudeRecipient(current_address)
     if not disconnected and Path(address.removeprefix("uds:")).is_socket():
         return ClaudeRecipient(address)
     name = socket_sender(address, metadata)
@@ -1092,13 +1512,13 @@ def socket_recipient(address: str, records: list[sessions.SessionRecord], metada
 
 
 def relay_socket(message: Message, timeout: float, records: list[sessions.SessionRecord],
-                 metadata: dict[str, object]) -> Result:
+                 metadata: dict[str, object], *, membership: staff.StaffSnapshot | None = None) -> Result:
     """Reuse the delivery connect: only a definite missing/refused socket permits a name retry."""
     started = time.monotonic()
     result = relay(message, timeout)
     if message.to.startswith("uds:") and result.outcome == "queued" and re.search(
             r"\b(?:ENOENT|ECONNREFUSED)\b", result.detail):
-        recipient = socket_recipient(message.to, records, metadata, disconnected=True)
+        recipient = socket_recipient(message.to, records, metadata, disconnected=True, membership=membership)
         if isinstance(recipient, RecipientLookupFailed):
             return Result("failed", f"{result.detail}; {recipient.reason}")
         return relay(replace(message, to=recipient.address), max(1.0, timeout - (time.monotonic() - started)))
@@ -1157,6 +1577,7 @@ def finish_socket_reply(path: Path, remaining: list[QueuedMessage], entry: Queue
 
 def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -> tuple[int, list[str]]:
     """With the drain lock held, retry known failures and archive uncertain deliveries."""
+    membership = staff.snapshot()
     outcomes = socket_reply_outcomes()
     old_files: list[tuple[Path, list[datetime]]] = []
     lines: list[str] = []
@@ -1211,21 +1632,22 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
         for entry in remaining.copy():
             identity = entry.get("socket_recovery", "")
             metadata = cast("dict[str, object]", cast(object, entry))
-            recipient = socket_recipient(entry["to"], records, metadata)
+            recipient = socket_recipient(entry["to"], records, metadata, membership=membership)
             if isinstance(recipient, RecipientLookupFailed):
                 lines.append(f"unresolved socket queue {path}: {recipient.reason}; left in place")
                 code = EXIT["failed"]
                 continue
             message = Message(recipient.address, entry["from"], entry["summary"],
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
-                              entry.get("shown_sender", entry["from"]))
-            if not saved:
-                _rewrite_queue(path, remaining)
-                saved = True
+                              entry.get("shown_sender", entry["from"]),
+                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
-            result = relay_socket(message, TIMEOUT, records, metadata)
+            if not saved:
+                _rewrite_queue(path, remaining)
+                saved = True
+            result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
                 lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
@@ -1242,11 +1664,11 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
     return code, lines
 
 
-def pending(to: str | None) -> str:
-    """Print and clear what is kept for a session: the one `to` means, or the caller's own.
+def pending(to: str | None, *, emit: bool = False) -> str:
+    """Print and clear queued messages for the selected session.
 
-    It is found by session id. What was kept under a name is found too: the name `to`, the session's
-    name now, and each name it once had that no live session has now.
+    Current staff owners also receive their messages from queues for previous sessions.
+    Names from previous sessions remain eligible when no other live session uses them.
     """
     records = sessions.live_sessions()
     if to is None:
@@ -1262,13 +1684,61 @@ def pending(to: str | None) -> str:
         keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
                 *(name for name in session["formerNames"] if name not in taken), *keys]
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
+    stable_values = set(keys)
+    if session is not None:
+        try:
+            member = staff.snapshot().by_current_session(session["sessionId"])
+        except staff.StaffUnreadable:
+            member = None
+        if member is not None:
+            stable_values.add(f"staff:{member.id}")
     with locked():
-        entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
-        for path in paths:
-            path.unlink(missing_ok=True)
-    return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-                       + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])) + "\n"
-                       + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
+        entries: list[QueuedMessage] = []
+        rewrites: list[tuple[Path, list[QueuedMessage]]] = []
+        candidates = list(dict.fromkeys([*paths, *(STATE / "queue").glob("*.jsonl")]))
+        for path in candidates:
+            selected: list[QueuedMessage] = []
+            kept: list[QueuedMessage] = []
+            try:
+                queued = read_queue(path)
+            except UnicodeError:
+                if path in paths:
+                    raise
+                continue
+            for entry in queued:
+                owner = entry.get("stable_recipient", "")
+                if owner in stable_values or path in paths and not owner.startswith("staff:"):
+                    selected.append(entry)
+                else:
+                    kept.append(entry)
+            if selected or path in paths:
+                entries.extend(selected)
+                rewrites.append((path, kept))
+        entries.sort(key=lambda entry: entry["time"])
+        newest: dict[tuple[str, str], QueuedMessage] = {}
+        unkeyed_or_legacy: list[QueuedMessage] = []
+        for entry in entries:
+            owner = entry.get("stable_recipient")
+            key = entry["key"]
+            if owner is not None and key is not None:
+                previous = newest.get((owner, key))
+                if (previous is None
+                        or "send_order" not in previous and "send_order" not in entry
+                        or "send_order" in entry and _queued_not_newer(previous, QueueOrder(entry["send_order"]))):
+                    newest[owner, key] = entry
+            else:
+                unkeyed_or_legacy.append(entry)
+        entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
+        text = "\n\n".join(stamped_text(
+            f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+            "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+            for index, entry in enumerate(entries, 1))
+        if emit and text:
+            print(text, flush=True)
+        for path, kept in rewrites:
+            _rewrite_queue(path, kept)
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -1276,13 +1746,49 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _print_roster_problems(problems: list[str]) -> None:
+def _recipient_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> list[str]:
+    """Use staff identities for anomalies and text for diagnostics without typed owners."""
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    references = {to, to.split(":", 1)[-1]}
+    if isinstance(member, staff.StaffRow):
+        references.update((member.name, str(member.id), str(member.current_session)))
+    typed: dict[str, bool] = {}
+    for anomaly in observed.row_anomalies:
+        owner = anomaly.row
+        matches = (owner.id == member.id if isinstance(member, staff.StaffRow)
+                   else to.casefold() in (owner.name.casefold(), owner.id, owner.current_session,
+                                          f"session:{owner.current_session}", f"codex:{owner.current_session}"))
+        for text in (anomaly.diagnostic, f"warning: {anomaly.diagnostic}"):
+            typed[text] = typed.get(text, False) or matches
+    related: list[str] = []
     for problem in problems:
+        if problem in typed:
+            matches = typed[problem]
+        else:
+            matches = any(reference and re.search(
+                rf"(?<![\w-]){re.escape(reference)}(?![\w-])", problem, re.IGNORECASE)
+                for reference in references)
+        if matches:
+            related.append(problem)
+    return related
+
+
+def _print_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> None:
+    related = _recipient_roster_problems(to, problems, observed, membership)
+    for problem in related:
         print(f"send.py: roster: {problem}", file=sys.stderr)
+    omitted = len(problems) - len(related)
+    if omitted:
+        print(f"send.py: roster problems omitted: {omitted}; "
+              + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py", file=sys.stderr)
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
-    import roster
+    from scripts.message import roster
 
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
@@ -1304,13 +1810,13 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     lines = [f"{name} matches {len(entries)} sessions:"]
     for entry in entries:
@@ -1325,8 +1831,95 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
     usage_error("\n".join(lines))
 
 
-def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+def resolve_staff_recipient(
+    target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
+    observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
+) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
+    """Select one staff identity before any transport lookup."""
+    from scripts.message import roster
+
+    reference = target
+    if target.startswith("worker:"):
+        for entry in observed:
+            if isinstance(entry.reach, roster.Messageable) and entry.reach.address == target:
+                if isinstance(entry.thread, roster.CodexThread):
+                    reference = entry.thread.thread_id
+                elif isinstance(entry.session, roster.ClaudeSession):
+                    reference = entry.session.session_id
+        if reference == target:
+            path = target.removeprefix("worker:")
+            if len(path.split("/")) == 2:
+                sender = roster.sender_identity(os.environ)
+                identity = (sender.thread_id if isinstance(sender, roster.CodexThread)
+                            else sender.session_id if isinstance(sender, roster.ClaudeSession) else "")
+                ancestor = membership.by_current_session(identity)
+                while ancestor is not None and ancestor.kind != "showrunner":
+                    ancestor = membership.parent_of(ancestor)
+                if ancestor is not None and path.split("/", 1)[0] != ancestor.name:
+                    path = f"{ancestor.name}/{path}"
+            member = membership.by_path(path)
+            if member is not None and member.kind == "worker":
+                return member
+    if target.startswith("uds:"):
+        record = next((record for record in records
+                       if f"uds:{record['messagingSocketPath']}" == target), None)
+        reference = record["sessionId"] if record is not None else socket_sender(target, {})
+    elif target.startswith(("session:", "codex:")):
+        reference = target.split(":", 1)[1]
+    member = membership.by_id(staff.StaffId(reference)) or membership.by_current_session(reference)
+    if member is not None:
+        return member
+    if target.startswith(("session:", "codex:", "worker:")) or not reference:
+        return NoStaffRecipient()
+    def normalized_name(value: str) -> str:
+        try:
+            return unit_names.name(value).casefold()
+        except unit_names.BadName:
+            return value.casefold()
+
+    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
+    matches: dict[staff.StaffId, staff.StaffRow] = {}
+    for candidate in membership.find():
+        chain = [candidate.name]
+        parent = candidate
+        visited = {candidate.id}
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo):
+            ancestor = membership.by_id(parent.parent.id)
+            if ancestor is None or ancestor.id in visited:
+                break
+            visited.add(ancestor.id)
+            chain.insert(0, ancestor.name)
+            parent = ancestor
+        path = "/".join(chain)
+        canonical = "/".join(normalized_name(part) for part in chain)
+        short = normalized_name(candidate.name)
+        if normalized == canonical or ("/" not in normalized and normalized == short):
+            # by_path handles canonical paths; by_id preserves duplicate-path evidence.
+            found = membership.by_path(path)
+            row = found if found is not None and found.id == candidate.id else membership.by_id(candidate.id)
+            if row is not None:
+                matches[row.id] = row
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if matches:
+        details = ", ".join(f"{row.name} (staff:{row.id}, session:{row.current_session})" for row in matches.values())
+        return RecipientLookupFailed(f"ambiguous staff row for {target!r}: {details}")
+    return NoStaffRecipient()
+
+
+def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    from scripts.message import roster
+
+    return [entry for entry in entries if (
+        isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id == member.current_session
+        or isinstance(entry.thread, roster.CodexThread) and entry.thread.thread_id == member.current_session
+        or isinstance(entry.reach, roster.Messageable)
+        and entry.reach.address in (f"session:{member.current_session}", f"codex:{member.current_session}", member.current_session)
+    )]
+
+
+def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    from scripts.message import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
@@ -1337,7 +1930,7 @@ def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roste
 def _matched_recipient(
     to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
 ) -> SessionRecipient | RemoteDelivery:
-    import roster
+    from scripts.message import roster
 
     if len(matches) > 1:
         _ambiguous_name(to, matches)
@@ -1350,75 +1943,146 @@ def _matched_recipient(
 
 
 def matching_recipients(
-    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster,
+    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
     """Find rows without delivering or exiting; ask the peer only after a local miss."""
-    import roster
+    from scripts.message import roster
 
-    matches = _recipient_matches(to, observed.entries)
+    membership = staff.snapshot() if membership is None else membership
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    if isinstance(member, RecipientLookupFailed):
+        return RecipientSearchFailed(member.reason, [member.reason])
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
+    matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
+               else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
-        return RecipientMatches(matches, LocalOnly(), observed.problems)
+        return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
     addressed = to.startswith(("session:", "worker:", "codex:"))
     if observed.problems and not addressed:
-        return LocalRosterIncomplete(observed.problems)
+        return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
-    problems = [*observed.problems, *peer.problems]
-    matches = _recipient_matches(to, peer.entries)
+    problems = [*observed.diagnostics, *peer.diagnostics]
+    member = resolve_staff_recipient(to, membership, observed=[*observed.entries, *peer.entries])
+    if isinstance(member, RecipientLookupFailed):
+        return RecipientSearchFailed(member.reason, [*problems, member.reason])
+    if isinstance(member, staff.StaffRow):
+        matches = _staff_transport_matches(member, observed.entries)
+        if matches:
+            return RecipientMatches(matches, LocalOnly(), problems)
+        matches = _staff_transport_matches(member, peer.entries)
+    else:
+        matches = _sender_label_matches(to, peer.entries)
     if not matches and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)
     return RecipientMatches(matches, NamedMachine(roster.remote.other_machine()), problems)
 
 
 def resolve_recipient(
-    to: str, scope: RecipientResolutionScope, observed: roster.Roster,
+    to: str, scope: RecipientResolutionScope, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
-    if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions(), {})
-    if isinstance(scope, NamedMachine):
-        return RemoteDelivery(scope.host, to)
-    if to.startswith("codex:"):
-        thread_id = to.removeprefix("codex:")
-        if not thread_id:
-            usage_error("codex: needs a thread id")
-    result = matching_recipients(to, scope, observed)
-    _print_roster_problems(result.problems)
-    if isinstance(result, LocalRosterIncomplete):
-        usage_error(f"absence of {to} here is not proven; use an address or --machine")
-    if isinstance(result, RecipientSearchFailed):
-        return RecipientLookupFailed(result.reason)
-    if result.entries:
-        return _matched_recipient(to, result.entries, result.destination)
-    if to.startswith("worker:"):
-        usage_error(f"no roster session has address {to}")
-    if to.startswith("codex:"):
-        from scripts.whoami.agent_accounts import codex_home_display
+    from scripts.message import roster
 
-        checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
-        return RecipientLookupFailed(
-            f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
-    return ClaudeRecipient(to)
+    membership = staff.snapshot() if membership is None else membership
+    problems = observed.diagnostics
+
+    def lookup() -> DeliveryRoute:
+        nonlocal problems
+        socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
+        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
+        if isinstance(member, RecipientLookupFailed):
+            usage_error(member.reason)
+        if (not isinstance(scope, NamedMachine)
+                and isinstance(member, staff.StaffRow) and member.kind == "worker"):
+            from scripts.herdr import worker_panes
+
+            holder = membership.parent_of(member)
+            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                       or holder.worktree.machine == roster.remote.local_machine()):
+                run = worker_panes.worker_run(holder, record=membership)
+                if unit_runs.worker_transport(run) == "herdr":
+                    return PaneWorkerRecipient(member)
+                if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
+                    return CodexWorkerRecipient(to, member.name, str(run))
+        if to.startswith("uds:"):
+            return socket_recipient(to, socket_records, {}, membership=membership)
+        if isinstance(member, staff.StaffRow):
+            for anomaly in observed.row_anomalies:
+                if anomaly.row.id == member.id:
+                    usage_error(anomaly.diagnostic)
+        if isinstance(scope, NamedMachine):
+            return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
+                                              else to if to.startswith("worker:") else f"session:{member.current_session}")
+                                  if isinstance(member, staff.StaffRow) else to)
+        if to.startswith("codex:"):
+            thread_id = to.removeprefix("codex:")
+            if not thread_id:
+                usage_error("codex: needs a thread id")
+        result = matching_recipients(to, scope, observed, membership=membership)
+        problems = result.problems
+        if isinstance(result, LocalRosterIncomplete):
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        if isinstance(result, RecipientSearchFailed):
+            related = _recipient_roster_problems(to, problems, observed, membership)
+            reason = (f"recipient lookup failed for {to!r}"
+                      if any(problem in result.reason for problem in problems if problem not in related)
+                      else result.reason)
+            return RecipientLookupFailed(reason)
+        if result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if to.startswith("worker:"):
+            usage_error(f"no roster session has address {to}")
+        if to.startswith("codex:"):
+            from scripts.whoami.agent_accounts import codex_home_display
+
+            checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
+            return RecipientLookupFailed(
+                f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
+        if isinstance(member, staff.StaffRow):
+            return ClaudeRecipient(f"session:{member.current_session}")
+        if to.startswith("session:"):
+            return ClaudeRecipient(to)
+        usage_error(f"no staff row or live session for {to!r}")
+
+    failed = True
+    try:
+        route = lookup()
+        failed = isinstance(route, RecipientLookupFailed)
+        return route
+    finally:
+        if failed:
+            _print_roster_problems(to, problems, observed, membership)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
         cwd: Path | None = None) -> tuple[int | None, str, str]:
     """Run command; (exit code or None on timeout, stdout, stderr).
 
-    A timeout stops the whole process group, so a relay's children go with it.
+    A timeout stops the process group. Notice deliveries instead inherit their
+    supervisor's group, whose whole-job deadline also stops descendants.
     """
+    grace = kill_grace()
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env, cwd=cwd, start_new_session=True) as process:
+                          text=True, env=env, cwd=cwd, start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as process:
         try:
             out, err = process.communicate(stdin, timeout=timeout)
             return process.returncode, out, err
         except subprocess.TimeoutExpired:
-            for sig, wait in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, None)):
+            for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
                 try:
-                    os.killpg(process.pid, sig)
+                    if os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1":
+                        process.send_signal(sig)
+                    else:
+                        process_group.send_process_group(process.pid, sig)
                 except ProcessLookupError:
                     pass
                 try:
-                    out, err = process.communicate(timeout=wait)
+                    out, err = process.communicate(timeout=grace if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
                     return None, out, err
                 except subprocess.TimeoutExpired:
                     continue
@@ -1429,7 +2093,7 @@ def relay_prompt(message: Message) -> str:
     lines = [
         "You are a relay that delivers one message. Make exactly one SendMessage call:",
         f"- to: {json.dumps(message.to)}",
-        f"- summary: {json.dumps(message.summary)}",
+        f"- summary: {json.dumps(quote_sender_lines(message.summary))}",
         "- message: the text between the BEGIN and END lines below, copied exactly. Keep every character, space, "
         + "line break, backtick and placeholder as written. Add nothing, drop nothing, reword nothing. Leave out "
         + "the BEGIN and END lines.",
@@ -1439,7 +2103,7 @@ def relay_prompt(message: Message) -> str:
                      + f"then make the call once more with `to` set to the row whose name is exactly "
                      + f"{json.dumps(message.to)}, followed by its [ref]. If no row has that name, stop.")
     lines += ["Then stop: reply with one line, the SendMessage result. Call no other tool.",
-              "----- BEGIN MESSAGE -----", agent_text(message), "----- END MESSAGE -----"]
+              "----- BEGIN MESSAGE -----", agent_text(message, via_relay=True), "----- END MESSAGE -----"]
     return "\n".join(lines)
 
 
@@ -1510,11 +2174,10 @@ def relay(message: Message, timeout: float) -> Result:
                "--tools", tools, "--allowedTools", tools,
                "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
                "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
-               "-n", message.sender, "--output-format", "stream-json", "--verbose"]
+               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
@@ -1535,13 +2198,13 @@ def relay(message: Message, timeout: float) -> Result:
             return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
     command = [sys.executable, "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
-    code, out, err = run(command, relay_prompt(message), timeout, env, Path.home())
+    code, out, err = run(command, relay_prompt(message), timeout, models_registry.agent_environment(env), Path.home())
     raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(raw, out + err)
     if code is None:
         return Result("queued", f"relay timed out after {timeout:g} s")
-    result = read_relay(out, agent_text(message))
+    result = read_relay(out, agent_text(message, via_relay=True))
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -1562,18 +2225,24 @@ def relay_plan(message: Message) -> RelayPlan:
             message.text,
             message.key,
             message.shown_sender,
+            message.human,
+            message.stamp,
         )
     )
 
 
 def codex(message: Message, session_dir: str, timeout: float) -> Result:
     command = [sys.executable, str(CODEX_MESH), "send", "--session-dir", session_dir, "--to", message.to,
-               "--message", agent_text(message)]
+               "--no-accounting", "--report-recipient", "--guard-text", message.text, "--from", message.sender, "--message", agent_text(message),
+               *(["--human"] if message.human else [])]
     code, out, err = run(command, "", timeout)
+    receiver, err = recipient_report(err)
+    if code == 4:
+        return Result("held", one_line(out), receiver=receiver)
     if code == 0:
-        return Result("sent", one_line(out) or "queued on the codex thread")
+        return Result("sent", one_line(out) or "queued on the codex thread", receiver=receiver)
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
-    return Result("failed", f"codex_mesh.py send: {why}")
+    return Result("failed", f"codex_mesh.py send: {why}", receiver=receiver)
 
 
 def codex_session(
@@ -1610,31 +2279,40 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
             hold: RevisionHold = (HeldRevision(source, identity, machine)
                                   if isinstance(source, str) and source and isinstance(identity, str) and identity
                                   else NO_HELD_REVISION)
-            reviewed = record.get("reviewed") is True if remote_record else True
+            reviewed = record.get("reviewed") is True if remote_record else record.get("reviewed") is not False
             need = record.get("need") if remote_record else original.need
             if need not in ("note", "decision", "blocked"):
                 need = original.need
             session = record.get("session")
             if isinstance(session, str):
                 body = session_prefix(SessionLine(session)) + body
-            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True)
+            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True,
+                              text_id=as_str(record.get("text_id")) or original.text_id,
+                              sender=as_str(record.get("sender")) or original.sender)
         return original
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = ()) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
+    selected_priority = decision_priority.priority(need, due)
+    command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     if text_id:
-        command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
-                   "--text-id", text_id]
+        command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
+                   "--text-id", text_id, *(["--answerable"] if answerable else [])]
         for value in values:
             command.extend(["--value", value])
+    if due:
+        command[2:2] = ["--due", due]
+    if reference["kind"] != "none":
+        command[2:2] = ["--push-reference", json.dumps(reference)]
+    if remote_forward:
+        command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
     if code == 6:
-        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True))
+        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
         return Result("held", "not sent, failed review: " + (err.removeprefix("pushover: not sent: ").strip() or "review failed"), failed)
     if code == 5:
         return Result("replaced", "a newer version replaced this push; nothing was sent")
@@ -1660,7 +2338,7 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
         return Result("refused", why)
-    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need))
+    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender))
     return Result("failed", failure_detail(f"the user was not reached: {why}", failed), failed)
 
 
@@ -1688,20 +2366,20 @@ def template_fix_notice(record: dict[str, object]) -> None:
                 return
             if stamp.exists():
                 return
-            _ = stamp.write_text(text_id, encoding="utf-8")
-        recipient = "natedev"
-        try:
-            for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
-                name, separator, value = line.partition("#")[0].partition("=")
-                if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
-                    recipient = value.strip()
-        except OSError:
-            pass
-        text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
-        command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
-        # Delivery and its error record run in the detached child.
-        _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            recipient = "natedev"
+            try:
+                for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
+                    name, separator, value = line.partition("#")[0].partition("=")
+                    if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
+                        recipient = value.strip()
+            except OSError:
+                pass
+            text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
+            command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
+            # Delivery and its error record run in the detached child.
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            write_atomic(stamp, text_id)
     except OSError as error:
         print(f"send.py: template fix notice failed for {text_id}: {error}", file=sys.stderr)
         log_template_fix_error(text_id, str(error))
@@ -1722,23 +2400,44 @@ def deliver_template_fix(text_id: str, recipient: str, text: str) -> None:
     command = [sys.executable, str(Path(__file__).resolve()), "--to", recipient, "--from", "push template review",
                "--summary", "Fix push template " + text_id, "--text", text]
     try:
-        code, out, err = run(command, "", TIMEOUT + 40)
+        code, out, err = run(command, "", send_budget.seconds())
         if code != 0:
             log_template_fix_error(text_id, (err or out).strip() or ("timed out" if code is None else f"exit {code}"))
     except OSError as error:
         log_template_fix_error(text_id, str(error))
 
 
+def recipient_report(errors: str) -> tuple[str, str]:
+    """Internal forwards report their resolved address without owning another log row."""
+    receiver = ""
+    diagnostics: list[str] = []
+    for line in errors.splitlines():
+        if line.startswith("SEND_RECIPIENT: "):
+            receiver = line.removeprefix("SEND_RECIPIENT: ")
+        else:
+            diagnostics.append(line)
+    return receiver, "\n".join(diagnostics)
+
+
 def remote(message: Message, host: str, options: Options) -> Result:
-    """Run this script on host; its own log and queue record the attempt there."""
-    forwarded = ["--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
+    """Forward delivery and queue ownership; this invocation owns its accounting."""
+    forwarded = ["--no-accounting", "--report-recipient", "--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
+    forwarded += ["--forwarded-sender-stamp", sender_native_id(message.stamp)]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
+    if options.human:
+        forwarded += ["--human"]
     if message.key is not None:
         forwarded += ["--key", message.key]
+        if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+            forwarded += ["--recipient-key", options.recipient_identity.name]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.reference["kind"] != "none":
+            forwarded += ["--push-reference", json.dumps(options.reference)]
+        if options.due:
+            forwarded += ["--due", options.due]
         if options.need == "blocked":
             # This host refused a push with no clear step and keeps its --clears-when record.
             forwarded += ["--self-clearing"]
@@ -1759,21 +2458,23 @@ def remote(message: Message, host: str, options: Options) -> Result:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
-    code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
+    code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
+    receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
+        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need, text_id=options.text_id, sender=message.sender),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
-    parsed = parse_outcome(out)
-    if isinstance(parsed, NoOutcomeHeader):
+    outcome = send_outcome(code, out)
+    if isinstance(outcome, UnconfirmedSendOutcome):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
+    parsed = outcome.header
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
-    return Result(parsed.outcome, f"on {host}: {detail}", failure)
+    return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
 # ---------------------------------------------------------------------------
@@ -1781,12 +2482,12 @@ def remote(message: Message, host: str, options: Options) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need) -> Result:
+def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need, text_id: str = "") -> Result:
     if isinstance(action, NoUserRecipient):
         raise AssertionError("a user message must state its action")
     failed = result.failure
     if isinstance(failed, NoFailedPush):
-        failed = FailedPush(message.summary, action, message.text, need=need)
+        failed = FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender)
     result = Result("held" if failed.held else "failed", failure_detail(result.detail, failed), failed)
     try:
         pid = os.environ.get("CLAUDE_PID", "")
@@ -1798,7 +2499,8 @@ def user_failure(message: Message, action: MessageUserAction, result: Result, ne
             entry: FailedPushRecord = {"time": time.time(), "title": failed.title,
                 "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
                 "body": failed.body, "message": failed.message, "fallback": failed.text,
-                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                "text_id": failed.text_id, "sender": failed.sender}
             if isinstance(failed.hold, HeldRevision):
                 entry["held_source"] = failed.hold.source
                 entry["held_identity"] = failed.hold.identity
@@ -1865,16 +2567,17 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
 
 
 def reviewed_waits(options: Options) -> Options:
-    """An auto_mode.refused alert keeps its waits sentence, a value the session writes, only when the
-    cold-read review passes the alert within WAITS_REVIEW_SECONDS. A timeout, a failure or no reviewer
-    sends the alert without it: a slow review never holds the alert back longer."""
+    """Review the waits sentence within the configured budget.
+
+    Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
+    """
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
-    draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[options.need], rendered.title, rendered.action,
+    draft = review.Draft(rendered.sender, decision_priority.priority(options.need, options.due), rendered.title, rendered.action,
                          rendered.body, False, rendered.session)
-    outcome = review.review(draft, False, limit=WAITS_REVIEW_SECONDS)
+    outcome = review.review(draft, False, limit=waits_review_seconds())
     if isinstance(outcome, review.Approved):
         return options
     why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
@@ -1911,8 +2614,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them,
-    with the waits sentence the alert showed and the alert's sender and key."""
+    """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
@@ -1949,8 +2651,9 @@ def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description=(
                                          "Send one message to a roster name, uds:<path>, "
-                                         "session:<id>, worker:<run id>/<worker name>, "
-                                         "codex:<thread id>, or user."
+                                         "session:<id>, codex:<thread id>, or user. "
+                                         "Use worker:<unit>/<worker> for a pane worker. "
+                                         "Use worker:<run id>/<worker name> for a run pinned to mesh."
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
@@ -1961,18 +2664,27 @@ def parse(argv: list[str]) -> Options:
         required=True,
         help=(
             "a roster name, uds:<path>, session:<id>, "
-            "worker:<run id>/<worker name>, codex:<thread id>, or user"
+            "codex:<thread id>, or user. "
+            "Use worker:<unit>/<worker> for a pane worker. "
+            "Use worker:<run id>/<worker name> for a run pinned to mesh."
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
+    _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
+    _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--report-recipient", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--forwarded-shown-sender", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--forwarded-sender-stamp", help=argparse.SUPPRESS)
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--question", default="", help="the open question record for decision.choices")
+    _ = parser.add_argument("--push-reference", default="", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     clears = parser.add_mutually_exclusive_group()
@@ -1982,6 +2694,7 @@ def parse(argv: list[str]) -> Options:
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
+    _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
     _ = parser.add_argument("--repeat-minutes", type=float,
                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
@@ -1989,20 +2702,38 @@ def parse(argv: list[str]) -> Options:
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
     _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
-    _ = parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"delivery seconds (default {TIMEOUT})")
+    _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
+    try:
+        reference = push_reference.admission_reference(text_id, as_str(attr(args, "question")), as_str(attr(args, "push_reference")),
+            remote_forward=isinstance(origin, ForwardedSender))
+    except (OSError, ValueError) as error:
+        usage_error(str(error).replace("\n", " "))
+    if reference["kind"] == "question" and attr(args, "key") is None:
+        args.key = "question:" + reference["path"]
     raw_values = cast(list[str], attr(args, "value"))
     # Only auto_mode.refused repeats a key: one command value for each refused command.
     commands: list[str] = []
     if text_id:
         if to != USER:
             parser.error("--text-id goes with --to user")
-        import push_texts
+        from scripts.notify import push_texts
         values: dict[str, str] = {}
         for value in raw_values:
             key, separator, item = value.partition("=")
@@ -2035,6 +2766,10 @@ def parse(argv: list[str]) -> Options:
         args.action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         args.no_action = isinstance(rendered.action, NoActionRequired)
         args.sender = optional_str(attr(args, "sender")) or rendered.sender
+        if text_id == "github.keys_cold":
+            args.key = "github.keys_cold:" + values["machine"]
+            if attr(args, "self_clearing") is not True:
+                args.clears_when = "github-warm-status"
         if text_id == AUTO_MODE_TEXT and attr(args, "key") is None:
             args.key = auto_mode_key(values["session"], tuple(commands))
     elif raw_values:
@@ -2042,6 +2777,13 @@ def parse(argv: list[str]) -> Options:
     priority = optional_str(attr(args, "priority"))
     if priority is not None:
         args.need = {"0": "note", "1": "decision", "2": "blocked"}[priority]
+    due = as_str(attr(args, "due"))
+    try:
+        _ = decision_priority.read_due(due)
+    except ValueError as error:
+        parser.error(str(error))
+    if due and (to != USER or attr(args, "need") != "decision"):
+        parser.error("--due needs --to user and --need decision")
     action_text = optional_str(attr(args, "action"))
     no_action = attr(args, "no_action") is True
     if to != USER:
@@ -2071,21 +2813,28 @@ def parse(argv: list[str]) -> Options:
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference", "recipient_identity"}}
+    recipient_key = optional_str(attr(args, "recipient_key"))
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
-                      scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
+                      scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
                       commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
                       self_clearing=get["self_clearing"] is True,
-                      shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved())
+                      human=get["human"] is True, no_accounting=get["no_accounting"] is True,
+                      report_recipient=get["report_recipient"] is True,
+                      shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
+                      sender_origin=origin, due=due, reference=reference,
+                      recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
     if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
         parser.error(f"--need {options.need} requires --action. {FIX}")
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and options.key is None:
+        parser.error("--recipient-key needs --key")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     if get["clears_when"] is not None and not options.clears_when.strip():
@@ -2132,50 +2881,169 @@ def body_text(options: Options) -> str:
     return sys.stdin.read()
 
 
-def sender_shown_name(sender: str, observed: roster.Roster) -> str:
-    """Resolve display text without changing sender keys or reply addresses."""
-    import roster
+def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) -> str:
+    """Resolve the display from the native id without changing reply addresses."""
+    from scripts.message import roster
 
-    matches = _recipient_matches(sender, observed.entries)
+    if isinstance(stamp, UnavailableSender):
+        return sender
+    matches = _sender_label_matches(sender_native_id(stamp), observed.entries)
     if len(matches) == 1:
         return roster.shown_name(matches[0]).render()
     return sender
+
+
+def sender_stamp() -> SenderStamp:
+    """Read the native sender identity independently of the display name."""
+    from scripts.message import roster
+
+    identity = roster.sender_identity(os.environ)
+    if isinstance(identity, roster.ClaudeSession):
+        return ClaudeSender(identity.session_id)
+    if isinstance(identity, roster.CodexThread):
+        return CodexSender(identity.thread_id)
+    return UnavailableSender()
+
+
+def sender_native_id(stamp: SenderStamp) -> str:
+    if isinstance(stamp, ClaudeSender):
+        return f"session:{stamp.session_id}"
+    if isinstance(stamp, CodexSender):
+        return f"codex:{stamp.thread_id}"
+    return "unavailable"
+
+
+def read_sender_stamp(value: object) -> SenderStamp:
+    """Decode recorded provenance without reading the current runtime."""
+    if value == "unavailable":
+        return UnavailableSender()
+    if isinstance(value, str):
+        kind, separator, identity = value.partition(":")
+        if separator and re.fullmatch(r"[\w-]+", identity):
+            if kind == "session":
+                return ClaudeSender(identity)
+            if kind == "codex":
+                return CodexSender(identity)
+    raise ValueError("invalid sender native id")
+
+
+def morty_stamp(stamp: SenderStamp) -> bool:
+    if isinstance(stamp, UnavailableSender):
+        return False
+    return morty_identity.matches(sender_native_id(stamp))
+
+
+def sender_stamp_lines(stamp: SenderStamp) -> str:
+    text = f"\nSender native id: {sender_native_id(stamp)}"
+    if morty_stamp(stamp):
+        text += "\nAuthority: morty (speaks for the user)"
+    return text
 
 
 def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
-def agent_text(message: Message) -> str:
-    """Keep the body preview intact and add the sending machine's display text."""
-    first, separator, rest = message.text.partition("\n")
-    return first + shown_sender_line(message.sender, message.shown_sender) + separator + rest
+def quote_sender_lines(text: str) -> str:
+    """Separate caller text from generated sender metadata."""
+    normalized = re.sub(r"\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", "\n", text)
+    return re.sub(r"(?m)^([^\S\n]*(?:Authority:|Sender native id:))", r"> \1", normalized)
+
+
+def stamped_text(first: str, rest: str, stamp: SenderStamp) -> str:
+    preview, separator, remainder = quote_sender_lines(first).partition("\n")
+    return preview + sender_stamp_lines(stamp) + separator + remainder + quote_sender_lines(rest)
+
+
+def agent_text(message: Message, *, via_relay: bool = False) -> str:
+    """Format caller text and add the sending machine's display and native stamp."""
+    first, separator, rest = quote_sender_lines(message.text).partition("\n")
+    sender = relay_session_name(message.sender) if via_relay else message.sender
+    return stamped_text(first + shown_sender_line(sender, message.shown_sender), separator + rest, message.stamp)
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
-    shown = shown_sender_line(message.sender, message.shown_sender)
-    return (f"Message from {message.sender} via postmaster: {message.summary} [{entry_id[:8]}]"
-            + f"{shown}\n\n{message.text}")
+    return stamped_text(
+        f"Message from {message.sender} via postmaster: {quote_sender_lines(message.summary)} [{entry_id[:8]}]"
+        + shown_sender_line(message.sender, message.shown_sender), "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
-    import roster
+    try:
+        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
+                      else staff.StaffSnapshot(()))
+    except staff.StaffUnreadable as error:
+        usage_error(f"staff lookup for {options.to!r}: {error}")
+    if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        return _send(options, membership=membership)
+    identity = Message(options.recipient_identity.name, options.sender or default_sender(),
+                       options.summary or "", "", options.key)
+    with delivery_turn(identity) as acquired:
+        if not acquired:
+            return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
+        return _send(options, membership=membership)
 
+
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "") -> Result:
+    """Deliver to a proved pane or retain the message through its holder."""
+    from scripts.herdr import worker_panes
+    from scripts.herdr import herdr
+
+    holder = membership.parent_of(worker)
+    if holder is None:
+        return Result("failed", f"{worker.name}: worker holder is unavailable")
+    if not reason:
+        state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
+        if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
+            try:
+                herdr.Herdr(herdr.shared_session()).prompt(
+                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
+                return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+            except (herdr.HerdrFailure, OSError) as error:
+                reason = str(error)
+        elif state is None:
+            reason = "worker observation is unavailable"
+        elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+            reason = state.reason
+        elif isinstance(state, worker_panes.OpenWorker):
+            reason = "worker is blocked"
+        elif isinstance(state, worker_panes.StoppedWorker):
+            reason = "worker is stopped"
+        else:
+            reason = "worker pane is closed"
+    options = parse(["--here", "--to", f"session:{holder.current_session}", "--from", sender,
+                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
+    return _send(options, membership=membership)
+
+
+def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
+    from scripts.message import roster
+
+    if options.to == USER and not options.text_id:
+        return Result("refused", push_texts.TEMPLATE_REQUIRED)
     if options.to == USER:
         options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
     if options.text_id == AUTO_MODE_TEXT:
         options = reviewed_waits(options)
     text = body_text(options).rstrip("\n")
-    if not text.strip():
+    if not text.strip() and not options.text_id:
         usage_error("the message is empty")
-    first = text.strip().splitlines()[0]
+    first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    observed = (roster.roster(os.environ, roster.ThisMachine()) if needs_recipient_roster or needs_sender_roster
+    reads_registry = (needs_recipient_roster or needs_sender_roster
+                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+    registry = sessions.read_registry() if reads_registry else sessions.RegistryRead((), ())
+    running = sessions.running_records(registry)
+    if reads_registry:
+        membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
+    records = [record for record in running if sessions.messaging_socket_exists(record)]
     if isinstance(options.selection, MeshWorker):
         route: DeliveryRoute = (
             RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
@@ -2185,17 +3053,32 @@ def send(options: Options) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope, observed)
+        route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
     destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
+    if isinstance(member, RecipientLookupFailed):
+        usage_error(member.reason)
+    if isinstance(member, NoStaffRecipient) and destination != options.to:
+        member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
+    stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
+                             else f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
+    registered = sessions.addressed(destination, records)
+    legacy_aliases = (destination,)
+    if registered is not None:
+        legacy_aliases += (f"session:{registered['sessionId']}", f"uds:{registered['messagingSocketPath']}")
     sender = options.sender or default_sender()
     if options.to == USER and options.sender is None and sender != "send.py":
         options = options._replace(answerable=True)
     emergency = options.to == USER and options.need == "blocked"
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
+    stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
-               else sender_shown_name(sender, observed) if options.to != USER else sender)
-    message = Message(destination, sender, summary, text, key, display)
+               else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
+    if sender.casefold() == "morty" and not morty_stamp(stamp):
+        print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
+    message = Message(destination, sender, summary, text, key, display, options.human, stamp)
     started = now()
+    order = new_queue_order() if options.to != USER else LEGACY_QUEUE_ORDER
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
     live = emergency and options.repeat_minutes is None
@@ -2206,14 +3089,33 @@ def send(options: Options) -> Result:
     # An emergency push with no clear step would repeat after its cause is fixed: refused, not claimed.
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
-    skip = None if refused or held is not None else claim(message, window, started, live=live)
+    cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
+    identity = replace(message, to=stable.value)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
+        skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
+        claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
+    else:
+        claim_result = ClaimGranted() if refused or held is not None else claim(
+            message, stable, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
+            legacy_aliases=legacy_aliases, live=live, clears_when=options.clears_when if emergency else cold_check,
+            emergency=emergency,
+            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
+    guarded = repeat_guard.Decision()
+    if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
+        guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
+            sender, stable.value,
+            text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
     elif held is not None:
         result = Result("held", held)
-    elif skip is not None:
-        result = Result("skipped", skip)
+    elif isinstance(claim_result, RepeatAccepted):
+        result = Result("skipped", claim_result.reason)
+    elif isinstance(claim_result, RepeatPending):
+        result = Result("pending", claim_result.reason)
+    elif guarded.held:
+        result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
         result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
@@ -2221,9 +3123,9 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
-            _ = rca.open_case(refusal_report(options))
+            _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
         transport = Message(
             route.name,
@@ -2232,20 +3134,25 @@ def send(options: Options) -> Result:
             message.text,
             message.key,
             message.shown_sender,
+            message.human,
+            message.stamp,
         )
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
+    elif isinstance(route, PaneWorkerRecipient):
+        result = deliver_worker_text(route.row, membership, agent_text(message),
+                                     sender=message.sender, timeout=options.timeout)
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {})
+            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {}, membership=membership)
             if relayed_result.outcome == "queued":
                 recipient = sessions.addressed(message.to, sessions.live_sessions())
                 if message.to.startswith("uds:") and recipient is None:
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
                 queued = replace(message, to=f"session:{recipient['sessionId']}") if recipient is not None else message
-                enqueue(queued, relayed_result.detail, started)
+                enqueue(queued, relayed_result.detail, started, recipient=stable, order=order)
                 if recipient is None:
                     return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
                                   + " so it is kept under that name")
@@ -2257,7 +3164,7 @@ def send(options: Options) -> Result:
                 "queued",
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
-            enqueue(message, result.detail, started)
+            enqueue(message, result.detail, started, recipient=stable, order=order)
             log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
@@ -2281,24 +3188,109 @@ def send(options: Options) -> Result:
                 result = relay_and_queue(plan.message, options.timeout)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
     if result.outcome == "sent" and message.key is not None:
-        for recipient in dict.fromkeys((message.to, options.to)):
-            _ = remove_queued_key(recipient, message.key)
-    # A failed send can retry. A queue or kept push owns its copy until delivery.
-    if (key is not None and not refused and held is None and skip is None
-            and result.outcome in {"failed", "refused", "held"}):
-        forget_sent(key, message.to, started)
-    if emergency and options.clears_when and key is not None and result.outcome == "sent":
-        posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
-        record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
-                                   sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
+        _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
+        if options.to != message.to:
+            _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
+        if (not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            record_acceptance(identity, started)
+    else:
+        # An undelivered emergency releases its claim for a later attempt.
+        # Other queued or kept messages retain their claims until delivery.
+        if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and ((emergency and result.outcome != "sent")
+                     or result.outcome in {"failed", "refused", "held", "pending"})):
+            forget_sent(key, stable.value, started)
+        elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+              and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            accept_sent(key, stable.value, started, delivered=result.outcome == "sent")
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
-        result = user_failure(message, options.action, result, options.need)
-    log(message, result, started, log_route)
-    return result
+        result = user_failure(message, options.action, result, options.need, options.text_id)
+    if not options.no_accounting:
+        log(message, result, started, log_route)
+    if options.report_recipient:
+        print("SEND_RECIPIENT: " + (result.receiver or message.to), file=sys.stderr)
+    return result._replace(receiver="")
+
+
+def repeat_notice_owner(sender: str) -> str:
+    """Follow staff parents to the sender's showrunner."""
+    membership = staff.snapshot()
+    member = resolve_staff_recipient(sender, membership)
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "agent":
+        return rca.owner_address("")
+    if isinstance(member, RecipientLookupFailed):
+        usage_error(member.reason)
+    visited: set[staff.StaffId] = set()
+    while member.kind != "showrunner":
+        if isinstance(member.parent, staff.StaffRoot) or member.id in visited:
+            usage_error(f"missing showrunner staff row for {sender!r}")
+        visited.add(member.id)
+        parent = membership.by_id(member.parent.id)
+        if parent is None:
+            usage_error(f"missing showrunner staff row for {sender!r}")
+        member = parent
+    return f"session:{member.current_session}"
+
+
+def deliver_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
+                          limits: repeat_guard.Limits) -> repeat_guard.NoticeOutcome:
+    """Only the notifier invokes this slow path, outside every guard lock."""
+    first = datetime.fromtimestamp(notice.first, timezone.utc).isoformat()
+    last = datetime.fromtimestamp(notice.last, timezone.utc).isoformat()
+    text = (f"Message flood from {state.sender} on {state.host}: {notice.copies} copies to "
+            + f"{notice.receivers} sessions, first {first}, last {last}.\n"
+            + f"Text: {notice.text}\nRepeated copies are held; distinct texts still arrive. Find the sender's cause.")
+    arguments = [sys.executable, str(Path(__file__).resolve()), "--to", repeat_notice_owner(state.sender), "--from", repeat_guard.NOTICE_SENDER,
+                 "--text", text]
+    arguments += ["--key", "repeat:" + notice.id + ":" + notice.kind, "--repeat-minutes", "0"]
+    code, out, err = run(arguments, "", limits.notice_timeout_seconds)
+    result = send_outcome(code, out)
+    if isinstance(result, ConfirmedSendOutcome):
+        if result.header.outcome == "sent":
+            return "delivered"
+        if result.header.outcome in {"queued", "kept"}:
+            return "queued"
+    print(f"repeat notice {notice.kind}: {one_line(err or out)}", file=sys.stderr)
+    # A skipped or replaced notice does not prove delivery of this notice.
+    if isinstance(result, ConfirmedSendOutcome):
+        return "unknown" if result.header.outcome in {"skipped", "replaced"} else "failed"
+    return "unknown" if code is None or code <= 0 else "failed"
+
+
+def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
+                          limits: repeat_guard.Limits) -> repeat_guard.NoticeOutcome:
+    """Discovery and delivery share one attempt budget in the supervised job group."""
+    request = json.dumps({"state": asdict(state), "id": notice.id, "kind": notice.kind, "limits": asdict(limits)})
+    code, out, err = run([sys.executable, str(Path(__file__).resolve()), "repeat-notice-attempt"],
+                         request, limits.notice_timeout_seconds)
+    if code == 0 and out.strip() in ("delivered", "queued", "failed", "unknown"):
+        return cast(repeat_guard.NoticeOutcome, out.strip())
+    repeat_guard.warn("notice attempt: " + one_line(err or out or "interrupted"))
+    return "unknown"
 
 
 def main(argv: list[str]) -> int:
+    if marker := os.environ.get("TEST_SENDER_GUARD"):
+        _ = Path(marker).write_text("real sender refused\n")
+        print("REFUSED: real scripts/message/send.py is forbidden in tests", file=sys.stderr)
+        return 1
+    user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
+    has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
+    if user_target and not has_template and argv[:1] != ["retire"]:
+        print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)
+        return EXIT["refused"]
     match argv:
+        case ["repeat-notices"]:
+            repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
+                               cleanup_seconds=2 * kill_grace())
+        case ["repeat-notice-attempt"]:
+            request = as_dict(loads(sys.stdin.read()))
+            state = repeat_guard.decode(json.dumps(request["state"]))
+            notice = next(item for item in state.notices if (item.id, item.kind) == (request["id"], request["kind"]))
+            limits = repeat_guard.Limits(**cast(dict[str, int], request["limits"]))
+            print(deliver_repeat_notice(state, notice, limits))
         case ["template-fix", failure_json]:
             template_fix_notice(as_dict(loads(failure_json)))
         case ["template-fix-deliver", text_id, recipient, text]:
@@ -2331,11 +3323,9 @@ def main(argv: list[str]) -> int:
             print(reopen(key))
         case ["pending", *named] if len(named) <= 1:
             try:
-                text = pending(named[0] if named else None)
+                _ = pending(named[0] if named else None, emit=True)
             except ValueError as error:
                 usage_error(str(error))
-            if text:
-                print(text)
         case ["ack" | "reopen" | "pending" | "clear-check" | "drain-sockets", *_]:
             usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": "",
                          "drain-sockets": ""}.get(argv[0], " KEY"))
@@ -2352,7 +3342,8 @@ def main(argv: list[str]) -> int:
                 failed = result.failure
                 record: FailedPushTransportRecord = {"title": failed.title,
                     "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
-                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                    "text_id": failed.text_id, "sender": failed.sender}
                 if isinstance(failed.hold, HeldRevision):
                     record["held_source"] = failed.hold.source
                     record["held_identity"] = failed.hold.identity

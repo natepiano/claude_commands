@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """Show resident PSS and swap by process kind from /proc.
 
-Ownership is loaded once from the adjacent working_set_owners.json snapshot.
-Regenerate it when production Units / Owns cells change. The command writes
-nothing. Unknown ownership is printed as unassigned.
+Ownership comes from the staff worktree that contains each process's working folder.
+The command writes nothing. Unknown ownership is printed as unassigned.
 PSS shares resident pages between the processes that map them. It excludes
 kernel memory and unmapped cache, so it is not the machine's used memory.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fnmatch
 import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import session_staff, staff
+from scripts.shutdown import remote
 
 @dataclass(frozen=True)
 class Category:
@@ -66,15 +72,6 @@ def load_owners(path: Path) -> tuple[tuple[str, str], ...]:
         return tuple(rules)
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot load ownership snapshot {path}: {error}") from error
-
-
-try:
-    OWNERS = load_owners(Path(__file__).with_name("working_set_owners.json"))
-except ValueError as error:
-    if __name__ != "__main__":
-        raise
-    print(f"working-set: {error}", file=sys.stderr)
-    sys.exit(1)
 
 
 # Separate-value options from Node v24.19.0 --help, plus the existing V8 options.
@@ -190,12 +187,12 @@ def python_script(arguments: tuple[str, ...], cwd: str) -> str:
     return script_path(script, cwd)
 
 
-def owner_for(script: str) -> str:
-    # Normalize checkout prefixes without following links outside /proc.
-    relative = "scripts/" + script.split("/scripts/", 1)[1] if "/scripts/" in script else script
-    for path, owner in OWNERS:
-        if fnmatch.fnmatchcase(relative, path) or (path.endswith("/") and relative.startswith(path)):
-            return owner
+def owner_for(folder: str, resolver: session_staff.RowResolver) -> str:
+    path = Path(folder)
+    if path.is_absolute():
+        found = resolver.member_by_folder(remote.local_machine(), path)
+        if isinstance(found, session_staff.MemberFound) and found.row.kind == "unit":
+            return found.row.name
     return "unassigned"
 
 
@@ -256,11 +253,22 @@ PROC = Path("/proc")
 
 
 def collect(proc: Path = PROC) -> WorkingSet:
+    try:
+        record = staff.local_snapshot()
+    except (OSError, ValueError) as error:
+        print(f"working-set: staff is unavailable: {error}", file=sys.stderr)
+        record = staff.StaffSnapshot(())
+    unit_record = replace(record, rows=tuple(row for row in record.rows if row.kind == "unit"))
+    resolver = session_staff.RowResolver(unit_record)
+    for row in record.rows:
+        if row.kind == "unit" and isinstance(row.worktree, staff.WorktreeUnfilled):
+            print(f"working-set: {row.name}: the worktree is not recorded", file=sys.stderr)
     memory = memory_fields(proc / "meminfo")
     machine = MachineMemory(memory["MemTotal"], memory["MemAvailable"], memory["SwapTotal"],
                             memory["SwapTotal"] - memory["SwapFree"])
     categories = {category.name: MemoryGroup(category.name) for category in CATEGORIES}
-    helpers: dict[tuple[str, str], MemoryGroup] = {}
+    helpers: dict[tuple[str, str, str], MemoryGroup] = {}
+    owners: dict[str, str] = {}
     unreadable = 0
     with os.scandir(proc) as entries:
         for entry in entries:
@@ -293,7 +301,10 @@ def collect(proc: Path = PROC) -> WorkingSet:
                     cwd = "<cwd unreadable>"
                 script = (python_script(arguments, cwd) if category == "Python helpers"
                           else script_path(classification.node_script, cwd))
-                group = helpers.setdefault((category, script), MemoryGroup(category, script, owner_for(script)))
+                if cwd not in owners:
+                    owners[cwd] = owner_for(cwd, resolver)
+                owner = owners[cwd]
+                group = helpers.setdefault((category, script, owner), MemoryGroup(category, script, owner))
                 group.add(sample)
     groups: list[MemoryGroup] = []
     for category in CATEGORIES:
@@ -307,7 +318,7 @@ def render(report: WorkingSet) -> str:
     lines = ["Memory in MiB; PSS is resident shared memory divided between its users.",
              f"{'Category / script [owner]':76} {'Count':>5} {'PSS':>10} {'Swap':>10}"]
     for group in report.groups:
-        label = f"  {group.script} [{group.owner.removesuffix('-unit')}]" if group.script else group.category
+        label = f"  {group.script} [{group.owner}]" if group.script else group.category
         # Escape control characters from process-controlled names before terminal output.
         label = label.encode("unicode_escape").decode("ascii")
         lines.append(f"{label:76} {group.count:5d} {group.pss_kib / 1024:10.1f} {group.swap_kib / 1024:10.1f}")

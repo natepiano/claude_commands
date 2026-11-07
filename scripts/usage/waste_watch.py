@@ -1,12 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tell a unit's showrunner when its agents spend their usage waiting, or a Codex worker stops compacting.
 
 The collector runs this script after each good pass. By hand:
-`python3 scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
+`~/.claude/scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
 Only the default store sends; a run over any other store prints what it would send.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -22,12 +26,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
+from scripts.production import session_staff, showrunners, staff
+from scripts.shutdown import remote
+from scripts.message import send_budget, session_send
 
 
 WINDOW = timedelta(hours=2)
@@ -45,11 +50,6 @@ WORKER_ROLES = frozenset({"impl", "test", "fix", "review", "worker"})
 ALERT_INTERVAL = timedelta(hours=6)
 WORST_THREADS = 3
 SENDER = "usage-waste-watch"
-REPOSITORY = Path(__file__).resolve().parents[2]
-
-
-def send_script() -> Path:
-    return Path(os.environ.get("WASTE_WATCH_SEND") or REPOSITORY / "scripts/message/send.py")
 
 
 def state_file() -> Path:
@@ -154,7 +154,7 @@ def thread_usage(db: sqlite3.Connection, start: datetime, end: datetime) -> list
 
 @dataclass(frozen=True)
 class Showrunner:
-    slug: str
+    name: str
     # `uds:<socket>`, or empty while the showrunner is not running.
     address: str
     units: tuple[UnitWorktree, ...]
@@ -173,24 +173,39 @@ class ShowrunnerLookupFailed:
 ShowrunnerLookup = ShowrunnersFound | ShowrunnerLookupFailed
 
 
-def registered_showrunners() -> ShowrunnerLookup:
+def registered_showrunners(*, resolver: session_staff.RowResolver | None = None) -> ShowrunnerLookup:
     """Every registered showrunner with its production doc's units, as the production tooling finds them."""
-    from scripts.production import showrunners
+    from scripts.message import unit_labels
 
     try:
-        runners = showrunners.registered_showrunners()
-    except OSError as error:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        record = resolver.record
+        problems: list[str] = []
+        diagnostics = unit_labels.StaffDiagnostics(problems)
+        runners = unit_labels.registered_showrunners(diagnostics, membership=record, resolver=resolver)
+        for warning in diagnostics.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        found = tuple(Showrunner(runner["name"], f"uds:{runner['socket']}" if runner["socket"] else "",
+                                usage_report.document_units(
+                                    showrunners.owner_for(runner["name"], record=record), resolver=resolver))
+                      for runner in runners)
+        if problems:
+            return ShowrunnerLookupFailed("; ".join(problems))
+        return ShowrunnersFound(found)
+    except (OSError, ValueError) as error:
         return ShowrunnerLookupFailed(f"showrunner lookup failed: {' '.join(str(error).split())}")
-    return ShowrunnersFound(tuple(
-        Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
-                   usage_report.document_units(Path(runner["doc"]))) for runner in runners))
 
 
-def folder_unit(folder: str | None, worktrees: tuple[UnitWorktree, ...]) -> str:
+def folder_unit(folder: str | None, worktrees: tuple[UnitWorktree, ...],
+                *, resolver: session_staff.RowResolver | None = None) -> str:
     if folder is None:
         return "unknown"
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     path = Path(folder)
-    return next((row.unit for row in worktrees if path.is_relative_to(row.worktree)), path.name or "unknown")
+    member = resolver.member_by_folder(remote.local_machine(), path)
+    if isinstance(member, session_staff.MemberFound):
+        return member.row.name
+    return next((row.unit for row in worktrees if path.is_relative_to(row.worktree)), "unknown")
 
 
 @dataclass
@@ -257,7 +272,7 @@ def alert_text(usage: UnitUsage, start: datetime) -> str:
             run = cast(ContextRun, thread.context_run)
             lines.append(f"- {thread.role or 'unassigned'} {thread.thread.label()}: {run.longest} requests "
                          + f"in a row, peak {thousands(run.peak)} tokens")
-    lines.append("See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+    lines.append("See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
                  + f"--since {since}")
     return "\n".join(lines)
 
@@ -305,8 +320,9 @@ class NotSent:
 def send(address: str, text: str) -> Delivered | NotSent:
     """send.py exit 0 is delivered and exit 1 is queued for the session; both count as delivered."""
     try:
-        result = subprocess.run([sys.executable, str(send_script()), "--to", address, "--from", SENDER,
-                                 "--text", text], capture_output=True, text=True, check=False, timeout=120)
+        result = subprocess.run(session_send.send_argv("--to", address, "--from", SENDER, "--text", text,
+                                 send_script=Path(os.environ.get("WASTE_WATCH_SEND") or session_send.SEND_SCRIPT)),
+                                capture_output=True, text=True, check=False, timeout=send_budget.seconds())
     except (OSError, subprocess.TimeoutExpired) as error:
         return NotSent(f"send.py failed: {' '.join(str(error).split())}")
     if result.returncode in (0, 1):
@@ -335,13 +351,14 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
             <= WAIT_SHARE_LIMIT * MINIMUM_WEIGHTED
             and not any(thread.context_flagged() for thread in threads)):
         return
-    lookup = registered_showrunners()
+    resolver = session_staff.RowResolver(staff.snapshot())
+    lookup = registered_showrunners(resolver=resolver)
     runners = lookup.showrunners if isinstance(lookup, ShowrunnersFound) else ()
     worktrees = usage_report.longest_first([
-        *(row for runner in runners for row in runner.units), *usage_report.unit_worktrees(production_docs)])
+        *(row for runner in runners for row in runner.units), *usage_report.unit_worktrees(production_docs, resolver=resolver)])
     units: dict[str, UnitUsage] = {}
     for thread in threads:
-        unit = folder_unit(thread.folder, worktrees)
+        unit = folder_unit(thread.folder, worktrees, resolver=resolver)
         units.setdefault(unit, UnitUsage(unit)).threads.append(thread)
     path = state_file()
     alerts = read_state(path)
@@ -360,7 +377,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         elif runner is None:
             reason = f"no registered showrunner lists unit {usage.unit}"
         elif not runner.address:
-            reason = f"showrunner {runner.slug} is not running"
+            reason = f"showrunner {runner.name} is not running"
         else:
             reason = ""
         if printing:
@@ -372,7 +389,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         else:
             sent = send(runner.address, text)
             if isinstance(sent, NotSent):
-                print(f"waste_watch: could not tell {runner.slug}: {sent.reason}; alert for the journal:\n{text}")
+                print(f"waste_watch: could not tell {runner.name}: {sent.reason}; alert for the journal:\n{text}")
                 continue
         alerts[usage.unit] = moment.isoformat()
         changed = True

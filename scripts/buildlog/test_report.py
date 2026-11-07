@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for report.py: a section per kind split by caller, then one summary row per kind."""
 
 from __future__ import annotations
@@ -18,25 +18,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest import mock
+from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 
-import disk
-import ci
-import index
-import mac_outcome
-import moments
-import report
-import holds
-import health
-from cgroup_test_support import GIB, slice_reading
-from user_zone import user_zone
-import rust_release
-import sync
-import store
-from record import TARGET_DIR_UNSET
-from test_holds import timed_hold_events, write_holder, write_mac_block
-from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
-from test_record_rerun import refresh_machine_health
-from test_memory_window import isolated_journal
+from scripts.buildlog import disk, ci
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import moments, report, holds, health
+from scripts.buildlog.cgroup_test_support import GIB, slice_reading
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog import rust_release, sync
+from scripts.buildlog import store
+from scripts.buildlog.record import TARGET_DIR_UNSET
+from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_mac_block
+from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from scripts.lib import test_hang_guard
+from scripts.buildlog.test_record_rerun import refresh_machine_health
+from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
 
 HISTORY_STAMP = "2026-09-30T12:00:00Z"
 
@@ -75,8 +72,7 @@ class MeasuredCliRun:
 
 def probe_cli() -> None:
     """Instrument the real CLI entry point, including its preparation work."""
-    import cli
-    import launches
+    from scripts.buildlog import cli, launches
 
     statements: list[str] = []
     instruction_batches = 0
@@ -115,10 +111,10 @@ def probe_cli() -> None:
 def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
     # Importing test_index installs its own paths; restore this fixture afterwards.
     result = subprocess.run(
-        [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
         env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
-        capture_output=True, text=True, check=False, timeout=120,
+        capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:
         raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
@@ -139,6 +135,7 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -158,7 +155,7 @@ class ReportSpeedTests(unittest.TestCase):
                 )))
                 _ = index.update()
                 result = subprocess.run(
-                    [sys.executable, "scripts/buildlog/cli.py", "report"],
+                    configured_host_cli(Path("scripts/buildlog/cli.py"), "report"),
                     cwd=Path(__file__).resolve().parents[2],
                     env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
                          "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
@@ -262,10 +259,11 @@ class ReportTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
@@ -2997,8 +2995,8 @@ class ReportTests(unittest.TestCase):
         }
         self.write(self.root / "natedev" / "2026-10.jsonl", step("one"))
 
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
-            with mock.patch("sync.sync_time", return_value="12:14 EDT"):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
+            with mock.patch("scripts.buildlog.sync.sync_time", return_value="12:14 EDT"):
                 lines = self.render().splitlines()
 
         self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary: successes"))
@@ -3037,12 +3035,28 @@ class ReportTests(unittest.TestCase):
             "free": 2**30,
             "floor": None,
         }
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
             lines = self.render().splitlines()
 
         self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary"))
         self.assertIn("| free | 1.0 GiB |", lines)
         self.assertNotIn("free (floor", "\n".join(lines))
+
+    def test_disk_section_names_each_filesystem_once(self) -> None:
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00", "host": "natedev", "rows": [],
+            "used": 10 * (2**30), "free": (2**30), "floor": None,
+            "filesystems": [
+                {"path": "/", "device": "1:1", "device_name": "root", "used": 10 * (2**30), "free": (2**30)},
+                {"path": "/build", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+                {"path": "/alias", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+            ],
+        }
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
+            text = "\n".join(report.disk_section())
+        self.assertIn("/build (2:1, build) free | 3.0 GiB", text)
+        self.assertIn("/ (1:1, root) free | 1.0 GiB", text)
+        self.assertNotIn("/alias", text)
 
     def test_disk_section_clamps_other_when_rows_exceed_used(self) -> None:
         unit = 2**30
@@ -3054,7 +3068,7 @@ class ReportTests(unittest.TestCase):
             "free": unit,
             "floor": None,
         }
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
             lines = report.disk_section()
 
         self.assertIn("| other | 0.0 GiB |", lines)
@@ -3087,7 +3101,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| /tmp | 1.0 GiB |", old_lines)
 
     def test_no_disk_section_without_snapshot(self) -> None:
-        with mock.patch("report.disk.read_snapshot", return_value=None):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=None):
             lines = self.render().splitlines()
 
         self.assertFalse(any(line.startswith("### Disk:") for line in lines))
@@ -3102,10 +3116,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(sync.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
 
     def test_nearest_rank_matches_p95_boundaries_and_single_value(self) -> None:
-        self.assertEqual(report.nearest_rank(list(range(1, 21)), 95), 19)
-        self.assertEqual(report.nearest_rank(list(range(1, 22)), 95), 20)
-        self.assertEqual(report.nearest_rank([37], 95), 37)
-        self.assertEqual(report.nearest_rank([360, 720, 1080, 1440], 75), 1080)
+        self.assertEqual(moments.nearest_rank(list(range(1, 21)), 95), 19)
+        self.assertEqual(moments.nearest_rank(list(range(1, 22)), 95), 20)
+        self.assertEqual(moments.nearest_rank([37], 95), 37)
+        self.assertEqual(moments.nearest_rank([360, 720, 1080, 1440], 75), 1080)
 
     def test_ci_freshness_for_today_and_a_past_day(self) -> None:
         now = datetime.now(UTC)
@@ -3163,9 +3177,11 @@ class ReportTests(unittest.TestCase):
         _ = (self.root / "sync_paused.json").write_text(json.dumps({
             "since": "2026-10-06T11:00:00Z", "why": "Mac hold",
         }))
-        note = report.mac_note()
-        self.assertTrue(note.startswith("Mac: sync paused since "))
-        self.assertIn("(Mac hold). Mac rows as of the ", note)
+        lines = report.peer_sync_lines()
+        mac = [line for line in lines if line.startswith("mac (")]
+        self.assertEqual(len(mac), 1)
+        self.assertIn("sync globally paused (Mac hold); run buildlog sync resume", mac[0])
+        self.assertIn("last successful exchange", mac[0])
 
     def test_every_step_kind_and_summary_places_p95_after_average(self) -> None:
         kinds = ("check", "clippy", "doc", "nextest", "mend", "fmt")

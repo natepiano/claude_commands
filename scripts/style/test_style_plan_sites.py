@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import re
-import sys
 import unittest
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_proposals
+from scripts.style import style_proposals
 
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -43,7 +42,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn(f"waived 1 findings in {issue}: {source} site moved to {target} in synced commit {self.tip}\n", output)
         states = {finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)}
         self.assertEqual(states, {moved.finding_id: style_ledger.Waived(), kept.finding_id: style_ledger.Filed(issue)})
-        ticket = ledger.ticket_open("names-unit")[0]
+        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]), ("proposal", [source], [kept.finding_id]))
         self.assertTrue(any(selection.kind == "read" and target in selection.files for selection in self.candidates()))
 
@@ -85,7 +84,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().proposal_tickets(), ())
         self.rejudge(finding, holds=True)
         _ = self.refill_decisions()
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
 
     def test_an_approved_lower_rank_finding_at_a_changed_file_is_waived_when_the_judgment_of_that_file_does_not_hold_it(self) -> None:
@@ -99,46 +98,44 @@ class StylePlanTests(StylePlanFixture):
 
     def test_a_queued_proposal_for_a_lower_rank_finding_judged_at_an_older_file_is_dropped(self) -> None:
         issue, finding, _ = self.approved_then_changed()
-        self.ledger().ticket_add("names-unit-9", "names-unit", "proposal", "names", "crates/alpha", [finding.path],
+        self.ledger().ticket_add("9", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path],
                                  [finding.rule], proposal=str(issue), finding_ids=(finding.finding_id,))
         output = self.refill_decisions()
-        self.assertIn(f"dropped names-unit-9: {finding.finding_id} {finding.path} changed since it was judged", output)
+        self.assertIn(f"dropped 9: {finding.finding_id} {finding.path} changed since it was judged", output)
         self.assertEqual([ticket["id"] for ticket in self.ledger().proposal_tickets() if ticket["state"] != "dropped"], [])
 
     def test_a_followed_finding_is_settled_by_a_later_judgment_of_its_new_file(self) -> None:
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", site)
-        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Moved;\n"})
         _ = self.refill_decisions()
         followed, = self.ledger().proposal_findings(issue)
         self.assertEqual((followed.finding_id, followed.path), (finding.finding_id, "crates/alpha/src/moved.rs"))
         definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == rule)
         self.assertEqual(self.ledger().judged_again_without(followed, definition), style_ledger.NotJudgedAgain())
-        self.record(rule, followed.path, self.tip, "modules-unit-2")
+        self.record(rule, followed.path, self.tip, "3002")
         self.assertIsInstance(self.ledger().judged_again_without(followed, definition), style_ledger.SupersedingJudgment)
 
     def test_a_followed_finding_is_not_settled_by_a_later_judgment_of_an_older_new_file(self) -> None:
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, _ = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, _ = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", site)
-        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Moved;\n"})
         _ = self.refill_decisions()
         followed, = self.ledger().proposal_findings(issue)
         moved = self.tip
         self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
         definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        self.record(rule, followed.path, moved, "modules-unit-2")
+        self.record(rule, followed.path, moved, "3002")
         self.assertEqual(self.ledger().judged_again_without(followed, definition), style_ledger.NotJudgedAgain())
-        self.record(rule, followed.path, self.tip, "modules-unit-3")
+        self.record(rule, followed.path, self.tip, "3003")
         self.assertIsInstance(self.ledger().judged_again_without(followed, definition), style_ledger.SupersedingJudgment)
 
 if __name__ == "__main__":

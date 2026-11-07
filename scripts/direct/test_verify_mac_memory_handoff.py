@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import final
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -21,7 +21,7 @@ class VerifyMacMemoryHandoffTests(VerifyMacMemoryRetryFixture):
         self.assertEqual(self.local_runs(), [])
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = once.write_text("free\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
         runners = self.runner_events()

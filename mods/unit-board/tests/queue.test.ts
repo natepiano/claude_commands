@@ -1,3 +1,4 @@
+import selectedPageFixture from './selected_page_fixture';
 import { describe, expect, mock, test } from 'claude-code/testing';
 import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput, UiPane } from 'claude-code';
@@ -10,7 +11,7 @@ import { CWD, drawnText, inspectDrawing, NOW, SESSION, sessionFixture } from './
 const HOME = '/test-home';
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`];
 const READ = [...ARGV, '--json', '--columns', '100', '--you', SESSION];
-const PRIORITY_ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/lint/memory_admit.py`, 'priority', 'set', '--unit', 'berth', '--why', "the user's bump"];
+const PRIORITY_ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`, 'bump', 'berth'];
 const command = (args = ''): CommandRunInput => ({ command: 'build:queue', args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
@@ -18,7 +19,7 @@ const turn: TurnCompleteInput = { answer: 'finished', reason: 'answer', duration
   isAborted: false, turnId: 'queue-turn' };
 const HEAD = 'Build queue 10:46:12 · 1 running · 1 waiting · #1 waits on memory pressure, budget';
 const BUMP = 'queue priority set for berth: first step now #1';
-const USAGE = 'build queue: use /build:queue bump <unit>';
+const USAGE = 'build queue: use /build:queue bump <position|session|folder>';
 
 function snapshot(): QueueLines {
   return {
@@ -42,6 +43,16 @@ function snapshot(): QueueLines {
   };
 }
 
+function selectedPage(): QueueLines {
+  const data = snapshot();
+  data.lines.push([], [{ text: '#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB', bold: true }],
+    [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.' }],
+    [{ text: 'Need source: same-shape p90 of 7 runs, last 14 days; failed-build floor 16.0 GiB.' }],
+    [{ text: 'Cargo token: worker nextest: waited 154 s (10:42-10:45).' }],
+    [{ text: 'Frees when: widget nextest end (budget charge drops 11.1 GiB).' }]);
+  return data;
+}
+
 /** The kit returns a semantic tree and never paints the host's viewport. */
 function expectHostClipping(tree: unknown, columns: number, lineCount: number) {
   expect((tree as { props: Record<string, unknown> }).props).toMatchObject({ width: columns, overflow: 'hidden' });
@@ -53,12 +64,12 @@ function expectHostClipping(tree: unknown, columns: number, lineCount: number) {
   for (const props of drawing.textProps) expect(props).toMatchObject({ wrap: 'truncate' });
 }
 
-function queueHost(on: On) {
+function queueHost(on: On, environment: Record<string, string> = {}) {
   const panes = new Map<string, UiPane>();
   const opened: string[] = [];
   const closed: string[] = [];
   const clock = mock.clock(on, { now: NOW });
-  mock.env(on, { HOME, USER_ZONE: 'UTC' });
+  mock.env(on, { HOME, USER_ZONE: 'UTC', ...environment });
   const processes: string[][] = [];
   const writes: QueuePaneState[] = [];
   const escaped: string[] = [];
@@ -98,7 +109,7 @@ function queueHost(on: On) {
   });
   on('process.run', async (_$, e) => {
     processes.push([...e.argv]);
-    if (e.argv.includes('priority')) {
+    if (e.argv.includes('bump')) {
       return { value: { exitCode: bumpFailure ? 2 : bumpRefusal ? 3 : 0,
         stdout: bumpFailure ? 'PRIVATE stdout' : bumpRefusal || BUMP + '\n',
         stderr: bumpFailure ? 'PRIVATE stderr' : '',
@@ -139,6 +150,43 @@ async function mount($: Engine, surface: 'terminal' | 'desktop' = 'terminal', co
 }
 
 describe('build queue pane', () => {
+  test('queue mutations supply the session and reads omit process options', async () => {
+    type Hook = (services: EngineInterface, event: CommandRunInput) => Promise<unknown>;
+    const hooks = new Map<string, Hook>();
+    const collect = (event: string, ...args: unknown[]) => {
+      const filter = args.length > 1 ? args[0] as { command?: string } : {};
+      hooks.set(filter.command ? `${event}:${filter.command}` : event, args.at(-1) as Hook);
+      return { catch: () => {} };
+    };
+    register(collect as On, {});
+    const calls: unknown[][] = [];
+    let state: Record<string, QueuePaneState> = {};
+    const services = {
+      session: sessionFixture,
+      env: { get: async () => HOME },
+      ui: { open: async () => ({}) },
+      clock: { every: () => ({ cancel: () => {} }) },
+      state: {
+        get: async () => ({ value: state }),
+        set: async (_key: unknown, value: typeof state) => { state = value; },
+      },
+      process: { run: async (...args: unknown[]) => {
+        calls.push(args);
+        const argv = args[0] as string[];
+        return { exitCode: 0, stdout: argv.includes('bump') ? BUMP : JSON.stringify(snapshot()),
+          stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+      } },
+    } as unknown as EngineInterface;
+    const run = hooks.get('command.run:build:queue')!;
+    await run(services, command());
+    expect(calls[0]).toEqual([READ]);
+    calls.length = 0;
+    await run(services, command('bump 2'));
+    expect(calls[0]).toEqual([[...ARGV, 'bump', '2'],
+      { env: { CLAUDE_CODE_SESSION_ID: SESSION } }]);
+    expect(calls[1]).toEqual([READ]);
+  });
+
   test('open is intercepted, stores loading before the JSON run and enables Escape', async ($, on) => {
     const fake = queueHost(on);
     await $.session.start(start);
@@ -171,6 +219,23 @@ describe('build queue pane', () => {
     });
   }
 
+  test('the recorded board paints running grants before numbered waiting rows', async ($, on) => {
+    const fake = queueHost(on);
+    fake.replace(selectedPageFixture as QueueLines);
+    await $.command.run(command());
+    const ui = await mount($, 'terminal');
+    const tree = await ui.drawn();
+    const lines = inspectDrawing(tree).lines;
+    expect(lines).toEqual(selectedPageFixture.lines.map(line => line.map(span => span.text).join('')));
+    const running = lines.findIndex(line => line.startsWith('run'));
+    const waiting = lines.findIndex(line => line.trimStart().startsWith('1 '));
+    expect(running).toBeGreaterThanOrEqual(0);
+    expect(waiting).toBeGreaterThan(running);
+    expect(lines.filter(line => line.startsWith('run'))).toHaveLength(1);
+    expect(lines.filter(line => /^\s+[12] /.test(line))).toHaveLength(2);
+    expect(lines.at(-1)).toContain('(unowned)');
+  });
+
   test('a span with omitted style fields paints with the default foreground, background and weight', async ($, on) => {
     const fake = queueHost(on);
     const data = snapshot();
@@ -187,6 +252,22 @@ describe('build queue pane', () => {
     expect(props.color ?? 'default').toBe('default');
     expect(props.backgroundColor ?? 'default').toBe('default');
     expect(props.bold).toBe(false);
+    expect(fake.processes).toEqual([READ]);
+  });
+
+  test('the pane preserves the bump mark supplied by the queue JSON', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: ' 1 tool-based-ui ' }, { text: '●', tone: 'warning' },
+      { text: 'cables   nextest' }], [{ text: ' 2 tool-based-ui lfo       nextest' }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const drawing = inspectDrawing(await ui.drawn());
+    expect(drawing.lines).toEqual(data.lines.map(line => line.map(part => part.text).join('')));
+    expect(drawing.spans.filter(part => part.text === '●')).toEqual([
+      { text: '●', color: 'warning', bold: false },
+    ]);
     expect(fake.processes).toEqual([READ]);
   });
 
@@ -276,23 +357,38 @@ describe('build queue pane', () => {
     expect(fake.processes).toEqual([READ]);
   });
 
-  test('a selector opens a card, survives timer refresh and reload, and a bare command restores the view', async ($, on) => {
+  test('the pane paints the same recorded page as the terminal', async ($, on) => {
     const fake = queueHost(on);
-    const data = snapshot();
-    data.lines = [[{ text: '#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB', tone: 'default', bold: true }],
-      [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.', tone: 'default', bold: false }]];
+    const data = selectedPage();
+    fake.replace(data);
+    await $.command.run(command('1'));
+    const ui = await mount($, 'terminal', 100);
+    const expected = data.lines.map(line => line.map(span => span.text).join(''));
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(expected);
+    expect(drawnText(await ui.drawn())).toContain('Frees when:');
+    expect(drawnText(await ui.drawn())).toContain('Need source: same-shape p90 of 7 runs, last 14 days; failed-build floor 16.0 GiB.');
+  });
+
+  test('a selector keeps the card below the queue through timer refresh and reload', async ($, on) => {
+    const fake = queueHost(on);
+    const data = selectedPage();
+    const page = data.lines.map(line => line.map(span => span.text).join(''));
     fake.replace(data);
     expect(await $.command.run(command('4'))).toEqual({ text: 'Build queue opened.' });
     const ui = await mount($);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     expect(drawnText(await ui.drawn())).toContain('Next? No. 3 steps are ahead');
     expect(fake.processes).toEqual([[...READ, '4']]);
     expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'card', selector: '4' } });
     await fake.clock.advance(10_000);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     await $.session.start(start);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     expect(fake.processes).toEqual([[...READ, '4'], [...READ, '4'], [...READ, '4']]);
+    fake.replace(snapshot());
     await $.command.run(command());
     expect(fake.processes.at(-1)).toEqual(READ);
-    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'view' } });
+    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'view' } });
   });
 
   test('a session or folder selector stays one process argument', async ($, on) => {
@@ -437,6 +533,30 @@ describe('build queue pane', () => {
   }
 
   for (const mode of ['exit', 'json', 'shape', 'truncated', 'throw'] as const) {
+    test(`${mode} failed refresh keeps the full queue and selected card until recovery`, async ($, on) => {
+      const fake = queueHost(on);
+      const data = selectedPage();
+      fake.replace(data);
+      await $.command.run(command('4'));
+      const ui = await mount($);
+      const page = inspectDrawing(await ui.drawn()).lines;
+      expect(page[0]).toBe(HEAD);
+      expect(page).toContain('#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB');
+      expect(page.at(-1)).toContain('Frees when:');
+      expect(page.join('\n')).toContain('failed-build floor 16.0 GiB');
+      expect(page.join('\n')).toContain('waited 154 s');
+      fake.failNext(mode);
+      await fake.clock.advance(10_000);
+      expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
+      expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'card', selector: '4' } });
+      const refreshed = selectedPage();
+      refreshed.lines[refreshed.lines.length - 1] = [{ text: 'Next? Yes. It starts at the next check.' }];
+      fake.replace(refreshed);
+      await fake.clock.advance(10_000);
+      expect(inspectDrawing(await ui.drawn()).lines).toEqual(refreshed.lines.map(line => line.map(span => span.text).join('')));
+      expect(fake.processes).toEqual([[...READ, '4'], [...READ, '4'], [...READ, '4']]);
+    });
+
     test(`${mode} failure shows a fixed reason and recovers on the next tick`, async ($, on) => {
       const fake = queueHost(on);
       fake.failNext(mode);
@@ -485,6 +605,13 @@ describe('build queue pane', () => {
       expect(drawnText(await ui.drawn())).toContain(HEAD);
     });
   }
+
+  test('a bump passes the pane session instead of the inherited session to the process', async ($, on) => {
+    const fake = queueHost(on, { CLAUDE_CODE_SESSION_ID: 'a-different-inherited-session' });
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: BUMP });
+    expect(fake.processes).toEqual([PRIORITY_ARGV]);
+    expect(fake.escaped).toEqual([]);
+  });
 
   for (const open of [false, true]) {
     test(`bump sets unit priority and ${open ? 'refreshes the open' : 'does not open a closed'} pane`, async ($, on) => {
@@ -544,7 +671,7 @@ describe('build queue pane', () => {
     expect(fake.escaped).toEqual([]);
   });
 
-  for (const refusal of ["build queue: type /build:queue bump berth in a showrunner pane"]) {
+  for (const refusal of ["build queue: no waiting step matches berth"]) {
     test(`bump reports its refusal: ${refusal}`, async ($, on) => {
       const fake = queueHost(on);
       fake.refuseBump(refusal);
@@ -554,6 +681,18 @@ describe('build queue pane', () => {
       expect(fake.escaped).toEqual([]);
     });
   }
+
+  test('an unknown-unit exit-3 refusal is shown in the open queue pane', async ($, on) => {
+    const fake = queueHost(on);
+    await $.command.run(command());
+    const refusal = 'build queue: unknown unit not-a-roster-unit';
+    fake.refuseBump(refusal);
+    expect(await $.command.run(command('bump not-a-roster-unit'))).toEqual({ text: refusal });
+    expect(fake.processes).toEqual([READ,
+      PRIORITY_ARGV.map(argument => argument === 'berth' ? 'not-a-roster-unit' : argument), READ]);
+    expect(fake.opened).toEqual(['build-queue']);
+    expect(fake.escaped).toEqual([]);
+  });
 
   test('an exit-2 bump hides permission errors even when they have the build queue prefix', async ($, on) => {
     mock.env(on, { HOME });
@@ -610,19 +749,19 @@ describe('build queue pane', () => {
             },
           },
           process: { run: async (argv: string[]) => ({
-            exitCode: argv.includes('priority') && result === 'refusal' ? 3 : 0,
-            stdout: argv.includes('priority') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
+            exitCode: argv.includes('bump') && result === 'refusal' ? 3 : 0,
+            stdout: argv.includes('bump') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
             stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
           }) },
         } as unknown as EngineInterface;
         const run = hooks.get('command.run:build:queue')!;
         await run(services, command());
         remaining = failedWrites;
-        expect(await run(services, command('bump berth'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
-        expect(failures).toBe(failedWrites);
-        if (failedWrites === 1) {
-          expect(state['build-queue']).toEqual({ kind: 'failed', reason: 'Build queue could not be read.', selection: { kind: 'view' } });
+        for (let attempt = 0; attempt < failedWrites; attempt++) {
+          expect(await run(services, command('bump berth'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
         }
+        expect(failures).toBe(failedWrites);
+        expect(state['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'view' } });
       });
     }
   }
@@ -817,7 +956,7 @@ function tablePaneLifetimeHost() {
 
 for (const pane of [
   { id: 'build-queue', command: 'build:queue', key: 'queuePanes', ready: 'queue' },
-  { id: 'accounts-board', command: 'accounts-board', key: 'accountsPanes', ready: 'accounts' },
+  { id: 'accounts', command: 'showrunner:accounts', key: 'accountsPanes', ready: 'accounts' },
 ]) {
   test(`${pane.id}: an older close cannot erase state written by a reopened pane`, async () => {
     const host = tablePaneLifetimeHost();
@@ -838,7 +977,7 @@ for (const pane of [
 
 test('reload reads and schedules the queue while the resumed accounts read is held', async () => {
   const host = tablePaneLifetimeHost();
-  host.panes.add('accounts-board');
+  host.panes.add('accounts');
   host.panes.add('build-queue');
   const held = host.pauseAccountsRead();
   const resuming = host.dispatch('session.start', start);

@@ -1,24 +1,24 @@
 ---
-description: Reach the user when work has stopped on something only they can do, or a decision only they can make is overdue. Any session, natedev or Mac.
+description: Notify the user when work needs them.
 ---
 
-Load `/message_style` before the first message to the user in a session.
+Load `/message_style` before the first message to the user. Use the matching registered text below. Fill values with facts; keep agent-written title, action and body short and to the point.
 
-Send one alert:
+On the Mac add `--machine natedev`; never read `~/.config/pushover/env`.
 
-`python3 ~/.claude/scripts/message/send.py --to user --need decision|blocked [--clears-when "<command that exits 0 when fixed>"] --action "<what the user does>" --summary "<what is at stake, under 45 characters>" --text "<the one action or decision, under 500 characters>"`
+Mac locked, screenshots black (replace `<clear-command>` with a command that exits 0 when unlocked):
+`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id mac.locked --value "sender=<your session>" --value "waiting=One unit's phase waits for 2 shots" --clears-when "<clear-command>"`
 
-On the Mac, add `--machine natedev`; the keys exist only on natedev. Never read `~/.config/pushover/env`.
+GitHub keys cold (one push per machine until `github-warm-status` passes; the template sets its key and clear check):
+`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id github.keys_cold --value "sender=<your session>" --value "machine=<machine with cold keys>"`
 
-News a terminal already shows, sent only when the user types in no terminal for N minutes (natedev): `python3 ~/.claude/scripts/message/escalate.py hold <key> --need note --no-action --summary "<title>" --text "<news>" [--minutes 15]`, then `close <key>` once it stops being true.
+A finished build hold still blocks work:
+`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id build_hold.blocking --value "sender=<your session>" --value "machine=natedev" --value "holder=builds" --value "reason=a compiler check" --value "finished=09:10 EST" --clears-when "<command that exits 0 after release>"`
 
-Every message says what the user does with `--action`, or says nothing is needed with `--no-action`. Emergency (`--need blocked`) is only for an action the user must take now. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2).
+Other work stopped on the user:
+`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id alert.blocked --value "sender=hana" --value "title=Hana crashes at start on the Mac" --value "action=On the Mac, tell the hana tab to roll back or keep the Bevy update" --value "body=Hana stops at start with a shader error since the Bevy update at 09:10. Mac screenshots wait until it starts again." --clears-when "<command that exits 0 when fixed>"`
 
-| Need | When |
-|---|---|
-| `blocked` (repeats until acknowledged) | Work has stopped and only the user can restart it: a login, a passphrase (`github-warmup`), a sudo step, a physical action. |
-| `decision` | A decision only the user can make, while other work continues. |
+A choice only the user can make:
+`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id alert.decision --value "sender=builds" --value "title=Keep the old build cache?" --value "action=Say keep or delete in the builds tab" --value "body=The old build cache uses 120 GiB. Deleting it frees the space; the next build of each repo takes about 10 minutes longer."`
 
-- One alert per block. If it is still blocked an hour after the user acknowledged, send `decision` saying what changed, never the same text.
-- Never for progress, finished work, or anything a session can decide or retry itself. Sessions with their own alert policy (`/showrunner:produce`) follow it.
-- `FAILED` (exit 3): fall back to PushNotification with the `fallback text:` that `send.py` printed.
+One alert per block. Never for progress, finished work, or a choice a session can make. `blocked` is only for an action the user must take now; its clear command stops repeats when fixed. The review refuses agent-written fields when a fixed template fits. On `FAILED` (exit 3), report the failure; no alternate push path.

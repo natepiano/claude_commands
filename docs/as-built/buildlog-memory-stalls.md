@@ -17,7 +17,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, the one filesystem capacity and device reader. It imports `cgroup_capture` only. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command), the parsers `parse_meminfo`, `parse_pressure`, `parse_cpu_ticks` and `parse_boot_id`, the readers `read_pressure` and `read_cpu_ticks`, and `read_power_profile` with its path `POWER_PROFILE_STATE`. The `/proc` paths are module values (`MEMINFO`, `PRESSURE`, `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`, `BOOT_ID`) that tests patch. Also the types `MachineMemoryUse`, `StallTotals`, `PartialStallTotals` (shared by memory, CPU and IO), `CpuTicks`, `PowerProfile` and `Unmeasured`. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. `append_line`, `locked_append`, `last_whole_row_end` and `read_last_whole_row_end` keep each monthly file whole (below). `note_error(context)` writes one timestamped line to `errors.log`. |
-| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 26` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
+| `scripts/buildlog/index.py` | The schema number is in [build-memory-admission.md](build-memory-admission.md). This module owns the step stall columns, `SAMPLE_COLUMNS`, `samples`, `add_sample`, `samples_host_at`, and `steps_host_started`. |
 | `scripts/buildlog/cli.py` | The `sample` command takes no arguments and exits 2 if given any. `usage-hours [YYYY-MM-DD]` reports the preceding 24 hours. |
 | `scripts/buildlog/report.py` | `memory_pressure_section()`, `cpu_disk_pressure_section()`, the pairing helper `sample_counter_deltas()` with `SampleCounterInterval` and `CounterNotRecorded`, and `MAX_SAMPLE_GAP_S`. It reuses `SCRATCH` and `SCRATCH_LABEL`. The samples' power profile feeds `power_profile_section()` (`docs/as-built/build-targets.md`, "What the reports read"). |
 | `scripts/buildlog/test_{record,index,store,sample,report,memory_records}.py` | Fixture tests; see Tests below. |
@@ -32,7 +32,7 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 
 ### Recorder health
 
-`health.calculate_snapshot()` runs on the machine that owns the data. It counts the `.json` files under `record.pending_launches_root()` and `record.pending_steps_root()`, and keeps each timestamped `errors.log` line except a `pending record <path>` line whose path no longer exists. `write_snapshot()` writes `RecorderHealthSnapshot(machine, generated_at, unfinished_records, error_timestamps)` to `<host folder>/recorder-health.json` (`v: 1`) under an exclusive `flock` on `store.root()/recorder-health.lock` (outside the synced host folders), through a temp file, fsync and `os.replace`. On a failure it notes `recorder health snapshot`, keeps the old snapshot and returns False. `launches.collect()` and `sync` refresh it (see `docs/as-built/build-memory-admission.md`, Mac sync).
+`health.calculate_snapshot()` runs on the machine that owns the data. It counts the `.json` files under `record.pending_launch_root()` and `record.pending_steps_root()`, and keeps each timestamped `errors.log` line except a `pending record <path>` line whose path no longer exists. `write_snapshot()` writes `RecorderHealthSnapshot(machine, generated_at, unfinished_records, error_timestamps)` to `<host folder>/recorder-health.json` (`v: 1`) under an exclusive `flock` on `store.root()/recorder-health.lock` (outside the synced host folders), through a temp file, fsync and `os.replace`. On a failure it notes `recorder health snapshot`, keeps the old snapshot and returns False. `launches.collect()` and `sync` refresh it (see `docs/as-built/build-memory-admission.md`, Mac sync).
 
 `read_snapshots()` returns one state per `Machine`: `FreshRecorderHealth` (at most `SNAPSHOT_MAX_AGE_SECONDS`, 2 h, old), `StaleRecorderHealth`, or `RecorderHealthUnavailable` (absent, unreadable or invalid). `machine_for_host()` maps every non-natedev `record.SYNC_HOSTS` folder to `Machine.MAC`, and the newest usable Mac folder wins. A snapshot more than `SNAPSHOT_CLOCK_SKEW_SECONDS` (300 s) in the future is skipped. A stale or unavailable machine reads as unknown, never as 0.
 
@@ -52,7 +52,11 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 
 The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` opens a test-phase window on the first tick when a running executable in the step's scope has a direct parent folder named `deps` (`/deps/[^/]+$`), under any target folder name. Build scripts run from `<profile>/build/<pkg>-<hash>/` and do not open it. The peak is the scope's `memory.stat` `anon`, so it counts all parallel tests. The sampler writes the anon peak, the start time and the context from `record.py test-phase-context RESERVATION ARGV...` to `$BUILDLOG_PEAK.test-phase.json` (temp + `mv`). The same loop still writes admission's `.max` and `.wave` files.
 
-`record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar into `PendingStep.test_phase` (`TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord`) before the save. An absent sidecar records null. An unreadable one keeps the sources and the pending record for a retry and writes one `pending record <path>` line to `errors.log`. Row fields: `test_phase_peak_bytes`, `test_phase_started_at`, and `TestPhaseContext` (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). `test_threads` comes from admission's one parser `memory_admit.test_threads`. `test_phase_charge` is null until admission records a test-phase entry charge. The fields are in the JSON rows only; the index has no column for them.
+`record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar before it saves `PendingStep.test_phase`. An absent sidecar records null. An unreadable sidecar retains the sources and the pending record for a retry. The recorder writes one `pending record <path>` line to `errors.log`. The JSON row contains `test_phase_peak_bytes`, `test_phase_started_at`, and the selection fields from `TestPhaseContext`. The selection fields are `repo_identity`, `test_scope`, `package`, `filters`, `call_id`, and `test_threads`. The recorder and admission use `parse.test_threads` to read the width.
+
+The row keeps the sidecar's `reservation_id` when the sampler records one.
+
+`test_phase_charge` copies the charge that admission used for this reservation. The object contains `bytes`, `selected_at`, `reservation_id`, and `need`. The sampler saves the reservation identity before admission selects the charge. Admission release saves the evidence in `admission/anon_peaks.jsonl` before the recorder starts. The recorder finds that reservation's completed history row and copies `test_phase_charge_use` without a new estimate. Terminal and tee steps use the same path. A step without recorded charge evidence retains null. Admission publishes history only for a scoped step with a positive sampled peak; other steps record a null charge. The `steps.test_phase_charge_bytes` index column contains the charge bytes. Older rows and rows without a charge have SQL NULL. The other test-phase fields remain in the JSON rows.
 
 ### Old field names
 
@@ -73,7 +77,7 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 ### Machine samples: `buildlog sample` → monthly JSONL → `samples`
 
 1. `sample()` checks that `/proc/meminfo`, `/proc/pressure/memory` and `/proc/sys/kernel/random/boot_id` exist. It parses all three, reads `/proc/pressure/cpu`, `/proc/pressure/io` and `/proc/stat` once each, reads the slice counters and the power profile, and appends one line to `store.sample_file(host, now)` through `store.append_line`, which first cuts an unfinished tail back to the last newline, then writes one line under the same flock with `O_APPEND`:
-   `{"kind":"sample","host":…,"at":<UTC ISO ms Z>,"boot_id":…,"mem_used_bytes":…,"swap_used_bytes":…,"builds_anon_bytes":…,"sccache_in_service":…,"ci_anon_bytes":…,"stall_some_us":…,"stall_full_us":…,"cpu_stall_some_us":…,"cpu_stall_full_us":…,"io_stall_some_us":…,"io_stall_full_us":…,"cpu_idle_ticks":…,"cpu_iowait_ticks":…,"cpu_total_ticks":…,"power_profile":…,"power_profile_since":…,"slices":…,"filesystem":…,"jobserver":…}`
+   `{"kind":"sample","host":…,"at":<UTC ISO ms Z>,"boot_id":…,"mem_used_bytes":…,"swap_used_bytes":…,"builds_anon_bytes":…,"sccache_in_service":…,"ci_anon_bytes":…,"stall_some_us":…,"stall_full_us":…,"cpu_stall_some_us":…,"cpu_stall_full_us":…,"io_stall_some_us":…,"io_stall_full_us":…,"cpu_idle_ticks":…,"cpu_iowait_ticks":…,"cpu_total_ticks":…,"power_profile":…,"power_profile_since":…,"slices":…,"filesystem":…,"jobserver":…,"zram":…}`
    - `mem_used_bytes` is MemTotal minus MemAvailable.
    - `swap_used_bytes` is SwapTotal minus SwapFree.
    - The stall fields are the raw counters since boot, in microseconds.
@@ -82,15 +86,22 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
    - The slice fields (`builds_anon_bytes`, `sccache_in_service`, `ci_anon_bytes`) are in `docs/as-built/build-memory-admission.md`.
    - `power_profile` is power-profiles-daemon's `Profile=` value under `[State]` (`performance`, `balanced`, `power-saver`); `power_profile_since` is the state file's mtime as `store.utc_iso`, the moment the daemon last wrote it. Both are `null` when `read_power_profile` answers `Unmeasured.VALUE`.
 2. The file sits in the host folder beside `<YYYY-MM>.jsonl`. `index.update()` already reads every `<root>/*/*.jsonl` and dispatches on `kind` through `ADDERS`, so `add_sample` picks the lines up incrementally with no special case. The hourly `buildlog sync` copies the host folder, so the Mac's index gets natedev's samples too.
-3. The `samples` table has one row per sample: `src, host, at, boot_id, mem_used_bytes, swap_used_bytes, builds_anon_bytes, sccache_in_service, ci_anon_bytes, stall_some_us, stall_full_us, cpu_stall_some_us, cpu_stall_full_us, io_stall_some_us, io_stall_full_us, cpu_idle_ticks, cpu_iowait_ticks, cpu_total_ticks, power_profile, power_profile_since, slices, filesystem, jobserver` (`SAMPLE_COLUMNS`; the seven CPU and IO columns `INTEGER`, both profile columns `TEXT`, the last three JSON `TEXT`, under "Raw resource readings" below). It is indexed on `(host, at)`. A line written before a field existed indexes it as NULL; nothing is backfilled.
+3. The `samples` table stores the machine counters, power profile, slices, filesystem, jobserver, and zram.
+   The resource objects use JSON `TEXT` columns.
+   The index uses `(host, at)`. Older source rows retain NULL for fields that they lack.
 
 ### Raw resource readings and hourly use
 
 `cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
-`slices` with one reading of each file. `sample.SampleTaken.slices` is passed to
-`memory.write_snapshot()` so the sample and snapshot do not reread the slice.
-The builds and CI slices remain separate. An absent cgroup has `state: absent`;
-an unreadable scalar is `unavailable` and does not discard other readings.
+`slices` with one reading of each file.
+See [Slice snapshots](build-memory-admission.md#slice-snapshots) for tick rows and the memory window reader.
+The builds and CI slices remain separate. An absent cgroup has `state: absent`.
+An unreadable scalar is `unavailable` and does not discard other readings.
+
+`EarlyoomKill.is_build` counts the configured `build_oom_score_adj` as a build kill.
+It also counts an absolute program when a resolved parent folder satisfies `sweep.is_cargo_target`.
+`outside_build_gate` uses that folder rule only when the kill lacks the configured build adjustment.
+Removed Cargo folders provide no build evidence.
 
 - `current_bytes` is `memory.current`, the whole charge enforced by `memory.max`.
   It already includes children, sccache, file cache and kernel memory. Nothing
@@ -129,9 +140,8 @@ sccache.service**; slice totals count those compiles once. Step IO is typed
 unavailable until NixOS ee6d018 (`DefaultIOAccounting=yes`) is built at the
 user's next rebuild. No code change is needed when scopes expose `io.stat`.
 
-Schema 26 indexes `steps.scope_resources` and `samples.slices`, `filesystem`,
-`jobserver` as JSON text, and keeps snapshots in `memory_snapshots.slices`.
-It rebuilds the derived index from immutable source logs; old rows have no
+The index stores `steps.scope_resources` and the `samples` columns `slices`, `filesystem`, `jobserver` and `zram` as JSON text.
+A schema change rebuilds the derived index from immutable source logs; old rows have no
 current-use reading. Worktree verification uses a scratch `BUILDLOG_DIR`,
 never the live index that the installed copy uses: `index.open_for_update`
 deletes an index of another schema version.
@@ -140,10 +150,8 @@ The Memory pressure section adds `Build memory held (60 s samples, last 24 h):
 average … GiB (`anon` … GiB, `file` … GiB, of which `inactive_file` … GiB) of the
 … GiB cap; busiest hour HH:00 at … GiB.` With no `current_bytes` it prints
 `Build memory held: no readings yet.` It reads natedev's builds slice
-from `samples.slices`, alongside that same sample row's `filesystem` and
-`jobserver`; a failed snapshot append cannot hide a saved sample. Snapshots
-remain for their existing readers and are never combined with samples for a
-number here. Step peaks are not used. Each component averages its own readings,
+from `samples.slices`, alongside that same sample row's `filesystem` and `jobserver`.
+This section uses sample rows only. Step peaks are not used. Each component averages its own readings,
 including hours without a current-use reading; the busiest hour uses its mean
 current charge. Missing values are skipped, never zero.
 
@@ -196,7 +204,8 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
   - `require_both=False` leaves a missing or invalid counter `Unmeasured`, while the default raises.
   - The boot id is trimmed, and an empty one is rejected.
   - Without `/proc`, `sample` prints exactly `buildlog sample is Linux only (requires /proc).` to stderr, exits nonzero and writes nothing.
-  - A real `cli.py sample` appends a sample record and its memory snapshot to `<host>/samples-YYYY-MM.jsonl`, with the memory and stall counters integers ≥ 0, and creates no `index.sqlite`.
+  - A real `cli.py sample` appends one sample row with zram to `<host>/samples-YYYY-MM.jsonl`.
+    Its memory and stall counters are integers ≥ 0. It creates no index file at `index_path()`.
   - The power profile reads its name and mtime from one open file; a state file replaced by rename after the open keeps the open file's profile and mtime; a missing, unreadable, sectionless or valueless file is `Unmeasured`; a sample writes `power_profile` with a UTC `power_profile_since`, or two `null` fields with no state file.
 - `test_store.py`: `sample_file` is `<root>/<host>/samples-YYYY-MM.jsonl` and is not `host_file`.
 - `test_record.py`:
@@ -222,7 +231,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 ## Invariants
 
-- **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test pins that no `index.sqlite` appears.
+- **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test checks that no file appears at `index_path()`.
 - **A test never writes the real log at `~/.local/state/buildlog`.** Every test module imports `test_index`, whose import calls `use_test_log()` and points `BUILDLOG_DIR` at a temp dir for the whole suite. `point_root_at()` moves it for a single test. Subprocess tests also pass `BUILDLOG_DIR` explicitly. The real `cli.py sample` test runs against a temp root.
 - **Nothing sits directly under a report table but its one `Source:` line.** That line carries any explanation of the table; a table without one ends at the next blank line. This section's `Source:` line sits under the heading, so its stall table ends at the blank line (`docs/as-built/build-followups.md` lists which tables carry the line).
 - **`report.py` has one style.** Cells are formatted through `table()`, `seconds()`, `count()` and `gib()`, with no new formatters.
@@ -235,7 +244,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **The power profile never stops a sample.** `read_power_profile` never raises; an unreadable profile is two `null` fields. The power-profile read never forks a process or opens D-Bus; jobserver readings use their required bounded `stevie` calls.
 - **Old samples stay as written.** A sample line without the profile fields indexes as NULL; nothing infers or backfills a profile for it.
 - **Units differ by table, deliberately.** `steps` stores stall in seconds (`REAL`, the scope's own total). `samples` stores the raw counters since boot in microseconds (`INTEGER`).
-- **Any column change bumps `SCHEMA_VERSION`.** `open_for_update` deletes an index at another version and rebuilds it from the JSON lines.
+- **The file name hashes the schema SQL.** Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - **`sample.py` has no import side effects.** `record.py` imports it after every step for `parse_pressure` and `Unmeasured`.
 - **The build-log modules import without a cycle.** `record.py` imports `memory_admit`, `memory_admit` imports `index`, and `scripts/lint/sweep.py` imports `record`. So `index.py` imports only `store` and `parse` of the buildlog modules, never `record`, and `sample.py` takes `FilesystemUsage` from `filesystem.py`, never from `disk.py` (which imports `sweep`). Check import cycles on a trial merge with builds; one branch alone may not hold every edge.
 - **The index never writes a source log.** A source `.jsonl` file is appended and never edited. To rewrite a month file by hand, truncate and write it in place under its flock; never rename a new file over it, since an appender that waits on the lock holds the old inode. Fix a bad line in a Mac host folder on the Mac: `sync.py` pulls those folders with `rsync -rt`, so a natedev edit is lost at the next sync.
@@ -256,9 +265,9 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **`power_profile_since` is the last write, not the last switch.** The daemon can rewrite its file with the same profile and a newer mtime. The report counts a change only when the profile name differs from the previous profiled sample.
 - **A subprocess test reads live `/proc` unless told otherwise.** A test that runs `sample()` in a subprocess must point `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch paths, as `test_memory_records.py` does.
 - **The `(of …)` duration counts PSI pairs only.** It is the time of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
-- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation**, which needs its own `Assertion-Change:` line at checkpoint.
+- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation.**
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
-- **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why it is this way
 

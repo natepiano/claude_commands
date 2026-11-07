@@ -1,0 +1,935 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Guarded persistent Spot build target with retained encrypted data.",
+  "Parameters": {
+    "InstanceType": {
+      "Type": "String",
+      "AllowedValues": [
+        "m7a.4xlarge"
+      ]
+    },
+    "AmiId": {
+      "Type": "AWS::EC2::Image::Id"
+    },
+    "AvailabilityZone": {
+      "Type": "AWS::EC2::AvailabilityZone::Name"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "SubnetId": {
+      "Type": "AWS::EC2::Subnet::Id"
+    },
+    "NotificationEmail": {
+      "Type": "String"
+    },
+    "RootDeviceName": {
+      "Type": "String"
+    },
+    "RootVolumeGiB": {
+      "Type": "Number"
+    },
+    "DataVolumeGiB": {
+      "Type": "Number",
+      "AllowedValues": [
+        500
+      ]
+    },
+    "DataVolumeIops": {
+      "Type": "Number",
+      "AllowedValues": [
+        6000
+      ]
+    },
+    "DataVolumeThroughput": {
+      "Type": "Number",
+      "AllowedValues": [
+        500
+      ]
+    },
+    "SpotMaxPrice": {
+      "Type": "String"
+    },
+    "MonthlyLimitUsd": {
+      "Type": "Number",
+      "MaxValue": 400
+    },
+    "NoticeLowPercent": {
+      "Type": "Number"
+    },
+    "NoticeHighPercent": {
+      "Type": "Number"
+    },
+    "StopPercent": {
+      "Type": "Number"
+    },
+    "CostTagKey": {
+      "Type": "String"
+    },
+    "CostTagValue": {
+      "Type": "String"
+    },
+    "Bootstrap": {
+      "Type": "String"
+    },
+    "ScalerUserName": {
+      "Type": "String"
+    },
+    "EnableCompute": {
+      "Type": "String",
+      "AllowedValues": [
+        "false",
+        "true"
+      ],
+      "Default": "false"
+    },
+    "ExistingDataVolumeId": {
+      "Type": "String",
+      "Default": ""
+    },
+    "DeploymentId": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{32}"
+    },
+    "BudgetName": {
+      "Type": "String",
+      "Default": ""
+    }
+  },
+  "Conditions": {
+    "Compute": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableCompute"
+        },
+        "true"
+      ]
+    },
+    "ReuseData": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "ExistingDataVolumeId"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "NewData": {
+      "Fn::And": [
+        {
+          "Condition": "Compute"
+        },
+        {
+          "Fn::Not": [
+            {
+              "Condition": "ReuseData"
+            }
+          ]
+        }
+      ]
+    },
+    "PreserveBudgetName": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "BudgetName"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "ScalerUser": {
+      "Type": "AWS::IAM::User",
+      "Properties": {
+        "UserName": {
+          "Ref": "ScalerUserName"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ]
+      }
+    },
+    "BudgetBlockPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Action": [
+                "ec2:StartInstances",
+                "ec2:RunInstances"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "BudgetRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "budgets.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:budgets::${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ApplyBudgetBlock",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:AttachUserPolicy",
+                    "iam:DetachUserPolicy"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ScalerUser",
+                      "Arn"
+                    ]
+                  },
+                  "Condition": {
+                    "ArnEquals": {
+                      "iam:PolicyARN": {
+                        "Ref": "BudgetBlockPolicy"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "MonthlyBudget": {
+      "Type": "AWS::Budgets::Budget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Budget": {
+          "BudgetName": {
+            "Fn::If": [
+              "PreserveBudgetName",
+              {
+                "Ref": "BudgetName"
+              },
+              {
+                "Fn::Sub": "${AWS::StackName}-monthly-${DeploymentId}"
+              }
+            ]
+          },
+          "BudgetType": "COST",
+          "TimeUnit": "MONTHLY",
+          "BudgetLimit": {
+            "Amount": {
+              "Ref": "MonthlyLimitUsd"
+            },
+            "Unit": "USD"
+          },
+          "CostFilters": {
+            "TagKeyValue": [
+              {
+                "Fn::Join": [
+                  "$",
+                  [
+                    {
+                      "Ref": "CostTagKey"
+                    },
+                    {
+                      "Ref": "CostTagValue"
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        "NotificationsWithSubscribers": [
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "NoticeLowPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "NoticeHighPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "StopPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "BudgetEnforcement": {
+      "Type": "AWS::Budgets::BudgetsAction",
+      "Properties": {
+        "BudgetName": {
+          "Ref": "MonthlyBudget"
+        },
+        "ActionType": "APPLY_IAM_POLICY",
+        "ApprovalModel": "AUTOMATIC",
+        "NotificationType": "ACTUAL",
+        "ActionThreshold": {
+          "Type": "PERCENTAGE",
+          "Value": {
+            "Ref": "StopPercent"
+          }
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "BudgetRole",
+            "Arn"
+          ]
+        },
+        "Definition": {
+          "IamActionDefinition": {
+            "PolicyArn": {
+              "Ref": "BudgetBlockPolicy"
+            },
+            "Users": [
+              {
+                "Ref": "ScalerUser"
+              }
+            ]
+          }
+        },
+        "Subscribers": [
+          {
+            "Type": "EMAIL",
+            "Address": {
+              "Ref": "NotificationEmail"
+            }
+          }
+        ]
+      }
+    },
+    "InstanceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          }
+        ]
+      }
+    },
+    "InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "InstanceRole"
+          }
+        ]
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Tailscale UDP only; no inbound TCP",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "udp",
+            "FromPort": 41641,
+            "ToPort": 41641,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Condition": "Compute",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "Properties": {
+        "TagSpecifications": [
+          {
+            "ResourceType": "launch-template",
+            "Tags": [
+              {
+                "Key": {
+                  "Ref": "CostTagKey"
+                },
+                "Value": {
+                  "Ref": "CostTagValue"
+                }
+              }
+            ]
+          }
+        ],
+        "LaunchTemplateData": {
+          "ImageId": {
+            "Ref": "AmiId"
+          },
+          "InstanceType": {
+            "Ref": "InstanceType"
+          },
+          "InstanceInitiatedShutdownBehavior": "stop",
+          "IamInstanceProfile": {
+            "Name": {
+              "Ref": "InstanceProfile"
+            }
+          },
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled",
+            "HttpPutResponseHopLimit": 1
+          },
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "SpotInstanceType": "persistent",
+              "InstanceInterruptionBehavior": "stop",
+              "MaxPrice": {
+                "Ref": "SpotMaxPrice"
+              }
+            }
+          },
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": {
+                "Ref": "RootDeviceName"
+              },
+              "Ebs": {
+                "Encrypted": true,
+                "VolumeType": "gp3",
+                "VolumeSize": {
+                  "Ref": "RootVolumeGiB"
+                },
+                "DeleteOnTermination": true
+              }
+            }
+          ],
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "AssociatePublicIpAddress": true,
+              "SubnetId": {
+                "Ref": "SubnetId"
+              },
+              "Groups": [
+                {
+                  "Ref": "SecurityGroup"
+                }
+              ]
+            }
+          ],
+          "TagSpecifications": [
+            {
+              "ResourceType": "instance",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            },
+            {
+              "ResourceType": "volume",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            },
+            {
+              "ResourceType": "spot-instances-request",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            }
+          ],
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Join": [
+                "",
+                [
+                  "#!/bin/bash\nset -euo pipefail\nexport AWS_BUILD_DATA_VOLUME_ID=",
+                  {
+                    "Fn::If": [
+                      "ReuseData",
+                      {
+                        "Ref": "ExistingDataVolumeId"
+                      },
+                      {
+                        "Ref": "DataVolume"
+                      }
+                    ]
+                  },
+                  "\nprintf %s ",
+                  {
+                    "Ref": "Bootstrap"
+                  },
+                  " | base64 --decode | gzip --decompress | bash\n"
+                ]
+              ]
+            }
+          }
+        }
+      }
+    },
+    "Instance": {
+      "Type": "AWS::EC2::Instance",
+      "Condition": "Compute",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "Properties": {
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "LaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "LaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        }
+      }
+    },
+    "DataVolume": {
+      "Type": "AWS::EC2::Volume",
+      "Condition": "NewData",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "AvailabilityZone": {
+          "Ref": "AvailabilityZone"
+        },
+        "Encrypted": true,
+        "VolumeType": "gp3",
+        "Size": {
+          "Ref": "DataVolumeGiB"
+        },
+        "Iops": {
+          "Ref": "DataVolumeIops"
+        },
+        "Throughput": {
+          "Ref": "DataVolumeThroughput"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "DeploymentId",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          }
+        ]
+      }
+    },
+    "DataAttachment": {
+      "Type": "AWS::EC2::VolumeAttachment",
+      "Condition": "Compute",
+      "Properties": {
+        "InstanceId": {
+          "Ref": "Instance"
+        },
+        "VolumeId": {
+          "Fn::If": [
+            "ReuseData",
+            {
+              "Ref": "ExistingDataVolumeId"
+            },
+            {
+              "Ref": "DataVolume"
+            }
+          ]
+        },
+        "Device": "/dev/sdf"
+      }
+    },
+    "ScalerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Compute",
+      "Properties": {
+        "PolicyName": "BuildScaler",
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:StartInstances",
+                "ec2:StopInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:DescribeSpotInstanceRequests"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ce:GetCostAndUsage"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "StopRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Compute",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "budgets.amazonaws.com",
+                  "ssm.amazonaws.com"
+                ]
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "BudgetStop": {
+      "Type": "AWS::Budgets::BudgetsAction",
+      "Condition": "Compute",
+      "Properties": {
+        "BudgetName": {
+          "Ref": "MonthlyBudget"
+        },
+        "ActionType": "RUN_SSM_DOCUMENTS",
+        "ApprovalModel": "AUTOMATIC",
+        "NotificationType": "ACTUAL",
+        "ActionThreshold": {
+          "Type": "PERCENTAGE",
+          "Value": {
+            "Ref": "StopPercent"
+          }
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "StopRole",
+            "Arn"
+          ]
+        },
+        "Definition": {
+          "SsmActionDefinition": {
+            "Subtype": "STOP_EC2_INSTANCES",
+            "Region": {
+              "Ref": "AWS::Region"
+            },
+            "InstanceIds": [
+              {
+                "Ref": "Instance"
+              }
+            ]
+          }
+        },
+        "Subscribers": [
+          {
+            "Type": "EMAIL",
+            "Address": {
+              "Ref": "NotificationEmail"
+            }
+          }
+        ]
+      },
+      "DependsOn": [
+        "StopPolicy"
+      ]
+    },
+    "StopPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Compute",
+      "Properties": {
+        "PolicyName": "StopOneInstance",
+        "Roles": [
+          {
+            "Ref": "StopRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:StopInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceStatus"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ssm:StartAutomationExecution"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "iam:PassRole"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "StopRole",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "ssm.amazonaws.com"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "BudgetName": {
+      "Value": {
+        "Ref": "MonthlyBudget"
+      }
+    },
+    "ComputeEnabled": {
+      "Value": {
+        "Ref": "EnableCompute"
+      }
+    },
+    "ExistingDataInput": {
+      "Value": {
+        "Ref": "ExistingDataVolumeId"
+      }
+    },
+    "InstanceId": {
+      "Condition": "Compute",
+      "Value": {
+        "Ref": "Instance"
+      }
+    },
+    "DataVolumeId": {
+      "Condition": "Compute",
+      "Value": {
+        "Fn::If": [
+          "ReuseData",
+          {
+            "Ref": "ExistingDataVolumeId"
+          },
+          {
+            "Ref": "DataVolume"
+          }
+        ]
+      }
+    },
+    "ScalerUserName": {
+      "Value": {
+        "Ref": "ScalerUser"
+      }
+    }
+  }
+}

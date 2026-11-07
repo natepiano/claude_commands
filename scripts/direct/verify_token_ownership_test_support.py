@@ -9,10 +9,9 @@ import time
 from typing import override
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class VerifyTokenOwnershipFixture(VerifyTokenWaitFixture):
@@ -50,9 +49,9 @@ class VerifyTokenOwnershipFixture(VerifyTokenWaitFixture):
                 found.append(pid)
         return found
 
-    def wait_for_group_exit(self, group: int) -> None:
+    def wait_for_group_exit(self, group: int, timeout: float = TEST_HANG_GUARD_SECS) -> None:
         """Observe exits without killing anything: the verifier must clean up."""
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + timeout
         while members := self.live_group_processes(group):
             descriptors: list[int] = []
             try:

@@ -1,6 +1,8 @@
 ---
-description: Load the message guide before writing anything the user reads — a push, a question, a report.
+description: Read the user message guide.
 ---
+
+Read this guide before writing any message to the user.
 
 Run `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --guide ~/rust/nate_style/message`.
 

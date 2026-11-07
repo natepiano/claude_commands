@@ -27,6 +27,14 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
                 self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
                 self.assertEqual("could not detach" in result.stderr, note, result.stderr)
 
+    def test_a_live_run_limit_refusal_starts_no_attached_command(self) -> None:
+        result = self.verify(self.detach_environment(4))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(len(self.mesh_runs_calls()), 1)
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertEqual(self.records(), [])
+        self.assertNotIn("running attached", result.stderr)
+
     def test_the_detached_run_itself_does_not_detach_again(self) -> None:
         environment = {**self.detach_environment(0), "UNIT_DETACHED_RUN": "1"}
         result = self.verify(environment)

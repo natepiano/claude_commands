@@ -1,24 +1,35 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.lint.memory_test_support import write_config_fixture
+
 import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import cast, override
 
+from scripts.agents.mesh_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
-CANCEL_LINE = ("verify.sh: cancelled — the tree changed while {cmd} ran, so this result "
-               + "would be stale. Resubmit the {cmd} when your edits are done.")
+def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
+    pattern = re.compile(
+        re.escape(f"verify.sh: cancelled — the tree changed while {command} ran")
+        + r"(?: \((?P<path>[^\n]+)\))?"
+        + re.escape(f", so this result would be stale. Resubmit the {command} when your edits are done."),
+    )
+    return [match for line in output.splitlines() if (match := pattern.fullmatch(line)) is not None]
 
 # Keep a real long-lived descendant: stopping only Cargo must fail cleanup.
 CARGO = r'''
@@ -31,13 +42,13 @@ from pathlib import Path
 
 args = sys.argv[1:]
 root = Path(os.environ["TEST_CONTROL"])
+if "--version" in args:
+    print("cargo fixture 1.0")
+    raise SystemExit(0)
 with (root / "events.jsonl").open("a") as events:
     events.write(json.dumps(args) + "\n")
 if args[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
-    raise SystemExit(0)
-if "--version" in args:
-    print("cargo fixture 1.0")
     raise SystemExit(0)
 stage = ""
 if args[:2] == ["nextest", "run"]:
@@ -50,6 +61,11 @@ elif args[:2] == ["+nightly", "fmt"]:
     stage = "fmt"
 elif args[:1] not in (["nextest"], ["test"]):
     raise SystemExit("unexpected cargo invocation: " + repr(args))
+if stage == "clippy" and os.environ.get("TEST_FAIL_FIRST_JUDGMENT") == "1":
+    judgment = root / "first-judgment"
+    if not judgment.exists():
+        judgment.touch()
+        raise SystemExit(101)
 if stage in os.environ.get("TEST_REWRITE_STAGES", "").split(","):
     marker = root / (stage + ".rewritten")
     if not marker.exists():
@@ -68,7 +84,7 @@ if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "release")
         child.terminate()
-        child.wait(timeout=10)
+        child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     else:
         signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))
         signal.pause()
@@ -87,7 +103,7 @@ child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm
 
 def cancel(signum, _frame):
     child.terminate()
-    child.wait(timeout=10)
+    child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
 
@@ -99,6 +115,7 @@ signal.pause()
 
 
 class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     workspace: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     control: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     board: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -106,6 +123,10 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
+        # This fixture's config reader enables tools but supplies no numeric
+        # policies. An absent fix limit exercises verify's default budget.
+        with (self.root / "lint-config.sh").open("a") as reader:
+            _ = reader.write('_lint_config_raw() { :; }\n')
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         metadata = write_workspace(self.workspace)
@@ -119,24 +140,8 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         (stubs / "git").unlink()
         (stubs / "git").symlink_to(git)
         self.write_tool(stubs / "cargo", CARGO)
-        self.write_shell_tool(stubs / "taplo", "exit 0\n")
+        self.write_shell_tool(stubs / "taplo", 'if [ "$1" = --version ]; then printf "taplo fixture 1.0\\n"; fi\n')
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
-        self.write_tool(stubs / "assertion-guard", """
-class GuardError(Exception):
-    pass
-
-def default_base(repo, explicit_base=""):
-    return "fixture-base"
-
-def git(repo, *arguments):
-    return "fixture-head" if arguments[0] == "rev-parse" else ""
-
-def read_rulings(sources, messages):
-    return {}
-
-if __name__ == "__main__":
-    raise SystemExit(0)
-""")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
         # use already-published routing readiness or the meminfo change event.
         sleep = shutil.which("sleep")
@@ -151,7 +156,6 @@ if __name__ == "__main__":
             "TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(stubs / "assertion-guard"),
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
             "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
@@ -164,6 +168,7 @@ if __name__ == "__main__":
         self.workspace = self.root / "workspace"
         self.control = self.root / "control"
         self.board = self.root / "board"
+        self.admission = caller_admission(self, self.root, self.environment)
 
     def release_lint_rewrites(self, process: subprocess.Popen[str]) -> None:
         # Formatting runs before clippy fix, then runs again without rewriting.
@@ -184,7 +189,36 @@ if __name__ == "__main__":
         path.chmod(0o755)
 
     def start_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(VERIFY), command, "sample"],
+        return self._start_verify(command, False, extra)
+
+    def start_supervised_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
+        return self._start_verify(command, True, extra)
+
+    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str]) -> subprocess.Popen[str]:
+        arguments = ["bash", str(VERIFY), command, "sample"]
+        if supervised:
+            record_path = self.control / "lint-run.json"
+            record: RunRecord = {
+                "run_id": "lint-run", "status": "running", "session_dir": str(self.board),
+                "worker": "test", "staff_id": "fixture", "label": "lint cancellation",
+                "command": arguments,
+                "log": str(self.control / "lint-run.log"), "started_at": time.time(),
+                "pid": 0, "director_dir": str(self.board), "done_message_file": "",
+            }
+            _ = record_path.write_text(json.dumps(record))
+            # Use the real supervisor. Keep result delivery inside this fixture.
+            supervisor = """
+import os
+import sys
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
+      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(())),
+      patch.object(mesh_runs.session_staff, "worker_directory", return_value=os.environ["PACKAGE_ROOT"])):
+    raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
+"""
+            arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]
+        process = subprocess.Popen(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
@@ -198,14 +232,14 @@ if __name__ == "__main__":
             super().wait_for_running(path, process)
         except (AssertionError, TimeoutError):
             if process.poll() is not None:
-                output, errors = process.communicate(timeout=10)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.fail(f"verify exited before {path.name}: {output!r} {errors!r}")
             raise
 
     def finish_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
             self.end_group(process.pid)
-        _ = process.communicate(timeout=30)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def cargo_calls(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in
@@ -217,20 +251,22 @@ if __name__ == "__main__":
 
     def assert_resources_held(self) -> None:
         self.assertTrue((self.board / "locks/cargo.d").is_dir(), "test did not take the cargo token")
-        self.assertTrue(list((self.root / "buildlog/admission").glob("*.reservation")),
+        self.assertTrue(self.admission.server.reservations,
                         "test did not take memory admission")
+        # The token owner starts a separate session. Register it for test cleanup.
+        descendant = int((self.control / "descendant.pid").read_text())
+        self.started_groups.add(os.getpgid(descendant))
 
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [], "cancel kept its queue place")
-        admission = self.root / "buildlog/admission"
-        reservations = [(path.name, path.read_text()) for path in admission.glob("*.reservation")]
+        reservations = list(self.admission.caller_reservations())
         self.assertEqual(reservations, [], "cancel kept memory admission")
-        self.assertEqual(list(admission.glob("*.waiting")), [], "cancel kept a memory queue place")
+        self.assertEqual(self.admission.server.waiters, {}, "cancel kept a memory queue place")
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
-                               capture_output=True, text=True, check=False, timeout=10).stdout.strip()
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 
     def assert_no_cache_verdict(self) -> None:
@@ -238,11 +274,11 @@ if __name__ == "__main__":
             self.assertEqual(list((self.board / "verify_cache").glob(suffix)), [],
                              "cancelled run recorded a cache verdict")
 
-    def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> None:
-        output, errors = process.communicate(timeout=15)
+    def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> re.Match[str]:
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
-        self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd=command)), 1,
-                         output + errors)
+        matches = cancellation_lines(output + errors, command)
+        self.assertEqual(len(matches), 1, output + errors)
         self.assert_no_cache_verdict()
         try:
             self.assert_resources_released()
@@ -252,15 +288,17 @@ if __name__ == "__main__":
         self.assertEqual(len(records), 1, records)
         self.assertEqual((records[0].get("outcome"), records[0].get("status")), ("cancelled", 77), records)
 
+        return matches[0]
+
     def mac_environment(self, *, local_first: bool = False) -> dict[str, str]:
         runner = self.root / "mac-runner.py"
         self.write_tool(runner, MAC_RUNNER)
         self.write_tool(self.root / "stubs/ssh", 'print("free_gib=1000\\nhost=test-mac\\nrc=0")\n')
         settings = self.root / "mac-settings.conf"
-        _ = settings.write_text(f"offload=on\nlinux_only.{self.workspace.name}=\n")
-        targets = self.root / "targets.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.workspace.name}=\n", template="mac_test")
+        targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
                                + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
-        return {"VERIFY_MAC_RUNNER": str(runner), "BUILD_TARGETS_CONFIG": str(targets),
-                "MAC_TEST_CONFIG": str(settings)}
+        return {"VERIFY_MAC_RUNNER": str(runner),
+                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(Path(settings).parent)}

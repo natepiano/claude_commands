@@ -1,12 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Collect model turns and their role histories into an incremental SQLite ledger."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import base64
+from bisect import bisect_right
 import fcntl
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -22,15 +28,11 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import BinaryIO, Literal, cast, override
 
-# Direct execution from any directory uses this checkout's modules.
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.lib import unit_runs
 from scripts.usage.activity import (
-    RequestActivity, RequestEvidence, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
+    RequestActivity, RequestEvidence, Waiting, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
 )
-from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, role_at, state_dir
+from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, state_dir
 from scripts.usage.rollouts import (
     KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
     is_edit, parse_timestamp, token_usage,
@@ -266,6 +268,7 @@ HISTORY_FIELDS: dict[HistoryEventType, tuple[tuple[str, str, Literal["text", "co
 @dataclass(frozen=True)
 class FileCursor:
     offset: int
+    context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -430,8 +433,13 @@ CREATE TABLE IF NOT EXISTS compactions (
     PRIMARY KEY (machine, family, parent_id, agent_id, at)
 );
 CREATE TABLE IF NOT EXISTS cursors (
-    machine TEXT NOT NULL, path TEXT NOT NULL, offset INTEGER NOT NULL,
+    machine TEXT NOT NULL, path TEXT NOT NULL, offset INTEGER NOT NULL, context TEXT,
     PRIMARY KEY (machine, path)
+);
+CREATE TABLE IF NOT EXISTS attribution_inputs (
+    machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL, history TEXT NOT NULL,
+    PRIMARY KEY (machine, family, parent_id, agent_id)
 );
 CREATE TABLE IF NOT EXISTS role_log_sources (
     machine TEXT PRIMARY KEY, problems INTEGER NOT NULL, state TEXT NOT NULL, read_at TEXT NOT NULL
@@ -519,6 +527,11 @@ ADDED_TURN_COLUMNS = (("activity", "TEXT NOT NULL DEFAULT 'unclassified'"), ("wa
 
 def migrate_store(db: sqlite3.Connection) -> None:
     version = check_store_key_version(db)
+    with db:
+        columns = {cast(str, row[1]) for row in cast(Iterable[sqlite3.Row],
+                                                    db.execute("PRAGMA table_info(cursors)"))}
+        if "context" not in columns:
+            _ = db.execute("ALTER TABLE cursors ADD COLUMN context TEXT")
     if version < STORE_VERSION:
         with db:
             if version < REQUEST_ACTIVITY_VERSION:
@@ -571,8 +584,8 @@ class RoleResolver:
     log: RoleLog
     sessions: set[str]
     directors: dict[Agent, tuple[Assignment, ...]] = field(default_factory=dict)
-    exact_logs: dict[str, RoleLog] = field(default_factory=dict)
     worker_ids: set[str] = field(default_factory=set)
+    histories: dict[Agent, tuple[Assignment, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         candidates: dict[str, set[str]] = {}
@@ -586,14 +599,14 @@ class RoleResolver:
                     self.worker_ids.update(matches)
 
     def resolve(self, agent: Agent, at: datetime) -> Attribution:
-        if isinstance(agent, ClaudeSession) and agent.agent_id in self.worker_ids:
-            log = self.log
-        else:
-            if agent.agent_id not in self.exact_logs:
-                self.exact_logs[agent.agent_id] = RoleLog(
-                    {agent.agent_id: self.log.assignments.get(agent.agent_id, ())}, ())
-            log = self.exact_logs[agent.agent_id]
-        assignment = role_at(log, agent.agent_id, at)
+        if agent not in self.histories:
+            history = self.log.assignments.get(agent.agent_id, ())
+            if isinstance(agent, ClaudeSession) and agent.agent_id in self.worker_ids:
+                history += self.log.assignments.get(agent.agent_id[:8], ())
+            self.histories[agent] = tuple(sorted(history, key=lambda entry: entry.at))
+        history = self.histories[agent]
+        index = bisect_right(history, at, key=lambda entry: entry.at)
+        assignment = history[index - 1] if index else None
         # A run event names its director explicitly, independently of cwd.
         evidence = [entry for entry in self.directors.get(agent, ()) if entry.at <= at]
         if evidence:
@@ -666,18 +679,38 @@ def save_measurement(db: sqlite3.Connection, value: Measurement, resolver: RoleR
 
 
 def reattribute(db: sqlite3.Connection, machine: str, resolver: RoleResolver) -> None:
-    rows = db.execute("SELECT machine, family, kind, parent_id, agent_id, turn_key, at, " +
-                      "role, lens, attribution, lens_state FROM turns WHERE machine = ?", (machine,))
-    for row in cast(Iterable[sqlite3.Row], rows):
-        at = parse_timestamp(cast(str, row["at"]))
-        if at is None:
+    agents = db.execute("SELECT DISTINCT family, kind, parent_id, agent_id FROM turns WHERE machine = ?", (machine,))
+    for agent_row in cast(Iterable[sqlite3.Row], agents):
+        family, kind, parent_id, agent_id = cast(tuple[str, str, str, str], tuple(agent_row))
+        agent = (CodexThread(machine, agent_id) if family == "codex" else
+                 ClaudeSubagent(machine, parent_id, agent_id) if kind == "subagent" else
+                 ClaudeSession(machine, agent_id))
+        history = (*resolver.log.assignments.get(agent_id, ()),
+                   *(resolver.log.assignments.get(agent_id[:8], ())
+                     if isinstance(agent, ClaudeSession) and agent_id in resolver.worker_ids else ()),
+                   *resolver.directors.get(agent, ()))
+        signature = hashlib.sha256(repr(history).encode()).hexdigest()
+        key = (machine, family, parent_id, agent_id)
+        saved = cast(sqlite3.Row | None, db.execute(
+            "SELECT history FROM attribution_inputs WHERE machine = ? AND family = ? " +
+            "AND parent_id = ? AND agent_id = ?", key).fetchone())
+        if saved is not None and saved[0] == signature:
             continue
-        columns = attribution_columns(resolver.resolve(stored_identity(row), at))
-        if columns != (row["role"], row["lens"], row["attribution"], row["lens_state"]):
-            _ = db.execute("UPDATE turns SET role = ?, lens = ?, attribution = ?, lens_state = ? " +
-                           "WHERE machine = ? AND family = ? AND parent_id = ? AND agent_id = ? AND turn_key = ?",
-                           (*columns, row["machine"], row["family"], row["parent_id"],
-                            row["agent_id"], row["turn_key"]))
+        rows = db.execute("SELECT machine, family, kind, parent_id, agent_id, turn_key, at, " +
+                          "role, lens, attribution, lens_state FROM turns " +
+                          "WHERE machine = ? AND family = ? AND parent_id = ? AND agent_id = ?", key)
+        for row in cast(Iterable[sqlite3.Row], rows):
+            at = parse_timestamp(cast(str, row["at"]))
+            if at is None:
+                continue
+            columns = attribution_columns(resolver.resolve(agent, at))
+            if columns != (row["role"], row["lens"], row["attribution"], row["lens_state"]):
+                _ = db.execute("UPDATE turns SET role = ?, lens = ?, attribution = ?, lens_state = ? " +
+                               "WHERE machine = ? AND family = ? AND parent_id = ? AND agent_id = ? AND turn_key = ?",
+                               (*columns, *key, row["turn_key"]))
+        _ = db.execute("INSERT INTO attribution_inputs VALUES (?, ?, ?, ?, ?) " +
+                       "ON CONFLICT(machine, family, parent_id, agent_id) DO UPDATE SET history = excluded.history",
+                       (*key, signature))
 
 
 def cursor_at(db: sqlite3.Connection, machine: str, path: str) -> int:
@@ -701,14 +734,35 @@ def claude_identity(machine: str, path: Path) -> ClaudeSession | ClaudeSubagent:
     return ClaudeSession(machine, path.stem)
 
 
+def evidence_fields(evidence: RequestEvidence) -> dict[str, object]:
+    return {"worked": evidence.worked, "wait": wait_action(evidence.first_wait) if evidence.first_wait else None,
+            "status": evidence.posted_status}
+
+
+def saved_evidence(value: object) -> RequestEvidence:
+    fields = object_fields(value)
+    action = fields.get("wait")
+    return RequestEvidence(bool(fields.get("worked")),
+                           Waiting(action) if isinstance(action, str) and action else None,
+                           bool(fields.get("status")))
+
+
 def read_file(machine: str, path: Path, family: Family,
-              previous: int) -> Iterator[ThreadMeasurement | FileCursor]:
-    """Replay context locally or on the Mac, yielding only new measurements."""
-    size = path.stat().st_size
-    if previous == size:
-        return
-    if previous > size:
+              previous: int, saved: str | None = None) -> Iterator[ThreadMeasurement | FileCursor]:
+    """Read new complete lines with the context stored at the last committed offset."""
+    stat = path.stat()
+    held = json_fields(saved) if saved else {}
+    identity = [stat.st_dev, stat.st_ino]
+    resumed = (held.get("parser") is True and held.get("identity") == identity and stat.st_size >= previous
+               and stat.st_size >= cast(int, held.get("size", 0)))
+    if resumed and held.get("size") == stat.st_size:
+        if held.get("mtime") == stat.st_mtime_ns and held.get("ctime") == stat.st_ctime_ns:
+            return
+        resumed = False
+    if saved and not resumed or previous > stat.st_size:
         previous = 0
+    if not saved and previous == stat.st_size:
+        return
     context = CodexContext(machine, path.name)
     agent = claude_identity(machine, path)
     edit_seen = False
@@ -718,9 +772,25 @@ def read_file(machine: str, path: Path, family: Family,
     opening_seen = False
     folder_seen = False
     completed = 0
+    if resumed:
+        context.agent = (CodexThread(machine, cast(str, held["agent"]))
+                         if held.get("agent") else ThreadNotIdentified())
+        context.model = reported_model(held.get("model"))
+        context.effort = reported_effort(held.get("effort"))
+        context.edit_seen = bool(held.get("codex_edit"))
+        opening = parse_timestamp(held.get("opening"))
+        if opening is not None:
+            context.lifecycle.opening = KnownThreadOpening(opening)
+        edit_seen = bool(held.get("edit"))
+        opening_seen = bool(held.get("opening_seen"))
+        folder_seen = bool(held.get("folder_seen"))
+        message_key = cast(str, held.get("message_key", ""))
+        evidence = saved_evidence(held.get("evidence"))
+        context.evidence = saved_evidence(held.get("codex_evidence"))
+        completed = previous
     with path.open("rb") as source:
-        # Changed files replay their prefix to recover context and the first edit.
-        # Unchanged files never enter this loop; cursors store only durable offsets.
+        if resumed:
+            _ = source.seek(previous)
         for offset, line in complete_lines(source):
             values: list[ThreadMeasurement] = []
             try:
@@ -756,20 +826,34 @@ def read_file(machine: str, path: Path, family: Family,
             if offset >= previous:
                 yield from values
             completed = offset + len(line)
-    yield FileCursor(completed)
+    held = {"parser": True, "identity": identity, "size": stat.st_size, "mtime": stat.st_mtime_ns, "ctime": stat.st_ctime_ns,
+            "agent": context.agent.agent_id if isinstance(context.agent, CodexThread) else None,
+            "model": context.model.value if isinstance(context.model, ReportedModel) else None,
+            "effort": context.effort.value if isinstance(context.effort, ReportedEffort) else None,
+            "codex_edit": context.edit_seen,
+            "opening": (context.lifecycle.opening.at.isoformat()
+                        if isinstance(context.lifecycle.opening, KnownThreadOpening) else None),
+            "edit": edit_seen, "opening_seen": opening_seen, "folder_seen": folder_seen,
+            "message_key": message_key, "evidence": evidence_fields(evidence),
+            "codex_evidence": evidence_fields(context.evidence)}
+    yield FileCursor(completed, json.dumps(held, separators=(",", ":")))
 
 
 def save_cursor(db: sqlite3.Connection, machine: str, path: str, cursor: FileCursor) -> None:
-    _ = db.execute("INSERT INTO cursors VALUES (?, ?, ?) " +
-                   "ON CONFLICT(machine, path) DO UPDATE SET offset = excluded.offset",
-                   (machine, path, cursor.offset))
+    _ = db.execute("INSERT INTO cursors (machine, path, offset, context) VALUES (?, ?, ?, ?) " +
+                   "ON CONFLICT(machine, path) DO UPDATE SET offset = excluded.offset, context = excluded.context",
+                   (machine, path, cursor.offset, cursor.context))
 
 
 def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Path,
                  family: Family, resolver: RoleResolver) -> int:
     added = 0
     with db:
-        for value in read_file(machine, local_path, family, cursor_at(db, machine, path)):
+        saved = cast(sqlite3.Row | None, db.execute(
+            "SELECT offset, context FROM cursors WHERE machine = ? AND path = ?", (machine, path)).fetchone())
+        previous = cast(int, saved[0]) if saved is not None else 0
+        context = cast(str | None, saved[1]) if saved is not None else None
+        for value in read_file(machine, local_path, family, previous, context):
             if isinstance(value, FileCursor):
                 save_cursor(db, machine, path, value)
             else:
@@ -1568,7 +1652,7 @@ def watch_waste(args: CommandLine) -> None:
     `waste_watch: <reason>` stderr line in place of the watch's own stderr.
     """
     script = os.environ.get("USAGE_WASTE_WATCH_SCRIPT") or str(Path(__file__).with_name("waste_watch.py"))
-    command = [sys.executable, script, "--db", str(args.db), "--production-docs", str(args.production_docs)]
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), script, "--db", str(args.db), "--production-docs", str(args.production_docs)]
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 timeout=WASTE_WATCH_TIMEOUT_SECONDS, check=False)

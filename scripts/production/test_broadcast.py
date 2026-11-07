@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import io
 import json
 import os
-import sys
 import shlex
 import tempfile
 import unittest
@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import broadcast
-import codex_daemon
-import process_table
-import roster
+from scripts.production import broadcast
+from scripts.message import codex_daemon
+from scripts.message import process_table
+from scripts.message import roster
+from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
@@ -30,18 +31,19 @@ NO_CODEX_THREAD = roster.NoCodexThread()
 # Every send must start before any can finish, proving deliveries run together.
 SEND_STUB = """import hashlib, json, os, sys, time, uuid
 from pathlib import Path
+TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
 root = Path(os.environ["LOG"])
 args = sys.argv[1:]
 to = args[args.index("--to") + 1]
 (root / ("started-" + hashlib.sha256(to.encode()).hexdigest())).touch()
-deadline = time.monotonic() + 3
+deadline = time.monotonic() + TEST_HANG_GUARD_SECS
 while len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]) and time.monotonic() < deadline:
     time.sleep(0.01)
 (root / ("send-" + uuid.uuid4().hex + ".json")).write_text(json.dumps(args))
 if to == os.environ.get("REFUSED") or len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]):
     print("QUEUED: relay timed out after 40 s")
     raise SystemExit(1)
-"""
+""".replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
 
 def entry(
@@ -80,7 +82,7 @@ class BroadcastTests(unittest.TestCase):
         (self.root / "peer-log").mkdir()
         peer_driver = binaries / "ssh"
         _ = peer_driver.write_text(
-            f"#!{sys.executable}\n"
+            f"#!{Path(__file__).resolve().parents[1] / 'lib/py'}\n"
             + "import json, os, shlex, sys\n"
             + "from pathlib import Path\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -92,8 +94,7 @@ class BroadcastTests(unittest.TestCase):
             + "    if item.startswith(('BROADCAST_SEND=', 'BROADCAST_CLOSING_MACHINES=')): key, value = item.split('=', 1); os.environ[key] = value\n"
             + "os.environ.pop('CODEX_THREAD_ID', None); os.environ.pop('CLAUDE_CODE_SESSION_ID', None)\n"
             + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-            + "import broadcast, roster\n"
+            + "from scripts.production import broadcast\nfrom scripts.message import roster\n"
             + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
             + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
@@ -123,11 +124,11 @@ class BroadcastTests(unittest.TestCase):
                   showrunner=roster.RunsProduction("other")),
             entry("trunk", "session:id-trunk", role="unit director",
                   showrunner=roster.UnderShowrunner("show", "hana", "session:id-hana"),
-                  director=roster.DirectsUnit("trunk-unit")),
+                  director=roster.DirectsUnit("trunk")),
             entry("ups", "session:id-ups"),
             entry("fps-impl", "worker:run-a/fps-impl", role="worker", kind="codex",
                   showrunner=roster.UnderShowrunner("show", "hana", "session:id-hana"),
-                  director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk"),
+                  director=roster.UnderDirector("trunk", "trunk", "session:id-trunk"),
                   thread=roster.CodexThread("thread-worker")),
             entry("Codex window", "codex:thread-window", kind="codex",
                   thread=roster.CodexThread("thread-window")),
@@ -159,6 +160,8 @@ class BroadcastTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, self.peer_problems)).encode()
         with (patch.dict(os.environ, environment),
+              patch.object(staff, "runtime_id", return_value=environment.get(
+                  "CLAUDE_CODE_SESSION_ID", self.environment["CLAUDE_CODE_SESSION_ID"])),
               patch.object(roster, "roster", side_effect=self.fixture_roster) as read_roster,
               patch.object(roster, "sender_identity", wraps=roster.sender_identity) as read_identity,
               redirect_stdout(output), redirect_stderr(errors)):
@@ -238,7 +241,7 @@ class BroadcastTests(unittest.TestCase):
                     showrunner=roster.UnderShowrunner("show", "runner", "session:runner")),
             replace(base, name="showrunner", role="worker", assignment=roster.WorkerAssignment(
                 "review", "/run", "review", "code6"),
-                    director=roster.UnderDirector("roles-unit", "director", "session:director")),
+                    director=roster.UnderDirector("roles", "director", "session:director")),
             replace(base, name="unit-director", role="freestanding"),
             replace(base, name="held-designer", kind="codex", role="astra-designer",
                     assignment=roster.HeldDesignRole("designer", "/held")),
@@ -248,7 +251,7 @@ class BroadcastTests(unittest.TestCase):
         for group, expected in ((broadcast.Showrunners(), {"misleading-impl"}),
                                 (broadcast.UnitDirectors(), {"code6"}),
                                 (broadcast.Workers(), {"showrunner"}),
-                                (broadcast.WorkersOfUnit("session:director", "roles-unit", "fixture"), {"showrunner"}),
+                                (broadcast.WorkersOfUnit("session:director", "roles", "fixture"), {"showrunner"}),
                                 (broadcast.Agents(), {"showrunner", "unit-director"}),
                                 (broadcast.TopLevel(), {"misleading-impl", "unit-director"}),
                                 (broadcast.AllRoles(), {row.name for row in rows})):
@@ -301,10 +304,10 @@ class BroadcastTests(unittest.TestCase):
 
     def test_a_unit_with_no_workers_says_none_for_its_scoped_group(self) -> None:
         self.rows = [row for row in self.rows if row.role != "worker"]
-        result, output, errors = self.run_main("--of", "trunk-unit", "--workers", "finish")
+        result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-2], ["workers of trunk-unit - none on this machine"])
+        self.assertEqual(output.splitlines()[:-2], ["workers of trunk - none on this machine"])
         self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_empty_groups_are_named_once_in_command_line_order(self) -> None:
@@ -413,7 +416,7 @@ class BroadcastTests(unittest.TestCase):
     def test_all_workers_include_claude_codex_and_orphans_but_no_directors(self) -> None:
         self.rows.extend([
             entry("claude-worker", "session:worker", role="worker",
-                  director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk")),
+                  director=roster.UnderDirector("trunk", "trunk", "session:id-trunk")),
             entry("orphan", "worker:orphan/impl", role="worker", kind="codex"),
         ])
         result, output, errors = self.run_main("--workers", "finish")
@@ -456,12 +459,12 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
         self.assertTrue(self.sent_texts()["worker:run-a/fps-impl"].startswith("finish\n\n"))
-        self.assertIn("workers of trunk-unit", self.sent_texts()["worker:run-a/fps-impl"])
+        self.assertIn("workers of trunk", self.sent_texts()["worker:run-a/fps-impl"])
 
     def test_socketless_directors_workers_are_selected_by_name_and_unit(self) -> None:
         self.rows = [replace(row, reach=roster.CannotReceiveMessages("no messaging socket"))
                      if row.role == "unit director" else row for row in self.rows]
-        for target in ("trunk", "trunk-unit"):
+        for target in ("trunk", "session:id-trunk"):
             with self.subTest(target=target):
                 result, output, errors = self.run_main("--of", target, "--workers", target)
                 self.assertEqual((result, errors), (0, ""), output)
@@ -487,10 +490,10 @@ class BroadcastTests(unittest.TestCase):
     def test_of_matching_two_directors_is_a_usage_error_with_both_addresses(self) -> None:
         self.rows.extend([
             entry("trunk", "session:second-trunk", role="unit director",
-                  director=roster.DirectsUnit("trunk-unit"),
+                  director=roster.DirectsUnit("trunk"),
                   showrunner=roster.UnderShowrunner("other", "natedev", "session:id-natedev")),
         ])
-        for target in ("trunk", "trunk-unit"):
+        for target in ("trunk", "trunk"):
             with self.subTest(target=target):
                 result, _output, errors = self.run_main("--of", target, "--workers", "finish")
                 self.assertEqual(result, 2)
@@ -499,15 +502,15 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(self.sends(), [])
 
     def test_unknown_unit_names_the_known_units(self) -> None:
-        result, _output, errors = self.run_main("--of", "unknown-unit", "--workers", "finish")
+        result, _output, errors = self.run_main("--of", "unknown", "--workers", "finish")
         self.assertEqual(result, 2)
-        self.assertIn("unknown-unit", errors)
-        self.assertIn("trunk-unit", errors)
+        self.assertIn("unknown", errors)
+        self.assertIn("trunk", errors)
         self.assertEqual(self.sends(), [])
 
     def test_unmessageable_reviewers_report_both_director_states_without_failure(self) -> None:
         for name, relationship in (
-            ("reviewer", roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk")),
+            ("reviewer", roster.UnderDirector("trunk", "trunk", "session:id-trunk")),
             ("orphan reviewer", roster.NoDirector()),
         ):
             self.rows.append(replace(
@@ -524,7 +527,7 @@ class BroadcastTests(unittest.TestCase):
     def test_between_turns_worker_is_reported_without_a_send_or_failure(self) -> None:
         self.rows.append(replace(
             entry("waiting", "", role="worker", kind="codex",
-                  director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk")),
+                  director=roster.UnderDirector("trunk", "trunk", "session:id-trunk")),
             reach=roster.CannotReceiveMessages("between turns; its unit director resumes it"),
         ))
         result, output, errors = self.run_main("--workers", "finish")
@@ -535,7 +538,7 @@ class BroadcastTests(unittest.TestCase):
 
     def test_top_level_includes_independent_directors_but_excludes_workers_and_codex(self) -> None:
         self.rows.extend([
-            entry("solo", "session:solo", role="unit director", director=roster.DirectsUnit("solo-unit")),
+            entry("solo", "session:solo", role="unit director", director=roster.DirectsUnit("solo")),
             entry("unhosted", "session:unhosted", role="unit director", director=roster.DirectsUnit("unhosted"),
                   showrunner=roster.ProductionWithoutRunningShowrunner("gone")),
             entry("claude worker", "session:worker", role="worker"),
@@ -697,10 +700,10 @@ class BroadcastTests(unittest.TestCase):
 
     def test_of_a_peer_director_uses_its_resolved_identity_and_only_its_machine(self) -> None:
         director = replace(entry("peer director", "session:peer-director", role="unit director",
-                                 director=roster.DirectsUnit("peer-unit")), machine="mac",
+                                 director=roster.DirectsUnit("peer")), machine="mac",
                            reach=roster.CannotReceiveMessages("no messaging socket"))
         worker = replace(entry("impl", "worker:peer/impl", kind="codex", role="worker",
-                               director=roster.UnderDirector("peer-unit", "peer director", "session:peer-director")), machine="mac")
+                               director=roster.UnderDirector("peer", "peer director", "session:peer-director")), machine="mac")
         self.peer_rows = [director, worker]
         result, output, errors = self.run_main("--of", "peer director", "--workers", "finish", here=False)
         self.assertEqual((result, errors), (0, ""), output)
@@ -712,7 +715,7 @@ class BroadcastTests(unittest.TestCase):
 
     def test_of_a_name_shared_across_machines_refuses_before_any_delivery(self) -> None:
         self.peer_rows = [replace(entry("trunk", "session:peer-trunk", role="unit director",
-                                       director=roster.DirectsUnit("peer-unit")), machine="mac")]
+                                       director=roster.DirectsUnit("peer")), machine="mac")]
         result, output, errors = self.run_main("--all", "all", "--of", "trunk", "--workers", "finish", here=False)
         self.assertEqual(result, 2, output + errors)
         self.assertIn("session:id-trunk", errors)

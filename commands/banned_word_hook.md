@@ -1,5 +1,5 @@
 ---
-description: Turn banned-word hook enforcement on or off
+description: Set forbidden word hook enforcement.
 ---
 
 # banned_word_hook

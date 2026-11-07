@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.production import session_staff  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 
@@ -45,14 +49,9 @@ PHASE_REFERENCE_PATTERN = re.compile(
     + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
 )
 UNIT_PHASE_PREFIX = re.compile(
-    r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
+    r"(?:^|[;,&][ \t]*|\b(?i:and)[ \t]+)(?P<quote>`|'|\"|\*\*)?(?P<unit>(?!(?i:and)(?![\w-]))[\w-]+)"
     + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
 )
-PLAN_UNIT_HEADER = re.compile(
-    r"^>[ \t]+\*\*Production:(?:\*\*)?[ \t]+[^\n]*?—[ \t]+unit[ \t]+`(?P<unit>[^`\n]+)`",
-    re.MULTILINE,
-)
-BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 
 class PlanPhase(TypedDict):
@@ -63,8 +62,6 @@ class PlanPhase(TypedDict):
     done: bool
     # The phases its `**Depends on:**` line names; None when the line is absent.
     depends_on: list[str] | None
-    # The gate its `**Blocked by:**` line names; empty when none.
-    blocked_by: str
 
 
 class EtaBand(NamedTuple):
@@ -95,9 +92,19 @@ def resolve_plan_path(working_dir: Path, value: str) -> Path:
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
 
 
-def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> session_staff.MemberFound | session_staff.NoSuchMember:
+    """Resolve the plan folder through the current staff worktree."""
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    return resolver.member_by_folder(remote.local_machine(), plan_path.expanduser().resolve().parent)
+
+
+def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[list[PlanPhase], list[str]]:
     text = plan_path.read_text(encoding="utf-8")
-    unit_header = PLAN_UNIT_HEADER.search(text)
+    try:
+        member = plan_member(plan_path, resolver=resolver)
+    except (OSError, ValueError) as error:
+        print(f"plan_history: {plan_path}: {error}", file=sys.stderr)
+        member = session_staff.NoSuchMember(session_staff.FolderMember(remote.local_machine(), plan_path.parent))
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -134,29 +141,27 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
                 # A unit name qualifies only the phase span that follows it.
                 qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
                 if qualifier is not None and (
-                    unit_header is None or qualifier.group("unit") != unit_header.group("unit")
+                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit") != member.row.name
                 ):
                     continue
                 phase_ids = reference.group("single") or reference.group("list")
                 for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
                     if dependency.lower() != "and" and dependency not in depends_on:
                         depends_on.append(dependency)
-        blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
                 depends_on=depends_on,
-                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
             )
         )
     return phases, duplicates
 
 
-def plan_phases(plan_path: Path) -> list[PlanPhase]:
+def plan_phases(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> list[PlanPhase]:
     """Return the plan's unique phase headings in document order."""
-    phases, _ = plan_phase_details(plan_path)
+    phases, _ = plan_phase_details(plan_path, resolver=resolver)
     return phases
 
 
@@ -178,18 +183,53 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
-def plan_runs(plan_path: Path) -> list[Path]:
+def _text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
+    """Resolve the director's current folder without changing its stored record."""
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+        return fields
+    row = unit_runs.run_owner(fields, record)
+    if isinstance(row, unit_runs.RunOwnerUnrecorded):
+        return fields
+    previous = _text(fields.get("working_dir"))
+    for key in ("plan_doc", "project_plan_doc"):
+        value = _text(fields.get(key))
+        if previous and value.startswith(previous + "/"):
+            fields[key] = str(Path(value).relative_to(previous))
+    for key in ("working_dir", "worktree"):
+        if key in fields:
+            del fields[key]
+    if not isinstance(row.worktree, staff.WorktreeUnfilled):
+        fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
+        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
+            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
+                                    capture_output=True, text=True, check=False)
+            fields["branch"] = branch.stdout.strip()
+            if branch.returncode == 0 and not fields["branch"]:
+                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
+                                        capture_output=True, text=True, check=False)
+                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
+    return fields
+
+
+def plan_runs(plan_path: Path, *,
+              record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
     target = plan_path.expanduser().resolve()
     try:
         paths = list((history_root() / "runs").glob("*.jsonl"))
     except OSError:
         return []
+    starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
+    if record is None:
+        record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+                  else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
-    for path in paths:
-        event = run_started_event(path)
-        if event is None:
-            continue
+    for path, event in starts:
+        event = staff_directory(event, record)
         working_dir = event.get("working_dir")
         plan_doc = event.get("plan_doc")
         if not isinstance(working_dir, str) or not isinstance(plan_doc, str):

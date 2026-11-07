@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Specification tests for the feature-log note writer and reader."""
 
 from __future__ import annotations
@@ -20,12 +20,10 @@ from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
-import feature_log
-from feature_log import locked, state_dir, vault_dir
+from scripts.feature_log import feature_log
+from scripts.feature_log.feature_log import locked, state_dir, vault_dir
+from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 TODAY = "2026-10-10"
 EVENT_TIME = "2026-10-10T12:34:56-07:00"
@@ -608,13 +606,15 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_project_of_never_forwards_and_maps_supported_origin_forms(self) -> None:
         cases = (
-            ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner"),
-            ("https://github.com/natepiano/bevy_brp\n", "bevy_brp"),
-            ("git@github.com:natepiano/claude_commands\n", "claude"),
-            ("https://github.com/someone/unknown.git\n", "none"),
+            ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner", False),
+            ("https://github.com/natepiano/bevy_brp\n", "bevy_brp", False),
+            ("git@github.com:natepiano/claude_commands\n", "claude", True),
+            ("https://github.com/natepiano/hana.git\n", "hana", True),
+            ("https://github.com/natepiano/nixos.git\n", "natedev", False),
+            ("https://github.com/someone/unknown.git\n", "none", False),
         )
         checkout = self.root / "checkout"
-        for origin, expected in cases:
+        for origin, expected, closes_by_change_review in cases:
             with self.subTest(origin):
                 ssh_runner = RecordingSshRunner(returncode=99)
                 git_runner = RecordingGitRunner(origin)
@@ -636,6 +636,8 @@ class FeatureLogTests(unittest.TestCase):
                             ["project-of", str(checkout)], ssh_runner
                         )
                 self.assertEqual(result, CliResult(0, f"{expected}\n", ""))
+                project = feature_log.PROJECTS.get(result.stdout.strip())
+                self.assertEqual(project.closes_by_change_review if project else False, closes_by_change_review)
                 self.assertEqual(ssh_runner.commands, [])
                 self.assertEqual(
                     git_runner.commands,
@@ -2913,6 +2915,63 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("landed", refused.stderr)
         self.assertEqual(proposal_path.read_bytes(), proposal_before)
 
+    def test_optional_review_operations_skip_only_absent_proposals_under_the_writer_lock(self) -> None:
+        exists = Path.exists
+        checked: list[Path] = []
+
+        def proposal_exists_under_lock(path: Path) -> bool:
+            if path == self.state / "proposals/natedev/C908.json":
+                checked.append(path)
+                with (self.state / "lock").open("a+", encoding="utf-8") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return exists(path)
+
+        for verb in ("add", "supersede", "drop"):
+            arguments = [verb, "--review", "natedev/C908"]
+            if verb == "drop":
+                arguments.extend(("--verdict", "not works"))
+            with self.subTest(verb=verb):
+                self.assert_rejected(arguments, "no proposal for natedev/C908")
+                checked.clear()
+                with patch.object(Path, "exists", new=proposal_exists_under_lock):
+                    self.assertEqual(self.cli([*arguments, "--if-proposed"]),
+                                     CliResult(0, "skipped: no proposal for natedev/C908\n", ""))
+                self.assertEqual(checked, [self.state / "proposals/natedev/C908.json"])
+                self.assert_rejected([*arguments, "--if-proposed", "--review", "../C908"], "review row")
+        self.assertFalse((self.state / "proposals").exists())
+
+    def test_optional_review_operations_preserve_proposal_errors_and_apply_existing_proposals(self) -> None:
+        arguments = self.proposal_arguments("C908", self.add_arguments(title="Optional result"))
+        self.assertEqual(self.cli(arguments).status, 0)
+        self.assert_rejected(["supersede", "--review", "C908", "--if-proposed"], "uses add")
+        self.assertEqual(self.cli(["add", "--review", "C908", "--if-proposed"]).status, 0)
+        self.assertTrue(self.note("hana", "optional result").exists())
+        self.assert_rejected(["drop", "--review", "C908", "--verdict", "not works", "--if-proposed"], "landed")
+        path = self.state / "proposals/C909.json"
+        _ = path.write_text("{", encoding="utf-8")
+        for verb in ("add", "supersede", "drop"):
+            arguments = [verb, "--review", "C909", "--if-proposed"]
+            if verb == "drop":
+                arguments.extend(("--verdict", "not works"))
+            with self.subTest(verb=verb):
+                self.assert_rejected(arguments, "cannot read proposal")
+
+    def test_optional_review_flag_reaches_the_writer_host_and_keeps_ssh_failures(self) -> None:
+        for verb in ("add", "supersede", "drop"):
+            arguments = [verb, "--review", "natedev/C908", "--if-proposed"]
+            if verb == "drop":
+                arguments.extend(("--verdict", "not works"))
+            runner = RecordingSshRunner(stderr="ssh failed\n", returncode=7)
+            with self.subTest(verb=verb), patch.dict(os.environ, {}, clear=False):
+                _ = os.environ.pop("FEATURE_LOG_VAULT")
+                with patch.object(socket, "gethostname", return_value="macbook.local"):
+                    result = self.cli_with_runner(arguments, runner)
+                remote = ("~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
+                          + shlex.join(arguments))
+                self.assertEqual(runner.commands, [["ssh", "natedev", remote]])
+                self.assertEqual(result, CliResult(7, "", "ssh failed\n"))
+
     def test_review_requires_a_proposal_and_the_matching_verb(self) -> None:
         missing = self.cli(["add", "--review", "A999"])
         self.assertEqual(
@@ -3216,10 +3275,10 @@ class FeatureLogTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True, pass_fds=(attempted_write,),
             )
-            self.addCleanup(process.communicate, timeout=TEST_HANG_GUARD_SECS)
+            self.addCleanup(process.communicate, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.addCleanup(process.kill)
             try:
-                ready, _, _ = select.select([attempted_read], [], [], TEST_HANG_GUARD_SECS)
+                ready, _, _ = select.select([attempted_read], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(ready, [attempted_read], "digest never attempted its held cursor lock")
                 self.assertEqual(os.read(attempted_read, 1), b"B")
                 self.assertIsNone(process.poll())
@@ -3227,10 +3286,10 @@ class FeatureLogTests(unittest.TestCase):
                 fcntl.flock(held_lock.fileno(), fcntl.LOCK_UN)
 
         try:
-            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            stdout, stderr = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             process.kill()
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             raise
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("+ locked digest result", stdout)

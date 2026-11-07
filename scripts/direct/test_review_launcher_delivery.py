@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
-from scripts.direct.test_review_launcher_pool import own_review_with_legacy_flags
-from typing import override
-from pathlib import Path
 from scripts.direct.review_launcher_test_support import ProgressState as ProgressState
 from typing import cast
 import json
@@ -22,11 +20,6 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
-    @override
-    def pool_command(self, session_dir: Path, *, lens: str = "contract", phase: str = "3",
-                     early: str = "", reviewer_type: str = "code", pass_index: int = 1) -> list[str]:
-        return own_review_with_legacy_flags(self, session_dir, lens=lens, phase=phase, early=early,
-                                           reviewer_type=reviewer_type, pass_index=pass_index)
 
     def test_ux_launch_checks_identity_before_the_worker_and_records_valid_checks(self) -> None:
         stale = self.start_implementation("ux-stale-identity")
@@ -104,7 +97,6 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
     def test_early_delivery_probes_default_to_five_seconds_without_test_overrides(self) -> None:
         session = self.start_implementation("default-early-poll")
-        worker = self.open_worker(session)
         self.finish_implementation(session)
         ready, finish = session / "ready", session / "finish"
         binaries = session / "bin"
@@ -131,7 +123,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         arguments = session / "poll-arguments"
         heartbeat_arguments = session / "heartbeat-arguments"
         environment = self.environment()
-        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+        for key in ("UNIT_WORKER_POLL_SECS",
                     "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
@@ -141,7 +133,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                             "TEST_PYTHON": sys.executable,
                             "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
         command = ["bash", "-c", 'export TEST_REVIEW_LAUNCHER_PID=$$; exec "$@"', "review-under-test",
-                   *self.review_command(session, "adversary", str(ready), worker)]
+                   *self.review_command(session, "adversary", str(ready))]
         process = subprocess.Popen(command,
                                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
@@ -155,6 +147,37 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         finally:
             output, errors = self.finish_early_launcher(process, ready, finish)
         self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_canceling_a_fresh_claude_launcher_group_stops_its_child(self) -> None:
+        session = self.start_implementation("fresh-claude-cancellation")
+        self.finish_implementation(session)
+        child_ready = session / "claude-child-pid"
+        environment = self.environment()
+        environment.update({"TEST_PYTHON": sys.executable, "TEST_CLAUDE_CHILD_PID": str(child_ready)})
+        with (self.root / "scripts/agents/agent_exec.sh").open("a") as agent:
+            _ = agent.write(
+                'exec "$TEST_PYTHON" -c \'import os, signal; from pathlib import Path; '
+                + 'Path(os.environ["TEST_CLAUDE_CHILD_PID"]).write_text(str(os.getpid())); signal.pause()\'\n'
+            )
+        with (session / "cancellation-output").open("w") as output:
+            process = subprocess.Popen(self.review_command(session, "", ""), env=environment,
+                                       stdout=output, stderr=output, text=True, start_new_session=True)
+            try:
+                descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
+                try:
+                    send_process_group(process.pid, signal.SIGTERM)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], [descriptor])
+                finally:
+                    if not select.select([descriptor], [], [], 0)[0]:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    os.close(descriptor)
+            finally:
+                try:
+                    send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
         child_ready = self.root / "blocked-review-child"
@@ -181,7 +204,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 os.close(descriptor)
         finally:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.communicate()
@@ -219,7 +242,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         _ = ready.write_text("", encoding="utf-8")
 
         result = self.run_review(session_dir, ready)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr + (session_dir / "review_agent_1.log").read_text())
 
         kinds = [
             (event["event_type"], event.get("pass_kind"))
@@ -235,15 +258,14 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             ],
         )
 
-    def test_an_early_assigned_review_baselines_after_the_writers_final_edit(self) -> None:
+    def test_an_early_claude_review_baselines_after_the_writers_final_edit(self) -> None:
         session_dir = self.start_implementation("early-writer-edit")
-        worker = self.open_worker(session_dir)
         ready = session_dir / "final_diff_1.ready"
         finish_review = session_dir / "finish_review"
         environment = self.environment()
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish_review)
         process = subprocess.Popen(
-            self.review_command(session_dir, "adversary", str(ready), worker),
+            self.review_command(session_dir, "adversary", str(ready)),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -272,68 +294,23 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
-        calls = [cast(list[str], json.loads(line)) for line in
-                 (self.root / "mesh_runs_calls.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(calls), 1)
-        call = calls[0]
-        self.assertEqual(call[:5], ["start", "--session-dir", str(session_dir), "--to", worker])
-        self.assertEqual(call[call.index("--label") + 1], "final diff ready")
-        stage_two = Path(call[call.index("--done-message-file") + 1]).read_text(encoding="utf-8")
-        self.assertIn(f"Stage 2: the final diff is at {session_dir / 'final_diff_1.diff'}", stage_two)
-        self.assertIn(str(ready), call)
-
-    def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
-        session_dir = self.start_implementation("assigned-early")
-        worker = self.open_worker(session_dir)
-        ready = session_dir / "final_diff_1.ready"
-
-        result = subprocess.run(
-            self.review_command(session_dir, "adversary", str(ready), worker),
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-
+    def test_plain_early_verdict_without_delivery_keeps_findings_without_a_turn_record_or_pass(self) -> None:
+        session = self.start_implementation("void-unit-review")
+        ready = session / "ready"
+        environment = self.environment()
+        command = self.review_command(session, "contract", str(ready))
+        environment["STUB_FINDINGS"] = "1. A void finding\n"
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
-            "reviewed\n",
-        )
-        recorded = self.pass_events("assigned-early")
-        self.assertEqual(
-            [(event["event_type"], event.get("pass_kind")) for event in recorded],
-            [("pass_started", "impl")],
-        )
-        heartbeat = (session_dir / "heartbeat.log").read_text(encoding="utf-8")
-        self.assertIn("finished before delivery", heartbeat)
+        self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
+        self.assertEqual(self.turn_records(session), [])
+        self.assertEqual((session / "review_findings_1_contract.txt").read_text(), environment["STUB_FINDINGS"])
+        self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
 
-    def test_early_verdict_without_delivery_records_void_and_findings_without_a_pass(self) -> None:
-        for arm in ("pool", "own"):
-            with self.subTest(arm=arm):
-                session = self.start_implementation(f"void-{arm}")
-                ready = session / "ready"
-                if arm == "pool":
-                    environment = self.pool_fixture()
-                    command = self.pool_command(session, early=str(ready))
-                else:
-                    environment = self.environment()
-                    command = self.review_command(session, "contract", str(ready), self.open_worker(session))
-                environment["STUB_FINDINGS"] = "1. A void finding\n"
-                result = subprocess.run(command, env=environment, capture_output=True,
-                                        text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
-                record, = self.turn_records(session)
-                self.assertEqual(record["status"], "void")
-                self.assertEqual(record["raised"], 1)
-                self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
-
-    def test_own_term_records_canceled_instead_of_successful_exit_trap(self) -> None:
+    def test_plain_review_term_keeps_the_signal_exit_code_without_a_turn_record(self) -> None:
         session = self.start_implementation("own-signal")
         self.finish_implementation(session)
-        worker = self.open_worker(session)
         environment = self.environment()
         finish = self.root / "finish"
         done = self.root / "done"
@@ -341,16 +318,15 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         environment["STUB_REVIEW_DONE_FILE"] = str(done)
         # File output lets the launcher exit without an inherited pipe hiding it.
         with (self.root / "signal-output.txt").open("w+") as output:
-            process = subprocess.Popen(self.review_command(session, "", "", worker), env=environment,
+            process = subprocess.Popen(self.review_command(session, "", ""), env=environment,
                                        stdout=output, stderr=output, text=True)
             try:
-                wait_until(lambda: (session / "follow_message.txt").exists() or process.poll() is not None, session, processes=(process,))
+                wait_until(lambda: (session / "agent_prompt_received.txt").exists() or process.poll() is not None, session, processes=(process,))
                 self.assertIsNone(process.poll())
-                self.assertTrue((session / "follow_message.txt").exists())
+                self.assertTrue((session / "agent_prompt_received.txt").exists())
                 process.send_signal(signal.SIGTERM)
                 code = process.wait(timeout=TEST_HANG_GUARD_SECS)
-                record, = self.turn_records(session)
-                self.assertEqual(record["status"], "canceled")
+                self.assertEqual(self.turn_records(session), [])
                 self.assertEqual(code, 143)
             finally:
                 finish.touch()

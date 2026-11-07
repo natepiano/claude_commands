@@ -47,7 +47,7 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 
 `width_trial.py report --since <ISO-8601 with offset> --until <ISO-8601 | now>` prints the switchback scorecard for natedev. Exit 0 on a report, 2 on a usage error.
 
-- `load_steps` reads `step = 'nextest'` rows from the build-log index (`store.root() / INDEX_NAME`, moved by `BUILDLOG_DIR`) and selects them by request time, `started_at − mem_wait_s`. A step's arm is `test_threads(argv)`: 16 is `physical`, 32 `logical`, none `unset`, any other width its number. Its block is `request // BLOCK_S` (6000 s).
+- `load_steps` reads `step = 'nextest'` rows from the build-log index (`index_path()`, moved by `BUILDLOG_DIR`) and selects them by request time, `started_at − mem_wait_s`. A step's arm is `test_threads(argv)`: 16 is `physical`, 32 `logical`, none `unset`, any other width its number. Its block is `request // BLOCK_S` (6000 s).
 - **whole-hana** run: `caller = 'verify'`, `repo = 'hana'`, the `-E` value is exactly `package(hana)`, and no `--test` in argv.
 - Metrics, `physical` against `logical`:
 
@@ -71,7 +71,7 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy. Workspace rustdoc runs separately through `verify.sh doc` at the checkpoint.
 
 - Clippy: `invoke_clippy --workspace --all-targets --all-features --keep-going` (`-- -D warnings` from `invoke.sh`). The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`. The lint call sites add `--keep-going`; `invoke.sh` does not add it. Lint takes no trailing `--features`; `verify.sh doc --features <list>` selects workspace doc features. CI's Windows-target clippy pass has no local counterpart. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their own scope.
-- Before its judgment, the clippy stage runs `cargo clippy --fix` with the judgment's scope and lint levels, then fmt. It repeats while a pass changes the tree, at most three times, then updates the cache key and judges. The fix pass never sets lint's status. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
+- Clippy judges first. A passing judgment needs no fixes. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial failures return directly. Repairs run `cargo clippy --fix`, then fmt, with the judgment scope and lint levels. Repairs stop when the tree remains unchanged or reaches `clippy_fix_pass_limit` from lint.conf. The default limit is 3. Clippy judges again after repairs. The final judgment sets the lint status. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix).
 - Taplo: `run taplo fmt --check` from `workspace_root` (from `cargo metadata`), so taplo loads the workspace `taplo.toml` whatever directory lint starts in. `config/lint.conf` does not gate it; it gates only the cargo stages. An unformatted `.toml` fails lint, names the file, and is cached like any lint failure.
 - `require_taplo` exits 2 with `taplo is required` before any stage when taplo is not on `PATH`. A taplo panic (exit 101) exits 3 on macOS, with a message to re-run unsandboxed, and 2 elsewhere.
 - `buildlog_step_compiles` in `invoke.sh` returns 1 for `taplo` (as for `cargo [+tc] fmt` and `*/sweep.py`), so taplo skips the build-hold wait and the memory gate.
@@ -82,7 +82,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 - The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no marker and is not counted by others.
 - No counter: a run is in flight while its marker is locked, and nothing a killed run leaves behind is counted.
 - Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a failed claim runs at the full width.
-- `invoke.sh` adds its width before the caller's arguments, and `memory_admit.test_threads` and `width_trial` read the first width in argv. Change both or neither.
+- `invoke.sh` adds its width before the caller's arguments, and `parse.test_threads` (admission calls it as `memory_admit.test_threads`) and `width_trial` read the first width in argv. Change both or neither.
 - The trial block in `nextest_width_arm` (6000 s) equals `BLOCK_S` in `width_trial.py`.
 - `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
 - The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. A width filter replaces any need to drop stale records.

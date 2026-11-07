@@ -1,151 +1,64 @@
 ---
-description: File a finished proposal as a hanadocs issue, record the user's approval, and see it started and closed.
+description: File and manage a production proposal.
 ---
 
 # Proposal
 
-A proposal is a hanadocs issue tagged `proposal`, in the folder the production
-doc's `Proposals` line names. `/showrunner:proposals` lists the open ones. There
-is no index to add a row to. Every frontmatter change after filing goes through:
+A proposal is a hanadocs issue with the `proposal` tag.
+The production document's `Proposals` field names its folder.
+Use `/showrunner:proposals` to list open proposals.
+
+Use this command for each field change:
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" <verb> <issue> …
 ```
 
-It edits that one file, sets `date_modified`, and prints what changed.
+The command locks the issue and sets `date_modified`.
+Report command failures.
+Use the proposal number and title when you name a proposal to the user.
 
-Each proposal carries a number, `proposal_id: "P12"`, as a change row carries
-`C12`. `number <issue>…` gives the next free number to each proposal without
-one, oldest first, and skips other issues; `create` numbers a new style
-decision. Numbers are never used again: the highest in the issues folder and
-in the vault's `archive/` beside it is taken. Name a proposal to the user by
-its number and title, such as `P12 selection widgets toggle`. On a
-missing file or one without frontmatter it exits 2: report the line.
-
-| State | `status` / `stage` | Set by |
+| State | Fields | Command |
 | --- | --- | --- |
-| waiting for approval | open / backlog | filing (`proposed_by`), or `unapprove` |
-| in progress | open / active | `approve` (`showrunner`, `unit`, `plan`, `approved_by`, `approved_in`), or `start` for a plan issue that has no approval |
-| built | closed | `close` (`as_built` or `reason`) |
-
-The footer's proposal count and the table's `waiting for your review` rows are
-the waiting proposals only; approval moves a proposal to in progress.
+| Waiting | `status: open`, `stage: backlog` | File or `unapprove` |
+| In progress | `status: open`, `stage: active` | `approve` or `start` |
+| Built | `status: closed`, `as_built` | `close --as-built <path>` |
+| Declined | `status: closed`, `reason` | `/close_issue` |
 
 ## File
 
-A style decision is filed by `style_proposals.py file`, never `/issue`.
-It covers one rule and crate under one rule text. The user answers once;
-later findings under that text keep the answer. Use `style_proposals.py sites`
-for all findings and `candidates` for off-rule ideas. A candidate is never a
-proposal; drop one with `style_proposals.py drop-candidate --idea "<text>"`. Other finished proposals become issues through `/issue`.
+File style decisions through `style_proposals.py file`.
+File other proposals through `/issue` with the tags `[issue, proposal]`.
+Store the writer's fixed staff id in `proposed_by`.
+Remove `showrunner` and `plan` from proposal frontmatter.
+Keep plan details in the unit configuration.
+Use `number <issue>…` to assign a P number.
+The command reserves numbers across the issues folder and its adjacent archive.
 
-For other proposals, tag `proposal` beside
-`issue`, and `proposed_by` the unit or session that wrote it; `/issue` then
-gives it its number. Drafts stay out.
-The writer proposes all five ranking values (`backlog_goal`,
-`backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort`) at
-once. The values reach the frontmatter only after the user confirms them, since
-the vault ranks every open issue by them. A unit has no user in its session, so
-it leaves the five fields empty, puts its values on a `Proposed ranking:` line
-at the top of the issue body, and sends the showrunner the issue path, one line,
-and the five values.
-
-Do not show a new proposal to the user unasked (user, 2026-10-09: proposals
-accumulate for them to review). They ask for one at a time (`/next proposal`),
-and after their answer the next waits until they ask. When they review one,
-show its proposed values in one plain-text line; they confirm or change them in their reply. Then write
-all five and delete the `Proposed ranking:` line:
-
-```sh
-… proposal_issue.py stars <issue> --goal "1 - Ship Hana" --alignment 3 --impact 3 --urgency 1 --effort 2
-```
-
-Never ask star by star, and never through a form.
-
-A proposal that blocks work, or matters by a date, takes a level for the
-user's review order: `proposal_issue.py urgency <issue> --level blocks` (or
-`soon --due <ISO>`, `later`). When the user calls one important, run
-`proposal_issue.py mark-important <issue>`.
+Leave ranking fields empty until the user confirms the ranking.
+Put the proposed ranking on one `Proposed ranking:` line in the body.
+Put alternatives on a separate `Alternatives:` line.
+Send the showrunner the issue path and proposed ranking.
+Do not present new proposals to the user unless requested.
+Use `urgency <issue> --level blocks|soon|normal|later` to set review priority.
+Use `--due <ISO>` with `soon`.
+Use `mark-important <issue>` when the user calls the proposal important.
 
 ## Approve
 
-For a style decision, record the user's approval with its unit's own plan
-copy and no phase numbers:
-
 ```sh
-… proposal_issue.py approve <issue> --by user --showrunner "<name>" --unit <unit> --plan "<unit plan copy>"
+… proposal_issue.py approve <issue> --by user --unit <staff id>
 ```
 
-`--by user` records that the user approved it. A showrunner that approves
-without the user's answer writes `--by showrunner`. `approve` also records the
-production of the showrunner it runs in (`approved_in`), and it refuses to run
-outside a showrunner. A user approval replaces a showrunner one. A showrunner
-approval keeps a user one. An approval with no `approved_by` is the user's.
+Use `--by showrunner` for an approval without the user's answer.
+The command stores the unit's fixed staff id in `unit`.
+The command stores the calling showrunner's fixed staff id in `approved_in`.
+A user approval replaces a showrunner approval.
+A showrunner approval preserves a user approval.
+Readers show current staff names.
 
-Proposals approved before 2026-10-20 move with `proposal_issue.py
-move-approved <issues folder>` (`--dry-run` first); a second run moves none.
-
-To undo a showrunner approval, run `proposal_issue.py unapprove <issue>`
-(`--dry-run` first) in the showrunner that approved it. It sets the approval
-fields empty, as filing writes them, and the stage to backlog, so the proposal
-waits for approval again. It refuses a user approval, an approval made in
-another showrunner, and an issue that is not an open, approved proposal. Only
-the user's decline undoes a user approval. Never undo an approval by hand.
-
-Refill builds its approved findings in small tickets. The decision stays open
-until every finding is built or waived. Decline only through:
-
-```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_proposals.py decline --repo <style checkout> --issue <issue> --words '<the user’s words>'
-```
-
-For other proposals, send the approved issue to the unit that builds it.
-The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
-line. Record that plan and its phases with the same `approve` command.
-`--showrunner` is the session name from `showrunners.py name <slug>`;
-`--unit` is the full name in the production's Units table. Approve sets the
-stage active: the proposal is in progress and leaves the waiting count. Other
-declined proposals close through `/close_issue`.
-
-## Start and close
-
-Style refill marks a decision active. Run `style_proposals.py complete` after
-each merge. It closes only approved decisions, when all findings are built or
-waived. It also closes an approved decision with no merged ticket when no
-finding is left to build. A later finding opens a closed, approved decision
-again with its approval when each of its findings is built, waived or withdrawn, whatever its close
-reason says. `file` skips a closed decision that still has a filed finding
-(`closed decision has unbuilt findings`): open it with
-`proposal_issue.py reopen <issue>`, then file again. A closed decision with no
-answer takes a later finding only when its close reason starts with `built in `
-or `nothing left to build: ` (else `closed decision has no approval`).
-A finding is built only when its change is in the code. Repair a decision
-or an old issue that closed too early with `style_proposals.py reopen --repo
-<style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
-lines first. It exits 1 when a built rename has no check; read the code and
-pass `--finding <id>` (not applied) or `--applied <id>`, with `--by <who>`.
-Filing withdraws a filed finding that an `exception` under its rule's newer
-text supersedes, and an unfiled finding whose site that text judged again.
-It closes a decision left with no filed finding. Run that step
-alone with `style_proposals.py withdraw --repo <style checkout> --proposals
-<folder>`; add `--dry-run` to see the lines first.
-Filing first moves a finding to the one file that now declares its item, or to its
-item's new name after a built rename, marks a
-filed rename built when its new name is declared, leaves a filed finding whose
-item is gone from its file, and withdraws the rest; run that step alone with `style_proposals.py
-follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
-the lines first.
-An outside rename can also follow automatically. Its old name must be absent from declarations throughout its crate.
-The source diff must map the renamed item, or exactly one changed file in that crate must gain it.
-At least half its non-blank body lines must remain after replacing only the renamed identifier.
-A child needs a proved owner rename and its own retained binding or member name.
-A refused search keeps the finding and decision, even when the source file is gone.
-Read its `left` line for the mapped declaration, candidate files, body counts and failed checks.
-Drop the bare duplicates of qualified renames from every open decision with
-`style_proposals.py drop-duplicates --repo <style checkout>`; add `--dry-run`
-to see the lines first. When a plain merge, not a ticket, built filed findings,
-mark them built with `style_ledger.py held built --repo <style checkout> --id
-<id> [--id <id> ...] --commit <merge>`; add `--by <who>` after reading the code
-of a finding the check cannot prove.
-For other proposals, `/unit:direct` marks plan issues active, and its final
-as-built pass closes them with the as-built doc.
+Use `unapprove <issue> [--dry-run]` from the approving showrunner to remove a showrunner approval.
+Only the user's decline removes a user approval.
+Use `decline-answer <issue> --words '<user words>'` for a style decision's declined answer.
+Use `style_proposals.py complete` after each merge to close completed style decisions.
+Use `reopen <issue>` to reopen a closed decision with its recorded answer.

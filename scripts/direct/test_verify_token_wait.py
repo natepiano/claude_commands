@@ -2,81 +2,89 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenWaitTests(VerifyTokenWaitFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = caller_admission(self, self.root, self.environment)
+
     def test_token_wait_restores_the_original_place_and_runs_with_memory_and_token(self) -> None:
         observer = self.root / "observe-token.py"
         observations = self.root / "token-observations.json"
-        _ = observer.write_text('''import json
+        _ = observer.write_text('import sys\n' + f'sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n' + '''import json
 import os
 from pathlib import Path
 import sys
+from scripts.build_queue.admission_service import read_state
 
 phase = sys.argv[1]
-directory = Path(os.environ["BUILDLOG_DIR"]) / "admission"
+state = read_state(Path(os.environ["BUILDLOG_DIR"]) / "admission")
+reservations = list(state.reservations.values())
+lock = Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d"
+assert lock.is_dir(), phase
 capture = Path(os.environ["TEST_TOKEN_OBSERVATIONS"])
 rows = json.loads(capture.read_text()) if capture.exists() else {}
-reservations = list(directory.glob("*.reservation"))
-if phase == "reserved":
-    assert len(reservations) == 1, reservations
-    rows[phase] = json.loads(reservations[0].read_text())["queue_waiter"]
-elif phase == "waiting":
+if phase == "admission":
+    assert phase not in rows, rows
     assert not reservations, reservations
-    waiting = [json.loads(path.read_text()) for path in directory.glob("*.waiting")]
-    assert len(waiting) == 1, waiting
-    row = waiting[0]
-    for field in ("pid", "start_time", "since", "priority_since"):
-        assert row.get(field) == rows["reserved"].get(field), (field, row, rows)
-    assert "token_left_at" in row, row
-    rows[phase] = row
 else:
     assert len(reservations) == 1, reservations
-    assert (Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d").is_dir()
-    rows[phase] = json.loads(reservations[0].read_text())["queue_waiter"]
+rows[phase] = {"holder": (lock / "holder_pid").read_text()}
 capture.write_text(json.dumps(rows))
 ''')
-        shell = self.root / "miss-once.sh"
-        missed = self.root / "missed-now"
+        shell = self.root / "observe.sh"
         _ = shell.write_text('''set -T
-observe_token_wait() {
-    if [[ "$BASH_COMMAND" == try_token_now && ! -e "$TEST_MISSED_NOW" ]]; then
-        python3 "$TEST_TOKEN_OBSERVER" reserved || exit 95
-        : > "$TEST_MISSED_NOW"
-        try_token_now() { return 1; }
-    elif [[ "$BASH_COMMAND" == acquire_token && -e "$TEST_MISSED_NOW" ]]; then
-        python3 "$TEST_TOKEN_OBSERVER" waiting || exit 94
+observe_admission() {
+    if [[ "${FUNCNAME[1]:-}" == buildlog_wait_for_memory && "$BASH_COMMAND" == 'with_token_renewal buildlog_wait_for_memory_only "$@"' ]]; then
+        python3 "$TEST_TOKEN_OBSERVER" admission || exit 95
     fi
 }
-trap observe_token_wait DEBUG
+trap observe_admission DEBUG
 ''')
-        result = self.verify({**self.environment, "BASH_ENV": str(shell), "TEST_MISSED_NOW": str(missed),
+        result = self.verify({**self.environment, "BASH_ENV": str(shell),
                               "TEST_TOKEN_OBSERVER": str(observer), "TEST_TOKEN_OBSERVATIONS": str(observations)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(missed.exists(), "the step must exercise the token-wait branch")
         captured = cast(dict[str, Record], json.loads(observations.read_text()))
-        self.assertEqual(set(captured), {"reserved", "waiting", "run"})
-        self.assertEqual(captured["reserved"]["since"], captured["run"]["since"])
+        self.assertEqual(set(captured), {"admission", "run"})
+        self.assertEqual(captured["admission"]["holder"], captured["run"]["holder"])
         directory = self.root / "buildlog/admission"
-        rows = [cast(Record, json.loads(line)) for line in (directory / "queue_times.jsonl").read_text().splitlines()]
-        gaps = [row for row in rows if row.get("kind") == "token_gap"]
-        self.assertEqual(len(gaps), 1)
-        gap = gaps[0]
-        self.assertEqual(gap["token_left_at"], captured["waiting"]["token_left_at"])
-        self.assertLessEqual(float(str(gap["token_left_at"])), float(str(gap["token_back_at"])))
-        self.assertGreaterEqual(float(str(gap["at"])), float(str(gap["token_back_at"])))
-        self.assertEqual((gap["pid"], gap["start_time"]),
-                         (captured["waiting"]["pid"], captured["waiting"]["start_time"]))
-        self.assertEqual(gap["step"], "check")
+        times = directory / "queue_times.jsonl"
+        rows = [cast(Record, json.loads(line)) for line in times.read_text().splitlines()] if times.exists() else []
+        self.assertEqual(sum(row.get("kind") == "token_gap" for row in rows), 0)
         self.assertEqual(list(directory.glob("*.reservation")), [])
         self.assertEqual(len(self.records()), 1)
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
+    def test_token_wait_names_a_holder_without_a_final_newline(self) -> None:
+        board = self.root / "board"
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board)}
+        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+            env={**environment, "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.started_groups.add(first.pid)
+        self.wait_for_running(self.root / "running", first)
+        output = self.root / "token-note.err"
+        with output.open("wb") as stream:
+            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                env={**environment, "UNIT_TEAM_ROLE": "second"}, stdout=stream,
+                stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(second.pid)
+        self.wait_for_output(output, "waiting for the cargo token since", second)
+        self.assertIn(f"first (pid {first.pid}) holds it", output.read_text())
+        _ = (self.root / "release").touch()
+        self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+        self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
 
     def test_mac_routing_under_hold_skips_initial_token_acquisition(self) -> None:
         holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -90,7 +98,7 @@ trap observe_token_wait DEBUG
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_MAC_EVENTS": str(self.root / "mac-events"),
-            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "TEST_MAC_ALLOWED": "1",
+            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "CONF_DIR": str(Path(self.root / "mac-settings").parent), "TEST_MAC_ALLOWED": "1",
         })
         result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -140,7 +148,7 @@ trap advance_elapsed_clock DEBUG
                        "TEST_CLOCK_READS": str(clock_reads),
                        "UNIT_RUN_DIR": str(self.root / "clock-board"),
                        "UNIT_TEAM_ROLE": "clock"}
-        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+        for key in ("UNIT_WORKER_POLL_SECS",
                     "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         result = self.verify(environment)

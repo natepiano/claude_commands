@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import importlib
 import json
 import os
@@ -21,10 +23,10 @@ from scripts.whoami import worker_usage
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class DefaultSourcesTests(unittest.TestCase):
     def test_first_read_accepts_a_concurrent_baseline_conversion(self) -> None:
@@ -105,6 +107,8 @@ class OutcomeFixture(CollectorFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         self.claude_root: Path = self.root / ".claude/projects"
         self.codex_root: Path = self.root / ".codex/sessions"
@@ -112,6 +116,8 @@ class OutcomeFixture(CollectorFixture):
         self.history = self.root / ".local/state/plan-delegate/runs"
         self.repository = self.root / "fixture-repository"
         self.production_docs = self.root / "production-docs"
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
         _ = self.git(self.repository, "init", "--quiet")
 
     def git(self, repository: Path, *arguments: str, at: str = "2026-10-10T21:40:00Z") -> str:
@@ -214,17 +220,47 @@ class ProductionPathsTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         document = Path(directory.name) / "sample-production.md"
-        _ = document.write_text(
-            "".join((
-                "# Production\n\n- **Repository:** `/repo/main`\n\n",
-                "## Units\n\n| Unit | Worktree |\n| --- | --- |\n",
-                "| a | `/repo/worktree` |\n",
-            )),
-            encoding="utf-8",
+        branch_worktree = Path(directory.name) / "worktree"
+        result = subprocess.run(
+            ["git", "init", "--quiet", str(branch_worktree)],
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _ = document.write_text("# Production\n\n- **Repository:** `/repo/main`\n", encoding="utf-8")
+        with isolated_staff_file(Path(directory.name) / "staff.json", {}):
+            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc(remote.local_machine(), document))
+            _ = fixture_member("unit", name="a", parent=owner.id,
+                               worktree=staff.PresentWorktree(remote.local_machine(), branch_worktree))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent, staff.snapshot())), (owner,))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent / "other", staff.snapshot())), ())
+            self.assertEqual(
+                outcomes.production_paths(owner),
+                (Path("/repo/main"), branch_worktree),
+            )
+
+    def test_staff_worktree_finds_the_repository_despite_a_stale_header(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repository = root / "main"
+        worktree = root / "worktree"
+        for command in (
+            ["git", "init", "--quiet", str(repository)],
+            ["git", "-C", str(repository), "-c", "user.name=Fixture",
+             "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+            ["git", "-C", str(repository), "worktree", "add", "--quiet", "-b", "unit", str(worktree)],
+        ):
+            _ = subprocess.run(command, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        document = root / "sample-production.md"
+        _ = document.write_text("# Production\n\n- **Repository:** `/wrong/header`\n", encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(Path(directory.name) / "staff.json", {}))
+        owner = recorded_showrunner("fixture-owner", document)
+        _ = fixture_member("unit", name="a", parent=owner.id,
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         self.assertEqual(
-            outcomes.production_paths(document),
-            (Path("/repo/main"), Path("/repo/worktree")),
+            outcomes.production_paths(owner),
+            (repository, worktree),
         )
 
 
@@ -539,8 +575,13 @@ class OutcomeTests(OutcomeFixture):
                      "checkpoint(fixture-plan): phase 6 — Other repository")
         second = self.git(second_repo, "rev-parse", "HEAD")
         _ = (self.production_docs / "fixture-production.md").write_text(
-            f"- **Repository:** `{second_repo}`\n\n## Units\n\n| Worktree |\n| --- |\n| `{self.repository}` |\n",
+            f"- **Repository:** `{second_repo}`\n",
             encoding="utf-8")
+        owner = recorded_showrunner("second-owner", self.production_docs / "fixture-production.md")
+        _ = fixture_member("unit", name="second", parent=owner.id,
+                           worktree=staff.PresentWorktree(remote.local_machine(), second_repo))
+        _ = fixture_member("unit", name="first", parent=owner.id,
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.repository))
         _ = self.collect()
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {first, side, second})
         _ = self.collect()
@@ -581,7 +622,11 @@ class OutcomeTests(OutcomeFixture):
     def test_removed_worktree_named_by_production_doc_leaves_checkpoints_ready(self) -> None:
         commit_id = self.commit("checkpoint(fixture-plan): phase 6 — Outcomes")
         _ = (self.production_docs / "fixture-production.md").write_text(
-            f"## Units\n\n| Worktree |\n| --- |\n| `{self.root / 'removed-worktree'}` |\n", encoding="utf-8")
+            "# Production\n", encoding="utf-8")
+        owner = fixture_member("showrunner", name="fixture",
+                               doc=staff.LiveDoc(remote.local_machine(), self.production_docs / "fixture-production.md"))
+        _ = fixture_member("unit", name="retired", parent=owner.id,
+                           worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed-worktree"))
         output = self.collect()
         self.assert_family_state(output, "natedev", "checkpoints", "ready")
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {commit_id})
@@ -712,9 +757,12 @@ class OutcomeTests(OutcomeFixture):
         with closing(sqlite3.connect(self.db_path)) as database, database:
             for table in ("openings", "edits", *OUTCOME_TABLES, "checkpoints", "account_readings", "account_role_changes"):
                 _ = database.execute(f"DROP TABLE {table}")
+            _ = database.execute("ALTER TABLE cursors DROP COLUMN context")
             _ = database.execute("PRAGMA user_version = 0")
             _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'old-cursor-sentinel', 123)")
         output = self.collect()
+        self.assertEqual([cast(str, row["name"]) for row in self.rows("PRAGMA table_info(cursors)")],
+                         ["machine", "path", "offset", "context"])
         self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), version)
         self.assertFalse(self.rows("SELECT * FROM cursors WHERE path = 'old-cursor-sentinel'"))
         self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), before)
@@ -723,7 +771,7 @@ class OutcomeTests(OutcomeFixture):
         self.assert_source_additions(output, "claude", 0)
         self.assert_source_additions(output, "codex", 0)
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'current-cursor-sentinel', 456)")
+            _ = database.execute("INSERT INTO cursors (machine, path, offset) VALUES ('natedev', 'current-cursor-sentinel', 456)")
         before_rows = self.snapshot()
         _ = self.collect()
         self.assertEqual(self.snapshot(), before_rows, "The new version does not clear cursors again")
@@ -744,7 +792,8 @@ class MacOutcomeTests(OutcomeFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+        _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+            "${HOME}/.claude/scripts/lib/py", str(Path(__file__).resolve().parents[1] / "lib/py")))
         ssh.chmod(0o700)
 
     def mac_collect(self, behavior: SshBehavior = "complete") -> MacRun:
@@ -1028,6 +1077,18 @@ class MacOutcomeTests(OutcomeFixture):
         self.assert_family_state(missing.output, "mac", "history", "missing")
         self.assertEqual(self.all_values(self.rows(query)), complete)
         self.assertEqual(len(self.rows("SELECT * FROM runs WHERE machine = 'mac'")), 1)
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase
+
+
+class BranchRepositoryLocationTests(StaffTestCase):
+    def test_repository_discovery_uses_the_staff_worktree(self) -> None:
+        fixture = self.separated_unit_folders()
+        with patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(outcomes.production_paths(fixture.runner), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

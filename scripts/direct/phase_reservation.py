@@ -9,9 +9,9 @@ a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
 reservation, which is never recorded here (`commands/unit/direct.md` →
-<PhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
-reservation that cargo-berth's session map names for the director's bare session id, from an edit
-the director made itself, is that phase's own. Codex workers edit through `apply_patch`, so the Codex
+<PhaseReservationContract/>). A `left_unmapped` reservation belongs to this phase when the map names it and its run for the director's bare session id.
+No other open phase may hold it through an `Active` state, a pending release, or its berth session map.
+Codex workers edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
 it checks every path of the phase changed since its baseline and writes `Active` from the answer.
@@ -29,12 +29,13 @@ attribution or lost-record repair while their plan review finishes. A recorder-o
 state file and no berth mapping of its own was never enrolled, as FinalGate's `final` phase, and is
 no lost record: its edits check under the bare session id. The hook reads the recorder's
 state in process. `progress_history.py finish-phase` clears an inactive state when the
-phase completes, and `start-phase` on a finished phase id restores its enrolled state from the
-kept board answer and removes the release marker (rca 261023-3). With one
+phase completes. `start-phase` restores a finished phase's enrolled state from the kept board answer and removes the release marker.
+It removes the worktree override and baselines before the next claim.
+With one
 open phase in the edit's worktree every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
-Before workers open, `claim --repo` writes the repository root in the phase directory's `worktree` file.
-A legacy phase with no file still matches every worktree.
+The staff row supplies the home folder.
+`claim --repo` writes a `worktree` file only when the phase uses another checkout.
 
 `enrolled_awaiting_first_touch` turns `Active`, and an `Active` record follows a new
 reservation of its own phase: once cargo-berth releases the recorded one, as a shrink's
@@ -44,6 +45,10 @@ on berth's board, and a released one takes the phase's live reservation. Every o
 left as it is: the checkpoint's own states belong to <CheckpointCommit/>.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -51,12 +56,16 @@ import os
 import shlex
 import subprocess
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import unit_runs
+from scripts.production import staff
+from scripts.agents import worker_lifecycle
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -95,8 +104,7 @@ LEDGER_UNREADABLE = "ledger_unreadable"
 # repository, and a ledger it cannot read (a scratch clone has none), since ledger loss fails open.
 FAILS_OPEN = frozenset({UNCONFIGURED, LEDGER_UNREADABLE})
 SESSION_ENVIRONMENT = "CARGO_BERTH_SESSION_ID"
-# The engine's answer when a sibling reservation of the run already holds every checked path:
-# the reservation id it returns is the sibling's, so it is never this phase's to record.
+# The engine leaves the phase unmapped when another session holds every checked path.
 LEFT_UNMAPPED = "left_unmapped"
 # cargo-berth's ledger folder in the repository's common git directory, and its map from a
 # harness session id to the reservation that session holds.
@@ -123,13 +131,9 @@ class CheckAnswer(NamedTuple):
 
 
 class KnownPhaseWorktree(NamedTuple):
-    """The repository root recorded when this phase claimed its files."""
+    """The phase folder from staff or an explicit checkout override."""
 
     root: Path
-
-
-class LegacyPhaseWorktree(NamedTuple):
-    """No worktree was recorded; this phase still matches every root."""
 
 
 class AllPhaseWorktrees(NamedTuple):
@@ -144,7 +148,7 @@ class OpenPhase(NamedTuple):
 
     phase: str
     directory: Path
-    worktree: KnownPhaseWorktree | LegacyPhaseWorktree = LegacyPhaseWorktree()
+    worktree: KnownPhaseWorktree
 
 
 class PhaseMissingRecord(NamedTuple):
@@ -236,19 +240,43 @@ def session_reservation(root: Path, session_id: str) -> tuple[str, str] | None:
     return (reservation, run) if reservation and run else None
 
 
-def own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str) -> Acquisition | None:
-    """The reservation a clear answer gives this phase: none when a sibling's already held every path.
+def _own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str,
+                    phase: OpenPhase) -> Acquisition | None:
+    """Return this phase's acquisition without recording a sibling's reservation.
 
-    The one exception is the director's own reservation. An edit the director makes itself, such as
-    to the plan doc, checks under its bare session id, so cargo-berth maps that reservation there
-    and a later check under the phase's session answers `left_unmapped` with it. With one open
-    phase there is no sibling, and a reservation the map names for the bare session id is the phase's.
+    Accept `left_unmapped` only when the bare session maps the reservation and run, and no other open phase holds the reservation.
+    A sibling holds it through an `Active` state, a pending release, or its berth session map.
     """
     acquisition = answer.acquisition
     if answer.session_mapping != LEFT_UNMAPPED or acquisition is None:
         return acquisition
-    director = session_reservation(root, session_id) if len(phases) == 1 else None
-    return acquisition if director == (acquisition.reservation_id, acquisition.coordination_run_id) else None
+    if session_reservation(root, session_id) != (acquisition.reservation_id, acquisition.coordination_run_id):
+        return None
+    for sibling in phases:
+        if sibling.directory == phase.directory:
+            continue
+        state = read_state(sibling.directory)
+        pending = _object(state.get(PENDING_FIELD)) if _string(state.get("kind")) == PENDING else {}
+        if acquisition.reservation_id in (_recorded(state), _string(pending.get("reservation_id"))):
+            return None
+        mapped = session_reservation(root, phase_session_id(session_id, sibling.phase))
+        if mapped is not None and mapped[0] == acquisition.reservation_id:
+            return None
+    return acquisition
+
+
+def record_own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str,
+                           phase: OpenPhase) -> Acquisition | None:
+    """Check ownership and record the acquisition under one lock for `left_unmapped` answers."""
+    session_dir = phase.directory.parent.parent
+    with ((session_dir / "phase_reservation.lock").open("a")
+          if answer.session_mapping == LEFT_UNMAPPED else nullcontext()) as lock:
+        if lock is not None:
+            worker_lifecycle.acquire_flock(lock)
+        acquisition = _own_acquisition(answer, root, phases, session_id, phase)
+        if acquisition is not None:
+            _ = record_active(phase.directory, acquisition)
+        return acquisition
 
 
 def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
@@ -337,27 +365,57 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
-def _phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree:
-    """Read the repository root kept by claim, or keep legacy global matching."""
-    try:
-        root = (directory / WORKTREE_FILE).read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return LegacyPhaseWorktree()
-    if not root:
-        raise ValueError(f"Empty phase worktree record: {directory / WORKTREE_FILE}")
-    return KnownPhaseWorktree(Path(root))
+def home_worktree(directory: Path) -> Path:
+    """Read the unit folder from its staff row."""
+    run = directory.parent.parent
+    owner = unit_runs.director(run)
+    if not owner:
+        raise StateRefused(f"{run}: run owner is unavailable")
+    row = staff.snapshot().by_member_reference(owner)
+    if row is None or row.kind != "unit":
+        raise StateRefused(f"run owner {owner!r}: unit staff row is unavailable")
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise StateRefused(f"run owner {owner!r}: unit staff row has no home folder")
+    return row.worktree.path
+
+
+def phase_worktree(directory: Path) -> KnownPhaseWorktree:
+    """Read the explicit checkout override or the unit folder from staff."""
+    path = directory / WORKTREE_FILE
+    root = Path(path.read_text(encoding="utf-8").strip()) if path.is_file() else home_worktree(directory)
+    return KnownPhaseWorktree(root)
 
 
 def _record_worktree(directory: Path, root: Path) -> None:
-    """Keep one live worktree per phase, before claim checks its reservation state."""
-    previous = _phase_worktree(directory)
-    if isinstance(previous, KnownPhaseWorktree):
-        if previous.root.resolve() == root:
-            return
-        if previous.root.is_dir():
-            raise StateRefused(f"phase worktree is {previous.root}; cannot claim it in {root}")
+    """Store only a checkout that differs from the unit folder."""
     directory.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+    if root == home_worktree(directory).resolve():
+        (directory / WORKTREE_FILE).unlink(missing_ok=True)
+    else:
+        write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+
+
+def _record_baselines(directory: Path, root: Path) -> None:
+    """Keep the first launch's commit and working-tree status through every later launch."""
+    baseline = directory / BASELINE_FILE
+    # Keep the lock inode: concurrent launchers must serialize the existence check and both writes.
+    # Closing the handle also releases a crashed launcher's lock, allowing the next claim to retry.
+    with baseline.with_name(BASELINE_FILE + ".lock").open("a") as lock:
+        worker_lifecycle.acquire_flock(lock)
+        if baseline.exists():
+            try:
+                _ = commit_id(root, baseline.read_text().strip())
+            except StateRefused as refused:
+                raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
+            return
+        head = commit_id(root, "HEAD")
+        status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True,
+                                text=True, check=False, stdin=subprocess.DEVNULL)
+        if status.returncode != 0:
+            raise StateRefused(f"git status --short failed in {root}: {status.stderr.strip()}")
+        # Publish the baseline last: after an interrupted status write, the next claim retries both.
+        write_text_atomic(directory / BASELINE_STATUS_FILE, status.stdout)
+        write_text_atomic(baseline, head + "\n")
 
 
 def open_phases(session_dir: Path) -> list[OpenPhase]:
@@ -370,7 +428,7 @@ def open_phases(session_dir: Path) -> list[OpenPhase]:
         return held_phases(session_dir)
     names = {phase_directory_name(phase) for phase in recorder_state.read_open_phase_ids(session_dir)}
     return [OpenPhase(name, session_dir / PHASES_DIR / name,
-                      _phase_worktree(session_dir / PHASES_DIR / name))
+                      phase_worktree(session_dir / PHASES_DIR / name))
             for name in sorted(names - {""}) if not (session_dir / PHASES_DIR / name / RELEASED_FILE).is_file()]
 
 
@@ -378,7 +436,7 @@ def held_phases(session_dir: Path) -> list[OpenPhase]:
     """Every phase whose directory still holds a state file, in phase-name order: a run with no recorder list."""
     phases = session_dir / PHASES_DIR
     found = sorted(phases.iterdir()) if phases.is_dir() else []
-    return [OpenPhase(path.name, path, _phase_worktree(path)) for path in found if (path / STATE_FILE).is_file()]
+    return [OpenPhase(path.name, path, phase_worktree(path)) for path in found if (path / STATE_FILE).is_file()]
 
 
 def enrolled_phases(phases: list[OpenPhase], root: Path, session_id: str) -> list[OpenPhase]:
@@ -416,8 +474,7 @@ def attribute(phases: list[OpenPhase], scopes: list[str],
               root: Path | AllPhaseWorktrees = ALL_PHASE_WORKTREES) -> Attribution | NoOpenPhaseHere:
     """Group scopes in the edit root; callers without one keep the original attribution."""
     if isinstance(root, Path):
-        phases = [phase for phase in phases if isinstance(phase.worktree, LegacyPhaseWorktree)
-                  or (phase.worktree.root.is_dir() and phase.worktree.root.resolve() == root.resolve())]
+        phases = [phase for phase in phases if phase.worktree.root.resolve() == root.resolve()]
         if not phases:
             return NoOpenPhaseHere()
     if len(phases) == 1:
@@ -483,6 +540,19 @@ def restore(phase_dir: Path, phase: str) -> str:
     if (phase_dir / STATE_FILE).exists() or board not in BOARD_STATES:
         return ""
     return enroll(phase_dir, phase, board)
+
+
+def reset_for_start(phase_dir: Path, phase: str) -> None:
+    """Remove the previous phase instance's placement and baselines before a new start."""
+    if not phase_dir.is_dir():
+        return
+    with (phase_dir / (BASELINE_FILE + ".lock")).open("a") as lock:
+        worker_lifecycle.acquire_flock(lock)
+        kind = _string(read_state(phase_dir).get("kind"))
+        if kind in HOLDS_RESERVATION:
+            raise StateRefused(f"phase {phase} holds a reservation ({kind}); confirm its release before restarting")
+        for name in (BASELINE_FILE, BASELINE_STATUS_FILE, WORKTREE_FILE):
+            (phase_dir / name).unlink(missing_ok=True)
 
 
 def commit_id(repo: Path, name: str) -> str:
@@ -797,14 +867,13 @@ def _record_active_command(args: argparse.Namespace) -> int:
     if answer.status != CLEAR or answer.acquisition is None:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
-    acquisition = own_acquisition(answer, root, phases, session_id)
+    acquisition = record_own_acquisition(answer, root, phases, session_id, phase)
     if acquisition is None or acquisition.reservation_id == recorded:
         if recorded:
             print(f"phase reservation: {stale}, and no live reservation of this phase replaces it", file=sys.stderr)
             return 1
         print("phase reservation: a sibling phase's reservation holds every changed path; still awaiting first touch")
         return 0
-    _ = record_active(phase.directory, acquisition)
     print(f"phase reservation: Active, reservation {acquisition.reservation_id}"
           + (f"; {stale}" if recorded else ""))
     return 0
@@ -827,7 +896,8 @@ def _claim_command(args: argparse.Namespace) -> int:
     root = root.resolve()
     try:
         _record_worktree(directory, root)
-    except StateRefused as refused:
+        _record_baselines(directory, root)
+    except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2
     phases = open_phases(session_dir)
@@ -848,11 +918,10 @@ def _claim_command(args: argparse.Namespace) -> int:
     if answer.status != CLEAR:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
-    acquisition = own_acquisition(answer, root, phases, session_id)
+    acquisition = record_own_acquisition(answer, root, phases, session_id, phase)
     if acquisition is None:
         print("phase reservation: a sibling phase's reservation holds every file; still awaiting first touch")
         return 0
-    _ = record_active(phase.directory, acquisition)
     print(f"phase reservation: Active, reservation {acquisition.reservation_id}")
     return 0
 

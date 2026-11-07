@@ -12,9 +12,14 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
-if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR" || return; fi
-
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
+
+BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$TMPDIR" >/dev/null || return
+fi
+# verify.sh needs the temporary parent before it loads the environment.
+[[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
@@ -108,12 +113,19 @@ buildlog_now() {
     [[ -n "${BUILDLOG_NOW:-}" ]] || BUILDLOG_NOW="$(date +%s 2>/dev/null)"
 }
 
+buildlog_read_context() {
+    local context known_folder="${BUILD_TARGET_DIR:-${BUILDLOG_TEST_TARGET_DIR:-}}"
+    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$HOME/.claude/scripts/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
+    BUILDLOG_TREE="${context%%$'\n'*}"
+    BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
+}
+
 # buildlog_begin ARGV...
 buildlog_begin() {
-    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE=""
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE="" BUILDLOG_TARGET_FOLDER=""
+    BUILDLOG_STEP_ARGV=("$@")
     [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
-    BUILDLOG_TREE="$("$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" key ${1+"$@"} </dev/null 2>/dev/null)" \
-        || BUILDLOG_TREE=""
+    buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
     if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
@@ -152,6 +164,12 @@ buildlog_exec() {
     "$@"
 }
 
+buildlog_write_step() {
+    BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
+        BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
+        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
+}
+
 # buildlog_end STATUS LOG TTY ARGV...
 buildlog_end() {
     [[ -n "${BUILDLOG_START:-}" ]] || return 0
@@ -164,14 +182,10 @@ buildlog_end() {
         mv -f "$log" "$held" 2>/dev/null || held=""
     fi
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
-        BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
-            "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
-            </dev/null >/dev/null 2>&1
+        buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
         ( trap '' HUP
-          BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
-            "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
-            </dev/null >/dev/null 2>&1 & )
+          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
@@ -182,11 +196,11 @@ buildlog_sample_anon() {
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
-    local phase_file=${4:-} reservation=${5:-} phase_context="" phase_started=null phase_peak=null
+    local phase_file=${4:-} sampling_context=${5:-} phase_context="" phase_started=null phase_peak=null
     local phase_temporary="$phase_file.tmp.${BASHPID:-$$}" membership pid executable
     local executables=()
-    if [[ -n "$phase_file" && -r "$reservation" ]]; then
-        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$reservation" "${@:6}") || phase_context=""
+    if [[ -n "$phase_file" && -n "$sampling_context" ]]; then
+        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" "${@:6}") || phase_context=""
         if [[ "$phase_context" == \{*\} ]]; then
             if printf '{"test_phase_peak_bytes":null,"test_phase_started_at":null,%s\n' "${phase_context#\{}" > "$phase_temporary"; then
                 mv -f "$phase_temporary" "$phase_file" || true
@@ -287,7 +301,25 @@ buildlog_finish_memory() {
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
-run_once() {
+buildlog_retry_unstarted_step() {
+    BUILDLOG_RETRY_STEP=0
+}
+
+without_progress_frames() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        printf '%s\n' "${line##*$'\r'}"
+    done
+}
+
+buildlog_exec_with_progress() {
+    CARGO_TERM_PROGRESS_WHEN=always \
+        CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
+        buildlog_exec "$@"
+}
+
+run_step_attempt() {
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
@@ -343,8 +375,8 @@ run_once() {
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" \
-            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_RESERVATION" "$@" &
+        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
+            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" &
         sampler_pid=$!
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
@@ -356,29 +388,40 @@ run_once() {
     # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox
     # detection underneath, which can fire only inside Claude Code, where
     # stdout is never a tty.
+    local log="" tty=0
     if [[ -t 1 ]]; then
-        local tty_status=0
+        tty=1
         set +e
-        buildlog_exec "$@" 9>&-
-        tty_status=$?
-        set -e
-        nextest_share_end
-        buildlog_finish_memory "$tty_status" "$sampler_pid"
-        buildlog_end "$tty_status" "" 1 "$@" || true
-        sweep_after_step "$@" || true
-        return $tty_status
+        buildlog_exec_with_progress "$@" 9>&-
+        status=$?
+    else
+        # $RANDOM too: a background sweep's run() shares this shell's $$.
+        log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
+        fi
+        # Keep output streaming for heartbeat_watch.sh and the watching worker.
+        set +e
+        buildlog_exec_with_progress "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        status=${PIPESTATUS[0]}
     fi
-    # $RANDOM too: a background sweep's run() shares this shell's $$.
-    local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
-    # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
-    # prove a worker is alive, so buffering a long build looks like a hang.
-    set +e
-    buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
     set -e
     nextest_share_end
     buildlog_finish_memory "$status" "$sampler_pid"
-    if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        rm -f -- "$BUILDLOG_PEAK.progress.log"
+    fi
+    buildlog_retry_unstarted_step "$@" || {
+        status=$?
+        [[ -z "$log" ]] || rm -f "$log"
+        return "$status"
+    }
+    if [[ "$BUILDLOG_RETRY_STEP" == 1 ]]; then
+        [[ -z "${BUILDLOG_PEAK:-}" ]] || rm -f "$BUILDLOG_PEAK"
+        [[ -z "$log" ]] || rm -f "$log"
+        return 0
+    fi
+    if [[ -n "$log" && $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
         buildlog_end "$status" "$log" 0 "$@" || true
         rm -f "$log"
         cat >&2 <<'EOF'
@@ -398,10 +441,21 @@ unsandboxed run needs approval, not whether it runs unsandboxed.
 EOF
         exit 3
     fi
-    buildlog_end "$status" "$log" 0 "$@" || true
-    rm -f "$log"
+    buildlog_end "$status" "$log" "$tty" "$@" || true
+    [[ -z "$log" ]] || rm -f "$log"
     sweep_after_step "$@" || true
     return $status
+}
+
+run_once() {
+    local BUILDLOG_RETRY_STEP=0 status=0
+    while :; do
+        run_step_attempt "$@" || status=$?
+        if (( status != 0 )) || [[ "$BUILDLOG_RETRY_STEP" != 1 ]]; then
+            return "$status"
+        fi
+        BUILDLOG_RETRY_STEP=0
+    done
 }
 
 run() {
@@ -417,19 +471,29 @@ SWEEP_EVERY_S=300
 
 sweep_after_step() {
     [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
-    local arg now last=0 dir stamp
+    local arg now last=0 parent name=lint-sweep dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0
     done
-    dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/lint-sweep"
+    parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    dir="$parent/$name"
     stamp="$dir/${PWD//\//%}"
     now="${EPOCHSECONDS:-$(date +%s)}"
     [[ -r "$stamp" ]] && read -r last < "$stamp"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
-    mkdir -p "$dir" && printf '%s\n' "$now" > "$stamp" || return 0
-    # Detached work and its descendants do not own verify.sh's foreground step.
-    ( trap '' HUP; TOKEN_HELD=0; invoke_sweep </dev/null >/dev/null 2>&1 & )
+    if [[ ! -d "$dir" ]]; then
+        "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable \
+            --parent "$parent" --name "$name" >/dev/null || return 0
+    fi
+    printf '%s\n' "$now" > "$stamp" || return 0
+    # Cargo locks protect the sweep. It must not take the board token.
+    (
+        trap '' HUP
+        TOKEN_HELD=0
+        run() { run_once "$@"; }
+        invoke_sweep </dev/null >/dev/null 2>&1 &
+    )
 }
 
 have_nextest() {
@@ -609,7 +673,16 @@ fmt_cargo() {
         lint_config_skip_notice fmt "cargo +nightly fmt $*"
         return 0
     fi
-    if ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
+    if [[ -n "$version_file" ]]; then
+        if [[ ! -f "$version_file" ]]; then
+            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+        fi
+        if [[ ! -s "$version_file" ]]; then
+            echo "cargo +nightly fmt is required" >&2
+            exit 2
+        fi
+    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi

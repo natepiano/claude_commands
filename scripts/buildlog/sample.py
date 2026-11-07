@@ -8,10 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict
 
-import store
-import cgroup_capture
-import filesystem
-from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
+from scripts.buildlog import store
+from scripts.buildlog import cgroup_capture, filesystem
+from scripts.lib.boot_identity import parse_boot_id as parse_boot_id
+from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+from scripts.buildlog.cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
 
@@ -97,14 +98,6 @@ def parse_meminfo(text: str) -> MachineMemoryUse:
     return MachineMemoryUse(values["MemTotal"] - values["MemAvailable"], values["SwapTotal"] - values["SwapFree"])
 
 
-def parse_boot_id(text: str) -> str:
-    """Return the kernel boot ID, rejecting an empty value."""
-    boot_id = text.strip()
-    if not boot_id:
-        raise ValueError("empty boot ID")
-    return boot_id
-
-
 def anon_bytes(cgroup: Path) -> int | Unmeasured:
     """Read process memory from a slice, or mark an absent slice unmeasured."""
     reading = cgroup_capture.read_cgroup(cgroup)
@@ -150,7 +143,16 @@ class FilesystemMeasured(TypedDict):
 
 
 def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailable:
-    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", os.environ.get("CARGO_TARGET_DIR", str(Path.home() / "rust")))
+    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", "")
+    if not path:
+        roots = read_cargo_output_roots(Path(os.environ.get("BUILDLOG_WORKSPACE", os.getcwd())))
+        if not isinstance(roots, CargoOutputRoots):
+            return {"state": "unavailable"}
+        path = str(roots.build_directory)
+    existing = Path(path)
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    path = str(existing)
     try:
         reading = filesystem.filesystem_usage(path)
         return {"state": "measured", "path": path, "total": reading.total, "used": reading.used,
@@ -162,13 +164,14 @@ def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailab
 class SampleTaken(NamedTuple):
     at: float
     host: str
-    slices: cgroup_capture.SliceCollection = {"builds": {"state": "absent"}, "ci": {"state": "absent"}}
 
 
 def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
+    from scripts.buildlog.memory import read_zram
+
     at = time.time()
     host = store.host_name()
     boot_id = parse_boot_id(BOOT_ID.read_text())
@@ -189,6 +192,7 @@ def sample() -> SampleTaken:
         "at": store.utc_iso(at),
         "boot_id": boot_id,
         "slices": slices,
+        "zram": read_zram(),
         "filesystem": filesystem_reading(),
         "jobserver": {"builds": free_pool_tokens("/dev/steve"), "ci": free_pool_tokens("/dev/steve-ci")},
         "mem_used_bytes": memory.memory_bytes,
@@ -209,4 +213,4 @@ def sample() -> SampleTaken:
         "power_profile_since": store.utc_iso(profile.since_epoch) if isinstance(profile, PowerProfile) else None,
     }
     store.append_line(store.sample_file(host, at), record)
-    return SampleTaken(at, host, slices)
+    return SampleTaken(at, host)

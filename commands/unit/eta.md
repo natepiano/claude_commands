@@ -1,5 +1,5 @@
 ---
-description: Give the showrunner a measured ETA for this unit's current phase, built from the durations this run has already recorded, when the unit director has not stated one.
+description: Estimate a phase ETA from run records.
 ---
 
 # ETA
@@ -22,7 +22,7 @@ not pause the phase's work.
 3. **Name the basis.** Say which recorded steps the time comes from, e.g. "hana
    full tests took 14–19 min in phases 10–11".
 4. **When the answer has an ETA, record it before answering.** Run
-   `python3 ~/.claude/scripts/direct/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis eta-command`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis eta-command`
    with the ETA and range in the answer. The recorder reads each time
    in the user's zone setting, and the `ETA recorded:` line it prints names
    that zone. If the answer has no range, omit both range options.

@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
-"""List, attach, start or resume standalone Claude sessions, each a tab of the shared herdr session.
+"""List, attach, start or resume standalone Claude sessions in the shared herdr session.
 
-A standalone session opens in the shared session's `ad-hoc` workspace; nothing here starts a herdr
-session of its own (user, 2026-10-26).
+Each standalone session uses a workspace with its tab name.
+This module starts no separate herdr session.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import itertools
 import os
-import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import herdr
+from scripts.herdr import herdr
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "message"))
-from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "production"))
-from scripts.production.showrunners import registered_showrunners  # noqa: E402
+from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
-from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
-ADHOC_SPACE = "ad-hoc"
 
 
 @dataclass(frozen=True)
@@ -75,6 +72,9 @@ def _attach_remote(host: RemoteHost, name: str) -> int:
         reason = " ".join(result.stderr.split()) or "no error message"
         print(f"herdr_sessions: {host.target}: {reason}", file=sys.stderr)
         return 1
+    if not result.stdout.strip():
+        print(f"herdr_sessions: {host.target}: remote session is unknown", file=sys.stderr)
+        return 1
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "--remote", host.target, "--session", result.stdout.strip()])
 
@@ -96,29 +96,12 @@ def _tab_pane(name: str) -> str:
 
 def _attach(pane: str) -> None:
     shared = herdr.shared_session()
-    herdr.Herdr(shared).focus_tab_of(pane)
+    try:
+        herdr.Herdr(shared).focus_tab_of(pane)
+    except (herdr.HerdrFailure, OSError) as error:
+        print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "session", "attach", shared])
-
-
-def _launch_rerun(verb: str, options: LaunchOptions, folder: Path, claude_arguments: list[str]) -> str:
-    command = [sys.executable, str(Path(__file__).resolve()), verb]
-    if options.name is not None:
-        command.extend(["--name", options.name] if verb == "start" else [options.name])
-    command.extend(["--cwd", str(folder)])
-    if verb == "resume":
-        command.extend(["--session-id", options.session_id])
-        if options.config_dir:
-            command.extend(["--config-dir", str(Path(options.config_dir).expanduser().resolve())])
-        if options.restore:
-            command.append("--restore")
-        if options.prompt_file:
-            command.extend(["--prompt-file", str(Path(options.prompt_file).resolve())])
-        if options.attach:
-            command.append("--attach")
-    if claude_arguments:
-        command.extend(["--", *claude_arguments])
-    return shlex.join(command)
 
 
 def _launch(verb: str, arguments: list[str]) -> int:
@@ -138,9 +121,6 @@ def _launch(verb: str, arguments: list[str]) -> int:
     options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
     claude_arguments = arguments[separator + 1:]
     session_kind = herdr.security_session()
-    if not isinstance(session_kind, (herdr.DesktopSession, herdr.NotMacSession)):
-        print(herdr.MAC_DESKTOP_TERMINAL_REQUIRED)
-        return 1
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():
         raise ValueError(f"{folder}: not a directory")
@@ -153,81 +133,35 @@ def _launch(verb: str, arguments: list[str]) -> int:
         config_dir = accounts.main_config_dir()
         pane_environment: dict[str, str] = {}
         unset_variables.update(account.NAMED_ACCOUNT_VARIABLES)
-        claude_json = Path.home() / ".claude.json"
     else:
         config_dir = selected.dir
         pane_environment = account.named_account_environment(config_dir)
-        claude_json = config_dir / ".claude.json"
-    environment = dict(os.environ)
-    for variable in unset_variables:
-        _ = environment.pop(variable, None)
-    environment.update(pane_environment)
-    trust = herdr.claude_trust(folder, claude_json)
-    if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
-        trust_command = (f"cd {shlex.quote(str(folder))} && env -u CLAUDE_CONFIG_DIR "
-                         + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude"
-                         if isinstance(selected, accounts.LegacyHomeLaunch)
-                         else accounts.trust_command(folder, selected))
-        if isinstance(trust, herdr.UnreadableTrustFile):
-            print(f"herdr_sessions: {reason}. Run: {trust_command}", file=sys.stderr)
-        else:
-            rerun = _launch_rerun(verb, options, folder, claude_arguments)
-            print(f"herdr_sessions: {reason}.\n"
-                  + "Paste this, accept Claude's trust prompt, then exit Claude; the session then starts:\n"
-                  + f"{trust_command} && {rerun}", file=sys.stderr)
-        return 1
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
-        opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
-                                      herdr.SessionTranscript(config_dir, options.session_id))
-    purpose: launch_permission.LaunchPurpose = (
-        launch_permission.RecordedSessionRestoreLaunchPurpose(options.session_id)
-        if options.restore else launch_permission.NewWorkLaunchPurpose()
-    )
-    try:
-        barrier = launch_permission.launch_barrier()
-        _ = barrier.__enter__()
-    except OSError as error:
-        print(f"herdr_sessions: shutdown state unreadable: launch barrier: {error}", file=sys.stderr)
-        return 1
-    try:
-        permission = launch_permission.launch_permission(environment, purpose)
-        if isinstance(permission, launch_permission.BlockedByShutdown):
-            print(f"herdr_sessions: {permission.reason}", file=sys.stderr)
-            return 1
-        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-            print(f"herdr_sessions: shutdown state unreadable: {permission.detail}", file=sys.stderr)
-            return 1
-        shared = herdr.shared_session()
-        _ = herdr.start_server(shared, 90_000, session_kind=session_kind)
-        server_environment = herdr.server_environment(shared)
-        for variable in sorted(unset_variables):
-            if variable in server_environment:
-                raise herdr.HerdrFailure(
-                    f"herdr server {shared} carries {variable} from where it started, so a new tab would "
-                    + "inherit it; start that server again from a shell without it"
-                )
-        taken = {pane.get("label") for pane in herdr.Herdr(shared).panes()}
-        if options.name in taken:
-            raise herdr.HerdrFailure(f"a tab named {options.name} is already open in herdr session {shared}")
-        name = options.name or next(candidate for candidate in (
-            herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
-            if candidate not in taken)
-        if verb == "resume":
-            claude_arguments.extend(["--resume", options.session_id])
-        claude_arguments.extend(["-n", name])
-        launched = herdr.launch_agent(shared, ADHOC_SPACE, name, str(folder), pane_environment,
-            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
-        if isinstance(launched, herdr.nix_env.Refused):
-            raise herdr.HerdrFailure(launched.reason)
-        pane, outcome = launched.pane, launched.outcome
-        if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
-            reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
-            print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-            return 1
-    finally:
-        _ = barrier.__exit__(None, None, None)
+        try:
+            opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
+                                          herdr.SessionTranscript(config_dir, options.session_id))
+        except OSError as error:
+            print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
+    shared = herdr.shared_session()
+    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    panes = herdr.Herdr(shared).panes()
+    taken = {pane.get("label") for pane in panes}
+    name = options.name or next(candidate for candidate in (
+        herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
+        if candidate not in taken)
+    if verb == "resume":
+        claude_arguments.extend(["--resume", options.session_id])
+    claude_arguments.extend(["-n", name])
+    launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
+        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
+        unset_environment=frozenset(unset_variables))
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(launched.reason)
+    pane, outcome = launched.pane, launched.outcome
+    if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
+        reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
+        print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
     if verb == "start" or options.attach:
         _attach(pane)
     return 0
@@ -255,9 +189,13 @@ def claude_names() -> dict[str, str]:
     return {pane: record["name"] for pane, record in newest.items()}
 
 
-def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity]) -> dict[str, str]:
+def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
+               record: staff.StaffSnapshot) -> dict[str, str]:
     """Classify live unit panes using the same staff join as tab ordering."""
-    classifier = herdr.UnitTabClassifier(client.session, herdr.herdr_processes(), staff.initial_snapshot())
+    from scripts.production.session_labels import StaffLabels
+
+    classifier = herdr.UnitTabClassifier(
+        client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
     spaces: dict[str, str] = {}
     if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
         for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
@@ -307,8 +245,7 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            print(f"herdr_sessions: herdr session {shared} is not running", file=sys.stderr)
-            return 1
+            _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")
@@ -330,8 +267,10 @@ def _main(argv: list[str]) -> int:
         with herdr.pane_snapshot() as read_panes:
             panes = read_panes(shared)
             names = claude_names()
-            roles = unit_roles(herdr.Herdr(shared), panes)
-            showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
+            membership = staff.initial_snapshot()
+            roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
+            showrunner_names = {runner["session"] for runner in require_complete(
+                registered_showrunners(membership=membership)) if runner["session"]}
             for row in panes:
                 pane = row["pane_id"]
                 claude = names.get(pane, "")

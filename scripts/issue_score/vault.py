@@ -11,14 +11,38 @@ from typing import cast
 from urllib.parse import unquote, urlsplit
 
 from scripts.feature_log import feature_log
+from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
 
-from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
+from scripts.issue_score.questions import body_character_limit, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
 
-VAULT_ROOT = Path.home() / "rust/hanadocs"
-ISSUES_DIR = VAULT_ROOT / "issues"
-AREA_DEFINITIONS_PATH = VAULT_ROOT / "conf/issue-areas.md"
-PROJECT_BASES_DIR = VAULT_ROOT / "home-base"
-STYLE_RULES_DIRS = (Path.home() / "rust/nate_style", Path(__file__).resolve().parents[2] / "docs/style")
+
+def vault_root(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return Path(scoring_config.text("vault_root")).expanduser()
+
+
+def issue_directory(*, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return vault_root(scoring_config=scoring_config) / "issues"
+
+
+def area_definitions_path(*, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return vault_root(scoring_config=scoring_config) / "conf/issue-areas.md"
+
+
+def project_bases_dir(*, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return vault_root(scoring_config=scoring_config) / "home-base"
+
+
+def style_rules_dirs(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[Path, ...]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return (Path(scoring_config.text("style_rules_root")).expanduser(),
+            Path(__file__).resolve().parents[2] / "docs/style")
+
+
 RATING_FIELDS = ("backlog_alignment", "backlog_impact", "backlog_urgency", "backlog_effort")
 LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area", "backlog_score")
 WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
@@ -117,14 +141,16 @@ def plain(value: str) -> str:
     return WIKILINK.sub(lambda match: match[1].split("|", 1)[-1], _unquote(value)).strip()
 
 
-def clean_body(body: str) -> str:
+def clean_body(body: str, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     cleaned = WIKILINK.sub(lambda match: match[1].split("|", 1)[-1], body)
-    if len(cleaned) <= BODY_CHARACTER_LIMIT:
+    limit = body_character_limit(scoring_config=scoring_config)
+    if len(cleaned) <= limit:
         return cleaned
-    prefix = cleaned[:BODY_CHARACTER_LIMIT]
+    prefix = cleaned[:limit]
     headings = list(re.finditer(r"(?m)^#{1,6}\s", prefix))
     # If the only heading opens the document, keep useful text up to the cap.
-    cut = headings[-1].start() if headings and headings[-1].start() > 0 else BODY_CHARACTER_LIMIT
+    cut = headings[-1].start() if headings and headings[-1].start() > 0 else limit
     return prefix[:cut].rstrip()
 
 
@@ -132,8 +158,10 @@ def normalize_area(area: str) -> str:
     return plain(area).strip("\"'").strip().casefold()
 
 
-def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
+def load_area_definitions(path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, str]:
     """Require a two-column area table; missing rows retain name-only criteria."""
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    path = area_definitions_path(scoring_config=scoring_config) if isinstance(path, UseConfiguredValue) else path
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -160,8 +188,10 @@ def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
     return definitions
 
 
-def load_project_names(base_dir: Path = PROJECT_BASES_DIR) -> dict[str, str]:
+def load_project_names(base_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, str]:
     """Read each shorthand's project filter from the same bases `/issue` uses."""
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    base_dir = project_bases_dir(scoring_config=scoring_config) if isinstance(base_dir, UseConfiguredValue) else base_dir
     names: dict[str, str] = {}
     for path in sorted(base_dir.glob("issues - *.base")):
         matches = set(re.findall(r'''project\.contains\(link\(["']([^"']+)["']\)\)''', path.read_text(encoding="utf-8")))
@@ -209,7 +239,9 @@ def _documents(issues_dir: Path) -> list[VaultDocument]:
     return [_frontmatter(path) for path in sorted(issues_dir.glob("*.md")) if path.is_file()]
 
 
-def load_open_issues(issues_dir: Path = ISSUES_DIR) -> list[Issue]:
+def load_open_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Issue]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    issues_dir = issue_directory(scoring_config=scoring_config) if isinstance(issues_dir, UseConfiguredValue) else issues_dir
     return [document.issue() for document in _documents(issues_dir)
             if plain(document.value("status")).casefold() == "open" and not document.is_style]
 
@@ -252,8 +284,10 @@ def _rule_summary(reference: str, rules_dirs: tuple[Path, ...]) -> RuleSummary |
     return MissingStyleRule(reference)
 
 
-def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> Issue:
+def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Issue:
     """Build scoring inputs from one issue snapshot, including its owning rules."""
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    rules_dirs = style_rules_dirs(scoring_config=scoring_config) if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
     issue = document.issue()
     if not document.is_style:
         return issue
@@ -265,14 +299,17 @@ def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] = STY
     return Issue(issue.path, issue.title, issue.project, issue.body, issue.labels, True, inputs)
 
 
-def load_scoring_issues(issues_dir: Path = ISSUES_DIR, *,
-                        rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> list[Issue]:
+def load_scoring_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *,
+                        rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Issue]:
     """Include open style proposals with explicit available or missing rule state."""
-    issues = load_open_issues(issues_dir)
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    issues_dir = issue_directory(scoring_config=scoring_config) if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    rules_dirs = style_rules_dirs(scoring_config=scoring_config) if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
+    issues = load_open_issues(issues_dir, scoring_config=scoring_config)
     for document in _documents(issues_dir):
         if not document.is_style or plain(document.value("status")).casefold() != "open":
             continue
-        issues.append(scoring_issue(document, rules_dirs=rules_dirs))
+        issues.append(scoring_issue(document, rules_dirs=rules_dirs, scoring_config=scoring_config))
     return sorted(issues, key=lambda issue: issue.path)
 
 
@@ -289,7 +326,9 @@ def _style_formula(document: VaultDocument, project_goals: dict[str, str]) -> di
     }
 
 
-def load_rated_issues(issues_dir: Path = ISSUES_DIR) -> RatedIssues:
+def load_rated_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> RatedIssues:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    issues_dir = issue_directory(scoring_config=scoring_config) if isinstance(issues_dir, UseConfiguredValue) else issues_dir
     documents = _documents(issues_dir)
     goals: dict[str, Counter[str]] = {}
     for document in documents:
@@ -323,15 +362,16 @@ def area_vocabulary(issues: Iterable[Issue]) -> list[str]:
     return sorted({area for issue in issues if (area := normalize_area(issue.labels.get("area", "")))})
 
 
-def build_state(issue: Issue) -> IssueState:
+def build_state(issue: Issue, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> IssueState:
     """Only issue content is visible to the model, never current labels."""
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     projects = issue.project.split(" | ")
     if any(project not in PROJECT_ABOUT for project in projects):
         raise ValueError(f"Unknown project context: {issue.project}")
     about = " ".join(PROJECT_ABOUT[project] for project in projects)
     content: IssueState = {"issue": {"title": plain(issue.title), "project": issue.project,
                                    "project_about": about,
-                                   "body": clean_body(PROPOSED_RANKING.sub("", issue.body))}}
+                                   "body": clean_body(PROPOSED_RANKING.sub("", issue.body), scoring_config=scoring_config)}}
     if isinstance(issue.style_inputs, StyleInputs):
         style = issue.style_inputs.model_state()
         content["issue"]["body"] = ""

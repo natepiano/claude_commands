@@ -1,20 +1,23 @@
 """Ordered next moves use an isolated log and the role-map host transport."""
 from __future__ import annotations
 
+import io
 import json
-import sys
 import tempfile
 import unittest
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.accounts import accounts, next_moves, role_map
-from scripts.whoami import run_out
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
-import quota_alert
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, test_refusal_watch as watch_tests
+from scripts.lib.conf import UseConfiguredValue
+from scripts.lib import conf
+from scripts.whoami import run_out, usage_store
+from scripts.whoami import quota_alert
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
 
@@ -30,6 +33,164 @@ class NextMovesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
+
+    @contextmanager
+    def watch_fixture(self) -> Generator[watch_tests.RefusalWatchTests]:
+        fixture = watch_tests.RefusalWatchTests()
+        try:
+            fixture.setUp()
+            yield fixture
+        finally:
+            _ = fixture.doCleanups()
+
+    def test_else_is_listed_and_old_entries_keep_their_format(self) -> None:
+        entry = next_moves.add_next_move("showrunners", 1, "claude2", fallback_targets=("claude4",))
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        self.assertEqual(next_moves.list_next_moves(), "showrunners 1: at 1% → claude2, else claude4")
+        legacy = next_moves.ClaudeGroupMove("old", "units", 1, 0, "claude2", NOW)
+        document = next_moves.encode_next_moves((legacy,))
+        self.assertNotIn('"else"', document)
+        self.assertEqual(next_moves.decode_next_moves(document), (legacy,))
+        self.assertEqual(legacy.fallback_targets, ())
+
+    def test_workers_keep_their_existing_target_form(self) -> None:
+        with self.assertRaisesRegex(next_moves.NextMoveError, "workers entries cannot use --else"):
+            _ = next_moves.add_next_move("workers", 1, "codex2", fallback_targets=("claude4",))
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_cli_add_and_mac_forward_keep_the_ordered_fallback(self) -> None:
+        with (patch.object(accounts, "claude_account_dir", return_value=self.home / ".claude2") as checked,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(accounts.main(["next", "add", "showrunners", "1", "claude2", "--else", "claude4"]), 0)
+        self.assertEqual([call.args[0] for call in checked.call_args_list], ["claude2", "claude4"])
+        entry, = next_moves.read_next_moves()
+        assert isinstance(entry, next_moves.ClaudeGroupMove)
+        self.assertEqual(entry.fallback_targets, ("claude4",))
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            self.assertEqual(arguments[0], "next-write")
+            forwarded, = next_moves.decode_next_moves(arguments[1])
+            assert isinstance(forwarded, next_moves.ClaudeGroupMove)
+            self.assertEqual((forwarded.to, forwarded.fallback_targets), ("claude2", ("claude4",)))
+            return arguments[1]
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote)):
+            forwarded = next_moves.add_next_move("showrunners", 1, "claude2", fallback_targets=("claude4",))
+        self.assertEqual(next_moves.decode_next_moves(next_moves.encode_next_moves((forwarded,))), (forwarded,))
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_due_entry_uses_the_first_target_when_both_have_room(self) -> None:
+        for group in ("units", "showrunners"):
+            with self.subTest(group=group), self.watch_fixture() as fixture:
+                _ = fixture.groups(showrunners="claude1")
+                _ = fixture.owner("member", host="unit" if group == "units" else "herdr")
+                fixture.reading(watch_tests.TARGET_LOGIN, 80)
+                entry = next_moves.add_next_move(group, 1, "claude2", fallback_targets=("claude3",))
+                lines = refusal_watch.run_auto_moves(watch_tests.NOW)
+                self.assertTrue(any("to claude2" in line for line in lines))
+                self.assertEqual([call.target for call in fixture.moves.calls], ["claude2"])
+                self.assertEqual(next_moves.read_next_moves(), ())
+                self.assertIn("auto: " + entry.id, accounts.roles_history_file().read_text())
+                self.assertEqual(fixture.notifications, [])
+
+    def test_due_entry_uses_else_for_each_blocked_first_target(self) -> None:
+        for cause in ("low", "zero", "stale", "missing reading", "refusal", "login", "missing account"):
+            with self.subTest(cause=cause), self.watch_fixture() as fixture:
+                _ = fixture.groups()
+                _ = fixture.owner("unit", host="unit")
+                fixture.reading(watch_tests.TARGET_LOGIN, 80)
+                if cause in ("low", "zero", "stale"):
+                    fixture.reading("main@example.invalid", 1 if cause == "low" else 0 if cause == "zero" else 80,
+                                    at=watch_tests.NOW - timedelta(minutes=11) if cause == "stale" else watch_tests.NOW)
+                elif cause == "missing reading":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", "main@example.invalid")]
+                    usage_store.write(saved)
+                elif cause == "refusal":
+                    refusals.write_refusal(refusals.AccountRefusal("claude", "main@example.invalid",
+                        refusals.UnknownWindow(), refusals.NoResetKnown(), watch_tests.NOW))
+                elif cause == "login":
+                    fixture.expired_login()
+                entry = next_moves.add_next_move("units", 1,
+                    "claude99" if cause == "missing account" else "claude2",
+                                                 fallback_targets=("claude3",))
+                preview = refusal_watch.run_auto_moves(watch_tests.NOW, dry_run=True)
+                self.assertTrue(any("would move from claude1 to claude3" in line for line in preview))
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+                self.assertEqual(fixture.moves.calls, [])
+                _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+                self.assertEqual([call.target for call in fixture.moves.calls], ["claude3"])
+                self.assertEqual(next_moves.read_next_moves(), ())
+                self.assertEqual(fixture.notifications, [])
+
+    def test_current_account_target_consumes_the_entry_without_a_move(self) -> None:
+        for target, fallbacks in (("claude1", ()), ("claude1", ("claude3",)), ("claude2", ("claude1",))):
+            with self.subTest(target=target, fallbacks=fallbacks), self.watch_fixture() as fixture:
+                _ = fixture.groups()
+                fixture.reading("main@example.invalid", 0)
+                entry = next_moves.add_next_move("units", 1, target, fallback_targets=fallbacks)
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW, dry_run=True), ["units: unchanged"])
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), ["units: unchanged"])
+                self.assertEqual(next_moves.read_next_moves(), ())
+                self.assertEqual(fixture.moves.calls, [])
+                self.assertEqual(fixture.notifications, [])
+
+    def test_due_entry_stays_queued_when_both_targets_are_blocked(self) -> None:
+        with self.watch_fixture() as fixture:
+            _ = fixture.groups()
+            fixture.reading("main@example.invalid", 0)
+            fixture.reading(watch_tests.TARGET_LOGIN, 0)
+            entry = next_moves.add_next_move("units", 1, "claude2", fallback_targets=("claude3",))
+            for _ in range(2):
+                lines = refusal_watch.run_auto_moves(watch_tests.NOW)
+                self.assertEqual(len(lines), 1)
+                self.assertIn("claude2", lines[0])
+                self.assertIn("claude3", lines[0])
+            self.assertEqual(len(fixture.notifications), 1)
+            fixture.reading(watch_tests.TARGET_LOGIN, 80, at=watch_tests.NOW - timedelta(minutes=11))
+            _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+            self.assertEqual(len(fixture.notifications), 2)
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            self.assertEqual(fixture.moves.calls, [])
+
+    def test_fallback_hold_uses_the_selected_account_and_keeps_its_clock(self) -> None:
+        with self.watch_fixture() as fixture:
+            _ = fixture.groups()
+            fixture.reading("main@example.invalid", 0)
+            fixture.reading(watch_tests.TARGET_LOGIN, 80)
+            entry = next_moves.add_next_move("units", 1, "claude2", next_moves.HalfPointHold(),
+                                             fallback_targets=("claude3",))
+            with (patch.object(next_moves, "account_pace", return_value=next_moves.PaceEstimate(2)) as pace,
+                  patch.object(next_moves, "render_time", return_value=watch_tests.NOW)):
+                self.assertIn("else claude3, hold half a point (≈15 min)", next_moves.list_next_moves())
+                pace.assert_called_once_with("claude1", watch_tests.NOW)
+                pace.reset_mock()
+                _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+                pace.assert_called_once_with("claude1", watch_tests.NOW)
+                _ = refusal_watch.run_auto_moves(watch_tests.NOW + timedelta(minutes=1))
+                self.assertEqual(pace.call_count, 1)
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            later = watch_tests.NOW + timedelta(minutes=15)
+            fixture.reading(watch_tests.SOURCE_LOGIN, 0, at=later)
+            fixture.reading("main@example.invalid", 0, at=later)
+            fixture.reading(watch_tests.TARGET_LOGIN, 80, at=later)
+            _ = refusal_watch.run_auto_moves(later)
+            self.assertEqual(next_moves.read_next_moves(), ())
+            self.assertEqual(accounts.group_label(accounts.group_accounts(), "units"), "claude3")
+
+    def test_replay_repairs_a_fallback_selection_before_consuming_the_entry(self) -> None:
+        with self.watch_fixture() as fixture:
+            _ = fixture.groups()
+            entry = next_moves.add_next_move("units", 1, "claude2", fallback_targets=("claude3",))
+            _ = accounts.set_group_account("units", "claude3", why="auto: " + entry.id,
+                                           now=watch_tests.NOW, origin=accounts.AutoOrigin())
+            accounts.roles_history_file().unlink()
+            _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+            self.assertEqual(next_moves.read_next_moves(), ())
+            self.assertIn("auto: " + entry.id, accounts.roles_history_file().read_text())
+            self.assertEqual(fixture.moves.calls, [])
 
     def test_add_and_remove_keep_entry_order_and_preserve_the_other_groups_plan(self) -> None:
         self.assertEqual(next_moves.read_next_moves(), ())
@@ -295,6 +456,26 @@ class NextMovesTests(unittest.TestCase):
                 "added_at": NOW.isoformat()}])
             with self.subTest(group=group, mode=mode), self.assertRaises(next_moves.NextMoveError):
                 _ = next_moves.decode_next_moves(document)
+
+    def test_half_point_duration_keeps_the_callers_settings_after_a_live_change(self) -> None:
+        account_config = conf.read("accounts")
+        path = conf.path("accounts")
+        contents = path.read_text()
+        if not path.write_text(contents.replace("hold_default_minutes=40", "hold_default_minutes=99")):
+            self.fail("The hold configuration fixture is empty")
+        with (patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace()),
+              patch.object(conf, "read", side_effect=AssertionError("hold read the configuration again"))):
+            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                account_config=account_config)
+        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+    def test_half_point_hold_reads_current_settings_for_the_named_request(self) -> None:
+        with (patch.object(conf, "read", wraps=conf.read) as reads,
+              patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace())):
+            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                account_config=UseConfiguredValue.CURRENT)
+        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        reads.assert_called_once_with("accounts")
 
     def test_half_point_duration_uses_selected_accounts_pace_in_points_per_second(self) -> None:
         path = self.home / "pace.jsonl"

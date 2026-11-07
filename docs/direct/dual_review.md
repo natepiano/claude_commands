@@ -8,9 +8,9 @@ Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs `adversary` and `contract` at once, plus `rerun`
-when <DualReview/> arms it. Each takes a distinct **lens**, named in its prompt;
-the unit director also performs the main review per <DualReview/>:
+A phase's broad review runs `adversary` and `contract` together.
+It also runs `rerun` when <DualReview/> arms it.
+Each prompt names its lens. The director performs the main review under <DualReview/>.
 
 | Lens | Reads for |
 | --- | --- |
@@ -38,12 +38,14 @@ An answer that shows unsafe rerun behavior is a defect, fixed in the phase
 as a blocker or minor finding. The prompt closes by asking for the rerun case
 the reviewer built, or a plain statement that it could not build one.
 
-The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
-director's main review audits style each phase.
+The `craft` lens remains off since 2026-10-04 (user: review trial ended).
+The `contract` reviewer also owns the phase style review under
+<ReviewPromptContract/>.
 
-Each lens uses the unit's own read-only reviewer. Dispatch with
-`assign.sh --role review`; it resumes `review`, or `review2` when `review` is
-busy. Keep both threads across phases and plans. Writers keep their own roles.
+The Codex lenses use the unit's read-only workers.
+Dispatch with `assign.sh --role review` under <LongLivedWorkers/>.
+The worker command selects a free reviewer and retains its native conversation across phases.
+Writers keep their assigned roles.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
@@ -67,7 +69,7 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-Every review prompt opens with:
+Every Codex review prompt opens with:
 
 ```
 You are the unit's code reviewer for <unit>, phase <N>. Edit nothing. Read
@@ -76,25 +78,64 @@ command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error.
 Re-read the tree; trust nothing from memory about its state.
 ```
 
-In a run's own-worker review, the opening also gives the concrete
-`board.sh role ... review` command for the worker's first tool call. The reviewer
-narrates each change of activity as a short output line so the wrapper
-heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
-heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
+For `herdr`, the reviewer posts no board lines and runs no suites.
+The director or a writer handles required board posts and suites.
+For an existing `mesh` pin, give the concrete `board.sh role ... review` command as the reviewer's first tool call.
+The reviewer reports each activity change as a short output line.
+It never polls, sleeps, or reports a wait.
+Give it no heartbeat path or `${IMPL_SUMMARY}`.
+The reviewer runs read-only.
 
-Do not repeat the implementer's listed verification or audit style. A reviewer
-may run one specific omitted check only when a plausible regression lies
-outside the listed gate, and must name that command; a Codex reviewer runs it
-with `verify.sh` per the `## Builds and tests` section of
-<WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
-<TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
+Do not repeat the implementer's listed verification.
+For `herdr`, name an omitted check for the director or a writer when a plausible regression requires it.
+For an existing `mesh` pin, a reviewer may run one omitted check for a plausible regression outside the listed gate.
+It names the command and uses `verify.sh` under <WritePromptContract/> item 3.
+Every Codex review prompt carries that item's `## Builds and tests` section verbatim.
+Broad reviews apply <TypeDesignContract/>.
+Closure reviews apply <ClosureReview/>, including any owed style assignment.
 
 Every review prompt carries the Three Gods sentence and the Type Design
 Contract under <WritePromptContract/>. Its standing-instructions line names
 `config/review/code.md`.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
-questions and no others; a closure review names no lens.
+questions, plus its style assignment below; a closure review names no lens.
+
+The phase style review starts **owed**. While owed, dispatch the `contract`
+reviewer through `assign.sh --role review --style-since <phase_baseline commit>`
+with the normal phase, run, worktree and prompt options below. The director
+passes the option, never assignment text. The runner prepares fresh input
+from that baseline through the working tree, including untracked files. To
+pin a committed range and exclude other work in flight, also pass
+`--style-until <end commit>`; both commits are validated before dispatch.
+The runner saves input under the phase's `style/` folder,
+appends `config/review/style.md` once and
+saves the returned marked report as `${PHASE_DIR}/phase_style_review.md`.
+Its `style_review_state.json` records **complete** or **owed** and the input
+and report paths. Earlier pass inputs and reports remain in their directories.
+The reviewer stays read-only: preparation and report saving belong to the
+runner. See <StyleReview/> for the manual caller of the same helper.
+
+The assignment becomes **complete** only when a reviewer returns the report
+with a finished result (findings or Pass) and includes its findings in the
+normal review summary for <Synthesize/>. The runner completes Off or No
+changes to review without sending an assignment. A canceled or failed dispatch,
+missing markers, invalid baseline or errored report leaves it owed, even if an
+artifact was written. Preparation errors do not stop the code review.
+
+For an owed retry, use the same `--style-since` option on the next closure
+`assign.sh --role review` dispatch, with `--to` naming the same reviewer; it receives fresh input
+and retains its completed guide load. Keep `--style-until` too when reviewing
+a pinned range. The runner refuses a second style dispatch while the phase
+has a live owner, naming that dispatch; cancel or finish it before retrying.
+A dead launcher releases ownership on the next dispatch.
+Once complete, later reviewers check style repairs through finding ids
+without repeating the pass. The phase cannot converge while style is owed;
+if no repair needs closure, dispatch that reviewer with the owed assignment
+alone. The director reads the ledger and result for <RunSummary/> and never
+substitutes a guide load or rule walk. Early reviews cannot carry this option:
+style input requires the final phase diff.
+Use `assign.sh` for every review dispatch.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:
@@ -103,14 +144,11 @@ this, verbatim:
 List each existing assertion or test that the diff removes, weakens, changes
 (same assertion, other expected value) or turns off (ignore, skip, xfail), with
 its path, test name, old text and new text. If there is none, write "none".
-Each one that the work order does not name in an "Assertion-Change:" line is a
-finding.
+Each one that the work order does not call for is a finding.
 ```
 
-`assertion_guard.py` finds the same list mechanically, and it blocks lint and
-the checkpoint; the reviewer judges whether a ruled change is correct. In
-cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a 6,000-line
-diff passed every review (user, 2026-10-28).
+In cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a
+6,000-line diff passed every review (user, 2026-10-28).
 </ReviewPromptContract>
 
 <BroadReviewPrompt>
@@ -125,16 +163,16 @@ Read surrounding code as needed. Report a numbered list; each item has a title, 
 1-3 sentence explanation, and severity:
 - blocker: wrong behavior, spec violation, or missing required work
 - minor: real edge, error-handling, or quality defect
-- nit: non-behavioral quality; style-guide conformance is out of scope
+- nit: non-behavioral quality
 End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings.
 
 ## Your lens
 [the lens name and what it reads for, from <TeamReview/>]
 
 Other reviewers read this same diff under their own lenses. Report only
-what yours covers: a finding another lens owns is that lens's to
-make, and duplicating it costs the synthesis a second opinion and buys a
-count instead.
+what yours covers, including your assigned phase style review: a finding
+another lens owns is that lens's to make, and duplicating it costs the
+synthesis a second opinion and buys a count instead.
 
 ## Three Gods
 [the section of that name in <WritePromptContract/>, verbatim]
@@ -213,11 +251,15 @@ final diff only.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
+   For `herdr`, Stage 2 uses `worker.py` with dispatch id `<dispatch id>-2`.
+   The launcher reads the transcript before input and requires `DONE <dispatch id>-2` to complete review.
+   Review Stage 2 reports through its status and summary files.
+   Only an existing mesh pin selects the retained mesh Stage 2 route.
 2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
    diff to a file and run this read-only check in every repository, including Rust:
 
    ```sh
-   python3 ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
+   ~/.claude/scripts/lib/py ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
    ```
 
    `<diff>` is that saved diff, including new phase files, made with whole-file
@@ -235,10 +277,10 @@ final diff only.
    Use the completed diff for this decision even when `adversary` was armed
    early. All broad reviewers read the same review copy and final diff.
    Create each lens's prompt under <ReviewPromptContract/>.
-3. Launch each reviewer under <DispatchContract/>. Launch pass 1's lenses in
-   one message so they run at once: `adversary`, `contract`, and `rerun`
-   when armed. When the adversary is already armed, launch `contract` and,
-   when armed, `rerun`. Each call uses:
+3. Launch each reviewer under <DispatchContract/>.
+   Launch pass 1's `adversary`, `contract`, and armed `rerun` lenses in one message.
+   When the adversary is already armed, launch the other selected lenses together.
+   Each call uses:
 
    ```sh
    bash ~/.claude/scripts/direct/assign.sh --role review --lens <lens> \
@@ -247,28 +289,23 @@ final diff only.
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
 
+   For `herdr`, name `--to review2` for a second lens that runs at the same time.
+   The worker command refuses automatic selection when all suitable workers are busy.
+   Give each additional concurrent lens a distinct available review name with `--to`.
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
-   Keep each dispatch handle. The allocator resumes `review`, then `review2`
-   when the first is busy. Read the summary path each dispatch returns.
+   Keep each dispatch handle and apply <LongLivedWorkers/> for selection and reuse.
+   Read the summary path each dispatch returns.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
-   `${IMPL_SUMMARY}` claims. On pass 1 only, run the style review named by
-   <PhaseChecks/>: read `~/.claude/commands/unit/style_review.md` in full and
-   apply <StyleReview/> with `since <commit from ${PHASE_DIR}/phase_baseline>`
-   and `${SESSION_DIR}` as its directory; supply the phase's findings ledger.
-   A missing or invalid baseline stops the review. Save its table and result to
-   `${SESSION_DIR}/phase_style_review_<phase-id>.md`, including `Off` or an
-   error. For its ledger writes use `findings.py open --caught-by main` with
-   each violation's severity, title, file and line; retain the returned ids
-   for <Synthesize/> without opening them again. A phase with no Rust change runs only the
-   banned-words scan under <StyleReview/>. Blind reviewers never audit style.
+   `${IMPL_SUMMARY}` claims. Style belongs to the assigned reviewer under
+   <ReviewPromptContract/>; the director does not load or walk the guide.
    The summaries' self-reports per <WritePromptContract/> — what a slot was unsure
    about, what it could not verify, what it touched outside its file set — are
    this read's alone: no lens receives a summary, so a stated doubt is a place
    only the main review can go looking. Say where this read did not reach. Later
    passes read only repair paths and affected callers, consumers, transitions,
-   or invariants; do not repeat the checklist walk.
+   or invariants.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
@@ -279,7 +316,8 @@ final diff only.
    finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
    old-diff review remains active. A canceled review supplies no verdict or
-   direct-fix agreement.
+   direct-fix agreement. Any owed style assignment follows
+   <ReviewPromptContract/> on the next reviewer dispatch.
 6. Otherwise finish the main pass and let <DispatchContract/> await every blind
    reviewer by its host-specific path. Each completed dispatch loads the summary
    named by its handle into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
@@ -293,6 +331,8 @@ Run `findings.py status` and write a prompt under <ReviewPromptContract/> that
 contains only:
 
 - The role-switch opening from <ReviewPromptContract/>.
+- The style assignment from <ReviewPromptContract/> when still owed, with the
+  complete phase diff and baseline; its scope is separate from the repair diff.
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
@@ -308,8 +348,9 @@ contains only:
 - The `## Type Design Contract` section using <WritePromptContract/> item 7's
   follow-up pointer.
 
-Forbid whole-phase and already-reviewed design findings, and style or polish
-findings on code the repair did not write. An outside-path problem is valid
+Outside an owed style assignment, forbid whole-phase and already-reviewed
+design findings, and style or polish findings on code the repair did not write.
+An outside-path problem is valid
 only when a quoted repair hunk causes it. Omit the broad questions and Type
 Design questions.
 

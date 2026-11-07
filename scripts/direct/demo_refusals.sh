@@ -13,30 +13,40 @@ scratch=$(mktemp -d /tmp/direct-refusals.XXXXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 step="scratch setup"
 trap 'printf "FAILED: %s (exit %s)\n" "$step" "$?" >&2' ERR
-mkdir -p "$scratch/home" "$scratch/history" "$scratch/ledger" "$scratch/run"
+mkdir -p "$scratch/home" "$scratch/history" "$scratch/run"
 export HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export UNIT_HISTORY_DIR="$scratch/history" PLAN_DELEGATE_HISTORY_DIR="$scratch/history"
-export AGENTS_CONFIG_FILE="$scratch/agents.conf"
-export AGENTS_CONFIG_PUBLISH=0
-export UNIT_CONFIG="$scratch/direct.conf" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
+export MODELS_CONFIG_FILE="$scratch/models.conf"
+export MODELS_CONFIG_PUBLISH=0
+export CONF_DIR="$scratch" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
 unset CLAUDE_CODE_SESSION_ID
-: > "$AGENTS_CONFIG_FILE"
+: > "$MODELS_CONFIG_FILE"
 # Fix the demo's thresholds so local tuning cannot change its examples.
-cat > "$UNIT_CONFIG" <<'CONFIG'
+cat > "$CONF_DIR/direct.conf" <<'CONFIG'
+# whole: 1..
 MIN_REPAIR_BUDGET=3
+# range: 5e-324..
 REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
 RUNAWAY_ROUNDS=5
+# whole: 1..
 MAX_FIX_ATTEMPTS=2
+# whole: 1..
 MAX_REOPENS=2
+# whole: 1..
 STALLED_ROUNDS=2
+# whole: 1..
 MAX_CONSECUTIVE_SAME_KIND_PASSES=3
+# whole: 0..
 MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
 ROUTING_FROM_ROUND=4
+# whole: 1..
 ASTRA_AFTER_FAILED_FIXES=2
 CONFIG
 
-F() { "$tools_dir/../lib/py" "$tools_dir/findings.py" "$@" --session-dir "$scratch/ledger"; }
+F() { "$tools_dir/../lib/py" "$tools_dir/findings.py" "$@" --session-dir "$scratch/run"; }
 P() { "$tools_dir/../lib/py" "$tools_dir/progress_history.py" "$@" --session-dir "$scratch/run"; }
 setup() {
     step="$1"; shift
@@ -66,15 +76,29 @@ passes() {
     setup "$step: passing call" "$@"
     printf 'exit=0\n'
 }
+record_fix() {
+    UNIT_PASS_OWNER=launcher setup "start repair $1" P start-pass \
+        --pass-kind fix --phase-id 1 --fix-pass "$1" --activity "Repair the demo finding" \
+        --called-task direct.fix --called-family claude --called-model opus --called-effort high
+    UNIT_PASS_OWNER=launcher setup "finish repair $1" P finish-pass --status completed
+}
+
+printf 'Phase 1 — Demo phase\n' > "$scratch/phase.md"
+printf 'Phase 9 — Some other phase\n' > "$scratch/stale.md"
+setup "start recorded run" P start-run --working-dir "$scratch" \
+    --main-family claude --main-model opus --main-effort high --main-session-id demo
+setup "open demo phase" P start-phase --phase-id 1 --phase-title "Demo phase" --work-order-file "$scratch/phase.md"
 
 setup "open finding" F open --severity blocker --title "Demo finding" --caught-by main
 refuse "1. Accepted checks are required" \
     '--accepted-checks is required: name affected accepted checks or "none: <why>"' \
     F dispatch --covers F001
 passes F dispatch --covers F001 --accepted-checks "none: demo edits reach no accepted behavior"
+record_fix 1
 setup "land first repair" F landed
 setup "first failed fix" F verdict --id F001 --state still_open
 setup "second repair" F dispatch --covers F001 --accepted-checks "none: demo"
+record_fix 2
 setup "land second repair" F landed
 setup "second failed fix" F verdict --id F001 --state still_open
 printf 'F001: two fixes failed. Try a different approach.\n' > "$scratch/note.md"
@@ -83,6 +107,7 @@ refuse "2. Astra review is due after two failed fixes" \
     F dispatch --covers F001 --accepted-checks "none: demo"
 passes F astra --id F001 --note "$scratch/note.md" --approach "Use a different repair approach"
 passes F dispatch --covers F001 --accepted-checks "none: demo"
+record_fix 3
 setup "land third repair" F landed
 setup "third failed fix" F verdict --id F001 --state still_open
 setup "round four Astra record" F astra --id F001 --note "$scratch/note.md" --approach "Check the failure before editing"
@@ -91,11 +116,6 @@ refuse "3. Round four requires kept evidence" \
     F dispatch --covers F001 --accepted-checks "none: demo"
 passes F dispatch --covers F001 --accepted-checks "none: demo" --keep "F001=broken:demo evidence"
 
-printf 'Phase 1 — Demo phase\n' > "$scratch/phase.md"
-printf 'Phase 9 — Some other phase\n' > "$scratch/stale.md"
-setup "start recorded run" P start-run --working-dir "$scratch" \
-    --main-family claude --main-model opus --main-effort high --main-session-id demo
-setup "open demo phase" P start-phase --phase-id 1 --phase-title "Demo phase" --work-order-file "$scratch/phase.md"
 refuse "4. A recorded launch requires its phase" \
     'Missing phase: --phase-id is required for a recorded run' \
     P check-launch --pass-kind impl

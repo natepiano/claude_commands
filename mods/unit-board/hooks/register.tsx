@@ -11,7 +11,7 @@ import { QueueView } from './queue';
 import type { QueuePaneState, QueueLines, QueueSelection } from '../types/queue';
 
 const PANE = 'unit-board';
-const ACCOUNTS = 'accounts-board';
+const ACCOUNTS = 'accounts';
 const ACCOUNT_PANES = { plugin: 'unit-board', key: 'accountsPanes' } as const;
 const QUEUE = 'build-queue';
 const QUEUE_PANES = { plugin: 'unit-board', key: 'queuePanes' } as const;
@@ -47,7 +47,7 @@ function commandSelection(data: BoardSnapshot<BoardData>, wanted: string): Selec
 }
 
 function retainWatch(active: OpenPane, path: RefreshPaths) {
-  if (path.kind === 'board') { active.paths.push(path); return; }
+  if (path.kind !== 'discovery') { active.paths.push(path); return; }
   const previous = active.paths.filter(path => path.kind === 'discovery');
   active.paths = [...active.paths.filter(path => path.kind === 'board'), {
     kind: 'discovery', sources: [...new Set([...previous.flatMap(path => path.sources), ...path.sources])],
@@ -148,9 +148,23 @@ interface TablePaneCalls<Ready, Context> {
 function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settings: TablePaneSettings) {
   let lifecycle: TablePaneLifecycle<Context> = { kind: 'closed', generation: 0 };
   let latestGeneration = 0;
+  const load = async (calls: TablePaneCalls<Ready, Context>, current: OpenTablePane<Context>) => {
+    const isOpen = () => lifecycle === current;
+    let pendingPaths = current.paths;
+    try {
+      const fresh = await calls.load(current.context, isOpen, paths => { pendingPaths = paths; });
+      if (isOpen()) current.paths = pendingPaths;
+      return fresh;
+    } catch (error) {
+      // A first load still needs discovery watches for recovery. Once loaded,
+      // keep all previous watches until a replacement succeeds.
+      if (isOpen() && !current.paths.length) current.paths = pendingPaths;
+      throw error;
+    }
+  };
   const read = async (calls: TablePaneCalls<Ready, Context>, current: OpenTablePane<Context>) => {
     const isOpen = () => lifecycle === current;
-    const fresh = await calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; });
+    const fresh = await load(calls, current);
     if (isOpen()) await calls.put(fresh, isOpen);
   };
   const refresh = async (calls: TablePaneCalls<Ready, Context>, force = false) => {
@@ -168,7 +182,7 @@ function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settin
         return;
       }
       const regenerated = await refreshIfChanged({ stat: path => calls.stat(path) }, current.paths,
-        () => calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; }),
+        () => load(calls, current),
         fresh => calls.put(fresh, isOpen), isOpen);
       if (regenerated || !isOpen()) return;
       const state = await calls.read();
@@ -254,12 +268,15 @@ function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, Ac
 async function queueRun($: EngineInterface, args: string[], isOpen = () => true) {
   const home = await $.env.get('HOME');
   if (!home || !isOpen()) throw new Error('Build queue could not be read.');
-  const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
-    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args]);
+  const argv = [`${home}/.claude/scripts/lib/py`,
+    `${home}/.claude/scripts/build_queue/build_queue.py`, ...args];
+  const result = args[0] === 'bump' || args[0] === 'clear' || args[0] === 'admit-head'
+    ? await $.process.run(argv, { env: { CLAUDE_CODE_SESSION_ID: await $.session.id() } })
+    : await $.process.run(argv);
   if (!isOpen()) throw new Error('Build queue could not be read.');
-  if (args[0] === 'priority' && result.exitCode === 3 && !result.isStdoutTruncated) {
-    const refusal = result.stdout.trim();
-    if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
+  if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
+    const selectorError = result.stdout.trim();
+    if (/^build queue: [^\r\n]+$/.test(selectorError)) return selectorError;
   }
   if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('Build queue could not be read.');
   return result.stdout;
@@ -322,6 +339,7 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
       if (!isOpen()) return;
       const saved = normalizeQueueState(previous[QUEUE]);
       if (state.kind === 'loading' && saved.kind === 'loading') return;
+      if (state.kind === 'failed' && saved.kind === 'queue') return;
       const selected: QueuePaneState = state.kind === 'queue' ? state : { ...state, selection: saved.selection };
       await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: selected });
     },
@@ -351,7 +369,6 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const accountsGeneration = accounts.checkpoint();
     const queueGeneration = queue.checkpoint();
-    await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
       startTimer($, opened, PANE, await $.session.id());
@@ -397,7 +414,7 @@ export const register: Register = on => {
     } finally { active.busy = false; }
     return { text: 'Unit board opened.' };
   });
-  on('command.run', { command: ACCOUNTS }, async ($, e) => {
+  on('command.run', { command: 'showrunner:accounts' }, async ($, e) => {
     if (e.args.trim() === 'close') {
       await $.ui.close({ id: ACCOUNTS });
       return { text: 'Accounts closed.' };
@@ -413,10 +430,10 @@ export const register: Register = on => {
     }
     if (/^bump(?:\s|$)/.test(wanted)) {
       const words = wanted.split(/\s+/);
-      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
+      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <position|session|folder>' };
       let line: string;
       try {
-        const output = await queueRun($, ['priority', 'set', '--unit', words[1], '--why', "the user's bump"]);
+        const output = await queueRun($, ['bump', words[1]!]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }

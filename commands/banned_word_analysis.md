@@ -1,5 +1,5 @@
 ---
-description: Show forbidden-word hit counts and last-triggered timestamps
+description: Report forbidden word counts and times.
 ---
 
 Show the local banned-word counter report.
@@ -15,7 +15,7 @@ tokens, so raw phrases like "latest trigger" silently fall back to count-sort.
   "newest", "by time", "when", etc. → run:
 
   ```bash
-  python3 ~/.claude/scripts/hooks/banned_words_lib.py --analysis last-triggered
+  ~/.claude/scripts/lib/py ~/.claude/scripts/hooks/banned_words_lib.py --analysis last-triggered
   ```
 
   This sorts newest-first; never-triggered words sort last.
@@ -24,7 +24,7 @@ tokens, so raw phrases like "latest trigger" silently fall back to count-sort.
   "most", "top", "frequency", "worst offenders") or are empty/ambiguous → run:
 
   ```bash
-  python3 ~/.claude/scripts/hooks/banned_words_lib.py --analysis
+  ~/.claude/scripts/lib/py ~/.claude/scripts/hooks/banned_words_lib.py --analysis
   ```
 
   This sorts by count, descending.

@@ -4,21 +4,22 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-import re
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.lib.conf import UseConfiguredValue
+from scripts.message import session_send
+from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
-SEND_SCRIPT = Path(__file__).resolve().parents[1] / "message/send.py"
-# A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
-_UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
+TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,16 @@ class PushExample:
 
 
 @dataclass(frozen=True)
+class TemplateValues:
+    displayed: dict[str, str]
+    supplied: dict[str, str]
+
+
+def display_values(given: dict[str, str]) -> TemplateValues:
+    return TemplateValues(dict(given), dict(given))
+
+
+@dataclass(frozen=True)
 class PushText:
     id: str
     sender: str
@@ -59,6 +70,7 @@ class PushText:
     header: bool = True
     # An agent writes the text at send time; no person approved it, so check it like free text.
     agent_written: bool = False
+    expand_values: Callable[[dict[str, str]], TemplateValues] = display_values
 
 
 @dataclass(frozen=True)
@@ -79,7 +91,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")
@@ -91,10 +103,45 @@ def catalog() -> tuple[PushText, ...]:
     return entries
 
 
-def shown_value(key: str, value: str) -> str:
-    """A session name loses its "-unit" end: the {sender} and {session} values, and any value that is
-    a whole unit id. Free text keeps every word, "per-unit" included (reviewer, 2026-10-21)."""
-    return value.removesuffix("-unit") if key in ("sender", "session") or _UNIT_ID.fullmatch(value) else value
+
+
+@dataclass(frozen=True)
+class DecisionChoice:
+    label: str
+    effect: str
+
+
+def decision_values(given: dict[str, str]) -> TemplateValues:
+    """Build decision rows from structured choices."""
+    for key, value in given.items():
+        if key != "choices" and value.splitlines() != [value]:
+            raise ValueError("decision.choices: values must have one line")
+    try:
+        raw = cast(object, json.loads(given.get("choices", "")))
+    except ValueError as error:
+        raise ValueError("decision.choices: choices must be a JSON list of label/effect objects") from error
+    if not isinstance(raw, list):
+        raise ValueError("decision.choices: choices must be a JSON list")
+    choices: list[DecisionChoice] = []
+    for item in cast(list[object], raw):
+        if not isinstance(item, dict):
+            raise ValueError("decision.choices: each choice needs a label and effect")
+        fields = cast(dict[str, object], item)
+        label, effect = fields.get("label"), fields.get("effect")
+        if (set(fields) != {"label", "effect"} or not isinstance(label, str)
+                or not isinstance(effect, str) or not label.strip() or not effect.strip()
+                or label.splitlines() != [label] or effect.splitlines() != [effect]):
+            raise ValueError("decision.choices: each choice needs a nonempty label and effect")
+        choices.append(DecisionChoice(label.strip(), effect.strip()))
+    if len(choices) < 2 or len({choice.label.casefold() for choice in choices}) != len(choices):
+        raise ValueError("decision.choices: supply at least two distinct choices")
+    if given.get("recommended_choice") not in {choice.label for choice in choices}:
+        raise ValueError("decision.choices: recommended_choice must name a listed choice")
+    if "choice_labels" in given:
+        raise ValueError("decision.choices: choice_labels is generated from choices")
+    displayed = dict(given) | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
+                    "choices": "\n".join(f"{choice.label}: {choice.effect}" for choice in choices)}
+    return TemplateValues(displayed, dict(given))
 
 
 def render_entry(entry: PushText, given: dict[str, str]) -> RenderedPush:
@@ -110,12 +157,13 @@ def render_entry(entry: PushText, given: dict[str, str]) -> RenderedPush:
                 if not field.isidentifier():
                     raise ValueError(f"{entry.id}: placeholder must be a name: {field}")
                 fields.add(field)
-    values = {key: shown_value(key, value) for key, value in given.items()}
+    expanded = entry.expand_values(given)
+    values = expanded.displayed
     if fields != set(values):
         raise ValueError(f"{entry.id}: missing values {sorted(fields - set(values))}; extra values {sorted(set(values) - fields)}")
     action = ActionRequired(entry.action.text.format(**values)) if isinstance(entry.action, ActionTemplate) else NoActionRequired()
     return RenderedPush(entry.id, entry.sender.format(**values), entry.need,
-                        entry.title.format(**values), action, entry.body.format(**values), dict(values),
+                        entry.title.format(**values), action, entry.body.format(**values), expanded.supplied,
                         SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
                         entry.header)
 
@@ -149,11 +197,12 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
+                   priority: str = "", due: str = "", question: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False,
+                   send_script: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats.
     `self_clearing`: the caller retires its own blocked push, so send.py needs no --clears-when."""
-    command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
-               "--need", rendered.need, "--text-id", rendered.id]
+    command = session_send.send_argv("--to", "user", "--from", sender or rendered.sender,
+                                     "--need", rendered.need, "--text-id", rendered.id, send_script=send_script)
     if key:
         command.extend(["--key", key])
     if self_clearing:
@@ -162,6 +211,10 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
         command.extend(["--value", f"{name}={value}"])
     if machine:
         command.extend(["--machine", machine])
+    if question:
+        command.extend(["--question", question])
+    if due:
+        command.extend(["--due", due])
     if priority:
         command.extend(["--priority", priority])
     if timeout:
@@ -171,7 +224,7 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
 
 def user_retire_argv(sender: str, key: str) -> list[str]:
     """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""
-    return [sys.executable, str(SEND_SCRIPT), "retire", "--to", "user", "--from", sender, "--key", key]
+    return session_send.send_argv("retire", "--to", "user", "--from", sender, "--key", key)
 
 
 class FilledExampleRecord(TypedDict):

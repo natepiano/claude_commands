@@ -1,5 +1,5 @@
 ---
-description: Show or edit which lint checks run — across /unit:direct phases and the lint CLI
+description: Set which lint checks run.
 ---
 
 # lint_config
@@ -50,12 +50,13 @@ effect on the next run of each consumer; nothing needs restarting.
 | Check | Runs | Where it applies |
 |---|---|---|
 | `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, validate_ci mend steps, `verify.sh lint`) |
-| `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` main phase review |
+| `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` reviewer worker |
 | `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, `verify.sh lint`) |
 | `doc` | `cargo doc -D warnings` | standalone `lint doc` only; `verify.sh doc` ignores this switch |
 | `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`) |
 
-Consumers: `/unit:style_review` reads the style switch, and
+Consumers: `scripts/lint/style_review.py` reads the style switch for both
+review launchers and `/unit:style_review`, and
 `scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI
 and `scripts/direct/verify.sh`.
 <PhaseChecks/> defines each phase's checks. `LINT_OP_STYLE_REVIEW=off` makes

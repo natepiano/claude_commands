@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build-moment comparisons over fixture logs and fixture progress history."""
 
 from __future__ import annotations
@@ -7,7 +7,6 @@ import json
 import os
 import sqlite3
 import subprocess
-import sys
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -15,15 +14,13 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import index
-import memory
-import moments
-import report
-import store
-import test_report as report_fixtures
-import test_memory_window as memory_fixtures
-from test_index import Record, call, sample, step
-from test_memory_window import write_lint_config
+from scripts.buildlog import index
+from scripts.buildlog import memory, moments, report
+from scripts.buildlog import store
+from scripts.buildlog import test_report as report_fixtures
+from scripts.buildlog import test_memory_window as memory_fixtures
+from scripts.buildlog.test_index import Record, call, sample, step
+from scripts.buildlog.test_memory_window import write_lint_config
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
@@ -42,6 +39,25 @@ def build(record_id: str, seconds: float, **fields: object) -> Record:
         "argv": ["cargo", "nextest", "run", "--workspace"],
         "session": record_id, "call_id": record_id, **fields,
     })
+
+
+def moment_fixture(test: unittest.TestCase) -> MomentTests:
+    fixture = MomentTests(methodName="runTest")
+    test.addCleanup(fixture.doCleanups)
+    fixture.setUp()
+    return fixture
+
+
+def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.CompletedProcess[str]:
+    database = index.index_path()
+    before = database.read_bytes()
+    result = subprocess.run(
+        memory_fixtures.configured_host_cli(Path(__file__).with_name("cli.py"), *args),
+        env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
+    )
+    test.assertEqual(result.returncode, 0, result.stderr)
+    test.assertEqual(database.read_bytes(), before)
+    return result
 
 
 class MomentTests(unittest.TestCase):
@@ -67,7 +83,7 @@ class MomentTests(unittest.TestCase):
         # These cases exercise the indexed Hana predicate, including each
         # evidence column in isolation. The index derives these three columns
         # from other source fields, so bind their fixture values after indexing.
-        with closing(sqlite3.connect(self.fixture.root / "index.sqlite")) as fixture_index:
+        with closing(sqlite3.connect(index.index_path_in(self.fixture.root))) as fixture_index:
             with fixture_index:
                 for record in records:
                     if record.get("kind") == "step":
@@ -78,8 +94,8 @@ class MomentTests(unittest.TestCase):
                         )
         return index.read_only()
 
-    def progress(self, events: list[Record], *, root: Path | None = None) -> None:
-        path = (root if root is not None else self.fixture.root / "progress") / "fixture.jsonl"
+    def progress(self, events: list[Record], *, root: Path | None = None, filename: str = "fixture.jsonl") -> None:
+        path = (root if root is not None else self.fixture.root / "progress") / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
 
@@ -134,6 +150,13 @@ class MomentTests(unittest.TestCase):
             build("end-exclusive", 172800, repo="hana", duration_s=99999),
         ]
 
+    def assert_rates(self, rates: moments.WindowRates, expected: dict[moments.MetricKey, float]) -> None:
+        for key, value in expected.items():
+            with self.subTest(rate=key):
+                actual = rates.rates[key]
+                self.assertIsInstance(actual, float)
+                self.assertAlmostEqual(cast(float, actual), value)
+
     def test_each_rate_uses_actual_window_days_and_the_documented_pair_rules(self) -> None:
         self.progress([
             {"event_type": "phase_finished", "status": "completed", "timestamp_epoch": START.timestamp() + 1,
@@ -156,13 +179,13 @@ class MomentTests(unittest.TestCase):
             "pass_reruns": 0.5, "pass_hours": 0.25, "fail_reruns": 0.5, "fail_hours": 1 / 12,
             "clippy": 1.0, "nextest_per_phase": 2.5, "clippy_per_phase": 1.0,
             "clone_rebuilds": 1.5, "clone_hours": 0.75, "clone_repeats_pct": 100 / 3,
+            "run_hours_hana_per_phase": 2.5, "wait_hours_hana_per_phase": 2 / 3,
+            "failed_per_phase": 1.0, "reruns_per_phase": 1.0,
+            "clone_rebuilds_per_phase": 1.5, "clone_hours_per_phase": 0.75,
+            "fail_reruns_per_phase": 0.5, "wait_hours_per_run_hour": 4 / 15,
         }
         self.assertEqual(set(rates.rates), set(expected))
-        for key, value in expected.items():
-            with self.subTest(rate=key):
-                actual = rates.rates[key]
-                self.assertIsInstance(actual, (int, float))
-                self.assertAlmostEqual(cast(float, actual), value)
+        self.assert_rates(rates, expected)
         self.assertEqual(rates.totals["nextest"], 5)
         self.assertEqual(rates.totals["pass_reruns"], 1)
         self.assertAlmostEqual(rates.totals["run_hours_hana"], 5)
@@ -171,8 +194,63 @@ class MomentTests(unittest.TestCase):
         with closing(self.connection(build("hana", 10, repo="hana"))) as connection:
             rates = moments.window_rates(connection, START, END)
         self.assertEqual(rates.phase_count, 0)
-        self.assertIsInstance(rates.rates["nextest_per_phase"], moments.RateUnavailable)
-        self.assertIsInstance(rates.rates["clippy_per_phase"], moments.RateUnavailable)
+        for row in moments.RATE_ROWS:
+            if row.unit in ("runs_per_phase", "hours_per_phase"):
+                with self.subTest(rate=row.key):
+                    self.assertEqual(rates.rates[row.key], moments.RateUnavailable("no natedev hana phases"))
+        self.assertEqual(rates.rates["wait_hours_per_run_hour"], 0)
+
+    def test_phase_rates_use_finished_phases_instead_of_elapsed_days(self) -> None:
+        phases = tuple(moments.PhaseFinished(START.timestamp() + number, f"phase-{number}", "/r/hana")
+                       for number in range(3))
+        with closing(self.connection(*self.rate_records())) as connection:
+            rates = moments.window_rates(connection, START, END, phases=phases)
+        expected: dict[moments.MetricKey, float] = {
+            "nextest_per_phase": 5 / 3, "clippy_per_phase": 2 / 3,
+            "run_hours_hana_per_phase": 5 / 3, "wait_hours_hana_per_phase": 4 / 9,
+            "failed_per_phase": 2 / 3, "reruns_per_phase": 2 / 3,
+            "clone_rebuilds_per_phase": 1, "clone_hours_per_phase": 0.5,
+            "fail_reruns_per_phase": 1 / 3,
+        }
+        self.assertEqual(rates.phase_count, 3)
+        self.assert_rates(rates, expected)
+
+    def test_zero_run_hours_have_no_wait_ratio_but_zero_totals_have_phase_rates(self) -> None:
+        phase = moments.PhaseFinished(START.timestamp(), "phase", "/r/hana")
+        with closing(self.connection(build("waiting", 10, repo="hana", duration_s=0, mem_wait_s=3600))) as connection:
+            rates = moments.window_rates(connection, START, END, phases=(phase,))
+        self.assertEqual(rates.rates["wait_hours_per_run_hour"], moments.RateUnavailable("no run_hours_hana"))
+        self.assertEqual(rates.rates["run_hours_hana_per_phase"], 0)
+        self.assertEqual(rates.rates["wait_hours_hana_per_phase"], 1)
+        self.assertEqual(rates.rates["failed_per_phase"], 0)
+        self.assertEqual(rates.rates["clone_rebuilds_per_phase"], 0)
+
+    def test_rate_table_orders_work_rates_first_and_names_every_unit(self) -> None:
+        phases = (moments.PhaseFinished(START.timestamp(), "before", "/r/hana"),
+                  moments.PhaseFinished(END.timestamp(), "after", "/r/hana"))
+        with closing(self.connection(*self.rate_records())) as connection:
+            before = moments.window_rates(connection, START, END, phases=phases)
+            after = moments.window_rates(connection, END, END + timedelta(days=1), phases=phases)
+        lines = report.moment_rate_table(before, after, moments.BuildMoment(END, "fixture change", "all"))
+        self.assertEqual(lines[0], "| Rate | Before | After | Change |")
+        rows = [line.split("|")[1:5] for line in lines[2:] if line.startswith("|")]
+        self.assertEqual([row[0].strip() for row in rows[:10]], [
+            "Hana nextest / phase", "Hana clippy / phase", "Hana run hours / phase",
+            "Hana wait hours / phase", "Hana nextest failed / phase", "Hana nextest reruns / phase",
+            "Hana clone rebuilds / phase", "Hana clone rebuild hours / phase",
+            "Hana same-worker fail then fail / phase", "Hana wait hours / run hour",
+        ])
+        cells = {row[0].strip(): row[1].strip() for row in rows}
+        self.assertEqual(cells["Hana nextest / phase"], "5.0 /phase")
+        self.assertEqual(cells["Hana run hours / phase"], "5.0 h /phase")
+        self.assertEqual(cells["Hana wait hours / run hour"], "0.3 h wait / h run")
+        self.assertEqual(cells["Run hours, hana"], "2.5 h /day")
+        self.assertEqual(cells["Hana nextest steps"], "2.5 /day")
+        self.assertEqual(cells["Hana nextest failed"], "40.0%")
+        self.assertIn("Hana phases finished: before 1, after 1.", lines)
+        self.assertIn("Per-day rows follow load; per-phase counts do not. "
+                      + "Per-phase hours still fall on a quieter machine. "
+                      + "We assume phases have about the same size on both sides.", lines)
 
     def test_redirected_log_uses_fixture_progress_when_no_progress_override_is_set(self) -> None:
         self.progress([{
@@ -218,7 +296,7 @@ class MomentTests(unittest.TestCase):
         self.assertEqual([(entry.args[1], entry.args[2]) for entry in grouped.call_args_list],
                          [(at - timedelta(days=7), at), (at, now)])
         nextest = next(line for line in lines if line.startswith("| Hana nextest steps |"))
-        self.assertEqual([cell.strip() for cell in nextest.strip("|").split("|")][2], "4.0")
+        self.assertEqual([cell.strip() for cell in nextest.strip("|").split("|")][2], "4.0 /day")
         self.assertEqual(self.fixture.rows(lines)[0][3:], ["1", "20.0 s", "1", "40.0 s", "—"])
         self.assertIn("Before: 7.000 days; after: 0.250 days (thin).", lines)
 
@@ -383,6 +461,7 @@ class MomentTests(unittest.TestCase):
         lines = self.section(day="2026-10-31")
         comparisons = [line for line in lines if line.startswith("Before ")]
         expected = (
+            ("Queue test-phase charge (2a819dfd)", "2026-10-31 20:36:00 UTC"),
             ("Build rules 1 (Moment 1)", "2026-10-31 10:50:00 UTC"),
             ("Floor sweep (e3b8e391)", "2026-10-29 18:26:00 UTC"),
             ("hana Bevy dylib", "2026-10-29 09:33:00 UTC"),
@@ -422,16 +501,9 @@ class MomentTests(unittest.TestCase):
             closing(self.connection(build("measured", 3600, repo="hana"))) as connection,
         ):
             expected = report.moments_section(connection, "2026-10-30")
-        database = self.fixture.root / "index.sqlite"
-        before = database.read_bytes()
-        result = subprocess.run(
-            [sys.executable, str(Path(report.__file__).with_name("cli.py")), "moments", "2026-10-30"],
-            env={**os.environ, "BUILDLOG_PROGRESS_DIR": str(self.fixture.root / "progress")},
-            capture_output=True, text=True, check=False, timeout=60,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = read_only_cli(self, ["moments", "2026-10-30"])
         self.assertEqual(result.stdout.splitlines(), expected)
-        self.assertEqual(database.read_bytes(), before)
+
 
 
 class MemoryMomentTests(unittest.TestCase):
@@ -440,11 +512,9 @@ class MemoryMomentTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = MomentTests(methodName="runTest")
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
-        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
+        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", side_effect=memory_fixtures.configured_local_host)))
 
     def memory_cells(self, lines: list[str]) -> dict[str, dict[str, str]]:
         start = next(number for number, line in enumerate(lines) if line.startswith("| Memory "))
@@ -481,6 +551,7 @@ class MemoryMomentTests(unittest.TestCase):
         return records
 
     def test_configured_kill_level_changes_the_python_split_and_definition(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         self.journal.stub_journal(early=[
             memory_fixtures.journal_entry(at + timedelta(minutes=1),
@@ -488,7 +559,7 @@ class MemoryMomentTests(unittest.TestCase):
             memory_fixtures.journal_entry(at + timedelta(minutes=2),
                 memory_fixtures.earlyoom_message(107, adj=500, cmdline="/usr/bin/editor")),
             memory_fixtures.journal_entry(at + timedelta(minutes=3),
-                memory_fixtures.earlyoom_message(108, adj=200, cmdline="/work/target/debug/test")),
+                memory_fixtures.earlyoom_message(108, adj=200, cmdline=f"{target}/debug/test")),
         ], kernel=[])
         config = write_lint_config(self.journal.base, 650)
         with closing(self.fixture.connection()):
@@ -496,7 +567,7 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-import index, memory, moments, report
+from scripts.buildlog import index, memory, moments, report
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)
@@ -507,8 +578,8 @@ with index.read_only() as connection:
     print("\\n".join(report.moments_section(connection, "2026-10-11")))
 '''
         result = subprocess.run(
-            [sys.executable, "-c", program], capture_output=True, text=True, check=False,
-            timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
+            timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                              "PYTHONPATH": str(Path(report.__file__).parent)},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -544,15 +615,16 @@ with index.read_only() as connection:
         self.assertEqual(sum("A window shorter than 2 day is thin" in line for line in section), 1)
 
     def test_memory_table_counts_kills_stalls_zero_waits_and_stopped_retries(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         moment = moments.MemoryMoment(at, "fixture budget raise")
         before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]
-        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline="/work/target/debug/test"))
+        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline=f"{target}/debug/test"))
         before_messages.extend((memory_fixtures.earlyoom_message(11, adj=200, cmdline="/usr/bin/editor"),
                                 memory_fixtures.earlyoom_message(12, adj=None)))
         after_messages = [memory_fixtures.earlyoom_message(20),
-                          memory_fixtures.earlyoom_message(21, adj=200, cmdline="/work/target/debug/test"),
-                          memory_fixtures.earlyoom_message(22, adj=100, cmdline="/work/target/release/test"),
+                          memory_fixtures.earlyoom_message(21, adj=200, cmdline=f"{target}/debug/test"),
+                          memory_fixtures.earlyoom_message(22, adj=100, cmdline=f"{target}/release/test"),
                           memory_fixtures.earlyoom_message(23, adj=None)]
         self.journal.stub_journal(early=[
             *(memory_fixtures.journal_entry(at - timedelta(minutes=10), message) for message in before_messages),

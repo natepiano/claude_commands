@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Sync pauses and Mac command status stay within a temporary state root."""
 
 from __future__ import annotations
@@ -19,20 +19,17 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import ci
-import cli
-import index
-import health
-import record
-import rust_release
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
+from scripts.buildlog import ci, cli
+from scripts.buildlog import index
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import rust_release
+from scripts.buildlog import store
+from scripts.buildlog import sync, vault_pull
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
@@ -48,8 +45,12 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, "BUILDLOG_PEER": "test-mac"}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(Path(temporary)),
+            "HOME": temporary, "BUILDLOG_PEER": "test-mac",
+        }))
         self.commands = []
         self.responses = []
         _ = self.enterContext(mock.patch.object(subprocess, "run", new=self.fake_run))
@@ -124,6 +125,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("natedev")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/Mac/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         # Whole subtrees include launch-only and sample-only hosts and nested
         # saved logs; no monthly-file discovery or extension filter is involved.
@@ -150,6 +152,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("Mac")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/natedev/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         self.assertEqual(filters[-1], "--exclude=*")
 
@@ -255,7 +258,7 @@ class SyncTests(unittest.TestCase):
         def run_ssh(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             self.commands.append(args)
             worker.start()
-            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(waiting.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
             self.assertFalse(returned.is_set())
             return subprocess.CompletedProcess(args, 255, stdout="", stderr="unreachable")
 
@@ -264,7 +267,7 @@ class SyncTests(unittest.TestCase):
             mock.patch.object(sync, "print", record_line, create=True),
         ):
             self.assertEqual(sync.sync(), 0)
-            worker.join(TEST_HANG_GUARD_SECS)
+            worker.join(test_hang_guard.TEST_HANG_GUARD_SECS)
 
         self.assertFalse(worker.is_alive())
         self.assertTrue(returned.is_set())

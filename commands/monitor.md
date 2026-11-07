@@ -1,5 +1,5 @@
 ---
-description: Switch which computer a monitor displays, or turn it off and on, over DDC/CI.
+description: Switch monitor inputs or power.
 ---
 
 **Arguments**: $ARGUMENTS — an optional monitor (`dell`, `samsung`) and an optional destination (`mac`, `linux`) or power state (`on`, `off`), in either order. Naming neither means report the current state.

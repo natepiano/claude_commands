@@ -17,6 +17,7 @@ from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 from scripts.production.merge_gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
@@ -38,18 +39,18 @@ class MergeGateHoldTests(TemporaryHoldTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        hold_environment = {name: os.environ[name] for name in (
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
+            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID", "UNIT_ACTIVE_DIR",
+            "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
+        )}
         self.addCleanup(self.gate.doCleanups)
         self.gate.setUp()
         self.gate.restore_fixture(suites_for_case(self))
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
-        self.environment = {**self.gate.environment, **{
-            name: os.environ[name] for name in (
-                "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "BUILD_TARGETS_CONFIG",
-                "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
-                "UNIT_ACTIVE_DIR", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
-                "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
-            )
-        }}
+        _ = (Path(self.gate.environment["CONF_DIR"]) / "build_targets.conf").write_bytes(
+            (self.root / "build_targets.conf").read_bytes())
+        self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
 
     def record(self, event: str) -> None:
@@ -62,11 +63,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_each_mode_waits_before_tests_types_or_promotion(self) -> None:
         arguments = ["--repo", str(self.gate.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                     "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit",
+                     "--previous-checkpoint", self.gate.base, "--unit", "fixture",
                      "--phase", "hold", "--type-dirs", "scripts/production",
-                     "--production", str(self.gate.quiet_production),
-                     "--settings-blob", self.gate.settings_blob,
-                     "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
+                     "--production", "quiet",
+                          "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
             with self.subTest(mode=mode):
                 os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + "-".join(mode)))
@@ -159,22 +159,25 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.assertIn("Gate tests: 0.00s;", output.getvalue())
 
     def test_final_hold_read_error_undoes_the_merge_without_pushing(self) -> None:
-        check_settings = merge_gate.check_settings
+        wait_until_free = merge_gate.BuildHoldWait.wait_until_free
+        reads = 0
 
-        def fail_final_hold_read(repo: Path, revision: str, approved: str) -> None:
-            check_settings(repo, revision, approved)
-            self.assertNotEqual(self.gate.git(repo, "rev-parse", "HEAD"), self.gate.base)
-            self.unreadable()
+        def fail_final_hold_read(hold: merge_gate.BuildHoldWait) -> None:
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                self.assertNotEqual(self.gate.git(self.gate.checkout, "rev-parse", "HEAD"), self.gate.base)
+                self.unreadable()
+            wait_until_free(hold)
 
         output = io.StringIO()
-        with mock.patch.object(merge_gate, "check_settings", side_effect=fail_final_hold_read), \
+        with mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", fail_final_hold_read), \
                 contextlib.redirect_stderr(output), redirect_stdout(output):
             code = merge_gate.main([
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit", "--phase", "hold",
-                "--production", str(self.gate.quiet_production), "--type-dirs", "scripts/production",
-                "--settings-blob", self.gate.settings_blob,
+                "--previous-checkpoint", self.gate.base, "--unit", "fixture", "--phase", "hold",
+                "--production", "quiet", "--type-dirs", "scripts/production",
             ])
         self.assertNotEqual(code, 0, output.getvalue())
         self.assertIn("natedev hold state cannot be read", output.getvalue())
@@ -247,7 +250,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
     def test_unreadable_hold_state_refuses_before_any_job(self) -> None:
         self.unreadable()
-        with self.assertRaisesRegex(merge_gate.GateRefused, "natedev hold state cannot be read"):
+        with self.assertRaisesRegex(GateRefused, "natedev hold state cannot be read"):
             _ = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
         self.assertEqual(self.gate.calls(), [])
         self.assertEqual(self.gate.module_events(), [])

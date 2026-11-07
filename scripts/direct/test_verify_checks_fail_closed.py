@@ -6,9 +6,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
-from typing import override
+from typing import cast, override
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_protocol as wire
 
 from scripts.direct import test_verify_mac_offload as offload_tests
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 CHECK_STUB = '''
@@ -29,50 +32,24 @@ if command == os.environ.get("TEST_BROKEN_CHECK"):
     if mode == "invalid":
         print("not a target table")
         raise SystemExit(0)
+    if mode == "tabbed-settings":
+        print("mac_allowed")
+        print("mac\\teligible\\t-\\t/tmp/mac\\tsettings.conf\\tmacos")
+        raise SystemExit(0)
     if mode == "held":
         raise SystemExit(10)
     if mode == "error":
         raise SystemExit(12)
 if command == "eligible":
     print("mac_allowed" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
-    print("natedev\\teligible\\t-\\t-")
+    print("natedev\\teligible\\t-\\t-\\t-")
     if os.environ.get("TEST_ELIGIBLE_MAC"):
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 if command == "wait-local" and os.environ.get("TEST_REMOVE_CHECK") == "1":
     Path(__file__).unlink()
 raise SystemExit(0)
 '''
 
-
-MEMORY_STUB = '''
-import os
-from pathlib import Path
-import sys
-
-if sys.argv[1] == "release":
-    Path(sys.argv[2]).unlink(missing_ok=True)
-    raise SystemExit(0)
-mode = os.environ.get("TEST_MEMORY_FAILURE", "")
-if mode == "usage":
-    print("usage: invalid memory check", file=sys.stderr)
-    raise SystemExit(2)
-if mode == "crash":
-    raise RuntimeError("memory check failed")
-reservation = Path(os.environ["TEST_RESERVATION"])
-if mode == "invalid":
-    print("admit")
-elif mode == "empty":
-    pass
-elif mode == "unknown":
-    print("deny|0|0|fallback|0|0|0|0|||sample|check|0|invalid|-")
-elif mode == "numeric":
-    print("admit|bad|0|fallback|0|0|0|0||" + str(reservation) + "|sample|check|0|reserved|-")
-elif mode == "untracked":
-    print("admit|0|0|fallback|0|0|0|0|||sample|check|0|untracked|-")
-else:
-    reservation.write_text("{}")
-    print("admit|0|0|fallback|0|0|0|0||" + str(reservation) + "|sample|check|0|reserved|-|0|0|")
-'''
 
 
 class VerifyChecksFailClosedTests(unittest.TestCase):
@@ -81,6 +58,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         self.fixture: offload_tests.VerifyMacOffloadTests = offload_tests.VerifyMacOffloadTests("runTest")
         self.targets: Path = Path()
         self.memory: Path = Path()
+        self.admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
         self.invoke: Path = Path()
 
     @override
@@ -96,10 +74,16 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             target = lint / path.name
             if path.name in {"invoke.sh", "memory_gate.sh"}:
                 _ = shutil.copyfile(path, target)
-            elif path.name != "memory_admit.py":
+            else:
                 target.symlink_to(path, target_is_directory=path.is_dir())
-        self.memory = lint / "memory_admit.py"
-        _ = self.memory.write_text(MEMORY_STUB)
+        queue = scripts / "build_queue"
+        queue.unlink()
+        queue.mkdir()
+        for path in (source.parent / "build_queue").iterdir():
+            if path.name != "admission_client.py":
+                (queue / path.name).symlink_to(path, target_is_directory=path.is_dir())
+        self.memory = queue / "admission_client.py"
+        self.restore_client()
         self.invoke = lint / "invoke.sh"
         self.targets = self.fixture.root / "check.py"
         _ = self.targets.write_text(CHECK_STUB)
@@ -116,6 +100,23 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "UNIT_TEAM_ROLE": "",
             "BUILDLOG_CHECK_FAILED_FILE": "", "LINT_SKIP_SWEEP": "1",
         })
+        self.admission = caller_admission(self, self.fixture.root, self.fixture.environment)
+        self.admission.server.line_filter = self.failure_line
+
+    def restore_client(self) -> None:
+        _ = self.memory.write_text("import sys\n" +
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n" +
+            "from scripts.build_queue.admission_client import main\nraise SystemExit(main())\n")
+
+    def failure_line(self, line: str) -> str:
+        mode = self.fixture.environment.get("TEST_MEMORY_FAILURE", "")
+        if not mode:
+            return line
+        if mode in ("usage", "crash"):
+            return wire.encode_reply(wire.Refused("memory check failed"))
+        return {"empty": "\n", "invalid": "admit\n", "unknown": '{"kind":"deny"}\n',
+                "numeric": '{"kind":"admitted","need":"bad"}\n',
+                "untracked": '{"kind":"admitted"}\n'}.get(mode, line)
 
     def clean_fixture(self) -> None:
         self.assertTrue(self.fixture.doCleanups(), "fixture cleanup failed")
@@ -123,7 +124,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
     def reset_observations(self) -> None:
         self.fixture.cargo_events_path.unlink(missing_ok=True)
         _ = self.targets.write_text(CHECK_STUB)
-        _ = self.memory.write_text(MEMORY_STUB)
+        self.restore_client()
 
     def run_step(self) -> subprocess.CompletedProcess[str]:
         # A conditional disables errexit inside the function. The checks must
@@ -134,7 +135,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             ["bash", "-c", command, "test", str(self.invoke)],
             cwd=self.fixture.root, env=self.fixture.environment,
             capture_output=True, text=True, check=False,
-            timeout=offload_tests.HANG_GUARD_S,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def assert_refused(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -214,6 +215,17 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
                                                  "TEST_CHECK_FAILURE": failure})
                 self.assert_refused(self.fixture.verify("test", "sample", "--filter", "smoke", "--no-cache"))
 
+    def test_settings_path_with_a_tab_refuses_before_the_step(self) -> None:
+        self.fixture.environment.update({
+            "TEST_BROKEN_CHECK": "eligible", "TEST_CHECK_FAILURE": "tabbed-settings",
+        })
+        result = self.fixture.verify("test", "sample", "--filter", "smoke", "--no-cache")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("target eligibility check returned invalid targets; step refused", result.stderr)
+        self.assertEqual(self.fixture.runner_events(), [])
+        self.assertEqual([event for event in self.fixture.cargo_events()
+                          if event["args"][:1] != ["metadata"]], [])
+
     def test_routing_hold_error_refuses_before_a_passing_mac_runner(self) -> None:
         self.fixture.environment.update({
             "TEST_BROKEN_CHECK": "register-local", "TEST_CHECK_FAILURE": "error",
@@ -262,7 +274,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             ["bash", "-c", command, "test", str(self.invoke)],
             cwd=self.fixture.root, env=self.fixture.environment,
             capture_output=True, text=True, check=False,
-            timeout=offload_tests.HANG_GUARD_S,
+            timeout=TEST_HANG_GUARD_SECS,
         )
         self.assert_refused(result)
         self.assertTrue(refused.exists())

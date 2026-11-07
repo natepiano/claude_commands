@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
+                         [--below <outstanding.json>]... [--reports-to <root name>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -42,11 +42,11 @@ production's own plumbing words (PLUMBING).
          missing file is an empty list.
 --below  With --footer, once per production below a root showrunner: that
          production's list. Its due items count with --outstanding. A list
-         that cannot be read adds the bullet `<slug>: needs-user list
-         unreadable`, where the slug is the file's name, and never fails the
+         that cannot be read adds the bullet `<name>: needs-user list
+         unreadable`, where the name is the file's name, and never fails the
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
-         `reports to <root slug>`.
+         `reports to <root name>`.
 --doc    With --footer, the production doc: the line after the header counts
          its changes, efficiency and proposals (footer_counts.py). A
          report reads the doc from its input's `doc`.
@@ -54,6 +54,10 @@ production's own plumbing words (PLUMBING).
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -73,15 +77,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import terminal_width
 from scripts.whoami import run_out
 from scripts.whoami import note_file
 from scripts.whoami.run_out import READINGS_LOG, Reading
-from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
+from scripts.build_hold.build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
-import urgency
-from urgency import Urgency, UrgencyError
+from scripts.production.update_registration import (
+    DueNow as DueNow,
+    DeferredUntil as DeferredUntil,
+    Ranking as Ranking,
+    OutstandingReminder as OutstandingReminder,
+    OutstandingQuestion as OutstandingQuestion,
+    ReviewedOutstandingQuestion as ReviewedOutstandingQuestion,
+    ReviewUnavailableOutstandingQuestion as ReviewUnavailableOutstandingQuestion,
+    Outstanding as Outstanding,
+    OutstandingTiming as OutstandingTiming,
+    InputError as InputError,
+    STARTED as STARTED,
+    UNREADABLE_LIST as UNREADABLE_LIST,
+    PLUMBING as PLUMBING,
+    parse_outstanding_entries as parse_outstanding_entries,
+    read_ranking as read_ranking,
+    plumbing as plumbing,
+    check_keys as check_keys,
+)
 
 # The longest update line of each length. `gantt` is the default: the chart, with only what needs the user and
 # what changed above it. It takes the input `simple` takes.
@@ -102,9 +123,7 @@ PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP
 THEN_PHASE_LABEL = re.compile(r"^(\d+(?:\s*[-–]\s*\d+)?)\s*:")
 COUNT = re.compile(r"\b(\d+) [a-z]")
 EXAMPLES = re.compile(r"\bsuch as\b|\be\.g\.|\bfor example\b")
-STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 # What a footer and the open-items list say of a lower production's list that cannot be read.
-UNREADABLE_LIST = "needs-user list unreadable"
 STAMP = "%Y-%m-%dT%H:%M"
 NO_REPORT = "no report yet"
 NO_ROWS = "No unit is working: every run has finished."
@@ -112,7 +131,6 @@ NO_ROWS = "No unit is working: every run has finished."
 # (user, 2026-10-02: "i have no idea what a stale file holds from the merged
 # work are released even means"; "retaking every view" and "file clashes get
 # settled at its checkpoint" were the same).
-PLUMBING = re.compile(r"\b(?:berth|reservations?|incursions?|holders?|file holds?|file clash\w*|writers?|testers?|retak\w*|re-?shoot\w*)\b", re.IGNORECASE)
 # A `then` that names another plan's document may name that plan's phases.
 OTHER_PLAN = re.compile(r"\S+\.md\b")
 WHITE = "⬜"
@@ -164,10 +182,6 @@ CHART_WIDTH = 95
 LABEL_EVERY_HOURS = 3
 
 JsonMap = dict[str, object]
-
-
-class InputError(Exception):
-    pass
 
 
 @dataclass(frozen=True)
@@ -268,73 +282,6 @@ class Topic:
 
 
 @dataclass(frozen=True)
-class DueNow:
-    pass
-
-
-@dataclass(frozen=True)
-class DeferredUntil:
-    at: datetime
-
-
-OutstandingTiming = DueNow | DeferredUntil
-
-
-@dataclass(frozen=True)
-class Ranking:
-    """Where an item goes in the user's list (urgency.py); `follows` is the text of the item it comes after."""
-    urgency: Urgency = Urgency()
-    follows: str = ""
-
-
-@dataclass(frozen=True)
-class OutstandingReminder:
-    since: datetime
-    text: str
-    timing: OutstandingTiming = DueNow()
-    rank: Ranking = Ranking()
-
-
-@dataclass(frozen=True)
-class OutstandingQuestion:
-    since: datetime
-    text: str
-    question: str
-    timing: OutstandingTiming = DueNow()
-    rank: Ranking = Ranking()
-    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
-    asked_by: str = ""
-
-
-@dataclass(frozen=True)
-class ReviewedOutstandingQuestion:
-    since: datetime
-    text: str
-    question: str
-    reviewed: str
-    timing: OutstandingTiming = DueNow()
-    rank: Ranking = Ranking()
-    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
-    asked_by: str = ""
-
-
-@dataclass(frozen=True)
-class ReviewUnavailableOutstandingQuestion:
-    since: datetime
-    text: str
-    question: str
-    reason: str
-    timing: OutstandingTiming = DueNow()
-    rank: Ranking = Ranking()
-    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
-    asked_by: str = ""
-
-
-Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
-               | ReviewUnavailableOutstandingQuestion)
-
-
-@dataclass(frozen=True)
 class UnreadableMacBlock:
     """A Mac block whose state file could not be decoded or read."""
 
@@ -346,7 +293,7 @@ MacBlockFooterState = NoMacBlock | PendingMacBlock | ActiveMacBlock | Unreadable
 
 @dataclass(frozen=True)
 class ProductionCount:
-    """One count config/dailies.conf names for this production; `None` when its source is missing."""
+    """One count selected by the fixed showrunner id; `None` means the source is missing."""
 
     label: str
     number: int | None
@@ -716,12 +663,6 @@ def as_list(value: object, where: str) -> list[object]:
     return cast(list[object], value)
 
 
-def check_keys(fields: JsonMap, allowed: set[str], where: str) -> None:
-    unknown = sorted(set(fields) - allowed)
-    if unknown:
-        raise InputError(f"{where}: unknown field(s) {', '.join(unknown)}; allowed: {', '.join(sorted(allowed))}")
-
-
 def optional_text(fields: JsonMap, key: str, where: str) -> str | None:
     value = fields.get(key)
     if value is None:
@@ -992,76 +933,11 @@ def check_plumbing(line: str, name: str) -> None:
         raise InputError(f"{name}: {problem}")
 
 
-def plumbing(line: str) -> str | None:
-    """Why the line fails the plumbing check, or None when it passes."""
-    found = PLUMBING.search(line)
-    if found is None:
-        return None
-    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out")
-
-
-def read_ranking(fields: JsonMap, where: str) -> Ranking:
-    """An item's `urgency`, `due`, `marked` and `follows`; none of them is a normal item."""
-    follows = fields.get("follows", "")
-    if not isinstance(follows, str) or "\n" in follows:
-        raise InputError(f"{where}.follows: expected one line of text")
-    try:
-        return Ranking(urgency.from_fields(fields), follows.strip())
-    except UrgencyError as error:
-        raise InputError(f"{where}: {error}") from None
-
-
 def read_outstanding(path: Path | None) -> list[Outstanding]:
-    """What waits on the user, oldest first; no file means nothing waits."""
-    if path is None or not path.exists():
-        return []
-    entries = cast(object, json.loads(path.read_text()))
-    if not isinstance(entries, list):
-        raise InputError(f"{path}: expected a JSON list")
-    items: list[Outstanding] = []
-    for index, entry in enumerate(cast(list[object], entries)):
-        where = f"{path}[{index}]"
-        if not isinstance(entry, dict):
-            raise InputError(f"{where}: expected an object")
-        fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
-                            "marked", "follows", "asked_by"}, where)
-        rank = read_ranking(fields, where)
-        since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
-        if not isinstance(since, str) or not STARTED.match(since):
-            raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
-        if after is not None and (not isinstance(after, str) or not STARTED.match(after)):
-            raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
-        if not isinstance(text, str) or not text.strip() or "\n" in text:
-            raise InputError(f"{where}.text: expected one non-empty line")
-        # The plumbing check runs when `update_registration.py questions` writes an item, not here:
-        # a stored item that fails it must not take the whole list down.
-        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
-        since_at = datetime.fromisoformat(since)
-        question = fields.get("question")
-        reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
-        asked_by = fields.get("asked_by", "")
-        if not isinstance(asked_by, str) or "\n" in asked_by or ("asked_by" in fields and not asked_by.strip()):
-            raise InputError(f"{where}.asked_by: expected one non-empty line")
-        if "question" not in fields:
-            if "reviewed" in fields or "review_unavailable" in fields or "asked_by" in fields:
-                raise InputError(f"{where}: question required for a review result or an asker")
-            items.append(OutstandingReminder(since_at, text, timing, rank))
-            continue
-        if not isinstance(question, str) or not question.strip():
-            raise InputError(f"{where}.question: expected non-empty full question")
-        if "reviewed" in fields:
-            if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
-                raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
-            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank, asked_by))
-        elif "review_unavailable" in fields:
-            if not isinstance(unavailable, str):
-                raise InputError(f"{where}.review_unavailable: expected reason text")
-            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by))
-        else:
-            items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by))
-    return sorted(items, key=lambda item: item.since)
+    """Read reminders and questions from their owning stores, oldest first."""
+    from scripts.production.update_registration import read_open_fields
+
+    return parse_outstanding_entries(read_open_fields(path), path or Path("questions"))
 
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
@@ -1154,7 +1030,8 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     if "held" not in fields:
         raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
-    label = optional_text(fields, "label", where) or unit.removesuffix("-unit")
+    name = optional_text(fields, "name", where) or unit
+    label = optional_text(fields, "label", where) or name
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)
@@ -1211,7 +1088,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.holds_builds: true while the unit's own session holds the builds, else left out")
     return Unit(
         unit=unit,
-        name=optional_text(fields, "name", where) or unit,
+        name=name,
         label=label,
         project=text(fields, "project", where),
         goal=parse_goal(fields.get("goal"), f"{where}.goal"),
@@ -1707,7 +1584,7 @@ def footer(
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
     # By name, so the lists keep one order however the tree was walked.
-    items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in sorted(unreadable))
+    items.extend(f"{name}: {UNREADABLE_LIST}" for name in sorted(unreadable))
     if root:
         items.append(f"reports to {root}")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
@@ -1723,7 +1600,7 @@ def footer(
 
 def doc_counts(doc: Path | None) -> str | None:
     """The counts line for a production doc; the status line carries the question count."""
-    import footer_counts
+    from scripts.production import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
@@ -1952,7 +1829,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
               or any(child.open for child in report.children))
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
-                        unreadable=[slug for child in report.children for slug in child.unreadable],
+                        unreadable=[name for child in report.children for name in child.unreadable],
                         root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
@@ -1986,7 +1863,7 @@ def last_report(value: object, state_path: Path, at: str | None, cadence: Report
 
 
 def log_line(report: Report, resolved: dict[str, ResolvedEta], now: datetime, zone_name: str) -> str:
-    parts = [f"{unit.unit} {unit.phase.split(':')[0]} "
+    parts = [f"{unit.name} {unit.phase.split(':')[0]} "
              + eta_text(unit, NoLastUnitReport(), resolved[unit.unit], now, zone_name, with_note=False)
              for unit in report.units]
     parts.extend(f"{topic.title} {topic.eta}" for topic in report.topics)
@@ -2006,21 +1883,26 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
                 nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
+    from scripts.production.update_registration import QuestionStaff, read_open_fields
+
     unreadable: list[str] = []
     try:
+        identities = QuestionStaff.read()
         if next_run is not None and not TIME.match(next_run):
             raise InputError(f"--next-run: {next_run!r} is not HH:MM or HH:MM+N")
         now, abbreviation = local_now(zone, "--zone", at)
         hold = read_dailies_hold()
         mac_block = read_mac_block()
-        outstanding = read_outstanding(outstanding_path)
-    except (InputError, json.JSONDecodeError, OSError) as error:
+        outstanding = parse_outstanding_entries(
+            read_open_fields(outstanding_path, document=doc, identities=identities),
+            outstanding_path or doc or Path("questions"))
+    except (InputError, ValueError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     # A lower production's bad list is named in the footer; it never takes the root's footer down.
     for path in below:
         try:
-            outstanding.extend(read_outstanding(path))
+            outstanding.extend(parse_outstanding_entries(read_open_fields(path, identities=identities), path))
         except (InputError, ValueError, OSError):
             unreadable.append(path.stem)
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
@@ -2082,8 +1964,12 @@ def main(arguments: list[str]) -> int:
         resolved = resolve_eta_moments(report, previous, now)
         check_changes(report, previous, resolved)
         check_idle(report, now)
-        outstanding = read_outstanding(outstanding_path)
-    except (InputError, json.JSONDecodeError, OSError) as error:
+        from scripts.production.update_registration import read_open_fields
+
+        outstanding = parse_outstanding_entries(
+            read_open_fields(outstanding_path, document=report.doc),
+            outstanding_path or report.doc or Path("questions"))
+    except (InputError, ValueError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     print("\n".join(render(report, previous, resolved, now, abbreviation, outstanding, at=at)))

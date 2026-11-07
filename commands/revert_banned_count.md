@@ -1,5 +1,5 @@
 ---
-description: Undo the most recent banned-word counter bump from its backup
+description: Restore the last forbidden word count.
 ---
 
 Roll the local banned-word counter file back to its backup — the snapshot taken
@@ -10,7 +10,7 @@ using it).
 ## Step 1 — revert
 
 ```bash
-python3 ~/.claude/scripts/hooks/banned_words_lib.py --revert
+~/.claude/scripts/lib/py ~/.claude/scripts/hooks/banned_words_lib.py --revert
 ```
 
 The script copies `forbidden-word-counts.json.bak` back over the live counter

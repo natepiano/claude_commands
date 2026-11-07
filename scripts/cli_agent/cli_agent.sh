@@ -3,7 +3,7 @@
 # commit_yes, merge, code — should run, then runs it.
 #
 # Family, model, and effort assignments live in the global registry,
-# ~/.claude/config/agents.conf, via scripts/agents/agents_config.sh.
+# ~/.claude/config/models.conf, via scripts/agents/models_config.sh.
 #
 # Usage:
 #   cli_agent.sh                    # no skill invocation -> launch agent's interactive REPL
@@ -14,7 +14,7 @@ set -euo pipefail
 
 CLI_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-source "$CLI_AGENT_DIR/../agents/agents_config.sh"
+source "$CLI_AGENT_DIR/../agents/models_config.sh"
 
 cli_agent_print_status() {
     agents_resolve_print cli.commit_prep
@@ -51,6 +51,7 @@ cli_agent_run() {
         codex)
             workers_home="$(agents_workers_home)" || return 1
             read -r -a agent_args <<< "$(agents_codex_args)"
+            models_agent_environment
             if [[ -z "$invocation" ]]; then
                 exec env "CODEX_HOME=$workers_home" codex "${agent_args[@]}"
             fi
@@ -60,6 +61,7 @@ cli_agent_run() {
             source "$CLI_AGENT_DIR/../agents/claude_account.sh"
             claude_launch_environment workers || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
+            models_agent_environment
             if [[ -z "$invocation" ]]; then
                 exec "$CLI_AGENT_DIR/../lib/py" "$CLI_AGENT_DIR/../lib/nix_env.py" exec "$(command -v claude)" "${agent_args[@]}"
             fi
@@ -73,7 +75,7 @@ case "${1:-}" in
         cli_agent_print_status
         ;;
     --set)
-        echo "ERROR: --set has been removed; use /agent to edit CLI assignments." >&2
+        echo "ERROR: --set has been removed; use /default_models to edit CLI assignments." >&2
         exit 1
         ;;
     *)

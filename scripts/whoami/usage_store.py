@@ -10,16 +10,15 @@ import fcntl
 import json
 import math
 import os
-import sys
 import tempfile
 from dataclasses import dataclass
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
 from scripts.whoami.note_file import canonical_label
@@ -218,6 +217,19 @@ def read_lock() -> Generator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+READ_INTERVAL_SECONDS: ContextVar[float] = ContextVar("usage_read_interval_seconds", default=90)
+
+
+@contextmanager
+def read_cadence(interval_seconds: float) -> Generator[None]:
+    """Use this pass's cadence in its tasks and worker threads, then restore it."""
+    token = READ_INTERVAL_SECONDS.set(interval_seconds)
+    try:
+        yield
+    finally:
+        READ_INTERVAL_SECONDS.reset(token)
+
+
 def claim_read(login: str, now: datetime) -> UsageReadClaim | UsageReadHeld:
     with read_lock():
         stored = load()
@@ -229,7 +241,7 @@ def claim_read(login: str, now: datetime) -> UsageReadClaim | UsageReadHeld:
             at = None
         if at is not None and at.tzinfo is not None:
             age = (now - at).total_seconds()
-            if age < 90 or (age < 600 and usage.get("attempt_outcome") == UsageReadOutcome.RATE_LIMITED_429):
+            if age < READ_INTERVAL_SECONDS.get() or (age < 600 and usage.get("attempt_outcome") == UsageReadOutcome.RATE_LIMITED_429):
                 return UsageReadHeld()
         usage["attempted_at"] = now.isoformat()
         # The claim replaces the previous attempt. A prior 429 cannot extend it.

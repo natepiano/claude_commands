@@ -1,18 +1,61 @@
 ---
-description: Stop or resume a local session, or restore recovery entries.
-argument-hint: 'down [--only ID[,ID...]] | stop SESSION | resume SESSION --why TEXT [--to claudeN] | status | restart | snapshot | forget NAME_OR_ID'
+description: Stop, resume, or restore a session.
+argument-hint: 'stop SESSION | resume NAME [--why TEXT] [--to ACCOUNT] | status | restart [--all] [--dry-run]'
 ---
 
-Run `agents stop SESSION` to end its Claude process. Codex workers keep their threads. Stop checks the process identity before each signal, sends TERM, then KILL if needed, and confirms exit. It creates no stopping record and waits for no ready mark.
+Run `agents stop SESSION` to stop the session and its worker agents.
+Stop checks the current session before each signal and confirms exit.
+Workers keep their rows, native conversations, and panes at the shell.
+Unknown workers retain their reasons and remain not proved stopped.
+Unproved targets stay unchanged; unrelated proved work continues.
+Stop uses the limits from `config/shutdown.conf`.
 
-Run `agents resume SESSION --why "reason" [--to claudeN]` to resume that conversation in its own herdr pane. The account exec command receives one opening message: why it stopped and resumed, continue its work, and resume its existing worker threads. No pane typing or second message is used. A session id or exact tab label selects a local session; run the command on the machine that owns its tab.
+Run `resume NAME [--why "reason"] [--to ACCOUNT]` from another pane and any directory.
+Use a short name, a staff id, or a session id.
+An exact Codex thread name resolves through the shared `session_index.jsonl`.
+A raw session id takes priority over a thread name.
+The default reason is `resumed by name`.
+The command restores the saved environment and folder.
+A Codex resume uses the configured `workers` account.
+A Claude unit or showrunner uses its configured role account.
+Other Claude sessions keep their saved account.
+`--to ACCOUNT` overrides the account for either family.
+A closed tab uses the existing restore path.
+A herdr server restore keeps the saved account for both families and sends no generated prompt.
+Resume from its own empty pane executes the saved launch in that pane.
+A running session prints `unchanged` with its current account and returns status 0.
+Restore resumes the director and its retained workers with their native conversations.
+A stopped worker reuses its pane and terminal; a proved closed worker can use a new split.
+Restore reads each worker's role and busy dispatch from the saved pass.
+An unavailable role prints its reason and starts no replacement worker.
+A busy worker continues that dispatch; the launcher checks the transcript before it submits work.
+A completed rerun prints one `unchanged` line, exits 0, and sends no restart notice.
+Resume does not stop or move a running session.
+An unknown name returns status 1 with close local unit and showrunner names when available.
+An ambiguous name returns status 1 with its matching members.
+A remote member returns status 1 with its machine name.
+`agents resume` accepts the same arguments.
 
-For one or many account moves, use `accounts.py move <session-id|exact-name|units|showrunners> <claudeN> --why "reason"`. The shared batch stops all selected sessions before any resumes. Each resumes in its own pane. One failure does not prevent the others. A self-move hands off to a detached batch and prints `moving now`; each final result goes to the shutdown logs directory.
+Move sessions with `accounts.py move <session-id|exact-name|units|showrunners> <claudeN> --why "reason"`.
+The batch stops selected sessions before it resumes them in their panes.
+One failure does not prevent unrelated moves.
+A self-move uses a detached batch and prints `moving now`; final results enter the shutdown logs directory.
+Worker account moves keep the conversation, pane, and terminal; see `docs/accounts.md`.
 
-`agents status [account]`, `restart [account] [--only ID[,ID...]] [--here]`, `snapshot` and `forget NAME_OR_ID [--account ACCOUNT]` retain recovery support. `now`, `ready`, `cancel`, `conduct` and `follow` are removed.
+`agents status [account]` shows the live sessions.
+`shutdown.py restart --all` stops each local live Claude or Codex row, then starts each row.
+`shutdown.py restart` resumes saved rows that do not run and restores their retained workers.
+A failed row prints one anomaly line; other rows continue.
+`restart.json` holds only the row IDs whose starts failed.
+A started or running row leaves the record.
+A refused row lock changes no saved row.
+`--only` leaves other saved rows alone.
+`--dry-run` prints each name, row ID, kind, and saved tab position without changes.
+A row without a saved tab says so on the same line.
+Staff supplies current sessions and worktrees; herdr keeps tab order by staff row ID.
+Shutdown records contain only row IDs; the existing pass supplies progress and launcher arguments.
+An interrupted tab rebuild can lose the split ratio and leave panes in the source workspace.
+Inspect the tab and panes named by its anomaly; a retry does not rebuild the split.
 
-Run `agents down [--only ID|NAME[,ID|NAME...]]` before a reboot. Without `--only`, it stops local Claude sessions across accounts at once through the shared stop. It leaves workers alone. Each line says stopped, already down, or failed with a reason. An already-down rerun succeeds. Before any stop, the existing launch entry gets `restart_after_down`; the watchdog leaves that intent alone. Confirmed exit sets its existing ended mark. A rerun finishes pending stops. A selected caller hands the batch to a detached process; its final lines go to the shutdown logs. Restart clears the marks after it confirms Claude is live, including one that was already running. Run `agents restart` or `agents restart --all` to resume each such conversation on its own account and in its own tab. A missing pane gets a fresh tab. A live session is left running, and a rerun succeeds. A normal `/exit` or `agents stop` stays closed.
-
-After a crash or reboot, run `agents restart`. Each session names its source: `from shutdown record` or `from snapshot taken <time> (<age>)`, using the entry’s last-seen time in the user’s zone. A record takes precedence for its id; other sessions with a crash signal still restore from snapshots. A snapshot session is restorable when its boot id changed or its herdr server or terminal process is gone. A session that exits while its host stays alive leaves the snapshot; old shutdown records remain restorable until Phase 8. Running sessions are skipped. Conflicting account evidence refuses a restore and names the accounts. An incomplete shutdown restores only after the owner is positively dead and cleanup is confirmed; unreadable liveness refuses it. A successful restore removes its snapshot entry; a failure keeps it for retry.
-
-`agents snapshot` changes no session. An incomplete observation keeps every previous recovery file and names its failed sources. Status lists unresolved sessions with their last-seen times in the user's zone. `agents forget NAME_OR_ID [--account ACCOUNT]` retires local recovery entries and stopped or failed shutdown-record entries without stopping a process; the account login or label selects between cross-account copies. Snapshot-only names participate in restart and forget, while status selections use membership and shutdown records. Codex restores in herdr with its recorded home and session id; without an id it opens Codex's resume picker. Snapshots stay on the machine that observed them.
+Only an existing run pinned to `mesh` uses retained server inventory, pause, and paused-worker resume messages.
+Only worker end or permanent unit removal deletes worker rows.

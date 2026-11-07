@@ -15,8 +15,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import dailies_render
+from scripts.production import dailies_render
 from scripts.whoami import note_file
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+)
 
 
 AT = "2026-10-05T12:45"
@@ -35,6 +38,10 @@ class DailiesAgentsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         self.agents = self.root / "agents"
         self.agents.mkdir()
         self.readings = self.root / "readings.jsonl"

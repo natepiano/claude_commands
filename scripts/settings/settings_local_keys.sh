@@ -1,46 +1,47 @@
 #!/usr/bin/env bash
 
-# The settings.json keys and hook groups that never reach a commit, and the
-# sidecar that keeps them alive across a checkout. Sourced by the clean and smudge filters, the
-# watcher, and ensure_git_filters.sh -- one list so none of them can drift.
-#
-# Why a sidecar exists: git unlinks the old working copy before it runs the
-# smudge filter, so the smudge cannot read these keys from the file it is
-# replacing. The watcher fires after every write to settings.json and copies
-# the keys here; the smudge merges them back into whatever git writes. The
-# file is repo-relative and falls under .gitignore's catch-all.
+# jq variables must remain literal inside the programs.
+# shellcheck disable=SC2016
 
-# extraKnownMarketplaces names folders on one machine (natedev's nate-local plugins).
-SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces"]'
+# Keep machine settings in a sidecar before checkout replaces settings.json.
+# extraKnownMarketplaces stores paths on this machine.
+# theme stores the theme for this machine.
+# voice stores the voice setting for this machine.
+SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces","theme","voice"]'
 SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
+SETTINGS_LOCAL_KEYS_NOTICES="settings.local-key-notices.json"
+_SETTINGS_LOCAL_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 
-# Hook groups that belong to one machine, matched by a substring of any of
-# their commands. iTerm2's Claude Code integration adds a group running
-# ~/.config/iterm2/cc-status to every hook event on the Mac -- a path that
-# exists nowhere else, so committed it would fail on every event on natedev.
-# The sidecar keeps these under its own `hooks` key, holding only the local
-# groups, and the merge appends them per event rather than as a whole key.
-# herdr installs its own SessionStart group with the home folder and matcher of each machine.
+settings_local_keys_baseline() {
+    local baseline
+    baseline="$(git -C "$_SETTINGS_LOCAL_ROOT" show HEAD:settings.json)" || {
+        echo "settings: cannot read committed HEAD:settings.json" >&2
+        return 1
+    }
+    printf '%s\n' "$baseline" | jq -ce 'if type == "object" then keys else error("settings must be an object") end'
+}
+
+# Preserve hook groups that run commands on one machine.
 SETTINGS_LOCAL_HOOK_PATTERNS_JSON='["/.config/iterm2/cc-status","/.claude/hooks/herdr-agent-state.sh"]'
 
-# enabledPlugins entries from a local marketplace (`<plugin>@<marketplace>`): the other entries
-# are shared, so these leave one by one, not as the whole key.
+# Preserve entries from local plugin marketplaces.
 SETTINGS_LOCAL_MARKETPLACES_JSON='["nate-local"]'
 
 # jq definitions every program below starts with.
-SETTINGS_LOCAL_DEFS="def local_hook: any(.hooks[]?; (.command // \"\") as \$c | ${SETTINGS_LOCAL_HOOK_PATTERNS_JSON} | any(. as \$p | \$c | contains(\$p)));
+SETTINGS_LOCAL_DEFS="def merged_key: . == \"hooks\" or . == \"enabledPlugins\";
+def listed_key: . as \$k | (${SETTINGS_LOCAL_KEYS_JSON} | index(\$k)) != null;
+def local_key: listed_key or ((merged_key | not) and (. as \$k | (\$baseline | index(\$k)) == null));
+def saved_entries: with_entries(select(.key | merged_key or local_key));
+def local_hook: any(.hooks[]?; (.command // \"\") as \$c | ${SETTINGS_LOCAL_HOOK_PATTERNS_JSON} | any(. as \$p | \$c | contains(\$p)));
 def local_hooks: with_entries(.value |= map(select(local_hook))) | with_entries(select(.value | length > 0));
 def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));
 def local_plugin: .key as \$k | ${SETTINGS_LOCAL_MARKETPLACES_JSON} | any(. as \$m | \$k | endswith(\"@\" + \$m));"
 
-# jq: what the clean filter commits -- the input without its local-only keys
-# or local hook groups, its hook events sorted by name. Event order carries no
-# meaning, and iTerm2 rewrites the object alphabetically when it adds its
-# groups, so an unsorted blob would read as changed after every such write.
-# A `hooks` key emptied because every group in it was local is dropped: the
-# smudge created it, so a blob committed without one round-trips.
-SETTINGS_LOCAL_KEYS_STRIP="$SETTINGS_LOCAL_DEFS"'
-delpaths($keys | map([.]))
+# Remove local values and sort shared hook events.
+# The clean filter uses this program.
+# shellcheck disable=SC2034
+SETTINGS_LOCAL_KEYS_STRIP='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
+with_entries(select(.key | local_key | not))
 | if has("hooks") then
     (.hooks | length) as $before
     | .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries)
@@ -53,19 +54,16 @@ delpaths($keys | map([.]))
   else . end'
 
 # jq: keep only the local-only keys of an object, plus its local hook groups.
-SETTINGS_LOCAL_KEYS_PICK="$SETTINGS_LOCAL_DEFS"'
+SETTINGS_LOCAL_KEYS_PICK='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
 . as $s
-| ($s | with_entries(select(.key as $k | $keys | index($k) != null)))
+| ($s | with_entries(select(.key | local_key)))
 + ($s.hooks // {} | local_hooks | if length == 0 then {} else {hooks: .} end)
 + ($s.enabledPlugins // {} | with_entries(select(local_plugin)) | if length == 0 then {} else {enabledPlugins: .} end)'
 
-# jq: append the sidecar keys the input lacks, in the input's own key order,
-# then each sidecar hook group its event lacks, at the end of that event.
-# An existing key is never touched, so a value the user just changed is not
-# rolled back by a stale snapshot, and a file with nothing missing comes out
-# byte-identical.
-SETTINGS_LOCAL_KEYS_MERGE='. as $cur | ($local[0] // {}) as $l
-| . + ($l | del(.hooks, .enabledPlugins) | with_entries(.key as $k | select(($cur | has($k)) | not)))
+# Smudge preserves saved local values and uses the incoming keys as its baseline.
+# Restore supplies the committed baseline and keeps existing values.
+SETTINGS_LOCAL_KEYS_MERGE='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'. as $cur | ($local[0] // {} | saved_entries) as $l
+| . + ($l | del(.hooks, .enabledPlugins) | with_entries(.key as $k | select(($ARGS.named.restore != true) or (($cur | has($k)) | not))))
 | reduce (($l.enabledPlugins // {}) | to_entries[]) as $p (.;
     if (.enabledPlugins // {} | has($p.key)) then . else .enabledPlugins[$p.key] = $p.value end)
 | reduce (($l.hooks // {}) | to_entries[]) as $e (.;
@@ -74,60 +72,75 @@ SETTINGS_LOCAL_KEYS_MERGE='. as $cur | ($local[0] // {}) as $l
       else .hooks[$e.key] += [$g] end))'
 
 # jq: how many sidecar keys and hook groups the input lacks.
-SETTINGS_LOCAL_KEYS_MISSING='. as $cur | ($local[0] // {}) as $l
+SETTINGS_LOCAL_KEYS_MISSING='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'. as $cur | ($local[0] // {} | saved_entries) as $l
 | ([$l | del(.hooks, .enabledPlugins) | keys[] | . as $k | select(($cur | has($k)) | not)] | length)
 + ([($l.enabledPlugins // {}) | keys[] as $k | select(($cur.enabledPlugins // {} | has($k)) | not)] | length)
 + ([($l.hooks // {}) | to_entries[] | .key as $k | .value[] | . as $g
     | select((($cur.hooks[$k] // []) | index([$g])) == null)] | length)'
 
-# Copy the local-only keys out of settings.json into the sidecar.
-#
-# The sidecar mirrors whichever of these keys settings.json currently has, so
-# removing an override -- picking the default model, for one, which Claude Code
-# records by deleting the `model` key rather than writing one -- propagates
-# here and the smudge stops restoring it. That is the only way a key can ever
-# be retired; the cost is that a bad write which drops one key takes the backup
-# for it within seconds.
-#
-# The one case that is refused is an ALL-empty result: a bare blob landing in
-# the working copy (smudge not installed, or failed) must not erase the whole
-# backup that exists to repair it.
-settings_local_keys_snapshot() {
-    local repo_root="$1" settings sidecar snapshot
-    settings="$repo_root/settings.json"
-    sidecar="$repo_root/$SETTINGS_LOCAL_KEYS_SIDECAR"
-    [[ -f "$settings" ]] || return 0
-
-    snapshot="$(jq --argjson keys "$SETTINGS_LOCAL_KEYS_JSON" \
-        "$SETTINGS_LOCAL_KEYS_PICK" "$settings" 2>/dev/null)" || return 0
-    [[ -n "$snapshot" && "$snapshot" != "{}" ]] || return 0
-    [[ -f "$sidecar" && "$(cat "$sidecar" 2>/dev/null)" == "$snapshot" ]] && return 0
-
-    printf '%s\n' "$snapshot" > "$sidecar.tmp" 2>/dev/null &&
-        mv "$sidecar.tmp" "$sidecar" 2>/dev/null
+# Use one atomic replacement for snapshots and restored settings.
+_settings_local_write() {
+    local path="$1" text="$2" temporary
+    [[ ! -d "$path" ]] || { echo "settings: destination is a directory: $path" >&2; return 1; }
+    temporary="$(mktemp "$path.XXXXXX")" || return 1
+    if ! { printf '%s\n' "$text" > "$temporary" && mv "$temporary" "$path"; }; then
+        rm -f "$temporary"
+        return 1
+    fi
 }
 
-# Put back any local-only key the sidecar has and settings.json lacks. This is
-# the repair for a checkout that ran before the smudge was installed, and it
-# runs at session start, never from the watcher, so a write Claude Code just
-# made is never fought.
+# Avoid the interpreter when the ledger needs no change or delivery.
+settings_local_keys_notices() {
+    local mode="$1" unknown="${2:-[]}" ledger machine work
+    ledger="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_NOTICES"
+    machine="$(hostname -s)" || return 1
+    if [[ -s "$ledger" ]]; then
+        work="$(jq --arg machine "$machine" --arg mode "$mode" --argjson keys "$unknown" '
+            .[$machine] // {} | . as $history
+            | if $mode == "record" then any($keys[]; . as $key | $history[$key] == null)
+              else any(.[]; . == "pending") end' "$ledger")" || return 1
+        [[ "$work" == true ]] || return 0
+    elif [[ "$mode" == deliver || "$unknown" == "[]" ]]; then
+        return 0
+    fi
+    "$_SETTINGS_LOCAL_ROOT/scripts/lib/py" "$_SETTINGS_LOCAL_ROOT/scripts/settings/local_key_notices.py" \
+        "$mode" "$_SETTINGS_LOCAL_ROOT" "$machine" "$unknown"
+}
+
+# Keep an empty backup only when the previous values are still local.
+settings_local_keys_snapshot() {
+    local settings sidecar snapshot baseline unknown
+    settings="$1"
+    sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
+    [[ -f "$settings" ]] || return 0
+    baseline="$(settings_local_keys_baseline)" || return 1
+    snapshot="$(jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_PICK" "$settings")" || return 1
+    if [[ "$snapshot" == "{}" && ! -e "$sidecar" ]]; then
+        return 0
+    fi
+    if [[ "$snapshot" == "{}" && -s "$sidecar" ]]; then
+        snapshot="$(jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_PICK" "$sidecar")" || return 1
+    fi
+    if [[ ! -f "$sidecar" || "$(<"$sidecar")" != "$snapshot" ]]; then
+        _settings_local_write "$sidecar" "$snapshot" || return 1
+    fi
+    unknown="$(printf '%s\n' "$snapshot" | jq "$SETTINGS_LOCAL_DEFS"'keys | map(select(listed_key or merged_key | not))' \
+        --argjson baseline "$baseline" -c)" || return 1
+    settings_local_keys_notices record "$unknown"
+}
+
+# Restore missing values without replacing a recent user edit.
 settings_local_keys_restore() {
-    local repo_root="$1" settings sidecar missing merged
-    settings="$repo_root/settings.json"
-    sidecar="$repo_root/$SETTINGS_LOCAL_KEYS_SIDECAR"
+    local settings sidecar missing merged baseline
+    settings="$_SETTINGS_LOCAL_ROOT/settings.json"
+    sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
     [[ -f "$settings" && -s "$sidecar" ]] || return 0
-
-    # Decide on keys, not text: jq reformats, so a text comparison would
-    # rewrite a file that is only laid out differently.
-    missing="$(jq --slurpfile local "$sidecar" \
-        "$SETTINGS_LOCAL_KEYS_MISSING" "$settings" 2>/dev/null)" || return 0
-    [[ "$missing" =~ ^[0-9]+$ && "$missing" -gt 0 ]] || return 0
-
-    merged="$(jq --slurpfile local "$sidecar" \
-        "$SETTINGS_LOCAL_KEYS_MERGE" "$settings" 2>/dev/null)" || return 0
-    [[ -n "$merged" ]] || return 0
-
-    printf '%s\n' "$merged" > "$settings.tmp" 2>/dev/null &&
-        mv "$settings.tmp" "$settings" 2>/dev/null &&
-        echo "ensure_git_filters: restored local-only keys into settings.json from $SETTINGS_LOCAL_KEYS_SIDECAR"
+    baseline="$(settings_local_keys_baseline)" || return 1
+    missing="$(jq --argjson baseline "$baseline" --slurpfile local "$sidecar" \
+        "$SETTINGS_LOCAL_KEYS_MISSING" "$settings")" || return 1
+    [[ "$missing" -gt 0 ]] || return 0
+    merged="$(jq --argjson baseline "$baseline" --argjson restore true --slurpfile local "$sidecar" \
+        "$SETTINGS_LOCAL_KEYS_MERGE" "$settings")" || return 1
+    _settings_local_write "$settings" "$merged" || return 1
+    echo "ensure_git_filters: restored local-only keys into settings.json from $SETTINGS_LOCAL_KEYS_SIDECAR"
 }

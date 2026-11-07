@@ -3,8 +3,10 @@ set -euo pipefail
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
-PY="${HOME}/.claude/scripts/lib/py"
+# repo needs >= 3.12.
+# Explicit discovery keeps the interpreter shim from writing its cache.
+export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
+PY="${0:A:h}/../lib/py"
 
 list_files=false
 project_root=""
@@ -424,7 +426,7 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
 
 counter_state="${HOME}/.claude/state/forbidden-word-counts.json"
 if [[ -s "$counter_state" ]]; then
-  counter_summary="$("$PY" - "$counter_state" <<'PY'
+  counter_summary="$("$PY" -c '
 import json
 import sys
 from pathlib import Path
@@ -460,8 +462,7 @@ if items:
         for key, count, timestamp in sorted(items)
     )
     print(f"Local forbidden-word counters: {joined} ({path})")
-PY
-)"
+' "$counter_state")"
   if [[ -n "$counter_summary" ]]; then
     printf '%s\n\n' "$counter_summary"
   fi
@@ -480,14 +481,14 @@ if [[ ${#style_files[@]} -gt 0 ]]; then
   for file in "${style_files[@]}"; do
     strip_frontmatter "$file"
     if [[ -n "${file_see_also[$file]:-}" ]]; then
-      while IFS= read -r stem; do
+      printf '%s\n' "${file_see_also[$file]}" | while IFS= read -r stem; do
         [[ -z "$stem" ]] && continue
         ref_file="${stem_to_file[$stem]:-}"
         if [[ -n "$ref_file" && -f "$ref_file" ]]; then
           ref_title="$(extract_title "$ref_file")"
           printf '\nSee also: %s (see_also → %s) — full rule loaded separately in this guide.\n' "${ref_title:-$stem}" "$stem"
         fi
-      done <<< "${file_see_also[$file]}"
+      done
     fi
   done
 fi

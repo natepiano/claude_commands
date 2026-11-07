@@ -9,10 +9,7 @@ import shutil
 import tempfile
 from typing import ClassVar, override
 
-from offload_test_support import CommandFixture, OffloadCommandFixture
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.mac_test.offload_test_support import CommandFixture, OffloadCommandFixture
 
 
 class SeededCleanupFixture(OffloadCommandFixture):

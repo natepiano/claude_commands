@@ -1,18 +1,17 @@
 ---
-description: List the production's units with their phases or style tickets.
+description: List unit phases and style tickets.
 ---
 
 # Units
 
 Run this in the showrunner session. Run
-`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/units_table.py"`
+`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer. Print its total line too, when present.
-Both tables have one row per live unit. **Unit** is the session name now, or
-`gone` (no herdr session carries its mark), `not running` (Claude has stopped)
-or `unknown`.
+Both tables show only the production's staff units. **Status** is `paused` or `active`, including stopped units.
+**Unit** is the unit's staff name, including stopped units and units without a session.
 
-For a production without `Kind: style`, the table is `| Unit | Phase | Task |`:
+For a production without `Kind: style`, the table is `| Unit | Status | Phase | Task |`:
 
 - **Phase**: `<n> of <total> · <title>` for the open phase; otherwise
   `between phases, <done> of <total> done`, `not started`, `plan done`,
@@ -21,7 +20,7 @@ For a production without `Kind: style`, the table is `| Unit | Phase | Task |`:
   `<step>: <what it does>`, cut to 80 characters with `…`, or `—`.
 
 For `Kind: style`, the table is
-`| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |`:
+`| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`:
 
 - **Ticket**: `#<n> · <rule> · <crate> · <work>`. The number drops the unit
   prefix. The rule is its file stem; an empty rule uses the first stem from
@@ -36,8 +35,8 @@ For `Kind: style`, the table is
   With no open step: `starting <work>` for an assigned ticket, `waiting for the
   showrunner to merge` for a checkpointed one, else `idle — <outcome>` or `idle`.
 - **ETA**: the current phase ETA as `<HH:MM>`, else `—`.
-- **Findings built (24 h)**: `<all time> (<n>)` for the unit's family; `<n>`
-  counts findings first built in the last 24 h.
+- **Findings built**: the all-time built count for the unit's family.
+- **Last 24 h**: findings first built in the last 24 hours.
 - **Findings left**: the family's filed findings with an approved decision:
   `<approved>`, or `<approved> approved of <filed> filed` when not all filed
   findings are approved. A recorded split adds `: ready <a> · changed <b> ·
@@ -52,6 +51,26 @@ and shows only when it differs. The date is now plus `approved / r` days.
 When `r` is zero, it ends with `no ETA: nothing built in 24 h`. Numbers use
 thousands commas. Times and the date use the production zone.
 
-It reads session marks, run records, decision files and read-only style ledgers.
-It never reads a pane. Missing ledgers or tables supply no data. When it exits
-non-zero, report its error in one line.
+Read failures that make the table wrong or incomplete appear as `anomaly:` lines below the table.
+Staff name conflicts also produce lines. The command does not scan other processes.
+A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
+A process without an identity reports an unreadable thread when its pane holds staff.
+One staff candidate retains its pane placement with unknown status.
+Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
+The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
+A failed send adds one anomaly line. It changes neither the table nor the exit code.
+
+Use `staff.py` to record a pause or resume:
+
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py pause <unit> --why "<why>"` for one unit.
+2. Use `pause --production <showrunner name> [--except <unit>...] --why "<why>"` for a production.
+3. Use `resume <unit>` or `resume --production <showrunner name>` to remove the pause record.
+
+Each `--except` accepts a unit's staff name, its `-unit` form, or its staff id within that production.
+An unmatched value refuses the whole command before any row changes.
+The refusal names the value and the production. A unit of another production does not match.
+
+A pause records its time, caller and reason in the staff row. It stops nothing. Both commands are safe to repeat.
+
+The command reads process identities, terminal metadata, run records, decision files and read-only style ledgers.
+It never reads pane contents. Missing ledgers or tables supply no data. Report a non-zero exit as one error line.

@@ -9,6 +9,10 @@ never drift onto different thresholds.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -18,7 +22,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import agents_registry  # noqa: E402
+from scripts.lib import models_registry  # noqa: E402
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
 # binary (`Hds`/`Sfo`/`CSe`, still `W9`/`Bye`/`SQo` in 2.1.233), the trigger is
@@ -39,14 +43,12 @@ PRECOMPUTE_RESERVE_TOKENS = 13_000
 # looks like a 225_000 trigger while compaction actually fires at 167_000.
 #
 # Which models have which window is registry data, not code: the
-# `[claude.context]` section of agents.conf lists each family with the version
+# `[claude.context]` section of models.conf lists each family with the version
 # its 1M window starts at, plus a `default`. This module only parses model ids
 # and applies those rows. An exact-id table once lived here, listed
 # `claude-fable-5`, and missed `claude-fable-5-1`: the hook quoted a 167k
 # trigger on a 1M model and a live unit run stalled at "100% full" with
 # over 800k tokens of headroom.
-AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
-DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
 CONTEXT_SECTION = "claude.context"
 
 # Used only when the registry itself cannot be read. The small window warns
@@ -258,39 +260,23 @@ def parse_version(text: str) -> tuple[int, int] | None:
 
 
 def read_context_rules() -> tuple[int, dict[str, ContextRule]]:
-    """The `[claude.context]` section: the default window and one rule per family.
+    """Read context windows through the shared registry parser.
 
-    Same file and env override as agents_config.sh, same syntax: `#` comments,
-    inline or whole-line, and `key=value` rows. A row that does not parse is
-    skipped rather than fatal -- a hook must never break the tool it follows.
+    Invalid context values are skipped so the hook can continue.
     """
-    path = Path(os.environ.get(AGENTS_CONFIG_ENV) or DEFAULT_AGENTS_CONFIG_PATH)
+    path = models_registry.registry_path()
     try:
-        text = agents_registry.registry_text(path)
+        text = models_registry.registry_text(path)
     except OSError:
-        # An override that has gone away -- a deleted scratch copy a long-lived
-        # `--bg` daemon still names -- falls back to the default registry, not
-        # to the small window.
+        # A removed override uses the shared default registry.
         try:
-            text = agents_registry.registry_text(DEFAULT_AGENTS_CONFIG_PATH)
+            text = models_registry.registry_text(models_registry.DEFAULT_PATH)
         except OSError:
             return FALLBACK_CONTEXT_TOKENS, {}
     default = FALLBACK_CONTEXT_TOKENS
     rules: dict[str, ContextRule] = {}
-    in_section = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("["):
-            in_section = line == f"[{CONTEXT_SECTION}]"
-            continue
-        if not in_section:
-            continue
-        key, separator, value = line.partition("=")
-        if not separator:
-            continue
-        key, value = key.strip(), value.strip()
+    section = models_registry.parse_registry(text).get(CONTEXT_SECTION, {})
+    for key, value in section.items():
         if key == "default":
             parsed_default = parse_window(value)
             if parsed_default is not None:

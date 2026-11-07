@@ -9,6 +9,10 @@ left out by session or Codex thread identity. Every message names its groups so
 recipients know it was sent directly.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import shlex
@@ -23,10 +27,11 @@ from typing import Literal, NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
-import roster  # noqa: E402
+from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
+from scripts.message import session_send
 
-SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
+SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
 USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
          + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
@@ -105,7 +110,7 @@ class Delivery(NamedTuple):
 def recipients() -> list[roster.RosterEntry]:
     """Read the roster once, retaining readable rows when a source fails."""
     result = roster.roster(os.environ, roster.ThisMachine())
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"broadcast: roster: {problem}", file=sys.stderr)
     return result.entries
 
@@ -151,7 +156,7 @@ def ending(told: Collection[BroadcastGroup], scope: roster.RosterScope = roster.
 
 def send(session: str, sender: str, text: str, *options: str) -> str:
     """One message through send.py; the empty string when it was sent, else send.py's own line."""
-    done = subprocess.run([sys.executable, str(SEND), "--to", session, "--from", sender, *options, "--text", text],
+    done = subprocess.run(session_send.send_argv("--to", session, "--from", sender, *options, "--text", text, send_script=SEND),
                           capture_output=True, text=True, check=False)
     return "" if done.returncode == 0 else (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
 
@@ -363,7 +368,7 @@ def main(arguments: list[str]) -> int:
     identity = roster.sender_identity(os.environ)
     if any(flag == "--of" for flag, _ in pairs):
         result = roster.roster(os.environ, scope)
-        for problem in result.problems:
+        for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()
         failures = [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")]

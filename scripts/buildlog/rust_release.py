@@ -6,28 +6,25 @@ import json
 import os
 import re
 import signal
-import shutil
 import socket
 import stat
 import subprocess
-import sys
-import tempfile
 import tomllib
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
+from typing import BinaryIO, Literal, TypedDict, cast
 
-import store
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-if TYPE_CHECKING:
-    from ..notify import review
-    from ..notify.push_texts import RenderedPush
-else:
-    import review
+from scripts.buildlog import store
+from scripts.message import send_budget
+from scripts.lib import process_group
+
+from scripts.build_hold import override_guard
+from scripts.copies import copies
+from scripts.lib import cargo_output, scratch
+from scripts.notify import review
+from scripts.notify.push_texts import RenderedPush
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -128,7 +125,7 @@ def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()
@@ -137,8 +134,19 @@ def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout:
 
 
 def free_space_gib() -> float:
-    disk = os.statvfs(Path.home())
-    return disk.f_bavail * disk.f_frsize / GIB
+    paths = [Path.home(), copies.gates_root(), HANA]
+    roots = cargo_output.read_cargo_output_roots(HANA)
+    if isinstance(roots, cargo_output.CargoOutputRoots):
+        paths.extend((roots.target_directory, roots.build_directory))
+    devices: dict[int, float] = {}
+    for path in paths:
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        device = path.stat().st_dev
+        if device not in devices:
+            disk = os.statvfs(path)
+            devices[device] = disk.f_bavail * disk.f_frsize / GIB
+    return min(devices.values())
 
 
 def build_hold_active(folder: Path = HOLD_DIR) -> bool:
@@ -164,15 +172,11 @@ def cargo_building() -> bool:
 
 
 def send_release_text(push: RenderedPush) -> bool:
-    if TYPE_CHECKING:
-        from ..notify.push_texts import user_send_argv
-    else:
-        from push_texts import user_send_argv
+    from scripts.notify.push_texts import user_send_argv
 
     command = user_send_argv(push)
-    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
     result = subprocess.run(command, capture_output=True, text=True,
-                            timeout=review.user_send_seconds() + 15, stdin=subprocess.DEVNULL)
+                            timeout=send_budget.user_seconds(review.user_send_seconds()), stdin=subprocess.DEVNULL)
     return result.returncode == 0
 
 
@@ -297,11 +301,16 @@ def directory_gib(path: Path) -> float:
     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file()) / GIB if path.exists() else 0.0
 
 
-def remove_clone(path: Path) -> None:
-    if path.is_symlink():
-        path.unlink()
-    elif path.exists():
-        shutil.rmtree(path)
+def trial_output_gib(clone: Path) -> tuple[float, float]:
+    """Count each physical output root once, including saved external intermediates."""
+    saved = scratch.save_cargo_outputs(clone)
+    roots = {clone / "target"}
+    for output in saved:
+        roots.update((output.roots.target_directory, output.roots.build_directory))
+    mend = clone / "mend-target"
+    roots = {root.resolve() for root in roots if not root.resolve().is_relative_to(mend.resolve())}
+    outer = [root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)]
+    return sum(directory_gib(root) for root in outer), directory_gib(mend)
 
 
 def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
@@ -312,90 +321,74 @@ def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
     )
 
 
-def default_trial_parent() -> Path:
-    return Path(tempfile.gettempdir())
+class TrialDeferred(Exception):
+    """The trial must keep its version pending until another night."""
 
 
-def trial_release(
-    version: str, run_command: RunCommand, held: Callable[[], bool], trial_parent: Path,
-) -> TrialOutcome:
-    clone = trial_parent / f"rust-release-trial-{version}"
+def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool]) -> TrialOutcome:
     env = trial_environment()
-    warnings = warning_crates = errors = error_crates = 0
     step = "toolchain"
-    reason = ""
     target_gib = mend_target_gib = 0.0
-    mend_builds = False
-    try:
-        remove_clone(clone)
-        steps: list[tuple[str, list[str], Path | None, dict[str, str], int]] = [
-            ("toolchain", ["rustup", "toolchain", "install", version, "--profile", "minimal", "--component", "clippy", "--component", "rustc-dev"], None, env, 1800),
-            ("clone", ["git", "clone", "--local", "--no-checkout", str(HANA), str(clone)], None, env, 600),
-        ]
-        for step, args, cwd, step_env, timeout in steps:
-            if held():
-                return {"status": "waiting", "version": version, "reason": "build hold active"}
+
+    def run(label: str, args: list[str], cwd: Path | None, step_env: dict[str, str],
+            timeout: int) -> subprocess.CompletedProcess[str]:
+        nonlocal step, target_gib, mend_target_gib
+        step = label
+        if held():
+            raise TrialDeferred("build hold active")
+        try:
             result = run_command(args, cwd, step_env, timeout)
-            if held():
-                return {"status": "waiting", "version": version, "reason": "build hold active"}
-            if trial_step_was_killed(result):
-                return {"status": "waiting", "version": version, "reason": f"{step} killed; retry next night"}
-            if result.returncode != 0:
-                reason = first_error(result)
-                break
-        else:
-            if held():
-                return {"status": "waiting", "version": version, "reason": "build hold active"}
-            step = "revision"
-            revision = run_command(["git", "-C", str(HANA), "rev-parse", "origin/init/catalyst"], None, env, 30)
-            if held():
-                return {"status": "waiting", "version": version, "reason": "build hold active"}
-            if trial_step_was_killed(revision):
-                return {"status": "waiting", "version": version, "reason": "revision killed; retry next night"}
-            if revision.returncode != 0:
-                reason = first_error(revision)
-            else:
-                sha = revision.stdout.strip()
-                checkout = run_command(["git", "-C", str(clone), "checkout", "--detach", sha], None, env, 600)
-                if held():
-                    return {"status": "waiting", "version": version, "reason": "build hold active"}
-                if trial_step_was_killed(checkout):
-                    return {"status": "waiting", "version": version, "reason": "checkout killed; retry next night"}
-                if checkout.returncode != 0:
-                    reason = first_error(checkout)
-            if not reason:
-                if held():
-                    return {"status": "waiting", "version": version, "reason": "build hold active"}
-                step = "clippy"
-                clippy_env = env | {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"}
-                clippy = run_command(["nix", "develop", ".#ci", "-c", "cargo", f"+{version}", "clippy", "--workspace", "--all-targets", "--all-features", "--message-format=json"], clone, clippy_env, 7200)
-                if held():
-                    return {"status": "waiting", "version": version, "reason": "build hold active"}
-                if trial_step_was_killed(clippy):
-                    return {"status": "waiting", "version": version, "reason": "clippy killed; retry next night"}
-                warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
-                if clippy.returncode != 0 and errors == 0:
-                    reason = first_error(clippy)
-            if not reason:
-                if held():
-                    return {"status": "waiting", "version": version, "reason": "build hold active"}
-                step = "cargo-mend"
-                mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(clone / "mend-target")}
-                mend = run_command(["cargo", f"+{version}", "install", "--path", str(Path.home() / "rust/cargo-liner/crates/cargo-mend"), "--root", str(clone / "mend-root")], clone, mend_env, 3600)
-                if held():
-                    return {"status": "waiting", "version": version, "reason": "build hold active"}
-                if trial_step_was_killed(mend):
-                    return {"status": "waiting", "version": version, "reason": "cargo-mend killed; retry next night"}
-                mend_builds = mend.returncode == 0
-        target_gib = directory_gib(clone / "target")
-        mend_target_gib = directory_gib(clone / "mend-target")
-        if reason:
-            return {"status": "failed", "version": version, "step": step, "reason": reason, "target_gib": target_gib, "mend_target_gib": mend_target_gib}
-        return {"status": "finished", "version": version, "warnings": warnings, "warning_crates": warning_crates, "errors": errors, "error_crates": error_crates, "mend_builds": mend_builds, "target_gib": target_gib, "mend_target_gib": mend_target_gib}
-    except (OSError, subprocess.SubprocessError) as error:
-        return {"status": "failed", "version": version, "step": step, "reason": str(error).splitlines()[0], "target_gib": directory_gib(clone / "target"), "mend_target_gib": directory_gib(clone / "mend-target")}
-    finally:
-        remove_clone(clone)
+        finally:
+            if cwd is not None:
+                target_gib, mend_target_gib = trial_output_gib(cwd)
+                mend_target = cwd / "mend-target"
+                if mend_target.is_dir() and not mend_target.is_symlink():
+                    scratch.mark_cargo_cache(mend_target)
+        if held():
+            raise TrialDeferred("build hold active")
+        if trial_step_was_killed(result):
+            raise TrialDeferred(f"{step} killed; retry next night")
+        return result
+
+    def failed(reason: str) -> TrialFailed:
+        return {"status": "failed", "version": version, "step": step, "reason": reason,
+                "target_gib": target_gib, "mend_target_gib": mend_target_gib}
+
+    try:
+        toolchain = run("toolchain", ["rustup", "toolchain", "install", version, "--profile", "minimal",
+                                      "--component", "clippy", "--component", "rustc-dev"], None, env, 1800)
+        if toolchain.returncode:
+            return failed(first_error(toolchain))
+        revision = run("revision", ["git", "-C", str(HANA), "rev-parse", "origin/init/catalyst"], None, env, 30)
+        if revision.returncode:
+            return failed(first_error(revision))
+        step = "checkout"
+        if held():
+            raise TrialDeferred("build hold active")
+        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip())) as checkout:
+            _ = scratch.save_cargo_outputs(checkout)
+            clippy_env = env | {
+                "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3",
+            }
+            clippy = run("clippy", ["nix", "develop", ".#ci", "-c", "cargo", f"+{version}", "clippy",
+                                    "--workspace", "--all-targets", "--all-features", "--message-format=json"],
+                         checkout, clippy_env, 7200)
+            warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
+            if clippy.returncode and errors == 0:
+                return failed(first_error(clippy))
+            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "mend-target"),
+                              "CARGO_BUILD_BUILD_DIR": str(checkout / "mend-target/intermediates")}
+            mend = run("cargo-mend", ["cargo", f"+{version}", "install", "--path",
+                                      str(Path.home() / "rust/cargo-liner/crates/cargo-mend"),
+                                      "--root", str(checkout / "target" / "mend-root")], checkout, mend_env, 3600)
+            return {"status": "finished", "version": version, "warnings": warnings,
+                    "warning_crates": warning_crates, "errors": errors, "error_crates": error_crates,
+                    "mend_builds": mend.returncode == 0, "target_gib": target_gib, "mend_target_gib": mend_target_gib}
+    except TrialDeferred as error:
+        return {"status": "waiting", "version": version, "reason": str(error)}
+    except (copies.CopyError, OSError, subprocess.SubprocessError) as error:
+        return failed(str(error).splitlines()[0])
 
 
 def count_phrase(number: int, crates: int, kind: str) -> str:
@@ -415,10 +408,7 @@ def trial_text(trial: TrialOutcome) -> str:
 
 
 def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
-    if TYPE_CHECKING:
-        from ..notify.push_texts import render
-    else:
-        from push_texts import render
+    from scripts.notify.push_texts import render
 
     if trial["status"] != "finished":
         raise ValueError("incomplete compiler trials are log notes, not user pushes")
@@ -456,7 +446,6 @@ def check_release(
     held: Callable[[], bool] = build_hold_active,
     building: Callable[[], bool] = cargo_building,
     send_text: Callable[[RenderedPush], bool] = send_release_text,
-    trial_parent: Callable[[], Path] = default_trial_parent,
 ) -> int:
     pin = read_pin()
     if pin is not None:
@@ -495,7 +484,7 @@ def check_release(
         return int(fetch_failed)
     if 2 <= today.hour < 5 and state["trial"]["status"] == "waiting":
         reason = waiting_reason(held, building, free_gib)
-        state["trial"] = {"status": "waiting", "version": state["stable_version"], "reason": reason} if reason else trial_release(state["stable_version"], run_command, held, trial_parent())
+        state["trial"] = {"status": "waiting", "version": state["stable_version"], "reason": reason} if reason else trial_release(state["stable_version"], run_command, held)
     write_state(state)
     if 2 <= today.hour < 5 and state["trial"]["status"] == "waiting":
         print(f"Rust {state['stable_version']} trial is waiting: {state['trial']['reason']}")

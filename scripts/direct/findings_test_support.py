@@ -14,17 +14,16 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Only the fsync test calls a function directly; never initialize it from live config.
-with patch.dict(os.environ, {"UNIT_CONFIG": str(Path(__file__).resolve().parents[2] / "config/direct.conf")}):
+with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
     from scripts.direct import findings as findings
 
 SCRIPT = Path(__file__).with_name("findings.py")
 FINDINGS_CODE = compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -42,18 +41,7 @@ def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path
 # findings.py has no compiled limits, so every run needs a complete config.
 # These are the machine's shipped values; a test that cares about one limit
 # overrides just that key on top of them.
-STANDARD_CONFIG = """\
-MIN_REPAIR_BUDGET=3
-REPAIR_ROUNDS_PER_FINDING=0.5
-RUNAWAY_ROUNDS=5
-MAX_FIX_ATTEMPTS=2
-MAX_REOPENS=2
-STALLED_ROUNDS=2
-MAX_CONSECUTIVE_SAME_KIND_PASSES=3
-MAX_REVIEW_CANCELLATIONS=1
-ROUTING_FROM_ROUND=4
-ASTRA_AFTER_FAILED_FIXES=2
-"""
+STANDARD_CONFIG = (SCRIPT.parents[2] / "config/direct.conf").read_text(encoding="utf-8")
 
 
 class FindingsLedgerFixture(unittest.TestCase):
@@ -91,11 +79,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def invoke(self, arguments: tuple[str, ...], at: int) -> subprocess.CompletedProcess[str]:
         command = [*arguments, "--session-dir", str(self.session_dir)]
-        # Retain executable and cross-process persistence/configuration coverage.
-        if self._testMethodName in (
-            "test_ids_are_stable_across_rounds",
-            "test_an_unusable_config_value_stops_the_run",
-        ):
+        if process_boundary_for_case(self):
             return subprocess.run(
                 [sys.executable, str(SCRIPT), *command], capture_output=True, text=True,
                 env=self.environment(at), check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -118,7 +102,7 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Pin the clock and the config so a machine's own direct.conf cannot move a limit."""
         environment = os.environ.copy()
         environment["UNIT_NOW_EPOCH"] = str(at)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         # The gate reads pass events from the durable stream under this root.
         # Left unset it resolves to the machine's own history, where a phase id
         # this fixture invented would be answered by whatever happens to live
@@ -128,7 +112,12 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def write_config(self, text: str) -> None:
         """Write the standard limits with `text` appended; a repeated key there wins."""
-        _ = self.config_file.write_text(STANDARD_CONFIG + text, encoding="utf-8")
+        changes = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        lines = [line.split("=", 1)[0] + "=" + changes.pop(line.split("=", 1)[0])
+                 if "=" in line and line.split("=", 1)[0] in changes else line
+                 for line in STANDARD_CONFIG.splitlines()]
+        _ = self.config_file.write_text("\n".join(lines) + "\n" + "\n".join(
+            key + "=" + value for key, value in changes.items()), encoding="utf-8")
 
     def write_partial_config(self, text: str) -> None:
         """Write `text` as the whole file, standard limits omitted."""
@@ -193,6 +182,21 @@ class FindingsLedgerFixture(unittest.TestCase):
     def status(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.run_command("status")))
 
+    def finding_rows(self) -> list[dict[str, object]]:
+        return cast(list[dict[str, object]], self.status()["findings"])
+
+    def ledger(self) -> str:
+        return (self.session_dir / "findings_state.json").read_text(encoding="utf-8")
+
+    def open_simplify(self, title: str, *, held: bool = False) -> str:
+        options = ("--held-for-decision",) if held else ()
+        return self.run_command(
+            "open", "--severity", "minor", "--title", title,
+            "--caught-by", "worker", "--lens", "simplify",
+            "--file", "scripts/direct/assign.py",
+            "--detail", "The change removes a retry that callers use.", *options,
+        )
+
     def events(self) -> list[dict[str, object]]:
         if not self.history_file.exists():
             return []
@@ -203,15 +207,32 @@ class FindingsLedgerFixture(unittest.TestCase):
         ]
 
     def close_round(self, covers: list[str], *, verdict: str = "accepted") -> None:
-        """Dispatch a batch, land it, and record every closure verdict for it.
-
-        `landed` stands in for the launcher, which is what calls it in a real run
-        once the repair worker exits cleanly.
-        """
+        """Dispatch a batch, record its fix pass, land it, and record each closure verdict."""
         _ = self.run_command("dispatch", "--covers", ",".join(covers))
+        self.record_repair_pass()
         _ = self.run_command("landed")
         for finding_id in covers:
             _ = self.run_command("verdict", "--id", finding_id, "--state", verdict)
+
+    def record_repair_pass(self, *, launch: int = 1, status: str = "completed", seconds: int = 10) -> None:
+        """Record a launch of the current batch in the private history."""
+        state = cast(dict[str, object], json.loads(self.ledger()))
+        batches = cast(list[dict[str, object]], state["rounds"])
+        number = cast(int, batches[-1]["round"])
+        started = 1_000 + number * 100 + launch * 20
+        record = {
+            "event_type": "pass_started", "phase_instance_id": state["phase_instance_id"],
+            "pass_instance_id": f"repair-{state['phase_instance_id']}-{number}-{launch}",
+            "pass_kind": "fix", "fix_pass": 1, "team_slot": f"repair-{number}",
+            "launch_check": {"fix_cause": {"round": number}},
+            "pass_started_at": started, "timestamp_epoch": started,
+        }
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(record) + "\n")
+            _ = stream.write(json.dumps({**record, "event_type": "pass_finished", "status": status,
+                                        "timestamp_epoch": started + seconds, "pass_elapsed_seconds": seconds}) + "\n")
 
     def write_two_open_phases(self) -> None:
         """Phase 15 started first and stays open while Phase 16 is the newest."""
@@ -236,14 +257,24 @@ class FindingsLedgerFixture(unittest.TestCase):
         return note
 
     def write_repair_intervals(self, count: int, *, instance: str = "instance-a") -> None:
-        """Unledgered fixes use distinct intervals even when fix_pass restarts at one."""
+        """Ledger batches use distinct intervals even when fix_pass restarts at one."""
         path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        history = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+        previous = max((cast(int, event["round"]) for event in history
+                        if event.get("event_type") == "finding_batch_dispatched"
+                        and event.get("phase_instance_id") == instance), default=0)
         records: list[dict[str, object]] = []
         for index in range(count):
+            number = previous + index + 1
+            records.append({
+                "event_type": "finding_batch_dispatched", "phase_instance_id": instance,
+                "round": number, "covered": ["F001"], "timestamp_epoch": 90 + index * 20,
+            })
             start: dict[str, object] = {
                 "event_type": "pass_started", "phase_instance_id": instance,
-                "pass_instance_id": f"repair-{instance}-{index}", "pass_kind": "fix",
+                "pass_instance_id": f"repair-{instance}-{number}", "pass_kind": "fix",
+                "launch_check": {"fix_cause": {"round": number}},
                 "fix_pass": 1, "pass_started_at": 100 + index * 20,
                 "timestamp_epoch": 100 + index * 20, "pass_activity": "repair failing tests",
             }
@@ -256,7 +287,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def route_finding(self, finding_id: str, *, reason: str = "spec-gap") -> str:
         return self.run_command(
-            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving-unit",
+            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving",
             "--work-order", "docs/follow-up.md — Phase 6 — Specify retry ownership",
             "--due", "Phase 6 checkpoint", "--evidence", "The Work Order has no owner rule",
         )

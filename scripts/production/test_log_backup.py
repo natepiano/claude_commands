@@ -7,12 +7,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
-import log_backup
+from scripts.production import log_backup, staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("log_backup.py")
@@ -29,6 +32,7 @@ class LogBackupTests(unittest.TestCase):
         self.doc: Path = Path()
         self.state: Path = Path()
         self.backups: Path = Path()
+        self.owner_id: staff.StaffId = staff.StaffId("")
 
     @override
     def setUp(self) -> None:
@@ -37,9 +41,17 @@ class LogBackupTests(unittest.TestCase):
         self.log = checkout / "docs/plans/demo-log.md"
         self.log.parent.mkdir(parents=True)
         self.state = self.root / "state"
-        self.backups = self.state / "demo" / "log-backups"
         self.doc = self.root / "demo-production.md"
         self.write_doc("running")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            "SHOWRUNNER_STATE_DIR": str(self.state),
+        })))
+        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc("natedev", self.doc))
+        _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
+        self.owner_id = owner.id
+        self.backups = self.state / owner.id / "log-backups"
 
     def write_doc(self, status: str, *, log_field: bool = True) -> None:
         fields = [
@@ -47,7 +59,6 @@ class LogBackupTests(unittest.TestCase):
             "- **Merge branch:** `demo`",
             f"- **Showrunner checkout:** `{self.root / 'checkout'}`",
             "- **User zone:** America/Los_Angeles — demo",
-            "## Units",
         ]
         if log_field:
             fields.insert(2, "- **Log:** `docs/plans/demo-log.md`")
@@ -57,7 +68,7 @@ class LogBackupTests(unittest.TestCase):
         return sorted(path.name for path in self.backups.iterdir()) if self.backups.exists() else []
 
     def run_script(self, script: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=300,
+        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                               env={**os.environ, "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state)})
 
     def test_a_log_is_copied_under_its_stamp(self) -> None:
@@ -99,17 +110,17 @@ class LogBackupTests(unittest.TestCase):
 
     def test_the_command_copies_into_the_production_s_own_directory(self) -> None:
         _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 0, result.stderr)
         names = self.names()
         self.assertEqual(len(names), 1)
         self.assertRegex(names[0], r"^log-\d{8}T\d{4}\.md$")
         self.assertEqual(result.stdout, f"copied to {self.backups / names[0]}\n")
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), str(self.doc)]).stdout, "nothing new to copy\n")
+        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), "backup-owner"]).stdout, "nothing new to copy\n")
 
     def test_the_command_refuses_a_doc_it_cannot_read(self) -> None:
         self.write_doc("running", log_field=False)
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 1)
         self.assertIn("log_backup: production doc lacks Log", result.stderr)
         self.assertEqual(self.run_script([sys.executable, str(SCRIPT)]).returncode, 2)
@@ -119,14 +130,19 @@ class LogBackupTests(unittest.TestCase):
         for status, code, copied in (("wrapped", 2, 0), ("paused", 1, 0), ("running", 0, 1)):
             with self.subTest(status=status):
                 self.write_doc(status)
-                result = self.run_script(["zsh", str(CHECK), str(self.doc)])
+                result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(self.names()), copied)
 
+    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
+        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.names(), [])
+
     def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
         self.write_doc("running", log_field=False)
-        result = self.run_script(["zsh", str(CHECK), str(self.doc)])
+        result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
         self.assertEqual(result.returncode, 0)
         self.assertIn("log_backup: production doc lacks Log", result.stderr)
         self.assertEqual(self.names(), [])

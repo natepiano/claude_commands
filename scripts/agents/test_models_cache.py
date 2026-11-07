@@ -14,7 +14,7 @@ from typing import final, override
 from unittest.mock import Mock, patch
 
 from scripts.lib.codex_models_cache import ModelsCacheUnreadable, read_models_cache
-from scripts.lib.test_agents_registry import ExactRows, write_registry
+from scripts.lib.test_models_registry import ExactRows, write_registry
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -102,19 +102,19 @@ class ModelsCacheTests(unittest.TestCase):
         self.assertEqual(self.cache.read_text(), "{broken")
 
     def environment(self) -> dict[str, str]:
-        registry = write_registry(self.root / "agents.conf", {
+        registry = write_registry(self.root / "models.conf", {
             "assignments": ExactRows({"direct": "codex"}),
             "direct.codex": {"impl": "sol:high"},
             "codex.agents": {"gpt-6.1-sol": "high"},
             "codex.families": {"sol": "gpt-6.1-sol"},
         })
-        return {**os.environ, "AGENTS_CONFIG_FILE": str(registry),
-                       "AGENTS_CONFIG_TIER_ONLY": "1", "AGENTS_CONFIG_PUBLISH": "0",
+        return {**os.environ, "MODELS_CONFIG_FILE": str(registry),
+                       "MODELS_CONFIG_TIER_ONLY": "1", "MODELS_CONFIG_PUBLISH": "0",
                 "CODEX_MODELS_CACHE_FILE": str(self.cache)}
 
     def resolve(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", "-c", 'source "$1"; _agents_model_slug codex sol',
-                               "cache-test", str(ROOT / "scripts/agents/agents_config.sh")],
+                               "cache-test", str(ROOT / "scripts/agents/models_config.sh")],
                               env=self.environment(), capture_output=True, text=True, check=False, timeout=LauncherHangGuard(self.id()).remaining())
 
 

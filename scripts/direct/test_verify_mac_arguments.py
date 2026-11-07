@@ -1,14 +1,21 @@
-"""Real verify.sh Mac arguments with disposable tools."""
+"""Test Mac arguments directly and keep complete routing cases."""
 from __future__ import annotations
 
-import unittest
 import json
 import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import final
+
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -70,33 +77,92 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["mac_holder"], "render checks")
         self.assertEqual(self.last_call()["mac_reason"], "busy")
 
-    def test_no_test_match_runs_locally_and_reaches_call_record(self) -> None:
-        result = self.verify(
-            "test",
-            "sample",
-            "--no-cache",
-            extra={
-                "TEST_RUNNER_MAC": "declined",
-                "TEST_RUNNER_REASON": "no_tests",
-                "TEST_RUNNER_SECONDS": "4.5",
-                "TEST_RUNNER_STATUS": "75",
-                "TEST_RUNNER_OUTPUT": (
-                    "mac_test: no test matched on the Mac; "
-                    "running on natedev instead"
-                ),
-            },
-        )
+    def test_no_test_match_result_reaches_call_record(self) -> None:
+        runner = self.root / "no-test-result.py"
+        self.write_executable(runner, '''
+import json
+import os
+import sys
+import time
+from pathlib import Path
 
+from scripts.mac_test import offload
+
+with (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").open("a") as output:
+    output.write(json.dumps({"args": sys.argv[1:], "token_held": False, "at": time.time()}) + "\\n")
+result = offload.NoTestMatchedOnMac(4.5)
+destination = offload.ResultFile(Path(sys.argv[sys.argv.index("--result") + 1]))
+raise SystemExit(offload.write_result(result, destination))
+''')
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "VERIFY_MAC_RUNNER": str(runner), "PYTHONPATH": str(VERIFY.parents[2]),
+        })
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "mac_test: no test matched on the Mac; running on natedev instead",
             result.stdout,
         )
-        self.assertEqual(len(self.local_runs()), 1)
+        runners = self.runner_events()
+        local = self.local_runs()
+        self.assertEqual(len(runners), 1)
+        self.assertEqual(len(local), 1)
+        runner_arguments = runners[0]["args"]
+        nextest_arguments = runner_arguments[runner_arguments.index("--") + 1:]
+        local_arguments = local[0]["args"][4:]
+        self.assertEqual(nextest_arguments, local_arguments)
+        self.assertIn("--no-tests=warn", nextest_arguments)
+        self.assertIn("--no-tests=warn", local_arguments)
         record = self.last_call()
         self.assertEqual(record["mac"], "declined")
         self.assertEqual(record["mac_reason"], "no_tests")
         self.assertEqual(record["mac_s"], 4.5)
+
+
+@final
+class NextestArgumentTests(unittest.TestCase):
+    def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
+        functions = shell_functions(VERIFY, "read_metadata", "set_gate_metadata", "load_metadata",
+                                    "require_member", "qualify_features", "merge_dev_features",
+                                    "take_features", "take_test_targets", "compose_nextest_args")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata: dict[str, object] = {
+                "workspace_root": str(root), "workspace_members": ["sample-id"],
+                "packages": [{"name": "sample", "id": "sample-id", "features": {},
+                              "manifest_path": str(root / "Cargo.toml"), "dependencies": [],
+                              "targets": [{"name": "sample", "kind": ["lib"], "test": True,
+                                           "src_path": str(root / "src/lib.rs")},
+                                          {"name": "integration_suite", "kind": ["test"], "test": True,
+                                           "src_path": str(root / "tests/integration_suite.rs")}]}],
+            }
+            script = functions + "\n" + "\n".join((
+                "PY=" + shlex.quote(sys.executable),
+                "VERIFY_METADATA_SCRIPT=" + shlex.quote(str(VERIFY.with_name("verify_metadata.py"))),
+                "GATE_METADATA=" + shlex.quote(json.dumps(metadata)),
+                "CMD=test", "DEV_FEATURES=", "METADATA_READY=0",
+            )) + r'''
+for selection in plain filter target; do
+    FEATURE_FLAGS=() TEST_SELECTION=() NEXTEST_ARGS=()
+    case "$selection" in
+        plain) ARGS=(sample) ;;
+        filter) ARGS=(sample --filter alpha) ;;
+        target) ARGS=(sample integration_suite) ;;
+    esac
+    compose_nextest_args
+    printf '%s\0' "${NEXTEST_ARGS[@]}"
+    printf '\0'
+done
+'''
+            result = subprocess.run(["bash", "-e", "-c", script], cwd=root,
+                                    text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cases = (((), True), (("--filter", "alpha"), False), (("integration_suite",), False))
+        answers = result.stdout.split("\0\0")[:-1]
+        self.assertEqual(len(answers), len(cases))
+        for (arguments, allow_empty), answer in zip(cases, answers, strict=True):
+            with self.subTest(arguments=arguments):
+                nextest_arguments = answer.split("\0")
+                self.assertEqual("--no-tests=warn" in nextest_arguments, allow_empty)
 
 
 if __name__ == "__main__":

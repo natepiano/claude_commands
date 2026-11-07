@@ -1,5 +1,5 @@
 ---
-description: Judge whether direct-ready phased plans should run as a production — several /unit:direct units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
+description: Assess plans for parallel production.
 ---
 
 # Greenlight
@@ -50,13 +50,12 @@ reading the Markdown yourself:
 
 ```sh
 set -o pipefail
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+~/.claude/scripts/lib/py -m scripts.berth.work_order \
   --repository-root "${REPO}" resolve --document "<plan>" --phase <N> \
   | jq -r '.work_order.files[].path'
 ```
 
-Also read each phase's **Goal**, **Constraints from prior phases**, and any
-`**Blocked by:**` line.
+Also read each phase's **Goal**, **Constraints from prior phases**, and its dependencies.
 </ReadPhases>
 
 ---
@@ -65,8 +64,7 @@ Also read each phase's **Goal**, **Constraints from prior phases**, and any
 1. **Order between phases.** Phase B comes after phase A when any of these hold:
    - B's **Constraints from prior phases** names something A builds: a type, a
      file, a behavior;
-   - A and B list the same file, unless it is a hub file (step 2);
-   - B carries a `**Blocked by:**` gate on A.
+   - A and B list the same file, unless it is a hub file (step 2).
 2. **Hub files.** A hub file is one that phases in otherwise independent groups
    all list: `lib.rs` or `mod.rs` re-exports, `Cargo.toml`, `Cargo.lock`,
    plugin registration, a shared types file, a shared example. A hub file does
@@ -75,14 +73,11 @@ Also read each phase's **Goal**, **Constraints from prior phases**, and any
 3. **Chains.** Drop the hub-file links. Each connected group of phases is a
    candidate unit. A group of one small phase joins the unit whose files it
    touches most.
-4. **Gates.** An order link between two units becomes a gate: the waiting unit's
-   phase waits for the other unit's phase to be on the merge branch. The gates
-   must form no cycle. If unit A waits on B and B waits on A, merge the two
-   units, or reorder phases when the plan allows it without changing what
-   ships.
-5. **Names.** Name each unit `<area>-unit` after the crate or module it owns:
+4. **Order.** Record start-order waits as owed actions in the showrunner's notes.
+   Use `cargo-berth sequence` for merge order.
+5. **Names.** Name each unit `<area>` after the crate or module it owns:
    short, lowercase, hyphenated. A unit that keeps the source plan's main line
-   may be `trunk-unit`.
+   may be `trunk`.
 </FormUnits>
 
 ---
@@ -102,8 +97,7 @@ is unmeasured. Never state a speedup that no measured run supports.
 
 - there are two or more units;
 - every unit has at least one phase that can run while another unit's phase
-  runs, with no gate between them;
-- the gates form no cycle;
+  runs;
 - each hub file has exactly one owner, and the units' owned files do not
   overlap;
 - units that change what users see can each launch the app on their own port.
@@ -121,7 +115,6 @@ example "every phase builds on the one before it".
 | Verdict | Production of <n> units / One `/unit:direct` run — <one-line reason> |
 | Units | <unit>: phases <source numbers> — owns <dirs/files>; one row per unit |
 | Hub files | <file> → <owner unit>; or None |
-| Gates | G<k>: <unit> phase <N> waits on <unit> phase <M>; or None |
 | Capacity | <cores, memory; known load-sensitive flakes; ceiling measured or unmeasured> |
 | Next | `/producer:to_production <plan>…` or `/unit:direct <plan>` |
 ```

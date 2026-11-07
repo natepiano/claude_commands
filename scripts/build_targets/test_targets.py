@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
@@ -14,13 +18,28 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
-import targets
-import build_hold
-import mac_test
-import offload
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+from scripts.build_targets import targets
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+from scripts.mac_test import offload
+if TYPE_CHECKING:
+    from . import target_config
+else:
+    from scripts.build_targets import target_config
 
 
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
@@ -80,8 +99,9 @@ class IsolatedTargetTest(unittest.TestCase):
         self.holders.mkdir()
         self.mac_state.mkdir()
         (self.root / "sessions").mkdir()
-        _ = self.settings.write_text("host=test-mac\n", encoding="utf-8")
+        _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "BUILD_HOLD_DIR": str(self.holders),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
@@ -93,6 +113,10 @@ class IsolatedTargetTest(unittest.TestCase):
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
+        home_config = self.root / ".claude/config"
+        home_config.mkdir(parents=True)
+        _ = config_environment(home_config)
+        _ = (home_config / "mac_test.conf").write_text(self.settings.read_text())
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch(
             "subprocess.run", side_effect=AssertionError("State reads must stay local"),
@@ -101,7 +125,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "subprocess.Popen", side_effect=AssertionError("State reads must stay local"),
         ))
 
-    def write_config(self, content: str, name: str = "targets.conf") -> Path:
+    def write_config(self, content: str, name: str = "build_targets.conf") -> Path:
         path = self.root / name
         _ = path.write_text(content, encoding="utf-8")
         return path
@@ -144,10 +168,25 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
-    def test_shipped_config_reads_mac_then_natedev(self) -> None:
+    def test_aws_classification_requires_linux_and_a_name_or_settings_match(self) -> None:
+        cases: tuple[tuple[str, target_config.Platform, str, bool], ...] = (
+            ("aws", "linux", "custom.conf", True),
+            ("builder", "linux", "aws_target.conf", True),
+            ("builder", "linux", "custom.conf", False),
+            ("aws", "macos", "custom.conf", False),
+            ("builder", "macos", "aws_target.conf", False),
+            ("aws", "macos", "aws_target.conf", False),
+        )
+        for name, platform, filename, expected in cases:
+            with self.subTest(name=name, platform=platform, filename=filename):
+                target = target_config.SshTarget(name, platform, self.root / filename)
+                self.assertEqual(target_config.is_aws_target(target), expected)
+
+    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
             targets.LocalTarget("natedev", "linux"),
+            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
 
     def test_order_follows_targets_key(self) -> None:
@@ -163,9 +202,14 @@ class ConfigurationTests(IsolatedTargetTest):
 
     def test_environment_selects_config_path(self) -> None:
         config = self.write_config("targets=fixture\nkind.fixture=local\nplatform.fixture=linux\n")
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             self.assertEqual(targets.read_targets(), (targets.LocalTarget("fixture", "linux"),))
-            self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (targets.LocalTarget("fixture", "linux"),))
+
+    def test_explicit_path_wins_over_environment(self) -> None:
+        config = self.write_config("targets=fixture\nkind.fixture=local\nplatform.fixture=linux\n")
+        explicit = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n", "explicit.conf")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
+            self.assertEqual(targets.read_targets(explicit), (targets.LocalTarget("natedev", "linux"),))
 
     def test_unknown_kind_names_its_key(self) -> None:
         config = self.write_config("targets=mac\nkind.mac=network\nplatform.mac=macos\n")
@@ -193,7 +237,7 @@ class ConfigurationTests(IsolatedTargetTest):
         folder = self.root / "configuration"
         folder.mkdir()
         settings = folder / "remote.conf"
-        _ = settings.write_text("host=test-mac\n", encoding="utf-8")
+        _ = write_config_fixture(settings, "host=test-mac\n", template="mac_test")
         config = folder / "targets.conf"
         _ = config.write_text(
             "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=remote.conf\n",
@@ -220,7 +264,7 @@ class EligibilityTests(IsolatedTargetTest):
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
 
     def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
@@ -234,7 +278,10 @@ class EligibilityTests(IsolatedTargetTest):
             ("", targets.LocalRequired("Linux sockets required"), targets.ExcludedTarget(mac, "Linux sockets required")),
         ):
             with self.subTest(settings=settings, routing=routing):
-                _ = self.settings.write_text(settings)
+                _ = write_config_fixture(self.settings, settings, template="mac_test")
+                if "linux_only.other=" in settings:
+                    _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
+                        if not line.startswith("linux_only.hana=")) + "\n")
                 self.assertEqual(targets.target_eligibility(self.root, "hana", routing),
                                  (expected, targets.EligibleTarget(local)))
 
@@ -246,12 +293,12 @@ class EligibilityTests(IsolatedTargetTest):
 
     def test_reversed_order_and_alternate_settings_decide_eligibility(self) -> None:
         alternate = self.root / "alternate.conf"
-        _ = alternate.write_text("linux_only.hana=hana\n")
+        _ = write_config_fixture(alternate, "linux_only.hana=hana\n", template="mac_test")
         config = self.write_config(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=alternate.conf\n"
         )
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
         self.assertEqual(results, (targets.EligibleTarget(targets.LocalTarget("natedev", "linux")),
                                   targets.ExcludedTarget(targets.SshTarget("mac", "macos", alternate), "linux_only")))
@@ -311,7 +358,7 @@ class TargetStateTests(IsolatedTargetTest):
         args.what = "nextest hana"
         args.worktree = str(self.root)
         output = io.StringIO()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
              mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))
@@ -365,7 +412,7 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_live_claim_is_running(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(
                 targets.target_state(self.mac()),
                 targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
@@ -379,7 +426,7 @@ class TargetStateTests(IsolatedTargetTest):
         record["idle_since"] = END.isoformat()
         _ = liner.write_text(json.dumps(record), encoding="utf-8")
         self.write_claim("claims/hana.json")
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(targets.target_state(self.mac()), targets.Running((
                 targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),
                 targets.RunningJob("nextest cargo-liner", later, targets.IdleSince(END)),
@@ -392,7 +439,7 @@ class TargetStateTests(IsolatedTargetTest):
             record = cast(dict[str, object], json.loads(path.read_text()))
             record["holder_session"] = session_id
             _ = path.write_text(json.dumps(record))
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             state = targets.target_state(self.mac())
         self.assertEqual(state, targets.Running((
             targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE, targets.HolderSession("report-session")),
@@ -410,7 +457,7 @@ class TargetStateTests(IsolatedTargetTest):
         (self.mac_state / "claims").mkdir()
         _ = (self.mac_state / "claims" / "cargo-liner.json").write_text(json.dumps(record), encoding="utf-8")
         self.write_claim("claims/hana.json")
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(
                 targets.target_state(self.mac()),
                 targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
@@ -424,25 +471,25 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_claim_with_gone_run_is_free(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
 
     def test_claim_with_reused_pid_is_free(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="different-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("different-run-start")):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
 
     def test_active_block_precedes_live_claim(self) -> None:
         self.write_block()
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(targets.target_state(self.mac()),
                              targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
     def test_retained_expired_block_precedes_live_claim(self) -> None:
         self.write_block(NOW - timedelta(seconds=1))
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertIsInstance(targets.target_state(self.mac()), targets.Held)
 
     def test_state_reads_leave_records_unchanged(self) -> None:
@@ -451,7 +498,7 @@ class TargetStateTests(IsolatedTargetTest):
         block = self.mac_state / "block.json"
         claim = self.mac_state / "run.json"
         before = (block.read_bytes(), claim.read_bytes())
-        with mock.patch("mac_test.process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertIsInstance(targets.target_state(self.mac()), targets.Held)
         self.assertEqual((block.read_bytes(), claim.read_bytes()), before)
 
@@ -459,7 +506,7 @@ class TargetStateTests(IsolatedTargetTest):
         self.write_claim()
         claim = self.mac_state / "run.json"
         before = claim.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
         self.assertEqual(claim.read_bytes(), before)
 

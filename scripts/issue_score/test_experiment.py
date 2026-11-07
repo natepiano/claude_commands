@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 from urllib.request import Request
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, decide, evaluate, experiment, questions, records, score_issues
 from scripts.issue_score import test_score_issues as run_support
 from scripts.issue_score import test_evaluate as report_support
@@ -18,7 +19,7 @@ from scripts.issue_score.test_decide import choice_answer, score_answer
 FIXTURES = Path(__file__).with_name("fixtures")
 
 
-class ExperimentTests(unittest.TestCase):
+class ExperimentTests(ConfiguredTestCase):
     def test_variants_are_added_without_replacing_or_mutating_production_questions(self) -> None:
         production = questions.main_questions()
         before = copy.deepcopy(production)
@@ -98,16 +99,17 @@ class ExperimentTests(unittest.TestCase):
             _ = experiment.build_questions(production, {"incompatible": {"category": changed}})
 
 
-class ExperimentRunTests(unittest.TestCase):
+class ExperimentRunTests(ConfiguredTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.fixture: run_support.ScoreIssuesTests = run_support.ScoreIssuesTests()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        _ = self.enterContext(mock.patch.object(client, "SPEND_LEDGER", self.fixture.state / "spend.jsonl"))
+        _ = self.enterContext(mock.patch.object(client, "spend_ledger", return_value=self.fixture.state / "spend.jsonl"))
 
     def test_experiment_is_fresh_tune_only_and_persists_projected_variants_without_poisoning_cache(self) -> None:
         tune = self.fixture.issue("Target A")

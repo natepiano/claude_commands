@@ -5,10 +5,10 @@ from __future__ import annotations
 import unittest
 from typing import final, override
 
-import finding_sites
-import style_ledger
-import test_style_ledger_sites
-from ledger_test_support import PARENT_FILE
+from scripts.style import finding_sites
+from scripts.style import style_ledger
+from scripts.style import test_style_ledger_sites
+from scripts.style.ledger_test_support import PARENT_FILE
 
 
 @final
@@ -20,6 +20,18 @@ class FindingSitesTests(unittest.TestCase):
         # Ledger fixtures clone a template initialized by their class setup.
         cls.addClassCleanup(test_style_ledger_sites.StyleLedgerSitesTests.doClassCleanups)
         test_style_ledger_sites.StyleLedgerSitesTests.setUpClass()
+
+    def test_changed_function_signature_cannot_carry_its_parameters_old_judgment(self) -> None:
+        source = "fn work(\n    item: &ImplItem,\n) -> bool { inspect(item) }\n"
+        original = finding_sites.SourceSites(source)
+        for changed in (source.replace("-> bool", "-> SurfaceReferenceMatch"),
+                        source.replace("&ImplItem", "&mut ImplItem")):
+            with self.subTest(source=changed):
+                self.assertFalse(original.same_owner(2, finding_sites.SourceSites(changed), 2))
+        # A body-only change keeps the same header, so the fix does not make a
+        # historical site depend on unrelated statements in the function body.
+        self.assertTrue(original.same_owner(2, finding_sites.SourceSites(
+            source.replace("inspect(item)", "consume(item)")), 2))
 
     def assert_unproved_owner(self, source: str) -> None:
         sites = finding_sites.SourceSites(source)
@@ -191,7 +203,7 @@ class FindingSitesTests(unittest.TestCase):
                   "fn work() {\n    let old = 791;\n}\n")
         ledger, _, finding = fixture.site_fixture(source=source, line=5)
         tip = fixture.commit_tip(ledger, {PARENT_FILE: "// heading\n" + source})
-        expected = style_ledger.UnchangedSite(PARENT_FILE, 6)
+        expected = fixture.expected_site(ledger, finding, PARENT_FILE, 6)
         self.assertEqual(fixture.strict_site(ledger, finding, tip), expected)
         self.assertEqual(ledger.finding_site(finding, tip), expected)
         old, new = finding_sites.SourceSites(source), finding_sites.SourceSites("// heading\n" + source)
@@ -384,9 +396,9 @@ class FindingSitesTests(unittest.TestCase):
         ledger, _, finding = fixture.site_fixture(source=source, line=3)
         tip = fixture.commit_tip(ledger, {"crates/alpha/src/other.rs": "fn unrelated() {}\n"})
         self.assertEqual(fixture.strict_site(ledger, finding, tip),
-                         style_ledger.UnchangedSite(PARENT_FILE, 3))
+                         fixture.expected_site(ledger, finding, PARENT_FILE, 3))
         self.assertEqual(ledger.finding_site(finding, tip),
-                         style_ledger.UnchangedSite(PARENT_FILE, 3))
+                         fixture.expected_site(ledger, finding, PARENT_FILE, 3))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Report named usage metrics from the ledger without reading logs or changing it."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sqlite3
@@ -16,10 +20,10 @@ from pathlib import Path
 from typing import NoReturn, cast, override
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.production import session_staff, staff
 from scripts.usage import collect, outcomes, weights
+from scripts.shutdown import remote
 from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
 
@@ -282,38 +286,21 @@ class UnitWorktree:
     worktree: Path
 
 
-def document_units(path: Path) -> tuple[UnitWorktree, ...]:
-    """The rows of one production doc's `## Units` table that name a unit and its worktree."""
+def document_units(owner: staff.StaffRow, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    """Read the showrunner's unit worktrees from one staff snapshot."""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        rows = resolver.record.find(kind="unit", parent=owner.id)
+    except staff.StaffUnreadable as error:
+        print(f"usage_report: {owner.name}: {error}", file=sys.stderr)
         return ()
     found: list[UnitWorktree] = []
-    in_units = False
-    headings: list[str] = []
-    for line in lines:
-        if line.strip() == "## Units":
-            in_units = True
-            continue
-        if not in_units:
-            continue
-        if line.startswith("## "):
-            break
-        if not line.lstrip().startswith("|"):
-            if headings:
-                break
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if not headings:
-            headings = cells
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        row = dict(zip(headings, cells, strict=False))
-        unit = outcomes.cell_value(row.get("Unit", ""))
-        worktree = outcomes.cell_value(row.get("Worktree", ""))
-        if unit and worktree:
-            found.append(UnitWorktree(unit, Path(worktree).expanduser()))
+    for row in rows:
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            print(f"usage_report: {row.name}: the worktree is not recorded", file=sys.stderr)
+        else:
+            found.append(UnitWorktree(row.name, tree.path))
     return tuple(found)
 
 
@@ -322,22 +309,29 @@ def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]
     return tuple(sorted(worktrees, key=lambda row: len(row.worktree.parts), reverse=True))
 
 
-def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
-    return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
-                         for row in document_units(document))
+def unit_worktrees(production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    return longest_first(row for owner in outcomes.production_owners(production_docs, resolver.record)
+                         for row in document_units(owner, resolver=resolver))
 
 
-def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...]) -> None:
+def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...],
+                              *, resolver: session_staff.RowResolver | None = None) -> None:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     @lru_cache(maxsize=8192)
     def report_unit(folder: str | None) -> str:
         # A SQL NULL is the boundary value for an agent whose folder was not reported.
         if folder is None:
             return "unknown"
         path = Path(folder)
+        member = resolver.member_by_folder(remote.local_machine(), path)
+        if isinstance(member, session_staff.MemberFound):
+            return member.row.name
+        # Retained worktrees keep the recorded attribution for history.
         for row in worktrees:
             if path.is_relative_to(row.worktree):
                 return row.unit
-        return path.name or "unknown"
+        return "unknown"
 
     db.create_function("report_unit", 1, report_unit, deterministic=True)
     weights.register(db)
@@ -957,7 +951,8 @@ def main(argv: Sequence[str] = ()) -> int:
         request = report_request(args)
         with closing(open_read_store(args.db)) as db:
             check_store_version(db)
-            register_report_functions(db, unit_worktrees(args.production_docs))
+            resolver = session_staff.RowResolver(staff.snapshot())
+            register_report_functions(db, unit_worktrees(args.production_docs, resolver=resolver), resolver=resolver)
             print(render_report(db, request), end="")
     except ReportRefused as error:
         print("usage_report: " + " ".join(str(error).splitlines()), file=sys.stderr)

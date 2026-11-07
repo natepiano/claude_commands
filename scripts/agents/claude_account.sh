@@ -9,7 +9,11 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
-selected = accounts.account_for_unscoped_launch(os.environ, workers=sys.argv[2] == "workers")
+try:
+    selected = accounts.account_for_unscoped_launch(os.environ, workers=sys.argv[2] == "workers")
+except accounts.AccountsError as error:
+    print(f"ERROR: {error}", file=sys.stderr)
+    raise SystemExit(1)
 print("" if isinstance(selected, accounts.LegacyHomeLaunch) else selected.dir)
 PYTHON
 )" || return 1

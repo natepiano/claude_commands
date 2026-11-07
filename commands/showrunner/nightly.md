@@ -1,5 +1,5 @@
 ---
-description: List the nightly review's open improvements in one table - largest measured gain per week first, with the one to do next marked recommended.
+description: List open nightly review proposals.
 ---
 
 # Nightly

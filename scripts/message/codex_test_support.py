@@ -11,12 +11,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
 
-import codex_daemon
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import codex_daemon
 if TYPE_CHECKING:
-    import roster
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+    from scripts.message import roster
 
 RpcMessage = dict[str, object]
 
@@ -183,7 +181,7 @@ def loaded_session_daemon(home: Path, names: dict[str, str], *, expect_contact: 
 
 def daemon_session_row(owner: codex_daemon.CodexDaemon, thread: str, name: str) -> roster.RosterEntry:
     """A loaded session row for tests that isolate send's formatting or transport errors."""
-    import roster
+    from scripts.message import roster
 
     return roster.RosterEntry(
         "machine", "codex", "freestanding", name, "idle", roster.Messageable(f"codex:{thread}"),

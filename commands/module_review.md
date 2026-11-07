@@ -1,5 +1,5 @@
 ---
-description: Three-pass module-structure evaluation. Three agents review a directory tree (cohesion / coupling / placement). The agent writes a restructure plan to a doc. If pass 1 surfaced over-large files (per the style guide), three more agents design split phases. Three final agents stress-test the complete plan. The agent refines and presents.
+description: Review module structure in the invoking session.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a planning doc only — implementation lives in a separate command or follow-up turn.
@@ -64,36 +64,24 @@ Store `${SCOPE}`, `${DOC_PATH}`, `${CRATE_NAME}`, `${CRATE_ROOT}`, and `${IS_WOR
 ---
 
 <InventoryScope>
-**Goal:** Build the file inventory once so every agent sees the same picture.
+**Goal:** Build one file inventory for all lenses.
 
 Run `find ${SCOPE} -type f -name "*.rs" | sort` and capture the output as `${INVENTORY}`. Also capture per-file line counts via `wc -l`.
 
-Identify the existing directory submodules under `${SCOPE}` (immediate children that are directories with a `mod.rs`) and the singleton `.rs` files at each layer. This is the picture every agent's prompt will reference.
+Identify immediate subdirectories with a `mod.rs` and singleton `.rs` files at each layer.
+Use this inventory for every lens.
 </InventoryScope>
 
 ---
 
 <Pass1Discovery>
-**Goal:** Three agents evaluate the structure along three lenses, with the Rust style guide loaded.
+**Goal:** Review module structure through three lenses.
 
-Launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+The invoking session runs each lens itself, one after the other: A, B, then C.
 
-Create an absolute `${SESSION_DIR}` under `/tmp/claude/module_review/<uuid>/`. Set `${WORKING_DIR}` to the repo root containing `${SCOPE}`; never use `~/.claude` unless it is itself that repo. Create `${WAVE_DIR}=${SESSION_DIR}/pass1`. Before backgrounding any reviewer:
+1. Create an absolute `${SESSION_DIR}` under `/tmp/claude/module_review/<uuid>/` for the findings.
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh module_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
-2. Capture provenance once for each task this command uses:
-   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
-   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.validation' >> "${SESSION_DIR}/agent_provenance.txt"`
-
-Write three absolute `${WAVE_DIR}/prompt_N.md` files and reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for each reviewer. External CLI agents inherit no session context. Every prompt file must be self-contained and include:
-
-- The charter + style-guide preamble below verbatim.
-- The review topic, intent, and posture/boundaries from `<ResolveScope/>` and this pass.
-- `${SCOPE}`, `${CRATE_ROOT}` when set, `${DOC_PATH}`, and every other relevant file as explicit absolute paths.
-- `${INVENTORY}` verbatim and the reviewer's specific lens.
-- The finding output format for this pass: Agent A's format below (Title / Where / Observation / Severity / Recommendation), shared by Agents B and C — the per-agent format governs, not the charter's generic schema.
-
-Each agent's prompt must include this preamble verbatim:
+Run this preamble once, before lens A.
 
 ```
 Before evaluating:
@@ -105,17 +93,16 @@ If the output mentions a saved file path, Read that file. Apply the loaded rules
 The style guide includes `forbidden-words.md`. Apply that file's rules to every word of every finding you return.
 ```
 
-Then the per-agent body. Pass `${INVENTORY}` verbatim into each prompt.
 
-**Agent A — Cohesion**
+**Lens A — Cohesion**
 > Evaluate **module cohesion** across `${SCOPE}`. For each module (top-level and each subdirectory), answer: do the files belong together? Name split candidates, merge candidates, and misplaced singletons. Output findings as numbered list: Title / Where (file paths) / Observation (concrete — name types/functions) / Severity (critical / important / minor) / Recommendation (move / merge / split / rename / leave-as-is with target path).
 
-**Agent B — Coupling and boundaries**
-> Evaluate **module coupling and boundary discipline** across `${SCOPE}`. Map who-imports-whom. Surface unhealthy directions (domain → UI, leaf → aggregator). For library/binary boundaries: identify generic code stuck in app-specific homes and app-specific code leaked into generic homes. Output findings same format as Agent A; cite actual `use` paths.
+**Lens B — Coupling and boundaries**
+> Evaluate **module coupling and boundary discipline** across `${SCOPE}`. Map who-imports-whom. Surface unhealthy directions (domain → UI, leaf → aggregator). For library/binary boundaries: identify generic code stuck in app-specific homes and app-specific code leaked into generic homes. Output findings same format as Lens A; cite actual `use` paths.
 >
 > If `${IS_WORKSPACE_MEMBER}` is true, also search **sibling workspace crates** for inbound imports via `rg "use ${CRATE_NAME}(::|;|\s+as\s+)" --type rust` across the whole repo (excluding `${CRATE_ROOT}`). Flag public API surface that's wider than its actual external use, and inbound paths that reach into deep submodules instead of crate-root re-exports.
 
-**Agent C — Root-vs-submodule placement**
+**Lens C — Root-vs-submodule placement**
 > Evaluate **root-vs-submodule placement** across `${SCOPE}`. Policy: every file lives either at the crate root (genuinely top-level concerns) or inside a directory submodule that groups files by responsibility. No flat sprawl of unrelated single-file modules at any layer.
 >
 > **Hard rule — singleton budget of 6 per layer.** If any layer has more than 6 singleton `.rs` files, you MUST propose organizing principles that bring the count down. "Top-level concern" is the *exception*, not the default — most files have peers along some responsibility axis if you look.
@@ -138,18 +125,16 @@ Then the per-agent body. Pass `${INVENTORY}` verbatim into each prompt.
 >
 > Output findings same format. End with a final tree sketch of the proposed layout (directories only, plus one or two example files per directory). The tree MUST show ≤6 singletons at every layer that started above the threshold, OR include an explicit per-file defense for every singleton above the budget.
 
-**Each agent must additionally:**
-- List every over-large file it finds in `${SCOPE}`, citing `when-to-split-a-module.md` and which criteria are met. Use `wc -l` plus an `awk` test-block boundary check (`/^#\[cfg\(test\)\]/`) to separate production-line count from inline tests.
+After lens C, list every over-large file in `${SCOPE}` once.
+Use the inventory line counts and the `awk` test-block check.
+Cite `when-to-split-a-module.md` and the criteria met.
 
-After all prompt files exist, issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+1. Write `${SESSION_DIR}/pass1_findings_<letter>.txt` after each lens, before the next lens.
+2. Write an explicit no-findings result when the lens finds no issue.
+3. Collect the three results as `${PASS1_FINDINGS}` and the flagged files as `${OVERSIZE_FILES}`.
+4. Report any incomplete lens before synthesis.
 
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh module_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every `${WAVE_DIR}/findings_N.txt`; collect findings as `${PASS1_FINDINGS}` and the union of flagged over-large files as `${OVERSIZE_FILES}`. Synthesis remains in this command session. Failure rule for every wave in this command: if a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review.
-
-Accepted risk: running the style loader is proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
+Never treat an incomplete review as a no-findings result.
 </Pass1Discovery>
 
 ---
@@ -161,7 +146,7 @@ Merge and dedupe findings. Resolve disagreements with judgment — pick the clea
 
 **Singleton-count gate (blocking).** Before writing the plan, count singletons at every layer of the proposed tree, including the root. If any layer has more than 6, the placement work is unfinished:
 
-- Return to Agent C's per-axis enumeration and pick at least one more grouping until the count drops to ≤6, **or**
+- Return to Lens C's per-axis enumeration and pick at least one more grouping until the count drops to ≤6, **or**
 - For each remaining singleton above the budget, write an explicit defense in the doc citing BOTH criteria: (a) referenced from `main.rs`/`lib.rs`, AND (b) no responsibility-peer along any axis in that layer. The defense names the axis the file is alone on.
 
 A blanket "the remaining files are top-level concerns" sentence is not acceptable. If the gate fails, do not proceed to write the doc — re-do the synthesis with stronger grouping pressure first.
@@ -205,7 +190,7 @@ when reviewing a workspace member; bare `cargo build` +
 `cargo nextest run` otherwise.>
 ```
 
-Do not cite agent reports. Do not include "options A vs B". State the recommendation.
+Do not cite lens reports. Do not include "options A vs B". State the recommendation.
 </WritePlacementPlan>
 
 ---
@@ -215,18 +200,20 @@ Do not cite agent reports. Do not include "options A vs B". State the recommenda
 
 **If `${OVERSIZE_FILES}` is empty:** print one line — `No over-large files in scope. Skipping pass 2.` — and proceed to pass 3.
 
-Otherwise, create `${WAVE_DIR}=${SESSION_DIR}/pass2` and run **3 external CLI agents in two waves** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode: Agents D and E launch in parallel; Agent F launches only after D completes, because F's prompt embeds D's proposed layouts. Each agent reviews **all** over-large files (not one agent per file) through a distinct lens.
+Otherwise:
 
-Write `prompt_D.md` and `prompt_E.md` under the wave up front, with matching `findings_D.txt`/`findings_E.txt` and `agent_D.log`/`agent_E.log` paths; `prompt_F.md` is written after D's findings arrive. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${OVERSIZE_FILES}` verbatim; its lens; and the complete finding schema from pass 1. `prompt_F.md` additionally embeds the full contents of `findings_D.txt` verbatim under a `## Agent D's proposed layouts` heading.
+1. Review all `${OVERSIZE_FILES}` through lenses D, E, then F.
+2. Use the pass 1 finding format for each lens.
+3. Write `${SESSION_DIR}/pass2_findings_<letter>.txt` before the next lens.
 
-**Agent D — Production seams**
+**Lens D — Production boundaries**
 > For each file in `${OVERSIZE_FILES}`: group top-level items by responsibility. Propose a submodule layout (`<file>/mod.rs` + N submodules), citing line ranges, type names, and function clusters. Apply `name-submodules-after-anchor-types.md` and `split-by-type-ownership.md`. Output per file: target layout, what goes where (current line ranges + items), sequencing for the split (leaves first).
 
-**Agent E — Production-vs-test ratio**
+**Lens E — Production-vs-test ratio**
 > For each file in `${OVERSIZE_FILES}`: compute production-line vs inline-test-line counts (use `awk '/^#\[cfg\(test\)\]/{print NR; exit}'` to find the test block boundary). If a file is >50% tests, the right action is test extraction (move tests to a `tests/` directory), not a module split. Flag any such file and propose the test-extraction target path. For genuine production-heavy files, confirm the split is warranted by `when-to-split-a-module.md`.
 
-**Agent F — Call-site impact** (launched after D; its prompt embeds D's findings)
-> For each file in `${OVERSIZE_FILES}` and each proposed submodule in the embedded `## Agent D's proposed layouts` section: count caller `use` statements that reference the file and predict which submodule each caller now needs.
+**Lens F — Call-site impact** (uses D's findings)
+> For each file in `${OVERSIZE_FILES}` and each proposed submodule in D's recorded proposed layouts: count caller `use` statements that reference the file and predict which submodule each caller now needs.
 >
 > Search both intra-crate and (when applicable) external workspace callers:
 > - Intra-crate: `rg "use crate::<path>::<file>" --type rust` inside `${CRATE_ROOT}` (or repo root for single-crate projects).
@@ -234,15 +221,8 @@ Write `prompt_D.md` and `prompt_E.md` under the wave up front, with matching `fi
 >
 > Identify dependencies between proposed submodules (which import which) to determine extraction order. Surface any cycle or visibility hazard.
 
-**Wave 1 — D and E.** Issue both Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
-
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh module_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-Yield after starting the wave; task notifications signal completion. Do not poll.
-
-**Wave 2 — F.** When D's notification arrives, read `${WAVE_DIR}/findings_D.txt` (apply the pass 1 failure rule if it is missing or empty), write `prompt_F.md` embedding it as described above, and launch F with the same command shape (`prompt_F.md` / `findings_F.txt` / `agent_F.log`), again `run_in_background: true` and `dangerouslyDisableSandbox: true`. E's completion order relative to F does not matter. After all three findings files are in, read them before synthesizing in-session.
+Read all three findings files before synthesis.
+Apply the pass 1 rule for no-findings results and incomplete lenses.
 
 Synthesize: append a `## Phase N — Split <file>` section to `${DOC_PATH}` for each file, in order of size or risk. Each phase contains:
 - Target layout (directory tree).
@@ -251,7 +231,7 @@ Synthesize: append a `## Phase N — Split <file>` section to `${DOC_PATH}` for 
   - When `${IS_WORKSPACE_MEMBER}` is true, the checkpoint commands are `cargo build -p ${CRATE_NAME}` + `cargo nextest run -p ${CRATE_NAME}`.
   - Otherwise, `cargo build` + `cargo nextest run`.
 
-For test-extraction-only files (Agent E's verdict), the phase has no internal sequencing steps — it's a straight test move. Say so.
+For test-extraction-only files (Lens E's verdict), the phase has no internal sequencing steps — it's a straight test move. Say so.
 
 Update the phase-overview table at the top of the doc to include the new phases. Each row's "Rough size" column should end with "one commit".
 </Pass2SplitPlanning>
@@ -259,37 +239,33 @@ Update the phase-overview table at the top of the doc to include the new phases.
 ---
 
 <Pass3Validation>
-**Goal:** Three agents stress-test the complete multi-phase plan.
+**Goal:** Validate the complete plan through three lenses.
 
-Create `${WAVE_DIR}=${SESSION_DIR}/pass3` and launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.validation` registry task and `readonly` mode. Each agent reads `${DOC_PATH}` and validates against the current code on disk.
+1. Run lenses G, H, then I yourself, one after the other.
+2. Read `${DOC_PATH}` once, before lens G. Compare it with the current code in each lens.
+3. Use the pass 1 finding format.
+4. Write `${SESSION_DIR}/pass3_findings_<letter>.txt` before the next lens.
 
-Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${DOC_PATH}` verbatim; its validation lens; and the complete finding schema from pass 1.
-
-**Agent G — Completeness**
+**Lens G — Completeness**
 > Walk every `.rs` file in `${SCOPE}` (the inventory from step 2). Confirm each is either explicitly moved, explicitly kept where it is, or covered by a "stays where" section. Check rename consistency across the doc. Check that each new directory's `mod.rs` re-export block accounts for every type currently imported via the old path. Flag sequencing chicken-and-egg cases (e.g. directory A imports from directory B but is sequenced first).
 
-**Agent H — Risk**
+**Lens H — Risk**
 > For each proposed move and split, count broken `use` statements via `rg`. Search both `use crate::...` (intra-crate) and, when `${IS_WORKSPACE_MEMBER}` is true, `use ${CRATE_NAME}::...` across sibling crates. Surface `pub(super)` visibility shifts when files move into nested directories, and `pub(crate)` items that need to become `pub` to remain reachable from external workspace callers (or vice versa). Identify hidden cycles, deferred items that actually block earlier phases, and tests that reach into module internals via paths that will move.
 
-**Agent I — Two-sided membership audit**
+**Lens I — Two-sided membership audit**
 > Apply symmetric pressure: question overgroupings AND missed groupings. The plan's conservatism bias is to leave root sprawl in place — counter it.
 >
 > **Side 1 — overgroupings.** For each new directory proposed: does it justify itself, or is it two files that happen to share a vibe? Read each member's header (top 30 lines) and judge if the grouping name describes what they all *do*, not what they all *are not*. Propose dissolutions, membership changes, or rename when a clearer home exists.
 >
 > **Side 2 — missed groupings.** Count singletons at every layer of the proposed tree. If any layer still has more than 6, that is a finding, not a passing grade. For each such layer:
 > - List every remaining singleton with its one-line responsibility.
-> - Walk the responsibility axes from Agent C's instructions (entry/CLI/config/domain/I-O/persistence/external-drivers/utilities/cross-cutting).
+> - Walk the responsibility axes from Lens C's instructions (entry/CLI/config/domain/I-O/persistence/external-drivers/utilities/cross-cutting).
 > - Propose at least one further grouping that drops the count, OR write a per-file defense citing both gate criteria from `WritePlacementPlan` (referenced from `main.rs`/`lib.rs` AND no axis-peer).
 >
 > Do not manufacture dissent on side 1, but do not pull punches on side 2. "Keep as proposed" is only a valid verdict when both sides pass — overgroupings hold AND every layer is within the singleton budget.
 
-Issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
-
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh module_review.validation readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every findings file and collect them as `${PASS3_FINDINGS}`. Refinement remains in this command session.
+Read all three findings files and collect them as `${PASS3_FINDINGS}` before refinement.
+Apply the pass 1 rule for no-findings results and incomplete lenses.
 </Pass3Validation>
 
 ---
@@ -303,7 +279,7 @@ For each finding:
 - If it's a risk that requires an extra step (e.g. fix a `pub(super)` before the move), insert that step into the sequencing.
 - If it's "keep as proposed" — do nothing.
 
-Conflicts between agents: pick the recommendation that best matches the style guide, not the loudest one.
+Resolve conflicts with the style guide.
 </RefinePlan>
 
 ---

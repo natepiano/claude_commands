@@ -1,112 +1,201 @@
-# Agent Registry — one place for family, agent, and effort assignments
+# Model registry
 
-Code reviews now use the unit's persistent `review` and `review2` workers
-through `assign.sh --role review`. Any pool maintenance paths described below
-remain only for the pending archive cleanup; they do not dispatch new reviews.
+Codex code reviews use the unit's persistent `review` and `review2` workers through `assign.sh --role review`.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
+Pool maintenance paths do not dispatch new reviews.
 
 ## What it is
 
-Every external-CLI agent this configuration launches — `/unit:direct`'s implementer and reviewer, the production unit directors `add_unit.py` starts, the `~/.zshrc` CLI aliases, `/ask_a_friend`, and the `/team_review` / `/api_review` / `/module_review` review teams — resolves which vendor CLI to run, which model, and at what reasoning effort from one file (`config/agents.conf`) through one resolver (`scripts/agents/agents_config.sh`), and launches through one dispatcher (`scripts/agents/agent_exec.sh`). The problem it solves: without a registry each consumer carries its own private assignment state in its own conf file and hard-codes its own vendor flags, so switching a function between vendors means editing several scripts and auditing "what runs what" means reading all of them. Here, a major function switches between the `codex` and `claude` families, or a single sub-task is re-pointed to a different model or effort, with one `/agent` edit, and no consumer assembles vendor flags itself.
+Agent launchers resolve their family, model, effort, and service tier from `config/models.conf`.
+Python uses `scripts/lib/models_registry.py`. Bash uses `scripts/agents/models_config.sh`.
+Consumers include unit workers, production unit directors, CLI aliases, and `/ask_a_friend`.
+The registry gives each task one source for its launch settings.
+`/default_models` changes a function's family or a task's model and effort.
 
 ## How it works
 
 ### Registry schema
 
-`config/agents.conf` is the only registry, shared by both machines. Shell and Python readers read it directly. It is INI-style, with four kinds of section; `#` starts a comment, including trailing row comments.
-
-Every writer calls `scripts/lib/agents_registry.py:store_registry(registry, before, after, description, *, additive_catalog=False)`. It replays changed rows on the latest file and atomically renames a temporary file in the same directory over it, preserving its mode. On the real `~/.claude` registry it serializes writers and fetches origin. One fast-forward helper checks ancestry, unfinished merges, and Git's index/worktree rules with `read-tree --dry-run -m -u` against a copy of the current index. Accepted-push recovery substitutes only the registry entry in that temporary index. A refused check leaves the live registry, index and HEAD unchanged; races or filesystem errors after the check can still interrupt reconciliation or the merge. An isolated index and `commit-tree` produce a commit containing only `config/agents.conf`, with subject `config(agents): <description>`, then push it. Rejected pushes fetch and replay the same rows on the newer tip, at most three attempts; exhaustion reports that the file is edited but not shared. The published tip is integrated with fast-forward only. No other path is staged, committed, stashed, reset or rebased.
-
-Publishing requires the registry's realpath to be the Git toplevel of `~/.claude` plus `config/agents.conf`, and `AGENTS_CONFIG_PUBLISH` must not be `0`. Tests disable publishing or use a temporary registry. Catalog sync uses additive replay: models and efforts accumulate across machines, and family targets never move backwards. It writes and publishes only additions; retiring a catalog model requires an explicit shared-registry edit, since `/agent` does not delete catalog rows.
+`config/models.conf` is the shared registry.
+Its INI-style sections hold assignments, task rows, catalogs, family aliases, and options.
+`#` starts a comment, including a trailing row comment.
 
 ```ini
 [assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>; `caller` = the family of the agent running it
 direct=codex
 
 [direct.codex]              # [<function>.<family>] — <subtask>=<agent>[:<effort>]
-implementation=gpt-5.6-terra:xhigh
-review=gpt-5.6-sol:xhigh
+impl=sol:high
+review=sol:high
 
 [codex.agents]                # [<family>.agents] — <agent>=<comma-separated valid efforts>
 gpt-5.6-sol=low,medium,high,xhigh,max,ultra
 
 [direct.options]            # [<function>.options] — launch flags, not agent rows
-codex_mesh=1
 codex_service_tier=fast
 ```
 
-An **options** section is the odd one out: it holds a function's launch flags
-rather than agent rows, and the consumer that owns the flag reads its own key with
-`_agents_registry_get <function>.options <key>`. It is invisible to the family
-enumeration — which only ever loops `codex` and `claude` — so `/agent` does
-not list it. `direct.options` holds `codex_mesh` and `codex_service_tier`;
-`cli.options` holds `codex_service_tier`. The tier keys — `codex_service_tier`
-and a row's own `codex_service_tier.<subtask>` — are the ones `agents_resolve`
-reads itself, because the tier is a codex CLI flag like the effort (step 6
-below), and the ones `/agent` edits (`agents_set_service_tier`).
+Options sections hold launch flags instead of agent rows.
+`[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
+The editor excludes options sections from family enumeration.
 
-Vocabulary: a **family** is a CLI vendor (`codex` | `claude`); an **agent** is a model within a family (`gpt-5.6-sol`, `opus`); a **function** is a consumer; a **task** is `<function>.<subtask>` — exactly two segments.
+A family is `codex` or `claude`.
+An agent is a model within that family.
+A function names a consumer; a task has exactly two segments, `<function>.<subtask>`.
 
-Every function carries *both* family sets, fully specified at all times, so a family switch is a one-line edit and never a row edit, except a function whose rows name exactly one family: it is pinned to that family (`production` has only `[production.claude]`, for unit directors). Every-function switches keep a pinned function and print `# kept <function> on <family>: its only set`; switching it alone to the other family is refused. The functions and their complete sub-task sets:
+A function normally has complete task sets for both families.
+A single-family function stays pinned to that family.
+A global family change keeps pinned functions and prints their names.
+A direct change to an unsupported family refuses without writing.
 
 | Function | Sub-tasks |
 | --- | --- |
-| `worker` | `impl`, `test`, `fix`, `review` |
+| `direct` | `impl`, `test`, `fix`, `review`, plus the Claude `simplify` task |
 | `cli` | `commit_prep`, `merge_branch`, `interactive` |
 | `ask_a_friend` | `consultation` |
-| `team_review` | `expert` |
-| `api_review` | `reviewer`, `adversary` |
-| `module_review` | `reviewer`, `validation` |
 | `production` | `director` |
+| `design_roles` | `designer`, `reviewer` |
 
-`[codex.agents]` is machine-generated (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` today). `[claude.agents]` is hand-maintained: `fable`, `opus`, `sonnet`, each `low,medium,high,xhigh,max`. Five functions are assigned `codex`, `production` is assigned `claude` (its only set; `director=opus:xhigh`), and `ask_a_friend` is assigned `caller` — it runs on the family of the agent asking, because only a like-to-like pair talks both ways (claude reaches claude by `SendMessage`, codex reaches codex through `codex_mesh.py`, and a codex friend has no route back to a claude caller).
+`[codex.agents]` and `[codex.families]` come from catalog synchronization.
+Family aliases such as `sol` resolve to a concrete model from `[codex.families]`.
+The Claude catalog and family aliases are hand-maintained.
+`production` has only a Claude set. `design_roles` has only a Codex set.
+`ask_a_friend` selects the caller's family.
+
+### Registry publication
+
+`store_registry(registry, before, after, description, *, additive_catalog=False)` owns every registry publication.
+It replays the changed rows against the latest text under an exclusive writer lock.
+It preserves unrelated edits, file mode, comments, and spacing.
+It returns the published text while it still holds the lock.
+The `store` command builds `configuration_shell` from that text without a second read.
+
+Publication applies only to the real registry under the Git root of `~/.claude`.
+`MODELS_CONFIG_PUBLISH=0` disables publication.
+Other paths use local atomic replacement through `atomic_file.write_text_atomic`.
+The shared writer fetches origin and checks fast-forward safety with a temporary index.
+An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
+Its subject is `config(models): <description>`.
+Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
+The commit uses local HEAD as its parent, so a push can include pre-existing local commits.
+The writer stages, commits, stashes, resets, or rebases no other path.
+
+A rejected push fetches and replays the same row changes, for at most three attempts.
+Repeating an interrupted edit publishes all pending local rows, even when the requested value already matches. Recovery recognizes an accepted push without another commit.
+Exhaustion reports that the file is edited but not shared.
+Local integration uses fast-forward only.
+A successful push with failed local reconciliation reports both facts.
+Catalog publication adds models and efforts and advances family targets.
+It never deletes catalog rows or moves family targets backwards.
+
+### Configuration lifetimes
+
+`models_registry.py` owns the path resolver and the only registry parser.
+An explicit `--registry` selects the path before `registry_path()` supplies `MODELS_CONFIG_FILE` or the default path.
+Bash passes a set `MODELS_CONFIG_FILE` explicitly, even when the shell variable is not exported.
+An explicit caller argument wins over that shell variable.
+
+`LaunchModelConfiguration(path, text, rows)` lasts for one launch or assignment operation.
+`RegistryEditBase(path, text, rows)` lasts for one editor operation.
+Each type contains the selected path, exact source text, and parsed `RegistryRow` values from one read.
+The parser retains empty sections and row order. The exact text retains comments and editor formatting.
+`configuration_shell` emits safely quoted section, key, and value arrays.
+Bash readers compare parsed keys. They do not parse registry rows again.
+Editor transformations use their base text and parsed values from the same generation.
+
+Each configuration's `environment(mapping)` shares that snapshot with the operation's helper processes.
+`MODELS_LAUNCH_CONFIGURATION` carries the launch snapshot.
+`MODELS_REGISTRY_EDIT_BASE` carries the editor snapshot.
+Neither variable is a persistent cache.
+Implementation, review, allocation, and thread creation share one configuration within an operation.
+Reusing an existing worker needs no allocation snapshot read.
+`unit_effort.py` uses one edit base for one command invocation.
+
+The next launch reads a fresh configuration.
+Each later Codex submission also reads a fresh configuration, including continuations, capacity retries, and resident wakes.
+`FreshLaunchConfiguration` marks that transition in the launcher.
+Model, effort, and service tier for one submission come from the same configuration.
+Explicit dispatch overrides retain their precedence.
+The [progress recorder](unit-progress-history.md#configuration-digest) uses the inherited exact text for telemetry.
+
+### Agent environment boundary
+
+Operation snapshots reach helpers, but they never reach an agent or an app-server.
+`models_registry.OPERATION_ENVIRONMENT` names both variables once for Python callers.
+`models_registry.agent_environment` removes them from a supplied environment.
+`staff.child_environment` applies this filter and removes staff lock proofs and copied staff identity.
+Python agent and app-server starts use this filtered environment.
+
+`models_agent_environment` removes both variables from the current shell.
+`agent_exec.sh` and `cli_agent.sh` call it immediately before their agent starts.
+`scripts/direct/claude_worker.py` filters the Claude start environment and settings JSON in the assign process.
+`nix_env.py exec` applies `agent_environment` after it obtains its final environment, immediately before `os.execvpe`.
+This prevents an environment restore from carrying an old snapshot into the agent.
+`review.sh` retains the snapshot until `agent_exec.sh` resolves its settings.
 
 ### Resolution algorithm and precedence
 
-`agents_resolve <task>` sets `AGENT_FAMILY`, `AGENT_MODEL`, `AGENT_EFFORT` (effort may be empty), `AGENT_SERVICE_TIER` (codex only, may be empty) and returns nonzero with a stderr message naming the offending piece *and* the allowed values on any failure:
+`agents_resolve <task>` sets `AGENT_FAMILY`, `AGENT_MODEL`, `AGENT_EFFORT`, and `AGENT_SERVICE_TIER`.
+A failure names the invalid value and allowed values on stderr.
+An empty effort or tier omits its corresponding flag.
 
-1. Split the task at the first dot. Reject anything that is not exactly two non-empty segments.
-2. **Family precedence:** an exact-task key in `[assignments]` (`direct.review=claude`) wins over the function key (`worker=codex`). Neither present → error listing the configured assignments. A value of `caller` maps to the running agent's family — `AGENTS_CALLER_FAMILY` if set, else `CODEX_THREAD_ID` ⇒ codex, else `CLAUDE_CODE_SESSION_ID` ⇒ claude (codex wins when both are set: a codex launched from a claude session inherits claude's variable); none detectable → error naming the override.
-3. Section `<function>.<family>` must exist → otherwise error listing the families that do have a set for that function.
-4. Row `<subtask>` must exist in that section → otherwise error listing the section's sub-tasks.
-5. Validate the pair: agent is everything before the first colon, effort everything after. A trailing colon with nothing after it is rejected. The agent must be a key in `[<family>.agents]`; a non-empty effort must appear in that agent's comma list. A catalog row with an *empty* effort list is legal and admits only bare (effort-less) pairs.
-6. Speed tier, codex family only: `[<function>.options] codex_service_tier.<subtask>`, else `codex_service_tier`, must be `fast`, `flex`, `default`, or `pace`; `pace` takes the tier `scripts/whoami/codex_pacer.py` last wrote (`fast` or `default`), and `default` once that is over ten minutes old or missing. An absent key leaves `AGENT_SERVICE_TIER` empty and the launch inherits `service_tier` from `~/.codex/config.toml`. A claude row always gets an empty tier, because Claude's fast mode bills extra usage. An unknown value is an error, because codex silently runs an unrecognised tier at standard speed.
+The resolver applies these rules:
 
-Exact-task overrides exist for one-off cross-vendor setups; function-level assignment is the norm and the only thing `/agent <function> <family>` writes.
+1. Split the task into two nonempty segments.
+2. Select the exact-task assignment before the function assignment.
+3. Resolve `caller` through `AGENTS_CALLER_FAMILY`, then `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`.
+4. Read the task row from `<function>.<family>`.
+5. Resolve a model alias through the family catalog.
+6. Validate the model and effort against `<family>.agents`.
+7. Select the task-specific service tier before the function tier.
 
-### Resolver API (`scripts/agents/agents_config.sh`)
+`AGENTS_CALLER_ASSIGNMENT` names the `caller` assignment value.
+No detectable caller family produces an error.
+A trailing colon with no effort is invalid.
+A model with an empty effort catalog accepts only a bare model name.
+A row edit leaves the active family unchanged.
 
-Sourcing the file sets `AGENTS_CONFIG_FILE` (overridable, defaults to `~/.claude/config/agents.conf`), `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, `CODEX_CATALOG_SYNC_STATE_FILE`, and fires the catalog freshness sync (below).
+Codex tiers are `fast`, `flex`, `default`, or `pace`.
+`pace` uses the recent `codex_pacer.py` value and defaults to `default` when unavailable or older than ten minutes.
+An absent tier inherits `service_tier` from the Codex config.
+Claude rows have no service tier.
 
-Public:
+### Resolver API (`scripts/agents/models_config.sh`)
 
-- `agents_config_trim <value>` — strip leading/trailing whitespace; the shared primitive.
-- `agents_resolve <task>` — the algorithm above; sets `AGENT_FAMILY` / `AGENT_MODEL` / `AGENT_EFFORT` / `AGENT_SERVICE_TIER`.
-- `agents_resolve_print <task>` — resolves, then prints one line: `task=… family=… agent=… effort=… tier=…`. `tier` is the resolved codex tier, `inherit(<x>)` when the registry sets none and `~/.codex/config.toml` gives `<x>` (bare `inherit` when it gives none), or `-` for a claude row.
-- `agents_list_assignments [filter]` — walks `[assignments]`; for a bare function key it resolve-prints every row of the active set, skipping sub-tasks shadowed by an exact-task override (which are printed once from their own key). Returns nonzero if *any* row fails to resolve; with a filter that matches no assignment it errors. A `caller` function prints the detected family's rows plus `# <fn>: caller — the calling agent's family (<fam> here)`, or both families' rows plus `(none detectable here)`.
-- `agents_list_function <function>` — prints every row of *both* families for one function as `task=… family=… agent=… effort=… active=yes|no tier=…` (a dormant codex row shows its stored tier), then a `# current family: X` line (with `(overrides: …)` when exact-task assignments exist). For a `caller` function `active=yes` marks the detected family's rows and the line reads `# current family: caller — the calling agent's family (X here|none detectable here)`.
-- `agents_set_assignment <function> <family>` — validates that every row of `[<function>.<family>]` resolves, then awk-rewrites the `[assignments]` line. Any invalid row → reject, name the row, file untouched. A `caller` function has no switch — rejected, pointing at row edits — and `caller` is not a switch target. A pinned function switched to the other family is refused with `ERROR: '<function>' runs only on <family>: [<function>.<family>] is its only set.`
-- `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly. `caller` lines are skipped: neither validated against the target nor rewritten. A pinned function is kept the same way and named in `AGENT_KEPT_FUNCTIONS`.
-- `agents_set_model <agent> [function]` — puts every function, or one, on one agent, keeping each row's effort. The agent names its family, as in `agents_set_row`. Every fixed assignment in scope, exact-task overrides included, switches to that family, and every row of each `[<function>.<family>]` set takes the agent. A `caller` function keeps its assignment, but its set for that family takes the agent too, since that set is live whenever an agent of that family asks. With no function named, a pinned function keeps its assignment and rows and is named in `AGENT_KEPT_FUNCTIONS`; named alone with an agent of the other family, it is refused with the pinned error. Validates the whole change first — an unknown or ambiguous agent, an agent given with `:<effort>`, a missing set, an override with no row, or a kept effort the agent's catalog lacks rejects it with the file untouched — then one awk pass rewrites the assignment and row lines, preserving trailing comments and spacing. Sets `AGENT_SWEEP_FAMILY`.
-- `agents_set_row <task> <agent>[:<effort>]` — edits one row. The **agent** names the family (the two catalogs share no names), so the row written is the one the agent could only have meant, live or dormant; an agent listed by both catalogs is refused as ambiguous, and an agent whose family has no `[<function>.<family>]` section names the missing section, and an agent of the other family on a pinned function gets the pinned error. Validates the pair, then awk-rewrites the row preserving its trailing inline comment and spacing byte-exactly. Sets `AGENT_ROW_FAMILY`, `AGENT_ROW_ACTIVE_FAMILY`, `AGENT_ROW_ACTIVE`. Editing a row never changes which family is live.
-- `agents_set_service_tier <fast|flex|default|inherit> [<function>|<function>.<subtask>]` — writes `codex_service_tier` (or `codex_service_tier.<subtask>`) in `[<function>.options]` for every function with a codex set, one function, or one row; `inherit` deletes the key. A function or every-function write also deletes the row keys beneath it, so each codex row in scope ends up on the named tier. Refuses an unknown tier word, function, or codex row, and a function with no codex set, with the file untouched. A missing options section is created after the function's last row, and one that `inherit` empties is removed with the blank line above it, so a set and its `inherit` round-trip byte for byte. Two awk passes over the file (plan, then write); replaces a key in place, preserving its trailing comment. Never changes which family is live. Sets `AGENT_TIER_FUNCTIONS`.
-- `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty and `-c service_tier="<tier>"` when the tier is.
-- `agents_claude_args` — one line: `--model <agent>`, plus `--effort <effort>` when effort is non-empty.
+Sourcing the file defines functions without reading or synchronizing the registry.
+`models_launch_configuration` obtains and exports the launch snapshot.
+`models_registry_edit` gives an editor one scoped base.
+`_models_registry_scope --launch|--edit` holds the parsed arrays for that scope.
+`models_registry_store` evaluates the configuration returned by the publication writer.
 
-Both emitters print a single space-joined line meant to be word-split into an argv array (`read -r -a`), never `eval`'d; the codex effort token carries literal embedded quotes and is one argv token.
+| Function | Result or change |
+|---|---|
+| `models_config_trim <value>` | Removes surrounding whitespace. |
+| `agents_resolve <task>` | Sets the four resolved launch values. |
+| `agents_resolve_print <task>` | Prints task, family, agent, effort, and tier. |
+| `agents_list_assignments [filter]` | Lists each active task once and reports invalid rows. |
+| `agents_list_function <function>` | Lists both family sets and marks active rows. |
+| `agents_set_assignment <function> <family>` | Validates the target set and changes its assignment. |
+| `agents_set_all_assignments <family>` | Changes supported assignments and keeps caller-based or pinned functions. |
+| `agents_set_model <agent> [function]` | Changes supported sets to the model while preserving valid efforts. |
+| `agents_set_row <task> <agent>[:<effort>]` | Changes the row in the model's family, without changing its assignment. |
+| `agents_set_service_tier <tier> [function or task]` | Changes tier options; `inherit` removes the selected override. |
+| `agents_codex_args` | Emits model, optional effort, and optional service-tier flags. |
+| `agents_claude_args` | Emits model and optional effort flags. |
 
-Private helpers:
+The editor validates the complete requested change before publication.
+Ambiguous model names and missing task sets produce errors.
+A function-wide tier change removes narrower task-tier overrides.
+`caller` functions keep their family assignment during global edits.
+`AGENT_KEPT_FUNCTIONS` reports pinned functions that a global edit preserved.
 
-- `_agents_config_has_section <section>` / `_agents_config_section_values <section>` — the low-level ini reader (comment-stripped, trimmed rows).
-- `_agents_registry_get <section> <key>` — prints the value by **literal** key comparison; returns 0 even on a miss, so it is errexit-safe inside `$(...)`.
-- `_agents_registry_has_key <section> <key>` — 0/1 presence, for `if` conditions.
-- `_agents_section_keys_inline <section>` — comma-joined key list for error text.
-- `_agents_function_families_inline <function>` — families that have a set section for a function.
-- `_agents_agent_families_inline <agent>` — families whose catalog lists an agent (one match names its family; two means the catalogs collided).
-- `_agents_families_inline` — comma-joined list of families that have an agent catalog, for the unknown-family error.
-- `_agents_active_family <function> <subtask>` — the family a task resolves through today, honoring exact-task overrides; shared by `agents_list_function` and `agents_set_row`.
-- `_agents_stored_service_tier <function> <subtask>` — the row key, else the function key, unvalidated; shared by resolution and `agents_list_function`.
-- `_agents_codex_config_tier` / `_agents_tier_display <family> <tier>` — the top-level `service_tier` in `~/.codex/config.toml`, and the `tier=` field built from it.
-- `_agents_effort_allowed <csv> <effort>` and `_agents_validate_pair <context> <family> <pair>` — pair splitting and catalog validation; `_agents_validate_pair` is what sets `AGENT_MODEL` / `AGENT_EFFORT`.
+The argument emitters produce one space-separated line for `read -r -a`.
+Callers do not evaluate that line as shell code.
+The Codex effort token includes literal quotes within one argument.
+`_models_registry_get` compares keys literally and returns zero with empty output when a key is missing. Use `_models_registry_has_key` to test presence.
+The remaining lookup helpers use the same parsed arrays.
+Awk transformations can produce edited text; they do not provide a second registry reader.
+Pass edited values to awk through `ENVIRON`. `awk -v` interprets backslash escapes.
 
 ### Shared launcher (`scripts/agents/agent_exec.sh`)
 
@@ -114,400 +203,146 @@ Private helpers:
 agent_exec.sh <task> <write|readonly> <working_dir> <prompt_file> <output_file> <log_file>
 ```
 
-Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt not found: <path>` to the log file and returns 1. Otherwise it sources `agents_config.sh`, calls `agents_resolve <task>`, reads the prompt into a variable, and dispatches on family (internal entry point `agents_exec_main`):
+A wrong argument count or mode returns 2.
+A missing prompt writes `Prompt not found: <path>` to the log and returns 1.
+`agents_exec_main` resolves the task from the operation's configuration.
+It sends prompt contents through stdin, avoiding the command-line argument size limit.
 
-- **codex** — `codex exec <agents_codex_args> [extra] --ephemeral (--full-auto | --sandbox read-only) -C <working_dir> -o <output_file> "$PROMPT" > <log_file> 2>&1`.
-- **claude** — `claude --print (--dangerously-skip-permissions | --permission-mode plan) --settings '{"sandbox":{"enabled":false}}' --verbose --output-format stream-json <agents_claude_args> [extra] -- "$PROMPT"`, executed in a subshell as `( cd "$working_dir" && … > "$log_file" 2>&1 )` because the claude CLI has no `-C`. The streamed JSON log is what `heartbeat_watch.sh` narrates; afterwards `agents_claude_extract_result` (an inline `python3` heredoc) pulls the final `result` event's text into `<output_file>`, preserving the caller contract "output = final answer, log = full log". Claude's own exit code is returned.
+| Family | Launch behavior |
+|---|---|
+| Codex | Uses the selected workers account, `codex exec`, `--ephemeral`, the working directory, and output file. |
+| Claude | Uses print mode with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and retains stream-json events in the log. |
 
-`AGENT_EXEC_EXTRA_ARGS` is appended to the family CLI's arg list. `AGENT_EXEC_DRY_RUN=1` prints the fully assembled command — every argv token `printf '%q'`-quoted by `agents_exec_print_argv`, with the redirection suffix, and a `cd <working_dir> && ` prefix on the claude branch — then exits 0 without executing. `agent_exec` exports nothing; consumers that need provenance re-resolve themselves.
+Write mode uses unrestricted write permissions.
+Readonly mode selects the read-only Codex sandbox or Claude plan permissions.
+`direct.simplify` also disables Claude editing tools.
+`claude_result.py` writes the final answer to the output file.
+An `is_error` result or nonempty errors array produces `ERROR: <reason>` and exit 1.
+Otherwise the launcher preserves the agent's exit status.
 
-### Addressable codex workers (`scripts/agents/codex_mesh.py`)
+`AGENT_EXEC_EXTRA_ARGS` adds arguments without interpreting shell quotes.
+`AGENT_EXEC_DRY_RUN=1` prints the quoted command and redirections without starting an agent.
+The launcher removes the operation snapshot at the [agent boundary](#agent-environment-boundary).
+An executable invocation runs `assign_gate.py` before dispatch.
 
-`agent_exec`'s codex branch runs `codex exec`, a process nothing outside it can
-reach: a worker launched that way takes one prompt and is unreachable until it
-exits. `codex_mesh.py` is the alternative launch path that gives a codex worker
-an address, so peers and the unit director can message and interrupt it mid-run
-the way they already can a claude worker. It launches `/unit:direct`'s codex
-workers, `/ask_a_friend`'s codex friend (`start --resident`) and each
-production's pooled reviewers (`review-pool.md`). For workers it
-is selected per `[direct.options] codex_mesh` in the registry (`1` as shipped,
-so the mesh is the normal codex launch path), overridable for one run with
-`UNIT_CODEX_MESH`; `implement.sh` reads it and branches, and `0`, or a
-missing key, runs a phase on `codex exec` instead.
+### Addressable workers
 
-One `codex app-server` per worker session, each worker a **thread** on it. A
-thread has an id, and that id is the worker's address:
+`assign.sh` is the worker launch entry point.
+`assign.py` reads the run's transport pin.
+A mesh run uses `codex_mesh.py` for Codex workers; a herdr run uses `worker.py` and a pane.
+Claude workers of a mesh run use `scripts/direct/claude_worker.py` in the assign process.
+The [worker design](long-lived-workers.md) owns admission, staff identity, family switches, retries, messages, and server lifecycle.
+The plain `codex exec` worker fallback is absent.
 
-```
-codex_mesh.py serve  --session-dir <dir>                      # start/reuse, print port
-codex_mesh.py start  --session-dir --name [--role] --cwd --prompt-file \
-                     --summary-file --log-file [--reply-file --model --effort \
-                     --service-tier --sandbox --timeout --resident]
-codex_mesh.py follow --session-dir --to <name> --role ...     # one more turn on a finished worker
-codex_mesh.py compact --session-dir --to <name>
-codex_mesh.py prime  --session-dir --name --instructions-file --cwd [--model --service-tier]
-codex_mesh.py fork   --session-dir --from <name> --name <new name>
-codex_mesh.py reset  --session-dir --to <name>              # back to the thread's first turn
-codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-file <path>)
-codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
-codex_mesh.py end    --session-dir --to <name>
-codex_mesh.py list   --session-dir                            # roster: name, status, thread id
-codex_mesh.py stop   --session-dir [--pause]                # --pause: workers paused, not ended
-codex_mesh.py reopen --session-dir --to <name>              # ended or abandoned worker back to paused
-codex_mesh.py sweep  [--root <dir>] [--stop]
-```
-
-`follow`, `compact`, `can-follow`, `release-follow`, the roster's `role`,
-`revision` and `context_tokens`, and overflow press-on are described in
-`long-lived-workers.md`; the role log and guarded roster writes in `usage-ledger.md`.
-`follow` takes `--cwd`, `--read-only` and `--image` for unit reviewers.
-`prime`, `fork` and `reset` remain for held designs and retained legacy state;
-`review-pool.md` records the earlier allocator. `prime --held-design --held-role` starts a held design role's
-thread for `scripts/astra/design_roles.py`; held roles, their access policy and the
-verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
-and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
-
-`serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
-(`start_new_session=True`) and records `{port, pid}` in
-`<session_dir>/mesh_server.json`; a later call reuses that server when the pid is
-still alive. Starting one takes an exclusive `flock` on
-`<session_dir>/mesh_server.lock`, because the workers of a phase reach
-`ensure_server` inside the same second and unlocked each would start a server of
-its own, orphaning two. `ensure_server` returns the port **and whether this call
-is what started it** — the flag the retry below turns on. The transport is
-newline-delimited JSON-RPC over a hand-written RFC 6455 client — loopback only,
-so no `--ws-auth` token.
-
-`start` connects, calls `thread/start` then `turn/start`, writes the worker's
-entry into `<session_dir>/mesh_roster.json`
-(`{name: {thread_id, turn_id, status, revision?, launcher_pid?, port?, role?, context_tokens?}}`, `launcher_pid` on a
-`waiting_capacity` entry and on a follow-up's `starting` and `running` entries,
-which also carry `previous_status` and `previous_role`; every read-modify-write under `fcntl.LOCK_EX`, because
-the workers register concurrently, and each write raises `revision` by one), and **blocks until its last turn ends**,
-translating the notification stream into the log file (`agent:`, `exec:`,
-`edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
-with nothing queued it writes the final message to the summary file — or, given
-`--reply-file` as `implement.sh` passes, to that file, filling the summary only
-when the worker left it empty — and exits, so `implement.sh`'s `wait`,
-heartbeat, and pass recording are untouched.
-
-A worker is **not one turn**. `send` puts a message in the thread queue and the
-server starts a turn for it by itself, so exiting at the first `turn/completed`
-would strand the message and kill the worker mid-reply. At each turn boundary
-`start` checks `thread/queue/list` and the thread's state, then watches
-`QUEUE_GRACE_SECS` (3 s) for a queued turn already in flight, and keeps
-streaming while work remains. The summary is the last turn's answer, so a peer's
-follow-up is reflected in what the unit director reads.
-
-A `follow` launcher accepts a completion only for the turn it follows, so that
-the end of an earlier turn cannot finish it. Once that turn has ended it follows
-no turn until the next `turn/started` names one. It does not take the next id
-from `thread/read`: when a peer's turn opens the instant the followed one ends,
-the thread reads `active` while its turn list still shows the old turn in
-progress. Before 2026-10-12 the launcher kept that old id, ignored the peer
-turn's start and end, and waited to its deadline; a tester worker showed
-`running` for 48 minutes that way.
-
-A launcher that gets no notice for `UNSEEN_END_CHECK_SECS` (60 s) checks with
-`_ended_unseen` that its turn has not ended without one: an empty queue and a
-thread that reads `idle` (read without turns, so it stays small) finish the run,
-and the worker's log says `thread is idle and no completion notice arrived`. The
-run is `done` when an answer was seen and failed when none was. A launcher
-waiting out a capacity retry skips the check. With `--resident`
-(ask_a_friend's friend) `start` stays attached across turns instead: each
-finished turn's reply is printed and delivered as it lands, the thread keeps
-accepting `send`, and only `end` releases the block. Between turns it wakes every
-`RESIDENT_POLL_SECS` (1 s) to look for the end marker; tests patch that constant
-and the reap constants as module attributes.
-
-`send` and `steer` address a worker by mesh name through the roster file, which
-is why they work from an unrelated process — the unit director, or a peer
-worker. `send` to a held design role queues the text in the role store
-(`design_roles.queue_message`) and prints `queued for <name>; holder adds it to the next
-authorized assignment`. Otherwise `send` delivers only while a launcher is attached. To a `running` worker
-it calls `thread/queue/add`, and the message lands at the start of the target's
-**next** turn; to a `waiting_capacity` worker it stores the message in
-`<worker>.pending.json` under an `flock`, for the resume turn. It refuses a
-`capacity_exhausted` worker or one being ended (exit 2), and any other status
-(`starting`, `done`, `failed`, `paused`, `ended`) with `<worker> is <status>, not running; read its summary file`
-(exit 1): the thread outlives the launcher, so the server would start a turn for
-a late message with nothing streaming it and nothing writing the summary.
-`steer` needs a `running` worker; it calls `turn/steer` with the roster's
-`expectedTurnId` and interrupts the turn in flight. `end` accepts `starting`,
-`running`, `done`, `failed`, `paused`, `waiting_capacity` and `capacity_exhausted`
-(`ENDABLE_STATUSES`): it drops the thread's queued messages, leaves the marker
-the `start` loop polls for, sets the worker's roster status to `ended`, and
-interrupts any live turn. Any other status, `ended` included, prints `<worker> is
-<status>; nothing to end` and exits 0, except that an `ended` held design role is
-ended again so `design_roles.py end` can confirm the thread release.
-
-`stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
-non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
-after `REAP_WAIT_SECS`, 5 s, checked every `REAP_POLL_SECS`, 0.2 s) and removes the
-server file. `scripts/direct/end_session.sh` calls it for every run folder the director
-holds (`unit_runs.py held`: the marker's run and each folder that records the director): the server is detached on purpose so it outlives
-each worker, so the end of the run is the only point that knows nobody needs
-it. That is also why it reaps `mesh_retired.json` as well as the live record —
-a server the retry below abandoned is left running, since it may still be
-finishing a peer worker's turn. Its watcher stops it sooner once no client and
-no running turn is left on it, and drops it from that list, so `stop` never
-signals a pid that has since gone to another process.
-
-**Recovering from a wedged app-server.** A stuck server answers every thread
-that attaches with a provider message it cached earlier — no round trip — so a
-usage limit that was real hours ago is replayed word for word to work that would
-have succeeded. Reading the message cannot tell that from a live refusal; the
-launcher settles it by running the work again on a server it starts itself,
-which has cached nothing. `command_start` retries once, through `_retry_warranted`, when all of these hold: the run ended `FailedBeforeThread` (no thread exists, so repeating the prompt cannot repeat edits), the server was inherited rather than started by this call, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the worker is not resident. A run that failed after `thread/start` is `FailedWithThread` and is not retried, since its prompt may already have done work, with one exception: a failure whose text holds `STALE_SIGN_IN` (`access token could not be refreshed`). That is an inherited server holding a Codex sign-in that changed after it started; the provider turned the turn away before any work, so a new thread repeats nothing, and a server started now reads the current sign-in. The other three conditions still apply, and the worker log says `the inherited app-server holds a Codex sign-in that has since changed; retrying on a new one`. `_retire_server`
-drops the record only when it still names the server that failed, so workers
-racing the same recovery replace one server between them rather than one each.
-Same failure on the fresh server means the provider really did refuse, and it is
-reported unchanged.
-
-**A proven usage limit reaches the quota handler.** A launch refusal reports its serving account, limit window and refusal time through `agent_notes.py blocked`. When the command exits, `codex_mesh.py` also passes `--stopped <session id> <worker> <command>`, taking the director from the run-active marker, else the launcher ancestry, and the command from `shlex.join(sys.argv)`. That director alone gets the command and an instruction to rerun it on Claude, even when fallback routing is already open. The stopped worker's continuation is cleared. Unknown or ambiguous directors get no message. A waiting follow reports the refusal without stopped-command metadata and keeps its continuation. Account moves retain their picker, journal and phone behavior; zero, forecast and other refusal details are logged, and restoration is journal-only. A fast refusal from an inherited server that was never retried proves nothing and is not reported.
-
-**Model at capacity.** A turn ends `TurnCompleted`, `TurnRefusedForCapacity` or `TurnFailed`; a run ends `RunCompleted`, `FailedBeforeThread`, `FailedWithThread` or `CapacityRetriesExhausted`. Capacity is the error's `codexErrorInfo` `serverOverloaded` / `flexUnavailable`, or the message `Selected model is at capacity`. On a refusal the launcher keeps the same thread and roster entry and owes the worker a resume turn. It moves messages queued for the thread to `<worker>.pending.json`, reads the thread (`_read_live_turn`), and, if a queued peer turn is already running, streams that turn first with the resume still owed. Once the thread reads `ThreadIdle`, it marks the entry `waiting_capacity` with its own `launcher_pid`, logs `capacity retry N: next turn at <time>`, waits, and starts a resume turn: `Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.`, followed by the held messages. The original prompt is never sent again. Before each resume it checks, under the pending-file lock, that no `end` marker exists and the roster still names this thread; otherwise it logs `capacity launcher ended|replaced; no resume turn started` and returns `FailedWithThread`.
-
-The wait budget is per busy spell. Within a spell the wait is `CAPACITY_WAIT_SECS` (30 s) doubling to `CAPACITY_MAX_WAIT_SECS` (300 s), with `CAPACITY_BUDGET_SECS` (1200 s) in all. `capacity_waited` and `capacity_retries` reset at one site in `_attach_and_run`, the `else` of the capacity check, just before the `resume_owed` branch: any turn that ends without a capacity refusal resets them, a peer turn that completes while a resume is owed included. Only a capacity refusal earns a wait, so an owed resume starts at once after a turn that ended any other way. A refusal that finds the budget spent sets the entry to `capacity_exhausted`, drops the thread's queue and interrupts any live turn (`_end_unwatched_turn`), and `start` exits 1 with `codex_mesh: <worker>: model still at capacity after 7 retries over 20 min; thread <id> stays on the roster (codex_mesh.py end --to <worker>)`.
-
-After a refused turn the app-server reports the thread as `systemError`, and `_read_live_turn` reads that as `ThreadIdle`, so the wait and the resume go ahead. Upstream (codex rust-v0.160.1), the app-server sets `systemError` after any failed turn, a capacity refusal (`server_overloaded`) included, and `note_turn_started` clears it (`app-server/src/thread_status.rs`, `bespoke_event_handling.rs`). The protocol's `ThreadStatus` is `notLoaded | idle | systemError | active{activeFlags}` (`v2/ThreadStatus.ts` from `codex app-server generate-ts`).
-
-**Relaunching a worker.** `start` on a name already on the roster handles the old entry by its status. A `failed` entry first repeats the dead launcher's cleanup, `_end_unwatched_turn(port, thread_id, log_path) -> RelaunchAllowed | RelaunchBlockedByLiveTurn`; blocked exits 2 with `codex_mesh: <worker>: thread <id> still has a live turn that could not be interrupted; relaunch once it ends`, and anything else relaunches, even when the old thread cannot be read. A `waiting_capacity` entry whose `launcher_pid` is alive exits 2 and names `codex_mesh.py end --to <worker>`; a dead one relaunches. Any other entry, while the session's server is up, is read through `thread/read`. `_read_live_turn(client, thread_id) -> ThreadLive(turn_id) | ThreadActiveWithoutTurn | ThreadIdle | ThreadStateUnknown(reason)` maps the thread's status: `idle`, `notLoaded` and `systemError` are `ThreadIdle`; `active` is `ThreadLive` when an `inProgress` turn carries an id, else `ThreadActiveWithoutTurn`; any other status, a read error or a missing thread is `ThreadStateUnknown`. `start` replaces the entry only on `ThreadIdle`. `ThreadStateUnknown` exits 2 with `codex_mesh: <worker>: thread <id>'s state could not be read (<reason>); use codex_mesh.py end --to <worker> before relaunching`, and a live turn exits 2 with `codex_mesh: <worker>: thread <id> has a live turn; use codex_mesh.py end --to <worker> before relaunching`. A thread left `systemError` by a refused turn reads `ThreadIdle`, so its worker relaunches, and `end` sends it no `turn/interrupt`.
+`design_roles.py` uses `worker.py add`, `assign`, and `end` for held Astra roles.
+These roles keep their staff row and current session in a pane.
+Held roles receive messages through `send.py`.
+An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
+`side_pane.py` serves ask-a-friend consultations without a staff row.
+The friend launches with the worker policy through `worker_panes.worker_policy`, so it replies with `send.py` and stops at no permission prompt.
+A managed Astra review starts through `assign.sh --role review --operation astra-review`.
+The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
+The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
+The mesh transport keeps the hold until the end of the worker succeeds.
+The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
+`assign.py` also retains `dispatch`, `adopt`, and `resume-account-move`.
+The two recovery operations remain until Phase 18.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
-Adds models and efforts to `[codex.agents]` and advances `[codex.families]` without deleting existing catalog entries; unrelated rows remain intact. It requires `jq`, reads the top-level `model=` from `~/.codex/config.toml` and the visible models (`visibility == "list"`) from `~/.codex/models_cache.json`, and writes `slug=<efforts>` from each model's `supported_reasoning_levels[].effort` (existing efforts retained; new efforts appended). Details:
+Synchronization adds Codex models and efforts and advances family aliases.
+It preserves existing catalog entries and unrelated rows.
+It requires `jq` and reads the selected model from the Codex config.
+It reads visible models and supported reasoning efforts from the Codex model cache.
+A selected model absent from the visible list is included with its available cache efforts.
 
-- Slugs must match `^[[:alnum:]][[:alnum:]./_-]*$` — notably no colon, which would collide with pair syntax; violators are skipped with a stderr warning.
-- If codex's selected model is not in the visible catalog it is prepended, with its cache efforts if present, empty otherwise.
-- **Vanished-agent protection:** an awk pass computes every codex-assigned row (function assignments plus exact-task overrides). For any assigned agent that would not survive — absent from the refreshed visible catalog *or* absent from the cache — the sync keeps that agent's previous `[codex.agents]` row and warns, naming the stale row and the fix: `re-point it: /agent <function>.<subtask> <agent>[:<effort>], or switch the family: /agent <function> <family>`. If no previous row exists to preserve, the sync hard-fails.
-- **Claude alias staleness:** `warn_missing_claude_aliases` parses the quoted aliases out of `claude --help`'s `--model` text and warns once per alias missing from `[claude.agents]`. Warn-only, never an auto-edit; no `claude` on PATH or help text that parses to nothing degrades to a silent no-op.
-- Writes via `mktemp` + `chmod` (copying the original mode) + `mv`, then touches `CODEX_CATALOG_SYNC_STATE_FILE`. `--check` reports staleness with exit 1 and writes nothing.
+The synchronizer skips slugs that do not match `^[[:alnum:]][[:alnum:]./_-]*$` and prints a warning.
+Parsed task assignments identify models that a refresh would remove.
+The synchronizer preserves each assigned model's previous catalog row and warns with an editor command.
+An assigned missing model without a previous row produces an error.
+Missing Claude aliases produce warnings without automatic edits.
+Unavailable Claude help produces no alias warning.
 
-Two triggers: the launchd job `scripts/agents/com.natemccoy.codex-agent-catalog-sync.plist` (`StartInterval` 300, plus at login), and a freshness gate at the top of `agents_config.sh` — if the state file is missing or either codex source file is newer than it, the sync runs at source time; a failure is warn-and-continue (`WARNING: Codex catalog sync failed; using … as-is.`).
+Synchronization takes `sync.lock` before its registry snapshot and parses that snapshot once.
+Transformations use `MODELS_REGISTRY_BASE`.
+Both generated sections use one parse of the temporary result.
+Publication uses `store_registry` with additive replay.
+A complete successful synchronization updates `CODEX_CATALOG_SYNC_STATE_FILE`. An incomplete catalog leaves the freshness gate open for the next synchronization.
+`--check` reports stale data with exit 1 and publishes nothing.
 
-### Administration (`scripts/agents/agent_admin.sh`, `commands/agent.md`)
+The launchd job `com.natemccoy.codex-agent-catalog-sync.plist` runs at login and every 300 seconds.
+Fresh `launch_configuration` and `edit_base` reads also check catalog freshness before taking their snapshot.
+This synchronization is a separate edit operation.
+An inherited snapshot skips synchronization. `MODELS_CONFIG_TIER_ONLY=1` also skips it.
 
-A thin dispatcher over the resolver:
+The gate requires an existing registry and an executable sync script.
+It compares the Codex config and cache modification times with the sync state file.
+It synchronizes when the state file is absent or an existing source is newer.
+Process settings come from `os.environ`, even when a caller passes `{}` to request a fresh snapshot.
+The settings are `MODELS_CONFIG_FILE`, `MODELS_CONFIG_TIER_ONLY`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, and `CODEX_CATALOG_SYNC_STATE_FILE`.
+Defaults are `~/.claude/config/models.conf`, `~/.codex/config.toml`, `~/.codex/models_cache.json`, and `~/.local/state/codex-agent-catalog-sync/last_success`.
+The child receives the selected registry path as `MODELS_CONFIG_FILE`.
+A sync failure prints `WARNING: Codex catalog sync failed; using the current model registry.` and continues.
+No-mode `shell` reads and `store` bypass the gate, so synchronization cannot call itself.
 
-- no args → `agents_list_assignments` + usage block;
-- `skills` → the unique sorted function names from `[assignments]`;
-- `<function>` → `agents_list_function` + usage with examples tuned to that function's real subtask and current pair;
-- `<family>` alone → `agents_set_all_assignments`, then a `# switched every function to <family>` line, a `# kept <fn> on <family>: its only set` line per pinned function, and the no-arg listing;
-- `<agent>` alone → `agents_set_model`, then `# switched every function to <agent> (<family>), efforts kept`, the `# kept …` lines, and the no-arg listing;
-- `<function> <family>` → `agents_set_assignment`;
-- `<function> <agent>` → `agents_set_model <agent> <function>`, then a `# switched …` line (or `# set [<fn>.<family>] …` for a `caller` function) and the function's rows;
-- `<function>.<subtask> <agent>[:<effort>]` → `agents_set_row`, then a `# updated [<function>.<family>] <task> — live|dormant` line (dormant hints the `agent_admin.sh <fn> <family>` that would make it live), then the function's rows;
-- a tier word (`fast`, `flex`, `default`, `inherit`) alone, after `<function>`, or after `<function>.<subtask>` → `agents_set_service_tier`, checked before the family and agent branches, then a `# set [<fn>.options] <key>=<tier> — live|dormant|live whenever a codex session runs <fn>` line (every function: `— dormant for <fns>: they run on claude` when any do), or for `inherit` a `# cleared …` line naming what the scope now follows; then the function's rows, or the no-arg listing for every function;
-- a lone dotted argument or three-plus args → usage on stderr, exit 1.
+### Administration (`scripts/agents/default_models.sh`, `commands/default_models.md`)
 
-`commands/agent.md` is the `/agent` skill: it runs the script with `dangerouslyDisableSandbox: true`, relays stdout/stderr exactly, and renders the row lines as a markdown table.
+`default_models.sh` dispatches to the shared resolver and scoped editor.
+
+| Arguments | Operation |
+|---|---|
+| None | Lists active assignments and usage. |
+| `skills` | Lists function names. |
+| `<function>` | Lists both family sets. |
+| `<family>` | Changes supported function assignments. |
+| `<agent>` | Changes supported model rows and keeps their efforts. |
+| `<function> <family or agent>` | Changes one function. |
+| `<function>.<subtask> <agent>[:<effort>]` | Changes one task row. |
+| A tier, alone or after a function or task | Changes the matching service-tier override. |
+
+The output names preserved pinned functions and marks inactive rows.
+Invalid argument counts print usage and return 1.
+`commands/default_models.md` relays the script output and renders resolved rows as a table.
 
 ### Consumers
 
-| File | Role |
-| --- | --- |
-| `config/agents.conf` | The shared registry. |
-| `scripts/lib/agents_registry.py` | Shared-file Python reader and atomic registry-only publisher used by every writer. |
-| `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
-| `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger; `agents_workers_home` reads the signed-in workers home for the shell launchers. |
-| `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` workers the path for `/ask_a_friend`'s codex friend (`start --resident`), and the launcher of each production's pooled reviewers (`prime`/`fork`/`reset`, `docs/as-built/review-pool.md`). One app-server per session, one thread per worker, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished worker's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
-| `scripts/agents/agent_admin.sh` | `/agent` backend. |
-| `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
-| `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the worker wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
-| `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
-| `scripts/direct/implement.sh` / `review.sh` | `/unit:direct`'s launchers. The implementation launcher adds a **required** pass kind as its 6th argument, optional activity and fix-count arguments, and a **required** `team_role` as its 9th (the worker's slot: `impl`, `test`, or a role-named extra slot such as `review` or `fix2`, matching `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`): a phase runs a two-worker team and a repair its one `impl` worker, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `UNIT_TEAM_ROLE` beside `UNIT_RUN_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per worker, and `start-pass` closes only a stale pass of the same worker, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The kind is checked against the four words at the argument, because an empty one used to be tolerated: the launcher skipped `start-pass`, ran its agent normally, and left the worker's previous pass standing -- so a repair round dispatched with the kind on `impl` alone produced a phase whose ledger held one live window and two records closed `error` an hour before, and refused every progress call once that one window closed. Nothing in the sequence looked like a launch fault; a register line with no `role=` field is the signature. The reviewer takes an optional leading `--to <worker>` or `--slot <name>` (`long-lived-workers.md`), optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `contract`, `craft`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, and `review_agent`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. A review on an open worker (`review.sh --to <worker>`) records under that worker's slot, the worker name's last hyphen segment, and one that opens a role-named worker (`--slot <name>`) records under that name; only a review outside a run, with neither flag, takes its worker from the lens — `test`, `impl`, `review` respectively; the `review` worker renders as an `Agent 3` column only when a shown stage assigned it, and each extra worker (`review2`, `fix2`, …) gets its own `Agent N` column. That slot is what `review.sh` exports as `UNIT_TEAM_ROLE`, empty lens included, so a lone reviewer cannot inherit a worker from its environment and close a live pass there so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the worker. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
-| `scripts/direct/board.sh` | The phase team's coordination substrate: an append-only `board.log` plus `mkdir`-atomic tokens under `locks/`, shared by every member writing into one session directory. Commands are `post` / `read` / `acquire` / `release` / `renew` / `role` / `roles` / `locks`. A file rather than messages because one append *is* the broadcast to every peer and the wrapper, where N-1 addressed sends can each half-fail; because it outlives the turn that wrote it, so a member resumed hours later reads the whole history; and because a message channel cannot make anything mutually exclusive, which the `mkdir` tokens can. Post kinds are a closed set (`register`, `claim`, `release`, `status`, `blocked`, `handoff`, `done`) so a peer can scan for what concerns it — `ask` and `answer` are deliberately absent, since a question to a peer is a message (`SendMessage`, or `codex_mesh.py` for a codex member) and two ways to ask one question means one of them goes unread; `read --since N` numbers every line before filtering, so a cursor counts board positions and stays valid across different filters. `role` is the only writer of `handoff`, and those lines are how `progress_history.py` learns which role each slot holds now. |
-| `scripts/direct/progress_history.py` | Cross-agent append-only unit-run event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/unit-history/runs/` (`unit_runs.history_root()`); live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. `progress` prints a short report (clocks table, phase heading, ETA line, worker lines, stage line, wall clock); the clocks table has separate project and phase rows, independent unchanged timers and unambiguous `HH:MM:SS` durations. `progress --tables` adds the round table. The legacy layout prints the clocks table only under `--tables`. It calibrates phase estimates from completed-phase history and records every stated ETA (`eta`, an `eta_stated` event per promise). `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
-| `scripts/direct/findings.py` | The worker fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state for the current phase's `instance_id`; a displaced phase's ledger waits in `findings_state-<instance_id>.json` until it is current again. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |
-| `scripts/direct/test_progress_history.py`, `test_findings.py` | `python3 -m unittest scripts.direct.test_progress_history scripts.direct.test_findings` from `~/.claude`. Both drive the real CLIs in a temp session dir with `UNIT_NOW_EPOCH` / `UNIT_HISTORY_DIR` pinning time and storage; `test_progress_history` runs the recorder's `main()` in-process through `recorder_fixture.invoke_recorder` and keeps one subprocess case for the CLI contract. |
-| `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex on the signed-in workers account home with `agents_codex_args` (the registry tier included), overriding a caller's `CODEX_HOME`, or claude with `-- "/$invocation"`. An unavailable workers account refuses before Codex starts. It has no assignment editor — assignment changes go through `/agent`. |
-| `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `agents_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume runs `add_unit.py ... --resume <session-id> --cwd <cwd>`, which resolves the same row and keeps the transcript's last model unless `--model` is given. |
-| `scripts/ask_a_friend/prepare_session.sh` / `launch_friend.sh` / `end_friend.sh` | `ask_a_friend.consultation`, resolved directly (not through `agent_exec`) because the friend is a live peer, not a one-shot: claude → `agent_bg.sh` with `AGENT_BG_DETACH=1` (the one `claude --bg --name <friend>` recipe; answers by `SendMessage`; `friend_id` for `claude stop`), codex → `codex_mesh.py start --resident --service-tier "$AGENT_SERVICE_TIER"` (a thread that outlives its turns; replies print between `=== reply from <friend> (N) ===` / `=== end reply ===`; `end` releases it). Protocol files: `friend_name`, `question.md`, `message_<N>.md`, `answer.txt` (codex), `status` `running\|ended\|error`, `agent.log`, provenance `consult_agent`. One friend carries consultation and implementation, so there is one row per family. |
-| `commands/team_review.md`, `api_review.md`, `module_review.md` | Call `agent_exec … readonly` directly, backgrounded, one call per lens/pass, with self-contained prompt files under wave-namespaced session dirs (`cycle2/`, `adversary/`, `pass3/`) and provenance captured in-session via `agents_resolve_print`. |
-| `commands/unit/direct.md`, `commands/ask_a_friend.md` | Consumer docs: call sites, log/provenance names, and `/agent` as the switch surface. |
+| Consumer | Configuration use |
+|---|---|
+| `assign.py`, `assign_claude.py`, `review.sh` | Share one launch configuration across allocation and delivery. |
+| `workers.py` | Reads a configuration only when it opens a worker. |
+| `codex_mesh.py` | Uses one configuration for each turn submission. |
+| `agent_exec.sh`, `cli_agent.sh` | Resolve task values before removing the operation snapshot. |
+| `unit_effort.py` | Shares one editor base through its command. |
+| `progress_history.py` | Reads the [configuration digest](unit-progress-history.md#configuration-digest) without publication. |
+| `add_unit.py` | Resolves `production.director` and requires Claude. |
+| `side_pane.py` | Resolves `ask_a_friend.consultation` in the caller's family. |
 
-All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK" 2>"$LOG_FILE"`) so an "on error read the log" instruction is true even on the resolution-failure path.
+[Long-lived workers](long-lived-workers.md) owns worker launch, handoff, and recovery behavior.
+[Unit progress history](unit-progress-history.md) owns recorder events and progress reports.
 
 ## Invariants
 
-- The registry is the only home for family/agent/effort. Consumers resolve through `agents_resolve` or `agent_exec` and never re-derive flag vocabulary — `agents_codex_args` / `agents_claude_args` own it.
-- Every function keeps **both** family sets fully specified, so switching families is a one-row edit (a one-family function is pinned and kept by every-function switches); `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
-- Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both instead of picking a family for it.
-- Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
-- Only `agents_set_assignment`, `agents_set_all_assignments`, and `agents_set_model` change which family is live. `agents_set_row` writes a row (live or dormant) and `agents_set_service_tier` writes a tier (live or dormant); neither flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
-- The sync adds to `[codex.agents]` and advances `[codex.families]`; it never removes catalog entries or touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
-- New lookups use `_agents_registry_get` / `_agents_registry_has_key` (literal key comparison). Never match keys with an unescaped `^key=` regex — dotted keys like `direct.review` mis-match.
-- Any awk that writes a user-supplied value passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve comments and spacing; `agents_registry_store` delegates atomic replacement and publication to `store_registry`.
-- `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
-- Callers pass **absolute** prompt/output/log paths to `agent_exec`.
-- `codex_mesh.py` carries unit workers, held designs and ask-a-friend threads.
-  Unit allocation resolves its role through `agents_resolve`. Launchers pass
-  the selected model and effort on each turn; transport does not choose them.
-- Every worker in one run shares one app-server, and its pid file is the only
-  record of it. A launch path that starts a server without writing
-  `mesh_server.json` leaks a process that nothing will reap.
-- Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
-- The session app-server is deliberately detached, so it outlives each worker
-  and a peer can still reach a thread between turns, and so the run's workers stay
-  open across phases. `end_session.sh` calls `codex_mesh.py stop --pause` at run
-  end. While the unit director lives, that leaves its workers and servers
-  untouched. Otherwise it preserves queued work before stopping the servers
-  recorded by that run. Ordinary idle-stop and retired-server reclamation free
-  unused servers between assignments; the next dispatch resumes the same thread.
-- A server nothing stops stays up for good: one started outside a `/unit:direct` run
-  (`/ask_a_friend`, a worker launched by hand), one whose run ended without
-  `end_session.sh`, and one whose run folder was deleted. `codex_mesh.py sweep`
-  reports them and stops nothing; `sweep --stop` stops the ones it calls unused. It reads each server's run folder from the
-  server's own stderr handle (`/proc/<pid>/fd/2` is that folder's
-  `mesh_server.log`), which survives a rewritten `mesh_server.json` and a
-  deleted folder. A server is `in use` on any one of: a client connected to its
-  port, a roster launcher still alive (a resident worker waits between turns with
-  no socket open), a run-active marker naming its folder, a start or a folder
-  change inside `SERVER_IDLE_SECS` (30 minutes), or a conversation that is not
-  idle. The last is asked of the server itself (`thread/loaded/list`, then
-  `thread/read` on each loaded and each roster thread, plus `thread/queue/list`
-  on each loaded thread). Queued submissions or an unreadable queue keep the
-  server. A turn left running
-  by a launcher killed at its time limit is seen with no client and no roster.
-  Anything that cannot be read counts as in use, and a server whose log names no
-  run folder is `unknown`. A stale run-active marker keeps
-  its server `in use`: the sweep does not yet check that the marker's session is
-  alive, as `remove_workers.py` does. Under `--stop` each unused server gets a
-  second look at the moment before it is signalled, under its run folder's
-  server lock so a launcher reaching `ensure_server` waits and then starts its
-  own. The second look must find the same pid still serving the same port and
-  must again say unused; then `_reap` stops it and `mesh_server.json` is removed
-  if it names that pid. A deleted run folder is not created again for the lock.
-  Nothing runs the sweep on a schedule. Neither `remove_workers.py` at phase
-  end nor `end_session.sh` at run end launches it. Explicit sweeps, idle-stop
-  and retired-server reclamation use the common busy check and its second look.
-- A codex app-server stops itself once nothing uses it.
-  `ensure_server` starts a watcher with each server: a detached shell that wakes
-  every `WATCH_WAKE_SECS` (5 minutes) and looks at the change time of
-  `mesh_server.json`, which `ensure_server` touches on every use. Only when that
-  is older than `SERVER_IDLE_SECS` does it run `codex_mesh.py idle-stop`, which
-  applies the sweep's verdict without the run-active marker and stops the
-  server through the same second look under the run folder's lock, or keeps it
-  and touches the record. The marker is left out because a stopped server comes
-  back at the next use: `follow` starts one and sends `thread/resume`, and `send`
-  now reopens a thread the server has not loaded (`_load_thread`; a new server
-  accepts a queued message for an unloaded thread and never runs it). A stopped server leaves no `mesh_server.json` and one
-  line in `mesh_server.log` saying why. Cost: a shell and a `sleep` per server
-  (under 1 MB of their own memory against a mean 38 MB per app-server), one
-  `find` per wake, and one short Python run about twice an hour while the server
-  is in use. The connection count needs `ss` and the run folder needs `/proc`,
-  so on the Mac automatic reclamation keeps a server when it cannot establish
-  that the server is unused. Explicit `stop` and `end_friend.sh` can stop it;
-  run end uses `stop --pause` and preserves a live director's servers. The
-  watcher is what reaps a server whose run folder no end step covers, such as
-  work that went on in a run folder after its run had closed.
-- A Codex sign-in change moves every run to a new app-server. An app-server
-  reads `$CODEX_HOME/auth.json` once, at start; after a new sign-in it holds a
-  token it cannot refresh and fails each turn with `access token could not be
-  refreshed`. `codex_mesh.py signin-changed` runs the moment that file changes,
-  from a path watch the NixOS config installs (a systemd user path unit on
-  Linux, a launchd agent on the Mac). It reads only the file's change time,
-  never its contents. For each run folder under `/tmp/claude/unit` or `/tmp/claude/delegate` whose
-  recorded server started before that time (`ps -o etime`, the same on both
-  systems), it retires the record, stops the old server at once if nothing uses
-  it or leaves it a watcher, writes a line to `mesh_server.log`, and sends that
-  line through `send.py` to each session whose run-active marker names the run.
-  The run's next dispatch starts a server that reads the current sign-in. A worker
-  mid-turn finishes on the old server, which `send` and `steer` keep reaching
-  through the port in the worker's roster entry while its launcher lives. Every
-  launcher writes that port before it opens its thread, `follow` included; for
-  an entry without one, `_worker_port` asks each running server of the run,
-  retired ones first, which holds the thread (`thread/loaded/list`). A worker
-  whose launcher lives is never given a new server: a second server cannot open
-  a thread another still holds, so when none holds it the message fails and
-  nothing is left running. A
-  resident worker moves itself between turns (`_move_resident`), carrying any
-  queued messages into its first turn on the new server under its pending lock.
-  A retired server is judged on its clients and running turns alone, since the
-  run's marker, launchers and activity belong to the newer server; its watcher
-  asks at every wake rather than waiting for the record to go quiet.
-  `ensure_server` makes the same check at each launch for a change the watch
-  missed. Any write to the file counts, a token refresh by another Codex process
-  included: that costs a server restart and a notice, never work. Running it
-  twice for one change moves nothing the second time. On the Mac the old server
-  is stopped by `end_session.sh`, as above.
-- A codex worker's launcher ends with its last turn, while its thread persists.
-  A `send` to a finished codex peer holds the message for its current roster
-  thread. Only the unit director's `implement.sh --to <worker>` or
-  `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
-  which receives the held messages first and its dispatch prompt last
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
-  `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
-  line's `reach=` field is what tells a peer which of the two it is addressing.
-- `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
-- `commands/unit/direct.md` holds the whole `/unit:direct` workflow, and it is a regular file. Call-site edits go in `direct.md`.
-- The `[worker.*]` header still names `/plan:worker`, an older name for `/unit:direct`; it is a comment only. Changes to it belong in the shared registry.
-- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and every member carries a `pass_kind`, so a team phase records one pass per worker rather than one for the whole phase. The kind names the work the worker was assigned and nothing else: the `test` worker records `test`, a writing worker `impl`, the repairing worker `fix`. An earlier claim here that a `test` kind would rewrite the `implementation` stage across the back corpus was wrong -- adding a kind cannot change stored events, only adding a stage could. A kind never triggers behavior either: round resolution is `UNIT_RESOLVES_ROUND=1`, set on the one repairing worker, so recording `fix` never resolves a round by itself. The board, not the launcher, is what a third concurrent member would change.
-- No `/unit:direct` prompt tells an agent to acquire the `cargo` token. `verify.sh` takes it, and a prompt that takes it too deadlocks the agent against its own held token.
-- Registry writers publish only `config/agents.conf`. `settings.json`, shell aliases, `scripts/claude_to_codex/`, and `~/.codex/config.toml` remain outside the edit.
-- Never use `AskUserQuestion` in the command docs; the review docs decide via in-session synthesis.
+- `config/models.conf` owns model choices. Consumers use the shared resolver and flag emitters.
+- A task has exactly two non-empty segments. Model aliases resolve through the selected family's catalog.
+- An empty effort omits the effort flag. A trailing colon with no effort is invalid.
+- Catalog entries with no effort values admit only a bare model name.
+- A family switch validates every target row before publication. A single-family function stays pinned.
+- A row edit changes the model and effort without changing the active family.
+- A service-tier edit changes no family or model. An absent tier inherits the Codex config.
+- Editor validation and transformation use one exact base. Locked replay preserves concurrent unrelated edits.
+- Shell output uses safe quoting. Dotted keys use literal comparisons.
+- Catalog synchronization adds models and efforts. It never deletes them or edits assignments.
+- Launch snapshots end at the agent boundary. Each later launch reads current settings.
+- Registry writers publish no settings, aliases, credentials, or Codex config files.
 
-## Calibration / gotchas
+## Gotchas
 
-- **bash 3.2.** macOS ships bash 3.2 — no associative arrays, no `${var,,}`, no bash-4 anything. The registry, worker, cli_agent, and ask_a_friend scripts use `#!/usr/bin/env bash` (also 3.2 here).
-- **bash only, never zsh.** The resolver uses `BASH_REMATCH` and process substitution. Sourcing it from zsh hangs or misbehaves — run every test and probe as `bash <script>` / `bash -c '…'`.
-- **Sourcing fires the sync.** `agents_config.sh`'s freshness gate can shell out to the sync (which itself shells out to `claude --help`, ~1-2 s). Tests and probes suppress it by exporting `CODEX_CATALOG_SYNC_STATE_FILE` at a freshly `touch`ed temp file *before* sourcing.
-- **Double resolution per launch.** Wrapper (provenance) plus `agent_exec` (execution) each source `agents_config.sh`, so a stale freshness gate fires the sync twice and doubles its `WARNING:` lines. Expected, not a defect.
-- **Absolute paths for `agent_exec`.** The claude branch redirects after `cd <working_dir>`, so relative output/log paths resolve against `working_dir` there but against the caller's cwd on the codex branch (the prompt file is read pre-`cd` in both).
-- **`initialize` needs `capabilities.experimentalApi: true`.** Without it the
-  app-server accepts the handshake and then fails `thread/queue/add` and
-  `turn/steer` with `-32600` and no indication a capability is missing.
-- **`thread/start` takes the SandboxMode *string*** (`"danger-full-access"`), not
-  the `SandboxPolicy` object (`{"type": "dangerFullAccess"}`) the generated
-  schema shows for other fields. The object is rejected as `unknown variant`.
-- **`ephemeral: true` and `thread/name/set` are incompatible** — the rename
-  returns `-32600 "ephemeral thread does not support metadata updates"`. Workers
-  are not ephemeral, since an ephemeral thread also refuses `thread/queue/add`.
-  The cost is the ordinary codex rollout file under `~/.codex/sessions`, which
-  also keeps a worker's transcript readable afterward. Naming stays
-  best-effort and `mesh_roster.json` is the address of record.
-- **`--listen unix://<path>` closes every connection silently** while the server
-  stays up. Use `ws://127.0.0.1:<port>`.
-- **`codex queue --thread` exits 0 for a thread with no live session.** The
-  acknowledgement says nothing about delivery — do not use it as a reachability
-  test.
-- **A finished codex worker holds messages for its next dispatch.** Its thread
-  persists, and `send` holds messages until the unit director starts its next
-  turn through `implement.sh --to` or `review.sh --to`. That turn receives them
-  first, and its dispatch prompt last. A thread started `--resident` (ask_a_friend's friend) stays
-  `running` across turns, prints each reply as it lands, and ends only on
-  `codex_mesh.py end`. `send` still refuses ended, missing and
-  capacity-exhausted workers.
-- **`systemError` is not terminal.** The thread stays loaded, and `turn/start` has no status gate, so a resume turn on the same thread is valid. A status outside the protocol's four reads `ThreadStateUnknown`: relaunching a `done` or `capacity_exhausted` entry exits 2, `end` exits 1, and inside the capacity loop the worker ends `failed` with `thread <id>: thread/read failed: unrecognized status <status>`.
-- **Capacity numbers.** The waits run 30, 60, 120, 240, 300, 300 and 150 s, so a spent budget reads `7 retries over 20 min`. The budget counts the measured sleep (`max(wait, elapsed)`), so a late wake spends it, and it counts only waits, not the time refused turns took, so a spell runs longer than 20 min of wall time.
-- **Stub app-server.** In `scripts/agents/test_codex_mesh.py` the stub answers `systemError` after an errored turn (`turn/failed`, or `turn/completed` carrying `error`) until the next `turn/start`, and an explicit `thread_statuses` entry wins. A stub that answered `idle` after a refused turn would hide the crash this guards against. `completed_then_capacity` and `capacity_with_peer` drive the budget-reset tests, and `test_failed_worker_relaunches_when_old_thread_has_unknown_status` uses `retired`, a status the protocol does not define. Workers run the live `~/.claude` copy of `codex_mesh.py`, so a change protects running workers only once it is there.
-- **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
-- **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
-- **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
-- **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult ran `write` (`--full-auto`) while it went through `agent_exec`; today the friend is a mesh thread (`codex_mesh.py start --resident`) and never touches `--sandbox read-only`. The worker reviewer's `--sandbox read-only` usage is proven and stays, for a review outside a run; a review inside a run goes to an open worker and runs on that thread's own sandbox. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
-- **The cli aliases run fast from the registry.** `cli_agent.sh` once hardcoded `-c service_tier="fast"` after `agents_codex_args`, which would have overridden any `/agent cli <tier>`; the hardcode is gone and each machine's `[cli.options]` carries `codex_service_tier=fast` instead.
-- **Concurrent edits and recovery.** Each shell setter validates and transforms one registry snapshot. Storage replays only its changed rows on the latest registry. Publishing serializes local writers and carries every unshared local row across rejected-push retries, preserving earlier local edits. Repeating an interrupted edit publishes pending rows even if the requested value is already local. After a lost push acknowledgement, an accepted commit or matching remote rows finish publication without another commit.
-- **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.
-- **`_agents_registry_get` returns 0 on a miss** (prints nothing) so it is safe under `set -e` in command substitution; use `_agents_registry_has_key` when you need presence as a condition.
-- **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `UNIT_RUN_DIR` / `UNIT_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. It acquires with `--pid $$`, so a `verify.sh` killed before that path runs leaves no stranded token: a waiter reclaims it as soon as that pid is gone (`build-memory-admission.md`, Cargo token reclaim). Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
-- **`verify.sh` remembers passes within a worker session.** A `test` or `lint` that exits 0 under `UNIT_RUN_DIR` or `UNIT_SESSION_DIR` is recorded in `<session>/verify_cache/`, keyed by the tree as the run left it plus the arguments, toolchain, `lint.conf`, the scripts and the cargo environment; a `test` key covers only the part of the tree its package is built from (its folder and its path dependencies', every member's `Cargo.toml`, every path outside the members), so a second phase editing another member in the same worktree neither drops the pass nor misses it (2026-10-17); the same call on the same tree prints `PASS (recorded)` with that run's log and takes no token. It looks again after taking the token, so a worker queued behind its peer's identical run gets the peer's record. Failures are never recorded; `--no-cache` forces a run. Each record holds what a repeat would cost (wall time minus cargo's `Finished … in` build time); every such call, `--no-cache` included, appends one line (ran, failed, interrupted, or reused with seconds saved; machine, workspace, worktree, branch, commit) to `~/.local/state/verify/events.jsonl`, which `/verify_saved` (`verify_saved.py`) totals for any span by workspace, worktree, day or week, the Mac's ledger read over ssh. `end_session.sh` deletes the records; the ledger stays.
-- **A green `verify.sh` only means what the tree it ran against means.** With three members editing one worktree, a pass is authoritative for a slot's work only after that slot has posted `done` to the board.
-- **cargo-berth claims are per harness session id, so cross-slot edits are blocked, not merged.** Each worker is its own claim holder: the tester cannot add a `#[cfg(test)]` block to a file `impl` claimed, which is why the contract routes it to an integration test under `tests/`.
-- **Editing a live launcher in place** (a script currently running) produces a spurious `unexpected EOF` exit 2 after the real work completes — bash re-reads the modified file at a stale byte offset. Check the status file and diff before treating it as a failure.
-- Sync `WARNING:` lines land in launchd stderr logs; they are not stage failures, and the usage-limit regexes are written not to match them.
-
-## Why it is this way
-
-- **Keep models absent from a machine's catalog.** Each machine sees a different catalog. Sync retains every existing model and effort, including entries no local assignment uses. Warnings still identify assigned models missing from the cache; removing a retired entry requires an explicit shared-registry edit; `/agent` does not delete catalog rows.
-- **Warn-only for claude alias staleness.** The effort list for a new alias is a judgment call and omissions (haiku) are deliberate, so the sync reports and never edits. A help-text wording change or a missing `claude` binary degrades to a no-op rather than a false edit.
-- **Serialized publication.** Real-registry writers take the repository's publication lock before fetching and replaying their row changes. The lock is released when the process exits.
-- **No per-project overrides.** One global registry (`config/agents.conf`) governs everything. Per-project layering would reintroduce exactly the scattered, hard-to-audit assignment state the registry exists to prevent, and `/agent status` would stop being the truth.
-- **Double resolution in the wrappers.** `agent_exec` deliberately exports nothing, so a wrapper that wants provenance resolves again itself. Both reads hit the same conf, so they agree; the alternative — `agent_exec` exporting or writing resolved values — would couple every consumer to the launcher's variable names and make the launcher responsible for file layout it does not own.
-- **Effort omission for a bare agent pair.** A row of just `agent` means "omit the effort flag entirely and let the CLI pick", which is materially different from any explicit level and is the only thing that validates against a catalog row with no reasoning levels. Hence no default-effort fallback anywhere: the stage scripts guard the flag with `[[ -n … ]]` rather than substituting a level, so the registry's silence is transmitted faithfully to the CLI.
-- **`systemError` reads as idle.** It means the last turn failed and none is active, which is what relaunch, `end` and the capacity loop need to know. Read as unknown, every capacity refusal on the real app-server ended the worker with `thread/read failed`, so the backoff and resume never ran outside a stub that answered `idle`. Any status the protocol does not define still reads as unknown, so a new upstream status is classified on purpose rather than defaulted to idle.
-- **A capacity budget per busy spell.** A turn that ends without a capacity refusal proves the model is answering again, so the next refusal starts a new spell. A budget for the whole run would let refusals hours apart add up and retire a long-lived worker, such as a resident friend, after one bad spell too many.
-- **An owed resume after a completed turn starts at once.** The completed turn shows the model is serving, so a wait would only delay the worker's own work; only a capacity refusal earns one.
-
-Accepted Codex turns record `turn_model` and `turn_effort` in the roster for display only. Board worker rows and progress worker notes read these fields. Durable identity model fields remain compatibility data and do not choose a dispatch model; worker reuse is by role and availability. Every turn resolves its current shared role default or an explicit dispatch override.
+- An unexported `MODELS_CONFIG_FILE` still selects the Bash reader's registry.
+- An inherited launch or edit snapshot suppresses catalog synchronization for that operation.
+- A telemetry read never synchronizes or publishes the registry.
+- A failed synchronization warns and uses the current registry. It does not stop the launch.
+- Catalogs differ across machines. Assigned missing models remain in the shared registry and produce a warning.
+- `agent_exec` owns its redirections. Wrappers retain absolute prompt, output, and log paths.
+- Retired-name tests also match a name that sentence punctuation follows.
+- [Worker lifecycle](long-lived-workers.md) owns worker dispatch and recovery.
+- [Merge-gate infrastructure](merge-gate-and-test-speed.md) owns test isolation and verification behavior.

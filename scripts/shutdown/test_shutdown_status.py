@@ -5,30 +5,27 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
-from unit_staff_test_support import legacy_unit_host
 import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
-import shutdown
-import restart_support
-import inventory
-from scripts.accounts import accounts
-import shutdown_record as record_store
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
+from scripts.agents import codex_mesh
 from scripts.whoami.account import UnreadableAccount
-from inventory import Inventory
-from shutdown_record import SessionShutdown
-from test_shutdown_record import LegacyRecordFixture, write_old, move_old
+from scripts.shutdown.inventory import Inventory
 
 
 LOGIN = "owner@example.com"
@@ -38,8 +35,6 @@ def action_line(label: str, verb: str, names: str, machine: str = "natedev") -> 
     identities = ",".join(name + "-id" for name in names.split(", "))
     return (f"  {label}: in a terminal on {machine}: ~/.claude/scripts/lib/py "
         f"~/.claude/scripts/shutdown/shutdown.py {verb} {LOGIN} --here --only {identities} · {names}")
-
-
 
 
 def empty_inventory(machine: str = "natedev") -> Inventory:
@@ -52,9 +47,8 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
     }
 
 
-def empty_recovery_inventory() -> shutdown.RecoveryStatusInventory:
-    return shutdown.RecoveryStatusInventory(**empty_inventory(), recovery=[],
-        snapshot=shutdown.NoSnapshotOutcomeRecorded(kind="no outcome recorded"))
+def empty_recovery_inventory() -> inventory.Inventory:
+    return empty_inventory()
 
 
 def complete_session(*, host: object) -> dict[str, object]:
@@ -84,52 +78,6 @@ def complete_session(*, host: object) -> dict[str, object]:
     }
 
 
-def complete_record(machine: str = "natedev") -> LegacyRecordFixture:
-    return cast(
-        LegacyRecordFixture,
-        cast(
-            object,
-            {
-                "login": LOGIN,
-                "label": "claude2",
-                "machine": machine,
-                "state": "settling",
-                "requested_at": "2026-10-09T21:49:10+00:00",
-                "requested_by": {"kind": "terminal"},
-                "scope": {"kind": "all account sessions"},
-                "conductor": {"kind": "not started"},
-                "force": "wait for ready",
-                "entries": [
-                    {
-                        "session": complete_session(host={"kind": "unknown"}),
-                        "timers": [],
-                        "settle_message": {"kind": "not sent"},
-                        "where": {"kind": "not said"},
-                        "progress": {"kind": "waiting"},
-                        "stop_issues": [],
-                    }
-                ],
-                "stop_issues": [],
-            },
-        ),
-    )
-
-
-def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> SessionShutdown:
-    old = complete_record(machine)
-    item = old["entries"][0]
-    item["session"]["name"] = name
-    item["session"]["session_id"] = name + "-id"
-    return SessionShutdown(
-        login=LOGIN, label="claude2", machine=machine,
-        requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
-        hold="account", then="stop", force=old["force"], alerts="user", probe=False,
-        session=item["session"], workers=[], timers=item["timers"],
-        settle_message=item["settle_message"], where=item["where"],
-        progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[], trail=[],
-    )
-
-
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
@@ -137,6 +85,60 @@ def setUpModule() -> None:
 
 @final
 class ShutdownStatusTests(ShutdownTestCase):
+    def test_stop_reports_each_unresolved_worker_and_the_director_result(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("director-session"))
+        row = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId("worker-session"))
+        record = staff.StaffSnapshot((parent, row))
+        write_text_atomic(self.root / "run/worker_transport", "herdr\n")
+        def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            print("anomaly: impl: terminal changed", file=sys.stderr)
+            return [worker_panes.UncertainWorker(row, "terminal changed")]
+        for result, expected in ((stop_resume.StopFailed("director-session", "director stop failed"), "director stop failed"),
+                                 (stop_resume.NotRunning("director-session"), "unchanged")):
+            with (self.subTest(result=result), patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(worker_panes, "worker_run", return_value=self.root / "run"),
+                  patch.object(worker_panes, "observe", side_effect=observe),
+                  patch.object(stop_resume, "stop", return_value=result),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(shutdown.main(["stop", "director"]), 1)
+            text = output.getvalue() + errors.getvalue()
+            self.assertEqual(text.count("anomaly: impl: terminal changed"), 1, text)
+            self.assertIn(expected, text)
+
+    def test_record_precedes_worker_window(self) -> None:
+        row = staff.StaffRow(staff.StaffId("retained-worker"), "worker", "impl", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("native-worker"))
+        record = staff.StaffSnapshot((row,))
+        def window(selected: staff.StaffSnapshot) -> None:
+            self.assertIs(selected, record)
+            self.assertEqual(shutdown_record.read(), [row.id])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "live_rows", return_value=[row]), patch.object(shutdown, "wait_for_workers", side_effect=window)):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+
+    def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
+        row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", staff.StaffRoot(),
+                             current_session=staff.StaffId("current-thread"))
+        client = Mock()
+        replies = iter([{"type": "active"}, {"type": "idle"}])
+        def reply(method: str, _params: object, **_options: object) -> dict[str, object]:
+            if method == "thread/read":
+                return {"result": {"thread": {"status": next(replies)}}}
+            return {"result": {"data": ["current-thread"] if method == "thread/loaded/list" else []}}
+        cast(Mock, client.call).side_effect = reply
+        with (patch("scripts.shutdown.restart.live_rows", return_value=[]),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(codex_mesh, "_running_servers", return_value=[codex_mesh.WebSocketServer(10, 20, 1)]),
+              patch.object(codex_mesh, "Client", return_value=client),
+              patch.object(time, "sleep") as wait,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        wait.assert_called_once_with(1)
+        self.assertRegex(output.getvalue().splitlines()[0], r"^saved 0 rows for restart at \d{2}:\d{2}$")
+        self.assertEqual(output.getvalue().splitlines()[1:], ["test-worker: current-thread: waiting for worker turn"])
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -197,21 +199,6 @@ else:
             encoding="utf-8",
         )
 
-    def test_status_actions_and_usage_lines_name_where_commands_run(self) -> None:
-        saved = session_shutdown(name='Place')
-        saved['progress'] = record_store.SessionStopped(kind='stopped', at=saved['requested_at'])
-        self.assertTrue(record_store.create_session(saved))
-        status_output, usage_output = (io.StringIO(), io.StringIO())
-        with patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(status_output):
-            self.assertEqual(shutdown.main(['status', LOGIN, '--here']), 0)
-        with redirect_stdout(usage_output), self.assertRaises(SystemExit) as exit_status:
-            _ = shutdown.main(['--help'])
-        self.assertEqual(exit_status.exception.code, 0)
-        command_lines = [line for text in (status_output.getvalue(), usage_output.getvalue()) for line in text.splitlines() if any((token in line for token in ('/shutdown', 'shutdown.py', 'accounts.py', 'github-warm')))]
-        self.assertGreaterEqual(len(command_lines), 4)
-        for line in command_lines:
-            with self.subTest(line=line):
-                self.assertTrue(any((phrase in line.casefold() for phrase in ('in this terminal', 'in a terminal on ', 'in any claude session on '))), line)
 
     def run_status(
         self, status: int, output: str, *, as_json: bool = True
@@ -410,436 +397,6 @@ else:
             output.getvalue(),
         )
 
-    def test_malformed_local_shutdown_record_reports_unreadable_and_status_succeeds(
-        self,
-    ) -> None:
-        account_state = self.state / LOGIN.casefold()
-        account_state.mkdir()
-        record_path = account_state / "record.json"
-        _ = record_path.write_text("not json", encoding="utf-8")
-
-        output = io.StringIO()
-        with (
-            patch.object(shutdown, "inventory", return_value=empty_inventory()),
-            redirect_stdout(output),
-        ):
-            result = shutdown.main(["status", LOGIN, "--here"])
-
-        self.assertEqual(result, 0)
-        self.assertIn(
-            f"natedev: shutdown record unreadable: {record_path} is not valid JSON\n",
-            output.getvalue(),
-        )
-
-    def test_remote_shutdown_record_transport_failure_reports_unreachable(self) -> None:
-        os.environ["SHUTDOWN_STATUS_RECORD_TRANSPORT"] = "255"
-
-        result, output, error = self.run_plain_status_with_ssh()
-
-        self.assertEqual(result, 0)
-        self.assertIn(
-            "Mac: shutdown record not reached (unreachable)\n",
-            output,
-        )
-        self.assertEqual(error, "")
-
-    def test_remote_shutdown_record_failure_reports_unavailable_status(self) -> None:
-        os.environ["SHUTDOWN_STATUS_RECORD_RC"] = "7"
-        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = "record command failed"
-
-        result, output, error = self.run_plain_status_with_ssh()
-
-        self.assertEqual(result, 0)
-        self.assertIn(
-            "Mac: shutdown record not reached (unavailable, rc 7)\n",
-            output,
-        )
-        self.assertEqual(error, "")
-
-    def test_unparseable_remote_shutdown_records_report_unreadable(self) -> None:
-        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = "not json"
-
-        result, output, error = self.run_plain_status_with_ssh()
-
-        self.assertEqual(result, 0)
-        self.assertIn(
-            "Mac: shutdown record unreadable: session records is not valid JSON\n",
-            output,
-        )
-        self.assertEqual(error, "")
-
-    def test_valid_remote_shutdown_record_renders_its_state(self) -> None:
-        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps(
-            [session_shutdown(machine="Mac")]
-        )
-
-        result, output, error = self.run_plain_status_with_ssh()
-
-        self.assertEqual(result, 0)
-        self.assertNotIn("Mac: shutdown settling\n", output)
-        self.assertIn("  shutdown: waiting\n", output)
-        self.assertEqual(error, "")
-
-    def test_status_renders_canonical_remote_stop_issues_under_their_sessions(self) -> None:
-        at = "2026-10-09T21:49:10+00:00"
-        local = complete_record()
-        local["entries"][0]["session"]["name"] = "local"
-        local["entries"][0]["stop_issues"] = [
-            record_store.NotReadyToStop(kind="not ready to stop", at=at, status="busy", progress="ready"),
-            record_store.StillRunningAfterStop(kind="still running", at=at, reason="alive after two SIGTERMs"),
-            record_store.AccountUnreadableAtStop(kind="account unreadable", at=at),
-            {"kind": "worker still live", "at": at},
-        ]
-        remote_record = session_shutdown(machine="Mac", name="remote")
-        remote_record["stop_issues"] = [
-            record_store.CodexServerLeftRunning(
-                kind="codex server left running", at=at, run_dir="/tmp/run", cause="stop not confirmed",
-            ),
-            record_store.LegacyTmuxSessionLeftRunning(
-                kind="legacy tmux session left running", at=at,
-                session_name="demo-unit", cause="owner identity lost",
-            ),
-        ]
-        self.assertEqual(remote_record["stop_issues"][-1]["kind"], "legacy tmux session left running")
-        write_old(local)
-        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([remote_record])
-        result, output, error = self.run_plain_status_with_ssh()
-        self.assertEqual((result, error), (0, ""))
-        expected = [
-            "  local: waiting",
-            "    not stopped: busy, ready",
-            "    still running: alive after two SIGTERMs",
-            "    not stopped: account unreadable",
-            "  remote: waiting",
-            "    Codex server /tmp/run left running: stop not confirmed",
-            "    legacy tmux session demo-unit left running: owner identity lost; tmux kill-session -t =demo-unit",
-        ]
-        self.assertEqual([line for line in output.splitlines() if line in expected], expected)
-
-    def test_legacy_hosts_and_leftovers_show_manual_commands_in_status_and_now(self) -> None:
-        saved = session_shutdown(name='old session')
-        saved['session'] = cast(inventory.TopLevelSession, cast(object, {**saved['session'], 'kind': 'top-level', 'host': inventory.LegacyTmuxHost(kind='legacy tmux', session_name='old:name')}))
-        saved['progress'] = record_store.SessionStopped(kind='stopped', at=saved['requested_at'])
-        saved['stop_issues'] = [record_store.LegacyTmuxSessionLeftRunning(kind='legacy tmux session left running', at=saved['requested_at'], session_name='old:name', cause='stop not confirmed')]
-        self.assertTrue(record_store.create_session(saved))
-        for verb in ('status',):
-            with self.subTest(verb=verb), patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
-                status = shutdown.main([verb, LOGIN, '--here', '--only', 'old session-id'])
-                self.assertEqual(status, 0)
-                self.assertIn('tmux kill-session -t =old:name', output.getvalue())
-                self.assertIn("--session-id 'old session-id'", output.getvalue())
-        remaining = record_store.find_session(LOGIN, 'old session-id')
-        assert remaining is not None
-        self.assertEqual(remaining['session'], saved['session'])
-        self.assertEqual(remaining['stop_issues'], saved['stop_issues'])
-        self.assertEqual(remaining['progress'], saved['progress'])
-
-    def test_every_legacy_cleanup_cause_holds_status_and_now(self) -> None:
-        for index, cause in enumerate(cast(tuple[record_store.StopLeftRunningCause, ...], ('stop not confirmed', 'owner identity lost'))):
-            saved = session_shutdown(name=f'leftover-{index}')
-            saved['progress'] = record_store.SessionNeedsManualRestart(kind='manual restart', command='old command')
-            saved['stop_issues'] = [record_store.LegacyTmuxSessionLeftRunning(kind='legacy tmux session left running', at=saved['requested_at'], session_name='old:name', cause=cause)]
-            self.assertTrue(record_store.create_session(saved))
-            for verb in ('status',):
-                with self.subTest(cause=cause, verb=verb), patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(shutdown.main([verb, LOGIN, '--here', '--only', saved['session']['session_id']]), 0)
-                    self.assertIn('manual restart', output.getvalue())
-                    self.assertIn('tmux kill-session -t =old:name', output.getvalue())
-            self.assertEqual(record_store.find_session(LOGIN, saved['session']['session_id']), saved)
-
-    def test_legacy_unit_without_leftovers_status_and_now_print_no_manual_command(self) -> None:
-        self.write_note('claude3', LOGIN)
-        _ = (self.root / '.claude.json').write_text(json.dumps({'oauthAccount': {'emailAddress': LOGIN}}))
-        self.assertEqual(accounts.setup('claude3'), [])
-        _ = (self.root / '.claude3/.claude.json').write_text(json.dumps({'oauthAccount': {'emailAddress': LOGIN}}))
-        group_file = accounts.groups_file()
-        group_file.parent.mkdir(parents=True, exist_ok=True)
-        _ = group_file.write_text(json.dumps({'units': 'claude3', 'showrunners': 'claude3'}))
-        saved = session_shutdown(name='old unit')
-        saved['session'] = cast(inventory.UnitSession, cast(object, {**saved['session'], 'kind': 'unit', 'host': legacy_unit_host(kind='legacy tmux unit', production='demo', unit='old', doc='/tmp/demo.md', session_name='old-destination')}))
-        saved['progress'] = record_store.SessionStopped(kind='stopped', at=saved['requested_at'])
-        self.assertTrue(record_store.create_session(saved))
-        for verb in ('status',):
-            with self.subTest(verb=verb), patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(shutdown.main([verb, LOGIN, '--here', '--only', saved['session']['session_id']]), 0)
-                self.assertNotIn('manual restart', output.getvalue())
-                self.assertNotIn('--session old-destination', output.getvalue())
-        self.assertEqual(record_store.find_session(LOGIN, saved['session']['session_id']), saved)
-
-    def test_unresolved_legacy_claude_and_codex_snapshots_list_without_manual_commands(self) -> None:
-        owner = cast(inventory.TopLevelSession, cast(object, {
-            **session_shutdown(name="snapshot claude")["session"], "kind": "top-level",
-            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-claude")}))
-        claude = record_store.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
-            last_seen="2026-10-09T21:49:10+00:00", state="unresolved")
-        codex_owner = cast(inventory.TopLevelSession, cast(object, {
-            **owner, "name": "snapshot codex", "session_id": "codex-id",
-            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-codex")}))
-        codex = record_store.SnapshotCodexSession(agent="codex", session=codex_owner, workers=[], timers=[],
-            last_seen=claude["last_seen"], state="unresolved", codex=inventory.CodexLaunch(
-                home=str(self.root / "recorded-codex"), resume=inventory.CodexSessionId(kind="session id", session_id="recorded-id")))
-        snapshot = record_store.RecoverySnapshot(machine="natedev", login=LOGIN, label="claude2",
-            taken_at=claude["last_seen"], sessions=[claude, codex])
-        record_store.write_snapshot(snapshot)
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("snapshot claude: unresolved", output.getvalue())
-        self.assertIn("snapshot codex: unresolved", output.getvalue())
-        self.assertNotIn("manual restart", output.getvalue())
-        self.assertEqual(record_store.read_snapshot(LOGIN), snapshot)
-        self.assertEqual(record_store.session_records(LOGIN), [])
-
-    def test_legacy_live_inventory_uses_the_same_fresh_manual_resume_command(self) -> None:
-        owner = cast(inventory.TopLevelSession, cast(object, {
-            **session_shutdown(name="live old")["session"], "kind": "top-level",
-            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-destination")}))
-        report = empty_inventory()
-        report["sessions"] = [owner]
-        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("--session-id 'live old-id'", output.getvalue())
-        self.assertNotIn("--session old-destination", output.getvalue())
-
-    def test_status_lists_progress_details_and_message_delivery_per_session(self) -> None:
-        failed = session_shutdown(name="failed launch")
-        failed["progress"] = record_store.SessionRestartFailed(
-            kind="restart failed", at="2026-10-09T21:49:10+00:00", reason="window did not open",
-        )
-        pending = session_shutdown(name="pending timers")
-        pending["progress"] = record_store.SessionRestoredTimersPending(
-            kind="timers pending", at="2026-10-09T21:49:10+00:00",
-            timers=[record_store.PendingTimer(instance="showrunner-demo", reason="notifier unavailable")],
-        )
-        manual = session_shutdown(name="manual session")
-        manual["progress"] = record_store.SessionNeedsManualRestart(
-            kind="manual restart", command="claude --resume session-id",
-        )
-        ready = session_shutdown(name="ready session")
-        ready["progress"] = record_store.SessionReadyToStop(kind="ready", at=ready["requested_at"])
-        ready["where"] = record_store.WhereSaid(kind="said", text="finish the launch tests", at=ready["requested_at"])
-        ready["settle_message"] = record_store.SettleMessageSent(kind="sent", at=ready["requested_at"])
-        waiting = session_shutdown(name="waiting session")
-        waiting["settle_message"] = record_store.SettleMessageQueued(
-            kind="queued", at=waiting["requested_at"], reason="no live session",
-        )
-        for item in (failed, pending, manual, ready, waiting):
-            self.assertTrue(record_store.create_session(item))
-        output = io.StringIO()
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(output):
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        expected = [
-            "  failed launch: restart failed — window did not open",
-            "  manual session: manual restart — in a terminal on natedev: claude --resume session-id",
-            "  pending timers: timers pending — showrunner-demo: notifier unavailable",
-            "  ready session: ready — finish the launch tests · message sent",
-            "  waiting session: waiting · message queued: no live session",
-        ]
-        self.assertEqual([line for line in output.getvalue().splitlines() if line in expected], expected)
-        self.assertNotIn("shutdown restart partial", output.getvalue())
-
-    def test_status_prints_observed_readiness_causes_for_waiting_and_ready_sessions(self) -> None:
-        for kind in ("waiting", "ready"):
-            with self.subTest(kind=kind):
-                saved = session_shutdown(name=kind)
-                if kind == "ready":
-                    saved["progress"] = {"kind": "ready", "at": saved["requested_at"]}
-                self.assertTrue(record_store.create_session(saved))
-                observed = inventory.parse_session({**saved["session"], "status": "busy",
-                    "checkout": {"kind": "git", "path": "/tmp/checkout", "head": {"kind": "branch", "name": "work"},
-                                 "upstream": {"kind": "tracking", "ahead": 2}, "dirty": []},
-                    "codex_servers": [{"run_dir": "/tmp/run", "pid": 5000, "busy_workers": ["worker"]}]}, "observed")
-                report = empty_inventory()
-                report["sessions"] = [observed]
-                output = io.StringIO()
-                with patch.object(shutdown, "inventory", return_value=report), patch.object(restart_support, "_showing_form", return_value=True), patch.object(restart_support, "merge_in_progress", return_value=True), redirect_stdout(output):
-                    self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-                self.assertIn(f"  {kind}: {kind} — busy, showing a form, ahead 2 on work, merge in progress, Codex worker worker is still running", output.getvalue())
-                record_store.archive_session(LOGIN, saved["session"]["session_id"])
-
-    def test_status_keeps_unobserved_sessions_without_a_readiness_detail(self) -> None:
-        saved = session_shutdown(name="missing")
-        self.assertTrue(record_store.create_session(saved))
-        output = io.StringIO()
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(restart_support, "_showing_form", side_effect=RuntimeError("cannot observe")), redirect_stdout(output):
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("  missing: waiting\n", output.getvalue())
-
-    def test_status_usage_limit_held_owner_shows_busy_worker_without_form_and_offers_actions(self) -> None:
-        saved = session_shutdown(name='Held')
-        saved['progress'] = record_store.SessionHeldByUsageLimit(kind='held by usage limit', at=saved['requested_at'])
-        saved['session']['status'] = 'idle'
-        self.assertTrue(record_store.create_session(saved))
-        worker = inventory.parse_session({**saved['session'], 'kind': 'worker', 'session_id': 'worker', 'name': 'worker', 'status': 'busy', 'host': {'kind': 'unknown'}, 'owner': {'kind': 'director', 'session_id': saved['session']['session_id']}}, 'worker')
-        report = empty_inventory()
-        report['sessions'] = [saved['session'], worker]
-        output = io.StringIO()
-        with patch.object(shutdown, 'inventory', return_value=report), patch.object(restart_support, '_showing_form', return_value=True) as form, patch.object(restart_support, 'merge_in_progress', return_value=False), redirect_stdout(output):
-            self.assertEqual(shutdown.main(['status', LOGIN, '--here']), 0)
-        self.assertIn('  Held: held by usage limit — Codex worker worker is still running\n', output.getvalue())
-        self.assertNotIn('showing a form', output.getvalue())
-        form.assert_not_called()
-        self.assertNotIn('  bring back:', output.getvalue())
-
-    def test_status_reports_owned_busy_workers_and_a_queued_message_once(self) -> None:
-        saved = session_shutdown(name="owner")
-        saved["settle_message"] = {"kind": "queued", "at": saved["requested_at"], "reason": "delivery pending"}
-        self.assertTrue(record_store.create_session(saved))
-        worker = inventory.parse_session({**saved["session"], "kind": "worker", "session_id": "worker",
-            "name": "worker", "status": "busy", "host": {"kind": "unknown"},
-            "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
-        report = empty_inventory()
-        report["sessions"] = [saved["session"], worker]
-        output = io.StringIO()
-        with patch.object(shutdown, "inventory", return_value=report), patch.object(restart_support, "_showing_form", return_value=False), patch.object(restart_support, "merge_in_progress", return_value=False), redirect_stdout(output):
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        line = next(line for line in output.getvalue().splitlines() if line.startswith("  owner: waiting"))
-        self.assertIn("Codex worker worker is still running", line)
-        self.assertEqual(line.count("message queued: delivery pending"), 1)
-
-    def test_status_uses_reported_peer_activity_without_local_process_probes(self) -> None:
-        saved = session_shutdown(machine="Mac", name="peer")
-        observed = inventory.parse_session({**saved["session"], "status": "busy"}, "peer")
-        peer = empty_inventory("Mac")
-        peer["sessions"] = [observed]
-        def remote(arguments: list[str]) -> tuple[int, str]:
-            return 0, json.dumps(peer if arguments[0] == "status" else [saved])
-        output = io.StringIO()
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(shutdown, "run_remote", side_effect=remote), patch.object(restart_support, "_showing_form", return_value=False) as form, patch.object(restart_support, "merge_in_progress", return_value=False) as merge, redirect_stdout(output):
-            self.assertEqual(shutdown.main(["status", LOGIN]), 0)
-        self.assertIn("  peer: waiting — busy", output.getvalue())
-        form.assert_not_called()
-        merge.assert_not_called()
-
-    def test_status_and_records_read_old_partial_and_slot_sessions_oldest_first(self) -> None:
-        unfinished = complete_record()
-        unfinished["state"] = "restart partial"
-        unfinished["entries"][0]["session"]["name"] = "failed launch"
-        unfinished["entries"][0]["progress"] = record_store.SessionRestartFailed(
-            kind="restart failed", at=unfinished["requested_at"], reason="window did not open",
-        )
-        write_old(unfinished)
-        _ = move_old(LOGIN)
-        newer = complete_record()
-        newer["entries"][0]["session"]["session_id"] = "another-session"
-        newer["requested_at"] = "2026-10-10T01:02:03+00:00"
-        write_old(newer)
-        status_output = io.StringIO()
-        records_output = io.StringIO()
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()):
-            with redirect_stdout(status_output):
-                self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-            with redirect_stdout(records_output):
-                self.assertEqual(shutdown.main(["records", "--here"]), 0)
-        expected = [
-            "  failed launch: restart failed — window did not open", "  shutdown: waiting",
-        ]
-        self.assertEqual([line for line in status_output.getvalue().splitlines() if line in expected], expected)
-        self.assertEqual(records_output.getvalue(),
-            "natedev claude2 failed launch: restart failed since 2026-10-09 14:49:10 PDT\n"
-            + "natedev claude2 shutdown: waiting since 2026-10-09 18:02:03 PDT\n",
-        )
-
-    def test_status_filters_remote_records_to_the_selected_account(self) -> None:
-        matching = session_shutdown(machine="Mac", name="mine")
-        matching["login"] = LOGIN.upper()
-        other = session_shutdown(machine="Mac", name="other account")
-        other["login"] = "other@example.com"
-        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([other, matching])
-        result, output, error = self.run_plain_status_with_ssh()
-        self.assertEqual((result, error), (0, ""))
-        self.assertIn("  mine: waiting\n", output)
-        self.assertNotIn("other account", output)
-
-    def test_records_json_reads_old_sessions_without_changing_the_slot(self) -> None:
-        old = complete_record()
-        second = complete_record()["entries"][0]
-        second["session"]["session_id"] = "second-session"
-        second["session"]["name"] = "second"
-        old["entries"].append(second)
-        write_old(old)
-        path = self.state / LOGIN / "record.json"
-        before = path.read_bytes()
-        output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(shutdown.main(["records", "--json", "--here"]), 0)
-        self.assertEqual(json.loads(output.getvalue()), record_store.session_records(LOGIN))
-        self.assertEqual(len(record_store.session_records(LOGIN)), 2)
-        self.assertEqual(path.read_bytes(), before)
-
-    def test_records_text_uses_los_angeles_time(self) -> None:
-        output = io.StringIO()
-        with (
-            patch.object(shutdown, "all_session_records", return_value=[session_shutdown()]),
-            redirect_stdout(output),
-        ):
-            result = shutdown.main(["records", "--here"])
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            output.getvalue(),
-            "natedev claude2 shutdown: waiting since 2026-10-09 14:49:10 PDT\n",
-        )
-
-    def test_records_json_here_prints_local_records(self) -> None:
-        record = session_shutdown()
-        output = io.StringIO()
-        with (
-            patch.object(shutdown, "all_session_records", return_value=[record]),
-            redirect_stdout(output),
-        ):
-            result = shutdown.main(["records", "--json", "--here"])
-
-        self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue()), [record])
-
-    def test_records_lists_one_object_per_session_on_both_machines(self) -> None:
-        local = session_shutdown(name="local")
-        remote = session_shutdown(machine="Mac", name="remote")
-        self.assertTrue(record_store.create_session(local))
-        local["trail"] = [record_store.ProgressStep(at=local["requested_at"], kind="waiting", detail="")]
-        remote_wire = {key: value for key, value in remote.items() if key != "trail"}
-        output = io.StringIO()
-        with (
-            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([remote_wire]))) as read_remote,
-            redirect_stdout(output),
-        ):
-            self.assertEqual(shutdown.main(["records", "--json"]), 0)
-        self.assertEqual(json.loads(output.getvalue()), [local, remote])
-        read_remote.assert_called_once_with(["records", "--json", "--here"])
-
-    def test_records_refuses_an_unreadable_local_session(self) -> None:
-        broken = self.state / LOGIN / "sessions" / "broken.json"
-        broken.parent.mkdir(parents=True)
-        _ = broken.write_text("{", encoding="utf-8")
-        output = io.StringIO()
-        error = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(error):
-            self.assertEqual(shutdown.main(["records", "--here"]), 3)
-        self.assertEqual(output.getvalue(), "")
-        self.assertIn(str(broken), error.getvalue())
-
-    def test_help_hides_internal_records_while_records_still_runs(self) -> None:
-        help_output = io.StringIO()
-        with (
-            redirect_stdout(help_output),
-            self.assertRaises(SystemExit) as exit_context,
-        ):
-            _ = shutdown.main(["--help"])
-
-        self.assertEqual(exit_context.exception.code, 0)
-        self.assertNotIn("records", help_output.getvalue())
-        self.assertNotIn("holds", help_output.getvalue())
-        self.assertNotIn("SUPPRESS", help_output.getvalue())
-
-        records_output = io.StringIO()
-        with (
-            patch.object(shutdown, "all_session_records", return_value=[]),
-            redirect_stdout(records_output),
-        ):
-            result = shutdown.main(["records", "--here"])
-
-        self.assertEqual(result, 0)
-        self.assertEqual(records_output.getvalue(), "")
 
     def test_reachable_remote_failure_is_unavailable_not_unreachable(self) -> None:
         result, output, error = self.run_status(3, "remote inventory failed")
@@ -876,66 +433,6 @@ else:
 
         _, plain, _ = self.run_status(255, "", as_json=False)
         self.assertIn("Mac: unreachable\n", plain)
-
-
-    def test_status_adds_actions_and_no_conductor_line_for_waiting_owner(self) -> None:
-        saved = session_shutdown(name='Owner')
-        self.assertTrue(record_store.create_session(saved))
-        report = empty_inventory()
-        report['sessions'] = [saved['session']]
-        output = io.StringIO()
-        with patch.object(shutdown, 'inventory', return_value=report), patch.object(restart_support, '_showing_form', return_value=False), patch.object(restart_support, 'merge_in_progress', return_value=False), redirect_stdout(output):
-            self.assertEqual(shutdown.main(['status', LOGIN, '--here']), 0)
-        self.assertIn('  Owner: waiting\n', output.getvalue())
-        self.assertNotIn(action_line('bring back', 'restart', 'Owner') + '\n', output.getvalue())
-
-
-
-
-    def test_status_stopped_and_failed_owners_offer_only_applicable_actions(self) -> None:
-        stopped, failed, stopping = [session_shutdown(name=name) for name in ('Stopped', 'Failed', 'Stopping')]
-        stopped['progress'] = {'kind': 'stopped', 'at': stopped['requested_at']}
-        failed['progress'] = {'kind': 'stop failed', 'at': failed['requested_at'], 'reason': 'still live'}
-        stopping['progress'] = {'kind': 'stopping', 'at': stopping['requested_at']}
-        for saved in (stopped, failed, stopping):
-            self.assertTrue(record_store.create_session(saved))
-        output = io.StringIO()
-        with patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(output):
-            self.assertEqual(shutdown.main(['status', LOGIN, '--here']), 0)
-        self.assertEqual([line for line in output.getvalue().splitlines() if any((label in line for label in ('  take out:', '  stop now:', '  bring back:')))], [action_line('bring back', 'restart', 'Failed, Stopped')])
-
-
-
-
-    def test_status_whole_machine_blocks_group_actions_and_report_conductor_once(self) -> None:
-        local: list[SessionShutdown] = []
-        remote: list[SessionShutdown] = []
-        for machine, records in (('natedev', local), ('Mac', remote)):
-            for name in ('bevy', 'failed', 'hana', 'nixos'):
-                saved = session_shutdown(machine=machine, name=name)
-                if name == 'bevy':
-                    saved['progress'] = {'kind': 'stopped', 'at': saved['requested_at']}
-                elif name == 'failed':
-                    saved['progress'] = {'kind': 'stop failed', 'at': saved['requested_at'], 'reason': 'still live'}
-                records.append(saved)
-                if machine == 'natedev':
-                    self.assertTrue(record_store.create_session(saved))
-
-        def peer(arguments: list[str]) -> tuple[int, str]:
-            if arguments[0] == 'records':
-                return (0, json.dumps(remote))
-            if arguments[0] == 'status':
-                return (0, json.dumps(empty_inventory('Mac')))
-            self.assertEqual(arguments, ['conductor-status', LOGIN, '--json', '--here'])
-            return (0, json.dumps({'kind': 'not running'}))
-        output = io.StringIO()
-        with patch.object(shutdown, 'inventory', return_value=empty_inventory()), patch.object(shutdown, 'run_remote', side_effect=peer), patch.object(shutdown, 'other_machine', return_value='Mac'), redirect_stdout(output):
-            self.assertEqual(shutdown.main(['status', LOGIN]), 0)
-        expected = [LOGIN + ' · ' + LOGIN]
-        for machine in ('natedev', 'Mac'):
-            expected.extend([machine + ':', '  no sessions on claude2', '  bevy: stopped', *(['    14:49:10 stopped'] if machine == 'natedev' else []), '  failed: stop failed — still live', *(['    14:49:10 stop failed still live'] if machine == 'natedev' else []), '  hana: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), '  nixos: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), action_line('bring back', 'restart', 'bevy, failed', machine), *(['  recovery snapshot: no successful snapshot recorded'] if machine == 'natedev' else [])])
-        self.assertEqual(output.getvalue().splitlines(), expected)
-
 
 
 if __name__ == "__main__":

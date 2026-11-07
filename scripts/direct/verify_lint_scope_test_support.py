@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+
 import json
 import os
 from pathlib import Path
@@ -11,14 +16,13 @@ import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
-# A hang limit, not a speed check. One `verify.sh lint` call starts about 60 processes: 10 s at
-# load 75 on natedev, and over 30 s at load 160 (two merge gates went red at 30 s, 2026-10-18).
-# A real hang still fails, after this many seconds.
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
+TAPLO_RESULTS_FILE = "taplo-results.jsonl"
 
 
 class CargoInvocation(TypedDict):
@@ -60,8 +64,22 @@ from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
-with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({"args": arguments}) + "\n")
+version_tools = {
+    ("mend", "--version"): "MEND",
+    ("+nightly", "fmt", "--version"): "RUSTFMT",
+    ("clippy", "--version"): "CLIPPY",
+}
+version_tool = version_tools.get(tuple(arguments))
+# Existing scope tests also record the rustfmt availability check.
+if not version_tool or version_tool == "RUSTFMT":
+    with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"args": arguments}) + "\n")
+if version_tool:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write(version_tool + "\n")
+    print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
+    raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
@@ -88,6 +106,11 @@ if arguments[:1] == ["clippy"]:
     if "TEST_CLIPPY_EXPECT_SOURCE" in os.environ:
         if source.read_text(encoding="utf-8") != os.environ["TEST_CLIPPY_EXPECT_SOURCE"]:
             raise SystemExit(101)
+    if "TEST_CLIPPY_STATUSES" in os.environ:
+        judgments = [json.loads(line)["args"] for line in
+                     Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
+        judgment_count = sum(args[:1] == ["clippy"] and "--fix" not in args for args in judgments)
+        raise SystemExit(json.loads(os.environ["TEST_CLIPPY_STATUSES"])[judgment_count - 1])
     raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
 if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     events = [json.loads(line)["args"] for line in
@@ -106,6 +129,12 @@ import os
 from pathlib import Path
 import sys
 
+if sys.argv[1:] == ["--version"]:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write("TAPLO\n")
+    print(os.environ.get("TEST_VERSION_TAPLO", "taplo fixture"))
+    raise SystemExit(0)
 with Path(os.environ["TEST_TAPLO_EVENTS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps({"args": sys.argv[1:], "cwd": str(Path.cwd())}) + "\n")
 status = int(os.environ["TEST_TAPLO_STATUS"])
@@ -136,7 +165,7 @@ case " $* " in
         if [ -n "${TEST_GIT_UNTRACKED:-}" ] && [ -e "$PACKAGE_ROOT/$TEST_GIT_UNTRACKED" ]; then
             printf '?? %s\000' "$TEST_GIT_UNTRACKED"
         fi ;;
-    *" ls-files "*) : ;;
+    *" ls-files "*) printf 'Cargo.toml\000taplo.toml\000' ;;
     *) exit 1 ;;
 esac
 # An empty status still succeeds.
@@ -177,6 +206,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.is_dir():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
+            _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -185,6 +215,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         home = self.root / "home"
@@ -202,33 +233,14 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
-        assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, '''
-class GuardError(Exception):
-    pass
-
-def default_base(repo, explicit_base=""):
-    return "fixture-base"
-
-def git(repo, *arguments):
-    return "fixture-head\\n" if arguments[0] == "rev-parse" else ""
-
-def read_rulings(sources, messages):
-    return {}
-
-if __name__ == "__main__":
-    raise SystemExit(0)
-''')
+        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / "python3-3.11"
-        interpreter_cache.parent.mkdir()
-        _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
+        seed_interpreter_cache(self.root / "cache")
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.root / "Cargo.toml").write_text(
@@ -296,9 +308,8 @@ if __name__ == "__main__":
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config),
+            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
         })
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -309,11 +320,81 @@ if __name__ == "__main__":
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")
         path.chmod(0o755)
 
-    def write_config(self, *, clippy: str) -> None:
-        _ = self.config.write_text(
-            f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n",
-            encoding="utf-8",
+    def use_real_toml_tools(self) -> None:
+        """Keep the lint fixture, replacing only its Git and Taplo stubs."""
+        for name in ("git", "taplo"):
+            executable = shutil.which(name)
+            if executable is None:
+                self.fail(f"fixture requires {name}")
+            source = f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
+            if name == "taplo":
+                results = self.root / TAPLO_RESULTS_FILE
+                _ = results.write_bytes(b"")
+                source = f"executable = {executable!r}\nresults = {str(results)!r}\n" + r'''
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+result = subprocess.run([executable, *sys.argv[1:]], stderr=subprocess.PIPE, check=False)
+signal = -result.returncode if result.returncode < 0 else 0
+with Path(results).open("a", encoding="utf-8") as output:
+    output.write(json.dumps({
+        "args": sys.argv[1:],
+        "returncode": result.returncode,
+        "signal": signal,
+        "stderr": result.stderr.decode("utf-8", errors="backslashreplace"),
+    }) + "\n")
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(128 + signal if signal else result.returncode)
+'''
+            self.write_executable(
+                self.root / "bin" / name,
+                source,
+            )
+        shutil.rmtree(self.root / ".git")
+        self.run_git("init", "--quiet", "--initial-branch=main")
+        # Logs and caches change during lint. Keep the untracked unit config
+        # visible, while explicitly adding every source/config used by a test.
+        _ = (self.root / ".git/info/exclude").write_text("/*\n!/.unit.toml\n", encoding="utf-8")
+        self.run_git("add", "--force", "--", "Cargo.toml", "taplo.toml", "src/lib.rs")
+        self.run_git("-c", "user.name=Lint fixture", "-c", "user.email=lint@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
+
+    def run_git(self, *arguments: str) -> None:
+        _ = subprocess.run(
+            ["git", "--literal-pathspecs", "-C", str(self.root), *arguments], env=self.environment,
+            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def toml_glob_neighbors(self, *, untracked_text: str) -> tuple[Path, Path]:
+        self.use_real_toml_tools()
+        tracked = self.root / "part[1].toml"
+        untracked = self.root / "part1.toml"
+        _ = tracked.write_text("value=1\n", encoding="utf-8")
+        _ = untracked.write_text(untracked_text, encoding="utf-8")
+        self.run_git("add", "--force", "--", tracked.name)
+        with self.assertRaises(subprocess.CalledProcessError) as missing:
+            self.run_git("ls-files", "--error-unmatch", "--", untracked.name)
+        self.assertEqual(missing.exception.returncode, 1)
+        return tracked, untracked
+
+    def invoke_workspace_taplo(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Exercise the production formatter without simulating a remote build hold."""
+        return self.invoke_taplo_at(self.root, *arguments)
+
+    def invoke_taplo_at(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Call the real formatter from the selected directory with the fixture tools."""
+        formatter = shell_functions(VERIFY, "workspace_taplo")
+        return subprocess.run(
+            ["bash", "-c", 'set -euo pipefail\nrun() { "$@"; }\n' + formatter
+             + 'workspace_taplo "$@"', "taplo-fixture", *arguments],
+            cwd=cwd, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def write_config(self, *, clippy: str) -> None:
+        _ = write_config_fixture(self.config, f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n")
 
     def enable_cache(self) -> Path:
         session = self.root / "session"
@@ -324,10 +405,11 @@ if __name__ == "__main__":
     def isolate_path_without_taplo(self) -> None:
         tools = self.root / "tools"
         tools.mkdir()
+        hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
-            "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
+            "bash", "python3", "awk", "cat", "cmp", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
-            "sort", "tail", "tee", "tr", "uname", "wc",
+            "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
             executable = shutil.which(name)
             if executable is None:
@@ -359,7 +441,9 @@ if __name__ == "__main__":
                 for line in self.taplo_events.read_text(encoding="utf-8").splitlines()]
 
     def assert_workspace_taplo_check(self) -> None:
-        self.assertEqual(self.taplo_calls(), [{"args": ["fmt", "--check"], "cwd": str(self.root)}])
+        self.assertEqual(self.taplo_calls(), [{
+            "args": ["fmt", "--check", "--", "Cargo.toml", "taplo.toml"], "cwd": str(self.root),
+        }])
 
     def calls(self, command: str) -> list[list[str]]:
         return [args[1:] for args in self.cargo_calls() if args[:1] == [command]]
@@ -373,7 +457,7 @@ if __name__ == "__main__":
 
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
-        self.assertEqual(self.calls("clippy"), [
+        self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
             ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])

@@ -16,8 +16,11 @@ is refused with exit 2 and the zones it could mean.
 ZONE_SSH, ZONE_BROADCAST and ZONE_STATE replace ssh, broadcast.py and the state folder in tests.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-import json
 import os
 import platform
 import re
@@ -27,28 +30,19 @@ import sys
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast
 from zoneinfo import ZoneInfo, available_timezones
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import user_zone  # noqa: E402
+from scripts.lib import main_publish, user_zone  # noqa: E402
+from scripts.lib.main_publish import Refusal as Refusal
+from scripts.lib.main_publish import checkout_of, first_line as _first_line, git, queue, queue_path, read_queue
+from scripts.lib.main_publish import ready as _ready
 
 MAC = "mac"
 SENDER = "zone"
-SUBJECT = "user zone: "
+SUBJECT = "zone("
 SHOWN_CANDIDATES = 3
-
-
-class Refusal(Exception):
-    """A name or a checkout state that /zone cannot act on; nothing was changed."""
-
-
-class QueuedChange(TypedDict):
-    zone: str
-    text: str
-    since: str
-    reason: str
 
 
 def _words(text: str) -> list[str]:
@@ -120,84 +114,19 @@ def write_zone(conf: Path, zone: str) -> None:
     write_text_atomic(conf, "\n".join(written) + "\n")
 
 
-def git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True, text=True, check=False)
-
-
-def _first_line(result: subprocess.CompletedProcess[str]) -> str:
-    text = (result.stderr or result.stdout).strip()
-    return text.splitlines()[0] if text else f"exit {result.returncode}"
-
-
-def checkout_of(conf: Path) -> Path:
-    found = git(conf.parent, "rev-parse", "--show-toplevel")
-    if found.returncode:
-        raise Refusal(f"{conf.parent} is not in a git checkout: {_first_line(found)}")
-    return Path(found.stdout.strip())
-
-
-def _ready(checkout: Path) -> None:
-    """Refuse unless the checkout is on main and holds origin/main."""
-    branch = git(checkout, "branch", "--show-current").stdout.strip()
-    if branch != "main":
-        raise Refusal(f"{checkout} is on {branch or 'no branch'}, not main")
-    fetched = git(checkout, "fetch", "-q", "origin", "main")
-    if fetched.returncode:
-        raise Refusal(f"git fetch origin main: {_first_line(fetched)}")
-    merged = git(checkout, "merge", "-q", "--ff-only", "origin/main")
-    if merged.returncode:
-        raise Refusal(f"{checkout} main does not take origin/main as a fast-forward: {_first_line(merged)}")
-
-
 def _commit(checkout: Path, conf: Path, zone: str, before_text: str | None) -> str:
-    """Commit the new conf; on a failure put the old text back and refuse."""
     label = datetime.now(ZoneInfo(zone)).tzname() or zone
-    committed = git(checkout, "commit", "-q", "--only", "-m", f"{SUBJECT}{zone} ({label}), set with /zone",
-                    "--", str(conf))
-    if committed.returncode:
-        if before_text is None:
-            conf.unlink(missing_ok=True)
-        else:
-            write_text_atomic(conf, before_text)
-        raise Refusal(f"git commit: {_first_line(committed)}; the zone is unchanged")
-    return git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
-
-
-def _push(checkout: Path) -> tuple[bool, str]:
-    """Push main when every commit origin lacks is a zone commit."""
-    unpushed = git(checkout, "log", "--format=%s", "origin/main..main").stdout.splitlines()
-    if not unpushed:
-        return True, "origin has it"
-    others = [subject for subject in unpushed if not subject.startswith(SUBJECT)]
-    if others:
-        return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
-    pushed = git(checkout, "push", "-q", "origin", "main")
-    if pushed.returncode:
-        return False, f"not pushed: {_first_line(pushed)}"
-    return True, "pushed"
+    before = main_publish.MissingFile() if before_text is None else main_publish.ExistingFile(before_text)
+    return main_publish.commit(checkout, conf, f"{SUBJECT}{zone}): set with /zone ({label})", before,
+                               subject_prefix=SUBJECT, unchanged="the zone is unchanged")
 
 
 def _ssh(remote: str) -> subprocess.CompletedProcess[str] | str:
-    """Run `remote` on the Mac; a string says why it could not run."""
-    command = [os.environ.get("ZONE_SSH") or "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", MAC, remote]
-    try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
-    except subprocess.TimeoutExpired:
-        return "timed out"
-    except OSError as error:
-        return str(error)
+    return main_publish.ssh(remote, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host=MAC)
 
 
-def pull_mac(checkout: Path) -> str | None:
-    """Pull natedev's main into the Mac's ~/.claude, as a promotion does. None when it worked, else why not."""
-    done = _ssh(f'cd "$HOME"/.claude && git pull -q --ff-only natedev:{shlex.quote(str(checkout))} main; '
-                + "printf 'rc=%s\\n' \"$?\"")
-    if isinstance(done, str):
-        return done
-    match = re.search(r"(?:^|\n)rc=(\d+)", done.stdout)
-    if done.returncode or match is None or int(match.group(1)):
-        return _first_line(done)
-    return None
+def pull_mac(checkout: Path) -> main_publish.MacPulled | main_publish.MacPullFailed:
+    return main_publish.pull_mac(checkout, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
 
 
 def _counted(output: str) -> tuple[bool, str]:
@@ -238,47 +167,22 @@ def notice(zone: str, before: str, commit: str) -> str:
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")
 
 
-def queue_path() -> Path:
-    state = os.environ.get("ZONE_STATE") or str(
-        Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "zone")
-    return Path(state) / "mac.json"
-
-
-def read_queue() -> QueuedChange | None:
-    try:
-        value = cast(object, json.loads(queue_path().read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(value, dict):
-        return None
-    fields = cast(dict[str, object], value)
-    if not all(isinstance(fields.get(key), str) for key in ("zone", "text", "since", "reason")):
-        return None
-    return cast(QueuedChange, cast(object, fields))
-
-
-def queue(change: QueuedChange) -> None:
-    path = queue_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(change, indent=2) + "\n")
-
-
 def drain(checkout: Path | None, *, pulled: bool) -> list[str]:
     """Send the queued Mac change: pull (unless `pulled`), then tell the Mac's sessions."""
     change = read_queue()
-    if change is None:
+    if isinstance(change, main_publish.NoPendingMacPull):
         return []
     if not pulled:
         if checkout is None:
-            return [f"mac: the {change['zone']} change waits since {change['since']}; run /zone on natedev"]
-        reason = pull_mac(checkout)
-        if reason is not None:
-            return [f"mac: the {change['zone']} change still waits since {change['since']}: {reason}"]
-    delivered, summary = broadcast_on_mac(change["text"])
+            return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
+        outcome = pull_mac(checkout)
+        if isinstance(outcome, main_publish.MacPullFailed):
+            return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
+    delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
-        return [f"mac: pulled the {change['zone']} change; its message still waits: {summary}"]
+        return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
     queue_path().unlink(missing_ok=True)
-    return [f"mac: took the {change['zone']} change queued at {change['since']}; message {summary}"]
+    return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 
 def set_zone(name: str) -> int:
@@ -302,21 +206,25 @@ def set_zone(name: str) -> int:
     else:
         print("was: the same; nothing to commit")
         commit = git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
-    pushed, push_line = _push(checkout)
+    pushed, push_line = main_publish.push(checkout)
     print(f"main: {commit}, {push_line}")
     text = notice(zone, before, commit)
-    reason = pull_mac(checkout)
-    if reason is None:
+    if not pushed:
+        print("mac: not pulled because main is not on origin")
+        print(f"broadcast: {broadcast(text, here=True)[1]}")
+        return 1
+    outcome = pull_mac(checkout)
+    if isinstance(outcome, main_publish.MacPulled):
         print("mac: pulled")
         queue_path().unlink(missing_ok=True)
         delivered, summary = broadcast(text, here=False)
     else:
         since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
-        queue(QueuedChange(zone=zone, text=text, since=since, reason=reason))
-        print(f"mac: queued ({reason}); a bare /zone or the next promotion sends it")
+        queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=outcome.reason))
+        print(f"mac: queued ({outcome.reason}); a bare /zone or the next promotion sends it")
         delivered, summary = broadcast(text, here=True)
     print(f"broadcast: {summary}")
-    return 0 if pushed and delivered else 1
+    return 0 if delivered else 1
 
 
 def show() -> int:

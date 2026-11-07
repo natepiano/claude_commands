@@ -2,20 +2,100 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from typing import final
 
+from scripts.direct import tree_watch
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+
 from scripts.direct.tree_watch_test_support import (
-    EventWatcher, TreeWatchFixture, WATCH_DEADLINE, TEST_HANG_GUARD_SECS,
+    EventWatcher,
+    TreeWatchFixture,
+    WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class TreeWatchTests(TreeWatchFixture):
+    def test_nested_workspace_build_identity_uses_its_own_output_roots(self) -> None:
+        workspace = self.nested_workspace()
+        output = self.root / "build-inputs"
+        outer = CargoOutputRoots(self.root, self.root / "target", self.root / "build")
+        nested = CargoOutputRoots(workspace, workspace / "target", workspace / "build")
+
+        def resolve(checkout: Path) -> CargoOutputRoots:
+            return nested if checkout == workspace else outer
+
+        with mock.patch.dict(os.environ, {"VERIFY_COMPUTE_TEST_BUILD": "1",
+                                         "VERIFY_TEST_BUILD_INPUTS_FILE": str(output)}), \
+                mock.patch.object(tree_watch, "read_cargo_output_roots", side_effect=resolve):
+            _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+        self.assertEqual(output.read_text().splitlines()[1:],
+                         [str(nested.target_directory), str(nested.build_directory)])
+
+    def test_build_identity_saves_both_resolved_output_roots(self) -> None:
+        output = self.root / "build-inputs"
+        target = self.root / "target"
+        build = self.root / "intermediates"
+        with mock.patch.dict(os.environ, {"VERIFY_COMPUTE_TEST_BUILD": "1",
+                                         "VERIFY_TEST_BUILD_INPUTS_FILE": str(output)}):
+            def calculate(roots: CargoOutputRoots | CargoOutputUnavailable) -> list[str]:
+                with mock.patch.object(tree_watch, "read_cargo_output_roots", return_value=roots):
+                    _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+                return output.read_text().splitlines()
+
+            split = calculate(CargoOutputRoots(self.root, target, build))
+            self.assertEqual(split[1:], [str(target), str(build)])
+            same = calculate(CargoOutputRoots(self.root, target, target))
+            self.assertEqual(same[1:], [str(target), str(target)])
+            self.assertNotEqual(split[0], same[0])
+            output.unlink()
+            with mock.patch.object(tree_watch, "read_cargo_output_roots",
+                                   return_value=CargoOutputUnavailable("metadata failed")):
+                _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+            self.assertFalse(output.exists())
+
+    def test_lint_versions_reuse_the_call_reading_and_keep_failed_reads_disabled(self) -> None:
+        saved = self.root / "lint-versions"
+        formatter = self.root / "rustfmt-version"
+        with mock.patch.dict(os.environ, {"VERIFY_LINT_VERSIONS_FILE": str(saved),
+                                         "VERIFY_LINT_RUSTFMT_VERSION_FILE": str(formatter)}):
+            with mock.patch.object(subprocess, "check_output", return_value=b"tool version\n") as probe:
+                first = tree_watch.lint_tool_versions()
+                self.assertEqual(tree_watch.lint_tool_versions(), first)
+                self.assertEqual(probe.call_count, 4)
+                self.assertEqual(formatter.read_bytes(), b"tool version")
+            saved.unlink()
+            with mock.patch.object(subprocess, "check_output", side_effect=OSError("tool missing")) as probe:
+                with self.assertRaises(OSError):
+                    _ = tree_watch.lint_tool_versions()
+                with self.assertRaises(ValueError):
+                    _ = tree_watch.lint_tool_versions()
+                probe.assert_called_once()
+
+    def test_lint_keys_without_result_caching_do_not_probe_versions(self) -> None:
+        import json
+
+        with mock.patch.object(tree_watch, "lint_tool_versions", side_effect=AssertionError("unexpected probe")):
+            key, watched = tree_watch.TreeInputs(["--", "lint"], json.dumps(self.metadata)).keys(lint_versions=False)
+        self.assertRegex(key, r"^[0-9a-f]{64}$")
+        self.assertRegex(watched, r"^[0-9a-f]{64}$")
+
+    def test_fired_path_names_the_changed_watched_file(self) -> None:
+        process, fired, before = self.start_watcher(os.getpid())
+        relative = "sample/src/lib.rs"
+        _ = (self.root / relative).write_text("// changed input\n")
+        self.assert_fires(process, fired, before)
+        self.assertEqual(fired.with_name(fired.name + ".path").read_text(), relative + "\n")
+
     def test_in_scope_edit_table_fires(self) -> None:
         for relative in ("sample/src/lib.rs", "dep/src/lib.rs", "sample/fixtures/input.bin",
                          "Cargo.toml", "Cargo.lock", ".cargo/config.toml",

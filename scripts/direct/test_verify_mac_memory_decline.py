@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import final
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -16,10 +16,10 @@ class VerifyMacMemoryDeclineTests(VerifyMacMemoryRetryFixture):
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "sleep-events", (process,))
+        self.wait_for_memory_wait(process)
         _ = clock.write_text("1000")
         self.release_memory(meminfo)
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(self.free_now_settings(), [])

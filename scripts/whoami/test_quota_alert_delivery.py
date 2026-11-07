@@ -4,30 +4,39 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
+from scripts.accounts.home_test_support import scratch_accounts_config
+from scripts.message import send_budget
+from scripts.shutdown import remote
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
-import review
-from push_texts import render
-import agent_notes
+from scripts.whoami import quota_alert
+from scripts.notify import review
+from scripts.notify.push_texts import render
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
+REAL_RELAY = quota_alert.relay
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch("socket.gethostname", return_value="worker.example"))
+
     def test_internal_switch_failure_details_do_not_leak_into_the_phone_push(self) -> None:
         note = self.note("codex1.md", "active", "0")
         push = quota_alert.refusal_push(note, quota_alert.NoCodexQuotaFallback(),
@@ -45,7 +54,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         for summary, text, ask in self.pushed:
             self.assertLess(len(summary), 45)
             self.assertLess(len("Action: " + ask.action + "\n" + text), 500)
-            self.assertTrue("natedev" in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
+            self.assertTrue(remote.local_machine() in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
@@ -61,13 +70,14 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on natedev")),
+                f"To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on {remote.local_machine()}")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
     def test_user_delivery_names_success_process_failure_and_launch_failure(self) -> None:
         push = render("quota.claude_next_move", account="claude2", remaining="0%")
         for code, line, expected in ((0, "SENT: to the user", quota_alert.PushSent()),
+                                     (6, "RETRY: active", quota_alert.PushFailed("RETRY: active")),
                                      (3, "FAILED: channel unavailable", quota_alert.PushFailed("stdout: FAILED: channel unavailable"))):
             with self.subTest(code=code), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, line, "")):
                 self.assertEqual(REAL_TELL_USER(push), expected)
@@ -83,14 +93,29 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertIsInstance(REAL_TELL_USER(render("quota.claude_next_move", account="claude2", remaining="0%")), quota_alert.PushSent)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
-            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 15)
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
-        self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
+            self.assertIsNone(REAL_RELAY("fixture", "message", None))
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--timeout") + 1], "30")
+            self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(30))
+
+    def test_relay_reads_the_current_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        for name in ("send", "postmaster", "codex_daemon"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
+        original = config.read_text()
+        done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
+        for limit in (40, 55):
+            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
+                self.assertIsNone(REAL_RELAY("fixture", "message", None))
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[command.index("--timeout") + 1], str(limit - quota_alert.KILL_GRACE))
+                self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         note = self.note("codex1.md", "active", "2")
         self.push_errors.append(quota_alert.PushFailed("fixture offline"))
         log = self.alert([note], self.now)
@@ -162,6 +187,43 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             for notice in notices.values():
                 assert notice["kind"] == "known"
                 self.assertEqual(notice["label"], "codex1")
+
+
+class RelayOutcomeTests(unittest.TestCase):
+    def test_user_delivery_requires_a_confirmed_success_outcome(self) -> None:
+        push = render("quota.claude_next_move", account="claude2", remaining="0%")
+        cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
+                 (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
+                 (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
+                 (0, "", False), (0, "QUEUED: inconsistent", False),
+                 (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
+        for code, text, accepted in cases:
+            with self.subTest(code=code, text=text), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, text, "")):
+                result = REAL_TELL_USER(push)
+                self.assertIsInstance(result, quota_alert.PushSent if accepted else quota_alert.PushFailed)
+                if isinstance(result, quota_alert.PushFailed):
+                    self.assertNotEqual(result.why, "")
+
+    def test_confirmed_relay_outcomes_preserve_success_and_queue_policies(self) -> None:
+        for code, header, expected in ((0, "SENT", None), (0, "SKIPPED", None),
+                                      (0, "KEPT", None), (0, "REPLACED", None),
+                                      (1, "QUEUED", "QUEUED: fixture detail"),
+                                      (6, "RETRY", "RETRY: fixture detail"),
+                                      (3, "FAILED", "stdout: FAILED: fixture detail"),
+                                      (2, "REFUSED", "stdout: REFUSED: fixture detail"),
+                                      (4, "HELD", "stdout: HELD: fixture detail"),
+                                      (5, "PENDING", "stdout: PENDING: fixture detail")):
+            with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": fixture detail", "")):
+                self.assertEqual(quota_alert.relay("fixture", "message", "fixture-key"), expected)
+
+    def test_inconsistent_and_missing_relay_results_report_failure(self) -> None:
+        for code, output in ((0, "QUEUED: offline"), (0, "FAILED: unavailable"), (1, "SENT: fixture"),
+                             (0, ""), (1, ""), (-15, "SENT: fixture")):
+            with self.subTest(code=code, output=output), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                failure = quota_alert.relay("fixture", "message", "fixture-key")
+                self.assertIsNotNone(failure)
+                self.assertNotEqual(failure, "")
 
 
 if __name__ == "__main__":

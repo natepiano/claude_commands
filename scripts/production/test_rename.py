@@ -1,49 +1,150 @@
-"""Production rename planning, state moves and apply recovery."""
+"""Rename the showrunner row and repair its live names."""
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import json
-import os
-import shlex
 import unittest
-from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-from scripts.direct import workers
 from scripts.production import rename_test_support as support
-from scripts.production import staff
-import rename
-from unit_move import PathMove
-from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, FAIL_PLAN_REWRITE, NEW, OLD, UNITS
-
+from scripts.production import staff, unit_move
+from scripts.message import sessions
+from scripts.herdr import herdr
+from scripts.production.rename_test_support import FAIL_GIT_MOVE_INDEX, NEW, OLD
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_same_name_keeps_a_pane_with_another_native_session(self) -> None:
+        row = self.production_row()
+        displays = support.RenameDisplays(row)
+        other = herdr.NativeAgentProcess(herdr.EnvironmentThread(fixture_runtime_id("another-live-session")), "probe-generation", {})
+        with (displays.installed(), mock.patch.object(herdr, "native_process", return_value=other)):
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual(displays.commands, [])
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), ("previous",) * 3)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("anomaly:", result.stderr)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_reports_an_unavailable_display_and_succeeds(self) -> None:
+        row = self.production_row()
+        displays = support.RenameDisplays(row)
+        with (displays.installed(), mock.patch.object(herdr.Herdr, "panes",
+                side_effect=herdr.HerdrFailure("display unavailable"))):
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual(result.stderr.strip(), "anomaly: set_displays: display unavailable")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_displays_without_an_update_timer(self) -> None:
+        row = self.production_row()
+        (self.notifier / f"showrunner-{row.name}" / "conf").unlink()
+        displays = support.RenameDisplays(row)
+        with displays.installed():
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), (row.name,) * 3)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_the_current_session_and_keeps_an_old_session(self) -> None:
+        row = self.production_row()
+        current = staff.native_id(fixture_runtime_id("showrunner-session-after-clear"))
+        row = staff.update_current_session(row.current_session, current)
+        record = sessions.SessionRecord(sessionId=current, name="previous", pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        path = self.root / "state/sessions/998041.json"
+        old_path = self.root / "state/sessions/998042.json"
+        self.write(path, json.dumps(record))
+        self.write(old_path, json.dumps({**record, "sessionId": row.id, "pid": 998042}))
+        before = old_path.read_bytes(), old_path.stat().st_mtime_ns
+        displays = support.RenameDisplays(row)
+        displays.pane = displays.tab = displays.workspace = row.name
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            self.assert_success(self.run_command("apply", row.name, row.name))
+            self.assertEqual(json.loads(path.read_text())["name"], row.name)
+            settled = path.read_bytes(), path.stat().st_mtime_ns
+            rerun = self.run_command("apply", row.name, row.name)
+        self.assert_success(rerun)
+        self.assertEqual(rerun.stdout.strip(), "unchanged")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), settled)
+        self.assertEqual((old_path.read_bytes(), old_path.stat().st_mtime_ns), before)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_each_display_and_keeps_the_current_row(self) -> None:
+        row = self.production_row()
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("showrunner-after-clear")))
+        for field in ("pane", "tab", "workspace"):
+            with self.subTest(field=field):
+                displays = support.RenameDisplays(row)
+                displays.pane = displays.tab = displays.workspace = row.name
+                setattr(displays, field, "previous")
+                before = self.snapshot()
+                with displays.installed():
+                    result = self.run_command("apply", row.name, row.name)
+                    self.assert_success(result)
+                    self.assertNotIn("unchanged", result.stdout)
+                    self.assertEqual((displays.pane, displays.tab, displays.workspace), (row.name,) * 3)
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.snapshot(), before)
+                    commands = list(displays.commands)
+                    rerun = self.run_command("apply", row.name, row.name)
+                self.assert_success(rerun)
+                self.assertEqual(rerun.stdout.strip(), "unchanged")
+                self.assertEqual(displays.commands, commands)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
+        self.assert_success(self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.name, retained.parent, retained.doc),
+                         (row.id, NEW, row.parent, staff.WrappedDoc("natedev", self.new_doc)))
+        before = self.snapshot()
+        self.assert_success(self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.doc))
+        with mock.patch.object(staff, "set_doc", side_effect=OSError("stopped after doc move")):
+            interrupted = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertIn("anomaly: document_move: stopped after doc move", interrupted.stderr)
+        self.assertFalse(self.doc.exists())
+        self.assertTrue(self.new_doc.is_file())
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual(retained.doc, staff.LiveDoc("natedev", self.doc))
+        self.assert_success(self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
+        before = self.snapshot()
+        self.assert_success(self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.snapshot(), before)
+
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
 
-    def test_plan_uses_staff_children_without_reading_saved_parent_contents(self) -> None:
-        self.write(self.state / "child/parent", "obsolete-parent\n")
-        self.write(self.state / "other/parent", "old\n")
-        result = self.run_rename("plan")
-        self.assert_success(result)
-        self.assertIn(f"4. parent {self.state / 'child/parent'}: old -> new", result.stdout)
-        self.assertNotIn(f"4. parent {self.state / 'other/parent'}:", result.stdout)
-
-    def test_rename_finds_the_workspace_member_and_keeps_its_id(self) -> None:
+    def test_bare_showrunner_name_renames_the_showrunner_and_keeps_its_id(self) -> None:
         row = self.production_row()
-        _ = staff.rename(row.id, "tools")
-        self.write(self.doc, self.doc.read_text().replace("## Production Context\n", "## Production Context\n\n- **Showrunner session:** `tools`\n"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record workspace name")
-        self.assert_success(self.run_rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None))
-        self.assertEqual(self.journal()["staff_id"], row.id)
-        self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
+        row = staff.rename(row.id, "tools")
+        self.assert_success(self.run_command("apply", "tools", NEW))
+        self.assertEqual(staff.by_id(row.id), replace(row, name=NEW))
+        self.assertTrue(self.doc.is_file())
+        self.assertFalse(self.new_doc.exists())
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
-        _ = staff.ensure("showrunner", name=NEW)
+        _ = fixture_member("showrunner", name=NEW)
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -52,525 +153,346 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = self.production_row()
-        for unit in staff.snapshot().find(kind="unit", parent=row.id):
-            _ = staff.retire(unit.id)
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id, *(unit.id for unit in staff.snapshot().find(kind="unit", parent=row.id)))
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
         self.assertEqual(self.snapshot(), before)
 
-    def interrupt_apply(self, count: int) -> rename.RenamePlan:
-        save = cast(Callable[[rename.RenamePlan, tuple[str, ...]], None], getattr(rename, "_save"))
-        stopped: list[rename.RenamePlan] = []
-
-        def interrupted(plan: rename.RenamePlan, completed: tuple[str, ...]) -> None:
-            save(plan, completed)
-            if len(completed) == count:
-                stopped.append(plan)
-                raise OSError("fixture interrupted apply")
-
-        with mock.patch.object(rename, "_save", side_effect=interrupted):
-            result = self.run_rename("apply")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("fixture interrupted apply", result.stderr)
-        self.assertEqual(self.completed_steps(), count)
-        return stopped[0]
-
-    def move_showrunner_checkout(self) -> None:
-        old = self.checkout
-        self.checkout = old.with_name("moved-checkout")
-        _ = old.rename(self.checkout)
-        self.doc = self.checkout / "docs/plans/old-production.md"
-        self.new_doc = self.doc.with_name("new-production.md")
-        _ = self.git("worktree", "repair")
-        for path in (self.doc, self.new_doc):
-            if path.exists():
-                self.write(path, path.read_text().replace(str(old), str(self.checkout)))
-        for conf in self.notifier.glob("showrunner-*/conf"):
-            self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
-        for unit in UNITS:
-            self.assertEqual(self.git("-C", str(self.worktrees / unit), "rev-parse", "--git-common-dir"),
-                             str(self.checkout / ".git"))
-        self.assertFalse(old.exists())
-
-    def assert_journal_has_no_current_locations(self) -> None:
-        journal = self.journal()
-        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall", "review_pool"):
-            self.assertNotIn(key, journal)
-        self.assertEqual(journal["plans"], [f"docs/plans/{unit}.md" for unit in UNITS])
-        self.assertNotIn(str(self.root), json.dumps(journal))
-
-    def test_resume_before_doc_timer_steps_after_checkout_moves(self) -> None:
-        _ = self.interrupt_apply(0)
-        self.move_showrunner_checkout()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_applied()
-        self.assert_journal_has_no_current_locations()
-
-    def test_resume_after_doc_timer_steps_after_checkout_moves(self) -> None:
-        _ = self.interrupt_apply(3)
-        self.move_showrunner_checkout()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_applied()
-        self.assert_journal_has_no_current_locations()
-        self.assert_success(self.run_command("repair-workers", NEW, "--dry-run"))
-
-    def test_old_format_journal_ignores_stale_locations_between_doc_and_timer_steps(self) -> None:
-        plan = self.interrupt_apply(1)
-        journal = self.journal()
-        # The seven-step count is also an older supported journal representation.
-        del journal["completed"]
-        journal["step"] = 1
-
-        def move_record(move: PathMove) -> dict[str, str]:
-            return {"source": str(move.source), "destination": str(move.destination)}
-
-        journal.update(checkout=str(self.checkout), old_doc=str(self.doc), new_doc=str(self.new_doc),
-                       plans=[str(path) for path in plan.plans], timer=move_record(plan.timer),
-                       state=[move_record(move) for move in plan.state],
-                       stall=[move_record(move) for move in plan.stall], review_pool=move_record(plan.review_pool))
-        self.write(self.state / "new/rename.json", json.dumps(journal))
-        self.move_showrunner_checkout()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_applied()
-        self.assert_journal_has_no_current_locations()
-
-    def test_resume_refuses_missing_expected_timer_even_when_other_slug_resolves(self) -> None:
-        _ = self.interrupt_apply(0)
-        old = self.notifier / "showrunner-old"
-        new = self.notifier / "showrunner-new"
-        _ = old.rename(new)
-        for other_exists in (True, False):
-            with self.subTest(other_timer_exists=other_exists):
-                if not other_exists:
-                    _ = new.rename(self.notifier / "unregistered")
-                result = self.run_rename("apply")
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("rename old -> new at _rename_doc: expected old's update timer", result.stderr)
-                self.assertEqual(self.completed_steps(), 0)
-
-    def test_resume_after_timer_step_refuses_old_timer_as_substitute(self) -> None:
-        _ = self.interrupt_apply(3)
-        _ = (self.notifier / "showrunner-new").rename(self.notifier / "showrunner-old")
-        result = self.run_rename("apply")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("rename old -> new at _rename_showrunner_state: expected new's update timer", result.stderr)
-        self.assertEqual(self.completed_steps(), 3)
-
-    def test_unit_move_recovery_and_worker_repair_resolve_moved_showrunner_checkout(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        with mock.patch.object(rename, "_move_unit_worktree", side_effect=OSError("fixture unit move interrupted")):
-            result = self.run_command("unit", NEW, "alpha-unit")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("fixture unit move interrupted", result.stderr)
-        # These unit worktrees use the conventional names, unlike the apply fixtures.
-        old = self.checkout
-        self.checkout = old.with_name("moved-checkout")
-        _ = old.rename(self.checkout)
-        self.doc = self.checkout / "docs/plans/old-production.md"
-        self.new_doc = self.doc.with_name("new-production.md")
-        _ = self.git("worktree", "repair")
-        self.write(self.new_doc, self.new_doc.read_text().replace(str(old), str(self.checkout)))
-        conf = self.notifier / "showrunner-new/conf"
-        self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        self.assert_unit_moved("alpha-unit")
-        self.assert_success(self.run_command("repair-workers", NEW))
-        self.assertNotIn("new_doc", self.journal())
-
-    def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
-        text = self.doc.read_text()
-        for unit, prose in zip(UNITS, (
-            "docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08)",
-            "`docs/as-built/agent-registry.md` and `docs/as-built/session-notifier.md` (runs done 2026-10-08)",
-        ), strict=True):
-            text = text.replace(f"docs/plans/{unit}.md", prose)
-        self.write(self.doc, text)
-        before = self.snapshot()
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        self.assertIn("2. Production headers: no unit plans", planned.stdout)
-        self.assertEqual(self.snapshot(), before)
-
-    def test_plan_selects_multiple_quoted_plans_and_apply_rewrites_both_headers(self) -> None:
-        self.write(self.doc, self.doc.read_text().replace(
-            "docs/plans/alpha-unit.md",
-            "`docs/plans/alpha-unit.md` and `docs/plans/beta-unit.md` "
-            + "(see `README.md` and `docs/as-built/history.md`; runs done 2026-10-08)"
-        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | permanent |"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record several plans in one cell")
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
-        self.assertEqual(len(headers), 2, planned.stdout)
-        for unit in UNITS:
-            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
-        self.assert_success(self.run_rename("apply"))
-        for unit in UNITS:
-            self.assertRegex(self.plan_path(unit).read_text(),
-                             r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-        self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def test_plan_and_apply_skip_plans_removed_from_git(self) -> None:
-        untracked = self.plan_path("alpha-unit")
-        original = untracked.read_text()
-        _ = self.git("rm", "--cached", "--", str(untracked))
-        _ = self.git("rm", "--", str(self.plan_path("beta-unit")))
-        self.write(self.checkout / ".gitignore", "docs/plans/alpha-unit.md\n")
-        _ = self.git("add", ".gitignore")
-        _ = self.git("commit", "-m", "Remove obsolete unit plans")
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        self.assertIn("2. Production headers: no unit plans", planned.stdout)
-        self.assert_success(self.run_rename("apply"))
-        self.assertEqual(untracked.read_text(), original)
-        self.assertFalse(self.plan_path("beta-unit").exists())
-        self.assertEqual(self.journal()["plans"], [])
-        self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def test_plan_skips_a_tracked_plan_missing_from_disk(self) -> None:
-        self.plan_path("alpha-unit").unlink()
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
-        self.assertEqual(len(headers), 1, planned.stdout)
-        self.assertIn(str(self.plan_path("beta-unit")), headers[0])
-
-    def test_plan_accepts_absolute_and_home_relative_quoted_plan_paths(self) -> None:
-        self.env["HOME"] = str(self.checkout)
-        self.write(self.doc, self.doc.read_text().replace(
-            "docs/plans/alpha-unit.md", f"`{self.plan_path('alpha-unit')}`"
-        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | `~/docs/plans/beta-unit.md` |"))
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
-        self.assertEqual(len(headers), 2, planned.stdout)
-        for unit in UNITS:
-            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
-
-    def test_plan_lists_every_production_move_without_writing(self) -> None:
-        before = self.snapshot()
-        result = self.run_rename("plan")
-        self.assert_success(result)
-        for path in (self.doc, self.new_doc, *(self.plan_path(unit) for unit in UNITS),
-                     self.notifier / "showrunner-old", self.notifier / "showrunner-new",
-                     *(self.state / directory / slug for directory in ("footers-off", "") for slug in (OLD, NEW)),
-                     *(self.state / directory / f"{slug}.json"
-                       for directory in ("review-paused", "outstanding") for slug in (OLD, NEW)),
-                     self.state / "child/parent",
-                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW)),
-                     self.pool / "old", self.pool / "new"):
-            self.assertIn(str(path), result.stdout)
-        self.assertIn(f"{self.state}/*/parent", result.stdout)
-        steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 9)))
-        self.assertEqual(steps, sorted(steps))
-        self.assertIn("merge branch old -> new", result.stdout)
-        self.assertIn("push origin new", result.stdout)
-        self.assertIn("keep old until finish", result.stdout)
-        self.assertEqual(self.snapshot(), before)
-
-    def test_apply_moves_state_and_commits_documents_on_the_new_merge_branch(self) -> None:
-        self.assert_success(self.run_rename("apply"))
-        self.assert_applied()
-
-    def test_apply_moves_pins_change_cells_child_parent_line_and_bevy_watch(self) -> None:
-        listed = self.root / "lists/change-review - old.md"
-        self.write(self.doc, self.doc.read_text().replace(
-            "## Production Context\n", f"## Production Context\n\n- **Change review:** `{listed}`\n").replace(
-            "- **Log:** `production.log`", "- **Log:** `docs/plans/old-log.md` — git-excluded"))
-        # A production log is never committed and stands untracked, as in a checkout whose .gitignore re-includes docs/.
-        self.write(self.checkout / "docs/plans/old-log.md", "one line per event\n")
-        self.write(self.checkout / "docs/plans/old-log-recovered.md", "recovered lines\n")
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Name the change review list")
-        _ = self.git("push", "origin", OLD)
-        rows = ["| # | Change | Merged | How to check | Production |", "| --- | --- | --- | --- | --- |",
-                "| C1 | own | m | try | old |", "| C2 | child's | m | try | child |", "| C3 | root's | m | try |  |"]
-        self.write(listed, "\n".join([
-            "---", "date_created: 2026-10-27", "date_modified: 2026-10-27", "---", "",
-            "# old showrunner: changes to review", "", "## To review", "", *rows, "",
-            "## Reviewed", "", "| # | Change | Verdict | Date |", "| --- | --- | --- | --- |", ""]))
-        pins = self.home / ".local/state/next"
-        question = {"current": "old: first", "ended": {"old: earlier": "2026-10-27T01:00:00"}, "moved": ["oldish: kept"]}
-        self.write(pins / "question-old.json", json.dumps(question))
-        self.write(pins / "next-old-all-below.json", json.dumps({"current": "C1", "source": "change-old"}))
-        child_doc = self.root / "child/docs/child-production.md"
-        self.write(child_doc, f"# Child\n\n## Production Context\n\n- **Parent production:** {self.doc}\n")
-        self.write(self.notifier / "showrunner-child/conf",
-                   "EVERY=15\nTARGET=session:test-child\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(child_doc)]) + "\n")
-        bevy = self.home / ".local/state/bevy-upgrade"
-        self.write(bevy / "old.json", json.dumps({"slug": OLD, "production": str(self.doc), "entries": 3}))
-        self.write(bevy / "old.lock", "")
-        self.write(self.notifier / "bevy-upgrade-old/conf", "EVERY=240\nRUN=py bevy_upgrade.py --production "
-                   + shlex.quote(str(self.doc)) + " check --scheduled\nFROM=bevy-upgrade-old\n")
-        board = self.root / "state/unit-board/old.json"
-        self.write(board, "{}\n")
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        for expected in ("/next pin", "change review", "in 1 rows", f"Parent production {child_doc}",
-                         "bevy upgrade watch", "remove derived unit board", "production log"):
-            self.assertIn(expected, planned.stdout)
-        self.assert_success(self.run_rename("apply"))
-        self.assertFalse((pins / "question-old.json").exists())
-        self.assertEqual(json.loads((pins / "question-new.json").read_text()),
-                         {"current": "new: first", "ended": {"new: earlier": "2026-10-27T01:00:00"},
-                          "moved": ["oldish: kept"]})
-        self.assertEqual(json.loads((pins / "next-new-all-below.json").read_text()),
-                         {"current": "C1", "source": "change-old"})
-        text = listed.read_text()
-        self.assertIn("| C1 | own | m | try | new |", text)
-        self.assertIn("| C2 | child's | m | try | child |", text)
-        self.assertRegex(text, r"\| C3 \| root's \| m \| try \| *\|")
-        self.assertIn(f"- **Parent production:** {self.new_doc}\n", child_doc.read_text())
-        self.assertFalse((bevy / "old.json").exists())
-        self.assertFalse((bevy / "old.lock").exists())
-        self.assertEqual(json.loads((bevy / "new.json").read_text()),
-                         {"slug": NEW, "production": str(self.new_doc), "entries": 3})
-        self.assertFalse((self.notifier / "bevy-upgrade-old").exists())
-        conf = (self.notifier / "bevy-upgrade-new/conf").read_text()
-        self.assertIn(f"--production {shlex.quote(str(self.new_doc))} check", conf)
-        self.assertIn("FROM=bevy-upgrade-new\n", conf)
-        self.assertFalse(board.exists())
-        self.assertFalse((self.checkout / "docs/plans/old-log.md").exists())
-        self.assertEqual((self.checkout / "docs/plans/new-log.md").read_text(), "one line per event\n")
-        self.assertIn("- **Log:** `docs/plans/new-log.md` — git-excluded", self.new_doc.read_text())
-        self.assertEqual((self.checkout / "docs/plans/new-log-recovered.md").read_text(), "recovered lines\n")
-        self.assertEqual(self.git("status", "--porcelain").splitlines(),
-                         ["?? docs/plans/new-log-recovered.md", "?? docs/plans/new-log.md"])
-
-    def test_timer_keeps_a_readable_document_through_doc_and_instance_moves(self) -> None:
-        result = self.run_command("apply", OLD, NEW, wrapper=CHECK_TIMER_HANDOFF)
-        self.assert_success(result)
-
-    def test_apply_extends_existing_former_names_in_production_context(self) -> None:
-        self.write(self.doc, self.doc.read_text().replace(
-            "## Production Context\n", "## Production Context\n\n- **Formerly:** `ancient`, `earlier`\n"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record earlier production names")
-        self.assert_success(self.run_rename("apply"))
-        context = self.new_doc.read_text().split("## Production Context", 1)[1].split("\n## ", 1)[0]
-        formerly = [line for line in context.splitlines() if line.startswith("- **Formerly:**")]
-        self.assertEqual(len(formerly), 1, context)
-        for slug in ("ancient", "earlier", OLD):
-            self.assertIn(f"`{slug}`", formerly[0])
-
-    def test_a_former_source_name_resumes_before_the_timer_moves(self) -> None:
-        self.write(self.doc, self.doc.read_text().replace(
-            "## Production Context\n", "## Production Context\n\n- **Formerly:** `ancient`\n"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record the source production's earlier name")
-        base = self.git("rev-parse", OLD)
-        failed = self.run_command("apply", "ancient", NEW, wrapper=FAIL_PLAN_REWRITE)
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertIn("simulated unit header rewrite failure", failed.stderr)
-        self.assertEqual(self.completed_steps(), 1)
-        self.assertTrue((self.notifier / "showrunner-old/conf").exists())
-        self.assertFalse((self.notifier / "showrunner-new").exists())
-        self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.completed_steps(), 9)
-        self.assertEqual(self.git("rev-parse", "new^"), base)
-        self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def test_a_move_interrupted_before_index_update_commits_only_the_new_doc(self) -> None:
-        failed = self.run_command("apply", OLD, NEW, wrapper=FAIL_GIT_MOVE_INDEX)
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+    def test_document_move_reruns_after_git_move_loses_its_index_update(self) -> None:
+        row = self.production_row()
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
         self.assertIn("simulated git mv index failure", failed.stderr)
-        self.assertEqual(self.completed_steps(), 0)
         self.assertFalse(self.doc.exists())
         self.assertTrue(self.new_doc.exists())
-        self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md",
-                                  "docs/plans/new-production.md"), "docs/plans/old-production.md")
-        self.assert_success(self.run_rename("apply"))
-        production_docs = [path for path in self.git("ls-tree", "-r", "--name-only", NEW).splitlines()
+        self.assert_success(self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        production_docs = [path for path in self.git("ls-files").splitlines()
                            if path.endswith("-production.md")]
         self.assertEqual(production_docs, ["docs/plans/new-production.md"])
-        self.assert_applied()
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
 
-    def test_retired_plan_prose_is_skipped_but_its_stall_state_moves(self) -> None:
-        retired = "| retired-unit | (retired; use `/unit:report` for history) | — | — |\n"
-        self.write(self.doc, self.doc.read_text().replace(
-            "\n## Production rules", retired + "\n## Production rules"))
-        self.write(self.stall_path(OLD, "retired-unit"), '{"stretch": 23}\n')
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record a retired unit with a quoted command")
-        before = self.snapshot()
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        self.assertEqual(self.snapshot(), before)
-        self.assertIn(str(self.stall_path(NEW, "retired-unit")), planned.stdout)
-        self.assertNotIn("/unit:report", planned.stdout)
-        self.assert_success(self.run_rename("apply"))
-        self.assertIn(retired, self.new_doc.read_text())
-        self.assertFalse(self.stall_path(OLD, "retired-unit").exists())
-        self.assertEqual(self.stall_path(NEW, "retired-unit").read_text(), '{"stretch": 23}\n')
-        committed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", NEW).splitlines()
-        self.assertEqual(set(committed), {"docs/plans/old-production.md", "docs/plans/new-production.md",
-                                         *(f"docs/plans/{unit}.md" for unit in UNITS)})
+    def test_document_move_recovery_keeps_partial_staging(self) -> None:
+        source = self.doc.relative_to(self.checkout).as_posix()
+        destination = self.new_doc.relative_to(self.checkout).as_posix()
+        staged = self.doc.read_bytes() + b"\nThe staged document edit.\n"
+        working = staged + b"\nThe unstaged document edit.\n"
+        _ = self.doc.write_bytes(staged)
+        _ = self.git("add", "--", source)
+        staged_blob = self.git("rev-parse", f":{source}")
+        _ = self.doc.write_bytes(working)
 
-    def test_check_rewrites_an_escaped_space_path_and_preserves_other_shell_text(self) -> None:
-        directory = self.doc.parent / "my checkout"
-        directory.mkdir()
-        moved_doc = directory / self.doc.name
-        _ = self.git("mv", str(self.doc), str(moved_doc))
-        self.doc = moved_doc
-        self.new_doc = directory / "new-production.md"
-        _ = self.git("commit", "-m", "Keep the production doc under a path with spaces")
-        prefix = "CHECK=env 'NOTE=keep  spacing'  zsh /scripts/production_check.sh "
-        suffix = " --literal 'other  argument'\n"
-        escaped = str(self.doc).replace(" ", "\\ ")
-        conf = self.notifier / "showrunner-old/conf"
-        original = conf.read_text()
-        updated = "".join(prefix + escaped + suffix if line.startswith("CHECK=") else line
-                          for line in original.splitlines(keepends=True))
-        self.write(conf, updated)
-        self.assert_success(self.run_rename("apply"))
-        expected = "".join(prefix + shlex.quote(str(self.new_doc)) + suffix if line.startswith("CHECK=") else line
-                           for line in original.splitlines(keepends=True))
-        self.assertEqual((self.notifier / "showrunner-new/conf").read_text(), expected)
-        self.assertTrue(self.new_doc.exists())
-        self.assertFalse(self.doc.exists())
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("rev-parse", f":{source}"), staged_blob)
 
-    def test_formerly_is_inserted_without_splitting_the_context_list(self) -> None:
-        self.assert_success(self.run_rename("apply"))
-        context = self.new_doc.read_text().split("## Production Context", 1)[1].split("## Units", 1)[0]
-        self.assertEqual(context, "\n\n- **Formerly:** `old`\n- **Merge branch:** `new`\n"
-                         + f"- **Showrunner checkout:** `{self.checkout}`\n- **Log:** `production.log`\n\n")
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.git("rev-parse", f":{destination}"), staged_blob)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("ls-files", "--", source), "")
 
-    def test_apply_resumes_after_a_step_four_filesystem_failure(self) -> None:
-        failed = self.run_rename("apply", fail_state=True)
+    def test_document_move_reruns_after_the_index_source_is_removed(self) -> None:
+        row = self.production_row()
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        git = unit_move.git
+
+        def interrupted(checkout: Path, *arguments: str) -> str:
+            result = git(checkout, *arguments)
+            if arguments[0] == "rm":
+                raise OSError("stopped after index removal")
+            return result
+
+        with mock.patch.object(unit_move, "git", side_effect=interrupted):
+            interrupted_move = self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertIn("stopped after index removal", interrupted_move.stderr)
+        self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md", "docs/plans/new-production.md"),
+                         "docs/plans/new-production.md")
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md", "docs/plans/new-production.md"),
+                         "docs/plans/new-production.md")
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
+        before = self.file_versions()
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.file_versions(), before)
+
+    def test_document_move_keeps_the_blob_indexed_before_source_removal(self) -> None:
+        source = self.doc.relative_to(self.checkout).as_posix()
+        destination = self.new_doc.relative_to(self.checkout).as_posix()
+        staged = self.doc.read_bytes() + b"\nThe staged document edit.\n"
+        working = staged + b"\nThe unstaged document edit.\n"
+        _ = self.doc.write_bytes(staged)
+        self.doc.chmod(0o755)
+        _ = self.git("add", "--", source)
+        source_entry = self.git("ls-files", "-s", "--", source).split()[:3]
+        _ = self.doc.write_bytes(working)
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        git = unit_move.git
+
+        def interrupted(checkout: Path, *arguments: str) -> str:
+            if arguments[0] == "rm":
+                raise OSError("stopped before source index removal")
+            return git(checkout, *arguments)
+
+        with mock.patch.object(unit_move, "git", side_effect=interrupted):
+            interrupted_move = self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertIn("stopped before source index removal", interrupted_move.stderr)
+        self.assertEqual(self.git("ls-files", "-s", "--", destination).split()[:3], source_entry)
+        self.assertEqual(self.git("ls-files", "-s", "--", source).split()[:3], source_entry)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.git("ls-files", "-s", "--", destination).split()[:3], source_entry)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("ls-files", "--", source), "")
+
+    def test_document_move_refuses_an_incomplete_staged_blob(self) -> None:
+        row = self.production_row()
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        journal = self.state / row.id / "rename.json"
+        fields = cast(dict[str, object], json.loads(journal.read_text()))
+        for blob in ({}, {"mode": 100644, "object_id": "blob"},
+                     {"mode": "100644", "object_id": 7},
+                     {"mode": "", "object_id": ""}, None):
+            with self.subTest(blob=blob):
+                fields["staged_blob"] = blob
+                self.write(journal, json.dumps(fields))
+                before = self.file_versions()
+                refused = self.run_command("apply", OLD, NEW,
+                    "--to-doc", str(self.new_doc), "--to-branch", NEW)
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn("the document move journal has an incomplete staged blob", refused.stderr)
+                self.assertEqual(self.file_versions(), before)
+
+    def test_invalid_optional_move_name_leaves_no_journal_and_allows_a_corrected_request(self) -> None:
+        row = self.production_row()
+        before = self.file_versions()
+        failed = self.run_command("apply", OLD, "../escape",
+                                  "--to-doc", str(self.new_doc), "--to-branch", NEW)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertIn("simulated step 4 state move failure", failed.stdout + failed.stderr)
+        self.assertFalse((self.state / row.id / "rename.json").exists())
+        self.assertEqual(self.file_versions(), before)
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
         self.assertTrue(self.new_doc.exists())
-        self.assertTrue((self.notifier / "showrunner-new/conf").exists())
-        self.assertFalse((self.notifier / "showrunner-old").exists())
-        self.assertTrue((self.pool / "old/pool.json").exists())
-        for unit in UNITS:
-            self.assertTrue(self.stall_path(OLD, unit).exists())
-            self.assertRegex(self.plan_path(unit).read_text(),
-                             r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-        self.assertEqual(self.completed_steps(), 3)
-        self.assertIs(self.journal()["done"], False)
-        self.assert_success(self.run_rename("apply"))
-        self.assert_applied()
-        before = self.snapshot()
-        self.assert_success(self.run_rename("apply"))
-        self.assertEqual(self.snapshot(), before)
 
-    def test_invalid_and_reserved_destinations_refuse_without_writes(self) -> None:
-        for destination in ("../escape", "bad.slug", "footers-off", "review-paused", "outstanding"):
-            for action in ("plan", "apply"):
-                with self.subTest(destination=destination, action=action):
-                    before = self.snapshot()
-                    result = self.run_rename(action, destination)
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn(destination, result.stdout + result.stderr)
-                    self.assertEqual(self.snapshot(), before)
-
-    def test_current_and_former_timer_slugs_are_unavailable_as_destinations(self) -> None:
-        taken = self.checkout / "docs/plans/taken-production.md"
-        self.write(taken, "# Taken\n\n## Production Context\n\n- **Formerly:** `retired`, `older`\n")
-        self.write(self.notifier / "showrunner-taken/conf",
-                   "TARGET=session:taken\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(taken)]) + "\n")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "Register another production")
-        for destination in ("taken", "retired", "older"):
-            for action in ("plan", "apply"):
-                with self.subTest(destination=destination, action=action):
-                    before = self.snapshot()
-                    result = self.run_rename(action, destination)
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn(destination, result.stdout + result.stderr)
-                    self.assertEqual(self.snapshot(), before)
-
-    def test_apply_rerun_keeps_unit_moves_and_other_journal_keys(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        journal = self.journal()
-        moves = journal["unit_moves"]
-        journal["future_record"] = {"keep": [1, "two"]}
-        journal["done"] = True
-        completed = cast(list[str], journal["completed"])
-        completed.remove("_rename_unit_workers")
-        completed.append("_later_apply_step")
-        self.write(self.state / "new/rename.json", json.dumps(journal))
-        self.assert_success(self.run_rename("apply"))
-        saved = self.journal()
-        self.assertEqual(saved["unit_moves"], moves)
-        self.assertEqual(saved["future_record"], {"keep": [1, "two"]})
-        self.assertIs(saved["done"], True)
-        self.assertIn("_later_apply_step", cast(list[str], saved["completed"]))
-
-    def test_repair_without_unit_moves_finds_old_run_and_allows_adoption(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        run = self.seed_paused_unit_worker()
-        journal = self.journal()
-        del journal["unit_moves"]
-        self.write(self.state / "new/rename.json", json.dumps(journal))
-        before = self.snapshot()
-        preview = self.run_command("repair-workers", NEW, "--dry-run")
-        self.assert_success(preview)
-        self.assertIn(f"would change run {run}", preview.stdout)
-        self.assertIn(f"would change worker {run}/w7", preview.stdout)
-        self.assertEqual(self.snapshot(), before)
-        self.assert_success(self.run_command("repair-workers", NEW))
-        new = self.unit_worktree(NEW, "alpha-unit")
-        destination = self.root / "runs/after-repair"
-        self.write(destination / workers.STATE, json.dumps({"status": "active", "working_dir": str(new),
-            "production": NEW, "unit": "alpha-unit", "run_id": destination.name}))
-        with mock.patch.dict(os.environ, self.env):
-            self.assertEqual(workers.adopt(run, destination, "w7"), "w7")
-        before = self.snapshot()
-        repeated = self.run_command("repair-workers", NEW)
-        self.assert_success(repeated)
-        self.assertIn("workers have nothing to change", repeated.stdout)
-        self.assertEqual(self.snapshot(), before)
-
-    def test_repair_without_a_rename_journal_uses_the_timer_doc(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        run = self.seed_paused_unit_worker()
-        (self.state / "new/rename.json").unlink()
-        fixed = self.run_command("repair-workers", NEW)
-        self.assert_success(fixed)
-        self.assertIn(f"changed worker {run}/w7", fixed.stdout)
-        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
-        self.assertEqual(state["working_dir"], str(self.unit_worktree(NEW, "alpha-unit")))
-
-    def test_repair_skips_a_run_that_matches_two_units(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        run = self.seed_paused_unit_worker()
-        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
-        state["plan_doc"] = ""
-        self.write(run / workers.STATE, json.dumps(state))
-        journal = self.journal()
-        del journal["unit_moves"]
-        self.write(self.state / "new/rename.json", json.dumps(journal))
-        self.write(self.new_doc, self.new_doc.read_text().replace(
-            str(self.unit_worktree(OLD, "beta-unit")), str(self.unit_worktree(NEW, "alpha-unit"))))
-        before = self.snapshot()
-        fixed = self.run_command("repair-workers", NEW)
-        self.assert_success(fixed)
-        self.assertIn(f"run {run}: ambiguous unit", fixed.stdout)
-        self.assertIn("skipped", fixed.stdout)
-        self.assertEqual(self.snapshot(), before)
-
-    def test_repair_reports_why_no_move_was_found(self) -> None:
-        self.assert_success(self.run_rename("apply"))
-        result = self.run_command("repair-workers", NEW)
+    def test_document_edits_after_journaling_are_kept_and_the_move_finishes(self) -> None:
+        row = self.production_row()
+        with mock.patch.object(staff, "rename", side_effect=OSError("stopped after journal")):
+            interrupted = self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertTrue((self.state / row.id / "rename.json").exists())
+        content = self.doc.read_bytes() + b"\nA new document edit.\n"
+        _ = self.doc.write_bytes(content)
+        result = self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW)
         self.assert_success(result)
-        self.assertIn("no moved unit was found: no unit run names an old worktree", result.stdout)
+        self.assertTrue(self.new_doc.exists(), result.stderr)
+        self.assertEqual(self.new_doc.read_bytes(), content)
+        self.assertFalse(self.doc.exists())
+        self.assertEqual(result.stderr.count("the document changed after the move request"), 1, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
+        self.assertEqual(self.git("branch", "--show-current"), NEW)
+        before = self.file_versions()
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.file_versions(), before)
+
+    def test_unit_reference_cannot_move_an_existing_showrunners_document(self) -> None:
+        row = self.production_row()
+        unit = fixture_member("unit", name="requested", parent=row.id)
+        before = self.file_versions()
+        result = self.run_command("apply", unit.id, row.name,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a showrunner", result.stderr)
+        self.assertEqual(self.file_versions(), before)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def file_versions(self) -> dict[Path, tuple[bytes, int]]:
+        return {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in self.root.rglob("*") if path.is_file() and path.name != "herdr.jsonl"}
+
+    def test_rename_changes_the_row_session_tab_and_workspace_without_a_move(self) -> None:
+        row = self.production_row()
+        record = sessions.SessionRecord(sessionId=row.current_session, name=OLD, pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        path = self.root / "state/sessions/998041.json"
+        self.write(path, json.dumps(record))
+        document = self.doc.read_bytes(), self.doc.stat().st_mtime_ns
+        branch = self.git("branch", "--show-current")
+        tip = self.git("rev-parse", "HEAD")
+        displays = support.RenameDisplays(row)
+        displays.pane = displays.tab = displays.workspace = OLD
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            self.assert_success(self.run_rename("apply"))
+        self.assertEqual(staff.by_id(row.id), replace(row, name=NEW))
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), (NEW,) * 3)
+        self.assertEqual(json.loads(path.read_text())["name"], NEW)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns), document)
+        self.assertFalse(self.new_doc.exists())
+        self.assertEqual((self.git("branch", "--show-current"), self.git("rev-parse", "HEAD")), (branch, tip))
+
+    def test_same_name_is_unchanged_when_every_name_agrees(self) -> None:
+        row = self.production_row()
+        record = sessions.SessionRecord(sessionId=row.current_session, name=row.name, pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        self.write(self.root / "state/sessions/998041.json", json.dumps(record))
+        displays = support.RenameDisplays(row)
+        displays.pane = displays.tab = displays.workspace = row.name
+        before = self.file_versions()
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual(result.stdout.strip(), "unchanged")
+        self.assertEqual(displays.commands, [])
+        self.assertEqual(self.file_versions(), before)
+
+    def test_to_doc_sets_the_row_after_the_file_move_and_keeps_the_document_text(self) -> None:
+        row = self.production_row()
+        content = self.doc.read_bytes()
+        set_doc = staff.set_doc
+
+        def publish(identity: staff.StaffId, doc: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
+            self.assertEqual(identity, row.id)
+            self.assertFalse(self.doc.exists())
+            self.assertEqual(self.new_doc.read_bytes(), content)
+            current = staff.by_id(identity)
+            assert current is not None
+            self.assertEqual(current.doc, row.doc)
+            return set_doc(identity, doc)
+
+        with mock.patch.object(staff, "set_doc", side_effect=publish) as published:
+            self.assert_success(self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        published.assert_called_once_with(row.id, staff.LiveDoc("natedev", self.new_doc))
+        self.assertEqual(staff.by_id(row.id), replace(row, name=NEW, doc=staff.LiveDoc("natedev", self.new_doc)))
+        self.assertEqual(self.git("branch", "--show-current"), NEW)
+        before = self.file_versions()
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.file_versions(), before)
+
+    def test_document_move_request_is_saved_before_the_row_changes(self) -> None:
+        row = self.production_row()
+        rename = staff.rename
+        document = self.doc.read_bytes()
+
+        def rename_row(identity: staff.StaffId, name: str) -> staff.StaffRow:
+            journal = self.state / row.id / "rename.json"
+            fields = cast(dict[str, object], json.loads(journal.read_text()))
+            self.assertEqual(fields["staff_id"], row.id)
+            self.assertEqual(fields["source"], str(self.doc))
+            self.assertEqual(fields["destination"], str(self.new_doc))
+            self.assertEqual(fields["branch"], NEW)
+            self.assertIs(fields["done"], False)
+            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual(self.doc.read_bytes(), document)
+            self.assertFalse(self.new_doc.exists())
+            self.assertEqual(self.git("branch", "--show-current"), OLD)
+            return rename(identity, name)
+
+        with mock.patch.object(staff, "rename", side_effect=rename_row) as renamed:
+            self.assert_success(self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        renamed.assert_called_once_with(row.id, NEW)
+
+    def test_finished_rename_rerun_changes_no_bytes_or_times(self) -> None:
+        row = self.production_row()
+        displays = support.RenameDisplays(row)
+        displays.pane = displays.tab = displays.workspace = OLD
+        with displays.installed():
+            self.assert_success(self.run_rename("apply"))
+            before = self.file_versions()
+            commands = list(displays.commands)
+            result = self.run_rename("apply")
+        self.assert_success(result)
+        self.assertEqual(result.stdout.strip(), "unchanged")
+        self.assertEqual(self.file_versions(), before)
+        self.assertEqual(displays.commands, commands)
+
+    # Keep the rename CLI process boundary.
+    @process_boundary
+    def test_plan_describes_the_rename_without_writes(self) -> None:
+        before = self.file_versions()
+        result = self.run_rename("plan")
+        self.assert_success(result)
+        self.assertIn(OLD, result.stdout)
+        self.assertIn(NEW, result.stdout)
+        self.assertEqual(self.file_versions(), before)
+
+    def test_rename_preserves_staff_stores_and_parent_relationships(self) -> None:
+        row = self.production_row()
+        child = fixture_member("showrunner", name="child", parent=row.id)
+        listed = self.root / "lists/change-review - old.md"
+        rows = ["| # | Change | Merged | How to check | Production |",
+                "| --- | --- | --- | --- | --- |",
+                f"| C1 | own | m | try | {row.id} |",
+                f"| C2 | child's | m | try | {child.id} |",
+                f"| C3 | root's | m | try | {row.id} |"]
+        self.write(listed, "\n".join(rows) + "\n")
+        pins = self.home / ".local/state/next"
+        question = {"current": f"{row.id}: first",
+                    "ended": {f"{row.id}: earlier": "2026-10-27T01:00:00"},
+                    "moved": ["oldish: kept"]}
+        pin = pins / f"question-{row.id}.json"
+        aggregate = pins / f"next-{row.id}-all-below.json"
+        self.write(pin, json.dumps(question))
+        self.write(aggregate, json.dumps({"current": "C1", "source": "change-old"}))
+        bevy = self.home / ".local/state/bevy-upgrade"
+        watch = bevy / f"{row.id}.json"
+        lock = bevy / f"{row.id}.lock"
+        job = self.notifier / f"bevy-upgrade-{row.id}/conf"
+        self.write(watch, json.dumps({"staff_id": row.id, "entries": 3}))
+        self.write(lock, "")
+        self.write(job, f"EVERY=240\nRUN=py bevy_upgrade.py --staff-id {row.id} check --scheduled\n"
+                       + f"FROM=bevy-upgrade-{row.id}\n")
+        run = self.root / "runs/current/progress_history_state.json"
+        self.write(run, json.dumps({"owner_staff_id": row.id}))
+        fixed = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                 for path in (listed, pin, aggregate, watch, lock, job, run)}
+        displays = support.RenameDisplays(row)
+        with displays.installed():
+            self.assert_success(self.run_rename("apply"))
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in fixed}, fixed)
+        self.assertEqual(json.loads(pin.read_text()), question)
+        self.assertEqual(json.loads(aggregate.read_text()), {"current": "C1", "source": "change-old"})
+        for content in rows[2:]:
+            self.assertIn(content, listed.read_text())
+        self.assertEqual(json.loads(watch.read_text()), {"staff_id": row.id, "entries": 3})
+        self.assertEqual(lock.read_text(), "")
+        self.assertIn(f"--staff-id {row.id} check", job.read_text())
+        self.assertIn(f"FROM=bevy-upgrade-{row.id}\n", job.read_text())
+        self.assertEqual(json.loads(run.read_text()), {"owner_staff_id": row.id})
+        self.assertEqual(staff.by_id(row.id), replace(row, name=NEW))
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(child.parent, staff.ReportsTo(row.id))
+
+    def test_invalid_staff_name_refuses_without_writes(self) -> None:
+        before = self.snapshot()
+        result = self.run_rename("apply", "../escape")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("../escape", result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ import type { BoardSnapshot } from '../types';
 
 export type RefreshPaths =
   | { kind: 'board'; board: string; sources: string[] }
-  | { kind: 'discovery'; sources: string[]; loadedAt: number };
+  | { kind: 'discovery'; sources: string[]; loadedAt: number }
+  | { kind: 'liveness' };
 export interface RefreshFiles { stat(path: string): Promise<{ mtimeMs: number }> }
 export interface BoardLoader {
   home(): Promise<string | undefined>;
@@ -26,6 +27,9 @@ export async function refreshIfChanged<T>(
   let changed = false;
   for (const path of paths) {
     if (!isOpen()) return false;
+    // Process exits can leave every registry file unchanged. Recheck counts on
+    // the existing pane tick, without a separate timer or remote discovery.
+    if (path.kind === 'liveness') { changed = true; continue; }
     let written: number;
     if (path.kind === 'discovery') written = path.loadedAt;
     else {
@@ -77,6 +81,7 @@ export async function loadBoard(
   }
   watch({ kind: 'discovery', sources: response.watch, loadedAt });
   const boards: BoardData[] = [];
+  // The generator supplies staff-id paths from the staff record.
   for (const path of response.files) {
     ensureOpen();
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
@@ -132,21 +137,26 @@ export async function loadAccounts(
   if (!home) throw new Error('Home directory is unavailable.');
   const loadedAt = await calls.now();
   const sources = new Set<string>();
+  let refreshLiveness = false;
   const inputs = [`${home}/.local/state/agent-notes/usage.json`, `${home}/.local/state/accounts/groups.json`,
     `${home}/.claude/config/accounts.json`, `${home}/.local/state/accounts/role_map_cache.json`];
-  for (const input of inputs) {
-    let path = input;
-    while (path) {
-      ensureOpen();
-      try {
-        await calls.stat(path);
-        sources.add(path);
-        break;
-      } catch { /* A missing input is discovered through its closest existing parent. */ }
-      path = path.slice(0, path.lastIndexOf('/')) || (path === '/' ? '' : '/');
+  const watchInputs = async (inputs: readonly string[]) => {
+    for (const input of inputs) {
+      let path = input;
+      while (path) {
+        ensureOpen();
+        try {
+          await calls.stat(path);
+          sources.add(path);
+          break;
+        } catch { /* A missing input is discovered through its closest existing parent. */ }
+        path = path.slice(0, path.lastIndexOf('/')) || (path === '/' ? '' : '/');
+      }
+      watch([{ kind: 'discovery', sources: [...sources], loadedAt },
+        ...(refreshLiveness ? [{ kind: 'liveness' } as const] : [])]);
     }
-    watch([{ kind: 'discovery', sources: [...sources], loadedAt }]);
-  }
+  };
+  await watchInputs(inputs);
   ensureOpen();
   const result = await calls.run([`${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/accounts/accounts.py`,
     'status', '--json', '--stored']);
@@ -156,6 +166,16 @@ export async function loadAccounts(
   try {
     const status = JSON.parse(result.stdout) as StoredAccountsStatus;
     if (!Array.isArray(status.accounts) || !Array.isArray(status.problems)) throw new Error();
+    if (status.upcoming_moves !== undefined && (!Array.isArray(status.upcoming_moves)
+      || !status.upcoming_moves.every(line => typeof line === 'string'))) throw new Error();
+    if (status.accounts.some(account => account.selected_roles !== undefined
+      && (!Array.isArray(account.selected_roles) || !account.selected_roles.every(role => typeof role === 'string')))) throw new Error();
+    if (status.session_inputs) {
+      if (!Array.isArray(status.session_inputs) || !status.session_inputs.every(path => typeof path === 'string')) throw new Error();
+      refreshLiveness = status.session_inputs.length > 0;
+      await watchInputs(status.session_inputs);
+    }
+    // Keep Python's combined role_counts and separate machine records unchanged.
     return status;
   } catch { throw new Error('Stored accounts status is invalid.'); }
 }

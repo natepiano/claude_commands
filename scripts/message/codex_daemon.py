@@ -2,6 +2,10 @@
 """Read each account's live Codex daemon and queue through its control socket."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import base64
 import json
@@ -12,12 +16,23 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import cast, final
 
-TIMEOUT_SECONDS = 5.0
-QUEUE_TIMEOUT_SECONDS = 30
+from scripts.lib import conf
+
 _clock = time.monotonic
+
+
+def timeout_seconds() -> float:
+    """Daemon discovery budget in seconds."""
+    return conf.read("codex_daemon").number("timeout_seconds")
+
+
+def queue_timeout_seconds() -> float:
+    """Queue request budget in seconds."""
+    return conf.read("codex_daemon").number("queue_timeout_seconds")
 
 
 @dataclass(frozen=True)
@@ -108,7 +123,7 @@ def read_daemons(environment: Mapping[str, str]) -> list[DaemonRead]:
     owners = daemons(environment)
     if not owners:
         return []
-    deadline = _OperationDeadline.starting_now(TIMEOUT_SECONDS)
+    deadline = _OperationDeadline.starting_now(timeout_seconds())
     with ThreadPoolExecutor(max_workers=len(owners)) as readers:
         pending = [readers.submit(loaded_sessions, owner.socket, deadline=deadline) for owner in owners]
         return [DaemonRead(owner, result.result()) for owner, result in zip(owners, pending)]
@@ -305,7 +320,7 @@ def loaded_sessions(
     deadline: _OperationDeadline | _StartReadDeadline = _START_READ_DEADLINE,
 ) -> list[DaemonSession] | DaemonUnreadable:
     if isinstance(deadline, _StartReadDeadline):
-        deadline = _OperationDeadline.starting_now(TIMEOUT_SECONDS)
+        deadline = _OperationDeadline.starting_now(timeout_seconds())
     if not socket_path.exists():
         return []
     client: _DaemonClient | None = None
@@ -357,11 +372,16 @@ def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float) 
             client.close()
 
 
+class ConfiguredQueueTimeout(Enum):
+    CURRENT = "current"
+
+
 def queue(
     daemon: CodexDaemon,
     thread_id: str,
     text: str,
-    timeout: float = QUEUE_TIMEOUT_SECONDS,
+    timeout: float | ConfiguredQueueTimeout = ConfiguredQueueTimeout.CURRENT,
 ) -> QueueResult:
     """Queue only through the live daemon that supplied the recipient's row."""
-    return _queue_socket(daemon.socket, thread_id, text, timeout)
+    return _queue_socket(daemon.socket, thread_id, text,
+                         queue_timeout_seconds() if isinstance(timeout, ConfiguredQueueTimeout) else timeout)

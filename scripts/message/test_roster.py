@@ -18,39 +18,45 @@ import unittest
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.herdr import worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
+    fixture_worker, fixture_runtime_id, fixture_session, fixture_roster, recorded_unit, fixture_member, recorded_showrunner,
 )
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import designer_fixture
+from scripts.astra.design_role_test_support import write_empty_binding_record
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "direct"))
 
-import codex_daemon
-from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
-import process_table
-import roster
-import send
-import broadcast
-import unit_lookup
-import unit_runs
-import herdr
-from fake_herdr import CommandResponse, herdr_listener
-import sessions
+from scripts.message import codex_daemon
+from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
+from scripts.message import process_table
+from scripts.message import roster
+from scripts.message import send
+from scripts.production import unit_lookup
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
+from scripts.message import sessions
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 from scripts.production import showrunners
 if TYPE_CHECKING:
-    from ..whoami import account, agent_accounts
+    from scripts.whoami import account, agent_accounts
 else:
     account = roster.account
     agent_accounts = roster.agent_accounts
@@ -121,6 +127,9 @@ class RosterTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
 
+        transport_config = self.root / "config"
+        transport_config.mkdir()
+        write_text_atomic(transport_config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
@@ -132,17 +141,21 @@ class RosterTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.home),
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+            "XDG_STATE_HOME": str(self.root / "state"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.ssh_log),
             "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
             "CLAUDE_BIN": str(fake_codex),
-            "CLAUDE_CODE_SESSION_ID": "sid-runner",
+            "CLAUDE_CODE_SESSION_ID": "acd50bad-5afa-5d3d-b155-3766b7d113e0",
             "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
+            "CONF_DIR": str(transport_config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "USAGE_STATE_DIR": str(self.root / "usage"),
             "ROSTER_RUN_ROOT": str(self.runs),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
@@ -150,7 +163,6 @@ class RosterTests(unittest.TestCase):
             "PROCESS_TABLE_PS": f"cat {self.ps_state}",
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
         }
         environment_patch = cast(
             AbstractContextManager[object],
@@ -159,7 +171,6 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(showrunners, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier))
-        _ = self.enterContext(mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions))
         _ = self.enterContext(mock.patch.object(
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
         ))
@@ -217,13 +228,39 @@ class RosterTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
-        instance = self.notifier / "showrunner-alpha"
+        instance = self.notifier / f"showrunner-{showrunner_relationship('alpha').id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
-            "TARGET=session:sid-runner\n"
-            + f"CHECK=zsh /scripts/production_check.sh {self.production_doc}\n",
+            "TARGET=session:acd50bad-5afa-5d3d-b155-3766b7d113e0\n"
+            + f"CHECK=zsh /scripts/production_check.sh {showrunner_relationship('alpha').id}\n",
             encoding="utf-8",
         )
+
+    def _publish_roster(self, path: Path, entries: dict[str, dict[str, object]],
+                        *, codex_home: Path | None = None) -> None:
+        for entry in entries.values():
+            identity = entry.get("thread_id")
+            if isinstance(identity, str) and identity:
+                try:
+                    _ = staff.native_id(identity)
+                except staff.StaffRefused:
+                    entry["thread_id"] = fixture_runtime_id(identity)
+            native = entry.get("thread_id")
+            if not isinstance(native, str):
+                reference = entry.get("staff_id")
+                member = staff.by_id(staff.native_id(reference)) if isinstance(reference, str) else None
+                native = member.current_session if member is not None else ""
+            for role in agents_log.ROLES:
+                if entry.get("role") == role and native:
+                    lens: agents_log.Lens | None = next(
+                        (lens for lens in agents_log.LENSES if entry.get("lens") == lens), None)
+                    agents_log.append(native, role, lens, datetime.now(UTC))
+                    break
+        parent = (showrunner_relationship("alpha") if path.parent.name == "orphan-run"
+                  else unit_membership("alpha", "unit-one"))
+        published = fixture_roster(cast(dict[str, object], entries), parent.id,
+                                   codex_home or self.root / "codex-home")
+        _ = path.write_text(json.dumps(published), encoding="utf-8")
 
     def _write_mesh(
         self,
@@ -233,11 +270,12 @@ class RosterTests(unittest.TestCase):
         server_pid: int | None = None,
     ) -> None:
         run.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(run / "worker_transport", "mesh\n")
         _ = (run / "mesh_server.json").write_text(json.dumps({
             "port": 45_678,
             "pid": os.getpid() if server_pid is None else server_pid,
         }), encoding="utf-8")
-        _ = (run / "mesh_roster.json").write_text(json.dumps(entries), encoding="utf-8")
+        self._publish_roster(run / "mesh_roster.json", entries)
 
     def _build_complete_roster(self) -> None:
         runner_cwd = self.home / "projects" / "runner"
@@ -248,27 +286,33 @@ class RosterTests(unittest.TestCase):
         self.production_doc = self.root / "alpha-production.md"
         _ = self.production_doc.write_text("\n".join((
             "- **User zone:** America/New_York",
-            "## Units",
-            "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| unit-one | docs/plan.md | {director_cwd} | unit-one | — | — |",
         )), encoding="utf-8")
+        _ = recorded_unit("alpha", "unit-one", director_cwd, self.production_doc, plan="docs/plan.md")
         self._write_showrunner_timer()
-        self._write_session(str(os.getpid()), "runner", "sid-runner", runner_cwd, status="ready")
+        runner = showrunner_relationship("alpha")
+        _ = staff.update_current_session(runner.current_session,
+            staff.native_id("acd50bad-5afa-5d3d-b155-3766b7d113e0"))
+        unit = unit_membership("alpha", "unit-one")
+        _ = staff.update_current_session(unit.current_session,
+            staff.native_id("17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
+        self._write_session(str(os.getpid()), "runner", "acd50bad-5afa-5d3d-b155-3766b7d113e0", runner_cwd, status="ready")
         self._write_session(
-            "director", "director", "sid-director", director_cwd,
+            "director", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", director_cwd,
             status="working", tmux="old-label:@1.%1",
         )
         self._write_session(
             "worker", "claude-worker", WORKER_SESSION_ID, worker_cwd, status="idle"
         )
-        self._write_session("solo", "solo-director", "sid-solo", solo_cwd, status="waiting")
-        self._write_session("free-old", "old-free-name", "sid-free", free_cwd, updated=1)
-        self._write_session("free-new", "free-claude", "sid-free", free_cwd, status="ready", updated=2)
+        _ = fixture_worker("alpha-test", unit.id, runtime_id=WORKER_SESSION_ID)
+        self._write_session("solo", "solo-director", "22135b22-7da2-5f04-8840-738da7f248ba", solo_cwd, status="waiting")
+        self._write_session("free-old", "old-free-name", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, updated=1)
+        self._write_session("free-new", "free-claude", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, status="ready", updated=2)
 
         self.director_run = self.runs / "director-run"
         self.director_run.mkdir()
-        _ = (self.runs / "active" / "sid-director").write_text(
+        _ = (self.director_run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: unit.id}),
+                                                               encoding="utf-8")
+        _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )
         _ = (self.director_run / "workers").write_text(
@@ -276,51 +320,52 @@ class RosterTests(unittest.TestCase):
         )
         self._write_mesh(self.director_run, {
             "alpha-impl": {
-                "thread_id": "thread-shared", "turn_id": "turn-1", "status": "running",
-                "launcher_pid": os.getpid(),
+                "thread_id": "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "turn_id": "turn-1", "status": "running",
+                "launcher_pid": os.getpid(), "role": "impl",
             },
-            "alpha-fix": {"thread_id": "thread-fix", "status": "done"},
-            "alpha-failed": {"thread_id": "thread-failed", "status": "failed"},
+            "alpha-fix": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done", "role": "fix"},
+            "alpha-failed": {"thread_id": "ea8ee697-99ad-5903-9952-ebc9b68e2eef", "status": "failed"},
             "alpha-start": {
-                "thread_id": "thread-start", "status": "starting", "launcher_pid": os.getpid(),
+                "thread_id": "8174bc31-7a95-5fd8-9220-e33314e2cd14", "status": "starting", "launcher_pid": os.getpid(),
             },
             "alpha-wait": {
-                "thread_id": "thread-wait", "status": "waiting_capacity",
+                "thread_id": "aa6c4f2b-129f-58c6-a216-8b690d57643f", "status": "waiting_capacity",
                 "launcher_pid": os.getpid(),
             },
-            "alpha-exhaust": {"thread_id": "thread-exhaust", "status": "capacity_exhausted"},
+            "alpha-exhaust": {"thread_id": "a0113ce8-7818-5b68-b018-eda02ae69013", "status": "capacity_exhausted"},
             "alpha-research": {
-                "thread_id": "thread-lens", "turn_id": "turn-2", "status": "running",
+                "thread_id": "76d3172a-4806-51c4-89b6-e328af9f6367", "turn_id": "turn-2", "status": "running",
                 "launcher_pid": os.getpid(), "role": "review", "lens": "adversary",
             },
             "alpha-review-plain": {
-                "thread_id": "thread-review", "turn_id": "turn-3", "status": "running",
+                "thread_id": "54d79ec8-8609-5bb5-a05d-e1c2476abfbe", "turn_id": "turn-3", "status": "running",
                 "launcher_pid": os.getpid(), "role": "review",
             },
-            "alpha-ended": {"thread_id": "thread-ended", "status": "ended"},
-            "alpha-no-thread": {"status": "starting", "launcher_pid": os.getpid()},
+            "alpha-ended": {"thread_id": "94e324e8-4161-520a-8910-2efc613382bb", "status": "ended"},
+            "alpha-no-thread": {"thread_id": fixture_runtime_id("alpha-published-start"),
+                                "status": "starting", "launcher_pid": os.getpid()},
         })
 
         solo_run = self.runs / "solo-run"
         solo_run.mkdir()
-        _ = (self.runs / "active" / "sid-solo").write_text(
+        _ = (self.runs / "active" / "22135b22-7da2-5f04-8840-738da7f248ba").write_text(
             str(solo_run) + "\n", encoding="utf-8",
         )
 
         orphan_run = self.runs / "orphan-run"
         self._write_mesh(orphan_run, {
             "orphan-impl": {
-                "thread_id": "thread-orphan", "turn_id": "turn-orphan", "status": "running",
+                "thread_id": "ceb99381-63dd-541b-aab3-79e899496801", "turn_id": "turn-orphan", "status": "running",
                 "launcher_pid": os.getpid(),
             },
-            "orphan-fix": {"thread_id": "thread-orphan-fix", "status": "done"},
+            "orphan-fix": {"thread_id": "eb7a624c-bc14-5a52-9eac-6f6c188a5ea5", "status": "done"},
         })
         (orphan_run / "heartbeat.log").touch()
 
         stale_run = self.runs / "stale-marker-run"
         self._write_mesh(stale_run, {
             "stale-impl": {
-                "thread_id": "thread-stale", "turn_id": "turn-stale", "status": "running",
+                "thread_id": "6c55fc12-fc24-5b88-ad32-0baaac429dc0", "turn_id": "turn-stale", "status": "running",
                 "launcher_pid": os.getpid(),
             },
         })
@@ -331,7 +376,7 @@ class RosterTests(unittest.TestCase):
         dead_server_run = self.runs / "dead-server-run"
         self._write_mesh(dead_server_run, {
             "dead-impl": {
-                "thread_id": "thread-dead", "turn_id": "turn-dead", "status": "running",
+                "thread_id": "43a61b0f-684c-531a-b22a-e17537e0398a", "turn_id": "turn-dead", "status": "running",
                 "launcher_pid": 999_999_999,
             },
         }, server_pid=999_999_999)
@@ -364,12 +409,116 @@ class RosterTests(unittest.TestCase):
     def _daemon_sessions(self) -> list[codex_daemon.DaemonSession]:
         return [
             codex_daemon.DaemonSession(
-                "thread-shared", "worker duplicate", str(self.home / "projects" / "unit-one"), "active",
+                "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "worker duplicate", str(self.home / "projects" / "unit-one"), "active",
             ),
             codex_daemon.DaemonSession(
-                "thread-window", "Codex window", str(self.home / "projects" / "codex"), "idle",
+                "eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539", "Codex window", str(self.home / "projects" / "codex"), "idle",
             ),
         ]
+
+    def test_docless_staff_row_warns_once_and_keeps_the_good_unit(self) -> None:
+        bad = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        self.assertEqual(membership, staff.initial_snapshot())
+        self.assertEqual(membership.inputs, (str(self.root / "staff.json"),))
+        self.assertIsInstance(membership.by_id(bad.id), staff.StaffRow)
+        self.assertIsInstance(bad.doc, staff.DocUnfilled)
+        status, output, errors = self._run_main("--here", "--json")
+        report = cast(dict[str, object], json.loads("\n".join(output)))
+        self.assertEqual(status, 0)
+        self.assertEqual(report["problems"], [])
+        self.assertEqual(report["warnings"], ["bad: the production document is not recorded"])
+        self.assertEqual(errors, ["could not read: warning: bad: the production document is not recorded"])
+        self.assertIn("director", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+        self.assertNotIn("free-claude", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+
+    def test_docless_staff_row_does_not_block_a_peer_name(self) -> None:
+        _ = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        result = roster.roster(os.environ, roster.ThisMachine())
+        template = next(entry for entry in result.entries if entry.name == "director")
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
+                             session=roster.ClaudeSession("peer-id"))
+        with mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.RecipientMatches)
+        assert isinstance(found, send.RecipientMatches)
+        self.assertEqual(found.entries, [peer_entry])
+        self.assertIsInstance(found.destination, send.NamedMachine)
+        peer.assert_called_once()
+        with mock.patch.object(roster, "peer_roster", return_value=roster.Roster([], [])):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.resolve_recipient("bad", send.LocalThenPeer(), result, membership=membership)
+
+    def test_docless_staff_warning_allows_peer_delivery_and_refuses_its_own_recipient(self) -> None:
+        bad = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        self.assertEqual(membership.inputs, (str(self.root / "staff.json"),))
+        self.assertEqual(membership.by_id(bad.id), bad)
+        observed = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(observed.problems, [])
+        self.assertTrue(any(entry.name == "director" for entry in observed.entries))
+        template = next(entry for entry in observed.entries if entry.name == "director")
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
+                             session=roster.ClaudeSession("peer-id"))
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer,
+              mock.patch.object(send, "STATE", self.root / "send-state"),
+              mock.patch.object(send, "remote", return_value=send.Result("sent", "fixture peer")) as deliver,
+              mock.patch.object(send, "relay", side_effect=AssertionError("no local relay")),
+              mock.patch.object(send, "user", side_effect=AssertionError("no user push")),
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = send.main(["--to", "peer-only", "--from", "fixture-reviewer", "--text", "fixture text"])
+            self.assertEqual(status, 0, output.getvalue() + errors.getvalue())
+            self.assertEqual(output.getvalue(), "SENT: fixture peer\n")
+            self.assertEqual(errors.getvalue(), "")
+            peer.assert_called_once()
+            deliver.assert_called_once()
+            message = cast(send.Message, deliver.call_args.args[0])
+            self.assertEqual((message.to, message.text), ("session:peer-id", "fixture text"))
+            with self.assertRaises(SystemExit) as refused:
+                _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
+            self.assertEqual(refused.exception.code, 2)
+            self.assertIn("bad: the production document is not recorded", errors.getvalue())
+            peer.assert_called_once()
+            deliver.assert_called_once()
+
+    def test_document_read_failure_still_blocks_unproven_peer_fallback(self) -> None:
+        _ = fixture_member("showrunner", name="unreadable", doc=staff.LiveDoc(
+            roster.remote.local_machine(), self.root / "missing-production.md"))
+        membership = staff.snapshot()
+        result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertTrue(any("missing-production.md" in problem for problem in result.problems))
+        with mock.patch.object(roster, "peer_roster") as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.LocalRosterIncomplete)
+        peer.assert_not_called()
+        self.assertTrue(any(entry.name == "director" for entry in result.entries))
+
+    def test_invalid_staff_parent_remains_a_staff_read_failure(self) -> None:
+        membership = staff.snapshot()
+        unit = next(row for row in membership.rows if row.kind == "unit")
+        for parent in (staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit.id):
+            with self.subTest(parent=parent):
+                rows = [replace(row, parent=staff.ReportsTo(parent)) if row.id == unit.id else row for row in membership.rows]
+                _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
+                with self.assertRaises(staff.StaffUnreadable):
+                    _ = staff.snapshot()
+                observed = roster.roster(os.environ, roster.ThisMachine())
+                self.assertTrue(any("requires a showrunner parent" in problem for problem in observed.problems))
+                self.assertEqual(observed.warnings, [])
+                with (mock.patch.object(roster, "peer_roster") as peer,
+                      redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused):
+                    _ = send.send(send.parse(["--to", "peer-only", "--from", "fixture-reviewer", "--text", "fixture text"]))
+                self.assertEqual(refused.exception.code, 2)
+                peer.assert_not_called()
+
+    def test_unit_worker_keeps_its_director_run_messaging_address(self) -> None:
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(result.problems, [])
+        unit_worker = next(entry for entry in result.entries if entry.name == "alpha-impl")
+        self.assertEqual(unit_worker.reach, roster.Messageable("worker:director-run/alpha-impl"))
 
     def _entries(self) -> dict[str, roster.RosterEntry]:
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
@@ -377,15 +526,100 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(found.problems, [])
         return {entry.name: entry for entry in found.entries}
 
+    def test_codex_session_without_a_staff_row_is_freestanding_and_lists_successfully(self) -> None:
+        result, _, errors = self._run_main("--json")
+        entry = self._entries()["Codex window"]
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(
+            (entry.role, entry.assignment, entry.showrunner, entry.director),
+            ("freestanding", roster.NotAWorker(), roster.NoShowrunner(), roster.NoDirector()),
+        )
+        self.assertEqual(entry.reach, roster.Messageable("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
+
+    def test_codex_unit_row_without_a_parent_claim_is_freestanding_and_lists_successfully(self) -> None:
+        record = staff.snapshot()
+        row = staff.StaffRow(
+            staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.StaffRoot(),
+            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+        )
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
+            result, _, errors = self._run_main("--json")
+            entry = self._entries()["Codex window"]
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(
+            (entry.role, entry.assignment, entry.showrunner, entry.director),
+            ("freestanding", roster.NotAWorker(), roster.NoShowrunner(), roster.NoDirector()),
+        )
+        self.assertEqual(entry.reach, roster.Messageable("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
+
+    def test_codex_unit_with_an_unavailable_recorded_parent_keeps_its_named_problem(self) -> None:
+        record = staff.snapshot()
+        wrong_kind = next(row.id for row in record.rows if row.kind == "unit")
+        for parent in (staff.StaffId("missing-owner"), wrong_kind):
+            with self.subTest(parent=parent):
+                row = staff.StaffRow(
+                    staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.ReportsTo(parent),
+                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+                )
+                with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
+                    result, lines, errors = self._run_main("--json")
+                self.assertEqual(result, 1)
+                self.assertEqual(json.loads("\n".join(lines))["problems"],
+                                 ["Codex window: the staff parent is unavailable"])
+                self.assertEqual(errors, ["could not read: Codex window: the staff parent is unavailable"])
+
+    def test_keyed_send_reuses_roster_registry_before_delivery(self) -> None:
+        state = self.root / "message"
+        state.mkdir()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        _ = fixture_worker("impl2", unit.id)
+        identity = "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"
+        registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
+        assert registered is not None
+        started = send.now()
+        targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
+        for target in targets:
+            registry = mock.Mock(wraps=sessions.read_registry)
+            with self.subTest(target=target):
+                _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
+                options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
+                                      "--key", "notice", "--repeat-minutes", "30"])
+                with (mock.patch.object(send, "STATE", state),
+                      mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+                      mock.patch.object(sessions, "read_registry", registry),
+                      mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+                registry.assert_called_once_with()
+                relay.assert_not_called()
+
+    def test_mesh_reader_uses_the_current_thread_from_the_staff_backend_record(self) -> None:
+        unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        worker = fixture_worker("impl2", unit.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        current = staff.native_id(fixture_runtime_id("roster-replaced-thread"))
+        fixture_session(current, staff.CodexBackend(self.root / "codex-home"))
+        worker = staff.update_current_session(worker.current_session, current)
+        self._write_mesh(self.director_run, {
+            worker.name: {"staff_id": worker.id, "status": "paused", "role": "review"},
+        })
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        entries = self._entries()
+        found = next(entry for entry in entries.values() if entry.name == worker.name)
+        self.assertEqual(found.thread, roster.CodexThread(current))
+        self.assertIsInstance(found.director, roster.UnderDirector)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertNotIn("thread_id", (self.director_run / "mesh_roster.json").read_text())
+
     def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
         full = roster.unit_labels(list(self._entries().values()))
-        wanted = ["sid-director", "sid-runner", "sid-free"]
+        wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"]
         with mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as scan, \
              mock.patch.object(codex_daemon, "loaded_sessions", side_effect=AssertionError("no daemon")) as daemon, \
              mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts:
             fast = roster.unit_labels_for(wanted, self.environment)
         self.assertEqual(fast, {session_id: full[session_id] for session_id in wanted})
-        self.assertEqual(fast["sid-director"], roster.UnitLabels("director", "alpha", "unit-one"))
+        self.assertEqual(fast["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("director", "alpha", "unit-one"))
         scan.assert_not_called()
         daemon.assert_not_called()
         accounts.assert_not_called()
@@ -393,21 +627,22 @@ class RosterTests(unittest.TestCase):
     def test_transferred_director_keeps_its_new_production_without_a_new_document_row(self) -> None:
         receiving = showrunner_relationship("receiving")
         row = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
-        _ = staff.move(row.id, receiving.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiving.id))
         env_file = self.root / "herdr-proc/991100/environ"
-        _ = env_file.write_bytes(env_file.read_bytes() + f"\0STAFF_ID={row.id}".encode())
+        _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
-        _ = doc.write_text("# Receiving\n\n## Units\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n")
+        _ = doc.write_text("# Receiving\n")
+        _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:sid-receiving\nCHECK=zsh /scripts/production_check.sh {doc}\n")
-        self._write_session(str(os.getppid()), "receiving-runner", "sid-receiving", self.home / "receiving",
+        _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {receiving.id}\n")
+        self._write_session(str(os.getppid()), "receiving-runner", "522e6367-86e1-5829-ada8-2c71b5c28c97", self.home / "receiving",
                             pid=os.getppid())
         director = self._entries()["director"]
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner,
-                         roster.UnderShowrunner("receiving", "receiving-runner", "session:sid-receiving"))
+                         roster.UnderShowrunner("receiving", "receiving-runner", "session:522e6367-86e1-5829-ada8-2c71b5c28c97"))
         self.assertNotIn("unit-one", doc.read_text())
 
     def test_full_roster_reads_the_staff_owner_once(self) -> None:
@@ -416,25 +651,65 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["director"].director, roster.DirectsUnit("unit-one"))
         self.assertEqual(reads.call_count, 1)
 
+    def test_stopped_mesh_run_uses_the_display_staff_record(self) -> None:
+        owner = unit_membership("alpha", "unit-one")
+        write_text_atomic(self.director_run / unit_runs.STATE_FILE, json.dumps({
+            unit_runs.OWNER_FIELD: owner.id, "status": "active",
+        }))
+        (self.sessions / "director.json").unlink()
+        (self.director_run / "heartbeat.log").touch()
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            entries = self._entries()
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(entries["alpha-impl"].director, roster.UnitWithoutRunningDirector("unit-one"))
+        self.assertEqual(entries["claude-worker"].director, roster.UnitWithoutRunningDirector("unit-one"))
+
+    def test_bad_run_pin_reports_the_cause_and_keeps_mesh_workers(self) -> None:
+        pin = self.director_run / "worker_transport"
+        for failure in ("invalid", "unreadable"):
+            with self.subTest(failure=failure):
+                if failure == "invalid":
+                    write_text_atomic(pin, "junk\n")
+                else:
+                    pin.unlink()
+                    pin.mkdir()
+                result = roster.roster(os.environ, roster.ThisMachine())
+                entries = {entry.name: entry for entry in result.entries}
+                self.assertEqual(entries["alpha-impl"].reach, roster.Messageable("worker:director-run/alpha-impl"))
+                self.assertTrue(any(str(pin) in problem for problem in result.problems), result.problems)
+                if failure == "invalid":
+                    self.assertTrue(any("junk" in problem for problem in result.problems), result.problems)
+
+    def test_backfilled_retired_rows_leave_full_roster_and_fast_session_labels_unchanged(self) -> None:
+        before = self._entries()
+        wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"]
+        labels = roster.unit_labels_for(wanted, self.environment)
+        old = unit_membership("alpha", "retired")
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=old.worktree)
+        historical = showrunner_relationship("wrapped")
+        _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
+        self.assertEqual(self._entries(), before)
+        self.assertEqual(roster.unit_labels_for(wanted, self.environment), labels)
+        self.assertIsNotNone(staff.by_id(old.id))
+
     def test_session_labels_read_the_staff_owner_once(self) -> None:
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
-            labels = roster.unit_labels_for(["sid-director", "sid-runner"], self.environment)
-        self.assertEqual(labels["sid-director"], roster.UnitLabels("director", "alpha", "unit-one"))
+            labels = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"], self.environment)
+        self.assertEqual(labels["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("director", "alpha", "unit-one"))
         self.assertEqual(reads.call_count, 1)
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
-        showrunner_launch(showrunner_relationship("alpha"), "sid-runner", self.environment)
-        _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
-        _ = self.production_doc.write_text(
-            "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
-        )
+        owner = showrunner_relationship("alpha")
+        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
+        showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
+        _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
-        fast = roster.unit_labels_for(["sid-director"], self.environment)
-        self.assertEqual(full["sid-director"], roster.UnitLabels("director", "builds", "unit-one"))
-        self.assertEqual(fast, {"sid-director": full["sid-director"]})
+        fast = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], self.environment)
+        self.assertEqual(full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("director", "builds", "unit-one"))
+        self.assertEqual(fast, {"17e44ec4-3e24-5ae1-b10d-5cf30de9455b": full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"]})
 
-    def test_duplicate_unit_marks_leave_both_sessions_unnamed_on_both_paths(self) -> None:
-        self._write_session("duplicate", "other-director", "sid-duplicate", self.home / "other", pid=991101)
+    def test_unregistered_runtime_with_the_same_unit_labels_keeps_the_registered_units_owner(self) -> None:
+        self._write_session("duplicate", "other-director", "6e203923-e688-516d-a58a-3a0712762814", self.home / "other", pid=991101)
         self._herdr_process(991101, 991099, ["claude"], HERDR_PANE_ID="w1:p2",
                             SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
         running_session = sessions.running_session
@@ -445,12 +720,12 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(sessions, "running_session", side_effect=fixture_running), \
              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(self.environment, roster.ThisMachine())
-            fast = roster.unit_labels_for(["sid-director", "sid-duplicate"], self.environment)
+            fast = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "6e203923-e688-516d-a58a-3a0712762814"], self.environment)
         full = roster.unit_labels(found.entries)
-        self.assertTrue(any("its mark is on herdr sessions" in problem for problem in found.problems))
+        self.assertFalse(any("its mark is on herdr sessions" in problem for problem in found.problems))
         expected = {
-            "sid-director": roster.UnitLabels("director", "—", "—"),
-            "sid-duplicate": roster.UnitLabels("other-director", "—", "—"),
+            "17e44ec4-3e24-5ae1-b10d-5cf30de9455b": roster.UnitLabels("director", "alpha", "unit-one"),
+            "6e203923-e688-516d-a58a-3a0712762814": roster.UnitLabels("other-director", "—", "—"),
         }
         self.assertEqual({sid: full[sid] for sid in expected}, expected)
         self.assertEqual(fast, expected)
@@ -459,10 +734,12 @@ class RosterTests(unittest.TestCase):
         self, *arguments: str,
         daemon: list[codex_daemon.DaemonSession] | codex_daemon.DaemonUnreadable | None = None,
         here: bool = True,
+        native_identity: str = "acd50bad-5afa-5d3d-b155-3766b7d113e0",
     ) -> tuple[int, list[str], list[str]]:
         output, errors = io.StringIO(), io.StringIO()
         daemon_result = self._daemon_sessions() if daemon is None else daemon
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=daemon_result), \
+                mock.patch.object(staff, "runtime_id", return_value=native_identity), \
                 redirect_stdout(output), redirect_stderr(errors):
             result = roster.main([*( ["--here"] if here else []), *arguments])
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines()
@@ -496,25 +773,26 @@ class RosterTests(unittest.TestCase):
         )
 
     def test_durable_role_roster_uses_holder_reach_after_its_run_folder_is_gone(self) -> None:
+        member = designer_fixture(unit_membership("alpha", "unit-one").id,
+                                  "lasting-astra-designer", self.root / "codex-home")
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000046", "fixture-host", 2),
             "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("alpha", "unit-one"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "lasting-designer-alias", design_roles.RoleOpen("lasting-thread")),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "lasting-astra-designer", design_roles.RoleOpen(member.id)),
              design_roles.RoleInstance("reviewer", "lasting-reviewer-alias", design_roles.RoleNotOpened())))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-designer-alias": {
-            "thread_id": "lasting-thread", "status": "done"}}))
-        with mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("sid-director")):
-            found = self._entries()
-        entry = found["lasting-designer-alias"]
-        self.assertEqual(entry.thread, roster.CodexThread("lasting-thread"))
+        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
+            "staff_id": member.id, "status": "done"}}))
+        found = self._entries()
+        entry = found["lasting-astra-designer"]
+        self.assertEqual(entry.thread, roster.CodexThread(member.current_session))
         self.assertEqual(entry.role, "astra-designer")
-        self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
+        self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(entry.assignment, roster.HeldDesignRole("designer", str(mesh)))
         self.assertIsInstance(entry.reach, roster.CannotReceiveMessages)
-        self.assertEqual(sum(row.thread == roster.CodexThread("lasting-thread") for row in found.values()), 1)
+        self.assertEqual(sum(row.thread == roster.CodexThread(member.current_session) for row in found.values()), 1)
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
         entries = self._entries()
@@ -522,29 +800,29 @@ class RosterTests(unittest.TestCase):
 
         self.assertEqual(entries["runner"], roster.RosterEntry(
             machine=machine, kind="claude", role="showrunner", name="runner",
-            status="ready", reach=roster.Messageable("session:sid-runner"),
+            status="ready", reach=roster.Messageable("session:acd50bad-5afa-5d3d-b155-3766b7d113e0"),
             cwd=str(self.home / "projects" / "runner"),
             showrunner=roster.RunsProduction("alpha"),
             director=roster.NoDirector(),
             assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("sid-runner"),
+            session=roster.ClaudeSession("acd50bad-5afa-5d3d-b155-3766b7d113e0"),
             account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["director"], roster.RosterEntry(
             machine=machine, kind="claude", role="unit director", name="director",
-            status="working", reach=roster.Messageable("session:sid-director"),
+            status="working", reach=roster.Messageable("session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
             cwd=str(self.home / "projects" / "unit-one"),
             showrunner=roster.UnderShowrunner(
-                "alpha", "runner", "session:sid-runner",
+                "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
             ),
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("sid-director"),
+            session=roster.ClaudeSession("17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
             account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["claude-worker"].role, "worker")
         self.assertEqual(entries["claude-worker"].director, roster.UnderDirector(
-            "unit-one", "director", "session:sid-director",
+            "unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b",
         ))
         self.assertEqual(entries["claude-worker"].assignment, roster.WorkerAssignment(
             "test", str(self.director_run), roster.AssignmentUnrecorded(), "test",
@@ -567,10 +845,10 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(entries[name].status, status)
                 self.assertEqual(entries[name].role, "worker")
                 self.assertEqual(entries[name].director, roster.UnderDirector(
-                    "unit-one", "director", "session:sid-director",
+                    "unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b",
                 ))
                 self.assertEqual(entries[name].showrunner, roster.UnderShowrunner(
-                    "alpha", "runner", "session:sid-runner",
+                    "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
                 ))
                 expected_reach: roster.MessageReach = (
                     roster.Messageable(f"worker:director-run/{name}")
@@ -586,7 +864,7 @@ class RosterTests(unittest.TestCase):
         )
         self.assertEqual(
             entries["alpha-impl"].assignment,
-            roster.WorkerAssignment("no role", str(self.director_run), roster.AssignmentUnrecorded(), "impl"),
+            roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
         self.assertEqual(
             entries["adversary reviewer"].assignment,
@@ -605,15 +883,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["Codex window"].role, "freestanding")
         self.assertEqual(
             entries["Codex window"].reach,
-            roster.Messageable("codex:thread-window"),
+            roster.Messageable("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
         )
         self.assertNotIn("worker duplicate", entries)
 
     def test_text_nests_workers_and_marks_this_session(self) -> None:
         result, lines, errors = self._run_main()
         self.assertEqual((result, errors), (0, []))
-        runner = next(line for line in lines if "[session:sid-runner]" in line)
-        director = next(line for line in lines if "[session:sid-director]" in line)
+        runner = next(line for line in lines if "[session:acd50bad-5afa-5d3d-b155-3766b7d113e0]" in line)
+        director = next(line for line in lines if "[session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b]" in line)
         worker = next(line for line in lines if "[worker:director-run/alpha-impl]" in line)
         self.assertIn("(you)", runner)
         self.assertEqual(len(director) - len(director.lstrip()), len(runner) - len(runner.lstrip()) + 2)
@@ -627,9 +905,32 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(any(line.strip() == "your Codex sessions" for line in lines))
         self.assertTrue(any("~/projects/unit-one" in line for line in lines))
 
+    def test_claude_shell_status_shows_background_and_keeps_raw_data(self) -> None:
+        session_id = "acd50bad-5afa-5d3d-b155-3766b7d113e0"
+        self._write_session(str(os.getpid()), "runner", session_id,
+                            self.home / "projects" / "runner", status="shell")
+        self.assertEqual(self._entries()["runner"].status, "shell")
+        for here in (True, False):
+            with self.subTest(here=here):
+                result, lines, errors = self._run_main(here=here)
+                self.assertEqual((result, errors), (0, []))
+                runner = next(line for line in lines if f"[session:{session_id}]" in line)
+                self.assertIn("claude, background", runner)
+                self.assertNotIn("shell", runner)
+                result, lines, errors = self._run_main("--json", here=here)
+                self.assertEqual((result, errors), (0, []))
+                report = cast(dict[str, object], json.loads("\n".join(lines)))
+                entries = cast(list[dict[str, object]], report["entries"])
+                entry = next(row for row in entries if row["address"] == f"session:{session_id}")
+                self.assertEqual(entry["status"], "shell")
+                result, lines, errors = self._run_main("--snapshot", here=here)
+                self.assertEqual((result, errors), (0, []))
+                snapshot = roster.RosterSnapshot.decode("\n".join(lines)).result
+                self.assertEqual(next(row for row in snapshot.entries if row.name == "runner").status, "shell")
+
     def test_socketless_director_keeps_worker_links_and_json_addresses(self) -> None:
         self._write_session(
-            "director-new", "director", "sid-director", self.home / "projects" / "unit-one",
+            "director-new", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", self.home / "projects" / "unit-one",
             updated=20, with_socket=False,
         )
         entries = self._entries()
@@ -637,7 +938,7 @@ class RosterTests(unittest.TestCase):
         for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
             with self.subTest(worker=name):
                 self.assertEqual(entries[name].director, roster.UnderDirector(
-                    "unit-one", "director", "session:sid-director",
+                    "unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b",
                 ))
         result, lines, errors = self._run_main("--json")
         self.assertEqual((result, errors), (0, []))
@@ -647,18 +948,18 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(by_name["director"]["address"], "")
         for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
             with self.subTest(serialized_worker=name):
-                self.assertEqual(by_name[name]["director_address"], "session:sid-director")
+                self.assertEqual(by_name[name]["director_address"], "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b")
 
     def test_socketless_director_nests_its_workers_in_full_and_filtered_text(self) -> None:
         self._write_session(
-            "director-new", "director", "sid-director", self.home / "projects" / "unit-one",
+            "director-new", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", self.home / "projects" / "unit-one",
             updated=20, with_socket=False,
         )
         for arguments in ((), ("--kind", "codex")):
             with self.subTest(arguments=arguments):
                 result, lines, errors = self._run_main(*arguments)
                 self.assertEqual((result, errors), (0, []))
-                directors = [line for line in lines if "[session:sid-director]" in line]
+                directors = [line for line in lines if "[session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b]" in line]
                 self.assertEqual(len(directors), 1)
                 director = directors[0]
                 workers = ("alpha-impl",) if arguments else ("alpha-impl", "claude-worker")
@@ -685,9 +986,9 @@ class RosterTests(unittest.TestCase):
                     result = roster.main(["--here", *arguments])
                 lines = output.getvalue().splitlines()
                 self.assertEqual((result, errors.getvalue()), (0, ""))
-                runners = [line for line in lines if "[session:sid-runner]" in line]
+                runners = [line for line in lines if "[session:acd50bad-5afa-5d3d-b155-3766b7d113e0]" in line]
                 self.assertEqual(len(runners), 1)
-                director = next(line for line in lines if "[session:sid-director]" in line)
+                director = next(line for line in lines if "[session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b]" in line)
                 worker = next(line for line in lines if "[worker:director-run/alpha-impl]" in line)
                 self.assertEqual(len(director) - len(director.lstrip()),
                                  len(runners[0]) - len(runners[0].lstrip()) + 2)
@@ -698,31 +999,80 @@ class RosterTests(unittest.TestCase):
                 if arguments:
                     self.assertIn("(context)", runners[0])
 
-    def test_roster_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+    def test_roster_uses_staff_workers_and_leaves_old_ledger_files_unchanged(self) -> None:
         current = self.director_run / "workers"
         previous = self.director_run / "seats"
         _ = current.replace(previous)
         old_time = 1_700_000_000
         os.utime(previous, (old_time, old_time))
+        before = previous.read_bytes(), previous.stat().st_mtime_ns
         worker = self._entries()["claude-worker"]
         self.assertEqual(worker.assignment, roster.WorkerAssignment("test", str(self.director_run), roster.AssignmentUnrecorded(), "test"))
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime, old_time)
-        modified = current.stat().st_mtime_ns
+        self.assertFalse(current.exists())
+        self.assertEqual((previous.read_bytes(), previous.stat().st_mtime_ns), before)
         self.assertEqual(self._entries()["claude-worker"].assignment, worker.assignment)
-        self.assertEqual(current.stat().st_mtime_ns, modified)
-        self._write_session("late-worker", "late-worker", "late-worker-id", self.home / "late-project")
+        native = fixture_runtime_id("late-worker")
+        self._write_session("late-worker", "late-worker", native, self.home / "late-project")
         self.assertEqual(self._entries()["late-worker"].role, "freestanding")
         with previous.open("a", encoding="utf-8") as ledger:
-            _ = ledger.write("late-worker-id\talpha-impl\n")
-        self.assertIn("late-worker-id", current.read_text(encoding="utf-8"))
-        modified = current.stat().st_mtime_ns
+            _ = ledger.write(f"{native}\tlate-impl\n")
+        modified = previous.read_bytes(), previous.stat().st_mtime_ns
+        self.assertEqual(self._entries()["late-worker"].role, "freestanding")
+        _ = fixture_worker("late-impl", unit_membership("alpha", "unit-one").id, runtime_id=native)
         late_worker = self._entries()["late-worker"]
         self.assertEqual(late_worker.role, "worker")
         self.assertEqual(late_worker.assignment, roster.WorkerAssignment("impl", str(self.director_run), roster.AssignmentUnrecorded(), "impl"))
         self.assertEqual(late_worker.director, worker.director)
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual((previous.read_bytes(), previous.stat().st_mtime_ns), modified)
+
+    def test_switched_worker_resolves_once_before_and_after_a_transcript_and_after_returning_to_codex(self) -> None:
+        from scripts.production import broadcast
+
+        native = staff.native_id(fixture_runtime_id("switched-claude-session"))
+        unit = unit_membership("alpha", "unit-one")
+        worker = staff.ensure_worker(native, "switched", unit.id)
+        self._write_session("switched", "switched-claude", native, self.home / "switched")
+        mesh = self.director_run / "mesh_roster.json"
+        _ = mesh.write_text(json.dumps({worker.name: {"staff_id": worker.id, "status": "done"}}))
+        saved = mesh.read_bytes()
+        self.assertEqual(sessions.transcript_locations(native), [])
+        for transcript in (False, True):
+            with self.subTest(transcript=transcript):
+                if transcript:
+                    fixture_session(native, staff.ClaudeBackend())
+                with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+                    observed = roster.roster(os.environ, roster.ThisMachine())
+                membership = staff.snapshot()
+                matches = send.matching_recipients(f"session:{native}", send.LocalOnly(), observed,
+                                                   membership=membership)
+                self.assertIsInstance(matches, send.RecipientMatches)
+                assert isinstance(matches, send.RecipientMatches)
+                self.assertEqual(len(matches.entries), 1)
+                recipient = matches.entries[0]
+                self.assertEqual((recipient.kind, recipient.role, recipient.session),
+                                 ("claude", "worker", roster.ClaudeSession(native)))
+                self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
+                route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
+                                               membership=membership)
+                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))
+                self.assertTrue(broadcast.selects(broadcast.WorkersOfUnit(
+                    "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b", unit.name, recipient.machine), recipient))
+                self.assertFalse(roster.is_top_level(recipient))
+                self.assertEqual(mesh.read_bytes(), saved)
+        codex = staff.native_id(fixture_runtime_id("switched-back-to-codex"))
+        _ = staff.update_current_session(native, codex)
+        fixture_session(codex, staff.CodexBackend(self.root / "return-codex"))
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            observed = roster.roster(os.environ, roster.ThisMachine())
+        matches = send.matching_recipients(f"session:{codex}", send.LocalOnly(), observed, membership=staff.snapshot())
+        self.assertIsInstance(matches, send.RecipientMatches)
+        assert isinstance(matches, send.RecipientMatches)
+        self.assertEqual(len(matches.entries), 1)
+        self.assertEqual((matches.entries[0].kind, matches.entries[0].role, matches.entries[0].thread),
+                         ("codex", "worker", roster.CodexThread(codex)))
+        self.assertEqual(mesh.read_bytes(), saved)
 
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
@@ -731,7 +1081,7 @@ class RosterTests(unittest.TestCase):
             (worker.role, worker.director, worker.assignment),
             (
                 "worker",
-                roster.UnderDirector("unit-one", "director", "session:sid-director"),
+                roster.UnderDirector("unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
                 roster.WorkerAssignment("test", str(self.director_run), roster.AssignmentUnrecorded(), "test"),
             ),
         )
@@ -750,26 +1100,87 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("review", str(self.director_run), "review", "plain"),
         )
 
-    def test_codex_worker_without_recorded_role_has_no_role(self) -> None:
+    def test_unpublished_roster_worker_reports_its_missing_staff_reference(self) -> None:
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "unpublished": {"status": "starting", "launcher_pid": os.getpid()},
+        }))
+        found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertTrue(any("unpublished" in problem for problem in found.problems), found.problems)
+        self.assertNotIn("unpublished", {entry.name for entry in found.entries})
+
+    def test_codex_worker_reads_its_role_from_staff_without_a_roster_role(self) -> None:
         self.assertEqual(
             self._entries()["alpha-impl"].assignment,
-            roster.WorkerAssignment("no role", str(self.director_run), roster.AssignmentUnrecorded(), "impl"),
+            roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
+
+    def test_a_roster_takes_folder_and_status_from_the_registry_read_it_receives(self) -> None:
+        registry = sessions.read_registry()
+        solo = next(item.record for item in registry.entries if item.record["name"] == "solo-director")
+        (self.sessions / "solo.json").unlink()
+
+        found = roster.roster(os.environ, roster.ThisMachine(), registry=registry)
+
+        entry = next(entry for entry in found.entries if entry.name == "solo-director")
+        self.assertEqual((entry.cwd, entry.status), (solo.get("cwd"), "waiting"))
+
+    def test_a_send_by_name_stops_when_the_session_folder_cannot_be_listed(self) -> None:
+        missing = self.root / "no-session-folder"
+        membership = staff.snapshot()
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(missing)}):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertIn(f"Claude session records: cannot list {missing}", result.problems)
+        with mock.patch.object(roster, "peer_roster") as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.LocalRosterIncomplete)
+        peer.assert_not_called()
+
+    def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit"}))
+        lost = unit_labels.LiveRun(run, unit_labels.NoRunningDirector())
+        problems: list[str] = []
+
+        found = roster._worker_ledger(lost, problems, staff.snapshot())  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(found, [])
+        self.assertEqual(problems, [f"{run}: run owner missing-unit: unit staff row is unavailable"])
+
+    def test_a_stopped_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit", "status": "active"}))
+        self._write_mesh(run, {"lost-worker": {"thread_id": fixture_runtime_id("lost-worker"), "status": "done", "role": "impl"}})
+        _ = (run / unit_runs.HEARTBEAT).write_text("live\n", encoding="utf-8")
+
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertIn(f"{run}: run owner missing-unit: unit staff row is unavailable", found.problems)
+        self.assertNotIn("lost-worker", {entry.name for entry in found.entries})
+        self.assertTrue(found.entries, found.problems)
+
+    def test_a_roster_build_reads_the_role_log_once(self) -> None:
+        with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
+            entries = self._entries()
+
+        self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
+        self.assertEqual(read.call_count, 1)
 
     def test_mesh_assignment_states_come_from_records_and_not_names(self) -> None:
         self._write_mesh(self.director_run, {
-            "arbitrary": {"thread_id": "thread-impl", "status": "done", "role": "impl"},
-            "another": {"thread_id": "thread-test", "status": "done", "role": "test"},
-            "repair": {"thread_id": "thread-fix", "status": "done", "role": "fix"},
-            "arbitrary-reviewer": {"thread_id": "thread-review", "status": "done", "role": "review"},
-            "legacy-impl": {"thread_id": "thread-old", "status": "done"},
-            "invalid-review": {"thread_id": "thread-bad", "status": "done", "role": "designer"},
+            "arbitrary": {"thread_id": "c11994bc-45da-585c-bb8c-b9aa62be4800", "status": "done", "role": "impl"},
+            "another": {"thread_id": "78c792af-377b-51b5-8da7-bddbe198f72c", "status": "done", "role": "test"},
+            "repair": {"thread_id": fixture_runtime_id("assignment-repair"), "status": "done", "role": "fix"},
+            "arbitrary-reviewer": {"thread_id": fixture_runtime_id("assignment-reviewer"), "status": "done", "role": "review"},
+            "legacy-impl": {"thread_id": "05a8f984-dd3e-5322-970d-625b046472de", "status": "done", "role": "impl"},
         })
-        entries = self._entries()
+        found = roster.roster(os.environ, roster.ThisMachine())
+        entries = {entry.name: entry for entry in found.entries}
         for name, expected in (("arbitrary", "impl"), ("another", "test"), ("repair", "fix"),
                                ("arbitrary-reviewer", "review"),
-                               ("legacy-impl", roster.AssignmentUnrecorded()),
-                               ("invalid-review", roster.AssignmentUnreadable("designer"))):
+                               ("legacy-impl", "impl")):
             with self.subTest(name=name):
                 entry = entries[name]
                 self.assertEqual(entry.role, "worker")
@@ -779,13 +1190,12 @@ class RosterTests(unittest.TestCase):
                 restored = roster.RosterSnapshot.decode(roster.RosterSnapshot(roster.Roster([entry], [])).encode()).result.entries[0]
                 self.assertEqual(restored.assignment, entry.assignment)
                 self.assertEqual(restored.thread, entry.thread)
-        self.assertIsInstance(roster.shown_name(entries["legacy-impl"]).job, roster.JobUnassigned)
-        self.assertIsInstance(roster.shown_name(entries["invalid-review"]).job, roster.JobUnassigned)
+        self.assertNotIsInstance(roster.shown_name(entries["legacy-impl"]).job, roster.JobUnassigned)
 
     def test_display_rename_keeps_record_keys_and_adds_a_structured_job(self) -> None:
         entry = replace(self._entry("identity-impl", "worker", "worker:run/identity-impl"),
                         showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                        director=roster.UnderDirector("roles-unit", "director", "session:director"),
+                        director=roster.UnderDirector("roles", "director", "session:director"),
                         assignment=roster.WorkerAssignment("impl", "/fixture/run", "impl", "impl"))
         snapshot = roster.RosterSnapshot(roster.Roster([entry], [])).encode()
         with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")), \
@@ -803,7 +1213,7 @@ class RosterTests(unittest.TestCase):
 
     def test_rendering_and_serializing_multiple_jobs_share_one_configuration_read(self) -> None:
         job = roster.ShownJob("worker", roster.JobSlot("impl"))
-        shown = roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart("roles-unit"), job, "worker:run/identity")
+        shown = roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart("roles"), job, "worker:run/identity")
         with mock.patch.object(names, "load_names", return_value=fixture_names(worker="builder")) as load:
             for attempt in range(3):
                 with self.subTest(attempt=attempt):
@@ -841,7 +1251,7 @@ class RosterTests(unittest.TestCase):
     def test_invalid_name_configuration_renders_the_address_and_reports_once(self) -> None:
         entry = replace(self._entry("identity", "unit director", "session:identity"),
                         showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                        director=roster.DirectsUnit("roles-unit"))
+                        director=roster.DirectsUnit("roles"))
         error = names.InvalidNames("/fixture/names.toml", "invalid fixture table")
         output = io.StringIO()
         with mock.patch.object(names, "runtime_names", wraps=names.runtime_names), \
@@ -855,17 +1265,17 @@ class RosterTests(unittest.TestCase):
     def test_shown_names_keep_organizational_role_assignment_and_slot_distinct(self) -> None:
         base = replace(self._entry("unrelated-name", "worker", "worker:run/arbitrary"),
                        showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
-                       director=roster.UnderDirector("roles-unit", "director", "session:director"))
+                       director=roster.UnderDirector("roles", "director", "session:director"))
         for role, slot, expected in (("impl", "impl", "worker impl"), ("test", "test", "worker test"),
-                                     ("review", "code6", "code reviewer 6"),
-                                     ("review", "code7", "code reviewer 7")):
+                                     ("review", "review", "code reviewer review"),
+                                     ("review", "review2", "code reviewer review2")):
             with self.subTest(slot=slot):
                 entry = replace(base, assignment=roster.WorkerAssignment(
                     role, "/run", roster.worker_role({"role": role}), slot))
                 self.assertEqual(roster.shown_name(entry).render(), f"sdlc · roles · {expected}")
                 self.assertEqual(entry.role, "worker")
                 self.assertEqual(entry.reach, roster.Messageable("worker:run/arbitrary"))
-        director = replace(base, role="unit director", director=roster.DirectsUnit("roles-unit"),
+        director = replace(base, role="unit director", director=roster.DirectsUnit("roles"),
                            assignment=roster.NotAWorker())
         self.assertEqual(roster.shown_name(director).render(), "sdlc · roles · unit director")
         runner = replace(director, role="showrunner", showrunner=roster.RunsProduction("sdlc"))
@@ -876,7 +1286,7 @@ class RosterTests(unittest.TestCase):
                         assignment=roster.WorkerAssignment("test", "/run", "test", "test"))
         self.assertEqual(roster.shown_name(entry).render(), "worker test")
         self.assertEqual(roster.shown_name(replace(entry, director=roster.UnderDirector(
-            "roles-unit", "director", "session:director"))).render(), "roles · worker test")
+            "roles", "director", "session:director"))).render(), "roles · worker test")
         self.assertEqual(roster.shown_name(replace(entry, showrunner=roster.ProductionWithoutRunningShowrunner(
             "sdlc"))).render(), "sdlc · worker test")
         free = replace(entry, role="freestanding", assignment=roster.NotAWorker())
@@ -887,10 +1297,10 @@ class RosterTests(unittest.TestCase):
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),
                            showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
-                           director=roster.UnderDirector("roles-unit", "director", "session:director"),
+                           director=roster.UnderDirector("roles", "director", "session:director"),
                            assignment=roster.WorkerAssignment("impl", "/run", "impl", "impl"),
                            thread=roster.CodexThread("fixed-thread"))
-        renamed = replace(original, director=roster.UnderDirector("records-unit", "director", "session:director"))
+        renamed = replace(original, director=roster.UnderDirector("records", "director", "session:director"))
         transferred = replace(renamed, showrunner=roster.UnderShowrunner("tools", "next", "session:next"))
         for entry, expected in ((original, "sdlc · roles · worker impl"),
                                 (renamed, "sdlc · records · worker impl"),
@@ -902,41 +1312,62 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(decoded.thread, roster.CodexThread("fixed-thread"))
                 self.assertEqual(decoded.reach, roster.Messageable("worker:run/fixed-address"))
 
-    def test_pool_titles_follow_each_number_and_current_lease(self) -> None:
-        pool = self.root / "review-pool"
-        state = pool / "sdlc" / "pool.json"
-        state.parent.mkdir(parents=True)
-        reviewers: dict[str, object] = {
-            name: {"type": "code", "lease": {"unit": "roles-unit", "ordinal": number}}
-            for number, name in ((6, "code6"), (7, "code7"))
-        }
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        with mock.patch.dict(os.environ, {"REVIEW_POOL_STATE": str(pool)}):
-            for number, name in ((6, "code6"), (7, "code7")):
-                with self.subTest(name=name):
-                    shown = roster.mesh_shown_name(str(pool / "sdlc" / "mesh" / name), name, {"role": "review"})
-                    self.assertEqual(shown.render(), f"sdlc · roles · code reviewer {number}")
-                    self.assertEqual(shown.address, name)
-            reviewers["code6"] = {"type": "code", "lease": {"unit": "other-unit", "ordinal": 1}}
-            _ = state.write_text(json.dumps({"reviewers": reviewers}))
-            moved = roster.mesh_shown_name(str(pool / "sdlc" / "mesh" / "code6"), "code6", {"role": "review"})
-            self.assertEqual(moved.render(), "sdlc · other · code reviewer 6")
-            self.assertEqual(moved.address, "code6")
 
-    def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
+    def test_bad_durable_binding_leaves_a_named_peer_send_quiet(self) -> None:
+        _ = write_empty_binding_record(self.root)
+        peer = self._entry('natedev', 'freestanding', 'session:peer-session')
+        os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
+        output, errors = io.StringIO(), io.StringIO()
+        doc = self.root / 'peer-production.md'
+        _ = doc.write_text('# Peer production\n')
+        local = staff.local_snapshot()
+        membership = staff.StaffSnapshot((*local.rows, staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
+            'natedev', staff.StaffRoot(), current_session=staff.StaffId('peer-session'),
+            doc=staff.LiveDoc('natedev', doc))))
+        with mock.patch.object(staff, 'snapshot', return_value=membership), \
+                mock.patch.object(send, 'STATE', self.root / 'send-state'), \
+                mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
+                mock.patch.object(send, 'user', side_effect=AssertionError('no real notification')), \
+                redirect_stdout(output), redirect_stderr(errors):
+            code = send.main(['--to', 'natedev', '--from', 'fixture-reviewer', '--text', 'owner update'])
+        self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
+        self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(deliver.call_count, 1)
+        forwarded = cast(send.Message, deliver.call_args.args[0])
+        self.assertEqual(forwarded.to, 'session:peer-session')
+        self.assertEqual(forwarded.text, 'owner update')
+
+    def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
+        bad = write_empty_binding_record(self.root)
+        code, output, errors = self._run_main('--json')
+        self.assertEqual(code, 0, errors)
+        report = cast(dict[str, object], json.loads('\n'.join(output)))
+        self.assertEqual(report['problems'], [])
+        self.assertEqual(report['warnings'], [f'durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        result = roster.roster(os.environ, roster.ThisMachine())
+        decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
+        self.assertEqual(decoded.warnings, result.warnings)
+        self.assertEqual(decoded.problems, [])
+
+    def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
-        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
-            "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("sdlc", "roles-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "design-address", design_roles.RoleNotOpened()),
-             design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleNotOpened())))
+        unit = unit_membership("sdlc", "roles")
+        runner = showrunner_relationship("sdlc")
         mesh = str(design_roles.mesh_directory(design_id))
-        for holder, prefix in ((design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                               (design_roles.ShowrunnerHolder("sdlc"), "sdlc")):
-            design_roles._save(replace(design, holder=holder))  # pyright: ignore[reportPrivateUsage]
+        for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
+            designer = fixture_worker("design-address", parent.id)
+            reviewer = fixture_worker("review-address", parent.id)
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
+                "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
+                "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.current_session)),
+                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.current_session))))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
-                with self.subTest(holder=holder, role=held_role):
+                with self.subTest(parent=parent, role=held_role):
                     shown = roster.mesh_shown_name(mesh, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)
@@ -944,16 +1375,30 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(roster.mesh_shown_name(mesh, "review-address", {
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
+    def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
+        showrunner = fixture_member("showrunner", name="docless")
+        owner = fixture_member("unit", name="docless", parent=showrunner.id)
+        run = self.root / "unplaced-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: owner.id}))
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            for _ in range(2):
+                self.assertEqual(roster.mesh_shown_name(
+                    str(run), "unplaced-worker", {"role": "impl"}).render(),
+                    "unplaced-worker")
+        self.assertEqual(errors.getvalue(), "")
+
     def test_mesh_worker_slots_keep_full_launch_identity_in_roster_and_titles(self) -> None:
-        _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("sid-director\n")
         self._write_mesh(self.director_run, {
             "alpha-render-a": {"thread_id": "render-thread", "status": "done", "role": "impl"},
             "alpha-physics-a": {"thread_id": "physics-thread", "status": "done", "role": "impl"},
             "arbitrary-address": {"thread_id": "explicit-thread", "status": "done", "role": "test", "slot": "test-b"},
         })
+        records = cast(dict[str, dict[str, object]], json.loads((self.director_run / "mesh_roster.json").read_text()))
         for slot in ("render-a", "physics-a"):
             _ = (self.director_run / f"impl_worker_{slot}.json").write_text(json.dumps({
-                "name": f"alpha-{slot}", "slot": slot}))
+                "staff_id": records[f"alpha-{slot}"]["staff_id"], "slot": slot}))
         entries = self._entries()
         for name, slot in (("alpha-render-a", "render-a"), ("alpha-physics-a", "physics-a"),
                            ("arbitrary-address", "test-b")):
@@ -962,139 +1407,31 @@ class RosterTests(unittest.TestCase):
                 assert isinstance(entry.assignment, roster.WorkerAssignment)
                 self.assertEqual(entry.assignment.slot, slot)
                 self.assertEqual(roster.shown_name(entry).render(), f"alpha · unit-one · worker {slot}")
-                record: dict[str, object] = {"role": entry.assignment.role}
+                record: dict[str, object] = dict(records[name])
                 if name == "arbitrary-address":
                     record["slot"] = slot
                 title = roster.mesh_shown_name(str(self.director_run), name, record)
                 self.assertEqual(title.render(), f"alpha · unit-one · worker {slot}")
                 self.assertEqual(title.address, name)
 
-    def test_roster_discovers_pool_reviewers_and_tracks_lease_changes_without_duplicate_daemon_rows(self) -> None:
-        pool = self.root / "review-pool" / "sdlc"
-        pool.mkdir(parents=True)
-        state = pool / "pool.json"
-        reviewers: dict[str, object] = {
-            "code6": {"type": "code", "lease": {"unit": "roles-unit"}},
-            "ui2": {"type": "ui", "lease": None},
-            "code7": {"type": "code", "lease": {"unit": "roles-unit"}},
-        }
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        mesh = pool / "mesh" / "3"
-        self._write_mesh(mesh, {
-            "code6": {"thread_id": "pool-code", "status": "running", "role": "review"},
-            "ui2": {"thread_id": "pool-ui", "status": "done", "role": "review"},
-            "code7": {"thread_id": "pool-ended", "status": "ended", "role": "review"},
-        })
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
-            codex_daemon.DaemonSession("pool-code", "daemon-alias", str(self.root), "idle")]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        entries = {entry.name: entry for entry in result.entries}
-        self.assertNotIn("daemon-alias", entries)
-        self.assertNotIn("code7", entries)
-        code, ui = entries["code6"], entries["ui2"]
-        self.assertEqual(code.role, "worker")
-        self.assertEqual(code.assignment, roster.WorkerAssignment("review", str(mesh), "review", "code6", "code"))
-        self.assertEqual(code.reach, roster.Messageable("worker:review-pool/sdlc/3/code6"))
-        self.assertEqual(code.thread, roster.CodexThread("pool-code"))
-        self.assertEqual(roster.shown_name(code).render(), "sdlc · roles · code reviewer 6")
-        self.assertEqual(roster.shown_name(ui).render(), "sdlc · UI reviewer 2")
-        self.assertIsInstance(roster.shown_name(ui).unit, roster.NoUnit)
-        reviewers["code6"] = {"type": "code", "lease": {"unit": "next-unit"}}
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        moved = self._entries()["code6"]
-        self.assertEqual(roster.shown_name(moved).render(), "sdlc · next · code reviewer 6")
-        self.assertEqual((moved.thread, moved.reach, moved.assignment), (code.thread, code.reach, code.assignment))
 
     def test_named_launch_record_wins_over_another_workers_matching_suffix(self) -> None:
-        _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("sid-director\n")
         self._write_mesh(self.director_run, {
             "arbitrary-impl": {"thread_id": "named-thread", "status": "running", "role": "test"}})
+        records = cast(dict[str, dict[str, object]], json.loads((self.director_run / "mesh_roster.json").read_text()))
         for slot, name in (("impl", "another-worker"), ("test", "arbitrary-impl")):
             _ = (self.director_run / f"impl_worker_{slot}.json").write_text(json.dumps({
-                "name": name, "slot": slot}))
+                "staff_id": records[name]["staff_id"] if name in records else fixture_runtime_id(name), "slot": slot}))
         entry = self._entries()["arbitrary-impl"]
         self.assertIsInstance(entry.assignment, roster.WorkerAssignment)
         assert isinstance(entry.assignment, roster.WorkerAssignment)
         self.assertEqual(entry.assignment.slot, "test")
         self.assertEqual(roster.shown_name(entry).render(), "alpha · unit-one · worker test")
-        title = roster.mesh_shown_name(str(self.director_run), "arbitrary-impl", {"role": "test"})
+        title = roster.mesh_shown_name(str(self.director_run), "arbitrary-impl", records["arbitrary-impl"])
         self.assertEqual(title.render(), "alpha · unit-one · worker test")
 
-    def test_pool_addresses_resolve_separately_across_productions_with_the_same_run_and_name(self) -> None:
-        meshes: dict[str, Path] = {}
-        for slug in ("sdlc", "hana"):
-            pool = self.root / "review-pool" / slug
-            pool.mkdir(parents=True)
-            _ = (pool / "pool.json").write_text(json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": None}}}))
-            meshes[slug] = pool / "mesh" / "3"
-            self._write_mesh(meshes[slug], {
-                "code6": {"thread_id": f"{slug}-thread", "status": "running", "role": "review"}})
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(result.problems, [])
-        reviewers = [entry for entry in result.entries if entry.name == "code6"]
-        self.assertEqual(len(reviewers), 2)
-        addresses: set[str] = set()
-        for entry in reviewers:
-            assert isinstance(entry.reach, roster.Messageable)
-            assert isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-            addresses.add(entry.reach.address)
-            recipient = send.resolve_recipient(entry.reach.address, send.LocalOnly(), result)
-            self.assertEqual(recipient, send.CodexWorkerRecipient(
-                entry.reach.address, "code6", str(meshes[entry.showrunner.production])))
-        self.assertEqual(len(addresses), 2)
-        unit_worker = next(entry for entry in result.entries if entry.name == "alpha-impl")
-        self.assertEqual(unit_worker.reach, roster.Messageable("worker:director-run/alpha-impl"))
 
-    def test_leased_pool_reviewers_join_only_their_productions_unit_broadcast(self) -> None:
-        for slug in ("alpha", "other"):
-            pool = self.root / "review-pool" / slug
-            pool.mkdir(parents=True)
-            _ = (pool / "pool.json").write_text(json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": {"unit": "unit-one"}}}}))
-            self._write_mesh(pool / "mesh" / "3", {
-                "code6": {"thread_id": f"{slug}-thread", "status": "running", "role": "review"}})
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(result.problems, [])
-        director = next(entry for entry in result.entries if entry.name == "director")
-        audience = broadcast.WorkersOfUnit("session:sid-director", "unit-one", director.machine)
-        reviewers = [entry for entry in result.entries if entry.name == "code6"]
-        self.assertEqual(len(reviewers), 2)
-        for entry in reviewers:
-            assert isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-            if entry.showrunner.production == "alpha":
-                self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
-                self.assertTrue(broadcast.selects(audience, entry))
-            else:
-                self.assertEqual(entry.director, roster.UnderDirector("unit-one", "", ""))
-                self.assertFalse(broadcast.selects(audience, entry))
 
-        # A lease survives the director going away; its address does not.
-        (self.sessions / "director.json").unlink()
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            offline = roster.roster(os.environ, roster.ThisMachine())
-        leased = next(entry for entry in offline.entries if entry.name == "code6"
-                      and isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-                      and entry.showrunner.production == "alpha")
-        self.assertEqual(leased.director, roster.UnderDirector("unit-one", "", ""))
-        self.assertFalse(broadcast.selects(audience, leased))
-
-    def test_unreadable_pool_reports_one_problem_without_listing_partial_reviewers(self) -> None:
-        pool = self.root / "review-pool" / "sdlc"
-        pool.mkdir(parents=True)
-        self._write_mesh(pool / "mesh" / "1", {
-            "code6": {"thread_id": "pool-code", "status": "running", "role": "review"}})
-        for text in ("broken JSON", json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": None}, "ui2": {"type": "unknown"}}})):
-            with self.subTest(text=text):
-                _ = (pool / "pool.json").write_text(text)
-                result = roster.roster(os.environ, roster.ThisMachine())
-                self.assertFalse(any(entry.name == "code6" for entry in result.entries))
-                problems = [problem for problem in result.problems if "review pool" in problem]
-                self.assertEqual(len(problems), 1, result.problems)
-                self.assertIn(str(pool / "pool.json"), problems[0])
 
     def test_legacy_snapshot_assignment_is_unrecorded_and_unknown_organization_is_rejected(self) -> None:
         entry = self._entry("old-impl", "worker", "worker:old/old-impl")
@@ -1112,7 +1449,7 @@ class RosterTests(unittest.TestCase):
         mesh = str(self.root / "held-design")
         base = replace(self._entry("unrelated-name", "worker", "worker:held/arbitrary", kind="codex"),
                        showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                       director=roster.UnderDirector("roles-unit", "director", "session:director"))
+                       director=roster.UnderDirector("roles", "director", "session:director"))
         entries = [
             replace(base, role="astra-designer", name="design-address",
                     assignment=roster.HeldDesignRole("designer", mesh),
@@ -1233,11 +1570,11 @@ class RosterTests(unittest.TestCase):
             "production": "alpha", "unit": "unit-one",
             "working_dir": str(self.home / "projects" / "unit-one"),
         }))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
-            "alpha-impl": {"thread_id": "thread-shared", "status": "running", "role": "impl",
+        self._publish_roster(self.director_run / "mesh_roster.json", {
+            "alpha-impl": {"thread_id": "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "status": "running", "role": "impl",
                            "launcher_pid": os.getpid()},
-            "alpha-fix": {"thread_id": "thread-fix", "status": "done", "role": "fix"},
-        }))
+            "alpha-fix": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done", "role": "fix"},
+        })
         _ = (self.director_run / "board.log").write_text("2026-10-29T12:00:00Z [test] handoff: role=impl fixture\n")
         before = self._entries()
         (self.sessions / "director.json").unlink()
@@ -1264,7 +1601,7 @@ class RosterTests(unittest.TestCase):
         second_run = self.runs / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {
             "alpha-impl": {
-                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "thread_id": "a23f7af5-2a2d-5558-9c4d-2b49cf96bfa0", "turn_id": "turn-other-run",
                 "status": "running", "launcher_pid": os.getpid(), "role": "impl",
             },
         })
@@ -1296,7 +1633,7 @@ class RosterTests(unittest.TestCase):
         second_run = former / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {
             "alpha-impl": {
-                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "thread_id": "a23f7af5-2a2d-5558-9c4d-2b49cf96bfa0", "turn_id": "turn-other-run",
                 "status": "running", "launcher_pid": os.getpid(), "role": "impl",
             },
         })
@@ -1320,7 +1657,7 @@ class RosterTests(unittest.TestCase):
     def test_newer_dead_record_does_not_supply_live_session_details(self) -> None:
         dead_cwd = self.home / "projects" / "dead-resume"
         self._write_session(
-            "free-dead", "free-claude", "sid-free", dead_cwd,
+            "free-dead", "free-claude", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", dead_cwd,
             status="dead status", updated=3, pid=999_999_999,
         )
         entry = self._entries()["free-claude"]
@@ -1330,30 +1667,44 @@ class RosterTests(unittest.TestCase):
 
     def test_a_relay_named_like_a_session_is_left_out_of_the_roster(self) -> None:
         # send.py's relay is a newer `claude -p` run started with `-n free-claude`.
-        self._write_session("relay", "free-claude", "sid-relay", self.home / "projects" / "relay",
+        self._write_session("relay", "free-claude", "d2d1a6c7-68f1-5f01-b1af-3a7622ca03c6", self.home / "projects" / "relay",
                             status="relaying", updated=9, entrypoint="sdk-cli")
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
             found = roster.roster(os.environ, roster.ThisMachine())
         named = [entry.session for entry in found.entries if entry.name == "free-claude"]
-        self.assertEqual(named, [roster.ClaudeSession("sid-free")])
+        self.assertEqual(named, [roster.ClaudeSession("abd1a227-f410-5c76-bc96-a0c77c0f3ef0")])
+
+    def test_a_recorded_relay_is_absent_even_without_its_entrypoint(self) -> None:
+        relay_name = relay_session_name("free-claude")
+        self._write_session("relay", relay_name, "d2d1a6c7-68f1-5f01-b1af-3a7622ca03c6", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="", pid=os.getppid())
+        write_relay_record(self.root / "state/message", os.getppid(), "free-claude")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertNotIn("d2d1a6c7-68f1-5f01-b1af-3a7622ca03c6", [entry.session.session_id for entry in found.entries
+                                       if isinstance(entry.session, roster.ClaudeSession)])
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())):
+            self.assertEqual(send.resolve_recipient("free-claude", send.LocalOnly(), found),
+                             send.ClaudeRecipient("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0"))
+        self.assertEqual([entry for entry in found.entries if entry.name == relay_name], [])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
-            "reused", "phantom", "sid-phantom", self.home / "projects" / "ended",
+            "reused", "phantom", "bbf424a8-e952-5b7a-8a50-9249787bdb50", self.home / "projects" / "ended",
             with_socket=False, proc_start="another start",
         )
         entries = self._entries()
         self.assertNotIn("phantom", list(entries))
-        self.assertFalse(any(entry.session == roster.ClaudeSession("sid-phantom") for entry in entries.values()))
+        self.assertFalse(any(entry.session == roster.ClaudeSession("bbf424a8-e952-5b7a-8a50-9249787bdb50") for entry in entries.values()))
 
     def test_running_session_without_socket_retains_identity_and_has_no_address(self) -> None:
         self._write_session(
-            "socketless", "socketless", "sid-socketless", self.home / "projects" / "socketless",
+            "socketless", "socketless", "3970025f-e6e7-5c02-b247-0f4a0753902b", self.home / "projects" / "socketless",
             with_socket=False,
         )
         entry = self._entries()["socketless"]
         self.assertEqual(entry.reach, roster.CannotReceiveMessages("no messaging socket"))
-        self.assertEqual(entry.session, roster.ClaudeSession("sid-socketless"))
+        self.assertEqual(entry.session, roster.ClaudeSession("3970025f-e6e7-5c02-b247-0f4a0753902b"))
         result, lines, errors = self._run_main("--json")
         self.assertEqual((result, errors), (0, []))
         document = cast(dict[str, object], json.loads("\n".join(lines)))
@@ -1364,7 +1715,7 @@ class RosterTests(unittest.TestCase):
 
     def test_sender_uses_newest_claude_identity_even_without_a_socket(self) -> None:
         self._write_session(
-            "free-socketless", "newest-free", "sid-free", self.home / "projects" / "resumed",
+            "free-socketless", "newest-free", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", self.home / "projects" / "resumed",
             status="waiting", updated=20, with_socket=False,
         )
         entries = self._entries()
@@ -1374,27 +1725,27 @@ class RosterTests(unittest.TestCase):
             roster.CannotReceiveMessages("no messaging socket"),
             str(self.home / "projects" / "resumed"), "waiting",
         ))
-        self.assertTrue(roster.is_sender(entry, roster.ClaudeSession("sid-free")))
-        self.assertFalse(roster.is_sender(entry, roster.ClaudeSession("sid-other")))
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-free"}):
-            result, lines, errors = self._run_main()
+        self.assertTrue(roster.is_sender(entry, roster.ClaudeSession("abd1a227-f410-5c76-bc96-a0c77c0f3ef0")))
+        self.assertFalse(roster.is_sender(entry, roster.ClaudeSession("e85a5b38-58dc-572a-8c07-b0fee760dba0")))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"}):
+            result, lines, errors = self._run_main(native_identity="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
         self.assertEqual((result, errors), (0, []))
-        self.assertTrue(any("session:sid-free (you)" in line for line in lines))
+        self.assertTrue(any("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0 (you)" in line for line in lines))
 
     def test_showrunner_socket_identity_beats_a_duplicate_display_name(self) -> None:
         self._write_session(
-            "runner-imposter", "runner", "sid-imposter",
+            "runner-imposter", "runner", "b9ec3232-747a-57d3-8f9f-6a271a1096b4",
             self.home / "projects" / "imposter", updated=20,
         )
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             entries = roster.roster(os.environ, roster.ThisMachine()).entries
         real = next(
             entry for entry in entries
-            if entry.reach == roster.Messageable("session:sid-runner")
+            if entry.reach == roster.Messageable("session:acd50bad-5afa-5d3d-b155-3766b7d113e0")
         )
         imposter = next(
             entry for entry in entries
-            if entry.reach == roster.Messageable("session:sid-imposter")
+            if entry.reach == roster.Messageable("session:b9ec3232-747a-57d3-8f9f-6a271a1096b4")
         )
         self.assertEqual((real.role, imposter.role), ("showrunner", "freestanding"))
 
@@ -1467,6 +1818,14 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_the_roster_recognizes_the_simplify_status_writer(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        write_text_atomic(self.director_run / "review_status_adversary", "reviewing\n")
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].status, "running")
+
     def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
         phase = self.director_run / "phases" / "4"
         phase.mkdir(parents=True)
@@ -1523,7 +1882,7 @@ class RosterTests(unittest.TestCase):
                 }
                 self._write_mesh(run, records)
                 if liveness == "active marker":
-                    _ = (self.runs / "active" / "sid-director").write_text(str(run) + "\n")
+                    _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(str(run) + "\n")
                 else:
                     heartbeat = run / "heartbeat.log"
                     heartbeat.touch()
@@ -1542,15 +1901,15 @@ class RosterTests(unittest.TestCase):
     def test_kind_codex_keeps_only_needed_claude_context(self) -> None:
         result, lines, errors = self._run_main("--kind", "codex")
         self.assertEqual((result, errors), (0, []))
-        runner = next(line for line in lines if "[session:sid-runner]" in line)
-        director = next(line for line in lines if "[session:sid-director]" in line)
+        runner = next(line for line in lines if "[session:acd50bad-5afa-5d3d-b155-3766b7d113e0]" in line)
+        director = next(line for line in lines if "[session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b]" in line)
         self.assertIn("(context)", runner)
         self.assertIn("(context)", director)
         self.assertEqual(runner.count("(context)"), 1)
         self.assertEqual(director.count("(context)"), 1)
         self.assertTrue(any("[worker:director-run/alpha-impl]" in line for line in lines))
         self.assertFalse(any("claude-worker" in line for line in lines))
-        self.assertFalse(any("[session:sid-free]" in line for line in lines))
+        self.assertFalse(any("[session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0]" in line for line in lines))
         self.assertFalse(any("solo-director" in line for line in lines))
 
     def test_json_has_all_public_fields_and_plain_problem_records(self) -> None:
@@ -1586,47 +1945,49 @@ class RosterTests(unittest.TestCase):
 
     def test_worker_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
         entries = self._entries()
-        self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("thread-shared"))
-        self.assertEqual(entries["Codex window"].thread, roster.CodexThread("thread-window"))
-        for name in ("runner", "claude-worker", "alpha-no-thread"):
+        self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("7aa082fc-e724-5e46-8846-bd68e7eb3f46"))
+        self.assertEqual(entries["Codex window"].thread, roster.CodexThread("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
+        for name in ("runner", "claude-worker"):
             self.assertEqual(entries[name].thread, roster.NoCodexThread())
         result, lines, errors = self._run_main("--json")
         self.assertEqual((result, errors), (0, []))
         document = cast(dict[str, object], json.loads("\n".join(lines)))
         rows = cast(list[dict[str, object]], document["entries"])
         by_name = {cast(str, row["name"]): row for row in rows}
-        self.assertEqual(by_name["alpha-impl"]["thread"], "thread-shared")
-        self.assertEqual(by_name["Codex window"]["thread"], "thread-window")
-        for name in ("runner", "claude-worker", "alpha-no-thread"):
+        self.assertEqual(by_name["alpha-impl"]["thread"], "7aa082fc-e724-5e46-8846-bd68e7eb3f46")
+        self.assertEqual(by_name["Codex window"]["thread"], "eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539")
+        for name in ("runner", "claude-worker"):
             self.assertIsNone(by_name[name]["thread"])
 
     def test_codex_worker_identity_marks_the_worker_and_not_its_inherited_director(self) -> None:
         with mock.patch.dict(os.environ, {
-            "CODEX_THREAD_ID": "thread-shared", "CLAUDE_CODE_SESSION_ID": "sid-director",
+            "CODEX_THREAD_ID": "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "CLAUDE_CODE_SESSION_ID": "17e44ec4-3e24-5ae1-b10d-5cf30de9455b",
         }):
             result, lines, errors = self._run_main()
         self.assertEqual((result, errors), (0, []))
         self.assertEqual(len([line for line in lines if "(you)" in line]), 1)
         self.assertTrue(any("[worker:director-run/alpha-impl] (you)" in line for line in lines))
-        self.assertFalse(any("[session:sid-director] (you)" in line for line in lines))
+        self.assertFalse(any("[session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b] (you)" in line for line in lines))
 
     def test_daemon_codex_identity_marks_its_own_window(self) -> None:
-        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-window"}):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"}):
             result, lines, errors = self._run_main()
         self.assertEqual((result, errors), (0, []))
         self.assertEqual(len([line for line in lines if "(you)" in line]), 1)
-        self.assertTrue(any("codex:thread-window (you)" in line for line in lines))
+        self.assertTrue(any("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539 (you)" in line for line in lines))
 
     def test_plain_shell_marks_no_session(self) -> None:
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
-            result, lines, errors = self._run_main()
+            result, lines, errors = self._run_main(native_identity="")
         self.assertEqual((result, errors), (0, []))
         self.assertFalse(any("(you)" in line for line in lines))
 
     def test_sender_identity_has_frozen_named_states_and_codex_precedence(self) -> None:
-        self.assertEqual(roster.sender_identity({}), roster.NoSession())
-        self.assertEqual(roster.sender_identity({"CLAUDE_CODE_SESSION_ID": "claude"}),
-                         roster.ClaudeSession("claude"))
+        with mock.patch.object(staff, "runtime_id", return_value=""):
+            self.assertEqual(roster.sender_identity({}), roster.NoSession())
+        with mock.patch.object(staff, "runtime_id", return_value="claude"):
+            self.assertEqual(roster.sender_identity({"CLAUDE_CODE_SESSION_ID": "claude"}),
+                             roster.ClaudeSession("claude"))
         identity = roster.sender_identity({
             "CODEX_THREAD_ID": "codex", "CLAUDE_CODE_SESSION_ID": "inherited",
         })
@@ -1635,7 +1996,21 @@ class RosterTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             identity.thread_id = "changed"  # pyright: ignore[reportAttributeAccessIssue]
 
-    def test_marked_unit_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
+    def test_sender_identity_uses_its_exact_registry_when_the_claude_hint_is_missing_or_stale(self) -> None:
+        from scripts.message import sessions as runtime_sessions
+
+        identity = "019b3a40-4250-7000-8000-000000000199"
+        started = runtime_sessions.process_start(os.getpid())
+        assert started is not None
+        self._write_session(str(os.getpid()), "current caller", identity, self.home,
+                            pid=os.getpid(), proc_start=started)
+        with mock.patch.object(runtime_sessions, "sessions_dir", return_value=self.sessions):
+            for hint in ("", "019b3a40-4250-7000-8000-000000000198"):
+                with self.subTest(inherited=hint):
+                    self.assertEqual(roster.sender_identity({"CLAUDE_CODE_SESSION_ID": hint}),
+                                     roster.ClaudeSession(identity))
+
+    def test_labeled_session_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
         (self.sessions / "director.json").unlink()
         worktree = self.home / "projects" / "unit-one"
         for name, pane in (("other-pane", "helper:@2.%2"), ("outside-herdr", "")):
@@ -1651,10 +2026,8 @@ class RosterTests(unittest.TestCase):
     def test_unit_without_marked_session_does_not_claim_a_worktree_session(self) -> None:
         _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
         worktree = self.home / "projects" / "unit-one"
-        worktree.mkdir(parents=True)
-        _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
         self._write_session(
-            "helper", "helper", "sid-helper", worktree,
+            "helper", "helper", "a24eb3a2-e6ab-50ff-b5ff-654fb1ab9708", worktree,
             tmux="unmarked:@2.%2",
         )
         helper = self._entries()["helper"]
@@ -1663,26 +2036,10 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(roster.is_top_level(helper))
         self.assertEqual(self.ssh_calls(), [])
 
-    def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
-        read = unit_lookup.every_marked_unit
-
-        def with_duplicate(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions:
-            found = read(record=record)
-            return unit_lookup.MarkedProductions(
-                found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
-
-        with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
-            found = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(found.problems, [
-            "unit hosts left out under alpha: unit-two: its mark is on herdr sessions copy and first"])
-        director = next(entry for entry in found.entries if entry.name == "director")
-        self.assertEqual(director.role, "unit director")
-        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
 
     def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
         self._write_session(
-            "director", "director", "sid-director", self.home / "projects" / "elsewhere",
+            "director", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", self.home / "projects" / "elsewhere",
             tmux="old-label:@1.%1", with_socket=False,
         )
         entries = self._entries()
@@ -1691,12 +2048,12 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner, roster.UnderShowrunner(
-            "alpha", "runner", "session:sid-runner",
+            "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
         ))
         for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
             with self.subTest(worker=name):
                 self.assertEqual(entries[name].director, roster.UnderDirector(
-                    "unit-one", "director", "session:sid-director",
+                    "unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b",
                 ))
         self.assertEqual(self.ssh_calls(), [])
 
@@ -1728,7 +2085,7 @@ class RosterTests(unittest.TestCase):
         # A socketless live record is deliberately excluded from _claudes; the
         # roster must join it by place rather than worktree ownership.
         (self.sessions / "director.json").unlink()
-        self._write_session("director", "director", "sid-director", self.home / "elsewhere", with_socket=False, pid=991001, proc_start="fixture")
+        self._write_session("director", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", self.home / "elsewhere", with_socket=False, pid=991001, proc_start="fixture")
         _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p2\0")
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991001, 991000, ["claude"], HERDR_PANE_ID="w1:p1",
@@ -1744,7 +2101,7 @@ class RosterTests(unittest.TestCase):
             director = self._entries()["director"]
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
-        self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:sid-runner"))
+        self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
 
     def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
@@ -1766,6 +2123,11 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
              mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home:
             entries = self._entries()
+            worker = entries["alpha-impl"].thread
+            assert isinstance(worker, roster.CodexThread)
+            environment = Path(os.environ["HERDR_PROC"]) / "991001" / "environ"
+            _ = environment.write_bytes(environment.read_bytes() + f"\0CODEX_THREAD_ID={worker.thread_id}".encode())
+            without_worker = self._entries()
         pane = entries["herdr native:w1:p1"]
         self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
         self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
@@ -1778,6 +2140,8 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn(mock.call(991003), read_home.call_args_list)
         self.assertEqual(entries["herdr native:w1:p3"].cwd, str(self.home))
         self.assertNotIn("herdr native:w1:p2", entries)
+        self.assertNotIn("herdr native:w1:p1", without_worker)
+        self.assertIn("herdr native:w1:p3", without_worker)
 
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
         binary = self._herdr_fixture({"default": {"code": 1, "stdout": json.dumps({
@@ -1811,6 +2175,9 @@ class RosterTests(unittest.TestCase):
 
 
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
+        owner = unit_membership("alpha", "unit-one")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"), expected=owner.worktree)
+        _ = self.production_doc.write_text("# Production\n")
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
@@ -1823,14 +2190,14 @@ class RosterTests(unittest.TestCase):
             (director.role, director.showrunner),
             (
                 "unit director",
-                roster.UnderShowrunner("alpha", "runner", "session:sid-runner"),
+                roster.UnderShowrunner("alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"),
             ),
         )
         self.assertEqual(
             (worker_entry.role, worker_entry.director),
             (
                 "worker",
-                roster.UnderDirector("unit-one", "director", "session:sid-director"),
+                roster.UnderDirector("unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
             ),
         )
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in found.problems))
@@ -1888,7 +2255,7 @@ class RosterTests(unittest.TestCase):
                 ))
             with mock.patch.dict(os.environ, {
                 "HOME": str(home), "AGENT_NOTES_DIR": str(notes), "ROSTER_CODEX_SOCKET": "",
-            }), mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.3), \
+            }), mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.3), \
                     mock.patch.object(codex_daemon, "read_daemons", new=timed_read_daemons):
                 found = roster.roster(os.environ, roster.ThisMachine())
             self.assertEqual(len(read_times), 1)
@@ -1974,16 +2341,21 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(agent_accounts, "workers_home", return_value=current))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(current),
+            "previous_servers": [{"port": 45677, "pid": os.getpid(), "codex_home": str(old)}],
         }))
-        _ = (self.director_run / "mesh_retired.json").write_text(json.dumps({"servers": [{
-            "port": 45677, "pid": os.getpid(), "codex_home": str(old),
-        }]}))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+        self._publish_roster(self.director_run / "mesh_roster.json", {
             "old-impl": {"thread_id": "old-thread", "status": "running", "port": 45677, "launcher_pid": os.getpid(), "role": "impl"},
             "new-test": {"thread_id": "new-thread", "status": "running", "port": 45678, "launcher_pid": os.getpid(), "role": "test"},
             "between-turns": {"thread_id": "waiting-thread", "status": "done", "launcher_pid": os.getpid()},
             "missing-server": {"thread_id": "lost-thread", "status": "running", "port": 49999, "launcher_pid": os.getpid()},
-        }))
+        })
+        old_worker = staff.local_snapshot().by_current_session(fixture_runtime_id("old-thread"))
+        assert old_worker is not None
+        fixture_session(old_worker.current_session, staff.CodexBackend(old))
+        for label in ("new-thread", "waiting-thread", "lost-thread"):
+            worker = staff.local_snapshot().by_current_session(fixture_runtime_id(label))
+            assert worker is not None
+            fixture_session(worker.current_session, staff.CodexBackend(current))
         entries = self._entries()
         before_move = {name: entries[name] for name in ("old-impl", "new-test")}
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
@@ -1991,7 +2363,10 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["missing-server"].account, roster.AccountLabel("codex2"))
-        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(),
+            "previous_servers": [{"port": 45677, "pid": os.getpid(), "codex_home": str(old)}],
+        }))
         entries = self._entries()
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
@@ -2005,7 +2380,7 @@ class RosterTests(unittest.TestCase):
                 assignment = entries[name].assignment
                 assert isinstance(assignment, roster.WorkerAssignment)
                 self.assertEqual(assignment.role, role)
-                self.assertEqual(entries[name].thread, roster.CodexThread(thread))
+                self.assertEqual(entries[name].thread, roster.CodexThread(fixture_runtime_id(thread)))
                 self.assertEqual(entries[name].reach, before_move[name].reach)
 
     def test_live_workers_keep_their_account_when_idle_stop_deletes_server_metadata(self) -> None:
@@ -2013,10 +2388,10 @@ class RosterTests(unittest.TestCase):
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(home),
         }))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+        self._publish_roster(self.director_run / "mesh_roster.json", {
             "idle-worker": {"thread_id": "idle-thread", "status": "done", "port": 45678},
             "legacy-worker": {"thread_id": "legacy-thread", "status": "done"},
-        }))
+        }, codex_home=home)
         with mock.patch.object(agent_accounts, "workers_home", return_value=home):
             before = self._entries()
             (self.director_run / "mesh_server.json").unlink()
@@ -2096,7 +2471,7 @@ class RosterTests(unittest.TestCase):
         os.environ["SSH_STATUS"] = "255"
         result, lines, errors = self._run_main(here=False)
         self.assertEqual(result, 1)
-        self.assertTrue(any("session:sid-free" in line for line in lines))
+        self.assertTrue(any("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0" in line for line in lines))
         self.assertEqual(len(errors), 1)
         self.assertIn("not reached", errors[0])
         self.assertEqual(len(self.ssh_calls()), 1)
@@ -2147,9 +2522,9 @@ class RosterTests(unittest.TestCase):
         snapshot = roster.RosterSnapshot.decode("\n".join(lines))
         director = next(row for row in snapshot.result.entries if row.name == "director")
         worker = next(row for row in snapshot.result.entries if row.name == "alpha-impl")
-        self.assertEqual(director.session, roster.ClaudeSession("sid-director"))
+        self.assertEqual(director.session, roster.ClaudeSession("17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
-        self.assertEqual(worker.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
+        self.assertEqual(worker.director, roster.UnderDirector("unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(self.ssh_calls(), [])
 
     def test_snapshot_is_hidden_from_help_and_public_json_has_no_session_field(self) -> None:
@@ -2211,11 +2586,91 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(self.ssh_calls(), [])
 
 
+class PaneRosterTests(StaffTestCase):
+    def test_missing_herdr_keeps_session_entries_and_reports_pane_workers(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.unit.current_session, "director")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(account, "process_config_dir", return_value=None), \
+             mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual([problem for problem in found.problems if problem.startswith("pane workers:")],
+            ["pane workers: herdr is not installed"])
+        self.assertIn("director", [entry.name for entry in found.entries])
+
+    def test_pane_workers_keep_five_states_and_replace_native_session_entries(self) -> None:
+        fixture = self.row_production()
+        rows = [fixture_worker(name, fixture.unit.id,
+                               backend=staff.CodexBackend(self.root / "codex") if name == "open" else staff.ClaudeBackend())
+                for name in ("open", "stopped", "closed", "unknown")]
+        remote_parent = fixture_member("unit", name="remote-parent", parent=fixture.runner.id,
+                                       worktree=staff.PresentWorktree("mac", self.root / "remote-tree"))
+        remote_worker = fixture_worker("remote-worker", remote_parent.id)
+        world = PaneWorld()
+        world.add(fixture.unit, "w1:p0")
+        world.add(rows[0], "w1:p1", family="codex")
+        world.add(rows[1], "w1:p2", live=False)
+        world.add(rows[3], "w1:p4")
+        world.locations["w1:p1"]["agent_status"] = "working"
+        _ = self.session_record(rows[0].current_session, "registry-copy")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        before = self.staff_file.read_bytes()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
+              mock.patch.object(worker_panes, "_client", return_value=world),
+              mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+              mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
+              mock.patch.object(herdr, "Herdr", return_value=world),
+              mock.patch.object(herdr, "herdr_processes", return_value=[
+                  herdr.HerdrProcess(world.foreground["w1:p1"][0], herdr.HerdrPlace("agents", "w1:p1"),
+                                     {"CODEX_THREAD_ID": rows[0].current_session}, "codex", str(fixture.worktree))]),
+              mock.patch.object(herdr, "process_environment", side_effect=ProcessLookupError("process exited")),
+              mock.patch.object(codex_daemon, "read_daemons", return_value=[])):
+            with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+                result = roster.roster(os.environ, roster.ThisMachine())
+            self.assertEqual(reads.call_count, 1)
+            entries = {entry.name: entry for entry in result.entries}
+            self.assertEqual(entries["open"].reach, roster.Messageable(f"worker:{fixture.unit.name}/open"))
+            self.assertEqual(entries["open"].status, "working; pane w1:p1")
+            self.assertIn("stopped", entries["stopped"].status)
+            self.assertEqual(entries["closed"].reach, roster.CannotReceiveMessages("closed"))
+            self.assertNotIn("registry-copy", entries)
+            self.assertNotIn("herdr agents:w1:p1", entries)
+            self.assertNotIn(remote_worker.name, entries)
+            world.unknown["w1:p4"] = "process read denied"
+            result = roster.roster(os.environ, roster.ThisMachine())
+            entries = {entry.name: entry for entry in result.entries}
+            self.assertEqual(entries["unknown"].status, "unknown; pane w1:p4: process read denied")
+            self.assertIsInstance(entries["unknown"].reach, roster.CannotReceiveMessages)
+            self.assertIn("incomplete:", entries["closed"].status)
+            self.assertIn("absence", entries["closed"].status)
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
+
+    def test_roster_names_owner_and_record_failures(self) -> None:
+        _ = self.row_production()
+        _ = self.write_document({"schema": 2, "rows": ["invalid member"]})
+        result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
+        self.assertTrue(any("staff membership" in problem for problem in result.problems), result.problems)
+        self.assertTrue(any("staff" in problem for problem in result.problems), result.problems)
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
+            result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
+        self.assertTrue(any("not reached" in problem for problem in result.problems), result.problems)
+
+
 class CodexHolderLabelsTests(unittest.TestCase):
     root: Path = Path()
     runs: Path = Path()
     registry: Path = Path()
     environment: dict[str, str] = {}
+    director_id: str = ""
+    runner_id: str = ""
     thread: str = "01a1775e-0fcd-7842-a664-436a33f9007b"
 
     @override
@@ -2234,7 +2689,6 @@ class CodexHolderLabelsTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr.json"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
         }
@@ -2242,11 +2696,14 @@ class CodexHolderLabelsTests(unittest.TestCase):
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        _ = unit_membership("builds", "report-unit")
+        unit = unit_membership("builds", "report")
+        self.director_id = unit.id
+        assert isinstance(unit.parent, staff.ReportsTo)
+        self.runner_id = unit.parent.id
         # Both registry records are live processes, with real start identities.
-        # Only their declared unit marks and run metadata come from fixture files.
-        for pid, sid, name in ((os.getppid(), "holder-director", "report-director"),
-                               (os.getpid(), "holder-runner", "builds-runner")):
+        # Only their declared session labels and run metadata come from fixture files.
+        for pid, sid, name in ((os.getppid(), self.director_id, "report-director"),
+                               (os.getpid(), self.runner_id, "builds-runner")):
             start = sessions.process_start(pid)
             self.assertIsNotNone(start)
             _ = (self.registry / f"{pid}.json").write_text(json.dumps({
@@ -2255,7 +2712,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             }))
         self.process(991099, 0, ["herdr", "--session", "native", "server"])
         self.process(os.getppid(), 991099, ["claude"],
-                     "HERDR_PANE_ID=w1:p1\0SHOWRUNNER_UNIT=builds\0SHOWRUNNER_UNIT_ID=report-unit\0")
+                     ('HERDR_PANE_ID=w1:p1\x00' + 'SHOWRUNNER_' + 'UNIT=builds\x00' + 'SHOWRUNNER_' + 'UNIT_ID=report\x00'))
         self.process(os.getpid(), 0, ["claude"])
         herdr_listener(self.root / "proc", 991099, "native", os.environ)
         _ = (self.root / "herdr.json").write_text(json.dumps({
@@ -2266,15 +2723,14 @@ class CodexHolderLabelsTests(unittest.TestCase):
             "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'},
         }))
         doc = self.root / "production.md"
-        _ = doc.write_text("## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
-                           + "| --- | --- | --- | --- | --- | --- |\n"
-                           + f"| report-unit | plan.md | {self.root / 'report-director'} | report | — | — |\n")
+        _ = doc.write_text("# builds\n")
+        _ = recorded_showrunner("builds", doc)
         timer = notifier / "showrunner-builds"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:holder-runner\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh builds\n")
         run = self.runs / "run-00"
         self.mesh(run, {"report-test2": {"thread_id": self.thread, "status": "running"}})
-        _ = (self.runs / "active/holder-director").write_text(str(run) + "\n")
+        _ = (self.runs / "active" / self.director_id).write_text(str(run) + "\n")
 
     def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
         directory = self.root / "proc" / str(pid)
@@ -2286,14 +2742,16 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
     def mesh(self, run: Path, workers: dict[str, dict[str, object]]) -> None:
         run.mkdir(parents=True, exist_ok=True)
-        _ = (run / "mesh_roster.json").write_text(json.dumps(workers))
+        records = fixture_roster(cast(dict[str, object], workers), staff.StaffId(self.director_id),
+                                 self.root / "codex-home")
+        _ = (run / "mesh_roster.json").write_text(json.dumps(records))
 
     def test_codex_thread_labels_equal_full_roster_without_mocking_readers(self) -> None:
         full = roster.unit_labels(roster.roster(self.environment, roster.ThisMachine()).entries)
-        fast = roster.unit_labels_for([self.thread, "holder-director", "unknown-thread", "report-test2"], self.environment)
-        self.assertEqual(fast, {sid: full[sid] for sid in (self.thread, "holder-director")})
+        fast = roster.unit_labels_for([self.thread, self.director_id, "unknown-thread", "report-test2"], self.environment)
+        self.assertEqual(fast, {sid: full[sid] for sid in (self.thread, self.director_id)})
         self.assertEqual(fast[self.thread], roster.UnitLabels("report-test2", "builds", "report"))
-        self.assertEqual(fast["holder-director"], roster.UnitLabels("report-director", "builds", "report"))
+        self.assertEqual(fast[self.director_id], roster.UnitLabels("report-director", "builds", "report"))
 
     def test_twenty_run_lookup_is_well_inside_the_cli_budget(self) -> None:
         wanted = [self.thread]
@@ -2304,7 +2762,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             name = f"report-test-{number}"
             self.mesh(run, {name: {"thread_id": thread, "status": "done"}})
             (run / "heartbeat.log").touch()
-            _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report-unit"}))
+            _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report"}))
             wanted.append(thread)
             expected[thread] = roster.UnitLabels(name, "builds", "report")
         started = time.perf_counter()
@@ -2313,12 +2771,12 @@ class CodexHolderLabelsTests(unittest.TestCase):
         self.assertEqual(labels, expected)
         self.assertLess(elapsed, 0.2, f"20-run label lookup took {elapsed:.3f} seconds")
 
-    def test_retired_and_redirected_workers_and_stale_runs_are_not_holders(self) -> None:
+    def test_ended_workers_and_stale_runs_are_not_holders(self) -> None:
         records: dict[str, dict[str, object]] = {
             "report-test2": {"thread_id": self.thread, "status": "done"},
             "ended": {"thread_id": "ended-thread", "status": "ended"},
-            "moved": {"thread_id": "moved-thread", "role_redirect": {"name": "elsewhere"}},
-            "moving": {"thread_id": "moving-thread", "transferring_role": {"name": "elsewhere"}},
+            "moved": {"thread_id": "moved-thread", "status": "ended"},
+            "moving": {"thread_id": "moving-thread", "status": "ended"},
             "held": {"thread_id": "held-thread", "held_design_id": "fixture-design"},
         }
         self.mesh(self.runs / "run-00", records)
@@ -2333,7 +2791,7 @@ class UnitLabelsTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        production_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+        production_membership("cargo-liner-style", "cargo-liner-style-types")
 
     def test_folder_name_joins_showrunner_and_unit(self) -> None:
         self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
@@ -2368,9 +2826,9 @@ class UnitLabelsTests(unittest.TestCase):
     def test_labels_use_production_and_unit_short_names_not_session_names(self) -> None:
         runner = roster.UnderShowrunner("builds", "builds-showrunner", "session:runner-id")
         entries = [
-            self.entry("director-id", "report-director", showrunner=runner, director=roster.DirectsUnit("report-unit")),
+            self.entry("director-id", "report-director", showrunner=runner, director=roster.DirectsUnit("report")),
             self.entry("worker-thread", "report-test2", showrunner=runner,
-                       director=roster.UnderDirector("report-unit", "report-director", "session:director-id"),
+                       director=roster.UnderDirector("report", "report-director", "session:director-id"),
                        codex=True),
             self.entry("runner-id", "builds-showrunner", showrunner=roster.RunsProduction("builds")),
             self.entry("unmatched-id", "scratch"),
@@ -2390,7 +2848,7 @@ class UnitLabelsTests(unittest.TestCase):
     def test_labels_and_shown_name_agree_on_production_and_unit(self) -> None:
         entry = self.entry("director-id", "report-director",
                            showrunner=roster.UnderShowrunner("builds", "builds-showrunner", ""),
-                           director=roster.DirectsUnit("report-unit"))
+                           director=roster.DirectsUnit("report"))
         shown = roster.shown_name(entry)
         labels = roster.unit_labels([entry])["director-id"]
         self.assertEqual(shown.production, roster.ProductionPart(labels.showrunner))
@@ -2401,9 +2859,9 @@ class UnitLabelsTests(unittest.TestCase):
         runner = roster.UnderShowrunner("cargo-liner-style", "cargo-liner", "session:liner")
         entries = [
             self.entry("style-director", "types-director", showrunner=runner,
-                       director=roster.DirectsUnit("cargo-liner-style-types-unit")),
+                       director=roster.DirectsUnit("cargo-liner-style-types")),
             self.entry("style-worker", "types-review", showrunner=runner,
-                       director=roster.UnderDirector("cargo-liner-style-types-unit", "types-director",
+                       director=roster.UnderDirector("cargo-liner-style-types", "types-director",
                                                      "session:style-director"),
                        codex=True),
         ]
@@ -2416,57 +2874,65 @@ class UnitLabelsTests(unittest.TestCase):
 
     def test_labels_collapse_whitespace_without_changing_the_registered_name(self) -> None:
         entry = self.entry("id", "report\n test2", showrunner=roster.UnderShowrunner(" builds\t", "runner", ""),
-                           director=roster.UnderDirector(" report-unit\n", "director", ""), codex=True)
+                           director=roster.UnderDirector(" report\n", "director", ""), codex=True)
         self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report")})
 
-    def test_fast_lookup_uses_only_fixture_sessions_registry_and_unit_marks(self) -> None:
+    def test_fast_lookup_uses_only_fixture_sessions_registry_and_staff_marks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        _ = unit_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+        unit = unit_membership("cargo-liner-style", "cargo-liner-style-types")
+        assert isinstance(unit.parent, staff.ReportsTo)
+        worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
-        _ = doc.write_text(
-            "## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
-            + "| --- | --- | --- | --- | --- | --- |\n"
-            + "| cargo-liner-style-types-unit | plan.md | /fixture/style | style | — | — |\n",
-        )
+        _ = staff.set_doc(unit.parent.id, staff.LiveDoc("natedev", doc))
+        _ = doc.write_text("# cargo-liner\n")
         records: list[sessions.SessionRecord] = [
             {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",
              "updatedAt": 1, "tmux": "", "formerNames": []}
             for pid, sid, name in (
-                (101, "runner-id", "cargo-liner"), (102, "style-id", "cargo-liner-style-types"),
-                (103, "free-id", "scratch"), (104, "worker-id", "types-review"),
+                (101, unit.parent.id, "cargo-liner"), (102, unit.id, "cargo-liner-style-types"),
+                (103, "free-id", "scratch"), (104, worker.id, "types-review"),
             )
         ]
         for record in records:
             process = root / "proc" / str(record["pid"])
             process.mkdir(parents=True)
-            marks = {
-                "style-id": "SHOWRUNNER_UNIT=cargo-liner-style\0SHOWRUNNER_UNIT_ID=cargo-liner-style-types-unit\0",
-                "worker-id": "CLAUDE_CODE_SESSION_ID=style-id\0",
-            }.get(record["sessionId"], "")
+            environment_by_identity: dict[str, str] = {
+                unit.id: ('' + 'SHOWRUNNER_' + 'UNIT=cargo-liner-style\x00' + 'SHOWRUNNER_' + 'UNIT_ID=cargo-liner-style-types\x00'),
+                worker.id: f"CLAUDE_CODE_SESSION_ID={unit.id}\0",
+            }
+            marks = environment_by_identity.get(record["sessionId"], "")
             _ = (process / "environ").write_text(marks)
+        registry = root / "sessions"
+        registry.mkdir()
+        for record in records:
+            _ = (registry / f"{record['pid']}.json").write_text(json.dumps(record))
         registered: list[showrunners.Showrunner] = [{
-            "session": "cargo-liner", "socket": "/fixture/runner-id.sock", "slug": "cargo-liner-style",
+            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "name": "cargo-liner-style",
             "zone": "America/New_York", "doc": str(doc),
         }]
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
+        _ = (notifier / "showrunner-cargo-liner-style/conf").write_text(
+            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {unit.parent.id}\n")
         with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
+             mock.patch.object(sessions, "sessions_dir", return_value=registry), \
+             mock.patch.object(sessions, "running_session", return_value=True), \
              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
              mock.patch.object(unit_labels, "registered_showrunners", return_value=registered), \
              mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no meshes")) as meshes, \
-             mock.patch.object(unit_lookup, "every_marked_unit", side_effect=AssertionError("no mark scan")) as marks_read, \
+             mock.patch.object(unit_lookup, "every_labeled_session", side_effect=AssertionError("no mark scan")) as marks_read, \
              mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
              mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts, \
              mock.patch.object(codex_daemon, "loaded_sessions", side_effect=AssertionError("no daemon")) as daemon:
-            labels = roster.unit_labels_for(["style-id", "runner-id", "free-id", "worker-id", "missing-id"],
+            labels = roster.unit_labels_for([unit.id, unit.parent.id, "free-id", worker.id, "missing-id"],
                                             environment)
         self.assertEqual(labels, {
-            "style-id": roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types"),
-            "worker-id": roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types"),
-            "runner-id": roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
+            unit.id: roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types"),
+            worker.id: roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types"),
+            unit.parent.id: roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
             "free-id": roster.UnitLabels("scratch", "—", "—"),
         })
         meshes.assert_not_called()

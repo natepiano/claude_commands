@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import unittest
 from unittest import mock
 from contextlib import closing
@@ -17,12 +18,12 @@ from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.usage import collect, weights
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
 REPORT = Path(__file__).with_name("usage_report.py")
@@ -89,6 +90,16 @@ class ReportFixture(OutcomeFixture):
             shutil.rmtree(directory)
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         _ = shutil.copytree(FIXTURES / "production-docs", self.production_docs, dirs_exist_ok=True)
+        for filename, entries in (("fixture-production.md", (("Base", "/invented/build"),
+                                                            ("Deep", "/invented/build/component"),
+                                                            ("director", "/invented/director"),
+                                                            ("no-turn", "/invented/no-turn"),
+                                                            ("loose", "/invented/loose"))),
+                                  ("other-production.md", (("Elsewhere", "/invented/elsewhere"),))):
+            owner = recorded_showrunner(filename, self.production_docs / filename)
+            for name, tree in entries:
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                                   worktree=staff.PresentWorktree(remote.local_machine(), Path(tree)))
         _ = self.commit("checkpoint(report-plan): phase 7 — First", "2026-10-10T21:37:00Z")
         _ = self.commit("checkpoint(report-plan): phase 7 — Second", "2026-10-10T21:38:00Z")
         _ = self.commit("checkpoint(other-plan): phase 7 — Unmapped", "2026-10-11T07:01:00Z")
@@ -100,13 +111,13 @@ class ReportFixture(OutcomeFixture):
         return environment
 
     def report(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(REPORT), "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), str(REPORT), "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def report_script(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -158,7 +169,8 @@ class ReportFixture(OutcomeFixture):
             (self.root / "outside-checkout").mkdir()
             (self.root / "bin").mkdir()
             ssh = self.root / "bin/ssh"
-            _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+            _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+                "${HOME}/.claude/scripts/lib/py", str(REPOSITORY / "scripts/lib/py")))
             ssh.chmod(0o700)
         report_path = self.root / "ssh-report.json"
         self.assertFalse(report_path.exists())
@@ -467,14 +479,15 @@ raise SystemExit(result)
 
     def test_unit_is_resolved_from_current_production_docs_with_longest_worktree(self) -> None:
         self.assert_report("unit", "weighted", "--by", "unit")
-        document = self.production_docs / "fixture-production.md"
-        _ = document.write_text(document.read_text(encoding="utf-8").replace("| Deep |", "| Renamed |"), encoding="utf-8")
+        deep = next(row for row in staff.snapshot().find(kind="unit") if row.name == "Deep")
+        _ = staff.rename(deep.id, "Renamed")
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:
-        document = self.production_docs / "other-production.md"
-        _ = document.write_text("## Units\n\n| Unit | Worktree |\n| --- | --- |\n| Wrong | `/invented/loos` |\n",
-                                encoding="utf-8")
+        owner = staff.snapshot().by_doc(remote.local_machine(), self.production_docs / "other-production.md")
+        assert owner is not None
+        _ = fixture_member("unit", name="Wrong", parent=owner.id,
+                           worktree=staff.PresentWorktree(remote.local_machine(), Path("/invented/loos")))
         self.assert_report("unit", "weighted", "--by", "unit")
 
     def test_reports_read_only_store_after_every_source_is_removed(self) -> None:
@@ -561,7 +574,7 @@ METRICS['turn_count'] = Metric('turn_count', 'Stored turn count',
                              TurnAggregate('turns', 'count(*)'), format=ReportFormat.COUNT)
 raise SystemExit(main(sys.argv[1:]))
 """
-        result = subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                  "--production-docs", str(self.production_docs), "turn_count"],
                                 env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -871,6 +884,31 @@ print(json.dumps(results))
         result = self.report("weighted")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(missing.exists())
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.usage import usage_report
+
+
+class BranchUsageLocationTests(StaffTestCase):
+    def test_usage_attribution_uses_the_staff_worktree(self) -> None:
+        fixture = self.separated_unit_folders()
+        with mock.patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(usage_report.unit_worktrees(fixture.doc.parent),
+                             (usage_report.UnitWorktree("member", fixture.worktree),))
+
+    def test_unfilled_unit_reports_its_fact_and_keeps_the_other_units(self) -> None:
+        fixture = self.separated_unit_folders()
+        from scripts.production.staff_test_support import fixture_member
+        _ = fixture_member("unit", name="unfilled", parent=fixture.runner.id)
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()) as errors:
+            rows = usage_report.document_units(fixture.runner)
+        self.assertEqual(rows, (usage_report.UnitWorktree("member", fixture.worktree),))
+        self.assertIn("unfilled", errors.getvalue())
 
 
 if __name__ == "__main__":

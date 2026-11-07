@@ -7,7 +7,6 @@ import io
 import json
 import math
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -19,19 +18,17 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request
 
-from scripts.issue_score import client, questions, score_issues, vault
+from scripts.issue_score.test_config import ConfiguredTestCase
+from scripts.issue_score import client, questions, score_issues
 from scripts.issue_score import records as run_records
+from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score.test_decide import choice_answer
 
 # proposals_table.py imports its production neighbors by bare name.
-PRODUCTION_DIR = str(Path(__file__).resolve().parents[1] / "production")
-if PRODUCTION_DIR not in sys.path:
-    sys.path.insert(0, PRODUCTION_DIR)
 from scripts.production.issues import Issue as ProposalIssue
 from scripts.production.proposals_table import proposal_score
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -45,17 +42,20 @@ class FixtureHTTPResponse(io.BytesIO):
         self.headers = Message()
 
 
-class ScoreIssuesTests(unittest.TestCase):
+class ScoreIssuesTests(ConfiguredTestCase):
     root: Path = Path()
     issues: Path = Path()
     state: Path = Path()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "vault" / "issues"
         self.issues.mkdir(parents=True)
         self.state = self.root / "state"
+        _ = self.configuration(vault_root=str(self.root / "vault"),
+                               spend_ledger=str(self.state / "spend.jsonl"))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"})))
         _ = self.enterContext(mock.patch.object(client, "urlopen", side_effect=AssertionError("Live HTTP forbidden")))
@@ -66,24 +66,10 @@ class ScoreIssuesTests(unittest.TestCase):
             + "| unused-fixture-area | A definition outside the fixture vocabulary. |\n",
             encoding="utf-8",
         )
-        read_definitions = vault.load_area_definitions
-
-        def temporary_definitions(path: Path = vault.AREA_DEFINITIONS_PATH) -> dict[str, str]:
-            if path == vault.AREA_DEFINITIONS_PATH:
-                path = self.root / "vault" / "conf" / "issue-areas.md"
-            return read_definitions(path)
-
-        _ = self.enterContext(mock.patch.object(vault, "load_area_definitions", side_effect=temporary_definitions))
         bases = self.root / "vault" / "home-base"
         bases.mkdir()
         _ = (bases / "issues - diegetic.base").write_text(
             'filters:\n  and:\n    - project.contains(link("hana_diegetic"))\n')
-        read_projects = vault.load_project_names
-
-        def temporary_projects(base_dir: Path = vault.PROJECT_BASES_DIR) -> dict[str, str]:
-            return read_projects(bases if base_dir == vault.PROJECT_BASES_DIR else base_dir)
-
-        _ = self.enterContext(mock.patch.object(vault, "load_project_names", side_effect=temporary_projects))
 
     def issue(self, name: str, *, area: str = "rendering", extra: str = "") -> Path:
         path = self.issues / (name + ".md")
@@ -101,7 +87,11 @@ class ScoreIssuesTests(unittest.TestCase):
         payload = cast(dict[str, object], json.loads(gzip.decompress(cast(bytes, request.data))))
         state = cast(dict[str, object], payload["state"])
         fixture = "area_response.json" if "areas" in state else "main_response.json"
-        return FixtureHTTPResponse((FIXTURES / fixture).read_bytes())
+        response = cast(client.Response, json.loads((FIXTURES / fixture).read_bytes()))
+        for name in cast(dict[str, questions.Question], payload["questions"]):
+            if "__" in name:
+                response["answers"][name] = response["answers"][name.split("__", 1)[0]]
+        return FixtureHTTPResponse(json.dumps(response).encode())
 
     def score(self, *, only: str = "Target*", limit: int = 0, model: str = "jev-1.14.0") -> Path:
         return score_issues.score(only, limit, issues_dir=self.issues, state_dir=self.state, model=model).result_path
@@ -284,7 +274,7 @@ class ScoreIssuesTests(unittest.TestCase):
             with self.subTest(fallback=fallback):
                 probabilities = {"rendering": .95, "unfiled": .05} if fallback else {"rendering": .05, "unfiled": .95}
                 winner = "rendering" if fallback else "unfiled"
-                area: client.Response = {"model": questions.MODEL, "usage": {"input_tokens": 500, "output_tokens": 100},
+                area: client.Response = {"model": questions.model(), "usage": {"input_tokens": 500, "output_tokens": 100},
                     "answers": {
                         "area": {"type": "choice", "choice": winner, "confidence": .95, "probabilities": probabilities},
                         "area_reverse": {"type": "choice", "choice": winner, "confidence": .95,
@@ -391,6 +381,131 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual({entry["issue_path"] for entry in self.records(run.result_path)},
                          {str(path) for path in (rated, unrated, default, style)})
         self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
+
+    def test_changed_body_limit_misses_cache_only_when_the_request_state_changes(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        config = Path(os.environ["CONF_DIR"]) / "issue_score.conf"
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            first = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 2)
+            cached = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 2)
+            self.assertEqual(cached["content_hash"], first["content_hash"])
+            self.change_configuration(config, body_character_limit="24001")
+            equivalent = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 2)
+            self.assertEqual(equivalent["content_hash"], first["content_hash"])
+            self.change_configuration(config, body_character_limit="8")
+            changed = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 4)
+            self.assertNotEqual(changed["content_hash"], first["content_hash"])
+            self.assertEqual(changed["payloads"]["main"]["state"]["issue"]["body"], "Repair t")
+            self.assertEqual(changed["payloads"]["area"]["state"]["issue"]["body"], "Repair t")
+            stable = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 4)
+            self.assertEqual(stable["content_hash"], changed["content_hash"])
+            self.change_configuration(config, body_character_limit="9")
+            updated = self.records(self.score())[0]
+            self.assertEqual(http.call_count, 6)
+            self.assertNotEqual(updated["content_hash"], changed["content_hash"])
+
+    def test_body_limit_changed_during_http_keeps_the_sent_state_hash_and_requires_a_new_request(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        config = Path(os.environ["CONF_DIR"]) / "issue_score.conf"
+        self.change_configuration(config, body_character_limit="8")
+        first_request = True
+
+        def change_limit_during_request(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            nonlocal first_request
+            if first_request:
+                self.change_configuration(config, body_character_limit="9")
+                first_request = False
+            return self.replay(request, timeout)
+
+        with mock.patch.object(client, "urlopen", side_effect=change_limit_during_request) as first_http:
+            first = self.records(self.score())[0]
+        self.assertEqual(first_http.call_count, 2)
+        for call in first_http.call_args_list:
+            payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
+            self.assertEqual(payload["state"]["issue"]["body"], "Repair t")
+        for name in ("main", "area"):
+            self.assertEqual(first["payloads"][name]["state"]["issue"]["body"], "Repair t")
+
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as second_http:
+            second = self.records(self.score())[0]
+        self.assertEqual(second_http.call_count, 2)
+        for call in second_http.call_args_list:
+            payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
+            self.assertEqual(payload["state"]["issue"]["body"], "Repair th")
+        for name in ("main", "area"):
+            self.assertEqual(second["payloads"][name]["state"]["issue"]["body"], "Repair th")
+        self.assertNotEqual(second["content_hash"], first["content_hash"])
+
+        with mock.patch.object(client, "urlopen", side_effect=AssertionError("Cached answers must avoid HTTP")) as cached_http:
+            cached = self.records(self.score())[0]
+        cached_http.assert_not_called()
+        self.assertEqual(cached["content_hash"], second["content_hash"])
+        self.assertEqual(cached["payloads"], second["payloads"])
+        self.assertEqual(cached["answers"], second["answers"])
+
+    def run_scoring_api(self, name: str, directory: Path | UseConfiguredValue) -> None:
+        if name == "score":
+            _ = score_issues.score("Target A", issues_dir=self.issues, state_dir=directory, fresh=True)
+        elif name == "propose":
+            _ = score_issues.propose("diegetic", "Repair graph", issues_dir=self.issues, state_dir=directory)
+        else:
+            replacement = questions.area_questions(["rendering", "tooling"], {})["area_fits"]
+            _ = score_issues.experiment({"same_fit": {"area_fits": replacement}}, "Target A",
+                                        issues_dir=self.issues, state_dir=directory)
+
+    def test_explicit_scoring_directories_keep_spend_beside_each_run(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        configured = self.root / "configured-spend.jsonl"
+        _ = configured.write_bytes(b"")
+        config = Path(os.environ["CONF_DIR"]) / "issue_score.conf"
+        self.change_configuration(config, spend_ledger=str(configured))
+        for name in ("score", "propose", "experiment"):
+            with self.subTest(api=name):
+                directory = self.root / name
+                with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+                    self.run_scoring_api(name, directory)
+                self.assertEqual(http.call_count, 2)
+                self.assertEqual(configured.read_bytes(), b"")
+                ledger = directory / "spend.jsonl"
+                self.assertEqual(len(ledger.read_text().splitlines()), 2)
+
+    def test_configured_scoring_storage_uses_the_configured_spend_ledger(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        config = Path(os.environ["CONF_DIR"]) / "issue_score.conf"
+        for name in ("score", "propose", "experiment"):
+            with self.subTest(api=name):
+                directory = self.root / name
+                ledger = self.root / (name + "-spend.jsonl")
+                self.change_configuration(config, state_dir=str(directory), spend_ledger=str(ledger))
+                with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+                    self.run_scoring_api(name, UseConfiguredValue.CURRENT)
+                self.assertEqual(http.call_count, 2)
+                self.assertEqual(len(ledger.read_text().splitlines()), 2)
+                self.assertFalse((directory / "spend.jsonl").exists())
+
+    def test_configured_spend_inside_the_vault_is_refused_before_any_request(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        config = Path(os.environ["CONF_DIR"]) / "issue_score.conf"
+        ledger = self.root / "vault" / "spend.jsonl"
+        self.change_configuration(config, state_dir=str(self.state), spend_ledger=str(ledger))
+        before = {path: path.read_bytes() for path in (self.root / "vault").rglob("*") if path.is_file()}
+        for name in ("score", "propose", "experiment"):
+            with self.subTest(api=name), mock.patch.object(client, "urlopen") as http:
+                with self.assertRaisesRegex(ValueError, "Spend ledger must be outside the issue vault"):
+                    self.run_scoring_api(name, UseConfiguredValue.CURRENT)
+                http.assert_not_called()
+        self.assertEqual(before, {path: path.read_bytes() for path in (self.root / "vault").rglob("*") if path.is_file()})
+        self.assertFalse(ledger.exists())
 
     def test_identical_content_version_and_model_reuse_cache_without_http(self) -> None:
         _ = self.issue("Target graph")
@@ -664,26 +779,28 @@ class ScoreIssuesTests(unittest.TestCase):
                     self.assertEqual(stable["content_hash"], updated["content_hash"])
                     previous = updated
 
-    def test_scoring_runs_eight_issues_concurrently_and_writes_each_once(self) -> None:
+    def test_scoring_reads_the_changed_worker_limit_and_writes_each_issue_once(self) -> None:
         for number in range(10):
             _ = self.issue(f"Target {number}", area="rendering" if number % 2 else "tooling")
         released = threading.Event()
         lock = threading.Lock()
         active = 0
         peak = 0
+        expected_workers = 8
 
         def concurrent_replay(state: Mapping[str, object], request_questions: Mapping[str, questions.Question],
-                              model: str, *, ledger_path: Path) -> client.Response:
+                              model: str, *, ledger_path: Path,
+                              scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> client.Response:
             nonlocal active, peak
-            _ = model, ledger_path
+            del model, ledger_path, scoring_config
             with lock:
                 active += 1
                 peak = max(peak, active)
-                if active == 8:
+                if active == expected_workers:
                     released.set()
             try:
                 if not released.wait(timeout=TEST_HANG_GUARD_SECS):
-                    raise AssertionError("Eight issues never reached the request boundary together")
+                    raise AssertionError("The configured workers did not reach the request boundary together")
                 fixture = "area_response.json" if "areas" in state else "main_response.json"
                 response = cast(object, json.loads((FIXTURES / fixture).read_text()))
                 return client.parse_response(response, request_questions)
@@ -698,6 +815,16 @@ class ScoreIssuesTests(unittest.TestCase):
         records = self.records(result)
         self.assertEqual(len(records), 10)
         self.assertEqual(len({record["issue_path"] for record in records}), 10)
+        expected_workers = 2
+        active = peak = 0
+        released.clear()
+        _ = self.configuration(workers="2", vault_root=str(self.root / "vault"),
+                               spend_ledger=str(self.state / "spend.jsonl"))
+        with mock.patch.object(client, "system_one", side_effect=concurrent_replay) as system_one:
+            rerun = score_issues.score(issues_dir=self.issues, state_dir=self.state, fresh=True)
+        self.assertEqual(peak, 2)
+        self.assertEqual(system_one.call_count, 20)
+        self.assertEqual(len(self.records(rerun.result_path)), 10)
 
     def test_cli_glob_and_limit_score_only_matching_open_non_style_issues(self) -> None:
         first = self.issue("Target A")
@@ -820,8 +947,9 @@ class ScoreIssuesTests(unittest.TestCase):
         requests: list[tuple[str, bool]] = []
 
         def budget_replay(state: Mapping[str, object], request_questions: Mapping[str, questions.Question],
-                          model: str, *, ledger_path: Path) -> client.Response:
-            _ = model, ledger_path
+                          model: str, *, ledger_path: Path,
+                              scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> client.Response:
+            del model, ledger_path, scoring_config
             title = cast(questions.IssueDescription, state["issue"])["title"]
             area_request = "areas" in state
             requests.append((title, area_request))

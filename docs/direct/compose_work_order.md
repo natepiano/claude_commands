@@ -11,7 +11,7 @@ that builds the wrong thing.
    fields:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+   ~/.claude/scripts/lib/py -m scripts.berth.work_order \
      --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
      --phase <target-phase>
    ```
@@ -81,6 +81,7 @@ that builds the wrong thing.
   scoped `verify.sh`, and a folder-wide basedpyright line to one line per
   slot over its own files; the unit director retains live smoke ownership.
 - Three Gods: <WritePromptContract/> item 9's section, verbatim.
+- Build rules: <WritePromptContract/> item 10's section, verbatim.
 
 Do not open code to fill a plan gap. Name the gap and let review catch its
 effect. Mark the dispatch as assembled from the Work Order without research.
@@ -91,6 +92,8 @@ conversation with files, behavior, APIs, edges, and constraints. Point to files
 instead of copying their contents. Do not load style. Derive verification per
 <VerificationContract/>.
 If State is supplied, put it after Workers and name the lasting writes or `none`.
+
+Use `build_folders.py run --owner O --name N -- CMD...` for a build experiment.
 
 Build the fallback prompt only from this unit's own Work Order, plan and
 conversation. Never read, copy or transform another unit's prompt files under

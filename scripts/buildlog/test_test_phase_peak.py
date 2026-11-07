@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import launches
-import record
-import store
-import test_record as record_tests
-import test_record_rerun as recovery_tests
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog import test_record_rerun as recovery_tests
 
 if TYPE_CHECKING:
     from ..lint import test_invoke_scope as scope_tests
@@ -36,7 +38,7 @@ class SampleTimeline:
 class SampledTestPhase:
     source: Path
     timeline: SampleTimeline
-    reservation: Path
+    sampling_context: str
 
 
 class PhaseRecordingStop(Enum):
@@ -96,17 +98,13 @@ class TestPhasePeakTests(unittest.TestCase):
         self.recovery = recovery_tests.RecordRerunTests()
         self.addCleanup(self.recovery.doCleanups)
         self.recovery.setUp()
-        launcher = self.recovery.fixture.base / ".claude" / "scripts" / "lib" / "py"
-        launcher.parent.mkdir(parents=True)
-        launcher.symlink_to(sys.executable)
 
     def timeline(self, *, marked: bool = True, name: str = "admission") -> SampleTimeline:
         root = self.recovery.fixture.root / name
-        root.mkdir(parents=True)
+        root.mkdir(parents=True, exist_ok=True)
         return sample_timeline(root, self.recovery.fixture.repo, marked=marked)
 
-    def reservation(self, timeline: SampleTimeline, *, filtered: bool = True, width: int = 8) -> Path:
-        path = timeline.files.maximum.with_suffix(".reservation")
+    def sampling_context(self, timeline: SampleTimeline, *, filtered: bool = True, width: int = 8) -> str:
         fields: dict[str, object] = {
             "pid": 101, "start_time": "original-process", "need": 987654321,
             "repo": "hana", "step": "nextest", "worktree": str(self.recovery.fixture.repo),
@@ -115,8 +113,8 @@ class TestPhasePeakTests(unittest.TestCase):
             "package": "hana" if filtered else "", "filters": ["one", "two"] if filtered else [],
             "call_id": "original-phase-call", "admitted_at": "2026-10-02T12:00:00Z",
         }
-        _ = path.write_text(json.dumps(fields))
-        return path
+        self.assertFalse(list(timeline.files.maximum.parent.glob("*.reservation")))
+        return json.dumps(fields)
 
     def invoke_environment(self, timeline: SampleTimeline, *, caller: str = "verify") -> dict[str, str]:
         return self.recovery.fixture.environment(
@@ -132,7 +130,7 @@ class TestPhasePeakTests(unittest.TestCase):
 
     def sample_scope(self, timeline: SampleTimeline, *, filtered: bool = True,
                      argv: tuple[str, ...] = ("cargo", "nextest", "run", "--test-threads", "8")) -> SampledTestPhase:
-        reservation = self.reservation(timeline, filtered=filtered)
+        reservation = self.sampling_context(timeline, filtered=filtered)
         source = timeline.files.scope.parent / "test-phase.json"
         shell = TIMELINE_SHELL + r'''
 BUILDLOG_RECORD=$TEST_PHASE_RECORDER
@@ -175,7 +173,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         self.assertEqual(fields["call_id"], "original-phase-call")
 
     def remove_admission_sources(self, sampled: SampledTestPhase) -> None:
-        for path in (sampled.reservation, sampled.timeline.files.maximum,
+        for path in (sampled.timeline.files.maximum,
                      sampled.timeline.files.maximum.with_suffix(".wave"), sampled.timeline.files.scope_path):
             path.unlink()
 
@@ -269,7 +267,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
 
     def test_reading_phase_context_repeatedly_leaves_the_import_search_path_unchanged(self) -> None:
         timeline = self.timeline()
-        reservation = self.reservation(timeline)
+        reservation = self.sampling_context(timeline)
         original_path = sys.path.copy()
         self.addCleanup(setattr, sys, "path", original_path)
         for attempt in range(2):
@@ -366,7 +364,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
     def assert_scoped_record(self, *, caller: str, filtered: bool, terminal: bool) -> None:
         name = f"{caller}-{'filtered' if filtered else 'full'}-{'terminal' if terminal else 'tee'}"
         timeline = self.timeline(name=name)
-        reservation = self.reservation(timeline, filtered=filtered, width=32)
+        reservation = self.sampling_context(timeline, filtered=filtered, width=32)
         peak = timeline.files.scope.parent / "record.peak"
         completion = timeline.files.scope.parent / "sample-completed"
         os.mkfifo(completion)
@@ -377,7 +375,7 @@ BUILDLOG_RECORD=$TEST_PHASE_RECORDER
 scope_path=$1 scope=$2 maximum=$3 ticks=$4 reservation=$5 peak=$6 completion_pipe=$7
 shift 7
 exec 7<>"$completion_pipe"
-LINT_NEXTEST_SHARE="${reservation%/*}/share"
+LINT_NEXTEST_SHARE="$ticks/share"
 build_hold_wait_local() { :; }
 build_hold_check_local() { return 0; }
 buildlog_now() { BUILDLOG_NOW=1790942400; }
@@ -387,11 +385,17 @@ buildlog_begin() {
     printf '%s\n' "$scope" > "$peak.cgroup"
 }
 buildlog_wait_for_memory() {
-    BUILDLOG_MEM_RESERVATION=$reservation BUILDLOG_MEM_WAIT_S=17 BUILDLOG_MEM_OUTCOME=Granted
+    BUILDLOG_MEM_RESERVATION=fixture-grant BUILDLOG_MEM_WAIT_S=17 BUILDLOG_MEM_OUTCOME=Granted
+    BUILDLOG_MEM_MAX_PATH=$maximum BUILDLOG_MEM_WAVE_PATH="${maximum%.max}.wave"
+    BUILDLOG_MEM_SAMPLING_CONTEXT=$reservation
 }
 buildlog_memory_python() {
     if [[ "${2:-}" == claim ]]; then
         printf '8\n'
+    elif [[ "${2:-}" == width ]]; then
+        return 0
+    elif [[ "${2:-}" == release ]]; then
+        rm -f "$maximum" "${maximum%.max}.wave"
     else
         if [[ "${2:-}" == test-phase-context ]]; then printf 'context\n' >> "$ticks/context-calls"; fi
         "$HOME/.claude/scripts/lib/py" "$@"
@@ -402,13 +406,13 @@ buildlog_exec() {
     local completed
     read -r -t 10 completed <&7 || return 92
     [[ "$completed" == done ]] || return 93
-    cp "$reservation" "$ticks/released-reservation.json"
+    "$HOME/.claude/scripts/lib/py" "$TEST_PHASE_RECORDER" test-phase-context "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" > "$ticks/released-reservation.json"
     printf 'fake nextest completed\n'
 }
 sweep_after_step() { :; }
 advance_tick
 run_once "$@"
-test ! -e "$reservation"
+test -z "${BUILDLOG_MEM_RESERVATION:-}"
 test ! -e "$maximum"
 test ! -e "${maximum%.max}.wave"
 '''
@@ -441,7 +445,7 @@ test ! -e "${maximum%.max}.wave"
         self.assertEqual((timeline.ticks / "context-calls").read_text().splitlines(), ["context"])
         self.assertEqual((timeline.ticks / "observed").read_text().splitlines(),
                          ["0:9000", "1:9000", "2:9000", "3:9000"])
-        self.assertFalse(reservation.exists())
+        self.assertFalse(list(timeline.files.maximum.parent.glob("*.reservation")))
         self.assertFalse(timeline.files.maximum.exists())
         self.assertFalse(timeline.files.maximum.with_suffix(".wave").exists())
         self.assertFalse(peak.exists())

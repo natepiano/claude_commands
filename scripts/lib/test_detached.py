@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_group import send_process_group
 from scripts.lib import detached
 
 
@@ -26,7 +27,7 @@ class DetachedTests(unittest.TestCase):
 
     def stop(self, pid: int) -> None:
         try:
-            os.killpg(pid, signal.SIGKILL)
+            send_process_group(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         try:

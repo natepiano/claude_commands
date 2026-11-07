@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 from collections.abc import Callable
 from contextvars import ContextVar
 from contextlib import redirect_stdout, redirect_stderr
@@ -19,8 +20,14 @@ from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-import build_hold
-from override_guard import require_checkout
+from scripts.build_hold import build_hold
+if TYPE_CHECKING:
+    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
+    from ..lib import test_hang_guard
+else:
+    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+    from scripts.lib import test_hang_guard
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
@@ -53,9 +60,6 @@ class HoldEventRecord(TypedDict):
     at: str
     until: str
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
@@ -102,6 +106,7 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 
 class IsolatedBuildHoldTest(unittest.TestCase):
+    admission_fixture: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     scratch: Path = Path()
     socket_dir: Path = Path()
     lifetime_reader: int = -1
@@ -163,6 +168,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),
             "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
+        self.admission_fixture = caller_admission(self, self.scratch, dict(os.environ))
         token = _finish_writers.set(self.finish_writers)
         self.addCleanup(_finish_writers.reset, token)
         self.addCleanup(self.reap_recorders)
@@ -184,7 +190,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         so wait again until a read returns EOF.
         """
         os.close(self.lifetime_writer)
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         try:
             while True:
                 remaining = max(deadline - time.monotonic(), 0)
@@ -202,5 +208,5 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
                 # A recorder runs a short subprocess; under load it can take far longer than its usual second.
-                thread.join(timeout=TEST_HANG_GUARD_SECS)
+                thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertFalse(thread.is_alive())

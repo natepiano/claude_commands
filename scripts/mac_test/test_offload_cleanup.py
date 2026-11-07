@@ -11,15 +11,15 @@ import unittest
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
-import offload
-import mac_test
-from offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
-from offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.mac_test import offload, mac_test
+from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -103,9 +103,9 @@ exit "$CLEANUP_TEST_STATUS"
         disk_status: int = 0,
         free_floor_gib: float = 100,
     ) -> subprocess.CompletedProcess[str]:
-        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
-            enabled=True, host="unused-host", connect_timeout_s=6, probe_timeout_s=1,
+            enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib="24", values={},
         )
@@ -119,7 +119,7 @@ exit "$CLEANUP_TEST_STATUS"
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
                  "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
@@ -241,7 +241,7 @@ class MacActivityShellTests(unittest.TestCase):
             for name in ("pgrep", "lsof", "ps", "id")
         )
         text = "kill() { printf 'signal requested\\n' >&2; return 99; }\n" + checks + "\n" + mac_test.mac_activity_script()
-        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
     def test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh(self) -> None:
         responses = {
@@ -252,7 +252,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nwork=0\nrc=0\n", ""))
 
     def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
         responses = {
@@ -266,7 +266,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nwork=5\nrc=0\n", ""))
                 calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
                 pgrep = [call for call in calls if call["command"] == "pgrep"]
                 lsof = [call for call in calls if call["command"] == "lsof"]
@@ -295,7 +295,7 @@ class MacActivityShellTests(unittest.TestCase):
         with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
             self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
             self.assertTrue(mac_test.mac_activity_script().startswith(marker))
-        self.assertEqual(selector.call_args_list, [mock.call(HANA), mock.call(offload.ALL_MIRRORS)])
+        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1), mock.call(offload.ALL_MIRRORS)])
 
     def run_selector(
         self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],
@@ -307,7 +307,7 @@ class MacActivityShellTests(unittest.TestCase):
         environment = {**os.environ, "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                        "ACTIVITY_TEST_DIR": str(self.root)}
         text = offload.mirror_selector_script(scope) + "select_leftovers\n"
-        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
     def test_repository_selector_stops_at_its_own_mirror_under_sh_and_zsh(self) -> None:
         responses = {
@@ -348,7 +348,7 @@ class MacActivityShellTests(unittest.TestCase):
             "sh -c cd /Users/test/rust/hana && cargo test",
         ]
         selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",
-                                  capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                                  capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(selected.returncode, 0, selected.stderr)
         self.assertEqual(selected.stdout.splitlines(), matching)
 

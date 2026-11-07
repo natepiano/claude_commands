@@ -2,6 +2,10 @@
 """Try the local postmaster outbox before handing delivery to the relay."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -16,21 +20,37 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypeGuard, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import sessions  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.lib import conf
 
-WAIT_SECONDS = 3.0
-CLAIM_GRACE_SECONDS = 2.0
-HEARTBEAT_MAX_AGE_SECONDS = 2.0
-POLL_SECONDS = 0.05
+from scripts.message import sessions  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 RELAY_ONLY_SENDERS = frozenset({"shutdown"})
 MAX_SAFE_INTEGER = 9007199254740991
 
 PostmasterMiss = Literal["absent", "stale", "self", "unclaimed", "outbox-error", "failed",
                          "expired", "claimed-no-result", "relay-only-sender"]
 ModOutcome = Literal["delivered", "failed", "expired", "withdrawn", "abandoned"]
+
+
+def wait_seconds() -> float:
+    """Outbox wait in seconds."""
+    return conf.read("postmaster").number("wait_seconds")
+
+
+def claim_grace_seconds() -> float:
+    """Claimed outbox grace in seconds."""
+    return conf.read("postmaster").number("claim_grace_seconds")
+
+
+def heartbeat_max_age_seconds() -> float:
+    """Maximum heartbeat age in seconds."""
+    return conf.read("postmaster").number("heartbeat_max_age_seconds")
+
+
+def poll_seconds() -> float:
+    """Outbox poll interval in seconds."""
+    return conf.read("postmaster").number("poll_seconds")
 
 
 class OutboxEntry(TypedDict):
@@ -209,7 +229,7 @@ def _heartbeat(root: Path, live: list[sessions.SessionRecord]) -> HeartbeatRead:
             if not is_heartbeat(read.value):
                 return NoFreshHeartbeat("stale")
             age = time.time() - read.value["at_ms"] / 1000
-            if 0 <= age <= HEARTBEAT_MAX_AGE_SECONDS and any(
+            if 0 <= age <= heartbeat_max_age_seconds() and any(
                 session["sessionId"] == read.value["session_id"] for session in live
             ):
                 return FreshHeartbeat(read.value, age)
@@ -279,7 +299,7 @@ def _result(root: Path, entry: OutboxEntry, started: float) -> Attempt | ResultP
             return RelayRequired("claimed-no-result", seconds)
 
 
-def _poll(root: Path, entry: OutboxEntry, started: float, deadline: float) -> Attempt | ResultPending:
+def _poll(root: Path, entry: OutboxEntry, started: float, deadline: float, interval: float) -> Attempt | ResultPending:
     while True:
         result = _result(root, entry, started)
         if not isinstance(result, ResultPending):
@@ -287,7 +307,7 @@ def _poll(root: Path, entry: OutboxEntry, started: float, deadline: float) -> At
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return result
-        time.sleep(min(POLL_SECONDS, remaining))
+        time.sleep(min(interval, remaining))
 
 
 def _withdraw(root: Path, entry_id: str) -> bool:
@@ -314,9 +334,12 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
         return RelayRequired(heartbeat.reason, time.monotonic() - started)
     if heartbeat.record["session_id"] == session["sessionId"]:
         return RelayRequired("self", time.monotonic() - started)
-    deadline = time.monotonic() + WAIT_SECONDS
+    wait = wait_seconds()
+    grace = claim_grace_seconds()
+    interval = poll_seconds()
+    deadline = time.monotonic() + wait
     entry = wire_entry(entry_id, session, sender, reply_destination(sender, live), text,
-                       int(time.time() * 1000) + int(WAIT_SECONDS * 1000))
+                       int(time.time() * 1000) + int(wait * 1000))
     temporary = root / "outbox" / f".{entry_id}.json.tmp"
     try:
         try:
@@ -325,7 +348,7 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
             os.replace(temporary, root / "outbox" / f"{entry_id}.json")
         except OSError:
             return RelayRequired("outbox-error", time.monotonic() - started)
-        result = _poll(root, entry, started, deadline)
+        result = _poll(root, entry, started, deadline, interval)
         if not isinstance(result, ResultPending):
             return result
         if not _withdraw(root, entry_id):
@@ -336,7 +359,7 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
             claimed = True
         if not claimed:
             return RelayRequired("unclaimed", time.monotonic() - started)
-        result = _poll(root, entry, started, time.monotonic() + CLAIM_GRACE_SECONDS)
+        result = _poll(root, entry, started, time.monotonic() + grace, interval)
         return (RelayRequired("claimed-no-result", time.monotonic() - started)
                 if isinstance(result, ResultPending) else result)
     finally:

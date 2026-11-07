@@ -10,19 +10,35 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import override
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
+from scripts.lib import scratch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
 SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
 
 class RemoveRunScratchTests(unittest.TestCase):
+    owner_id: str = ""
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        self.enterContext(mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(root / "unit-workers")}))
+        owner = fixture_member("showrunner", name="demo")
+        self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
+
     def make_run(self) -> tuple[Path, Path]:
         """A run folder with copies at several depths, and a folder outside it."""
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         run = root / "run"
         (run / "verify_cache").mkdir(parents=True)
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
         _ = (run / "verify_cache" / "pass").write_text("ok\n", encoding="utf-8")
         _ = (run / "workers").write_text("id\tname\n", encoding="utf-8")
         _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
@@ -44,33 +60,67 @@ class RemoveRunScratchTests(unittest.TestCase):
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
 
+    def test_a_bad_cargo_removal_mark_does_not_stop_other_folder_removals(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases" / "p4" / "gate"
+        mark = scratch.cargo_removal_mark(checkout)
+        _ = mark.write_text("{broken")
+        with (mock.patch.object(workers, "protected_working_directories", return_value=()),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
+            self.assertEqual(remove_run_scratch.main(), 1)
+        self.assertTrue(checkout.exists())
+        self.assertEqual(mark.read_text(), "{broken")
+        self.assertFalse((run / "scratch" / "export").exists())
+        self.assertFalse((run / "p26_before").exists())
+        self.assertFalse((run / "verify_cache").exists())
+
+    def test_run_checkout_cleanup_uses_the_saved_cargo_output_guard(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases" / "p4" / "gate"
+        events: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved, ())
+            self.assertTrue((path / ".git").exists())
+            events.append("guard")
+        with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            remove_run_scratch.remove(checkout)
+        self.assertEqual(events, ["guard"])
+        self.assertFalse(checkout.exists())
+
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"
         command_cwd = checkout / "target"
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
         records = run / "mesh_runs"
         records.mkdir()
         record = records / "verify.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                   "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
-        self.addCleanup(lambda: child.communicate(timeout=4))
-        _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "cwd": str(command_cwd)}))
-        with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(run.parent / "unit-workers")}):
+        self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
+        environment = {"UNIT_WORKERS_STATE": str(run.parent / "unit-workers"), "CODEX_HOME": str(run.parent / "codex")}
+        _ = self.enterContext(isolated_staff_file(run.parent / "staff.json", environment))
+        owner = fixture_member("showrunner", name="demo")
+        parent = fixture_member("unit", name="builders", parent=owner.id,
+                                worktree=staff.PresentWorktree("natedev", command_cwd))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
+        member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
+        _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "staff_id": member.id}))
+        with mock.patch.dict(os.environ, environment):
             store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
             with store.locked() as ledger:
                 ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                    workers.CodexThread("kept-thread", str(run.parent / "codex")), workers.Paused(),
-                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+                    workers.CodexThread(member.current_session, str(run.parent / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})], staff_id=member.id)
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
-                                    text=True, timeout=10, check=False)
+                                    text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(command_cwd.is_dir(), result.stdout)
             self.assertFalse((run / "scratch" / "export").exists())
             self.assertTrue(record.exists())
-            _ = record.write_text(json.dumps({"status": "finished", "pid": os.getpid(), "worker": "w7", "cwd": str(command_cwd)}))
+            _ = record.write_text(json.dumps({"status": "finished", "pid": os.getpid(), "worker": "w7", "staff_id": member.id}))
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
-                                    text=True, timeout=10, check=False)
+                                    text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(checkout.exists())
 
@@ -141,6 +191,7 @@ class RemoveRunScratchTests(unittest.TestCase):
         git("commit", "-q", "--allow-empty", "-m", "start")
         git("branch", "copy")
         run.mkdir()
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
         git("worktree", "add", "-q", str(run / "phases" / "p4" / "gate"), "copy")
         return source, run, run / "phases" / "p4" / "gate"
 

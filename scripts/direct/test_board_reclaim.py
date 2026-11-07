@@ -15,10 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from typing import cast, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 BOARD = Path(__file__).with_name("board.sh")
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Hold news for the user, and send it when they have not typed in a terminal in time.
 
-  escalate.py hold KEY --summary TITLE --text TEXT (--action TEXT | --no-action)
-                   [--minutes 15] [--need note|decision|blocked]
+  escalate.py hold KEY --text-id ID --value KEY=VALUE ...
+                   [--minutes 15] [--question PATH]
   escalate.py close KEY    the news is over; the next hold of KEY starts a new wait, and a sent
                            --need blocked push stops repeating (send.py retire --to user)
   escalate.py typed        the user typed in a terminal: the prompt hook's call
@@ -11,10 +11,14 @@
 
 `hold` is for news a terminal already shows. It waits `--minutes`: if the user
 types in any terminal in that time it is never sent, and if not, `due` sends it
-with `send.py --to user --key escalate-KEY`. Holding a KEY already held changes nothing, so a caller
+through `push_texts.user_send_argv()` with its registered template. Holding a KEY already held changes nothing, so a caller
 may hold on every check and `close` once the news stops being true.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -30,33 +34,28 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
-from scripts.production.showrunners import load_settings, registered_showrunners
-if TYPE_CHECKING:
-    from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                        codex_account, workers_home)
-else:
-    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                codex_account, workers_home)
-from user_action import (FIX, ActionRefused, ActionRequired, ActionUnstated, NoActionRequired, UserAction,
-                         parse_user_action)
+from scripts.production.showrunners import load_settings
+from scripts.production import staff
+from scripts.message import send_budget, session_send
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+                                    codex_account, workers_home)
+from scripts.notify.user_action import ActionRequired, NoActionRequired, UserAction
 
 if TYPE_CHECKING:
-    from send import Need
+    from scripts.message.send import Need
 
 STATE = Path(os.environ.get("ESCALATE_STATE_DIR")
              or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "escalate")
-SEND = Path(os.environ.get("ESCALATE_SEND") or Path(__file__).with_name("send.py"))
+SEND = Path(os.environ.get("ESCALATE_SEND") or session_send.SEND_SCRIPT)
 NOTIFIER = Path(os.environ.get("ESCALATE_NOTIFIER") or Path(__file__).with_name("notifier.sh"))
 PY = Path(__file__).resolve().parent.parent / "lib" / "py"
 JOB = "escalate"
 KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-USAGE = ("usage: escalate.py hold KEY --summary TITLE --text TEXT (--action TEXT | --no-action) "
-         + "[--minutes N] [--need note|decision|blocked]"
+USAGE = ("usage: escalate.py hold KEY --text-id ID --value KEY=VALUE ... "
+         + "[--minutes N] [--question PATH] "
          + " | close KEY | typed | due | list")
 
 Outcome = Literal["waiting", "sent", "answered", "review_held"]
@@ -139,6 +138,9 @@ class StoredHeldMessage(TypedDict):
     codex_owner: NotRequired[StoredCodexAccount]
     relays: NotRequired[list[HeldRelay]]
     review_reason: NotRequired[str]
+    text_id: NotRequired[str]
+    values: NotRequired[dict[str, str]]
+    reference: NotRequired[push_reference.PushReference]
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,13 @@ class HeldMessage:
     @property
     def action(self) -> UserAction:
         return self.push.action
+
+
+@dataclass(frozen=True, kw_only=True)
+class RegisteredHold(HeldMessage):
+    text_id: str
+    values: tuple[tuple[str, str], ...]
+    reference: push_reference.PushReference = field(default_factory=lambda: push_reference.NO_REFERENCE)
 
 
 @dataclass(frozen=True)
@@ -265,9 +274,22 @@ def read(path: Path) -> ReadHeld:
         return UnreadableHeld()
     legacy = _legacy_held(value)
     record = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    text_id = record.get("text_id", "")
+    values = record.get("values", {})
+    registered_values: dict[str, str] = {}
     if "text_id" in record or "values" in record:
-        text_id = record.get("text_id")
-        return RetiredScriptHold(text_id if isinstance(text_id, str) else "unknown")
+        if not isinstance(text_id, str) or not text_id or not isinstance(values, dict):
+            return UnreadableHeld()
+        raw_values = cast(dict[str, object], values)
+        if not all(isinstance(item, str) for item in raw_values.values()):
+            return UnreadableHeld()
+        registered_values = cast(dict[str, str], raw_values)
+        if text_id not in {entry.id for entry in push_texts.catalog()}:
+            return RetiredScriptHold(text_id)
+        try:
+            _ = push_texts.render(text_id, **registered_values)
+        except ValueError:
+            return UnreadableHeld()
     if legacy is None:
         return UnreadableHeld()
     if "action" not in record:
@@ -284,6 +306,14 @@ def read(path: Path) -> ReadHeld:
     if not isinstance(review_reason, str):
         return UnreadableHeld()
     push = SessionPush(legacy.summary, legacy.text, action, legacy.need)
+    if text_id:
+        try:
+            reference = push_reference.read_reference(record.get("reference"))
+        except ValueError:
+            return UnreadableHeld()
+        return RegisteredHold(push, legacy.held_at, legacy.minutes, legacy.outcome,
+            owner, _read_relays(record.get("relays")), origin, review_reason,
+            text_id=cast(str, text_id), values=tuple(registered_values.items()), reference=reference)
     return HeldMessage(push, legacy.held_at, legacy.minutes, legacy.outcome,
                        owner, _read_relays(record.get("relays")), origin, review_reason)
 
@@ -324,6 +354,10 @@ def write(path: Path, held: HeldMessage) -> None:
         "outcome": held.outcome,
         "action": _stored_action(held.action),
     }
+    if isinstance(held, RegisteredHold):
+        record["text_id"] = held.text_id
+        record["values"] = dict(held.values)
+        record["reference"] = held.reference
     if isinstance(held.origin, SessionQuestionOrigin):
         record["origin_session"] = held.origin.session_id
     if held.relays:
@@ -362,10 +396,14 @@ def _stored_action(action: UserAction) -> _StoredUserAction:
     return {"kind": "none"}
 
 
-def hold(key: str, push: SessionPush, minutes: int = 15,
-         *, owner: HoldOwner = UNOWNED_HOLD,
+def hold(key: str, push: SessionPush | push_texts.RenderedPush, minutes: int = 15,
+         *, question: str = "", owner: HoldOwner = UNOWNED_HOLD,
          relays: tuple[HeldRelay, ...] = (), origin: QuestionOrigin = UNKNOWN_QUESTION_ORIGIN) -> bool:
     """Start KEY's wait; false when KEY is already held."""
+    rendered = push if isinstance(push, push_texts.RenderedPush) else None
+    reference = push_reference.NO_REFERENCE if rendered is None else push_reference.admission_reference(rendered.id, question)
+    if rendered is not None:
+        push = SessionPush(rendered.title, rendered.body, rendered.action, rendered.need)
     if isinstance(push.action, NoActionRequired) and push.need != "note":
         raise ValueError(f"need {push.need} requires an action")
     with locked():
@@ -373,16 +411,20 @@ def hold(key: str, push: SessionPush, minutes: int = 15,
         existing = read(path)
         if isinstance(existing, RetiredScriptHold):
             _ = discard_script_hold(path, existing)
-        if isinstance(existing, (HeldMessage, UnreadableHeld)):
+        if isinstance(existing, (HeldMessage, LegacyHeld, UnreadableHeld)):
             return False
         schedule()
-        write(path, HeldMessage(push, time.time(), minutes, "waiting", owner, relays, origin))
+        held = HeldMessage(cast(SessionPush, push), time.time(), minutes, "waiting", owner, relays, origin)
+        if rendered is not None:
+            held = RegisteredHold(held.push, held.held_at, minutes, "waiting", owner, relays, origin,
+                                  "", text_id=rendered.id, values=tuple(rendered.values.items()), reference=reference)
+        write(path, held)
     return True
 
 
-def discard_script_hold(path: Path, held: RetiredScriptHold) -> Settled:
+def discard_script_hold(path: Path, held: RetiredScriptHold | RegisteredHold,
+                        reason: str = "script warnings no longer escalate to the phone") -> Settled:
     """Under the state lock, log an obsolete script hold once and close it."""
-    reason = "script warnings no longer escalate to the phone"
     record: RetiredHoldRecord = {"time": time.time(), "key": path.stem,
                                 "text_id": held.text_id, "reason": reason}
     with (STATE / "log.jsonl").open("a", encoding="utf-8") as output:
@@ -408,8 +450,8 @@ def close(key: str) -> bool:
             return False
         if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
             try:
-                done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
-                                       "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
+                done = subprocess.run(session_send.send_argv("retire", "--to", "user", "--from", JOB,
+                                       "--key", user_key(key), send_script=SEND), capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
                     failure_detail(done, lines=1)).replace("\n", "; ")
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -421,47 +463,55 @@ def close(key: str) -> bool:
     return True
 
 
+def _outgoing_codex_hold(key: str, held: ReadHeld, home: Path, login: str) -> bool:
+    """Registered holds for an old Codex key or another account must retire."""
+    return key == "five-hour-codex" or (isinstance(held, HeldMessage)
+            and isinstance(held.owner, KnownCodexAccount)
+            and (held.owner.home != home or held.owner.login.casefold() != login.casefold()))
+
+
 def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
     for path in (STATE / "held").glob("*.json"):
         held = read(path)
         if isinstance(held, RetiredScriptHold):
             _ = discard_script_hold(path, held)
             continue
-        if path.stem == "five-hour-codex" or (isinstance(held, HeldMessage)
-                and isinstance(held.owner, KnownCodexAccount)
-                and (held.owner.home != home or held.owner.login.casefold() != login.casefold())):
+        if isinstance(held, (HeldMessage, LegacyHeld)) and not isinstance(held, RegisteredHold):
+            continue
+        if _outgoing_codex_hold(path.stem, held, home, login):
             relays = held.relays if isinstance(held, HeldMessage) else ()
             if not relays:
                 try:
-                    names = [*load_settings()["always"], *(runner["session"] for runner in registered_showrunners())]
+                    names = [*load_settings()["always"], *(f"session:{row.current_session}" for row in staff.active(staff.snapshot(), "showrunner"))]
                 except (OSError, ValueError):
-                    names = []
+                    continue
                 label = held.owner.label if isinstance(held, HeldMessage) and isinstance(held.owner, KnownCodexAccount) else "Codex"
                 relays = tuple(HeldRelay(recipient=name, key=f"5-hour {label}") for name in dict.fromkeys(names))
             for relay in relays:
-                _ = subprocess.run([sys.executable, str(SEND), "retire", "--to", relay["recipient"],
-                                    "--from", "quota_alert", "--key", relay["key"]],
+                _ = subprocess.run(session_send.send_argv("retire", "--to", relay["recipient"],
+                                    "--from", "quota_alert", "--key", relay["key"], send_script=SEND),
                                    capture_output=True, text=True, check=False)
             path.unlink(missing_ok=True)
 
 
 def reconcile_codex_holds(home: Path, login: str) -> None:
-    """Cancel outgoing and legacy Codex holds after a known selection, without a recovery notice."""
+    """Cancel registered Codex holds after an account selection. Keep legacy free-text holds."""
     with locked():
         _cancel_outgoing_codex_holds(home, login)
 
 
 def deliver(held: HeldMessage, key: str) -> str:
     """Send one held message to the user; the empty string when sent, else send.py's own line."""
-    import review
+    from scripts.notify import review
 
-    action_args = ["--action", held.action.text] if isinstance(held.action, ActionRequired) else ["--no-action"]
-    # `close` retires a sent blocked push.
-    clearing = ["--self-clearing"] if held.need == "blocked" else []
-    command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--key", user_key(key), "--summary", held.summary,
-               "--need", held.need, *clearing, *action_args, "--text", held.text]
+    if not isinstance(held, RegisteredHold):
+        return "template revision required"
+    rendered = push_texts.render(held.text_id, **dict(held.values))
+    command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
+                                      self_clearing=held.need == "blocked", send_script=SEND,
+                                      question=held.reference["path"] if held.reference["kind"] == "question" else "")
     done = subprocess.run(command, capture_output=True, text=True, check=False,
-                          timeout=review.user_send_seconds() + 15)
+                          timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
 
 
@@ -475,10 +525,10 @@ def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[
             relays.append(HeldRelay(recipient=recipient, key="review-held-" + entry_key))
     for relay in relays:
         try:
-            done = subprocess.run([sys.executable, str(SEND), "--to", relay["recipient"], "--from", JOB,
+            done = subprocess.run(session_send.send_argv("--to", relay["recipient"], "--from", JOB,
                                    "--key", relay["key"], "--summary", "Relayed push needs revision",
-                                   "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it."],
-                                  capture_output=True, text=True, check=False, timeout=40)
+                                   "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it.", send_script=SEND),
+                                  capture_output=True, text=True, check=False, timeout=send_budget.seconds())
             if done.returncode not in (0, 1):
                 errors.append(f"{relay['recipient']}: {failure_detail(done)}")
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -503,7 +553,14 @@ def due(now: float) -> list[Settled]:
         seen = typed_at()
         for path in sorted((STATE / "held").glob("*.json")):
             held = read(path)
-            if not isinstance(held, HeldMessage):
+            if isinstance(held, (HeldMessage, LegacyHeld)) and not isinstance(held, RegisteredHold):
+                owner = (held.origin.session_id if isinstance(held, HeldMessage)
+                         and isinstance(held.origin, SessionQuestionOrigin) else
+                         held.owner.label if isinstance(held, HeldMessage)
+                         and isinstance(held.owner, KnownCodexAccount) else path.stem)
+                print(f"escalate.py: {owner}: legacy hold needs a template revision; not delivered", file=sys.stderr)
+                continue
+            if not isinstance(held, RegisteredHold):
                 continue
             if held.outcome == "review_held" and held.review_reason:
                 errors = forward_review_hold(held, held.review_reason, path.stem)
@@ -513,7 +570,22 @@ def due(now: float) -> list[Settled]:
                 continue
             if held.outcome != "waiting":
                 continue
+            if held.reference["kind"] == "question":
+                try:
+                    opening = push_reference.read_question(Path(held.reference["path"]))
+                except (OSError, ValueError) as error:
+                    settled.append(Settled(f"{path.stem}: NOT sent: {error}", True))
+                    continue
+                reason = ("question closed" if opening.status == "closed" else
+                          "question reopened" if opening.since != held.reference["since"] else "")
+                if reason:
+                    settled.append(discard_script_hold(path, held, reason))
+                    continue
             if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
+                continue
+            if (isinstance(identity, KnownCodexAccount)
+                    and _outgoing_codex_hold(path.stem, held, identity.home, identity.login)):
+                # Cancellation may need a later inventory; the outgoing account must never alert meanwhile.
                 continue
             if seen >= held.held_at:
                 held = replace(held, outcome="answered")
@@ -558,58 +630,45 @@ def listing(now: float) -> list[str]:
     return lines or ["nothing held"]
 
 
-def parse_hold_options(arguments: list[str]) -> tuple[dict[str, str], bool] | None:
-    options = {"--minutes": "15", "--need": "decision"}
-    no_action = False
-    seen: set[str] = set()
+def registered_hold_options(arguments: list[str]) -> tuple[push_texts.RenderedPush, int, str]:
+    text_id = ""
+    question = ""
+    minutes = "15"
+    values: dict[str, str] = {}
     index = 0
     while index < len(arguments):
-        option = arguments[index]
-        if option == "--no-action":
-            if option in seen:
-                return None
-            seen.add(option)
-            no_action = True
-            index += 1
-            continue
-        if option not in ("--summary", "--text", "--minutes", "--need", "--action") \
-                or option in seen or index + 1 >= len(arguments):
-            return None
-        seen.add(option)
-        options[option] = arguments[index + 1]
+        if index + 1 >= len(arguments):
+            raise ValueError(USAGE)
+        option, value = arguments[index:index + 2]
+        if option == "--text-id" and not text_id:
+            text_id = value
+        elif option == "--question":
+            question = value
+        elif option == "--minutes":
+            minutes = value
+        elif option == "--value":
+            key, separator, item = value.partition("=")
+            if not separator or key in values:
+                raise ValueError("--value needs distinct key=value pairs")
+            values[key] = item
+        else:
+            raise ValueError(USAGE + "; " + push_texts.TEMPLATE_REQUIRED)
         index += 2
-    return options, no_action
+    if not text_id or not minutes.isdigit():
+        raise ValueError(USAGE + "; " + push_texts.TEMPLATE_REQUIRED)
+    return push_texts.render(text_id, **values), int(minutes), question
 
 
 def main(arguments: list[str]) -> int:
     match arguments:
         case ["hold", key, *pairs] if KEY.fullmatch(key):
-            from send import CHANNEL_PRIORITY
-
-            parsed = parse_hold_options(pairs)
-            if parsed is None:
-                print(USAGE, file=sys.stderr)
-                return 2
-            options, no_action = parsed
-            if options.keys() != {"--summary", "--text", "--minutes", "--need", "--action"} \
-                    and options.keys() != {"--summary", "--text", "--minutes", "--need"}:
-                print(USAGE, file=sys.stderr)
-                return 2
-            action = parse_user_action(options.get("--action"), no_action)
-            if isinstance(action, (ActionUnstated, ActionRefused)):
-                reason = FIX if isinstance(action, ActionUnstated) else f"{action.reason}. {FIX}"
-                print(f"escalate.py: {reason}", file=sys.stderr)
-                return 2
-            if options["--need"] not in CHANNEL_PRIORITY or not options["--minutes"].isdigit():
-                print(USAGE, file=sys.stderr)
-                return 2
             try:
-                started = hold(key, SessionPush(options["--summary"], options["--text"], action, options["--need"]),
-                               int(options["--minutes"]), origin=current_question_origin())
+                rendered, minutes, question = registered_hold_options(pairs)
+                started = hold(key, rendered, minutes, question=question, origin=current_question_origin())
             except ValueError as error:
-                print(f"escalate.py: {error}. {FIX}", file=sys.stderr)
+                print(f"escalate.py: {error}", file=sys.stderr)
                 return 2
-            print(f"{key}: held; sent to the user in {options['--minutes']} min unless they type in a terminal"
+            print(f"{key}: held; sent to the user in {minutes} min unless they type in a terminal"
                   if started else f"{key}: already held")
         case ["close", key] if KEY.fullmatch(key):
             print(f"{key}: closed" if close(key) else f"{key}: not held")

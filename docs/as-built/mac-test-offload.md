@@ -2,11 +2,13 @@
 
 ## What it is
 
-`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. Both reports show coordination state now and recorded hold intervals; `/build:report` gives the Mac's own steps a section apart from natedev's.
+`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold they keep their local path. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
+During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold they keep their local path. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path, platform) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
 
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
+
+Mac-allowed lint, check, and doc use the same availability checks and target reservations as tests during a natedev Cargo token wait. A free eligible Mac permits immediate routing. An idle alert marker does not control admission. Blocks, live repository claims, and retry delays still apply. Tree repair steps remain local.
 
 Lint during a hold keeps local `cargo fmt` and `taplo fmt`, then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. Compile rewrite loops do not run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
@@ -37,42 +39,105 @@ A claim from any caller (offload, `mac_run.sh`, a session following `/build:mac`
   - `MacIdle` and no `idle_since`: write `idle_since` as now.
   - `MacIdle` and `idle_since` at least `claim_idle_minutes` old: delete the claim's file, start the block watcher when a block is present (as `release` does), print the message to the watcher's journal, and send it to `session:<holder_session>` through `send_message` with key `mac-claim-idle-<pid>-<since>`. A claim with no `holder_session` sends nothing.
   - `ActivityCheckFailed`: print `Mac claim activity check failed: <reason>` and change nothing. An unreachable Mac never releases a claim.
-- The message: `Your Mac claim "<what>" (since <HH:MM>) was released at <HH:MM>: nothing ran on the Mac for 15 minutes, so tests waiting for it can run. Claim it again before your next Mac command: python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<what>' --worktree '<worktree>' [--remote '<host>'] (see /build:mac).` The `--worktree` is the claim's own, so the repeated claim keeps its scope; the `--remote` word appears for a remote claim.
+- The message: `Your Mac claim "<what>" (since <HH:MM>) was released at <HH:MM>: nothing ran on the Mac for 15 minutes, so tests waiting for it can run. Claim it again before your next Mac command: ~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<what>' --worktree '<worktree>' [--remote '<host>'] (see /build:mac).` The `--worktree` is the claim's own, so the repeated claim keeps its scope; the `--remote` word appears for a remote claim.
 - `mac_activity_script()` runs over one ssh call (`BatchMode=yes`, `ConnectTimeout=connect_timeout_s`, 10 s total) and prints `active=<n>` and `rc=0`; any other answer is `ActivityCheckFailed`. A Mac process is one of the user's processes that `offload.mirror_selector_script(ALL_MIRRORS)` selects (a command line or working directory under `.local/state/mac-test/mirror/`), or whose executable is named `cargo`, `rustc` or `cargo-nextest`, or whose executable path contains `/target/` (test and app binaries). The check sends no signal. The text runs under the Mac's `sh` and `zsh -f`.
 
 ### The idle Mac watch — `scripts/buildlog/mac_idle.py`
 
-The existing `buildlog-sample.timer` runs `buildlog sample` on natedev every
-60 seconds. That command also runs the idle Mac check. It needs no new unit.
-The check starts a three-minute idle interval when it sees no claim. A claim
-in `claims/`, a legacy `run.json`, a Mac block, or a future `unreachable_until`
-stops it. A change to the claims folder resets the interval. The check reads
-these files and never changes a claim or a build hold.
+The existing `buildlog-sample.timer` runs the idle check on natedev.
+Its default interval is 60 seconds.
+The check writes `~/.local/state/mac-idle/alert.json` on each pass.
+The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
+The views read the saved file and local configuration.
+They make no SSH or recipient lookup calls.
 
-The check reads live step records with `runs_on=mac_allowed` and state `waiting_hold` or `waiting_mac`, for every eligible kind. The shared record reader validates the owner PID and process start. It uses the recorded decision rather than matching verify.sh command names or making another package decision. Permanent declines stay excluded for that call.
+The check counts live steps that can use a Mac.
+It accepts `MacAllowed` and `SshAllowed` records with Mac targets.
+The step must have state `waiting_hold` or `waiting_mac`.
+The check validates the owner PID and process start time.
+It preserves P10 admission reads and excludes permanent local declines.
 
-For a missing session temp folder, the check requires a session record whose
-PID and start time still match a live process. It then creates the folder
-under `/tmp/claude/session/`. For a missing leave hook or a pending retry
-deadline, it writes the call's `.retry` marker. The normal leave check reads
-that marker and bypasses the deadline, then checks `free-now`. Hold and
-memory waits also accept the call's exported marker hook when their normal
-hook is empty. Cargo-token waits use the same retry check. The original call
-removes the marker before its Mac attempt and keeps its own result and
-buildlog row. The watch starts no build step.
+The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 
-An unknown cause sends one message per cause per call to the `builds-unit`
-director in production `build-followups`. The check resolves that address
-with `scripts/message/roster.py --json` and sends through `send.py`. A call
-started before marker support gets this message too. It sends no message to
-the user. A failed send stays pending for another pass; a queued send counts
-as accepted.
+| Key | Default | Purpose |
+|---|---:|---|
+| `alert_seconds` | 180 | Delay before the view alert and showrunner message |
+| `push_seconds` | 600 | Delay before the phone push |
+| `stale_seconds` | 300 | Maximum age of a saved reading |
+| `repeat_minutes` | 1440 | Minimum repeat window for an outage |
+| `send_timeout_s` | 180 | Timeout for a phone send |
 
-Buildlog index schema 21 includes `mac_idle`: one row per cause per call, with the
-wait, cause and action. The `.cases` record prevents one row on every pass.
-A pending send is retried without another row. `buildlog schema` lists the
-fields. `MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private roots for
-tests; test claim, session, process and buildlog roots are private too.
+The shared configuration reader supplies these values at use.
+`mac_test.read_config()` uses the same idle decoder.
+`CONF_DIR` selects the configuration folder.
+`MAC_TEST_CONFIG` can select the idle watch's configuration file.
+Missing or invalid override values use the shipped configuration.
+A typed configuration error names a key that has no usable value.
+Views show that error as `MAC IDLE WATCH`.
+
+The watch sends the builds showrunner one message after `alert_seconds` while eligible steps wait.
+It resolves the address with `showrunners.py address builds`.
+The message names the block, idle claim, or free Mac.
+It lists the waiting steps and their wait evidence.
+The views place the same `MAC IDLE` alert first.
+`MAC UNREACHABLE` identifies a future connection backoff.
+`MAC IDLE WATCH` identifies unreadable or stale state.
+Neither condition sends an idle notification.
+
+After `push_seconds`, a block uses `mac_idle.blocked` with `need=blocked`.
+An idle claim or free Mac uses `mac_idle.stuck` with `need=decision`.
+A free Mac has no reservation sentence.
+The block push names `/build:mac unblock` as its action.
+The other push asks the builds showrunner to resume Mac work.
+
+Both sends use outage keys and `--repeat-minutes`.
+The repeat window covers at least `repeat_minutes` and the current outage age.
+Both sends use `--recipient-key` for confirmed delivery tracking.
+The showrunner identity is `showrunner:builds`; the phone identity is `user`.
+A socket change does not change the showrunner identity.
+Existing callers without this option retain builds' pending-claim behavior.
+
+For these logical recipients, `send.py` holds a separate advisory lock across acceptance checks, transport, and confirmation.
+It records confirmation only after delivery or a recoverable queue accepts the message.
+It never holds the global state lock during transport.
+Contention returns `RETRY` with exit 6.
+The watch does not mark a retry as delivered.
+A process stop before acceptance permits the next pass to retry.
+A stop after confirmation causes no second delivery.
+A stop between acceptance and confirmation can cause one duplicate.
+Delivery takes precedence over loss in that gap.
+This policy covers process stops, including SIGTERM, SIGKILL, and session stops.
+It does not cover power loss or promise filesystem synchronization.
+
+The watch saves `messaged` and `pushed` only after accepted delivery.
+The block push uses `mac_idle.py cleared --since <since>`.
+That check reads only the saved result.
+It clears when the outage changes, ends, or has no waiting steps.
+Missing and stale readings never clear a push.
+A later outage gets new marks and keys.
+
+The claim watcher records `work_idle_since` from its existing activity check.
+Cargo, rustc, cargo-nextest, and test binaries under `deps/` count as work.
+Other executables under `target/` count as apps.
+An app can retain a claim while no work runs.
+Any activity still clears `idle_since`.
+The existing default 15-minute claim release rule remains unchanged.
+A failed activity check changes neither idle key.
+
+The full process scan runs only after `alert_seconds` while work waits.
+Repeated stale-record diagnostics print once until their evidence changes.
+Repairs run only when no block or live claim reserves the Mac.
+A live session record permits recreation of its missing temporary folder.
+Missing leave hooks and pending retry deadlines create `.retry` markers.
+Hold, memory, and CPU-token waits preserve their existing marker behavior.
+The watch starts no build step.
+Other repair notices go to the builds showrunner.
+
+Buildlog schema 21 keeps one `mac_idle` row per cause per call.
+The `.cases` record prevents duplicate rows.
+Failed repair messages remain pending.
+The recorded action is `message_showrunner`.
+`MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private test roots.
 
 ### Footer and dailies — `scripts/production/dailies_render.py`
 
@@ -80,11 +145,65 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The offload runner — `scripts/mac_test/offload.py`
 
+Nextest accepts repeated `--env NAME` arguments and one `--fetch FOLDER` argument. Other verbs and `--copy` refuse these arguments.
+The runner forwards only named variables. Quoted assignments precede the fixed runner assignments, so the fixed assignments take priority.
+A fetch folder must have a plain relative path. The runner removes that folder in the mirror before the test starts.
+After a reported test result, the runner measures the folder and copies it before releasing the claim.
+This also applies after test failure or when no tests match. A lost or declined run copies nothing.
+The runner uses `rsync -rlp --safe-links` and publishes the completed copy through an atomic rename.
+Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
+A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
+
+After a Linux run reports completion, natedev releases the slot claim before it calls `buildlog.sync.sync_target(target)`.
+The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
+AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
+The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
+This setting controls the recorder write; the box starts no connection.
+
+The exchange uses the existing sync lock without waiting for another exchange.
+A paused sync or a target without a host mapping causes no exchange.
+The exchange uses `sync.connect_timeout_s`, `sync.reach_timeout_s`, and `sync.rsync_timeout_s` from `config/build_targets.conf`.
+A failed exchange prints one line and leaves the hourly sync to retry.
+The run keeps its result and its measured duration before the exchange.
+The Mac keeps its existing hourly sync path.
+
+Tool parity uses one form for the sender, the probe, execution, and refusal messages.
+The normalizer strips each version line and joins nonempty lines with one space.
+This includes all lines from `cargo nextest --version`.
+
+Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
+It excludes processes from other users.
+Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
+It also excludes direct children of another user, except children of PID 1.
+Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
+Other same-user processes with unreadable evidence keep the slot busy.
+
+`verify-linux` steps use the target slots and build budget for admission.
+They do not contact natedev's admission service or obey natedev's hold.
+The controller still checks spending before AWS admission.
+
+A missing completion marker reports the runner exit status when available.
+It does not prove a link failure.
+The attempt record keeps the reason.
+An interruption marker reports the instance generation.
+
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
-- The copy is `rsync -rlpc --delete --exclude-from` into `~/.local/state/mac-test/mirror/<repo>`, leaving out `/.git`, `/target/` and every ignored path, so the mirror's `target` folder survives the copy.
-- The run is one ssh call through `lint <verb>`, with `mac_skip.<repo>` applied only to nextest's `-E` filter and `LINT_SWEEP_BUDGET_GIB` from `mac_budget_gib[.<repo>]`. `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` so dependencies build for the supported macOS version; changing it costs one rebuild. It also sets `LINT_SKIP_SWEEP=1`, so `scripts/lint/invoke.sh` `sweep_after_step` returns at once and the Mac's steps start no detached sweep that could outlive the run; runs on natedev keep their sweep. The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`. Nextest exit 4 is `NoTestMatchedOnMac`: `mac_test: no test matched on the Mac; running on natedev instead`, exit 75.
+- `copies.remote_rsync` builds the refresh command for the configured mirror root.
+  It excludes `/.git`, `/target/`, ignored paths, and the metadata that copies.py owns.
+  The mirror's build output survives the refresh.
+- The run uses one ssh call through `lint <verb>`.
+  `mac_skip.<repo>` applies only to nextest's `-E` filter.
+  `LINT_SWEEP_BUDGET_GIB` comes from `mac_budget_gib[.<repo>]`.
+  `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` so dependencies build for the supported macOS version.
+  Changing that target causes one rebuild.
+  It also sets `LINT_SKIP_SWEEP=1`, so `scripts/lint/invoke.sh` `sweep_after_step` returns at once.
+  The Mac's steps start no detached sweep that could outlive the run.
+  Normal runs on natedev keep their sweep unless the caller sets `LINT_SKIP_SWEEP=1`.
+  The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`.
+  Nextest exit 4 becomes `NoTestMatchedOnMac` and runner exit 75.
+  The runner prints `mac_test: no test matched on the Mac; running on natedev instead`.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
@@ -92,6 +211,27 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 - Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
+
+`test <package> --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
+A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
+Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
+A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
+TERM, INT and HUP end the wait and record the caller's signal.
+
+`--env NAME` and `--fetch <folder>` require `--mac`. These flags can appear anywhere after the verb.
+Verify removes them before constructing Cargo arguments, cache keys and call records.
+Variable names must be valid and exported by the caller. Empty values are allowed.
+Verify saves the caller's values before assigning its own variables. A pipe transfers the values to Python without placing them on argv.
+The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `RUSTDOCFLAGS` at the verify interface.
+It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
+The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
+One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
+A Mac-only call reuses only a Mac pass. Forwarding or fetch disables cache reads and writes.
+If tests pass but fetch fails, the call exits 2 and retains the Mac pass evidence.
+A test failure retains the runner's status. No forwarded name, value or folder is added to the build log.
+
+A new admission wait clears an inherited queue identity. A rejoining step restores its own identity after sourcing the gate.
+An interrupted run stops and reaps both log readers after recording its result. This also handles a blocked output pipe.
 
 - `--local "<why>"` sets `LOCAL_ONLY` and records `declined` / `local_flag`, with the reason exported as `BUILDLOG_LOCAL_REASON`. It takes the next argument as a required reason and exits 2 before any work when that is missing, blank or starts with `--`. It also exits 2 before any work when the reason names a reservation: any of the whole words reserve, reserved, reservation, hold, holds, held, blocked, claim, claims, busy, showrunner or ruling, in any case. The message points to `/build:hold hold <why> target mac`, the one way to keep tests off the Mac. A reservation in a `--local` reason is recorded nowhere and never ends: on 2026-10-18 a unit's 'Mac reserved for demo', a day old, kept its tests waiting on a held natedev while the Mac was free (user, 2026-10-18). The reason never enters `tree_key` or the cargo words. Use it only for a test that must run on Linux. Otherwise, when the runner exists, `try_mac_test()` runs between the first cache lookup and the cargo token: `"$PY" "$MAC_RUNNER" run --repo-root <top level> --package <pkg> --call-id "$BUILDLOG_CALL_ID" --result <temp file> [--filter-run] -- "${NEXTEST_ARGS[@]}"` (`compose_nextest_args()` builds the words; `VERIFY_MAC_RUNNER` substitutes the runner in tests).
 - `declined` and `lost` allow a local run. No usable result is recorded as `declined` / `runner`. While natedev waits for memory or a hold, each temporary result keeps the Mac leave hook. Routing and local waits share `remember_mac_retry` and `mac_retry_hook`: `busy` and `blocked` use the normal poll; other temporary results, including `lost` and `runner`, set a monotonic deadline 180 s after the attempt ends. Each repeated result sets a new deadline. One stderr line explains the delay per call. A local step that can start proceeds at once. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop Mac retries. A target excluded by configuration is never tried. A `passed` ends the call (`verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.`), exit 0, recorded as `passed_full`, or `passed_filter` on a `--filter` run. Its output is captured and kept as the call's pass record, marked `host=mac` and judged on the tree read just before the Mac run; an edit made meanwhile leaves nothing recorded. A `--local` call does not reuse a `host=mac` record; its natedev pass replaces it. `failed` records the call and exits with the runner's status.
@@ -135,6 +275,10 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 
 ## Config — `config/mac_test.conf`
 
+`fetch_limit_mib` limits one returned folder (default 512 MiB).
+`fetch_retention_days` sets the retention period for completed and partial fetch folders (default 14 days).
+Both values use the existing configuration reader.
+
 `offload=on`; `host=mac`; `free_floor_gib=100`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=natepiano/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`; `claim_idle_minutes=15`, `claim_poll_seconds=60`. `leftover_timeout_s` is not set, so the leftover check uses 10 s. `free_floor_gib` serves both the probe's disk decline and the cleanup's keep-or-remove test. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
 
 ## Invariants
@@ -161,7 +305,7 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 - Offloaded Mac nextest rows in the build log have an empty `repo`; filter them with `coalesce(repo,'')=''` and `host <> 'natedev'`. The log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one name.
 - A `gh` set that times out after GitHub applied it reads `still_on`, then `off_before` at the next settle. Turning the switch back on after `off_unconfirmed` can undo a hand-made switch-off in between.
 - `world_panel_words_match_drawn_pixels` fails only on the Mac, cause not found; it is excluded there, so only natedev runs and CI cover it.
-- `basedpyright scripts/mac_test` exits 3 on a clean pass (no `.venv`); the result is its last line.
+- `basedpyright scripts/mac_test` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 
@@ -174,3 +318,41 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 - Build output is kept above the disk floor because a cold rebuild costs far more than natedev's run; deleting after every run and a size-capped trim were ruled out.
 - No revision counter on `block.json`: every writer holds a lock. The footer reads `block.json` directly, never `status`, which takes a lock and can call `gh`.
 - The Mac copy exists because the user decided on 2026-10-16, "yes - build it this way - and make sure that you can track on report on the times we were able to get a test done faster with the copy". A natedev test that waited for a busy Mac often still compiles when the Mac frees; a copy then turns the idle Mac into an earlier result, and giving way to any new test keeps Mac-first routing unchanged for the next call.
+
+## Registered remote mirrors
+
+`OffloadRequest` requires the copy owner and holder session.
+It also carries the repository scope.
+`request_from_arguments` selects the holder through `build_hold.owning_session()` before the shell session fallback.
+`request_mirror` uses this supplied session without another lookup.
+Busy refusals can name the unit director's session.
+
+`offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
+It publishes ownership only for the selected slot after admission succeeds.
+Failed admission and unselected slots retain their owners.
+Claims and admission use `target_config.slot_capacity` with an explicit missing-value policy.
+An empty configured capacity raises `ConfigError`.
+The policy supplies a fallback only when both capacity keys are absent.
+The Mac retains its single slot per repository.
+
+`mac_run.sh` creates its task-owned clone through `copies.py`.
+It preserves both registrations until process exit and scratch cleanup succeed.
+It then removes the Mac registration before the natedev registration.
+Failed clone cleanup retains both registrations.
+
+[Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
+Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.
+The scan accepts lsof output only with exit status 0 or 1.
+
+## Documentation copies
+
+`verify.sh doc` calls `copies.py hold` without a staged-tree argument.
+`hold` computes the staged tree and passes it to `copies.standing` through `StagedSource(tree)`.
+It prints the tree identity and checkout path on separate lines.
+`verify.sh` reads both lines.
+The private index folder uses the configured `prefixes.copies-index` name through `build_folders.temporary_build_folder`.
+The copy owner holds the lease until the verify shell closes its input descriptor.
+Both routes use the staged copy and keep the existing target directory.
+The source index remains unchanged.
+A pass record still requires the original staged tree identity after the step.
+The token boundary, local repair rule, and step records remain in verify.sh.

@@ -2,6 +2,10 @@
 """Report the pre-registered nextest-width switchback trial."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -19,10 +23,11 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
-import store
-from memory_admit import expected_peak, git_identity, test_threads
+from scripts.buildlog import store
+from scripts.buildlog import index as buildlog_index
+from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
 WASHOUT_S = 900
@@ -446,7 +451,9 @@ def _clock(epoch: float) -> str:
 
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:
     root = root if root is not None else store.root()
-    index = root / store.INDEX_NAME
+    index = buildlog_index.index_path_in(root)
+    if not index.exists():
+        _ = buildlog_index.update_in(root)
     steps = load_steps(index, since, until, host)
     arms: dict[int | None, list[Step]] = defaultdict(list)
     for step in steps:
@@ -485,8 +492,10 @@ def report(since: float, until: float, host: str = "natedev", root: Path | None 
     t_values = _value_by_arm(arms, t_stat)
     f_values = _value_by_arm(arms, f_stat)
     repository = git_identity(["cargo", "nextest", "run"], str(Path.home() / "rust/hana"))[0]
+    configuration = read_memory_config()
     r_values: dict[int | None, float | None] = {
-        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width).bytes / GIB
+        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width,
+                             first_peak_bytes=configuration.program_first_peaks["cargo"]).bytes / GIB
         for width in widths
     }
 

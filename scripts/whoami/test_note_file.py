@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import os
 import tempfile
 import unittest
@@ -10,9 +9,26 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import note_file
+from scripts.accounts.home_test_support import scratch_accounts_config
+from scripts.lib import conf
+
+
+class NotesConfigurationTests(unittest.TestCase):
+    def test_many_note_reads_read_the_configured_folder_once(self) -> None:
+        with scratch_accounts_config() as config:
+            notes = config / "notes"
+            notes.mkdir()
+            _ = (notes / "claude1.md").write_text("---\nlogin: fixture\n---\n")
+            _ = (config / "accounts.conf").write_text(f"notes_directory={notes}\n")
+            with (patch.dict(os.environ, {"HOME": str(config)}),
+                  patch.object(conf, "read", wraps=conf.read) as read):
+                _ = os.environ.pop("AGENT_NOTES_DIR", None)
+                for _ in range(20):
+                    self.assertEqual(note_file.note_path("claude1"), notes / "claude1.md")
+                    self.assertEqual([note.label for note in note_file.read_notes()], ["claude1"])
+                read.assert_called_once_with("accounts")
 
 
 @final

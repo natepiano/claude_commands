@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_pressure_reading
+
+from scripts.build_queue.admission_test_support import caller_admission
+
 import json
 import os
 import select
@@ -21,9 +25,13 @@ from typing import ClassVar, Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -34,8 +42,6 @@ INVOKE = VERIFY.parent.parent / "lint" / "invoke.sh"
 
 CYCLE_ID = "c" * 32
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 VERIFY_WAITING = "; waiting (tests that can run on the Mac"
 
@@ -151,11 +157,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # The committed Mac fixture exposes setUp(), not a seed builder. Own
-        # the copying here so this suite needs only that public lifecycle.
+        # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.setUp()
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.build_fixture()
         cls.fixture_root = builder.root
         seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
         cls.fixture_seed = Path(seed_directory) / "seed"
@@ -173,7 +179,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
-            "BUILDLOG_BUILD_BUDGET_GIB": "64",
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -191,6 +196,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -226,7 +232,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
         pressure = root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
@@ -243,6 +249,37 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "",
             "BUILDLOG_HOLD_WAITER_FILE": "",
         })
+
+    def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
+        """Call the real hold checks, command launcher, and call recorder."""
+        script = self.fixture.root / "unblocked-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+                              "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
+            + '''
+PY=$CLAUDE_PYTHON
+CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
+TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify BUILDLOG_SYNC=1
+export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds" BUILDLOG_HOLD_WAIT_S=0
+BUILDLOG_MAC="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+status=0
+if [[ "$CMD" == check ]]; then
+    run_once cargo check || status=$?
+else
+    run_once cargo nextest run || status=$?
+fi
+note_event ran 0 0 0 0 "$status"
+exit "$status"
+''')
+        return subprocess.run(["bash", str(script), str(INVOKE), command], cwd=self.fixture.root,
+            env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
     def hold(self, key: str = "hana") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
@@ -270,6 +307,34 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
+
+    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+        """Keep the real admission client waiting behind a private memory limit."""
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            _ = admission.occupy_host()
+            admission.free(0)
+        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
+            'lint_config_enabled() {\n'
+            + '    [[ "$1" == clippy ]] || return 1\n'
+            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
+            + '}\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        self.fixture.environment.update({
+            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
+            "LINT_SKIP_SWEEP": "1",
+        })
+        process = self.start("lint", "sample")
+        self.wait_for_call(process, "waiting for memory since")
+        return process
+
+    def memory_queue_pids(self) -> set[int]:
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
+
+    def wait_for_owned_exit(self, timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
@@ -318,9 +383,9 @@ import tempfile
 
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-")
+    print("natedev\\teligible\\t-\\t-\\t-")
     if {runs_on!r} == "mac_allowed":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
@@ -329,15 +394,17 @@ else:
 
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
+        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": "thread-impl",
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.fixture.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Hold"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
              "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
@@ -345,15 +412,13 @@ else:
         ):
             result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}}))
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
         history = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}, worker_name: {"thread_id": "thread-test"}}))
+        record_wait_workers(self.fixture.root, session, self.fixture.environment,
+                            {"fixture-impl": "thread-impl", worker_name: "thread-test"})
         for arguments in (
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
@@ -362,7 +427,7 @@ else:
         ):
             result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment["CODEX_THREAD_ID"] = "thread-test"
+        self.fixture.environment["CODEX_THREAD_ID"] = fixture_runtime_id("thread-test")
         self.hold()
         process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
         self.wait_for_call(process)
@@ -376,7 +441,7 @@ else:
         for wait in (started, finished):
             self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
                               wait["worker_name"], wait["owner_session"]),
-                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, "thread-test"))
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, fixture_runtime_id("thread-test")))
 
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"
@@ -424,6 +489,9 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         observer = self.fixture.root / "python-observer"
         self.fixture.write_executable(observer, '''import json, os, sys
 from pathlib import Path
+if os.environ.get("TEST_PYTHON_STARTS"):
+    with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
+        output.write(json.dumps(sys.argv[1:]) + chr(10))
 if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
     with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
         output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))

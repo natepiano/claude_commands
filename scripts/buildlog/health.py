@@ -6,6 +6,10 @@ report day's midnight without inspecting another machine's private sources.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -19,8 +23,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-import record
-import store
+from scripts.buildlog import record
+from scripts.buildlog import store
 
 SNAPSHOT_NAME = "recorder-health.json"
 SNAPSHOT_MAX_AGE_SECONDS = 2 * 60 * 60
@@ -30,6 +34,7 @@ SNAPSHOT_CLOCK_SKEW_SECONDS = 5 * 60
 class Machine(StrEnum):
     NATEDEV = "natedev"
     MAC = "Mac"
+    AWS = "aws"
 
 
 @dataclass(frozen=True)
@@ -62,11 +67,10 @@ type RecorderHealth = FreshRecorderHealth | StaleRecorderHealth | RecorderHealth
 
 
 def machine_for_host(host: str) -> Machine:
-    """The historical Mac folder names in the sync allow-list name one machine."""
-    if host == Machine.NATEDEV:
-        return Machine.NATEDEV
-    if host in record.SYNC_HOSTS:
-        return Machine.MAC
+    """Resolve the host through the configured target mapping."""
+    for machine in Machine:
+        if host in record.target_hosts(machine.value.lower()):
+            return machine
     raise ValueError(f"unknown build-log host: {host}")
 
 
@@ -77,7 +81,7 @@ def snapshot_path(host: str) -> Path:
 def calculate_snapshot() -> RecorderHealthSnapshot:
     machine = machine_for_host(store.host_name())
     pending = 0
-    for root in (record.pending_launches_root(), record.pending_steps_root()):
+    for root in (record.pending_launch_root(), record.pending_steps_root()):
         try:
             paths = list(root.iterdir())
         except FileNotFoundError:
@@ -164,7 +168,7 @@ def read_snapshots() -> tuple[RecorderHealth, ...]:
     """Read one state per machine; the newest usable Mac alias wins."""
     now = time.time()
     latest: dict[Machine, RecorderHealthSnapshot] = {}
-    for host in record.SYNC_HOSTS:
+    for host in record.synchronized_hosts():
         try:
             snapshot = _read_snapshot(host)
         except (OSError, ValueError):
@@ -175,7 +179,10 @@ def read_snapshots() -> tuple[RecorderHealth, ...]:
         if previous is None or snapshot.generated_at > previous.generated_at:
             latest[snapshot.machine] = snapshot
     states: list[RecorderHealth] = []
+    active = set(record.configured_targets())
     for machine in Machine:
+        if machine.value.lower() not in active:
+            continue
         snapshot = latest.get(machine)
         if snapshot is None:
             states.append(RecorderHealthUnavailable(machine))

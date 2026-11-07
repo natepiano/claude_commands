@@ -2,9 +2,19 @@
 """Read configured build targets and their recorded holds and runs."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
+from calendar import monthrange
+import json
+from typing import cast
+import time
+from typing import TYPE_CHECKING
 from pathlib import Path
 import sys
 
@@ -12,17 +22,24 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent
 for directory in ("build_hold", "mac_test", "lint", "lib"):
     sys.path.insert(0, str(SCRIPTS / directory))
-import build_hold
-import mac_test
-import offload
-from target_config import (
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test, offload
+from scripts.build_targets.target_config import (
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
     Platform as Platform,
     SshTarget as SshTarget,
     Target as Target,
     read_targets as read_targets,
+    is_aws_target,
 )
+
+if TYPE_CHECKING:
+    from ..aws_target import ledger as cost_ledger, measurement
+    from ..buildlog import record
+else:
+    from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.buildlog import record
 
 
 @dataclass(frozen=True)
@@ -145,7 +162,101 @@ class StateUnreadable:
     reason: str
 
 
-TargetState = Free | Running | Held | Unreachable | StateUnreadable
+@dataclass(frozen=True)
+class RepositorySlots:
+    """Occupied capacity belongs to one repository, including retained remote ownership."""
+
+    repository: str
+    capacity: int
+    active: int
+    retained: int
+
+
+    @property
+    def occupied(self) -> int:
+        return self.active + self.retained
+
+
+@dataclass(frozen=True)
+class RemovalComplete:
+    """No incomplete removal record remains."""
+
+
+@dataclass(frozen=True)
+class RemovalPending:
+    resources: tuple[str, ...]
+    storage_usd_per_day: Decimal
+
+
+REMOVAL_COMPLETE = RemovalComplete()
+
+
+@dataclass(frozen=True)
+class AwsStatusRow:
+    target: str
+    state: str
+    evidence_at: int
+    reason: str
+    spending: str
+    decision_at: int
+    monthly_usd: Decimal | measurement.MeasurementUnavailable
+    monthly_limit_usd: Decimal | measurement.MeasurementUnavailable
+    slots: tuple[RepositorySlots, ...]
+    results: tuple[record.AttemptResult, ...]
+    notices: tuple[cost_ledger.LimitEvent, ...]
+    starting_at: int
+    recovery: measurement.ControllerRecovery
+    removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
+
+
+def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
+    """Read local controller, ledger, claim, and result evidence without probes or writes."""
+    try:
+        paths = mac_test.state_paths(target.name)
+        snapshot = measurement.read_status_measurement(target.settings, paths.directory, int(time.time()))
+        if isinstance(snapshot, measurement.MeasurementUnavailable):
+            return StateUnreadable(snapshot.reason)
+        claims = tuple(claim for claim in mac_test.read_claims(paths) if mac_test.run_is_live(claim.record))
+        repositories: dict[mac_test.ClaimScope, list[mac_test.HeldClaim]] = {}
+        for claim in claims:
+            scope = replace(claim.scope, slot=0) if isinstance(claim.scope, mac_test.RepositoryScope) else claim.scope
+            repositories.setdefault(scope, []).append(claim)
+        slots: list[RepositorySlots] = []
+        for scope, held in repositories.items():
+            active = sum(1 for claim in held if not mac_test.run_is_kept(claim.record)
+                         and not claim.record.get('cleanup_pending'))
+            capacity = mac_test.slot_capacity(paths, scope)
+            name = scope.name if isinstance(scope, mac_test.RepositoryScope) else 'unknown'
+            slots.append(RepositorySlots(name, capacity, active, len(held) - active))
+        slots.sort(key=lambda row: row.repository)
+        permission = snapshot.permission
+        spending = cost_ledger.permission_status(permission) if snapshot.enabled else 'disabled'
+        costs = snapshot.costs
+        monthly = costs.monthly.usd if isinstance(costs, cost_ledger.CostEstimate) else measurement.MeasurementUnavailable(costs.reason)
+        reason = snapshot.controller.reason
+        if not isinstance(permission, cost_ledger.PermissionAllowed):
+            reason = '; '.join(filter(None, (reason, permission.reason)))
+        removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
+        removal_path = paths.directory / 'down.json'
+        if removal_path.exists():
+            value = cast(object, json.loads(removal_path.read_text()))
+            if not isinstance(value, dict):
+                raise ValueError('down.json: expected a removal record')
+            saved = cast(dict[str, object], value)
+            resources = tuple(str(saved[key]) for key in ('volume', 'budget') if saved.get(key))
+            inventory = cost_ledger.CostLedger(paths.directory).read_snapshot().inventories
+            names = ('retained_storage_usd_per_month', 'gp3_iops_usd_per_month', 'gp3_throughput_usd_per_month')
+            monthly_storage = sum((r.usd_per_month for r in inventory[-1].resources if r.name in names), Decimal(0)) if inventory else Decimal(0)
+            now = datetime.fromtimestamp(time.time(), timezone.utc)
+            removal = RemovalPending(resources, monthly_storage / monthrange(now.year, now.month)[1])
+        return AwsStatusRow(target.name, snapshot.controller.state, snapshot.controller.at, reason, spending,
+                            permission.at, monthly, snapshot.monthly_limit_usd, tuple(slots),
+                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery, removal)
+    except (OSError, ValueError, mac_test.StateReadError, ConfigError) as error:
+        return StateUnreadable(str(error))
+
+
+TargetState = Free | Running | Held | Unreachable | StateUnreadable | AwsStatusRow
 
 
 def target_eligibility(
@@ -202,7 +313,7 @@ def target_state(target: Target) -> TargetState:
                 else UntilReleased()
             )
             return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
-        paths = mac_test.state_paths()
+        paths = mac_test.state_paths(target.name)
         claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
         if not isinstance(block, mac_test.NoMacBlock):
@@ -214,9 +325,15 @@ def target_state(target: Target) -> TargetState:
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return Held(block.holder, block.reason, block.since, block_end, session)
+        if is_aws_target(target):
+            return read_aws_status(target)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
-        return Running(jobs) if jobs else Free()
+        if jobs:
+            return Running(jobs)
+        if isinstance(offload.read_backoff(utc_now().timestamp(), target.name), offload.ActiveBackoff):
+            return Unreachable("retry backoff")
+        return Free()
     except build_hold.ReleaseRecordReadError as error:
         return StateUnreadable(build_hold.release_record_error_line(error))
-    except (OSError, UnicodeError, mac_test.StateReadError) as error:
+    except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))

@@ -2,11 +2,14 @@
 """Report operating-system conditions in a Rust workspace."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from bisect import bisect_right
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import re
 import sys
@@ -16,11 +19,11 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
-import sweep
+from scripts.build_hold import override_guard
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from scripts.lib import conf
 
-import cargo_manifest
-import offload
+from scripts.mac_test import cargo_manifest, offload
 
 
 ListingStatus = Literal["yes", "no", "unknown"]
@@ -296,8 +299,7 @@ def suggestion(
 def configured_packages(repository: offload.RepositoryIdentity) -> frozenset[str]:
     if isinstance(repository, offload.UnknownRepository):
         return frozenset()
-    config = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    values = sweep.config_values(str(Path(config).expanduser()))
+    values = conf.read("mac_test").values()
     return frozenset(offload.comma_values(values.get(f"linux_only.{repository.name}", "")))
 
 

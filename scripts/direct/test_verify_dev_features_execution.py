@@ -20,7 +20,8 @@ class VerifyDevFeatureExecutionTests(DevFeatureFixture):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.calls_made(), [
                     "nextest --version",
-                    f"nextest run --no-fail-fast --workspace --lib -E {expression} --features {DEV_ARGUMENTS}",
+                    f"nextest run --no-fail-fast --workspace --lib -E {expression} --features {DEV_ARGUMENTS}"
+                    + (" --no-tests=warn" if not extra else ""),
                 ])
 
     def test_final_uses_the_same_dev_features_for_check_and_nextest(self) -> None:

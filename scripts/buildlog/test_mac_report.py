@@ -15,22 +15,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
-import index
-import launches
-import mac_report
-import mac_outcome
-import store
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.buildlog import index
+from scripts.buildlog import launches, mac_report
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import store
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+    from ..lint.memory_test_support import config_environment
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from test_holds import hold_event, timed_hold_events, write_mac_block
-from test_index import Record, call, encode, point_root_at, step
-from test_report import MeasuredCliRun, measure_cli_work
-from user_zone import user_zone
+    from scripts.lint.memory_test_support import config_environment
+from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
+from scripts.buildlog.test_report import MeasuredCliRun, measure_cli_work
+from scripts.lib.user_zone import user_zone
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
@@ -58,6 +61,7 @@ class MacReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, config_environment(self.root.parent))))
         tools = rust_tool_path(self.root.parent / "tools")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": tools})))
         self.log = self.root / "natedev" / "2026-10.jsonl"
@@ -205,6 +209,67 @@ class MacReportTests(unittest.TestCase):
         )
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
 
+    def test_linux_tree_keys_never_supply_natedev_pass_evidence(self) -> None:
+        self.write(
+            self.mac_call("mac-failure", "failed"),
+            step("mac-failure-step", started_at=START, call_id="mac-failure",
+                 caller="verify-mac", host="Mac", target="mac", step="nextest",
+                 status=1, tree_key="linux-tree"),
+            self.mac_call("linux-pass", "declined", "local_flag", target="aws"),
+            step("linux-pass-step", started_at=START, call_id="linux-pass",
+                 caller="verify-linux", host="aws-build", target="aws", step="nextest",
+                 status=0, tree_key="linux-tree"),
+            self.mac_call("loopback-pass", "declined", "local_flag", target="loopback"),
+            step("loopback-pass-step", started_at=START, call_id="loopback-pass",
+                 caller="verify-linux", host="natedev", target="loopback", step="nextest",
+                 status=0, tree_key="loopback-tree"),
+            self.mac_call("mac-pass"),
+            step("mac-pass-step", started_at=START, call_id="mac-pass",
+                 caller="verify-mac", host="Mac", target="mac", step="nextest",
+                 status=0, tree_key="mac-tree"),
+            self.mac_call("local-pass", "declined", "local_flag"),
+            step("local-pass-step", started_at=START, call_id="local-pass",
+                 host="natedev", target="natedev", step="nextest", status=0,
+                 tree_key="local-tree"),
+        )
+
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            evidence = mac_report.read_test_tree_evidence(connection, START, END)
+
+        selection = mac_report.TestSelectionTree("hana", "test hana", "local-tree")
+        self.assertEqual(evidence.passing_natedev_trees, {selection})
+        self.assertEqual(set(evidence.keyed_mac_calls), {"mac-failure", "mac-pass"})
+        self.assertIn("Mac failures with a natedev pass of the same tree: 0 recorded", self.report())
+
+        self.write(step("local-retry-step", started_at=START, call_id="local-pass",
+                        host="natedev", target="natedev", step="nextest", status=0,
+                        tree_key="linux-tree"))
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
+    def test_explicit_targets_override_host_aliases_and_legacy_mac_rows_keep_their_evidence(self) -> None:
+        self.write(
+            self.mac_call("mac-failed", "failed"),
+            step("mac-failed-step", started_at=START, call_id="mac-failed", host="Mac",
+                 target="mac", caller="verify-mac", step="nextest", status=1, tree_key="shared-tree"),
+            self.mac_call("aws", "", target="aws"),
+            step("aws-step", started_at=START, call_id="aws", host="natedev",
+                 target="aws", caller="verify-linux", step="nextest", status=0, tree_key="aws-tree"),
+            self.mac_call("local", "declined", "local_flag", target="natedev"),
+            step("local-step", started_at=START, call_id="local", host="Mac",
+                 target="natedev", caller="verify", step="nextest", status=0, tree_key="shared-tree"),
+            self.mac_call("legacy-mac"),
+            step("legacy-step", started_at=START, call_id="legacy-mac", host="Mac",
+                 caller="verify-mac", step="nextest", status=0, tree_key="legacy-tree"),
+        )
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            evidence = mac_report.read_test_tree_evidence(connection, START, END)
+        self.assertEqual(evidence.passing_natedev_trees,
+                         {mac_report.TestSelectionTree("hana", "test hana", "shared-tree")})
+        self.assertEqual(set(evidence.keyed_mac_calls), {"mac-failed", "legacy-mac"})
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
     def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
         mirror = self.root.parent / "mac-mirror"
         mirror.mkdir()
@@ -221,7 +286,7 @@ class MacReportTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(Path(__file__).with_name("record.py")), "step", "1",
              str(started), str(started + 1), "0", "", "", "cargo", "nextest", "run"],
-            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=60,
+            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [
@@ -512,7 +577,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("| Blocked | natedev held |", output)
 
     def test_mac_report_cli_accepts_custom_hours_without_collecting_launches(self) -> None:
-        import cli
+        from scripts.buildlog import cli
 
         with patch.object(launches, "collect", side_effect=AssertionError("launch collection must not run")):
             with patch("builtins.print") as printed:
@@ -520,7 +585,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("## Last 2 hours", str(printed.call_args))
 
     def test_mac_report_cli_rejects_invalid_hours_before_updating_index(self) -> None:
-        import cli
+        from scripts.buildlog import cli
 
         for args in (["--hours", "0"], ["--hours", "nan"], ["--hours", "-1"], ["--hours"], ["--day", "today"]):
             with self.subTest(args=args):
@@ -539,7 +604,7 @@ class MacReportTests(unittest.TestCase):
         for args in (["mac-report", "--hours", "2"], ["schema"]):
             result = subprocess.run(
                 [sys.executable, str(CLI), *args], env={**os.environ, "BUILDLOG_DIR": str(self.root)},
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             if args[0] == "mac-report":

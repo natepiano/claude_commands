@@ -2,15 +2,9 @@
 from __future__ import annotations
 
 import unittest
-from typing import TYPE_CHECKING, final
+from typing import final, override
 
-import crates_io_pacer
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 @final

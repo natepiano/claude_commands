@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Count production CI points, verify their runs, and send one review alert."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -9,17 +13,15 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
-from production_units import Production, read_production
-from production_units import Refusal, cell_value
-from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history, merge_lock
+from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
 
 
 class CiDue(NamedTuple):
@@ -107,12 +109,10 @@ def ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
 def due(production: Production, state_dir: Path, no_ci: bool) -> CiDue | CiNotDue | CiNotUsed:
     if no_ci:
         return CiNotUsed()
-    count = merge_branch_history(production.checkout, production.merge_branch).code_merge_count()
+    count = len(merged_checkpoints(production))
     record = ci_record(state_dir)
     since = count - (record.merges_collected if isinstance(record, CiRecord) else 0)
-    if since < 0:
-        raise PointFailure("due", "merge history predates the last collected CI point")
-    return CiDue() if since >= 5 else CiNotDue(since)
+    return CiDue() if since >= 5 or since < 0 else CiNotDue(since)
 
 
 def write_json(path: Path, fields: dict[str, object]) -> None:
@@ -150,28 +150,26 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     tip = branch_tip(production)
-    origin = required(git(production.checkout, "remote", "get-url", "origin"), "ci start")
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
-    history = merge_branch_history(production.checkout, tip)
-    last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
-    checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
-                  else "production wrap")
+    checkpoints = merged_checkpoints(production)
+    checkpoint = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase}" if checkpoints else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ci-point-", dir=state_dir.resolve()) as temporary:
-        checkout = Path(temporary) / "checkout"
-        _ = required(command("ci start", "git", "clone", "--shared", "--no-checkout", "--",
-                             str(production.checkout.resolve()), str(checkout)), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "origin", origin), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "--push", "origin", push_origin), "ci start")
-        _ = required(git(checkout, "checkout", "--detach", tip), "ci start")
-        # A checkout can set its commit identity locally instead of globally.
+    with copies.standing(production.name, production.checkout, copies.CommittedSource(tip)) as checkout:
+        source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
+        settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
             identity = git(production.checkout, "config", "--get", key)
             if identity.returncode == 0:
-                _ = required(git(checkout, "config", key, identity.stdout.strip()), "ci start")
-        argv = ("env", f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
+                settings.append((key, identity.stdout.strip()))
+        # Git's command environment reaches validation's child commands without
+        # changing the standing checkout's persistent configuration.
+        inherited = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+        configuration = [f"GIT_CONFIG_COUNT={inherited + len(settings)}"]
+        for index, (key, value) in enumerate(settings, inherited):
+            configuration.extend((f"GIT_CONFIG_KEY_{index}={key}", f"GIT_CONFIG_VALUE_{index}={value}"))
+        argv = ("env", *configuration, f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
                 "--validate-only", "--fix-commit",
-                f"ci({production.slug}): validation fixes after {checkpoint}")
+                f"ci({production.name}): validation fixes after {checkpoint}")
         validation_log = state_dir.resolve() / "ci_validation.log"
         try:
             with validation_log.open("w", encoding="utf-8") as output:
@@ -191,7 +189,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
                 f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash",
                 str(script.resolve().with_name("push_direct.sh")))
-        with merge_lock(production.checkout, production.slug):
+        with merge_lock(production.checkout, production.name):
             _ = required(git(production.checkout, "fetch", "--no-tags", str(checkout), validated), "validation")
             if validated != tip:
                 current_branch = required(git(production.checkout, "branch", "--show-current"), "validation")
@@ -229,7 +227,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
         return
     run = read_run(state_dir)
     tip = branch_tip(production)
-    count = merge_branch_history(production.checkout, tip).code_merge_count()
+    count = len(merged_checkpoints(production))
     _ = command("ci collect", "gh", "run", "watch", run.run_id, "--repo", run.repo,
                 "--exit-status", cwd=production.checkout)
     view = run_view(run, production.checkout)
@@ -288,44 +286,6 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         return WatchFirstAlert(line, table)
 
 
-def gates(production: Production, gate_id: str) -> tuple[str, str, str]:
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
-    if "## Gates" not in lines:
-        raise PointFailure("notice", "production doc has no Gates table")
-    start = lines.index("## Gates") + 1
-    for line in lines[start:]:
-        if line.startswith("## "):
-            break
-        if not line.startswith("|"):
-            continue
-        cells = [cell_value(cell.strip()) for cell in line.strip("|").split("|")]
-        if len(cells) < 3 or cells[0] != gate_id:
-            continue
-        waiting = re.fullmatch(r"(.+?) phase (\S+)", cells[1], re.IGNORECASE)
-        target = re.fullmatch(r"(.+?) phase (\S+)", cells[2], re.IGNORECASE)
-        if waiting is None or target is None:
-            raise PointFailure("notice", f"invalid gate {gate_id}")
-        return waiting.group(1), target.group(1), target.group(2)
-    raise PointFailure("notice", f"gate {gate_id} not found")
-
-
-def notice(production: Production, gate_id: str, kind: str, log: Path | None) -> None:
-    waiting, target, phase = gates(production, gate_id)
-    if kind == "lift":
-        if log is None:
-            raise PointFailure("notice lift", "--log is required")
-        message = f"From the showrunner: {gate_id} lifted — your tests pass without {target} phase {phase} ({log}). Continue."
-    else:
-        history = merge_branch_history(production.checkout, production.merge_branch)
-        landed = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and entry.unit == target and entry.phase == phase
-                       and isinstance(entry.kind, CodeCheckpoint)), None)
-        if not isinstance(landed, MergeEntry):
-            raise PointFailure("notice clear", f"{target} phase {phase} has no code merge on {production.merge_branch}")
-        message = (f"From the showrunner: {gate_id} clear — {target} phase {phase} is on "
-                   f"{production.merge_branch} as {landed.merge_hash}. Merge {production.merge_branch} and continue.")
-    report(f"notice {kind}", "ok", f"send {waiting}: {message}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -336,25 +296,17 @@ def main() -> int:
     _ = start_parser.add_argument("--cancel-prior", action="store_true")
     collect_parser = ci_commands.add_parser("collect")
     watch_parser = commands.add_parser("watch")
-    notice_parser = commands.add_parser("notice")
-    notice_commands = notice_parser.add_subparsers(dest="notice_action", required=True)
-    clear_parser = notice_commands.add_parser("clear")
-    lift_parser = notice_commands.add_parser("lift")
-    for subparser in (due_parser, start_parser, collect_parser, watch_parser, clear_parser, lift_parser):
-        _ = subparser.add_argument("--production", required=True, type=Path)
+    for subparser in (due_parser, start_parser, collect_parser, watch_parser):
+        _ = subparser.add_argument("--production", required=True)
     for subparser in (due_parser, start_parser, collect_parser, watch_parser):
         _ = subparser.add_argument("--state-dir", required=True, type=Path)
     for subparser in (due_parser, start_parser, collect_parser):
         _ = subparser.add_argument("--no-ci", action="store_true")
-    for subparser in (clear_parser, lift_parser):
-        _ = subparser.add_argument("gate_id")
-    _ = lift_parser.add_argument("--log", type=Path)
     args = parser.parse_args()
     action = cast(str, args.action)
-    step = action + (f" {cast(str, args.ci_action)}" if action == "ci" else
-                     f" {cast(str, args.notice_action)}" if action == "notice" else "")
+    step = action + (f" {cast(str, args.ci_action)}" if action == "ci" else "")
     try:
-        production = read_production(cast(Path, args.production))
+        production = read_production(cast(str, args.production))
         if action == "due":
             state = due(production, cast(Path, args.state_dir), cast(bool, args.no_ci))
             if isinstance(state, CiNotUsed):
@@ -375,11 +327,8 @@ def main() -> int:
             report("watch", "ok", detail or "no open review watch")
             if isinstance(state, WatchFirstAlert):
                 print(state.table)
-        else:
-            notice(production, cast(str, args.gate_id), cast(str, args.notice_action),
-                   cast(Path | None, getattr(args, "log", None)))
         return 0
-    except (PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
+    except (copies.CopyError, PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         report(error.step if isinstance(error, PointFailure) else step, "failed", str(error))
         return 2
 

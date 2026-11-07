@@ -22,6 +22,10 @@ The note at ~/rust/hanadocs/nightly improvement list.md copies the ledger's tabl
 NIGHTLY_REVIEW_NOTE replaces that path; both commands rewrite the note.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import re
@@ -33,14 +37,19 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
-ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
-# A title longer than this is cut, so one long sentence cannot widen the whole table.
-TITLE_WIDTH = 90
+
+def state_root() -> Path:
+    settings = conf.read("nightly_review")
+    override = os.environ.get("XDG_STATE_HOME")
+    base = Path(override) if override else Path(settings.text("state_directory")).expanduser()
+    return base / settings.text("state_folder")
+
 
 LINE = re.compile(
     r"^- (?P<night>\d{4}-\d{2}-\d{2}(?:-[a-z]+)?) (?P<scope>[^:,]+)(?:, (?P<kind>also found|noted))?: (?P<body>.+)$"
@@ -166,18 +175,19 @@ def ordered(lines: list[str]) -> list[Candidate]:
     return [entry.item for entry in urgency.queue_order(entries(lines), QUEUE)]
 
 
-def escaped(cell: str) -> str:
+def escaped(cell: str, width: int) -> str:
     text = " ".join(cell.split()).replace("|", "\\|")
-    return text if len(text) <= TITLE_WIDTH else text[: TITLE_WIDTH - 1].rstrip() + "…"
+    return text if len(text) <= width else text[: width - 1].rstrip() + "…"
 
 
 def table(candidates: list[Candidate]) -> str:
+    width = conf.read("nightly_review").whole("title_characters")
     lines = ["| Pick | Night | Area | Candidate | Gain per week | State |", "| --- | --- | --- | --- | --- | --- |"]
     for index, candidate in enumerate(candidates):
         # With nothing measured there is no basis for a pick, so no row is marked.
         pick = "recommended" if index == 0 and rank(candidate)[0] < UNMEASURED_RANK else ""
         cells = (pick, candidate.night, candidate.area, candidate.title, candidate.gain_text, candidate.state)
-        lines.append("| " + " | ".join(escaped(cell) for cell in cells) + " |")
+        lines.append("| " + " | ".join(escaped(cell, width) for cell in cells) + " |")
     return "\n".join(lines)
 
 
@@ -187,9 +197,9 @@ def now() -> datetime:
 
 def write_note(body: str) -> None:
     value = os.environ.get("NIGHTLY_REVIEW_NOTE")
-    note = Path(value).expanduser() if value else Path.home() / "rust" / "hanadocs" / "nightly improvement list.md"
+    note = Path(value).expanduser() if value else Path(conf.read("nightly_review").text("note_path")).expanduser()
     try:
-        if not note.parent.is_dir() or not (ROOT / "ledger.md").is_file():
+        if not note.parent.is_dir() or not (state_root() / "ledger.md").is_file():
             return
         moment = now().astimezone(user_zone())
         host = socket.gethostname().split(".", 1)[0]
@@ -248,7 +258,7 @@ def record(report: Path) -> int:
     if not candidates:
         print(f"candidates: {report} has no `# <title>` and `**Target:**` to record", file=sys.stderr)
         return 1
-    ledger = ROOT / "ledger.md"
+    ledger = state_root() / "ledger.md"
     known = read_lines(ledger)
     new: list[str] = []
     for candidate in candidates:
@@ -278,14 +288,14 @@ def record(report: Path) -> int:
 def main(arguments: list[str]) -> int:
     match arguments:
         case []:
-            candidates = ordered(read_lines(ROOT / "ledger.md"))
+            candidates = ordered(read_lines(state_root() / "ledger.md"))
             body = table(candidates) if candidates else "no open candidates"
             print(body)
             write_note(body)
             return 0
         case ["next"]:
             # One candidate only: the user asks for the next one when they want it (user, 2026-10-20).
-            shown = urgency.top(entries(read_lines(ROOT / "ledger.md")), QUEUE)
+            shown = urgency.top(entries(read_lines(state_root() / "ledger.md")), QUEUE)
             print(shown.item.line if shown is not None else "no open candidates")
             return 0
         case ["record", report]:

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Sample production waits and perform the mechanical work that clears them."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -9,21 +13,20 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
-import unit_lookup
+from scripts.production import session_staff, staff, unit_lookup
+from scripts.production.production_doc import Production, Refusal, read_production
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, retired_units
-from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
+from scripts.production.merge_checkpoint import Stop, git, report as merge_report
+from scripts.direct import progress_history
+from scripts.lib.user_zone import user_zone
 
 JsonMap = dict[str, object]
 StateResult = TypeVar("StateResult")
@@ -104,14 +107,6 @@ class LogEvent(NamedTuple):
     moment: datetime
 
 
-class CleanupClean(NamedTuple):
-    pass
-
-
-class CleanupFailed(NamedTuple):
-    detail: str
-
-
 class BerthOverlap(NamedTuple):
     scopes: tuple[str, ...]
     blocker: str
@@ -129,12 +124,13 @@ class BerthNotConfigured(NamedTuple):
 class Unit(NamedTuple):
     name: str
     # The unit's session name at this moment, read from its live session; empty when none runs.
-    # It addresses the unit and is never a key: every record is kept under the unit's name.
+    # The session addresses the unit. The fixed staff id keys saved state.
     session: str
     branch: str
     worktree: Path
     # The pid of the unit's live Claude; None when none runs.
     pid: int | None
+    staff_id: staff.StaffId
 
 
 class WaitingFailure(Exception):
@@ -152,21 +148,30 @@ def report(step: str, state: str, message: str) -> None:
 
 
 def units_from_doc(production: Production) -> tuple[Unit, ...]:
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    """The active units in staff row order; a unit with no readable folder or branch is reported and left out."""
     try:
-        marked = unit_lookup.marked_units(production.slug)
-    except OSError as error:
+        record = staff.snapshot()
+        rows = record.find(kind="unit", parent=production.owner.id)
+        marked = unit_lookup.labeled_sessions(production.name, record=record)
+    except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
+    resolver = session_staff.RowResolver(record)
     units: list[Unit] = []
-    for cells in live_unit_table(lines, production.slug):
-        row = {heading: cell_value(cell) for heading, cell in cells.items()}
-        if not all(row.get(heading) for heading in ("Unit", "Worktree", "Branch")):
-            raise WaitingFailure("production", f"invalid Units row: {cells}")
-        found = marked.get(row["Unit"])
+    for row in rows:
+        name = row.name
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            print(f"waiting: {name}: unavailable: the worktree is not recorded", file=sys.stderr)
+        if not isinstance(row.worktree, staff.PresentWorktree):
+            continue
+        branch = resolver.unit_branch(row)
+        if not isinstance(branch, session_staff.Branch):
+            print(f"waiting: {name}: unavailable: {branch.reason}", file=sys.stderr)
+            continue
+        found = marked.get(row.name)
         claude = found.claude if found is not None else None
         live = isinstance(claude, unit_lookup.LiveClaude)
-        units.append(Unit(row["Unit"], claude.name if live else "", row["Branch"],
-                          Path(row["Worktree"]).expanduser(), claude.pid if live else None))
+        units.append(Unit(name, claude.name if live else "", branch.name, row.worktree.path,
+                          claude.pid if live else None, row.id))
     return tuple(units)
 
 
@@ -222,7 +227,7 @@ def eta_requested(seen: JsonMap, key: str) -> EtaRequested | EtaNotYetRequested:
 def eta_request(production: Production, name: str, phase: str, state_dir: Path) -> None:
     unit = named_unit(production, name)
     path = state_dir / "eta_seen.json"
-    key = f"{unit.name}|{phase}"
+    key = f"{unit.staff_id}|{phase}"
 
     def request(seen: JsonMap) -> EtaRequested | EtaNotYetRequested:
         state = eta_requested(seen, key)
@@ -269,40 +274,30 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     state_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(production.zone).strftime("%Y%m%d-%H%M%S-%f")
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
-    cleanup: CleanupClean | CleanupFailed = CleanupClean()
-    with tempfile.TemporaryDirectory(prefix="production-scratch-") as parent:
-        worktree = Path(parent) / "checkout"
-        added = False
-        try:
-            add = git(production.checkout, "worktree", "add", "--detach", str(worktree), unit.branch)
-            if add.returncode:
-                raise WaitingFailure("scratch-test", detail(add))
-            added = True
-            merge = git(worktree, "merge", "--no-commit", "--no-ff", production.merge_branch)
-            if merge.returncode:
-                _ = log.write_text(merge.stdout + merge.stderr, encoding="utf-8")
-                state: ScratchGreen | ScratchRed | ScratchConflict = ScratchConflict(
-                    f"{detail(merge)} ({log})")
-            else:
-                try:
-                    with log.open("w", encoding="utf-8") as output:
-                        test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
-                                              stderr=subprocess.STDOUT, text=True, check=False)
-                    tail = tail_lines(log, 4) or f"exit {test.returncode}"
-                    state = ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log)
-                except OSError as error:
-                    _ = log.write_text(f"{error}\n", encoding="utf-8")
-                    state = ScratchRed(str(error), log)
-        finally:
-            if added:
-                _ = git(worktree, "merge", "--abort")
-                removed = git(production.checkout, "worktree", "remove", "--force", str(worktree))
-                if removed.returncode:
-                    cleanup = CleanupFailed(detail(removed))
-    passed = scratch_verdict(state)
-    if isinstance(cleanup, CleanupFailed):
-        report("scratch-test", "failed", f"temporary worktree cleanup: {cleanup.detail}")
-    if not passed or isinstance(cleanup, CleanupFailed):
+    passed = False
+    try:
+        with copies.standing(production.name, production.checkout, copies.CommittedSource(unit.branch),
+                             merge=copies.MergeRevision(production.merge_branch)) as worktree:
+            try:
+                with log.open("w", encoding="utf-8") as output:
+                    test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
+                                          stderr=subprocess.STDOUT, text=True, check=False)
+                tail = tail_lines(log, 4) or f"exit {test.returncode}"
+                state: ScratchGreen | ScratchRed | ScratchConflict = (
+                    ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log))
+            except OSError as error:
+                _ = log.write_text(f"{error}\n", encoding="utf-8")
+                state = ScratchRed(str(error), log)
+            passed = scratch_verdict(state)
+    except copies.PreparationError as error:
+        _ = log.write_text(f"{error}\n", encoding="utf-8")
+        _ = scratch_verdict(ScratchConflict(f"{error} ({log})"))
+        raise WaitingFailure("scratch-test", "") from error
+    except copies.PostUseError as error:
+        raise WaitingFailure("scratch-test", f"post-use step: {error}") from error
+    except copies.CopyError as error:
+        raise WaitingFailure("scratch-test", str(error)) from error
+    if not passed:
         raise WaitingFailure("scratch-test", "")
 
 
@@ -400,7 +395,8 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
-    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines(), production.slug)
+    retired = {row.name for row in staff.snapshot().find(kind="unit", parent=production.owner.id)
+               if isinstance(row.worktree, staff.RemovedWorktree)}
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}
     for event in log_events(production, now):
@@ -457,19 +453,12 @@ def current_phase(events: tuple[LogEvent, ...], unit: Unit) -> PhaseOnLog | NoPh
     return NoPhaseOnLog()
 
 
-def phase_start(events: tuple[LogEvent, ...], unit: Unit,
-                previous: MergeEntry | NoMerge) -> PhaseStart | NoPhaseStart:
-    if not isinstance(previous, NoMerge):
-        prior_phase = str(previous.phase)
-        pattern = re.compile(rf"(?:^|: ){re.escape(unit.name)} phase {re.escape(prior_phase)} "
-                             + r"\([^)]+\) merged as [^;]+;")
-    else:
-        # A line written before session names left the log also says `tmux <name>,`.
-        pattern = re.compile(rf": added {re.escape(unit.name)} \([^)]+\),(?: tmux [^,]+,)? worktree ")
-    for event in reversed(events):
-        if pattern.search(event.line):
-            return PhaseStart(event.moment)
-    return NoPhaseStart()
+def phase_start(unit: Unit, phase: str, events: list[dict[str, object]]) -> PhaseStart | NoPhaseStart:
+    starts = [event["timestamp_epoch"] for event in events
+              if event.get("working_dir") == str(unit.worktree.resolve()) and event.get("phase_id") == phase
+              and isinstance(event.get("timestamp_epoch"), (int, float))]
+    return (PhaseStart(datetime.fromtimestamp(float(cast(float, starts[-1])), user_zone()))
+            if starts else NoPhaseStart())
 
 
 def eta_moment(text: str, line_moment: datetime) -> EtaOnLog | NoEtaOnLog:
@@ -516,13 +505,14 @@ def agenda_state(seen: JsonMap, item: AgendaOpen) -> AgendaOpen | AgendaNotDue:
 def agenda(production: Production, state_dir: Path) -> None:
     now = datetime.now(production.zone)
     events = log_events(production, now)
-    history = merge_branch_history(production.checkout, production.merge_branch)
     due_items: list[AgendaOpen] = []
-    for unit in units_from_doc(production):
+    units = units_from_doc(production)
+    starts = progress_history.events_for_worktrees(tuple(unit.worktree for unit in units), frozenset({"phase_started"}))
+    for unit in units:
         phase = current_phase(events, unit)
         if isinstance(phase, NoPhaseOnLog):
             continue
-        start = phase_start(events, unit, history.last_code_for_unit(unit.name))
+        start = phase_start(unit, re.sub(r"^Phase (\S+).*", r"\1", phase.phase), starts)
         if isinstance(start, NoPhaseStart):
             continue
         eta = phase_eta(events, unit, phase.phase, start)
@@ -552,7 +542,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="step", required=True)
     for name in ("scratch-test", "waits", "search", "agenda", "eta-request"):
         sub = commands.add_parser(name)
-        _ = sub.add_argument("--production", required=True, type=Path)
+        _ = sub.add_argument("--production", required=True)
         if name in ("scratch-test", "agenda", "eta-request"):
             _ = sub.add_argument("--state-dir", required=True, type=Path)
         if name == "scratch-test":
@@ -567,7 +557,7 @@ def main() -> int:
     args = parser.parse_args()
     step = cast(str, args.step)
     try:
-        production = read_production(cast(Path, args.production))
+        production = read_production(cast(str, args.production))
         if step == "scratch-test":
             scratch_test(production, cast(str, args.unit), cast(str, args.tests), cast(Path, args.state_dir))
         elif step == "waits":

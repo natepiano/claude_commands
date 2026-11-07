@@ -2,6 +2,10 @@
 """Pause scheduled updates while a session has an active conversation."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -18,12 +22,19 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
+
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
+    from ..message.relay_identity import message_sender_name
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     import script_prompts
     import unit_runs
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+    from scripts.message.relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -56,6 +67,13 @@ HARNESS_NOTICE = re.compile(r"^\[Cross-session [a-z]+ notice\]")
 USAGE_RESET = "Your claude.ai usage limit has reset."
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
+WHOLE_PASTE = re.compile(
+    r'<pasted_content id="(?P<id>[^"]+)">'
+    + rf'(?P<text>\s*{re.escape(SCRIPT_ENVELOPE_START)}'
+    + rf'(?:(?!{re.escape(SCRIPT_ENVELOPE_END)}).)*{re.escape(SCRIPT_ENVELOPE_END)}\s*'
+    + r'|(?:(?!</?pasted_content\b).)*)'
+    + r'</pasted_content(?: id="(?P=id)")?>\s*', re.DOTALL,
+)
 
 type ScheduledSenderLookup = Callable[[], frozenset[str]]
 type ScheduledPromptLookup = Callable[[], tuple[str, ...]]
@@ -353,7 +371,7 @@ def is_return_question(prompt: str) -> bool:
         return False
     opening_tag = text.partition(">")[0]
     match = FROM_NAME.search(opening_tag)
-    return match is not None and match.group(1) == WATCHER
+    return match is not None and message_sender_name(match.group(1)) == WATCHER
 
 
 def prompt_source(
@@ -366,10 +384,16 @@ def prompt_source(
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
+    # A complete script envelope can contain literal paste tags.
+    paste = WHOLE_PASTE.fullmatch(text)
+    script_text = paste.group("text").lstrip() if paste is not None else text
+    if script_text.startswith(SCRIPT_ENVELOPE_START):
+        return PromptSource.SCHEDULED
+    recorded_script = typed_by_script(script_text)
     if CROSS_SESSION_TAG.match(text) is not None:
         opening_tag = text.partition(">")[0]
         match = FROM_NAME.search(opening_tag)
-        name = match.group(1) if match is not None else ""
+        name = message_sender_name(match.group(1)) if match is not None else ""
         return (PromptSource.SCHEDULED if name in JOB_SENDERS or name in senders()
                 else PromptSource.PEER)
     if (NOTICE_TAG.match(text) is not None
@@ -378,7 +402,7 @@ def prompt_source(
             or HARNESS_NOTICE.match(text) is not None
             or text.startswith(USAGE_RESET)):
         return PromptSource.NOTICE
-    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or typed_by_script(text):
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or recorded_script:
         return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
@@ -394,7 +418,7 @@ def pauses(source: PromptSource) -> bool:
 
 
 def is_showrunner_session(session_id: str) -> bool:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     return bool(showrunner_footer.targeted_instances(session_id))
 
@@ -408,17 +432,25 @@ def is_showrunner_or_unit_director(session_id: str) -> bool:
 
 
 def session_reports(session_id: str) -> list[Report]:
+    from scripts.hooks import showrunner_footer
+
     reports: list[Report] = []
     try:
         entries = list(notifier_root().iterdir())
     except OSError:
         return reports
+    try:
+        showrunner_instances = showrunner_footer.targeted_instances(session_id)
+    except (OSError, UnicodeError) as error:
+        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
+        showrunner_instances = []
     for entry in entries:
         try:
             if not entry.is_dir():
                 continue
             conf_lines = (entry / "conf").read_text(encoding="utf-8").splitlines()
-            if f"TARGET=session:{session_id}" not in conf_lines:
+            if (f"TARGET=session:{session_id}" not in conf_lines
+                    and entry not in showrunner_instances):
                 continue
             if any(line.startswith("RUN=") for line in conf_lines):
                 continue
@@ -874,7 +906,7 @@ def _send_question(delivery: QuestionDelivery) -> bool:
         result = subprocess.run(
             [*send_command(), "--to", f"uds:{delivery.socket}", "--from", WATCHER,
              "--key", f"conversation-pause-{delivery.session_id}", "--text", QUESTION],
-            capture_output=True, text=True, check=False, timeout=90,
+            capture_output=True, text=True, check=False, timeout=send_budget.seconds(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)
@@ -893,9 +925,16 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     return words
 
 
-def _review_slugs(record: PauseRecord) -> frozenset[str]:
-    return frozenset(name.removeprefix("showrunner-")
-                     for name in record.instances if name.startswith("showrunner-"))
+def _review_names(record: PauseRecord) -> frozenset[str]:
+    from scripts.production import showrunners, staff
+
+    names: set[str] = set()
+    for name in record.instances:
+        if name.startswith("showrunner-"):
+            owner = showrunners.owner_for_timer(notifier_root() / name)
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+                names.add(owner.name)
+    return frozenset(names)
 
 
 def _timer_paused(instance: Path) -> bool:
@@ -971,7 +1010,7 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     scheduled_root = state_root() / "scheduled-prompts"
     try:
@@ -994,8 +1033,8 @@ def tick(now: int) -> tuple[str, ...]:
             try:
                 record = read_record(path)
                 review_open = any(
-                    showrunner_footer.review_pause_path(slug).exists()
-                    for slug in _review_slugs(record)
+                    showrunner_footer.review_pause_path(name).exists()
+                    for name in _review_names(record)
                 )
                 _advance(path, record, now, session, review_open, questions, actions)
             except FileNotFoundError:

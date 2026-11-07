@@ -2,7 +2,12 @@
 """Pause a session's automatic updates when a conversation begins, and record the user's activity."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import hashlib
 import json
 import os
 import signal
@@ -29,7 +34,7 @@ class PromptPayload(TypedDict, total=False):
 def _record_typed_prompt() -> None:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-        import escalate
+        from scripts.message import escalate
 
         escalate.typed()
     except HookBudgetSpent:
@@ -43,8 +48,8 @@ def _record_typed_prompt() -> None:
         )
 
 
-def _record_activity(session_id: str) -> None:
-    """Tell auto silence the user typed in a showrunner or unit director session.
+def _record_activity(session_id: str, source: str, prompt: str) -> None:
+    """Send classified activity from a showrunner or unit director session.
 
     The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
     """
@@ -56,7 +61,9 @@ def _record_activity(session_id: str) -> None:
         override = os.environ.get("AUTO_SILENCE_COMMAND")
         script = Path(__file__).resolve().parent.parent / "notify" / "auto_silence.py"
         command = [override] if override else [sys.executable, str(script)]
-        _ = subprocess.Popen([*command, "active"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        digest = hashlib.sha256(prompt.encode()).hexdigest()
+        _ = subprocess.Popen([*command, "active", "--source", source, "--session-id", session_id,
+                              "--pane-id", os.environ.get("HERDR_PANE_ID", ""), "--prompt-hash", digest], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except HookBudgetSpent:
         raise
@@ -106,7 +113,13 @@ def main() -> None:
             finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
-            _record_activity(session_id)
+        activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
+                           conversation_pause.PromptSource.PEER: "PeerPrompt",
+                           conversation_pause.PromptSource.SCHEDULED: "ScriptPrompt",
+                           conversation_pause.PromptSource.NOTICE: "HarnessNotice"}[source]
+        if not prompt.strip():
+            activity_source = "UnknownPrompt"
+        _record_activity(session_id, activity_source, prompt)
         return_question = conversation_pause.is_return_question(prompt)
         if (source in {conversation_pause.PromptSource.SCHEDULED,
                        conversation_pause.PromptSource.NOTICE}

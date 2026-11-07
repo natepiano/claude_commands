@@ -2,16 +2,20 @@
 """urgency.py: the order every queue shows its items in, and the pin on the item /next showed."""
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import urgency  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.urgency import Entry, Urgency, UrgencyError  # noqa: E402
 
 
@@ -116,6 +120,97 @@ class ReadTest(unittest.TestCase):
 
 
 class PinTest(unittest.TestCase):
+    def test_two_concurrent_moves_preserve_both_items(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder}):
+            urgency.pin("q", "a")
+            read_text = Path.read_text
+            read = threading.Event()
+            release = threading.Event()
+            entering = threading.Event()
+
+            def pause_after_file_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                content = read_text(path, encoding=encoding, errors=errors)
+                if path == Path(folder) / "q.json" and threading.current_thread().name.startswith("first-move"):
+                    read.set()
+                    if not release.wait(TEST_HANG_GUARD_SECS):
+                        raise RuntimeError("the first move was not released")
+                return content
+
+            def second_move() -> None:
+                entering.set()
+                urgency.move_to_end("q", "b", at(6))
+
+            with mock.patch.object(Path, "read_text", new=pause_after_file_read), \
+                    ThreadPoolExecutor(max_workers=1, thread_name_prefix="first-move") as first_worker, \
+                    ThreadPoolExecutor(max_workers=1) as second_worker:
+                first = first_worker.submit(urgency.move_to_end, "q", "a", at(5))
+                try:
+                    self.assertTrue(read.wait(TEST_HANG_GUARD_SECS))
+                    second = second_worker.submit(second_move)
+                    self.assertTrue(entering.wait(TEST_HANG_GUARD_SECS))
+                    with (Path(folder) / ".lock").open("a+", encoding="utf-8") as contender:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    release.set()
+                first.result(TEST_HANG_GUARD_SECS)
+                second.result(TEST_HANG_GUARD_SECS)
+            self.assertEqual(urgency.ended("q"), {"a": at(5), "b": at(6)})
+            self.assertEqual(urgency.pinned("q"), "")
+
+    def test_a_move_during_selection_cannot_restore_the_moved_pin(self) -> None:
+        for across in (False, True):
+            with self.subTest(across=across), tempfile.TemporaryDirectory() as folder, \
+                    mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder}):
+                entries = [Entry("a", "", since=at(1)), Entry("b", "", since=at(2))]
+                urgency.pin("q", "a")
+                read_text = Path.read_text
+                read = threading.Event()
+                release = threading.Event()
+                entering = threading.Event()
+
+                def pause_selection_file_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    content = read_text(path, encoding=encoding, errors=errors)
+                    if (path == Path(folder) / "q.json"
+                            and threading.current_thread().name.startswith("selection") and not read.is_set()):
+                        read.set()
+                        if not release.wait(TEST_HANG_GUARD_SECS):
+                            raise RuntimeError("the selection was not released")
+                    return content
+
+                def move() -> None:
+                    entering.set()
+                    urgency.move_to_end("q", "a", at(5))
+
+                def select() -> None:
+                    if across:
+                        _ = urgency.top_across({"q": entries}, "all")
+                    else:
+                        _ = urgency.top(entries, "q")
+
+                with mock.patch.object(Path, "read_text", new=pause_selection_file_read), \
+                        ThreadPoolExecutor(max_workers=1, thread_name_prefix="selection") as selector, \
+                        ThreadPoolExecutor(max_workers=1) as mover:
+                    selection = selector.submit(select)
+                    try:
+                        self.assertTrue(read.wait(TEST_HANG_GUARD_SECS))
+                        moving = mover.submit(move)
+                        self.assertTrue(entering.wait(TEST_HANG_GUARD_SECS))
+                        with (Path(folder) / ".lock").open("a+", encoding="utf-8") as contender:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        release.set()
+                    selection.result(TEST_HANG_GUARD_SECS)
+                    moving.result(TEST_HANG_GUARD_SECS)
+                self.assertEqual(urgency.pinned("q"), "")
+                self.assertEqual(urgency.ended("q"), {"a": at(5)})
+                self.assertEqual(keys(urgency.queue_order(entries, "q")), ["b", "a"])
+                if across:
+                    self.assertEqual(urgency.top_across({"q": entries}, "all"), ("q", entries[1]))
+                else:
+                    self.assertEqual(urgency.top(entries, "q"), entries[1])
+
     def test_shown_item_stays_until_it_leaves(self) -> None:
         with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder}):
             first = [Entry("a", "", since=at(1)), Entry("b", "", since=at(2))]

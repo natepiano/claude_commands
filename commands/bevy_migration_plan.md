@@ -1,5 +1,5 @@
 ---
-description: Generate project-specific Bevy migration plan by analyzing the current codebase against official migration guides
+description: Plan a Bevy version migration.
 ---
 
 # Bevy Migration Plan Generator
@@ -58,10 +58,12 @@ CODEBASE = [second argument or $PWD] (e.g., "~/rust/my_game" or current director
 BEVY_REPO_DIR = ${HOME}/rust/bevy-${VERSION} (global, reusable across projects)
 GUIDES_DIR = [resolved at clone time — captured from the final stdout line of bevy_migration_ensure_repo.sh in CloneRepository. The migration-guides directory moved from release-content/ (<= 0.18) to _release-content/ (0.19+), so do NOT hardcode it.]
 MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-plan.md
-PRODUCTION_DOC = [the one `*-production.md` under ${CODEBASE}/docs (`find "${CODEBASE}/docs" -name '*-production.md'`); none means the project is not in a production, and more than one means ask the user which]
+SHOWRUNNER_NAME = [the showrunner parent row's `name`; no showrunner parent means no production]
+PRODUCTION_DOC = [that showrunner row's `doc.path`]
+PLAYBOOK = ${CODEBASE}/docs/bevy_migration/playbook.md (earlier upgrades' lessons; may not exist)
 ```
 
-**Production and watch:** "a project in a production" below means PRODUCTION_DOC exists. The `/showrunner:bevy_upgrade` watch is open for it when `python3 ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${PRODUCTION_DOC}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
+**Production and watch:** A unit belongs to a production when its staff row has a showrunner parent. The `/showrunner:bevy_upgrade` watch is open for it when `~/.claude/scripts/lib/py ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${SHOWRUNNER_NAME}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
 
 **Path Expansion Note:**
 - When constructing bash commands, ensure tildes are expanded to actual paths
@@ -507,6 +509,10 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    rm -f "/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}").md"
    ```
 
+2a. **Read the playbook:**
+
+   If PLAYBOOK exists, Read it and store each item, in order and in its words, as PLAYBOOK_STEPS. With no PLAYBOOK, change nothing.
+
 3. **Sort sections by requirement level and identify anomalies:**
    - REQUIRED guides first, then HIGH, then MEDIUM, then LOW
    - For each section, parse the occurrence counts from the header:
@@ -598,6 +604,16 @@ During the two-pass analysis, [N] guide(s) showed significant variance (>20%) be
 ---
 
 [Insert DEPENDENCY_OUTPUT content here]
+
+---
+
+[If PLAYBOOK_STEPS exist, insert this section; otherwise omit it:]
+
+## Playbook Steps
+
+Required steps from ${PLAYBOOK}.
+
+[One numbered step per PLAYBOOK_STEPS item]
 
 ---
 

@@ -9,7 +9,7 @@ import json
 import io
 import os
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -21,6 +21,11 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateLedgerTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
@@ -95,7 +100,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertCountEqual(starts, [("hooks", "test_first.py"), ("added_folder", "test_added.py")])
         self.assertEqual(self.pass_records()[-1]["suites"], folders)
 
-    def test_checkpoint_reuses_unit_tree_and_still_runs_types_and_checks_settings(self) -> None:
+    def test_checkpoint_reuses_unit_tree_and_still_runs_types(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
@@ -105,12 +110,6 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertTrue((self.state / "types-ran").exists())
         self.assertIn("tests reused from", second.stdout)
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
-        self.clear_gate_events()
-        refused = self.run_gate("--settings-blob", "00000000")
-        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("tests reused from", refused.stdout)
-        self.assertIn("settings.json differs", refused.stderr)
-        self.assertEqual(self.module_events(), [])
 
     @gate_suites("lib", "hooks")
     def test_checkpoint_full_pass_records_and_tests_only_reuses_it(self) -> None:
@@ -239,7 +238,7 @@ class MergeGateLedgerTests(MergeGateFixture):
             assert isinstance(selected, CertifiedBase)
             self.assertEqual(selected.commit, head)
 
-    def test_nightly_uses_a_disposable_shared_clone_and_marks_and_notifies_only_red(self) -> None:
+    def test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         self.write(self.checkout / "untracked.txt", "keep the caller's edits\n")
         before_head = self.git(self.checkout, "rev-parse", "HEAD")
@@ -249,14 +248,13 @@ class MergeGateLedgerTests(MergeGateFixture):
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, memory_cap_mib: int, type_dirs: list[str], *, module_time_limit_s: float,
+                def suite_run(repo: Path, type_dirs: list[str], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git/objects/info/alternates").is_file())
                     self.assertEqual(merge_gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
                     self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
-                    self.assertGreater(memory_cap_mib, 0)
                     self.assertGreater(module_time_limit_s, 0)
                     self.assertEqual(type_dirs, ["scripts"])
                     self.write(repo / "subject.txt", "only the copy changes\n")
@@ -266,14 +264,16 @@ class MergeGateLedgerTests(MergeGateFixture):
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         mock.patch.object(merge_gate, "run_suites", side_effect=suite_run), \
-                        mock.patch.object(merge_gate, "tell_nightly_red") as notice, redirect_stdout(output):
+                        mock.patch.object(merge_gate, "tell_nightly_red") as notice, \
+                        mock.patch.object(merge_gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
                     code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
                 self.assertEqual(code, int(red), output.getvalue())
                 self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), before_head)
                 self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
                 self.assertEqual(self.git(self.checkout, "show-ref", "--heads"), before_branches)
                 self.assertEqual((self.checkout / "subject.txt").read_text(), "base\n")
-                self.assertTrue(all(not path.exists() for path in copies))
+                self.assertTrue(all((path / ".git").is_dir() for path in copies))
+                self.assertEqual(len(set(copies)), 1)
                 if red:
                     record = cast(dict[str, object], json.loads(marker.read_text()))
                     self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", f"{self.checkpoint}^{{tree}}"))
@@ -284,13 +284,42 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertFalse(marker.exists())
                     notice.assert_not_called()
 
-    def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
-        from scripts.production import showrunners
+    def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:
+        from scripts.copies import copies
+        from scripts.production import change_review, showrunners
 
-        self.write(self.quiet_production, "- **Merge branch:** `integration`\n")
+        _ = self.git(self.unit, "push", "origin", "HEAD:integration")
+        observed: list[Path] = []
+
+        def suite_run(repo: Path, *_args: object, **_kwargs: object) -> merge_gate.GateRun:
+            observed.append(repo)
+            return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(change_review, "production_doc", side_effect=change_review.ChangeReviewError("none")),
+              mock.patch.object(showrunners, "timer_docs", return_value={}),
+              mock.patch.object(copies, "fallback_owner", return_value="configured-nightly"),
+              mock.patch.object(merge_gate, "run_suites", side_effect=suite_run),
+              redirect_stdout(io.StringIO())):
+            code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+        self.assertEqual(code, 0)
+        checkout, = observed
+        self.assertEqual(checkout.name, "configured-nightly-gate")
+        self.assertTrue((checkout / ".git").is_dir())
+
+    def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
+        from scripts.production import showrunners, staff
+        from scripts.production.staff_test_support import fixture_member
+        from scripts.shutdown import remote
+
+        production = self.checkout / "quiet-production.md"
+        self.write(production, "# Quiet production\n")
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}), \
-                mock.patch.object(showrunners, "timer_docs", return_value={"quiet": self.quiet_production}), \
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "", "STAFF_FILE": str(self.root / "staff.json")}
+        with mock.patch.dict(os.environ, environment):
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), production))
+        with mock.patch.dict(os.environ, environment), \
+                mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
                 mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
                 redirect_stdout(output):
             merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),

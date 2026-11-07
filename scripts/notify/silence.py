@@ -23,6 +23,10 @@ natedev holds the state: on the Mac every subcommand, and pushover.py's check, r
 ssh. NOTIFY_STATE_DIR, when set, names this host's state directory and keeps everything here.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -40,10 +44,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone, zone_label  # noqa: E402
+from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
+from scripts.notify import push_reference
 
 PY = Path.home() / ".claude/scripts/lib/py"
 SILENCE = Path.home() / ".claude/scripts/notify/silence.py"
@@ -68,6 +72,9 @@ class SilenceRecord(TypedDict):
 
 
 class KeptPush(TypedDict):
+    reference: NotRequired[push_reference.PushReference]
+    due: NotRequired[str]
+    need: NotRequired[str]
     source: str
     priority: str
     title: str
@@ -152,11 +159,21 @@ def parse_push(text: str) -> KeptPush | None:
         return None
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
-    found = {name: record.get(name) for name in KeptPush.__annotations__} | {
+    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
+    for name in ("due", "need"):
+        if name in record:
+            found[name] = record[name]
     if not all(isinstance(item, str) for item in found.values()):
         return None
-    return cast(KeptPush, cast(object, found))
+    try:
+        reference = push_reference.read_reference(record.get("reference"))
+    except ValueError:
+        return None
+    result = cast(KeptPush, cast(object, found))
+    if "reference" in record:
+        result["reference"] = reference
+    return result
 
 
 def shown(moment: datetime) -> str:
@@ -270,6 +287,13 @@ def on(until: datetime | None, runner: Run) -> int:
             _ = stop_timer(unit, runner)
             print("silence: the old end timer could not be stopped; silence not changed", file=sys.stderr)
             return 1
+        if old is not None and old["auto"]:
+            try:
+                automatic_event("end", "manual_on", old, next_state="manual")
+            except OSError as error:
+                _ = stop_timer(unit, runner)
+                print(f"silence: end event append failed: {error}", file=sys.stderr)
+                return 1
         write_state(record)
     print(f"silence on from {shown(datetime.fromisoformat(record['since']))} {ends(record)}")
     return 0
@@ -281,7 +305,17 @@ class PushChannel(Protocol):
 
 def post_kept(push: KeptPush) -> int:
     """pushover.py posts it; imported here, as pushover.py imports this module."""
-    return cast(PushChannel, cast(object, importlib.import_module("pushover"))).post_kept(push)
+    return cast(PushChannel, cast(object, importlib.import_module('scripts.notify.pushover'))).post_kept(push)
+
+
+class AutomaticSilenceEvents(Protocol):
+    def record_command_event(self, event: str, cause: str, record: SilenceRecord, next_state: str) -> None: ...
+
+
+def automatic_event(event: str, cause: str, record: SilenceRecord, *, next_state: str = "off") -> None:
+    """Record an automatic transition while the caller holds the silence lock."""
+    channel = cast(AutomaticSilenceEvents, cast(object, importlib.import_module('scripts.notify.auto_silence')))
+    channel.record_command_event(event, cause, record, next_state)
 
 
 def claim(when: Callable[[SilenceRecord], bool] | None = None, *,
@@ -297,37 +331,59 @@ def claim(when: Callable[[SilenceRecord], bool] | None = None, *,
                                  or (record is not None and not when(record))):
             return None
         kept = read_kept()
+        if record is not None and record["auto"]:
+            automatic_event("end", "manual_off", record)
         state_file().unlink(missing_ok=True)
     return record, kept
 
 
 def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, deliver: Deliver, opening: str) -> int:
     _ = stop_timer(record["timer"] if record else None, runner)
-    failed = attempted = 0
+    failed = delivered = dropped = 0
     with locked():
         pending = read_kept()
         for push in kept:
             # Another release may already have posted this push since claim read it.
             if push not in pending:
                 continue
-            attempted += 1
-            if deliver(push) != 0:
+            try:
+                code = deliver(push)
+            except Exception:
+                if record is not None and record["auto"]:
+                    automatic_event("release_failed", "delivery_exception", record)
+                raise
+            if code != 0:
                 failed += 1
                 continue
+            if isinstance(code, push_reference.KeptPushDropped):
+                dropped += 1
+            else:
+                delivered += 1
             pending.remove(push)
             temporary = kept_file().with_suffix(".tmp")
             _ = temporary.write_text("".join(json.dumps(left) + "\n" for left in pending), encoding="utf-8")
             _ = temporary.replace(kept_file())
         if not pending:
             kept_file().unlink(missing_ok=True)
-    plural = "" if attempted == 1 else "es"
+        if record is not None and record["auto"]:
+            try:
+                automatic_event("release_failed" if failed else "released", "held_push_release", record)
+            except OSError as error:
+                print(f"silence: release event append failed: {error}", file=sys.stderr)
+                failed += 1
+    plural = "" if delivered == 1 else "es"
     note = f"; {failed} failed, see ~/.local/state/notify/pushover.jsonl" if failed else ""
-    print(f"{opening}; {attempted} kept push{plural} delivered{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
+    dropped_note = f"; {dropped} dropped" if dropped else ""
+    print(f"{opening}; {delivered} kept push{plural} delivered{dropped_note}{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
     return 1 if failed else 0
 
 
 def off(runner: Run, deliver: Deliver | None = None, timer: str = "") -> int:
-    claimed = claim(lambda record: record["timer"] == timer, release_if_off=True) if timer else claim()
+    try:
+        claimed = claim(lambda record: record["timer"] == timer, release_if_off=True) if timer else claim()
+    except OSError as error:
+        print(f"silence: end event append failed: {error}", file=sys.stderr)
+        return 1
     if claimed is None:
         return 0
     record, kept = claimed
@@ -336,7 +392,11 @@ def off(runner: Run, deliver: Deliver | None = None, timer: str = "") -> int:
 
 def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> int:
     """End a silence whose end passed without its timer firing, as `off` does."""
-    claimed = claim(past_end)
+    try:
+        claimed = claim(past_end)
+    except OSError as error:
+        print(f"silence: end event append failed: {error}", file=sys.stderr)
+        return 1
     if claimed is None:
         return 0
     return release(*claimed, runner or run, deliver or post_kept, "silence ended at its end time")

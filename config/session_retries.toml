@@ -1,6 +1,4 @@
-# Registry reads include the initial read: one reread across a concurrent write.
-registry_reads = 2
-registry_delay_seconds = 0.05
-# Resume retries include the first launch; reruns use the same saved pane launch.
-resume_attempts = 3
-resume_delay_seconds = 0.0
+# Registry reads include the initial read. Claude Code rewrites a record in place,
+# so a reader can see a half-written file; four reads 100 ms apart cover that write.
+registry_reads = 4
+registry_delay_seconds = 0.1

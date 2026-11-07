@@ -27,10 +27,11 @@ source "$SCRIPT_DIR/git_filters_table.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/settings_local_keys.sh"
 
-# Every write to settings.json is the moment to copy its local-only keys to
-# the sidecar; the smudge filter puts them back the next time git writes the
-# file. See settings_local_keys.sh.
-settings_local_keys_snapshot "$REPO_ROOT"
-git_filters_refresh_all "$REPO_ROOT"
+# The guarded clean saves the local values before the index refresh.
+if ! git_filters_refresh_all "$REPO_ROOT"; then
+    echo "refresh_filtered_index: clean failed; index refresh stopped." >&2
+    exit 1
+fi
+settings_local_keys_notices deliver
 
 exit 0

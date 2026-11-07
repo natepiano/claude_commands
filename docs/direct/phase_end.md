@@ -31,8 +31,17 @@ Run these steps in order for each completed loop or verbose phase:
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed. Its hash is
    mergeable now;
    `Phase <next> ETA` counts from this commit.
+   Read `findings.py status --phase <completed phase>` before sending the notice.
+   Include every `held_for_decision` item as `Held simplify: <id> — <files> — <proposed change>; ledger <path>`.
    Outside a production, report
    `Checkpoint <short hash> — phase N: <title>.`.
+   Start the daily simplify run as a background shell after the code ready notice:
+
+   ```sh
+   bash ~/.claude/scripts/direct/assign.sh --role simplify --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}"
+   ```
+
+   The next phase does not wait for this run.
 3. **Plan review.** Run <RunPhaseReview/> before the next phase's Work Order is
    used. A defect found in the committed phase becomes a follow-up phase
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.
@@ -42,12 +51,10 @@ Run these steps in order for each completed loop or verbose phase:
    open: its `finish-phase` in step 5 waits until this review has finished,
    also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
-5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
-   `remove_workers.py`, helpers, launchers, and apps. Run it before the next
-   launch. Per <LongLivedWorkers/>, Codex turns finish but their threads remain
-   open until `end_session.sh`; Claude workers keep their existing cleanup.
-   A pooled reviewer belongs to the unit, not the phase, and stays. Then
-   run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
+5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/> before the next launch.
+   Retain pane workers and their native conversations under <LongLivedWorkers/>.
+   Apply the compatibility cleanup only when the existing run's pin is `mesh`.
+   Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
    run <NextPhase/> through that phase's <LaunchImplementation/>. The review has

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-import bulk_constants as bulk
-import style_footprint as rust
+from scripts.style import bulk_constants as bulk
+from scripts.style import style_footprint as rust
 
 
 @dataclass(frozen=True)

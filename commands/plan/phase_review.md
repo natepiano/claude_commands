@@ -1,5 +1,5 @@
 ---
-description: After implementing a phase, keep review prose temporary, update remaining Work Orders, review approved next items, and prepare the phase for as-built shrink.
+description: Review a completed plan phase.
 ---
 
 Use this after implementing a phase of a multi-phase plan. Review prose is
@@ -84,9 +84,8 @@ recovery condition, diagnostic, or externally observable lifecycle, record:
    node-runtime repository, or none. Then its owner — an existing remaining Work
    Order for an in-repository destination, or `${NEXT_ITEMS_PATH}` for one this
    plan cannot implement. Name the acceptance test for every in-repository
-   destination. A destination is never dropped for being blocked by a gate or
-   living in another repository; that is what makes it a next item rather than a
-   phase.
+   destination. Keep a destination when it waits on code or belongs to another repository.
+   Record it as a next item.
 6. When no external surface is appropriate, `implementation-only because
    <reason>` instead of silently omitting it.
 
@@ -143,43 +142,22 @@ what actually changed — those are the architect's subject. It still reads the
 others for consistency, but it verifies the named ones against real code. An
 unscoped invocation covers every remaining phase as before.
 
-**Dispatch it through the worker launcher, not the Agent tool.** A launcher
-dispatch writes a status file and streams `[wrapper]` beats with an activity
-digest into the shared heartbeat log, so the orchestrating agent can watch this
-review and narrate it exactly like an implementation or code review. An Agent-tool
-subagent produces no readable liveness signal — its only output is a full
-transcript too large to read — which leaves the user with an unexplained
-multi-minute silence at the same point in every phase.
+1. Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`.
+2. Select an open worker under `/unit:direct`'s `<RunPhaseReview/>`.
+3. Dispatch the review through `assign.sh`.
 
-Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a worker
-run, select an open worker per `/unit:direct`'s `<RunPhaseReview/>`, then:
-
-```
-bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" --phase <phase> \
-  "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/architect_prompt_<phase>.md" \
-  review \
-  "<plan-doc filename> — phase: <phase>
-architect review of the remaining phases against what phase <phase> actually shipped" \
-  "reviewing the remaining phases against what just shipped" \
-  <pass_index>
+```sh
+bash ~/.claude/scripts/direct/assign.sh --role review --to "<full-worker-name>" \
+  --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" --phase <phase> \
+  --prompt "${SESSION_DIR}/architect_prompt_<phase>.md" --pass <pass_index>
 ```
 
-If every open worker is busy, use the same call with `--slot review` in place of
-`--to "<full-worker-name>"`; that worker stays open. Only a phase review outside a
-unit run calls `review.sh` with neither option.
+If every open worker is busy, replace `--to "<full-worker-name>"` with `--new-worker review`.
+For a phase review outside a unit run, omit both worker options.
 
-- `review` is the subtask name; it resolves through `[worker.<family>]` in
-  `~/.claude/config/agents.conf` like every other worker subtask. There is no
-  separate `architect` row: that key named an agent tier rather than a kind of
-  work, and every architecture-review pass ever recorded already ran as kind
-  `review`. The four subtasks are `impl`, `test`, `fix`, `review`.
-- `<pass_index>` continues the phase's review numbering — one past the last code
-  review pass — so `review_findings_<N>.txt` never overwrites a code review's
-  findings. Findings come back in that file.
-- **`SESSION_DIR`**: use the session established in Step 1.
-- Apply `/unit:direct`'s `<DispatchContract/>`; do not invent another wait or
-  progress mechanism.
+- Set `--pass` to one past the phase's last code review index.
+- Use the session from Step 1.
+- Apply `/unit:direct`'s `<DispatchContract/>` for progress and completion.
 
 The prompt must include:
 
@@ -324,7 +302,7 @@ byte-identical.
    Orders, which this command must leave byte-identical:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+   ~/.claude/scripts/lib/py -m scripts.berth.work_order \
      --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
      --phase <todo-phase>
    ```

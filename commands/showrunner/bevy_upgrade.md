@@ -1,5 +1,5 @@
 ---
-description: Track a production's Bevy upgrade, current dependency pins, and the user's answers.
+description: Track a production Bevy upgrade.
 argument-hint: "[status | line | check | stop | start <version> | approve <crate> <words> | decline <crate> <words> | forget <crate> | note <crate> [<text>]]"
 ---
 
@@ -15,6 +15,9 @@ report its error in one line.
 - Run `approve` and `decline` only on the user's own words about that crate,
   passed verbatim as one quoted argument. An answer for one crate never
   extends to another.
+- At `start`, if `docs/bevy_migration/playbook.md` exists in the production's
+  repository, read it and treat each item as a required step of the upgrade.
+  With no playbook, change nothing.
 - Use `note` for what a script cannot look up, such as why a pull request's CI
   fails. With no text, it clears the note.
 - A report says `stale` when the table does.

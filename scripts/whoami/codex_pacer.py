@@ -3,7 +3,7 @@
 
 agent_notes.py calls `tick` every two minutes from the agent-sessions timer,
 after it has written every Codex account's remaining usage, weekly reset and
-limit resets. The registry tier `pace` (`/agent pace`) makes each codex launch
+limit resets. The registry tier `pace` (`/default_models pace`) makes each codex launch
 read the decision written here; under any other tier nothing reads it, and the
 measuring carries on regardless.
 
@@ -36,6 +36,10 @@ agent_notes.py by hand is one tick.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -48,14 +52,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import agents_registry  # noqa: E402
+from scripts.lib import models_registry  # noqa: E402
 
 from scripts.whoami.note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
 
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
 SESSIONS = Path.home() / ".codex" / "sessions"
-AGENTS_CONF = Path.home() / ".claude" / "config" / "agents.conf"
+MODELS_CONF = models_registry.registry_path()
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
 BUFFER = 5.0                 # percent left at every checkpoint
@@ -77,7 +80,7 @@ OUTPUT_WEIGHT = 8.0
 
 STATE_FILE = STATE_DIR / "state.json"
 PLAN_FILE = STATE_DIR / "plan.json"
-TIER_FILE = STATE_DIR / "tier"  # read by _agents_pace_tier in agents_config.sh
+TIER_FILE = STATE_DIR / "tier"  # read by _agents_pace_tier in models_config.sh
 
 
 class AgentNote(Protocol):
@@ -435,18 +438,11 @@ def make_plan(state: State, notes: Sequence[AgentNote], registry: str, now: date
 
 def registry_tier() -> str:
     """The worker rows' stored tier: what the bulk of codex launches carry."""
-    section = ""
     try:
-        lines = agents_registry.registry_text(AGENTS_CONF).splitlines()
+        rows = models_registry.parse_registry(models_registry.registry_text(MODELS_CONF))
     except OSError:
         return ""
-    for line in lines:
-        text = line.split("#", 1)[0].strip()
-        if text.startswith("["):
-            section = text.strip("[]")
-        elif section == "direct.options" and text.startswith("codex_service_tier="):
-            return text.split("=", 1)[1].strip()
-    return ""
+    return rows.get("direct.options", {}).get("codex_service_tier", "")
 
 
 def config_tier() -> str:
@@ -520,7 +516,7 @@ def describe(plan: Plan) -> list[str]:
     in_charge = plan["registry_tier"] == "pace"
     lines = [
         f"Tier now: {plan['tier']}" + ("" if in_charge else
-            f" (not in force: the registry tier is {plan['registry_tier'] or 'inherit'}; `/agent pace` hands it over)"),
+            f" (not in force: the registry tier is {plan['registry_tier'] or 'inherit'}; `/default_models pace` hands it over)"),
         f"Fast share: {plan['fast_share']:.0%} of each half hour",
         f"Fast costs {plan['k']:.2f}x default per {plan['model']} token: "
         + (f"fit over {plan['k_hours']} hours" if plan["k_hours"] else "prior from Sep 22 - Oct 1; not enough of both tiers to fit"),

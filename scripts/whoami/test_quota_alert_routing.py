@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import json
 import unittest
 from datetime import timedelta
 from typing import cast
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.quota_alert_test_support import Notes, REGISTRY as REGISTRY
 
@@ -20,9 +20,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_a_quota_refusal_moves_every_codex_function_to_claude_once(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
-        self.assertEqual(self.refuse(), "switched to claude for codex1: direct, module_review")
+        self.assertEqual(self.refuse(), "switched to claude for codex1: direct, design_roles")
         self.assertEqual(self.assignments(),
-                         {"direct": "claude", "cli": "claude", "module_review": "claude", "ask_a_friend": "caller"})
+                         {"direct": "claude", "cli": "claude", "design_roles": "claude", "ask_a_friend": "caller"})
         self.sent.clear()
         _ = self.alert(notes, self.now + timedelta(minutes=30))
         self.assertEqual(self.sent, [])
@@ -35,10 +35,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         assert "switch" in saved
         self.assertNotIn("credits_off_until", saved["switch"])
         self.assertEqual(self.routing_entries()[-1]["kind"], "routed to claude")
-        # The user puts module_review back on codex mid-episode; the next run does not move it again.
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
+        # The user changes design_roles during the episode. The next run keeps that choice.
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "design_roles", "codex"))
         _ = self.alert(notes, self.now + timedelta(minutes=60))
-        self.assertEqual(self.assignments()["module_review"], "codex")
+        self.assertEqual(self.assignments()["design_roles"], "codex")
 
     def test_successful_claude_fallback_is_logged_without_a_session_or_phone_push(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]
@@ -47,7 +47,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.pushed.clear()
         later = self.now + timedelta(minutes=5)
         log = self.block(notes, later)
-        self.assertIn("switched to claude for codex1: direct, module_review", log)
+        self.assertIn("switched to claude for codex1: direct, design_roles", log)
         self.assertTrue(any(line.startswith("quota status codex1:") for line in log))
         self.assertEqual(self.sent, [])
         self.assertEqual(self.pushed, [])
@@ -65,7 +65,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         assert isinstance(owner, agent_accounts.KnownCodexAccount)
         with quota_alert.state_file() as state:
             self.assertEqual(quota_alert.switch_to_claude(state, note, stamp, owner),
-                             quota_alert.CodexWorkMovedToClaude("codex1", ("direct", "module_review")))
+                             quota_alert.CodexWorkMovedToClaude("codex1", ("direct", "design_roles")))
 
         log = self.block([note], self.now + timedelta(minutes=1))
         self.assertTrue(any("New work had already moved to Claude" in line for line in log))
@@ -73,7 +73,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
     def test_refusal_push_says_when_nothing_was_on_codex(self) -> None:
         registry = quota_alert.REGISTRY
-        _ = write_registry(registry, {"assignments": {"direct": "claude", "module_review": "claude"}}, base_text=REGISTRY)
+        _ = write_registry(registry, {"assignments": {"direct": "claude", "design_roles": "claude"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()
