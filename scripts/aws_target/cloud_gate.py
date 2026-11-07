@@ -9,6 +9,7 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ from uuid import uuid4
 from scripts.aws_target import gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
 from scripts.aws_target.config import money, read_settings
+from scripts.build_queue import progress_profile
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
@@ -38,7 +40,7 @@ class CloudCompleted:
 
 
 def settings() -> conf.ConfigRead:
-    return conf.read_or_repository('merge_gate_instances')
+    return conf.read_or_repository('cloud_gate')
 
 
 def read(path: Path) -> dict[str, object]:
@@ -69,16 +71,37 @@ def image_missing(reason: str) -> bool:
                                            'InvalidLaunchTemplateId.NotFound'))
 
 
+def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+    """Read module completion lines from the current box log."""
+    total = 0
+    finished: set[str] = set()
+    for line in text.splitlines():
+        start = re.fullmatch(r'Runner: (\d+) modules, whole machine, \d+ CPUs', line)
+        if start:
+            total = int(start[1])
+        result = re.fullmatch(r'(\S+) exit=-?\d+ seconds=\d+\.\d+(?: stopped)?', line)
+        if result:
+            finished.add(result[1])
+    return (progress_profile.ProgressCounter('modules', min(len(finished), total), total)
+            if total else progress_profile.NoCounter('The box has no module counter yet'))
+
+
 @final
 class GateWorker:
     """Own one durable launch, result transfer, and confirmed termination."""
-    def __init__(self, api: AwsCli, book: ledger.CostLedger, settings_path: Path, *,
+    def __init__(self, api: AwsCli, book: ledger.CostLedger, settings_path: Path, sidecar: Path, *,
                  clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep) -> None:
         self.api = api
         self.book = book
         self.settings_path = settings_path
+        self.sidecar = sidecar
         self.clock = clock
         self.pause = pause
+
+    def publish_log(self, folder: Path) -> None:
+        counter = log_progress((folder / 'gate.log').read_text())
+        if isinstance(counter, progress_profile.ProgressCounter):
+            progress_profile.publish_counter(self.sidecar, counter)
 
     def charges(self) -> None:
         def fetch(start: int, end: int) -> Decimal:
@@ -149,7 +172,7 @@ class GateWorker:
                              result='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/result.json')
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
-                        {'Key': 'Workload', 'Value': 'cloud-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
+                        {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
                         {'Key': 'ExpiresAt', 'Value': str(request['expires'])},
                         {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
                 import base64
@@ -236,12 +259,13 @@ class GateWorker:
                 while self.clock() < ledger.instant(request, 'expires'):
                     bucket = ledger.text(deployment, 'bucket')
                     if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                        pass
+                        self.publish_log(folder)
                     if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
                         if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                             raise ValueError('The final log is absent')
                         row = read(folder / 'remote-result.json')
                         validate_result(row, request)
+                        self.publish_log(folder)
                         break
                     state = self.api.observe(instance, int(self.clock())).state
                     if state not in ('pending', 'running'):
@@ -353,6 +377,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         request = read(folder / 'request.json') if (folder / 'request.json').exists() else prepare(repo, folder, mode, full, module_time_limit_s)
         save(current, {'attempt': folder.name, **identity})
         save(folder / 'deployment.json', deployment)
+        sidecar = folder / 'reservation.cgroup'
         credential = str(Path(settings().text('credential_file')).expanduser())
         command = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=cloud-gate-' + folder.name,
                    '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
@@ -360,7 +385,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
                    '--property=KillMode=control-group', '--property=UMask=0077',
                    '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
                    '--working-directory=' + str(Path(__file__).resolve().parents[2]),
-                   sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory)]
+                   sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
+                   '--sidecar', str(sidecar)]
         # The service owns every AWS call. The session only reads local evidence.
         _ = service(command)
         if not (folder / 'outcome.json').exists():
@@ -386,6 +412,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)
+    _ = parser.add_argument('--sidecar', required=True, type=Path)
     args = parser.parse_args()
     folder = cast(Path, args.worker)
     directory = cast(Path, args.directory)
@@ -394,7 +421,7 @@ def main() -> int:
             return 0
         configuration = conf.read('aws_target')
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
-        worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'))
+        worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
         save(folder / 'outcome.json', worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json')))
     return 0
 

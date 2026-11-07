@@ -259,7 +259,7 @@ trap boot_failed EXIT
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
-    packages = conf.read_or_repository('merge_gate_instances').words('packages')
+    packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     session = (log_push_loop(links, log_push_s) if links.get('production') else '') + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh

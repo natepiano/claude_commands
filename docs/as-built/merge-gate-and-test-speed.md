@@ -67,7 +67,7 @@ Its writes use only `artifacts/${aws:userid}/*`, which contains its role and ins
 The expiry role terminates only gate-tagged instances and writes only its function logs.
 The gate bucket blocks public access, requires HTTPS, encrypts objects, and removes old artifacts.
 
-`config/merge_gate_instances.conf` supplies these values through `conf.py` at use:
+`config/cloud_gate.conf` supplies these values through `conf.py` at use:
 
 | Key | Default | Purpose |
 | --- | --- | --- |
@@ -711,3 +711,25 @@ Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes befor
 Tree watcher scope coverage remains in `scripts/direct/test_tree_watch.py`, with `tree_watch_test_support.py` owning one Git fixture seed per class, including the two nested Cargo workspace layouts, and private copies restored at the same paths per test. Key CLI calls run in-process; scope tests run the real watcher loop with an event-controlled sleep, completing explicit snapshot iterations instead of waiting through fixed intervals. All Git snapshots and file publication stay real, and the parent-exit test keeps a real watcher process. Negative checks require two completed observations and a live watcher, followed by the original positive-change proof; the original 2.5-second change and parent-exit bounds remain. Only non-speed setup and cleanup waits use the named 600-second hang guard in `scripts/lib/test_hang_guard.py`.
 
 Dailies input coverage remains in `scripts/production/test_dailies_input.py`, with `dailies_input_test_support.py` building the production document, Git checkout and origin, status, judgment, fake tools and environment once per class. Each test gets private files and Git metadata restored at the seed's original paths. Renderer, ETA-request, review-watch, phase-table and style-ledger commands run their real parsers and handlers in-process; their output, state changes, Git commands and SQLite ledger remain real. The two builder subprocess smoke calls remain. All test bodies and assertions are retained unchanged; this fixture has no fixed sleeps or polling intervals.
+
+## Cloud gate resource names
+
+The feature uses `scripts/aws_target/cloud_gate.py` and `config/cloud_gate.conf`.
+The machines use the name `cloud-claude-gate`.
+The instance `Name` tag and the resource `Workload` tags use `cloud-claude-gate`.
+The instance profile has no CloudFormation tag property.
+
+| Resource | Name |
+| --- | --- |
+| Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
+| Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
+| Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+
+The box sends logs every `log_push_s=5` seconds.
+The route reads module counters from each log download.
+It writes the existing queue progress format through `progress_profile.publish_counter`.
+
+The route passes an attempt sidecar path to the scaler service.
+The service writes module progress beside that path.
+Cloud admission and cloud status remain separate work for the queue interface order.
+The route does not request local memory for a cloud gate.

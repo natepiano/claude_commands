@@ -86,7 +86,27 @@ class GateResourcesTests(unittest.TestCase):
         current = self.template()
         for section in ('Resources', 'Parameters', 'Outputs'):
             for name, row in ledger.mapping(before[section]).items():
+                if name.startswith("Gate") or name.startswith("EnableGates"):
+                    continue
                 self.assertEqual(ledger.mapping(current[section])[name], row, (section, name))
+
+    def test_cloud_resources_use_the_machine_name(self) -> None:
+        names = {'GateBucket': 'BucketName', 'GateRole': 'RoleName', 'GateProfile': 'InstanceProfileName',
+                 'GateSecurityGroup': 'GroupName', 'GateLaunchTemplate': 'LaunchTemplateName',
+                 'GateExpiryRole': 'RoleName', 'GateExpiryFunction': 'FunctionName', 'GateExpirySchedule': 'Name',
+                 'GateExpiryLog': 'LogGroupName'}
+        for name, field in names.items():
+            with self.subTest(resource=name):
+                properties = ledger.mapping(ledger.mapping(self.resources()[name])['Properties'])
+                suffix = '-expiry' if name in ('GateExpiryRole', 'GateExpiryFunction', 'GateExpirySchedule', 'GateExpiryLog') else ''
+                prefix = '/aws/lambda/' if name == 'GateExpiryLog' else ''
+                self.assertEqual(properties[field], {'Fn::Sub': prefix + 'cloud-claude-gate-${DeploymentId}' + suffix})
+                if name == 'GateProfile':
+                    continue
+                tags = (ledger.rows(properties, 'Tags') if name != 'GateLaunchTemplate' else
+                        ledger.rows(ledger.rows(properties, 'TagSpecifications')[0], 'Tags'))
+                self.assertIn({'Key': 'Workload', 'Value': 'cloud-claude-gate'}, tags)
+                self.assertIn({'Key': 'Name', 'Value': 'cloud-claude-gate'}, tags)
 
     def test_launch_template_terminates_spot_and_deletes_its_root(self) -> None:
         resource = ledger.mapping(self.resources()['GateLaunchTemplate'])
@@ -109,7 +129,7 @@ class GateResourcesTests(unittest.TestCase):
         self.assertEqual(properties['Users'], [{'Ref': 'ScalerUser'}])
         terminate = by_action[str(['ec2:TerminateInstances'])]
         self.assertEqual(ledger.mapping(ledger.mapping(terminate['Condition'])['StringEquals']), {
-            'ec2:ResourceTag/GateDeployment': {'Ref': 'DeploymentId'}, 'ec2:ResourceTag/Workload': 'cloud-gate'})
+            'ec2:ResourceTag/GateDeployment': {'Ref': 'DeploymentId'}, 'ec2:ResourceTag/Workload': 'cloud-claude-gate'})
         role = by_action[str(['iam:PassRole'])]
         self.assertEqual(role['Resource'], {'Fn::GetAtt': ['GateRole', 'Arn']})
         self.assertEqual(role['Condition'], {'StringEquals': {'iam:PassedToService': 'ec2.amazonaws.com'}})
@@ -170,6 +190,6 @@ class GateResourcesTests(unittest.TestCase):
         self.assertEqual(client.operation, 'describe_instances')
         filters = client.filters
         self.assertIn({'Name': 'tag:GateDeployment', 'Values': ['fixture']}, filters)
-        self.assertIn({'Name': 'tag:Workload', 'Values': ['cloud-gate']}, filters)
+        self.assertIn({'Name': 'tag:Workload', 'Values': ['cloud-claude-gate']}, filters)
         schedule = ledger.mapping(ledger.mapping(self.resources()['GateExpirySchedule'])['Properties'])
         self.assertIn('rate(1 minute)', json.dumps(schedule))

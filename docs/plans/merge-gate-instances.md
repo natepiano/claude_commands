@@ -203,7 +203,7 @@ No candidate receives a production startup deadline from the estimates above.
 ## Launch, scale, and termination
 
 The production route uses one fresh Spot instance for each merge gate or targeted test.
-`config/merge_gate_instances.conf` sets the order to `m7a.8xlarge`, then `m7a.4xlarge`.
+`config/cloud_gate.conf` sets the order to `m7a.8xlarge`, then `m7a.4xlarge`.
 The route tries every deployed public zone at 32 vCPU before it tries 16 vCPU.
 It never requests On-Demand capacity.
 The configured slot count is nine. The queue phase will enforce that value.
@@ -472,7 +472,7 @@ That phase will cache only the package list and nixpkgs revision, independent of
 It will use the machine name `cloud-claude-gate`.
 No image build or queue display ships in this route phase.
 
-`config/merge_gate_instances.conf` contains the new settings and their limits.
+`config/cloud_gate.conf` contains the new settings and their limits.
 `config/aws_target.conf` remains the source for placement, credentials profile, accounting settings, and shared caps.
 
 ## Fallback and separation from Rust
@@ -743,3 +743,25 @@ Owner: **sdlc devtools**. **queue** carries the selected environment identity.
 4. Compare cold full, repeated full, and affected gates.
 
 This phase changes result reuse. Worker retention follows the selected method.
+
+## Cloud gate resource names
+
+The feature uses `scripts/aws_target/cloud_gate.py` and `config/cloud_gate.conf`.
+The machines use the name `cloud-claude-gate`.
+The instance `Name` tag and the resource `Workload` tags use `cloud-claude-gate`.
+The instance profile has no CloudFormation tag property.
+
+| Resource | Name |
+| --- | --- |
+| Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
+| Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
+| Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+
+The box sends logs every `log_push_s=5` seconds.
+The route reads module counters from each log download.
+It writes the existing queue progress format through `progress_profile.publish_counter`.
+
+The route passes an attempt sidecar path to the scaler service.
+The service writes module progress beside that path.
+Cloud admission and cloud status remain separate work for the queue interface order.
+The route does not request local memory for a cloud gate.

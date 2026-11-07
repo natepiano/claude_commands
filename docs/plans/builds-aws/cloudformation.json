@@ -1017,9 +1017,16 @@
           },
           {
             "Key": "Workload",
-            "Value": "cloud-gate"
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
           }
-        ]
+        ],
+        "BucketName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
       }
     },
     "GateBucketPolicy": {
@@ -1090,7 +1097,11 @@
           },
           {
             "Key": "Workload",
-            "Value": "cloud-gate"
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
           }
         ],
         "Policies": [
@@ -1125,7 +1136,10 @@
               ]
             }
           }
-        ]
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
       }
     },
     "GateProfile": {
@@ -1136,7 +1150,10 @@
           {
             "Ref": "GateRole"
           }
-        ]
+        ],
+        "InstanceProfileName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
       }
     },
     "GateSecurityGroup": {
@@ -1170,9 +1187,16 @@
           },
           {
             "Key": "Workload",
-            "Value": "cloud-gate"
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
           }
-        ]
+        ],
+        "GroupName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
       }
     },
     "GateLaunchTemplate": {
@@ -1242,11 +1266,18 @@
               },
               {
                 "Key": "Workload",
-                "Value": "cloud-gate"
+                "Value": "cloud-claude-gate"
+              },
+              {
+                "Key": "Name",
+                "Value": "cloud-claude-gate"
               }
             ]
           }
-        ]
+        ],
+        "LaunchTemplateName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
       }
     },
     "GateScalerPolicy": {
@@ -1301,7 +1332,7 @@
                   "aws:RequestTag/GateDeployment": {
                     "Ref": "DeploymentId"
                   },
-                  "aws:RequestTag/Workload": "cloud-gate",
+                  "aws:RequestTag/Workload": "cloud-claude-gate",
                   "ec2:InstanceType": {
                     "Ref": "GateInstanceTypes"
                   },
@@ -1337,7 +1368,7 @@
                   "aws:RequestTag/GateDeployment": {
                     "Ref": "DeploymentId"
                   },
-                  "aws:RequestTag/Workload": "cloud-gate"
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
                 },
                 "Null": {
                   "aws:RequestTag/GateAttempt": "false",
@@ -1383,7 +1414,7 @@
                   "aws:RequestTag/GateDeployment": {
                     "Ref": "DeploymentId"
                   },
-                  "aws:RequestTag/Workload": "cloud-gate"
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
                 }
               }
             },
@@ -1417,7 +1448,7 @@
                   "ec2:ResourceTag/GateDeployment": {
                     "Ref": "DeploymentId"
                   },
-                  "ec2:ResourceTag/Workload": "cloud-gate"
+                  "ec2:ResourceTag/Workload": "cloud-claude-gate"
                 }
               }
             },
@@ -1504,7 +1535,7 @@
                       "ec2:ResourceTag/GateDeployment": {
                         "Ref": "DeploymentId"
                       },
-                      "ec2:ResourceTag/Workload": "cloud-gate"
+                      "ec2:ResourceTag/Workload": "cloud-claude-gate"
                     }
                   }
                 },
@@ -1515,11 +1546,24 @@
                     "logs:PutLogEvents"
                   ],
                   "Resource": {
-                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cloud-gate-${DeploymentId}:*"
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry:*"
                   }
                 }
               ]
             }
+          }
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
           }
         ]
       }
@@ -1529,7 +1573,7 @@
       "Condition": "Gates",
       "Properties": {
         "FunctionName": {
-          "Fn::Sub": "cloud-gate-${DeploymentId}"
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
         },
         "Runtime": "python3.13",
         "Handler": "index.handler",
@@ -1553,8 +1597,18 @@
           }
         },
         "Code": {
-          "ZipFile": "import os, time, boto3\n\ndef handler(event, context):\n    ec2 = boto3.client('ec2')\n    filters = [{'Name': 'tag:GateDeployment', 'Values': [os.environ['DEPLOYMENT']]},\n               {'Name': 'tag:Workload', 'Values': ['cloud-gate']},\n               {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]\n    for page in ec2.get_paginator('describe_instances').paginate(Filters=filters):\n        for group in page['Reservations']:\n            for instance in group['Instances']:\n                tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}\n                try:\n                    expired = int(tags['ExpiresAt']) <= time.time()\n                except (KeyError, ValueError):\n                    expired = False\n                if expired:\n                    ec2.terminate_instances(InstanceIds=[instance['InstanceId']])\n"
-        }
+          "ZipFile": "import os, time, boto3\n\ndef handler(event, context):\n    ec2 = boto3.client('ec2')\n    filters = [{'Name': 'tag:GateDeployment', 'Values': [os.environ['DEPLOYMENT']]},\n               {'Name': 'tag:Workload', 'Values': ['cloud-claude-gate']},\n               {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]\n    for page in ec2.get_paginator('describe_instances').paginate(Filters=filters):\n        for group in page['Reservations']:\n            for instance in group['Instances']:\n                tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}\n                try:\n                    expired = int(tags['ExpiresAt']) <= time.time()\n                except (KeyError, ValueError):\n                    expired = False\n                if expired:\n                    ec2.terminate_instances(InstanceIds=[instance['InstanceId']])\n"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
       },
       "DependsOn": "GateExpiryLog"
     },
@@ -1563,11 +1617,21 @@
       "Condition": "Gates",
       "Properties": {
         "LogGroupName": {
-          "Fn::Sub": "/aws/lambda/cloud-gate-${DeploymentId}"
+          "Fn::Sub": "/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry"
         },
         "RetentionInDays": {
           "Ref": "GateLogDays"
-        }
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
       }
     },
     "GateExpirySchedule": {
@@ -1593,6 +1657,19 @@
               ]
             },
             "Id": "GateExpiry"
+          }
+        ],
+        "Name": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
           }
         ]
       }

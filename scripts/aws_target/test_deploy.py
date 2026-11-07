@@ -622,8 +622,8 @@ sys.exit(7)
     def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        _ = (self.root / 'merge_gate_instances.conf').write_bytes(
-            (deploy.TEMPLATE.parents[3] / 'config/merge_gate_instances.conf').read_bytes())
+        _ = (self.root / 'cloud_gate.conf').write_bytes(
+            (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
                    'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}

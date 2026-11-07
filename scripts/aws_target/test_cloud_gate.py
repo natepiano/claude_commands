@@ -16,6 +16,7 @@ from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, instant
+from scripts.build_queue import admission_client, progress_profile
 from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
@@ -25,6 +26,7 @@ from scripts.production import merge_gate as gate
 class FakeGateAws:
     """Implement only the operations that a gate scaler can request."""
     def __init__(self) -> None:
+        self.log: str = 'fixture cloud output\n'
         self.commands: list[list[str]] = []
         self.launches: list[dict[str, object]] = []
         self.refusals: list[str] = []
@@ -55,7 +57,7 @@ class FakeGateAws:
             key_at = args.index('--key') + 1
             key, destination = args[key_at], Path(args[key_at + 1])
             if key.endswith('/gate.log') and self.has_log:
-                _ = destination.write_text('fixture cloud output\n')
+                _ = destination.write_text(self.log)
             elif key.endswith('/result.json') and self.has_result:
                 cloud_gate.save(destination, self.result)
             else:
@@ -83,8 +85,8 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         repository = Path(__file__).resolve().parents[2]
-        _ = (self.root / 'merge_gate_instances.conf').write_bytes(
-            (repository / 'config/merge_gate_instances.conf').read_bytes())
+        _ = (self.root / 'cloud_gate.conf').write_bytes(
+            (repository / 'config/cloud_gate.conf').read_bytes())
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.now) - 1,
@@ -116,7 +118,7 @@ class CloudGateTests(CostFixture):
 
     def execute(self) -> dict[str, object]:
         worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
-            self.book, self.settings, clock=lambda: self.now, pause=self.advance)
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
         return worker.execute(self.folder, self.request, self.deployment)
 
     def test_complete_result_keeps_log_and_confirms_termination(self) -> None:
@@ -125,6 +127,34 @@ class CloudGateTests(CostFixture):
         self.assertEqual((self.folder / 'gate.log').read_text(), 'fixture cloud output\n')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
+
+    def test_each_log_download_publishes_module_progress(self) -> None:
+        self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'
+                         + 'fixture/test_ok.py exit=0 seconds=1.00\n')
+        with mock.patch.object(progress_profile, 'publish_counter', wraps=progress_profile.publish_counter) as publish:
+            self.assertEqual(self.execute()['status'], 'complete')
+        sidecar = self.folder / 'reservation.cgroup'
+        counter = progress_profile.ProgressCounter('modules', 1, 1)
+        self.assertEqual(progress_profile.read_counter(sidecar), counter)
+        self.assertEqual(publish.call_count, 2)
+        publish.assert_has_calls([mock.call(sidecar, counter), mock.call(sidecar, counter)])
+
+    def test_module_progress_counts_each_module_once(self) -> None:
+        text = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+                + 'fixture/test_one.py exit=1 seconds=1.00\n'
+                + 'fixture/test_two.py exit=-15 seconds=2.00 stopped\n'
+                + 'fixture/test_one.py exit=0 seconds=1.00\n')
+        self.assertEqual(cloud_gate.log_progress(text), progress_profile.ProgressCounter('modules', 2, 2))
+        self.assertIsInstance(cloud_gate.log_progress('Preparing tools\n'), progress_profile.NoCounter)
+        self.assertIsInstance(cloud_gate.log_progress('Runner: 0 modules, whole machine, 32 CPUs\n'),
+                              progress_profile.NoCounter)
+
+    def test_instance_and_volume_tags_use_the_machine_name(self) -> None:
+        self.assertEqual(self.execute()['status'], 'complete')
+        for resource in ledger.rows(self.fake.launches[0], 'TagSpecifications'):
+            tags = {str(row['Key']): row['Value'] for row in ledger.rows(resource, 'Tags')}
+            self.assertEqual(tags['Name'], 'cloud-claude-gate')
+            self.assertEqual(tags['Workload'], 'cloud-claude-gate')
 
     def test_first_gate_reconciles_the_period_before_deployment(self) -> None:
         self.assertEqual(self.execute()['status'], 'complete')
@@ -287,7 +317,7 @@ class CloudRouteTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         repository = Path(__file__).resolve().parents[2]
-        for name in ('merge_gate', 'merge_gate_instances'):
+        for name in ('merge_gate', 'cloud_gate'):
             _ = (self.root / (name + '.conf')).write_bytes((repository / 'config' / (name + '.conf')).read_bytes())
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
@@ -301,6 +331,8 @@ class CloudRouteTests(CostFixture):
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
         _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
+        _ = self.enterContext(mock.patch.object(admission_client, 'admit',
+                              side_effect=AssertionError('A cloud gate must take no local memory')))
 
     def test_bundle_keeps_exact_tree_main_and_current_branch(self) -> None:
         folder = self.root / 'attempt'
@@ -347,6 +379,9 @@ class CloudRouteTests(CostFixture):
         self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
         self.assertIn('cloud log', output.getvalue())
         self.assertEqual(commands[0][0], 'systemd-run')
+        sidecar = Path(commands[0][commands[0].index('--sidecar') + 1])
+        folder = Path(commands[0][commands[0].index('--worker') + 1])
+        self.assertEqual(sidecar, folder / 'reservation.cgroup')
         self.assertIn('--setenv=AWS_SHARED_CREDENTIALS_FILE=' + str(self.root / '.config/aws-build/credentials'), commands[0])
         self.assertIn('--property=KillMode=control-group', commands[0])
         self.assertEqual(ledger.mapping(cast(object, json.loads(destination.read_text())))['host'], 'remote-host')
