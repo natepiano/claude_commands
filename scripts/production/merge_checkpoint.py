@@ -44,6 +44,7 @@ from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import conf  # noqa: E402
+from scripts.message import session_send  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -1224,7 +1225,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
         red = current["result"] == "red"
         text = (f"Bump gate {'red' if red else 'green'}: {current['unit']}; tip {current['tip']}; "
                 + f"{current['detail']}; log {current['log']}")
-        script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
+        script = tool("send.py", session_send.SEND_SCRIPT, "MERGE_CHECKPOINT_SEND")
         recipients: tuple[Literal["unit", "showrunner"], ...] = ("unit", "showrunner") if red else ("showrunner",)
         delivered = current.get("delivered_to", [])
         current["delivered_to"] = delivered
@@ -1577,7 +1578,7 @@ def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
 
 
 def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
-    script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
+    script = tool("send.py", session_send.SEND_SCRIPT, "MERGE_CHECKPOINT_SEND")
     try:
         address = child_runner("address", request.child.name)
         if not address:

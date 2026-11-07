@@ -19,6 +19,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
@@ -191,7 +192,7 @@ always=natedev
             _ = deliver()
         sends: dict[str, tuple[str, UserAction]] = {}
         for command in commands:
-            self.assertEqual(command[:2], [sys.executable, str(quota_alert.SEND)])
+            self.assertEqual(command[:2], [sys.executable, str(session_send.SEND_SCRIPT)])
             with redirect_stderr(io.StringIO()) as refusal:
                 try:
                     options = send.parse(command[2:])

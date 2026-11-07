@@ -71,7 +71,7 @@ from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import repeat_guard
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.production import staff, session_staff, worker_admission
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
@@ -93,7 +93,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
                   + "crashed before it reported. Start the run again if you still need its result.")
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
-SEND_SCRIPT = codex_mesh.SEND_SCRIPT
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
 # places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
@@ -505,8 +504,8 @@ def send_to_director(session_id: str, summary: str, text: str) -> Literal["sent"
     """One send.py call to a Claude session; tests replace this."""
     try:
         sent = subprocess.run(
-            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "mesh-runs",
-             "--summary", summary, "--text", text],
+            session_send.send_argv("--to", f"session:{session_id}", "--from", "mesh-runs",
+                                   "--summary", summary, "--text", text),
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
