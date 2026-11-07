@@ -159,12 +159,12 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retire_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
-        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             pass
         with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
             pass
         with copies.workspace(
-            "alpha", self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
+            str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
         ) as workspace:
             pass
         code, output = self.retire()
@@ -173,24 +173,38 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(workspace.exists())
         self.assertTrue(other.exists())
 
+    def test_retire_keeps_a_same_named_units_copy_in_another_production(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
+        parent = fixture_member("showrunner", name="other-production")
+        other = fixture_member("unit", name="alpha", parent=parent.id)
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as mine:
+            pass
+        with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
+            pass
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(mine.exists())
+        self.assertEqual(git(theirs, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "HEAD"))
+
     def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
         _ = git(self.worktree, "rm", "Cargo.toml")
         _ = git(self.worktree, "commit", "-qm", "remove the root build manifest")
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
-        with copies.standing("alpha", self.worktree, copies.CommittedSource("HEAD")) as tree:
+        with copies.standing(str(self.unit_staff_id), self.worktree, copies.CommittedSource("HEAD")) as tree:
             self.assertTrue(tree.is_relative_to(Path(os.environ["SCRATCH_ROOT"])))
-            self.assertEqual(copies.owned_trees("alpha").standing, ())
+            self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
             self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
         self.assertFalse(tree.exists())
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
-        self.assertEqual(copies.owned_trees("alpha").standing, ())
+        self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
 
     def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
-        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertIn("busy", output)
@@ -198,7 +212,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(self.worktree.exists())
 
     def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
-        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertIn("busy", output)
@@ -209,9 +223,9 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retirement_dry_run_lists_trees_and_workspaces_without_changes(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
-        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             pass
-        with copies.workspace("alpha", self.checkout, "HEAD", name="worker", branch="worker") as workspace:
+        with copies.workspace(str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker") as workspace:
             pass
         before = {path: path.read_bytes() for folder in (tree, workspace)
                   for path in folder.rglob("*") if path.is_file()}
@@ -686,7 +700,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(checkout.exists())
 
     def test_retirement_removes_only_its_remote_mirrors(self) -> None:
-        mine = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        mine = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
         other = copies.RemoteMirror("beta-unit", copies.SelectedRepository("hana"), "mac", "mirror/beta", "beta-session")
         with fake_remote_removal((mine, other)) as remove:
             code, output = self.retire()
@@ -695,7 +709,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
 
     def test_retirement_refuses_a_busy_remote_mirror_before_worktree_removal(self) -> None:
-        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
         copies.register_remote(mirror)
         with copies.remote_lease(mirror):
             code, output = self.retire()
@@ -706,7 +720,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertTrue(copies.remote_record_path(mirror).exists())
 
     def test_retirement_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
-        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac",
+        mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
         with local_remote_transport(self.root):
             self.assertEqual(publish_mirror(mirror), 0)

@@ -461,7 +461,7 @@ def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
         print(f"refused: {reason}")
     for row in members(unit, staff.snapshot()):
         print(f"would stop: session {row.current_session}")
-    trees = copies.owned_trees(unit.staff_member.name)
+    trees = copies.owned_trees(str(unit.staff_member.id))
     for tree in (*trees.standing, *(entry[0] for entry in trees.workspaces)):
         print(f"would remove: checkout {tree}")
     print(f"would remove: worktree {unit.worktree}")
@@ -495,28 +495,13 @@ def release_reservations(unit: Unit, *, settings: conf.ConfigRead) -> None:
             print(f"anomaly: {failure(result)}")
 
 
-def remove_unit_trees(owner: str) -> None:
-    """Remove the unit's copies under both supported owner names."""
-    failures: list[str] = []
-    failure_type: type[copies.CopyError] = copies.CopyError
-    for name in sorted({owner, copies.unit_owner(owner)}):
-        try:
-            copies.remove_trees(name)
-        except copies.CopyError as error:
-            failures.append(str(error))
-            if isinstance(error, copies.RemoteMirrorKept):
-                failure_type = copies.RemoteMirrorKept
-    if failures:
-        raise failure_type("\n".join(failures))
-
-
 def retire(unit: Unit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
         try:
-            remove_unit_trees(row.name)
+            copies.remove_trees(str(row.id))
         except copies.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
@@ -572,7 +557,7 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for item in remaining):
         return 1
     try:
-        remove_unit_trees(row.name)
+        copies.remove_trees(str(row.id))
     except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
         return 1

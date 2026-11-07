@@ -180,10 +180,14 @@ if (state / "slow-delivery").exists():
     from scripts.direct.wait_for_test_state import wait_for_file
     (state / "delivery-started").touch()
     wait_for_file(state / "delivery-release")
-if (state / "stop-before-showrunner-notice").exists() and "showrunner" in args[args.index("--to") + 1]:
-    import signal
-    os.kill(os.getppid(), signal.SIGKILL)
-    raise SystemExit(1)
+if (state / "stop-before-showrunner-notice").exists():
+    sys.path.insert(0, __TEST_REPOSITORY__)
+    from scripts.production import staff
+    recipient = staff.local_snapshot().by_current_session(args[args.index("--to") + 1].removeprefix("session:"))
+    if recipient is not None and recipient.kind == "showrunner":
+        import signal
+        os.kill(os.getppid(), signal.SIGKILL)
+        raise SystemExit(1)
 retry = state / "send-fail-once"
 if retry.exists():
     retry.unlink()

@@ -30,7 +30,19 @@ The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-Standing trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
+Standing trees live below `<root>/<repo>/`.
+`StaffOwner(row_id)` identifies a staff row. `RoleOwner(name)` identifies a fixed role without a staff row.
+The records hold the row id or the role name.
+A new folder uses the current staff name or the role name, followed by `-gate`.
+Another owner's folder takes that name, so the new folder uses the next free numbered suffix.
+The folder keeps its creation name through a staff rename.
+Lookup selects the owner's records before it selects free readable names.
+The caller writes the first record while it holds the claim.
+A gate folder without a record is free when lookup reaches its readable name.
+The caller takes that folder only after it acquires the claim.
+Owner removal does not select an unrecorded folder.
+A rename removes no copy and changes no copy record.
+Lists show the current staff name from the row id.
 `<repo>` is the repository identity from the last part of its origin URL, without `.git`.
 Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
 A cycle of local origins is an error.
@@ -41,13 +53,13 @@ Its nested proof crate does not select a standing copy.
 The root under `~/worktrees` belongs to the existing trusted direnv root.
 
 The CLI reads the calling session's local staff row.
-A worker uses its parent unit's name.
+A worker uses its parent unit's row id.
 A caller without a staff row receives an error.
-Owners for new trees must match `[a-z0-9][a-z0-9_-]*`.
+Text owners enter through one boundary as staff row ids or fixed role names.
 
 ## Fresh copies
 
-`fresh_tree(owner)` creates a scratch task folder with the default task and the word `<owner>-gate`.
+`fresh_tree(owner)` creates a scratch task folder with the default task and the word `<current staff name>-gate` or `<role>-gate`.
 It creates a `checkout` folder inside the task folder and yields a `GateLease`.
 The task folder's busy lock protects the copy throughout preparation and caller use.
 Command children inherit the lease descriptors.
@@ -127,7 +139,7 @@ Each prepared tree has one `.gate.json` record:
 
 ```json
 {
-  "owner": "verify",
+  "owner": "11111111-1111-4111-8111-111111111111",
   "repo": "claude_commands",
   "source": "/home/natepiano/worktrees/claude-build-followups-verify",
   "commit": "1111111111111111111111111111111111111111",
@@ -193,7 +205,9 @@ Repository removal reads this field without using the source checkout.
 Editable copies retain scratch's checks for unsaved work and active tasks.
 Removal continues after a busy tree, a kept copy, or a removal failure.
 Removal keeps a gate while a registered copy still borrows its Git objects.
-It removes each tree that it can remove, including standing trees' `.removing` directories.
+It removes each tree that it can remove.
+Every idle `.removing` tombstone in the repository scope is removable, regardless of its former owner.
+A tombstone has no owner because removal has already condemned it.
 After it releases the locks, it reports each failure on a separate line and exits 2.
 A retry completes interrupted removal. Repeated removal succeeds when the trees are gone.
 

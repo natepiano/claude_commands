@@ -128,11 +128,11 @@ class EndSessionTests(unittest.TestCase):
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             source = self.seed()
-            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
+            with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
                 pass
             with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
                 pass
-            with copies.workspace("end-unit", source, "HEAD", name="worker", branch="worker") as workspace:
+            with copies.workspace(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, "HEAD", name="worker", branch="worker") as workspace:
                 pass
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -145,24 +145,25 @@ class EndSessionTests(unittest.TestCase):
         environment = self.environment()
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
+            owner = str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit"))
             source = ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
                                              "end@example.invalid", {"file": "content"}).checkout
-            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
+            with copies.standing(owner, source, copies.CommittedSource("HEAD")) as tree:
                 self.assertTrue(tree.is_relative_to(Path(environment["SCRATCH_ROOT"])))
-                self.assertEqual(copies.owned_trees("end-unit").standing, ())
+                self.assertEqual(copies.owned_trees(owner).standing, ())
                 self.assertTrue((tree / ".git").is_dir())
             self.assertFalse(tree.exists())
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(self.marker.exists())
-            self.assertEqual(copies.owned_trees("end-unit").standing, ())
+            self.assertEqual(copies.owned_trees(owner).standing, ())
 
     def test_end_keeps_a_busy_tree_and_still_clears_the_marker(self) -> None:
         environment = self.environment()
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             source = self.seed()
-            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
+            with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
                 result = self.run_end(environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("busy", result.stderr)

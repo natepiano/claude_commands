@@ -444,7 +444,7 @@ class CrateRunTests(CargoProjectTests):
             _ = batch.advance("bulk_sample", renamed, commands, available, fixture_execute)
         self.assertEqual([call.args for call in calls.call_args_list], [(self.repo,)])
         gates = list((copies.gates_root() / self.repo.name).iterdir())
-        self.assertEqual({path.name for path in gates}, {batch.owner + "-gate", batch.owner + "-gate-2"})
+        self.assertEqual({path.name for path in gates}, {"sample-style-gate", "sample-style-gate-2"})
         self.assertTrue(any(path in observed for path in gates))
 
     def test_worker_names_separate_run_and_package_at_the_last_dot(self) -> None:

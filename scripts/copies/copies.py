@@ -24,6 +24,7 @@ import time
 from threading import Event, Thread
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
+from uuid import UUID
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -50,6 +51,45 @@ class CopyError(Exception):
     """An invalid request or an unavailable checkout."""
 
     exit_code: int = 2
+
+
+@dataclass(frozen=True)
+class StaffOwner:
+    """A fixed staff row owns the copy."""
+
+    row_id: str
+
+
+@dataclass(frozen=True)
+class RoleOwner:
+    """A fixed role owns the copy without a staff row."""
+
+    name: str
+
+
+CopyOwner = StaffOwner | RoleOwner
+
+
+def copy_owner(text: str) -> CopyOwner:
+    """Read a row identity or a fixed role at the text boundary."""
+    try:
+        identity = str(UUID(text))
+    except ValueError:
+        return RoleOwner(text)
+    return StaffOwner(identity)
+
+
+def owner_name(owner: CopyOwner) -> str:
+    """Read the current name without changing the copy's folder."""
+    if isinstance(owner, RoleOwner):
+        return owner.name
+    from scripts.production import staff
+
+    try:
+        row = staff.local_snapshot().by_id(staff.StaffId(owner.row_id))
+    except staff.StaffUnreadable:
+        row = None
+    return row.name if row is not None else owner.row_id
 
 
 @dataclass(frozen=True)
@@ -275,7 +315,7 @@ def source_owner(source: Path) -> str:
     try:
         member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
         if member is not None:
-            return checked_owner(unit_owner(member.name) if member.kind == "unit" else member.name)
+            return str(member.id)
     except staff.StaffUnreadable:
         pass
     return fallback_owner("verify")
@@ -325,7 +365,7 @@ def caller_owner() -> str:
     row = record.owner_of(staff.caller_identity())
     if row is None:
         raise CopyError("calling session has no staff row or unit owner")
-    return row.name
+    return str(row.id)
 
 
 def origin_url(source: Path) -> str | None:
@@ -372,8 +412,29 @@ def checked_owner(owner: str) -> str:
 
 
 def tree_paths(owner: str, repo: str, pool: CopiesConfiguration) -> tuple[Path, ...]:
+    """Find owned records before choosing unused readable folder names."""
     parent = pool.root / repo
-    return tuple(parent / f"{owner}-gate{suffix}" for suffix in GATE_SUFFIXES)
+    selected: list[Path] = []
+    identity = copy_owner(owner)
+    if parent.exists():
+        for tree in sorted(parent.iterdir()):
+            if tree.is_symlink() or not tree.is_dir() or tree.name.endswith(".removing"):
+                continue
+            try:
+                record = read_record(tree)
+            except CopyError:
+                continue
+            if copy_owner(record.owner) == identity:
+                selected.append(tree)
+    name = owner_name(identity)
+    suffix = 1
+    while len(selected) < len(GATE_SUFFIXES):
+        tail = "" if suffix == 1 else f"-{suffix}"
+        candidate = parent / f"{name}-gate{tail}"
+        if not (candidate / GATE_RECORD).exists() and not removing_path(candidate).exists():
+            selected.append(candidate)
+        suffix += 1
+    return tuple(selected)
 
 
 def read_record(tree: Path) -> GateRecord:
@@ -452,12 +513,18 @@ def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generato
 
     waiter = Thread(target=first_tree_released, daemon=True)
     while True:
+        candidates = tree_paths(owner, repo, pool)
         for tree in candidates:
             if removing_path(tree).exists():
                 continue
             descriptors: list[int] = []
             with claim_tree(tree, create=not tree.exists(), inherited_fds=descriptors) as state:
                 if state is ClaimState.ACQUIRED:
+                    if (tree / GATE_RECORD).exists():
+                        if copy_owner(read_record(tree).owner) != copy_owner(owner):
+                            continue
+                    else:
+                        write_record(tree, owner, repo, Path(), "")
                     yield GateLease(tree, tuple(descriptors))
                     return
         if not announced:
@@ -472,10 +539,15 @@ def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generato
         _ = wake.wait(pool.wait_seconds)
 
 
+def _scratch_gate_word(owner: str) -> str:
+    """Make a readable gate word with scratch's permitted characters."""
+    return re.sub(r"[^A-Za-z0-9_-]", "-", f"{owner_name(copy_owner(owner))}-gate").lstrip("-_")
+
+
 @contextmanager
 def fresh_tree(owner: str) -> Generator[GateLease]:
     """Hold a private scratch checkout and delete its folder after use."""
-    path = scratch.new(word=f"{owner}-gate", throwaway=True)
+    path = scratch.new(word=_scratch_gate_word(owner), throwaway=True)
     try:
         descriptors: list[int] = []
         with claim_tree(path, create=False, inherited_fds=descriptors) as state:
@@ -507,7 +579,7 @@ def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> No
     replace_git = False
     if (tree / GATE_RECORD).exists():
         previous = read_record(tree)
-        if previous.owner != owner or previous.repo != repo:
+        if copy_owner(previous.owner) != copy_owner(owner) or previous.repo != repo:
             raise CopyError(f"{tree}: gate record belongs to another owner or repository")
         replace_git = previous.source != str(source)
     elif any(child.name != scratch.BUSY for child in tree.iterdir()):
@@ -890,7 +962,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         base = source_commit(source, policy)
     except OSError as error:
         raise CopyError(str(error)) from error
-    if (source in ACTIVE_GATES.get() and read_record(source).owner == owner
+    if (source in ACTIVE_GATES.get() and copy_owner(read_record(source).owner) == copy_owner(owner)
             and commit_at(source, "HEAD") == base and isinstance(policy, CommittedSource) and isinstance(merge, NoMerge)):
         yield source
         return
@@ -942,7 +1014,7 @@ def list_trees() -> None:
                 size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True)
                 words = size.stdout.split()
                 disk = words[0] if size.returncode == 0 and words else "unreadable"
-            print(f"{tree}\t{record.owner}\t{record.repo}\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
+            print(f"{tree}\t{owner_name(copy_owner(record.owner))}\t{record.repo}\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
 
 
 def removing_path(tree: Path) -> Path:
@@ -975,7 +1047,7 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
                     and (hold is None or hold["reason"] != LEGACY_WORKER_HOLD_REASON)):
                 continue
             raise CopyError(f"repair record {tree / copy_record.RECORD}: copy is not registered")
-        if record.fields.get("owner_unit") != owner:
+        if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
@@ -1080,11 +1152,23 @@ def owned_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> OwnedTr
     directories = ([pool.root / scope.name] if isinstance(scope, SelectedRepository) else
                    sorted(path for path in pool.root.iterdir() if path.is_dir() and not path.is_symlink())
                    if pool.root.exists() else [])
-    if not OWNER.fullmatch(owner):
-        directories = []
-    standing = tuple(tree for directory in directories
-                     for candidate in tree_paths(owner, directory.name, pool)
-                     for tree in (removing_path(candidate), candidate) if tree.exists())
+    standing_list: list[Path] = []
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for tree in sorted(directory.iterdir()):
+            if tree.is_symlink() or not tree.is_dir():
+                continue
+            if tree.name.endswith(".removing"):
+                standing_list.append(tree)
+                continue
+            try:
+                record = read_record(tree)
+            except CopyError:
+                continue
+            if copy_owner(record.owner) == copy_owner(owner):
+                standing_list.append(tree)
+    standing = tuple(standing_list)
     try:
         workspaces = tuple(owned_workspaces(owner, scope))
     except CopyError as error:
@@ -1141,9 +1225,9 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                     continue
                 if state is not ClaimState.ACQUIRED:
                     raise BusyCopy(tree)
-                if (tree / GATE_RECORD).exists():
+                if not tree.name.endswith(".removing") and (tree / GATE_RECORD).exists():
                     record = read_record(tree)
-                    if record.owner != owner or record.repo != tree.parent.name:
+                    if copy_owner(record.owner) != copy_owner(owner) or record.repo != tree.parent.name:
                         raise CopyError(f"{tree}: gate record belongs to another owner or repository")
                 present.append(tree)
             except (CopyError, OSError, scratch.ScratchError) as error:
@@ -1272,7 +1356,7 @@ def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirr
 
 
 def owned_remote_mirrors(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
-    return [mirror for mirror in remote_mirrors(scope) if mirror.owner == owner] if owner else []
+    return [mirror for mirror in remote_mirrors(scope) if copy_owner(mirror.owner) == copy_owner(owner)] if owner else []
 
 
 class BusyRemoteMirror(CopyError):
@@ -1524,7 +1608,7 @@ def mirror_remove(args: CopyArguments) -> int:
                 raise CopyError(f"{tree}: busy; held by session {args.session}")
             record = tree / floor_claims.MIRROR_RECORD
             raw = floor_claims.read_mirror_record(record if record.exists() else authority)
-            if raw.get("owner") != args.owner or raw.get("repo") != args.repository:
+            if copy_owner(str(raw.get("owner", ""))) != copy_owner(args.owner) or raw.get("repo") != args.repository:
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
             if tree.exists():
                 write_text_atomic(authority, json.dumps(raw) + "\n")

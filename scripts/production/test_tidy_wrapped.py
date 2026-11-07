@@ -93,14 +93,14 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         owner = self.owner("done")
-        _ = fixture_member("unit", name="alpha", parent=owner.id)
-        _ = fixture_member("unit", name="beta", parent=owner.id,
+        alpha = fixture_member("unit", name="alpha", parent=owner.id)
+        beta = fixture_member("unit", name="beta", parent=owner.id,
                            worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
         state = self.state_files("done")
-        with copies.standing("alpha", source, copies.CommittedSource("HEAD")) as unit_tree:
-            with copies.standing("done", source, copies.CommittedSource("HEAD")) as production_tree:
+        with copies.standing(str(alpha.id), source, copies.CommittedSource("HEAD")) as unit_tree:
+            with copies.standing(str(owner.id), source, copies.CommittedSource("HEAD")) as production_tree:
                 pass
-            with copies.standing("beta", source, copies.CommittedSource("HEAD")) as retired_tree:
+            with copies.standing(str(beta.id), source, copies.CommittedSource("HEAD")) as retired_tree:
                 pass
             with copies.standing("live", source, copies.CommittedSource("HEAD")) as unrelated:
                 pass
@@ -120,7 +120,7 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        with copies.workspace("done", source, "HEAD", name="damaged", branch="worker") as tree:
+        with copies.workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
             pass
         record = tree / copy_record.RECORD
         original = record.read_text()
@@ -340,7 +340,7 @@ class TidyWrappedTests(unittest.TestCase):
     def test_wrap_removes_only_the_owners_remote_mirrors(self) -> None:
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
-        mine = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        mine = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
         other = copies.RemoteMirror("live", copies.SelectedRepository("hana"), "mac", "mirror/live", "live-session")
         with fake_remote_removal((mine, other)) as remove:
             _ = tidy_wrapped.tidy("done", doc)
@@ -351,7 +351,7 @@ class TidyWrappedTests(unittest.TestCase):
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
+        mirror = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
         copies.register_remote(mirror)
         with copies.remote_lease(mirror):
             with self.assertRaisesRegex(tidy_wrapped.TidyRefused, "mirror/done.*done-session"):
@@ -362,7 +362,7 @@ class TidyWrappedTests(unittest.TestCase):
     def test_wrap_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
         from scripts.production import tidy_wrapped
         doc = self.doc("done", "wrapped")
-        mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac",
+        mirror = copies.RemoteMirror(str(self.owner("done").id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/done"), "done-session")
         with local_remote_transport(self.root):
             self.assertEqual(publish_mirror(mirror), 0)

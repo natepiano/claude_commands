@@ -24,6 +24,8 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
 
 @final
@@ -44,6 +46,18 @@ class RemoteCopiesTests(unittest.TestCase):
 
     def remote(self, owner: str = "alpha", path: str = "mirror/repository") -> copies.RemoteMirror:
         return copies.RemoteMirror(owner, copies.SelectedRepository(self.source.name), "host", path, "holder-session")
+
+    def test_a_remote_mirror_keeps_its_staff_owner_after_a_rename(self) -> None:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        parent = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="alpha", parent=parent.id)
+        mirror = self.remote(str(unit.id))
+        with fake_remote_removal((mirror,)) as remove:
+            _ = staff.rename(unit.id, "renamed")
+            self.assertEqual(copies.owned_remote_mirrors(str(unit.id)), [mirror])
+            copies.remove_trees(str(unit.id))
+        remove.assert_called_once_with(mirror)
+        self.assertEqual(copies.owned_remote_mirrors(str(unit.id)), [])
 
     def test_staged_source_keeps_only_index_content_without_source_changes(self) -> None:
         original = self.source / "source.txt"

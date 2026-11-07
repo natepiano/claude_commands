@@ -63,13 +63,12 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
                     paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
-    owners = {production_name}
+    owners = {str(row.id)}
     if document is not None:
         record = identities.record
         try:
             for row in unit_lookup.doc_units(document, record):
-                owners.add(row.name)
-                owners.add(copies.unit_owner(row.name))
+                owners.add(str(row.id))
         except staff.StaffUnreadable:
             pass  # a production with no showrunner row has no units
     try:
