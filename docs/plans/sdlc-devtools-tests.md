@@ -1450,3 +1450,35 @@ Every entry script under `scripts/` runs under bare `python3 <path>` from any wo
 **Gotchas:** `xwininfo` prints a title with no escapes, so `TREE_WINDOW` reads to the last `": (` on the line. natedev has `xwininfo` only in the nix store, not on PATH.
 
 **Ruled out:** unescaping tree titles — `xwininfo` does not escape them.
+
+### Phase 8p — An edited change row still covers its change  · status: done
+
+Source: sdlc [75c820be] 2026-11-07; design accepted [a461de8b]. hana edited the Change text of a row. The next `list-ready` scan found no row with the old text and added the change again as C289. hana removed C289 by hand. Run after the 3z top hash, with its own hash.
+
+**Depends on:** 3z
+
+#### Work Order
+
+**Goal:** a row whose Change text was edited still covers its own change, and no other change.
+
+**Spec:**
+1. A row with the same Change text covers a change under the current `_covered` rule. This match runs first.
+2. Coverage is decided per review list and per merge, over every change of that merge routed to that list, also in a `live --step` run that adds only one step's changes.
+3. Each row that no text match used, and whose Merged hash is that merge's hash, covers one change of that merge that no text match covered. Pair `ReadyNow` changes first, in commit order. Then pair `AfterStep` changes, in commit order, only when every `AfterStep` change still uncovered in that merge waits on the same step. With two or more steps uncovered, an `AfterStep` change is covered only by its text: the row cannot tell which step it came from, and a duplicate row is safer than a hidden change.
+4. A row's Merged hash never covers a change only because the merge holds the checkpoint. A merge with two changes and one row keeps the second change uncovered. An `AfterStep` change with no row stays uncovered.
+5. Add no new check, refusal or column.
+
+**Files:**
+- `scripts/production/change_review.py` — `_covered`, its call in `append_rows`, and what `list_ready` passes for a merge.
+- `scripts/production/test_change_review.py` — tests.
+
+**Workers:** `1 writer + 1 tester`. `impl` owns `change_review.py`; `test` owns `test_change_review.py`.
+
+**Acceptance gate:**
+1. A test edits the Change text of a row that `list-ready` wrote, runs `list-ready` again on the same merge, and finds no new row.
+2. A test with a two-change merge, two rows and one row text edited runs `list-ready` again and finds no new row.
+3. A test with a two-change merge whose first change already has a row adds a row for the second change.
+4. A test with a merge of one ready change (row text edited) and one `after <step>` change runs `live --step` and adds one row for the step change.
+5. A test with a merge of two `after <step>` changes on two steps releases the second step first, edits its row, then releases the first step, and finds a row for the first step's change.
+6. The existing change review tests pass with no assertion changed.
+7. basedpyright `0 errors, 0 warnings, 0 notes` on both files; the full gate passes.
