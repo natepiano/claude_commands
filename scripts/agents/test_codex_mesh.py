@@ -5225,7 +5225,23 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             "cwd": str(self.session_dir),
             "input": [{"type": "text", "text": "Original worker task"}],
             "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY, "serviceTier": "default",
+            "approvalPolicy": "never",
         })
+
+    def test_fresh_and_resumed_implementation_turns_disable_approval_prompts(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        fresh = self.methods("turn/start")
+        self.assertEqual(len(fresh), 1)
+        self.assertEqual(_as_test_dict(fresh[0]["params"])["approvalPolicy"], "never")
+
+        self.server.requests.clear()
+        code, errors = self.run_follow(role="impl")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertTrue(self.methods("thread/resume"))
+        resumed = self.methods("turn/start")
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(_as_test_dict(resumed[0]["params"])["approvalPolicy"], "never")
 
     def test_follow_cwd_is_parsed_into_the_turn_cwd_destination(self) -> None:
         parsed: list[argparse.Namespace] = []
@@ -5408,6 +5424,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             ],
             "model": "gpt-test", "effort": "high", "cwd": str(worktree),
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+            "approvalPolicy": "never",
             "serviceTier": "default",
         })
 
@@ -5437,6 +5454,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
+                    "approvalPolicy": "never",
                     "serviceTier": "default",
                     "model": "gpt-test", "effort": "high",
                     **overrides,

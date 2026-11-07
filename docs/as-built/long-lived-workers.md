@@ -160,6 +160,9 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 
 **Protocol.** Initialize with `capabilities.experimentalApi=true` for queue calls. Pass a `SandboxMode` string in `thread/start.sandbox`. Worker threads remain non-ephemeral because ephemeral threads reject queued submissions.
 
+Every `turn/start` request sets `approvalPolicy` to `never` and names its `sandboxPolicy`.
+The server keeps the thread's last turn policy, so resumed workers also need both fields.
+
 **Launch retry.** A nonresident launch can retry once after a fast failure from an inherited server. Eligible outcomes are `FailedBeforeThread` and `FailedWithThread` containing `STALE_SIGN_IN`. The failure must occur within 120 seconds.
 
 **Settlement.** A launcher remains attached while queued work, pending messages, or buffered notices remain. A missing completion notice requires idle-thread evidence before settlement. Settlement without an answer reports failure.

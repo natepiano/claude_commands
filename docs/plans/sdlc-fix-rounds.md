@@ -323,6 +323,8 @@ From the sdlc showrunner, 2026-11-06: "unit-board's review trial recorder printe
 
 `review-trial` reads the selected instance's ledger file through `findings.read_phase_ledger`. The UX and code counts and the UX repair rounds come from that ledger, so a routed or closed finding counts, and a closure reply adds none.
 
-### Phase 9z — The launcher sees the end of a worker that read a passed run  · status: todo
+### Phase 9z — The launcher sees the end of a worker that read a passed run  · status: in progress
 
 From the sdlc showrunner, 2026-11-06. Codex worker merge16 (verify-unit) stopped with no event after it read a passed run, twice (14:59 and 16:35 EST). Its launcher stayed attached for 62 and 19 minutes. An interrupt ended the wait in seconds. Find why the launcher does not see the worker's end, and fix the cause where it lives. Add no new check.
+
+Cause: the worker's turn never ended. Each stall began at an `rm -f` of a run log, which Codex holds for approval under `on-request`. merge16's turns all ran `on-request`: `_start_turn` named `sandboxPolicy` on each turn but no `approvalPolicy`, and the server keeps a thread's last turn policy. The launcher does not answer server requests, so the approval waited until an interrupt. `_start_turn` now names `approvalPolicy: never` on every turn. sdlc kept the fix to `_start_turn`.

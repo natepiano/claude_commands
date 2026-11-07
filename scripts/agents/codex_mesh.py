@@ -6094,8 +6094,9 @@ def _start_turn(
     cwd = _as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd"))
     if cwd:
         params["cwd"] = cwd
-    # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
-    # turn that leaves it out would inherit a previous `--read-only` turn's sandbox.
+    # The server keeps a thread's last turn policy. Each turn names both policies
+    # to prevent inherited approval prompts or a previous read-only sandbox.
+    params["approvalPolicy"] = "never"
     params["sandboxPolicy"] = _turn_sandbox_policy(
         READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
     # Resolve at every submission, including continuations and capacity retries.
