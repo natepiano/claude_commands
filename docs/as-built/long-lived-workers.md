@@ -141,6 +141,7 @@ The refusal says `Claude prompt delivery is unknown: transcript has a torn JSON 
 
 `worker_fill.py end-friend` stops a friend in process.
 For Codex, a failed `command_end` still reaches the server stop.
+A failed staff retirement also reaches the server stop before the command returns 1.
 A failed server stop keeps the retry eligible to stop that server again.
 The command writes `ended` only after a confirmed stop or confirmed absence.
 Claude friends use the same completion rule through their stop result.
@@ -194,9 +195,9 @@ The verbs:
 
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, and `previous_status`. It records the task role and lens in `agents.jsonl`. |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores the previous status and records the restored task role in `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
-| `end` | `--session-dir --to` | Clears the worker's pending queue, writes its end marker and sets the worker's roster `status` to `"ended"`. |
+| `end` | `--session-dir --to` | Clears the pending queue, writes the end marker and sets roster `status` to `"ended"`. Keeps the staff row and thread id. A second `end` retries cleanup. Permanent removal retires the staff row. |
 | `stop` | `--session-dir [--pause]` | Sets every roster worker to `"ended"` and stops the current server and every retired one. With `--pause` (a shutdown stop, `docs/as-built/shutdown-and-restart.md`) it instead sets every non-ended worker to the followable `"paused"`, with `paused_from` and `paused_turn`, after dropping its queued messages and interrupting a live turn. |
-| `reopen` | `--session-dir --to` | Returns an `ended` worker, or an abandoned `running`/`starting` worker, to `"paused"` on its recorded thread. With a live recorded server it requires a positive idle read and no live launcher, clears the stale turn id, and stores `not_measured_since_compaction`. Its one-line result names that same thread; no replacement thread is opened. A live turn, unreadable thread, missing thread id or live launcher refuses recovery with exit 2. |
+| `reopen` | `--session-dir --to` | Returns an `ended`, `running`, `starting` or `waiting_capacity` worker to `"paused"` on its recorded thread when its launcher is dead. Requires positive idle evidence when recovering a live status or recorded server. Clears the stale turn id and stores `not_measured_since_compaction`. Prints the same thread id. A live turn, unreadable thread, missing thread id or live launcher refuses recovery with exit 2. `assign.sh --to` calls it before dispatch. |
 | `sweep` | `[--root] [--stop]` | Gives a verdict on every app-server listening on `ws://` (see Cleanup). |
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
@@ -341,7 +342,7 @@ Restore retains launcher recovery and shares dispatch reads across pane workers.
   - Current run servers and held design servers share the 30-minute quiet window (`SERVER_IDLE_SECS`): a live worker launcher, a server under 30 minutes old, a mesh folder changed in the last 30 minutes, or a conversation mid-turn means in use.
 
   It reads `thread/queue/list` for loaded threads; queued submissions or unreadable queue state keep the server. It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Ordinary idle-stop and retired-server reclamation can free an unused server while the director lives; the next dispatch resumes the same worker name and thread. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
-- **Sign-in change.** `signin-changed` retires servers that hold the old sign-in. Running workers are interrupted and resumed on a new server. Idle workers move at their next turn.
+- **Sign-in change.** `signin-changed` retires servers that hold the old sign-in. Running workers are interrupted and resumed on a new server. The move selects a recorded server whose loaded threads include the worker's thread. Unreadable server evidence refuses the move. Proven absence permits a marker with the roster's last `turn_id`, without queue transfer or interruption. `assign.sh --operation resume-account-move` resumes that thread on a new server, even when its launcher died. Idle workers move at their next turn.
 
 `scripts/direct/workers.py` stores each unit ledger at `~/.local/state/unit-workers/<staff id>.json`.
 `UNIT_WORKERS_STATE` selects a private root.
@@ -612,15 +613,16 @@ connection, initialization, queue draining, readback and interruption. A
 released lifecycle lock is not proof that the turn stopped: follow still
 requires positive idle evidence.
 
-An abandoned running worker recovers through `follow` or `reopen`. The current
-server may not know a thread on a retired server: recovery checks the old
-writer, resumes the exact thread on the current server and proves idle before
-publishing recovery or submitting work. Live or unknown state preserves pending
-work and names the cause. Reopen probes without a roster flock, then rechecks
-revision and launcher under the roster flock. Compact does not recover a dead
-launcher; its refusal directs the caller to follow or reopen.
-When no server is live, follow refuses before claiming an abandoned worker;
-reopen can restart the server and recover only after proving that same thread idle.
+`assign.sh --to` calls `reopen` for an ended worker or a live status with a dead launcher.
+Recovery checks the old server, resumes the recorded thread and proves it idle before dispatch.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+Live or unknown state preserves pending work and names the cause.
+Reopen probes without a roster flock, then rechecks the revision and launcher under that flock.
+Compact does not recover a dead launcher; its refusal directs the caller to follow or reopen.
+Without a live server, reopen starts a server and proves the recorded thread idle.
+`end` keeps the staff row and thread id for recovery. Permanent removal retires the row.
+`assign.py` ends an Astra reviewer, releases its role, and retires its staff row after the review.
+The unit ledger keeps ended workers so unit retirement can find and retire their rows.
 
 
 ## Whole worker-state publication

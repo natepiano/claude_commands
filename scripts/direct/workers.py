@@ -386,7 +386,7 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object], members
 
 @contextmanager
 def ending_worker(run: Path, name: str) -> Generator[Callable[[], None], None, None]:
-    """Keep the ledger lock before membership during a permanent end."""
+    """Record the end under the ledger lock and retain the worker for permanent removal."""
     raw = worker_lifecycle.read_json_object(run / ROSTER)
     entry = _object(raw.get(name))
     location = _text(entry.get("unit_ledger"))
@@ -407,7 +407,6 @@ def ending_worker(run: Path, name: str) -> Generator[Callable[[], None], None, N
         def remember_end() -> None:
             identity = worker.staff_id
             store.record_end(ledger, identity, worker, run)
-            del ledger.workers[name]
             store.save(ledger)
         yield remember_end
 

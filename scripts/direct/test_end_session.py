@@ -87,7 +87,8 @@ class EndSessionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
+        environment = {name: value for name, value in os.environ.items()
+                       if name != "CODEX_THREAD_ID" and not name.startswith("PLAN_DELEGATE_")}
         environment.update({
             "HOME": str(self.root),
             "PYTHONPATH": str(END_SESSION.resolve().parents[2]),
@@ -234,7 +235,7 @@ class EndSessionTests(unittest.TestCase):
         environment.update({"UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
             "SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
-        with patch.dict(os.environ, environment):
+        with patch.dict(os.environ, environment, clear=True):
             store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
             with store.locked() as ledger:
                 ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},

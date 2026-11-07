@@ -320,6 +320,21 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(saved["assignment_id"], "accepted")
         self.assertEqual(saved["thread_id"], mesh_fixture.THREAD_ID)
 
+    def test_unit_retirement_removes_a_worker_staff_row_after_its_run_ends(self) -> None:
+        store = self.lifecycle_worker()
+        member = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert member is not None
+        owner = staff.local_snapshot().parent_of(member)
+        assert owner is not None
+        code, output, errors = self.run_mesh(["end", "--to", "w7"])
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(staff.local_snapshot().by_id(member.id), member)
+        with bounded_worker_change(), redirect_stdout(io.StringIO()):
+            workers.end_unit(owner)
+        self.assertIsNone(staff.local_snapshot().by_id(member.id))
+        with store.locked(write=False) as ledger:
+            self.assertNotIn("w7", ledger.workers)
+
     def test_end_unit_rerun_after_end_marker_retries_transport_cleanup(self) -> None:
         store = self.lifecycle_worker()
         member = staff.by_current_session(mesh_fixture.THREAD_ID)
