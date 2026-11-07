@@ -1,7 +1,0 @@
-[package]
-name = "aws-routing-proof"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[workspace]

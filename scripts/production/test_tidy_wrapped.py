@@ -1,6 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import json
 import io
@@ -65,7 +67,7 @@ class TidyWrappedTests(unittest.TestCase):
         if rows:
             return rows[0]
         return fixture_member("showrunner", name=production_name, runtime_id=fixture_runtime_id("tidy:" + production_name),
-                              doc=staff.WrappedDoc("natedev", document))
+                              doc=staff.WrappedDoc(remote.local_machine(), document))
 
     def state_files(self, production_name: str) -> tuple[Path, ...]:
         owner = self.owner(production_name)
@@ -93,7 +95,7 @@ class TidyWrappedTests(unittest.TestCase):
         owner = self.owner("done")
         _ = fixture_member("unit", name="alpha", parent=owner.id)
         _ = fixture_member("unit", name="beta", parent=owner.id,
-                           worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
+                           worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "beta"))
         state = self.state_files("done")
         with copies.standing("alpha", source, copies.CommittedSource("HEAD")) as unit_tree:
             with copies.standing("done", source, copies.CommittedSource("HEAD")) as production_tree:
@@ -154,7 +156,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
         doc = self.doc("Done_Name", "wrapped")
-        owner = fixture_member("showrunner", name="Done_Name", doc=staff.WrappedDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="Done_Name", doc=staff.WrappedDoc(remote.local_machine(), doc))
         _ = fixture_member("unit", name="Alpha_unit", parent=owner.id)
         state = self.state_files("Done_Name")
         result = self.run_tidy(doc)
@@ -249,8 +251,8 @@ class TidyWrappedTests(unittest.TestCase):
         caller = self.root / "caller"
         git("worktree", "add", "-b", "other-owner", str(other))
         git("worktree", "add", "-b", "caller", str(caller))
-        first = fixture_member("showrunner", name="first-owner", doc=staff.WrappedDoc("natedev", document))
-        second = fixture_member("showrunner", name="second-owner", doc=staff.WrappedDoc("natedev", other / relative))
+        first = fixture_member("showrunner", name="first-owner", doc=staff.WrappedDoc(remote.local_machine(), document))
+        second = fixture_member("showrunner", name="second-owner", doc=staff.WrappedDoc(remote.local_machine(), other / relative))
         fields = {"since": "2000-01-01T08:00", "text": "Choose the layout",
                   "question": "Keep this layout?", "asked_by": str(first.id)}
         question = self.write(folder / "question-layout.md",

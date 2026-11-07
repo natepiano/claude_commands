@@ -471,6 +471,11 @@ assert not loaded, loaded
         _ = config_environment(config.parent)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
+    def test_repository_key_keeps_the_fixed_path_name(self) -> None:
+        self.assertEqual(folders.repository_key(Path("/fixture/hana")), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana", "/fixture/hana"), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana space%", "/fixture/hana"), "hana space%-e4417bba")
+
     def test_equal_repository_basenames_have_distinct_keys(self) -> None:
         first = self.root / "first" / "hana"
         second = self.root / "second" / "hana"

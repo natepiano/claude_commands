@@ -1,12 +1,10 @@
 """Resolve production store owners through the shared staff join."""
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources
-import unit_lookup
+from scripts.production import unit_lookup
 
 
 def document_id(document: Path, *, record: staff.StaffSnapshot | None = None) -> staff.StaffId:

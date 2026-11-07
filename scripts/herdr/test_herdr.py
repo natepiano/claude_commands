@@ -133,6 +133,13 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
+        })))
+
     def test_pane_agent_process_reads_only_the_foreground_agent_without_native_identity(self) -> None:
         from scripts.herdr.test_worker_panes import PaneWorld
 
@@ -1867,6 +1874,13 @@ class LaunchDestinationTests(StaffTestCase):
 
 @final
 class ConfirmedPaneCloseTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
+        })))
+
 
     def test_finish_restore_keeps_each_record_when_its_close_is_unconfirmed(self) -> None:
         for verified in (False, True):
@@ -2023,6 +2037,13 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
 
 @final
 class PaneSelectionTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
+        })))
+
     def test_stale_or_duplicate_labels_never_select_a_pane(self) -> None:
         row = unit_membership("production", "worker")
         client = herdr.Herdr("fixture")
@@ -5427,7 +5448,8 @@ class LayoutHerdr(herdr.Herdr):
     """An in-memory herdr session: workspaces and tabs in order, one pane per tab."""
 
     def __init__(self, session: str = "fixture") -> None:
-        super().__init__(session)
+        with patch.dict(os.environ, {"HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py"))}):
+            super().__init__(session)
         self.spaces: list[tuple[str, str]] = []
         self.tabs: list[dict[str, str]] = []
         self.count: int = 0

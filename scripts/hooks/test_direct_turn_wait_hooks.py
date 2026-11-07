@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -89,7 +91,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         staff_environment: dict[str, str] = {}
         resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
         _ = fixture_member("showrunner", name="expected-showrunner",
-                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc("natedev", document))
+                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc(remote.local_machine(), document))
         _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         sessions = root / "sessions"
         sessions.mkdir()

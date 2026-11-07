@@ -168,7 +168,7 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(grouped.status_units("show"), {row.name: replace(observed[1], unit=row.name)})
 
     def test_unreadable_session_record_keeps_placement_and_reports_one_failure(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
         from scripts.message import sessions
 
         row = unit_membership("show", "unit")
@@ -177,7 +177,7 @@ class StatusDiscoveryTests(StaffTestCase):
         errors = StringIO()
         with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
               mock.patch.object(herdr, "herdr_processes", return_value=processes),
-              mock.patch("unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
+              mock.patch("scripts.production.unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
               redirect_stderr(errors), labels.anomalies() as lines):
             observed = unit_lookup.observed_session_labels(record=staff.snapshot())
             grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(), sources=labels.MemberSources(()))
