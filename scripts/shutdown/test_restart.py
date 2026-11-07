@@ -125,6 +125,7 @@ class ClaudeLaunchTrustTests(RestartTestCase):
             return herdr.PromptSubmissionNotRequired()
 
         with (patch.object(herdr, "open_tab", return_value="w1:p1"),
+              patch.object(herdr.Herdr, "run_in_pane"),
               patch.object(herdr, "start_agent", side_effect=start) as started):
             result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
