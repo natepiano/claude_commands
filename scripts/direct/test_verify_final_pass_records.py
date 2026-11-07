@@ -17,7 +17,7 @@ class FinalPassTests(FinalPassFixture):
         _ = old.write_text("{}")
         expired = time.time() - 15 * 24 * 60 * 60
         os.utime(old, (expired, expired))
-        result = self.verify("final-pass")
+        result = self.verify("final", "--saved")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("no final pass record", result.stderr)
         self.assertTrue(old.exists())

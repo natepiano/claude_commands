@@ -70,7 +70,15 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 
 Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy. Workspace rustdoc runs separately through `verify.sh doc` at the checkpoint.
 
-- Clippy: `invoke_clippy --workspace --all-targets --all-features --keep-going` (`-- -D warnings` from `invoke.sh`). The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`. The lint call sites add `--keep-going`; `invoke.sh` does not add it. Lint takes no trailing `--features`; `verify.sh doc --features <list>` selects workspace doc features. CI's Windows-target clippy pass has no local counterpart. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their own scope.
+- Clippy uses `invoke_clippy --workspace --all-targets --all-features --keep-going`.
+  `invoke.sh` adds `-- -D warnings`.
+  The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`.
+  The lint callers add `--keep-going`; `invoke.sh` does not add it.
+  Lint takes no trailing `--features`.
+  `verify.sh doc [<package>] --features <list>` checks the staged workspace.
+  A named package owns feature names without a slash.
+  CI's Windows-target Clippy pass has no local counterpart.
+  The other commands keep their own scope.
 - Clippy judges first. A passing judgment needs no fixes. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial failures return directly. Repairs run `cargo clippy --fix`, then fmt, with the judgment scope and lint levels. Repairs stop when the tree remains unchanged or reaches `clippy_fix_pass_limit` from lint.conf. The default limit is 3. Clippy judges again after repairs. The final judgment sets the lint status. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix).
 - Taplo: `run taplo fmt --check` from `workspace_root` (from `cargo metadata`), so taplo loads the workspace `taplo.toml` whatever directory lint starts in. `config/lint.conf` does not gate it; it gates only the cargo stages. An unformatted `.toml` fails lint, names the file, and is cached like any lint failure.
 - `require_taplo` exits 2 with `taplo is required` before any stage when taplo is not on `PATH`. A taplo panic (exit 101) exits 3 on macOS, with a message to re-run unsandboxed, and 2 elsewhere.

@@ -89,6 +89,15 @@ class VerifyMetadataTests(unittest.TestCase):
                     name = request.split(":", 1)[0].upper().replace("-", "_")
                     self.assertEqual(self.values(result.stdout), {name: case["stdout"].rstrip("\n")})
 
+    def test_workspace_requests_select_members_and_the_example_owner(self) -> None:
+        result = self.run_helper("workspace.json", ["test-targets::", "build-targets:::", "example-features::gated"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = self.values(result.stdout)
+        self.assertEqual(values["TEST_TARGETS"].splitlines(), ["--lib", "--bins", "--tests"])
+        self.assertEqual([line for line in values["BUILD_TARGETS"].splitlines() if line.startswith("binary ")],
+                         ["binary alpha-cli", "binary beta-cli", "binary solo-cli"])
+        self.assertEqual(values["EXAMPLE_FEATURES"], "alpha/graphics,dep/window")
+
     def test_one_process_answers_multiple_requests_from_one_metadata_document(self) -> None:
         for fixture in ("workspace.json", "no_tests.json", "gated_examples.json"):
             selected: dict[str, GoldenMetadataCase] = {}

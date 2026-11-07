@@ -2175,7 +2175,7 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     if key not in config.values:
         return IneligibleMacStep("repo")
     excluded = comma_values(config.values[key])
-    if verb == "nextest":
+    if verb == "nextest" and package:
         if package in excluded:
             return IneligibleMacStep("linux_only")
     else:

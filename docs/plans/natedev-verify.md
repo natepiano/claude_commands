@@ -1196,7 +1196,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Gotchas:**
 - The loop ran at the top level, so `exit` and `set --` acted on the script. The caller restores the positional arguments from `ARGS`.
 
-### Phase 41g — One form for every verify command  · status: todo
+### Phase 41g — One form for every verify command  · status: done
 
 **Depends on:** Phase 41d.
 
@@ -1355,7 +1355,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
    | `build` | `build` (new) | `build` |
    | `final` | `check`, `nextest` | `check`, `test` |
 
-   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. `config/aws_target.conf` adds `lint`, `example` and `build` to `kinds`, and `config/README.md` states the new list. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
+   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. **Held edit:** do not change the `kinds` line of `config/aws_target.conf` or its text in `config/README.md` in this edit round. The change would add `lint`, `example` and `build`. builds asked the user on 2026-11-06: approve, pinned only, or no. The director applies the answer as a separate edit. Until then a Linux target with today's `kinds` answers "target does not permit this command" for those steps, and no test reads the live `kinds` line. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
 5. `build` on another target prints `binary: <target>:<path>`.
 6. A pinned `final` runs both steps on the target, keeps the clean tree check, and saves no pass: a saved pass answers only for this machine. An unpinned `final` keeps `final_pass.py` unchanged, with its clean tree and compiler identity. Name this rule in the as-built.
 7. Update `verify help <command>`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md`.

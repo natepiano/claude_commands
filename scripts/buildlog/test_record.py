@@ -1345,7 +1345,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         final = self.record("call", "interrupted", "", "0", "0", "12", "", "0", "12", "final")
         self.assertEqual(final.returncode, 0, final.stderr)
         record = self.records()[-1]
-        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", None, None, None))
+        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
 

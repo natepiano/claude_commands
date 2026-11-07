@@ -4,7 +4,22 @@
 
 `verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold, check and doc keep their local path. A lint can leave its first mend memory wait for a free Mac. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path, platform) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
+During a natedev build hold, `verify.sh check`, `doc`, and the read-only lint judgment can use the Mac.
+Outside a hold, check and doc keep their local path.
+A lint can leave its first mend memory wait for a free Mac.
+`build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
+Its first line is `mac_allowed` or `natedev_only <reason>`.
+Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
+A named test package uses its package rule.
+A workspace test refuses Mac offload when any member is `linux_only`.
+Check, lint, and doc require every workspace member to permit macOS.
+This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
+An unreadable member keeps the step on natedev.
+Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
+Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`.
+Calls without `--kind` keep the test-target table.
+The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the call's route state.
+The call guard, hold enforcer, and idle watch read that record.
 
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
 
@@ -212,7 +227,7 @@ An interruption marker reports the instance generation.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 
-`test <package> --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
+`test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.

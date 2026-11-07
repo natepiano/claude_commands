@@ -13,7 +13,7 @@ class FinalPassTests(FinalPassFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         compiler = Path(self.environment["HOME"]) / "stubs/rustc"
         _ = compiler.write_text('#!/bin/sh\nprintf "different compiler\\n"\n')
-        answer = self.verify("final-pass")
+        answer = self.verify("final", "--saved")
         self.assertEqual(answer.returncode, 1, answer.stdout + answer.stderr)
         self.assertIn("rustc differs", answer.stderr)
 

@@ -96,8 +96,10 @@ else:
         repository_key as repository_key,
     )
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct.step_record import NamedPackage, WorkspacePackages
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
@@ -1124,12 +1126,14 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
 def call(args: list[str]) -> None:
     outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
     words = args[9:]
+    package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
+    selection = NamedPackage(package_name) if package_name else WorkspacePackages()
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
         "command": " ".join([verb, *words]),
         "verb": verb,
-        "package": words[0] if words and verb != "final" else None,
+        "package": selection.name if isinstance(selection, NamedPackage) else "workspace",
         "outcome": outcome,
         "status": optional_int(status),
         "cached": cached == "1",

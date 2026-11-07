@@ -22,7 +22,7 @@ class FinalPassTests(FinalPassFixture):
         _ = shutil.copyfile(VERIFY.parent / "final_pass.py", folder / "final_pass.py")
         changed = folder / "verify.sh"
         _ = changed.write_text(VERIFY.read_text() + "\n# Test script change.\n")
-        answer = subprocess.run(["bash", str(changed), "final-pass"], cwd=self.root,
+        answer = subprocess.run(["bash", str(changed), "final", "--saved"], cwd=self.root,
                                 env=self.environment, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(answer.returncode, 1, answer.stdout + answer.stderr)
         self.assertIn("verify.sh differs", answer.stderr)
@@ -48,7 +48,7 @@ class FinalPassTests(FinalPassFixture):
         self.assertEqual(names.count("final_pass.py"), 2, rows)
         self.assertEqual(names.count("verify_metadata.py"), 1, rows)
 
-        query = self.verify("final-pass")
+        query = self.verify("final", "--saved")
         self.assertEqual(query.returncode, 0, query.stdout + query.stderr)
         appended = trace.read_text().splitlines()
         self.assertEqual(appended[:len(rows)], rows)
@@ -59,7 +59,7 @@ class FinalPassTests(FinalPassFixture):
 
         trace.unlink()
         del self.environment["VERIFY_PY_TRACE"]
-        untraced = self.verify("final-pass")
+        untraced = self.verify("final", "--saved")
         self.assertEqual(untraced.returncode, 0, untraced.stdout + untraced.stderr)
         self.assertEqual(untraced.stdout, query.stdout)
         self.assertEqual(untraced.stderr, query.stderr)
@@ -75,7 +75,7 @@ class FinalPassTests(FinalPassFixture):
             "import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n")
         trace = self.root.parent / "terminated.tsv"
         environment = {**self.environment, "VERIFY_PY_TRACE": str(trace)}
-        result = subprocess.run(["bash", str(changed), "final-pass"], cwd=self.root,
+        result = subprocess.run(["bash", str(changed), "final", "--saved"], cwd=self.root,
                                 env=environment, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
         self.assertTrue(trace.exists(), "SIGTERM lost the helper trace")

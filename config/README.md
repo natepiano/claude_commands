@@ -113,6 +113,11 @@ next run, so a change is immediate:
 - `scripts/lint/invoke.sh` — the lint CLI and
   `scripts/direct/verify.sh`'s `lint` and `fmt` arms
 
+Use `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]`.
+Without a package, lint covers the workspace. `--check` prevents repairs with
+or without a package. See `<VerificationContract/>` in `commands/unit/direct.md`
+for all command forms.
+
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
 `validate_ci.sh`. Those are correctness gates rather than lints, and a release

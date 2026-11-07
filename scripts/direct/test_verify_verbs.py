@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import shutil
 import subprocess
+from typing import cast
 import unittest
 
+from scripts.direct.verify_final_pass_test_support import FinalPassFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY
 
@@ -27,9 +31,10 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         commands, flags = missing.stderr.split("Commands:\n", 1)[1].split("\nFlags:\n", 1)
         self.assertEqual([line.split()[0] for line in commands.splitlines()], [
             "check", "test", "lint", "doc", "example", "build", "final",
-            "final-pass", "help",
+            "help",
         ])
         self.assertEqual([line.split()[0] for line in flags.splitlines()], [
+            "--test", "--name", "--check", "--saved", "--tree",
             "--filter", "--features", "--no-cache", "--target", "--mac",
             "--local", "--session-dir",
         ])
@@ -37,7 +42,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
     def test_each_command_has_separate_help(self) -> None:
         for command in (
             "check", "test", "lint", "doc", "example", "build", "final",
-            "final-pass", "help", "example-test",
+            "help", "example-test",
         ):
             with self.subTest(command=command):
                 result = self.invoke_verify("help", command, cwd=self.root)
@@ -48,6 +53,20 @@ class VerifyVerbTests(VerifyLintCacheFixture):
                 self.assertGreater(len(result.stdout.splitlines()), 3)
                 for line in result.stdout.splitlines():
                     self.assertLess(len(line), 80, line)
+
+    def test_removed_forms_name_the_new_form(self) -> None:
+        for arguments, form in (
+            (("final-pass",), "verify final [<package>] [--saved] [--tree <tree>]"),
+            (("lint", "--workspace"), "verify lint [<package>] [--check]"),
+            (("example", "sample", "demo"), "verify example [<package>] [--name <name>]"),
+            (("test", "sample", "smoke"), "verify test [<package>] [--test <name>]"),
+            (("final", "--tree", "HEAD"), "verify final [<package>] [--saved] [--tree <tree>]"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.invoke_verify(*arguments, cwd=self.root)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(form, result.stderr)
+                self.assertEqual(self.cargo_calls(), [])
 
     def test_missing_or_unknown_help_command_keeps_the_usage_error(self) -> None:
         usage = self.invoke_verify(cwd=self.root).stderr
@@ -127,6 +146,44 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         self.assertFalse(target_query.exists())
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assertEqual(self.cargo_calls(), [])
+
+
+class VerifyWorkspaceFormTests(FinalPassFixture):
+    def recorded_calls(self) -> list[dict[str, object]]:
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in Path(self.environment["BUILDLOG_DIR"]).rglob("*.jsonl")
+                for line in path.read_text().splitlines()]
+        return [row for row in rows if row.get("kind") == "call" and row.get("tool") == "verify.sh"]
+
+    def test_check_without_package_preserves_features_and_records_workspace(self) -> None:
+        self.environment["BUILDLOG_OFF"] = "0"
+        result = self.verify("check", "--features", "foo")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check --workspace --lib --bins --features foo,extra", self.calls_made())
+        self.assertEqual([(row["package"], row["command"]) for row in self.recorded_calls()],
+                         [("workspace", "check --features foo")])
+
+    def test_test_without_package_runs_workspace_tests(self) -> None:
+        result = self.verify("test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [call.split() for call in self.calls_made() if call.startswith("nextest run ")]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--workspace", calls[0])
+        self.assertIn("--lib", calls[0])
+        self.assertIn("--bins", calls[0])
+        self.assertIn("--tests", calls[0])
+        self.assertNotIn("-E", calls[0])
+
+    def test_named_final_records_its_package_without_a_saved_pass(self) -> None:
+        self.environment["BUILDLOG_OFF"] = "0"
+        result = self.verify("final", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check --workspace --all-targets --features extra", self.calls_made())
+        calls = [call for call in self.calls_made() if call.startswith("nextest run ")]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--workspace --tests -E package(sample)", calls[0])
+        self.assertEqual([row["package"] for row in self.recorded_calls()], ["sample"])
+        self.assertEqual(self.pass_files(), [])
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         tracked = self.root / "tracked file\nwith newline.toml"
         _ = tracked.write_text('value=1\n')
         self.run_git("add", "--force", "--", tracked.name)
-        for arguments in (("lint", "sample"), ("lint", "--workspace", "--check")):
+        for arguments in (("lint", "sample"), ("lint", "--check")):
             with self.subTest(arguments=arguments):
                 result = self.invoke_verify(*arguments, cwd=self.root / "src")
                 diagnostics = (self.root / support.TAPLO_RESULTS_FILE).read_text(encoding="utf-8")

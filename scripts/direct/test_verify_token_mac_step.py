@@ -97,7 +97,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
                 + 'raise SystemExit(runner_status)'))
         else:
             self.take_peer_token()
-        arguments = ("lint", "--workspace" if after_mac else "sample", "--no-cache")
+        arguments = ("lint", *(("sample",) if not after_mac else ()), "--no-cache")
         if after_mac:
             arguments += ("--check",)
         process = self.start_verify(*arguments)
@@ -139,7 +139,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
 
     def test_local_fmt_takes_the_token_after_a_memory_wait_leaves_for_the_mac(self) -> None:
         _ = self.prepare_memory_lint()
-        process = self.start_verify("lint", "--workspace", "--check", "--no-cache")
+        process = self.start_verify("lint", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
@@ -175,7 +175,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
             + "Path(os.environ['TEST_BLOCK_PROBE']).write_text(str(result.returncode))\n"
             + "raise SystemExit(result.returncode)\n")
         observed = self.runner_state / "block-probe"
-        process = self.start_verify("lint", "--workspace", "--check", "--no-cache", extra={
+        process = self.start_verify("lint", "--check", "--no-cache", extra={
             "VERIFY_MAC_TEST_SCRIPT": str(probe),
             "TEST_REAL_FREE_NOW": str(Path(mac_test.__file__)), "TEST_BLOCK_PROBE": str(observed),
         })
@@ -213,6 +213,7 @@ hold_before_mend_check() {
             ;;
     esac
 }
+set -o functrace
 trap hold_before_mend_check DEBUG
 ''')
         self.write_executable(self.runner, RUNNER_STUB.replace(
@@ -220,7 +221,7 @@ trap hold_before_mend_check DEBUG
             'for hold in Path(os.environ["BUILD_HOLD_DIR"]).iterdir():\n'
             + '    hold.unlink()\n'
             + 'raise SystemExit(runner_status)'))
-        result = self.verify("lint", "--workspace", "--check", "--no-cache", extra={
+        result = self.verify("lint", "--check", "--no-cache", extra={
             "BUILD_TARGETS_SCRIPT": str(targets), "BASH_ENV": str(shell),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",

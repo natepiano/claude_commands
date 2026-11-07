@@ -812,6 +812,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
+    def test_workspace_test_with_a_linux_only_member_declines_before_claim(self) -> None:
+        self.write_portable_workspace()
+        self.config["linux_only.hana"] = "portable"
+        self.sync_config()
+        self.assert_declined(self.command("--workspace", package=""), "linux_only")
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertEqual(self.events_for("rsync"), [])
+
     def test_implicit_linux_member_blocks_workspace_verbs_through_target_and_shared_dependencies(self) -> None:
         for section in ("dependencies", "dev-dependencies", "build-dependencies", 'target.\'cfg(unix)\'.dependencies'):
             with self.subTest(section=section):

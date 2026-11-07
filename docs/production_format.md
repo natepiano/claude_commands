@@ -91,9 +91,10 @@ The showrunner staff row gives its path. The row's `name` is the production name
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
   timer unless asked)
-- **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
-  besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
-  first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
+- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+  in addition to the changed packages' tests.
+  Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
+  Text after the first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
   `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
   checkout: a package name, a directory or an unset variable is refused before the merge
   starts

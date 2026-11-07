@@ -119,7 +119,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     import subprocess
     subprocess.run([sys.executable, os.environ["TEST_STATE_OBSERVER"], "tree"], check=True)
 '''))
-        result = self.run_verify("lint", "--workspace", "--no-cache")
+        result = self.run_verify("lint", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.observations()
         initial = rows[0]

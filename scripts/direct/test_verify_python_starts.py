@@ -197,7 +197,7 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
         self.assert_pair("lint", "sample")
         _ = (self.root / "sample/src/new.rs").write_text("// new source\n")
         self.environment["RUSTFLAGS"] = "-C opt-level=1"
-        self.assert_pair("lint", "--workspace", "--check")
+        self.assert_pair("lint", "", "--check")
         _ = (self.root / "session/lint.conf").write_text("# changed config\n")
         self.assert_pair("lint", "sample")
 

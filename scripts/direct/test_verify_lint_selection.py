@@ -9,7 +9,7 @@ from scripts.direct import verify_lint_scope_test_support as support
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
     def test_check_lint_only_judges_without_fixes(self) -> None:
-        _ = self.verify("lint", "--workspace", "--check")
+        _ = self.verify("lint", "--check")
         self.assertEqual(self.calls("clippy"), [[
             "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings",
         ]])
@@ -30,7 +30,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
     def test_example_keeps_its_single_target_and_required_features(self) -> None:
         for example, features in (("plain", []), ("featured", ["--features", "sample/a"])):
             with self.subTest(example=example):
-                _ = self.verify("example", "sample", example)
+                _ = self.verify("example", "sample", "--name", example)
                 self.assertEqual(self.calls("clippy"), [[
                     "--workspace", "--example", example, *features, "--", "-D", "warnings"
                 ]])
