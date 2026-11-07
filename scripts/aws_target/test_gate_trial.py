@@ -307,6 +307,7 @@ class GateTrialTests(unittest.TestCase):
         _ = (self.root / 'trial.conf').write_text(trial_config())
         _ = (self.root / 'flake.lock').write_text(json.dumps({'root': 'host', 'nodes': {
             'host': {'inputs': {'nixpkgs': 'tools'}}, 'tools': {'locked': {'rev': 'f' * 40}}}}))
+        _ = self.enterContext(mock.patch.object(trial, 'host_basedpyright_version', return_value='1.39.10'))
 
     def run_trial(self, *, step: str = 'size', sizes: tuple[int, ...] = (16,), runs: int = 1, reserve: float = 4,
                   vcpus: int = 16, family: str = 'm7a') -> trial.GateTrial:
@@ -639,8 +640,12 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'basedpyright', 'sqlite', 'google-chrome'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
+        self.assertNotIn('#google-chrome', data)
+        self.assertNotIn('#basedpyright', data)
+        self.assertNotIn('NIXPKGS_ALLOW_UNFREE', data)
+        self.assertNotIn('--impure', data)
         self.assertIn('--command bash -ec', data)
         for shell in ('bash', 'zsh'):
             link = f'ln -sf "$(command -v {shell})" /bin/{shell}'
@@ -666,6 +671,16 @@ class GateTrialTests(unittest.TestCase):
         self.assertGreater(len(tools), 20)
         self.assertTrue(all(word.startswith('github:NixOS/nixpkgs/' + 'f' * 40 + '#') for word in tools))
         self.assertNotIn('nixos-26.05#', self.fake.payloads[0])
+
+    def test_host_version_pins_basedpyright_before_the_gate_starts(self) -> None:
+        with mock.patch.object(trial, 'host_basedpyright_version', return_value='1.40.2') as version:
+            command = self.run_trial()
+        version.assert_called_once_with()
+        self.assertEqual(command.basedpyright_version, '1.40.2')
+        self.assertIn('Guest basedpyright version: 1.40.2', self.output)
+        data = self.fake.payloads[0]
+        self.assertIn('uv tool install basedpyright==1.40.2', data)
+        self.assertLess(data.index('uv tool install'), data.index('exec python3 /var/lib/gate-trial/guest.py'))
 
     def test_capacity_refusal_tries_next_public_zone_with_its_price(self) -> None:
         self.fake.capacity_zones = {'us-east-1a'}
@@ -1022,13 +1037,13 @@ class GuestTests(unittest.TestCase):
         url = prefix + 'a' * (400 - len(prefix))
         links = {'step': 'size', 'commit': 'a' * 40,
                  **dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
-        data = trial.user_data(links, 'f' * 40, 30, 30, 600)
+        data = trial.user_data(links, 'f' * 40, '1.39.10', 30, 30, 600)
         self.assertLessEqual(len(data.encode()), 16384)
 
     def tool_session(self) -> str:
         links: dict[str, str] = dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
         links['step'] = 'size'
-        data = trial.user_data(links, 'f' * 40, 30, 30, 600)
+        data = trial.user_data(links, 'f' * 40, '1.39.10', 30, 30, 600)
         return shlex.split(data[data.index('nix --extra-experimental-features'):])[-1]
 
     def test_tests_use_an_unprivileged_user_after_root_setup(self) -> None:
@@ -1048,10 +1063,18 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
+            uv = root / 'uv'
+            _ = uv.write_text('#!/bin/sh\n'
+                + 'printf "%s\\n" "$*" > "$HOME/uv-arguments"\n'
+                + 'mkdir -p "$HOME/.local/bin"\n'
+                + 'printf "#!/bin/sh\\necho basedpyright 1.39.10\\n" > "$HOME/.local/bin/basedpyright"\n'
+                + 'chmod +x "$HOME/.local/bin/basedpyright"\n')
+            uv.chmod(0o700)
             python = root / 'python3'
             _ = python.write_text('#!' + sys.executable + '\nimport json, os, subprocess\n'
                 + "print(json.dumps({'initialized':os.environ.get('__NIXOS_SET_ENVIRONMENT_DONE'),"
-                + "'tool':subprocess.check_output(['zsh','-c','command -v fixture-tool'],text=True).strip()}))\n")
+                + "'tool':subprocess.check_output(['zsh','-c','command -v fixture-tool'],text=True).strip(),"
+                + "'basedpyright':subprocess.check_output(['basedpyright','--version'],text=True).strip()}))\n")
             python.chmod(0o700)
             script = shlex.split(self.tool_session().rsplit('bash -c ', 1)[1])[0]
             script = script.replace('. /etc/profile', '. ' + shlex.quote(str(profile)))
@@ -1061,6 +1084,8 @@ class GuestTests(unittest.TestCase):
             payload = ledger.mapping(cast(object, json.loads(result.stdout)))
             self.assertEqual(payload['initialized'], '1')
             self.assertEqual(payload['tool'], str(tool))
+            self.assertEqual(payload['basedpyright'], 'basedpyright 1.39.10')
+            self.assertEqual((root / 'uv-arguments').read_text(), 'tool install basedpyright==1.39.10\n')
 
     def test_fixed_system_profile_path_resolves_the_tool_python(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -1070,6 +1095,7 @@ class GuestTests(unittest.TestCase):
             system = root / 'system'
             system.mkdir()
             (tools / 'python3').symlink_to(sys.executable)
+            (tools / 'chromium').symlink_to(sys.executable)
             mount = tools / 'mount'
             _ = mount.write_text('#!/bin/sh\ncp -a "$2"/. "$3"/\n')
             mount.chmod(0o700)
@@ -1082,6 +1108,14 @@ class GuestTests(unittest.TestCase):
                 'import json, sys; print(json.dumps(list(sys.version_info[:2])))'], text=True, timeout=10)
             self.assertGreaterEqual(cast(list[int], json.loads(version)), [3, 13])
             self.assertEqual((system / 'python3').resolve(), Path(sys.executable).resolve())
+            self.assertEqual((system / 'google-chrome').resolve(), (tools / 'chromium').resolve())
+            session = self.tool_session()
+            self.assertLess(session.index('/run/gate-trial-bin/google-chrome'), session.index('mount --bind'))
+
+    def test_host_basedpyright_version_reads_only_the_version_number(self) -> None:
+        with mock.patch.object(subprocess, 'check_output', return_value='basedpyright 1.39.10\nbased on pyright 1.1.409\n') as version:
+            self.assertEqual(trial.host_basedpyright_version(), '1.39.10')
+        version.assert_called_once_with(['basedpyright', '--version'], text=True)
 
     def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
         for present in (True, False):

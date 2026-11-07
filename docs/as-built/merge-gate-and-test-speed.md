@@ -188,7 +188,11 @@ Both modes use one launch loop with the same commands, test environments, timeou
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
 The gate trial sends the host's module times as a separate S3 object.
 The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
-All guest tools use that revision, including Python, basedpyright, SQLite, and `google-chrome` for headless chart tests.
+The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
+The guest links `google-chrome` to Chromium before the system profile bind mount for headless chart tests.
+The host reads and prints its basedpyright version at trial start.
+The guest installs that version through uv and adds `$HOME/.local/bin` to PATH before the gate starts.
+The installation time counts in running to tools ready.
 Root prepares the shell links and a temporary system profile bind mount with Python at `/run/current-system/sw/bin/python3`.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
 Its shell reads `/etc/profile` before tests, then restores the tool PATH.

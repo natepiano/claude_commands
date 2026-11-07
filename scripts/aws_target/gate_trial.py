@@ -70,6 +70,11 @@ def host_nixpkgs_revision() -> str:
     return ledger.text(locked, 'rev')
 
 
+def host_basedpyright_version() -> str:
+    """Read the host's basedpyright version before creating trial resources."""
+    return subprocess.check_output(['basedpyright', '--version'], text=True).split()[1]
+
+
 # This program runs inside the instance's tool shell, not on natedev.
 GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback, urllib.request
 root = pathlib.Path('/var/lib/gate-trial')
@@ -239,25 +244,27 @@ trap boot_failed EXIT
 '''
 
 
-def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
+def user_data(links: dict[str, str], revision: str, basedpyright_version: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
-    packages = ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
+    packages = ('git', 'python3', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
                 'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux',
-                'taplo', 'zsh', 'bash', 'gh', 'sqlite', 'google-chrome', 'util-linux')
+                'taplo', 'zsh', 'bash', 'gh', 'sqlite', 'chromium', 'util-linux')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
-    session = '''ln -sf "$(command -v bash)" /bin/bash
+    session = f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
 mkdir -p /run/gate-trial-bin
 cp -as /run/current-system/sw/bin/. /run/gate-trial-bin/
 ln -sf "$(command -v python3)" /run/gate-trial-bin/python3
+ln -sf "$(command -v chromium)" /run/gate-trial-bin/google-chrome
 mount --bind /run/gate-trial-bin /run/current-system/sw/bin
 chown -R gate-trial:users /var/lib/gate-trial
 runuser -u gate-trial -- env HOME=/home/gate-trial XDG_RUNTIME_DIR=/run/user/$(id -u gate-trial) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u gate-trial)/bus bash -c '
 tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
-export PATH="$tool_path:$PATH"
+export PATH="$HOME/.local/bin:$tool_path:$PATH"
+uv tool install {shlex.quote('basedpyright==' + basedpyright_version)}
 exec python3 /var/lib/gate-trial/guest.py'
 '''
     return f'''#!/bin/sh
@@ -277,8 +284,7 @@ touch /var/lib/gate-trial/timeline.log
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
-export NIXPKGS_ALLOW_UNFREE=1
-nix --extra-experimental-features 'nix-command flakes' shell --impure {tools} --command bash -ec {shlex.quote(session)}
+nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
 '''
 
 
@@ -428,6 +434,7 @@ class GateTrial:
         self.interrupted = False
         self.module_seconds: dict[str, float] = {}
         self.nixpkgs_revision = ''
+        self.basedpyright_version = ''
 
     def cancel(self) -> None:
         with self.changed:
@@ -764,7 +771,7 @@ class GateTrial:
         with tempfile.TemporaryDirectory() as folder:
             data = Path(folder) / 'user-data'
             minutes = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes')
-            _ = data.write_text(user_data(self.links(key, step), self.nixpkgs_revision, minutes,
+            _ = data.write_text(user_data(self.links(key, step), self.nixpkgs_revision, self.basedpyright_version, minutes,
                                          self.option('log_push_s'), self.option('module_limit_s')))
             lifetime = minutes * 60
             try:
@@ -1010,6 +1017,8 @@ class GateTrial:
             with tempfile.TemporaryDirectory() as folder:
                 self.nixpkgs_revision = host_nixpkgs_revision()
                 print('Guest nixpkgs revision: ' + self.nixpkgs_revision, flush=True)
+                self.basedpyright_version = host_basedpyright_version()
+                print('Guest basedpyright version: ' + self.basedpyright_version, flush=True)
                 self.module_seconds = read_measures(gate_state_dir() / 'module_seconds.json')
                 bundle = Path(folder) / 'source.bundle'
                 self.commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()

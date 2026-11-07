@@ -656,13 +656,17 @@ Start with one small run:
 7. Terminate each instance when its attempt ends.
 
 The host reads the root `nixpkgs` input revision from `/etc/nixos/flake.lock` before it creates trial resources.
-Every guest tool uses that revision, including Python, basedpyright, SQLite, and `google-chrome` for headless chart tests.
+The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
+The guest links `google-chrome` to Chromium for headless chart tests.
+The host reads and prints its basedpyright version at trial start.
+The guest installs that version through `uv tool install basedpyright==<version>` and adds the installation directory to PATH.
 The tool shell also includes `taplo`, `zsh`, `bash`, `gh`, and Git.
 Root prepares `/bin/bash`, `/bin/zsh`, and Python at `/run/current-system/sw/bin/python3` through a temporary bind mount.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
 Its shell reads `/etc/profile` before tests start, then restores the tool PATH.
 The exported NixOS environment marker prevents child zsh shells from replacing fixture paths.
-Tool preparation time includes these packages and setup. Its change remains to be measured.
+Tool preparation time includes the Nix packages, the basedpyright installation, and the environment setup.
+The change in preparation time remains to be measured.
 
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.

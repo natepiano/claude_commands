@@ -69,6 +69,8 @@ Jobs use natedev and the Mac while AWS routing stays closed.
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
 3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+4. **Gate trial evidence.** In progress. A cloud gate trial passes clean at each size. The report gives each size's time in four parts: request to running, instance setup, tests, and teardown. It also gives CPU use during the tests. The test time is the time to expect from a prepared image. User, 2026-11-07.
+5. **Prepared trial image.** After phase 4. A saved image holds the tools, so a box starts without the setup step. The phase decides when to rebuild the image after natedev changes. The trial then measures setup again, to show the time saved. User, 2026-11-07.
 
 ## Removal status
 
