@@ -935,7 +935,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - The remaining CPU is 11 real `invoke_verify` calls. Step-record starts are 225 and 19.96 process s; admission and release commands are 44 and 25.17 process s. The showrunner routed these starts to the verify unit and the queue unit.
 - Phase 50 owns the write watch and the one inotify binding (Phase 43 F005, F006).
 
-### Phase 44 — `copies.py` does less Git work  · status: todo
+### Phase 44 — `copies.py` does less Git work  · status: done
 **Depends on:** none
 
 #### Work Order
