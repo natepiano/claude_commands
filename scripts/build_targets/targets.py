@@ -14,14 +14,9 @@ from calendar import monthrange
 import json
 from typing import cast
 import time
-from typing import TYPE_CHECKING
 from pathlib import Path
-import sys
 
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 from scripts.build_hold import build_hold
 from scripts.mac_test import mac_test, offload
 from scripts.build_targets.target_config import (
@@ -34,12 +29,8 @@ from scripts.build_targets.target_config import (
     is_aws_target,
 )
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger as cost_ledger, measurement
-    from ..buildlog import record
-else:
-    from scripts.aws_target import ledger as cost_ledger, measurement
-    from scripts.buildlog import record
+from scripts.aws_target import ledger as cost_ledger, measurement
+from scripts.buildlog import record
 
 
 @dataclass(frozen=True)

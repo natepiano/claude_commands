@@ -183,6 +183,9 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
+        shim = self.root / ".claude/scripts/lib/py"
+        shim.parent.mkdir()
+        shim.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
         self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         self.environment = {

@@ -12,7 +12,6 @@ import hashlib
 import json
 import random
 import sqlite3
-import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -21,12 +20,10 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import Literal, NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.buildlog import store
 from scripts.buildlog import index as buildlog_index
 from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000

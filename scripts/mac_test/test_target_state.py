@@ -15,25 +15,20 @@ import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog", "lib", "lint"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
 if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_targets import targets
-    from ..build_hold import build_hold
-    from ..buildlog import record, store
-    from ..lib import conf
-    from ..lint.memory_test_support import write_config_fixture, config_environment
+    from scripts.mac_test import mac_test, offload
+    from scripts.build_targets import targets
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record, store
+    from scripts.lib import conf
+    from scripts.lint.memory_test_support import write_config_fixture, config_environment
 else:
     from scripts.mac_test import mac_test, offload
     from scripts.build_targets import targets

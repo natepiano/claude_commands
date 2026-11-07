@@ -1183,6 +1183,7 @@ class GuestTests(unittest.TestCase):
             shim = repo / 'scripts' / 'lib' / 'py'
             shim.parent.mkdir()
             shim.symlink_to(Path(__file__).resolve().parents[1] / 'lib' / 'py')
+            (shim.parent / 'package_root.py').symlink_to(Path(__file__).resolve().parents[1] / 'lib/package_root.py')
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result',
                      'module_seconds': 'https://fixture.invalid/module_seconds'}

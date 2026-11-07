@@ -124,7 +124,8 @@ try:
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
-        sys.path.insert(0, str(repo))
+        with open(repo / 'scripts/lib/package_root.py') as package_root:
+            exec(package_root.read(), {'__file__': package_root.name})
         from scripts.production import merge_gate
         timings = {}
         if 'module_seconds' in links:
