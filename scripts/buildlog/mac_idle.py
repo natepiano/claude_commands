@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -85,6 +86,7 @@ class VerifyCall:
     local_reason: str = ""
     kind: str = "test"
     wait_state: step_record.StepState = step_record.StepState.WAITING_MAC
+    updated: str = ""
 
 
 def read_record(path: Path) -> dict[str, object]:
@@ -217,7 +219,8 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        disk_excluded = isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk"
+        disk_excluded = (isinstance(record.runs_on, step_record.AnyTarget) and bool(record.mac_disk_exclusions)) or (
+            isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk")
         if disk_excluded:
             if record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
                                     step_record.StepState.ON_NATEDEV):
@@ -245,7 +248,8 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
         if call.local_reason and call.local_reason != "disk" and not disk_excluded:
             continue
         calls.append(replace(call, repo=str(record.repo), package=step_record.package_name(record.package), kind=record.kind,
-                             wait_state=record.state, local_reason="disk" if disk_excluded else call.local_reason))
+                             wait_state=record.state, updated=record.updated,
+                             local_reason="disk" if disk_excluded else call.local_reason))
     if diagnostics != old_diagnostics:
         write_record(paths.state / "step_diagnostics.json", diagnostics)
     return tuple(calls)
@@ -448,6 +452,27 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
     return unit_labels.unit_labels_for(session_ids, environment)
 
 
+def calls_past_wait_limit(paths: MacIdlePaths, calls: tuple[VerifyCall, ...], now: float,
+                         alert_seconds: float) -> tuple[VerifyCall, ...]:
+    path = paths.state / "wait_starts.json"
+    previous = read_record(path)
+    starts: dict[str, str] = {}
+    ready: list[VerifyCall] = []
+    for call in calls:
+        identity = json.dumps([call.call_id, call.start])
+        starts[identity] = str(previous.get(identity, call.updated))
+        try:
+            started = datetime.fromisoformat(starts[identity].replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ready.append(call)
+            continue
+        if now - started >= alert_seconds:
+            ready.append(call)
+    if starts != previous:
+        write_record(path, starts)
+    return tuple(ready)
+
+
 def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
     """Save the one idle reading, notify its outage and repair free-Mac waits."""
     from scripts.mac_test import mac_test
@@ -463,6 +488,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
         has_steps = any(step_record.record_directory().glob("*.json"))
         live: dict[int, LiveProcess] = {}
         calls = waiting_calls(paths, live) if has_steps else ()
+        settings = mac_idle_alert.read_idle_config()
+        calls = calls_past_wait_limit(paths, calls, now, settings.alert_seconds)
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")
         saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0,
             "waiting": len(calls), "cause": "", "holder": "", "detail": "", "until": 0.0,
@@ -511,7 +538,6 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                 saved["cause"] = "disk"
             saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
         write_record(paths.state / "alert.json", saved)
-        settings = mac_idle_alert.read_idle_config()
         if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds or not calls:
             return
         # Only wait evidence and repairs need the process ancestry.

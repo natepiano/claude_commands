@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import contextlib
 import io
 import json
@@ -21,6 +23,20 @@ from scripts.statusline import counts_row
 
 
 class QuestionLibraryTests(unittest.TestCase):
+    def test_invalid_timer_text_does_not_hide_a_valid_staff_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            with (isolated_staff_file(root / "staff.json", {}),
+                  mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(root)})):
+                owner = fixture_member("showrunner", name="timer-owner")
+                invalid = root / "showrunner-invalid"
+                invalid.mkdir()
+                _ = (invalid / "conf").write_bytes(b"\xff")
+                valid = root / f"showrunner-{owner.id}"
+                valid.mkdir()
+                _ = (valid / "conf").write_text(f"TARGET=session:{owner.id}\n")
+                self.assertEqual(showrunner_footer.targeted_instances(owner.current_session), [valid])
+
     def test_read_production_uses_one_staff_read_and_the_timer_folder_owner(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -28,7 +44,7 @@ class QuestionLibraryTests(unittest.TestCase):
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})):
                 doc = root / "different-document-production.md"
                 _ = doc.write_text("> **Status: PRODUCTION — running.** Test\n")
-                owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc("natedev", doc))
+                owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(remote.local_machine(), doc))
                 other = fixture_member("showrunner", name="another-owner")
                 instance = root / f"showrunner-{owner.id}"
                 instance.mkdir()
@@ -83,7 +99,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(
                     f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
-                _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+                _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
                 identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
@@ -117,7 +133,7 @@ class QuestionLibraryTests(unittest.TestCase):
             doc = root / "production.md"
             _ = doc.write_text("> **Status: PRODUCTION — wrapped.** demo\n- **User zone:** America/Los_Angeles — demo\n")
             with isolated_staff_file(root / "staff.json", {}):
-                owner = fixture_member("showrunner", name="demo", doc=staff.WrappedDoc("natedev", doc))
+                owner = fixture_member("showrunner", name="demo", doc=staff.WrappedDoc(remote.local_machine(), doc))
                 instance = root / f"showrunner-{owner.id}"
                 instance.mkdir()
                 _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {owner.id}\n")
@@ -139,7 +155,7 @@ class QuestionLibraryTests(unittest.TestCase):
                     "> **Status: PRODUCTION — running.** demo\n"
                     + f"- **Proposals:** {folder}\n", encoding="utf-8")
                 owner = fixture_member("showrunner", name="renamed-owner",
-                                       doc=staff.LiveDoc("natedev", doc))
+                                       doc=staff.LiveDoc(remote.local_machine(), doc))
                 instance = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(

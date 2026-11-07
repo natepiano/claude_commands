@@ -71,11 +71,6 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import terminal_width
@@ -1600,7 +1595,7 @@ def footer(
 
 def doc_counts(doc: Path | None) -> str | None:
     """The counts line for a production doc; the status line carries the question count."""
-    import footer_counts
+    from scripts.production import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 

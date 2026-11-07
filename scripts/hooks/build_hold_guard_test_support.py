@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 
 if TYPE_CHECKING:
-    from ..build_hold import build_hold, hold_applies as hold_applies
+    from scripts.build_hold import build_hold, hold_applies as hold_applies
 else:
     from scripts.build_hold import build_hold
     from scripts.build_hold import hold_applies as hold_applies

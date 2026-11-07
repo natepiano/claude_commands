@@ -1,26 +1,17 @@
 # Resume by name and recovery on the right account, in the right tab
 
-> **Production:** sdlc. Owner: shutdown-unit. Starts after the Phase 10 hash.
+> **Production:** sdlc. Owner: shutdown-unit. Status: done, merged as cdf3e0ea8.
 
-## Goal
-1. `resume <name>` finds a saved Codex conversation by its exact name, and resumes it on the configured workers account with its history.
-2. A closed showrunner or unit starts on its role account on the first start. No watchdog move follows.
-3. A restart with no saved tab opens in the parent showrunner's workspace.
-4. Work that was shut down stays down: the watchdog restarts only a unit whose newest launch record exists and is not `ended`.
+## As-built
+1. `resume <name>` looks up an unknown name by exact match in the shared `session_index.jsonl` of the Codex home. One id resolves. More than one id gives the "ambiguous name; candidates" failure. A canonical UUID is used as the id and reads no index.
+2. `stop_resume.resume_account` picks the target account for both families. It reads the role at invocation: a Codex session takes the workers role, and a unit or showrunner row takes its role. Other Claude sessions keep their saved account. `--to` overrides it for both families. The source account does not count.
+3. A herdr server restore passes the saved home to `restart.start_row` as an `AccountSelection`, so the session keeps its saved account.
+4. `running_on_account` leaves a session that already runs unchanged, and prints `unchanged` with its account. In an unknown process, a pane that reports the session id counts as running.
+5. `herdr.row_workspace` picks the workspace: the row's parent showrunner, else the entry name, else the shared session. `stop_resume._resume_once` and `restart.start_row` both call it.
+6. `scripts/accounts/unit_watchdog.py` restarts only a unit whose newest launch record exists and is not `ended`.
+7. `resume_unit` completes the director's resume first: it writes the receipt and discards the parked facts. It then restores the workers and returns the worker's exit code. A rerun restores the workers.
 
-## Work
-1. `scripts/shutdown/stop_resume.py` `_resume`: look up an unknown name by exact match in the shared `session_index.jsonl`. One id resolves. More than one id gives the existing "ambiguous name; candidates" failure.
-2. One function picks the target account for both families. It reads the role at invocation, for a staff row and for a session with no row. `--to` overrides it. The source account does not count.
-3. `running_on_account` leaves a session that already runs unchanged.
-4. One function picks the workspace: the row's parent showrunner, else the entry name, else the shared session. `stop_resume._resume_once` and `restart.start_row` both call it. `start_row` passes the result as the fallback when no saved tab exists.
-5. `scripts/accounts/unit_watchdog.py`: a unit with no launch record, or with a newest record that is `ended`, gets no restart. Delete the no-record restart path. Correct `test_crashed_unit_without_a_pane_launch_record_restarts_on_its_launch_account` and `test_public_stop_keeps_a_unit_down_across_watchdog_ticks` to state the new rule.
-
-## Accepted risk
-A crashed unit with no launch record stays down until someone resumes it. sdlc accepted this on 2026-11-06.
-
-## Proof, on TEST sessions only
-Never brain or morty. Do not move namecheck's pane.
-1. A TEST Codex session named `zz-move-*` starts on one account. It resumes by name on the workers account, with a thread row only on the other account, and recalls a word from its history.
-2. A closed TEST showrunner with an old pane record resumes by name through the script and starts on its role account the first time.
-3. A closed TEST unit with no saved tab restarts in its parent showrunner's workspace.
-4. A TEST unit with an `ended` record and a TEST unit with no record stay down across watchdog passes.
+## Known limits
+1. A crashed unit with no launch record stays down until someone resumes it. sdlc accepted this on 2026-11-06.
+2. A session in an unknown process, with no pane that reports its id, can get a second process on the same conversation.
+3. The role account step does not change a pane shell whose `resume` alias holds an old `CLAUDE_CONFIG_DIR`. A herdr restart or a reboot clears those shells.

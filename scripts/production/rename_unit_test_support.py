@@ -1,6 +1,8 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -239,7 +241,7 @@ class UnitRenameFixture(StaffTestCase):
             "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
         unit = fixture_member("unit", name="names", parent=parent.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
         for directory in (self.checkout, worktree):
@@ -284,7 +286,7 @@ class FolderRenameFixture(StaffTestCase):
         identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
         return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
             current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
 
     @override
     def setUp(self) -> None:
@@ -319,9 +321,9 @@ class FolderRenameFixture(StaffTestCase):
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
         owner = fixture_member("showrunner", name="folder-production",
-            doc=staff.LiveDoc("natedev", self.checkout / "production.md"))
+            doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
         _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())

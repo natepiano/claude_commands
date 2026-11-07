@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib import test_hang_guard
 from scripts.lib.test_models_registry import ExactRows, registry_text
 from scripts.production import staff, unit_config
@@ -11,14 +13,11 @@ import shutil
 import subprocess
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -117,7 +116,7 @@ class ReviewLauncherFixture(LauncherFixture):
             member = unit_membership("fixture", "fixture")
             return staff.ensure("unit", name=member.name, parent=member.parent,
                                 runtime_id=member.current_session,
-                                worktree=staff.PresentWorktree("natedev", self.working_dir)).current_session
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.working_dir)).current_session
 
     @override
     def prepare_fixture(self) -> None:

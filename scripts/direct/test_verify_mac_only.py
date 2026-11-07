@@ -18,6 +18,24 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class VerifyMacOnlyTests(VerifyMacOffloadFixture):
+    def isolate_automatic_environment(self) -> dict[str, str]:
+        selected_names = {
+            "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "CI", "TZ", "LANG",
+            "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC",
+            "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME",
+            "LC_PAPER", "LC_TELEPHONE",
+            "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+        }
+        self.environment = {
+            name: value for name, value in self.environment.items()
+            if name not in selected_names
+            and not name.startswith(("HANA_", "WGPU_", "BEVY_", "INSTA_", "TRACE_"))
+        }
+        return {
+            "TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "verify",
+            "COLUMNS": "80", "LINES": "24",
+        }
+
     def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
         """Pass a runner result through the real result reader and call recorder."""
         functions = shell_functions(
@@ -39,7 +57,7 @@ BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S=""
 BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
 BUILDLOG_LOCAL_REASON=""
 export BUILDLOG_CALL_ID="result-$$" BUILDLOG_LOCAL_REASON
-STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s' "$MAC_SETTINGS")
+STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_SETTINGS")
 MAC_LEAVE_SETTINGS=$MAC_SETTINGS MAC_LEAVE_REASON=""
 try_reserved_target
 '''
@@ -54,6 +72,7 @@ try_reserved_target
         )
 
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
+        automatic_environment = self.isolate_automatic_environment()
         for name, value in (
             ("SHELLOPTS", "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail"),
             ("UID", str(os.getuid())),
@@ -64,14 +83,14 @@ try_reserved_target
                 result = self.verify("test", "sample", "--mac", "why", "--env", name, extra=passed)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {name: value})
+                self.assertEqual(observed, {**automatic_environment, name: value})
                 self.assertEqual(len(self.runner_events()), 1)
                 self.assertEqual(self.local_runs(), [])
                 self.clear_observations()
                 control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
                 self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
                 self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), {})
+                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
 
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
         real_sleep = shutil.which("sleep")
@@ -109,6 +128,7 @@ try_reserved_target
         self.assertEqual(self.last_call()["mac_reason"], "blocked")
 
     def test_forwarded_environment_uses_callers_values_despite_shell_bindings(self) -> None:
+        automatic_environment = self.isolate_automatic_environment()
         for name in ("name", "PKG", "MAC_REASON", "ARGS"):
             with self.subTest(name=name):
                 self.clear_observations()
@@ -117,7 +137,7 @@ try_reserved_target
                     name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {name: value})
+                self.assertEqual(observed, {**automatic_environment, name: value})
                 self.clear_observations()
                 previous_calls = self.call_records()
                 refused = self.verify("test", "sample", "--mac", "why", "--env", name)
@@ -150,10 +170,9 @@ try_reserved_target
 
     def test_policy_refusals_start_nothing(self) -> None:
         cases = (
-            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("check", "sample", "--mac", "why"), '--mac applies only to test.'),
+            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
             (("test", "sample", "--mac", "why", "--local", "requires Linux"), '--mac and --local cannot be used together.'),
             (("test", "sample", "--env", "SHOTS"), '--env and --fetch need --mac "<why>".'),
             (("test", "sample", "--fetch", "target/shots"), '--env and --fetch need --mac "<why>".'),

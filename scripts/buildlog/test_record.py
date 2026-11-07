@@ -21,16 +21,11 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, cast, override
+from typing import BinaryIO, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-if TYPE_CHECKING:
-    from ..lib.socket_test_support import short_socket_directory
-    from ..lib.shell_test_support import shell_function, shell_functions
-else:
-    from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lib.shell_test_support import shell_function, shell_functions
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.shell_test_support import shell_function, shell_functions
 
 from scripts.buildlog import record as recorder
 from scripts.buildlog import step_context
@@ -39,19 +34,11 @@ from scripts.buildlog import report, sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
-if TYPE_CHECKING:
-    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from ..lint.memory_test_support import fake_memory_readings
-else:
-    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.buildlog.test_index import point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -1344,7 +1331,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         final = self.record("call", "interrupted", "", "0", "0", "12", "", "0", "12", "final")
         self.assertEqual(final.returncode, 0, final.stderr)
         record = self.records()[-1]
-        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", None, None, None))
+        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
 

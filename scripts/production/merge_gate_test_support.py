@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 import json
@@ -475,7 +477,7 @@ class MergeGateFixture(unittest.TestCase):
         self.quiet_production = self.root / "quiet-production.md"
         self.write(self.quiet_production, "# quiet\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))
         _ = self.git(self.root, "init", "-b", "main", str(self.checkout))
         _ = self.git(self.checkout, "config", "user.name", "Merge Gate Fixture")
@@ -483,6 +485,7 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(self.checkout, "remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
         _ = install_test_runner(self.checkout)
         shim = self.checkout / "scripts/lib/py"

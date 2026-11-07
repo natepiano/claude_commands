@@ -7,7 +7,7 @@ from dataclasses import replace
 import unittest
 
 from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
-from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
+from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, with_waiting
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
 from scripts.lib.terminal_cells import terminal_width
@@ -36,8 +36,38 @@ class QueueCardTests(QueueFixtureTests):
                 self.fixture.write_running(used=int(5.1 * gate.GIB), need=int(11.1 * gate.GIB), step=step)
                 model = self.fixture.model()
                 text = plain(queue_card.render_card(model, [1], 400))
-                self.assertIn(f", {prose}: admitted ", text)
-                self.assertIn(f"Frees when: widget-enhancements-title {prose} end ", text)
+                self.assertIn(f", hana {prose}: admitted ", text)
+                self.assertIn(f"Frees when: widget-enhancements-title hana {prose} end ", text)
+
+    def test_running_card_names_the_private_machine_after_pid(self) -> None:
+        model = self.fixture.model()
+        for columns in (60, 80, 100, 140):
+            with self.subTest(columns=columns):
+                lines = queue_card.render_selection(model, "1", columns)
+                text = plain(lines)
+                record = " ".join(text.split())
+                self.assertIn("pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, hana nextest:", record)
+                self.assertEqual(record.count("pid 900"), 1)
+                self.assertEqual(record.count("0 min ago"), 1)
+                self.assertNotIn("min machine", text)
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+
+    def test_project_names_appear_in_the_heading_steps_ahead_and_first_in_line(self) -> None:
+        model = self.fixture.model()
+        first, second = model.reading.view.waiting[:2]
+        model = with_waiting(model, [replace(first, project="nateroids", step="nextest"), replace(second, project="hana")])
+        head = model.reading.explanation.head
+        self.assertIsInstance(head, gate.HeadExplanation)
+        if isinstance(head, gate.HeadExplanation):
+            model = replace(model, reading=replace(model.reading,
+                explanation=replace(model.reading.explanation,
+                    head=replace(head, waiter=model.reading.view.waiting[0]))))
+        text = plain(queue_card.render_card(model, [2], 400))
+        self.assertIn("hana nextest", text.splitlines()[0])
+        ahead, = [line for line in text.splitlines() if "#1 pid" in line]
+        self.assertIn("nateroids nextest", ahead)
+        first_line, = [line for line in text.splitlines() if "First in line:" in line]
+        self.assertIn("nateroids nextest", first_line)
 
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
@@ -116,7 +146,7 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn("#2 of 32", text)
         self.assertIn("step admission checks unavailable", text)
 
-    def test_unowned_slice_owner_selector_marks_its_running_record_once_on_the_complete_page(self) -> None:
+    def test_unowned_slice_owner_selector_finds_its_record_without_a_view_row(self) -> None:
         model = self.fixture.model()
         running = model.reading.explanation.running[0]
         run = LiveBuildRun(123, "123", NOW - 600)
@@ -124,22 +154,34 @@ class QueueCardTests(QueueFixtureTests):
         memory = gate.UnownedSliceMemory(5 * gate.GIB, cgroup="verify.scope", owner="run-owner", activity=activity, pid=run.pid)
         step = replace(running.step, session_id="run-owner", session_name="run-owner", measured=memory,
                        step="between steps", promise=0, run=run)
-        reading = queue_read_fixture(replace(model.reading.view, running=(step,)),
+        reading = queue_read_fixture(replace(model.reading.view, running=(step,), waiting=(), promised=0),
                                      policy=admission_policy_fixture())
         model = replace(model, reading=reading)
         model = replace(model, labels={**model.labels, "run-owner": UnitLabels("worker", "builds", "run-unit")})
         view = queue_view.render_view(model, 400, selector="run-owner")
         card = queue_card.render_selection(model, "run-owner", 400)
         text = plain([*view, (), *card])
-        self.assertIn("▸", text)
+        self.assertIn("Selected running step: ", plain(card))
+        self.assertIn("run-unit", plain(card))
+        self.assertNotIn("Selected running step: ", plain(view))
+        self.assertNotIn("▸", plain(view))
         self.assertNotIn("(unowned)", text)
-        self.assertIn("run-unit", text)
+        self.assertNotIn("run-unit", plain(view))
         self.assertNotIn("run-owner", text)
         self.assertNotIn("No waiting or running step matches", text)
-        self.assertEqual(text.count("run-unit"), 1)
-        self.assertIn("between steps", plain(view))
-        self.assertIn("5.0", plain(view))
+        selected, = [entry for entry in queue_card.page_running_steps(model)
+                     if queue_view.running_matches_selector(entry.step, "run-owner", model.labels)]
+        self.assertEqual(selected.step, step)
+        self.assertNotIn("between steps", plain(view))
+        self.assertIn("5.0", plain(card))
         self.assertNotIn("run-owner", plain(card))
+        other = replace(model, reading=queue_read_fixture(
+            replace(model.reading.view, waiting=(self.fixture.model().reading.view.waiting[0],)),
+            policy=admission_policy_fixture()))
+        unselected = plain(queue_card.render_selection(other, "1", 400))
+        self.assertNotIn("Selected running step: ", unselected)
+        self.assertNotIn("run-unit", unselected)
+        self.assertNotIn("between steps", unselected)
 
     def test_step_ahead_keeps_its_run_place_instead_of_joining_earlier(self) -> None:
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
@@ -335,7 +377,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_running_selector_prints_one_complete_running_evidence_record(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "id-widget", 400))
-        expected = ("Selected running step: pid 900 · tool-based-ui / widget / widget-enhancements-title, nextest: "
+        expected = ("Selected running step: pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, hana nextest: "
                     "admitted 10:45 (0 min ago); need 11.1 GiB; anonymous use 5.1 GiB; "
                     "held slot 0.0 GiB; kept aside 6.0 GiB")
         self.assertEqual(text.count(expected), 1)

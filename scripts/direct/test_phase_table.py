@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -11,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import chdir, redirect_stderr
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
@@ -22,7 +24,7 @@ from scripts.direct import phase_table
 from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
+from scripts.production import fake_showrunner, fake_unit_host, session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit, unit_membership,
 )
@@ -84,6 +86,24 @@ class PhaseTableTests(unittest.TestCase):
     def write_plan(self, text: str) -> None:
         _ = self.plan.write_text(text, encoding="utf-8")
 
+    def test_owner_only_run_uses_the_moved_staff_folder_from_an_unrelated_folder(self) -> None:
+        self.write_plan(plan_text("# Plan", "### Phase 1 — Current work · status: todo"))
+        row = recorded_unit("show", "table", self.working_dir,
+                            self.working_dir / "docs/production.md", plan="docs/plan.md")
+        state = self.session_dir / "progress_history_state.json"
+        _ = state.write_text(json.dumps({"owner_staff_id": row.id, "status": "active", "plan_doc": "docs/plan.md"}))
+        before = state.read_bytes()
+        destination = self.root / "moved"
+        _ = self.working_dir.rename(destination)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        with chdir(self.root):
+            record = self.build(1_200)
+        self.assertEqual(record.plan, destination / "docs/plan.md")
+        self.assertEqual([phase.title for phase in record.phases], ["Current work"])
+        self.assertEqual(state.read_bytes(), before)
+        with self.assertRaisesRegex(phase_table.NoState, "owner"):
+            _ = phase_table.build(self.session_dir, resolver=session_staff.RowResolver(staff.StaffSnapshot(())))
+
     def write_state(self, phase: dict[str, object] | None) -> None:
         state = {
             "working_dir": str(self.working_dir),
@@ -96,6 +116,13 @@ class PhaseTableTests(unittest.TestCase):
             json.dumps(state),
             encoding="utf-8",
         )
+
+    def test_run_without_a_folder_reports_unreadable_staff_as_no_state(self) -> None:
+        _ = (self.session_dir / "progress_history_state.json").write_text(
+            json.dumps({"plan_doc": "docs/plan.md"}))
+        _ = (self.root / "staff.json").write_text("[]")
+        with self.assertRaisesRegex(phase_table.NoState, "no available owner folder.*staff record must be an object"):
+            _ = phase_table.build(self.session_dir)
 
     def write_run(
         self,
@@ -195,7 +222,7 @@ class PhaseTableTests(unittest.TestCase):
         for unit, plan, worktree in rows:
             row = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
             if plan.startswith("retired"):
-                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", worktree), expected=row.worktree)
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree), expected=row.worktree)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
@@ -279,7 +306,7 @@ class PhaseTableTests(unittest.TestCase):
     def unit_id(self, production: str = "show", unit: str = "table") -> str:
         row = unit_membership(production, unit)
         if isinstance(row.worktree, staff.WorktreeUnfilled):
-            row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / row.id), expected=row.worktree)
+            row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / row.id), expected=row.worktree)
         return row.id
 
     def write_phase_note(

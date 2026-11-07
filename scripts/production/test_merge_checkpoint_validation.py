@@ -11,9 +11,9 @@ from unittest import mock
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import merge_checkpoint
 from scripts.production import staff
+from scripts.production.production_doc import read_new_production
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
@@ -212,10 +212,54 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("commit", "-m", "conflicting main edit", cwd=main_writer)
         _ = self.git("push", "origin", "main", cwd=main_writer)
         result = self.run_checkpoint(sha)
-        self.assertIn("push: failed", result.process.stdout)
+        self.assertIn("push: held", result.process.stdout)
+        self.assertIn("src/alpha.txt", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
+        self.assertNotEqual(merge_checkpoint.git(self.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode, 0)
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), result.before)
+
+    def test_push_main_conflict_preserves_checkout_for_both_rollback_policies(self) -> None:
+        _ = self.checkpoint(content="unit alpha\n")
+        sha = self.checkpoint("src/beta.txt", "unit beta\n")
+        before_checkpoint_merge = self.git("rev-parse", "HEAD")
+        original_files = {path: (self.checkout / path).read_bytes() for path in ("src/alpha.txt", "src/beta.txt")}
+        _ = self.git("merge", "--no-ff", "-m", "merge checkpoint", sha)
+        _ = self.git("push", "origin", "production")
+        for path in ("src/alpha.txt", "src/beta.txt"):
+            self.write(self.promote, path, "main side\n")
+        _ = self.git("add", "src", cwd=self.promote)
+        _ = self.git("commit", "-m", "conflicting main edits", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        production = read_new_production(self.doc, "example")
+        before = self.git("rev-parse", "HEAD")
+        before_files = {path: (self.checkout / path).read_bytes() for path in ("src/alpha.txt", "src/beta.txt")}
+        for may_undo in (False, True):
+            with self.subTest(may_undo=may_undo):
+                with self.assertRaises(merge_checkpoint.Stop) as stopped:
+                    if may_undo:
+                        _ = merge_checkpoint.push_git(production, True)
+                    else:
+                        _ = merge_checkpoint.refresh_pushed_tip(production, before)
+                error = stopped.exception
+                output = StringIO()
+                with redirect_stdout(output):
+                    merge_checkpoint.report(error.step, error.state, error.detail)
+                self.assertIn("push: held", output.getvalue())
+                self.assertIn("src/alpha.txt, src/beta.txt", output.getvalue())
+                self.assertIn("merge origin/main into the merge branch", error.message)
+                self.assertIn("run the push again", error.message)
+                self.assertNotEqual(merge_checkpoint.git(self.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD"), before_checkpoint_merge if may_undo else before)
+                self.assertEqual(self.git("status", "--porcelain"), "")
+                if may_undo:
+                    for path, content in original_files.items():
+                        self.assertEqual((self.checkout / path).read_bytes(), content)
+                else:
+                    for path, content in before_files.items():
+                        self.assertEqual((self.checkout / path).read_bytes(), content)
+
+
     def test_red_package_resets_merge_and_known_flake_continues(self) -> None:
         self.write(self.unit, "crates/alpha/Cargo.toml", '[package]\nname = "alpha"\nversion = "0.1.0"\n')
         self.write(self.unit, "crates/alpha/src/lib.rs", "pub fn value() -> i32 { 1 }\n")

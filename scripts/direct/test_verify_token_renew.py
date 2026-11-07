@@ -388,7 +388,7 @@ class LintInputIdentityTests(VerifyLintCacheFixture):
         judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
         expected = [judgment]
         if fixes:
-            fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+            fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
             expected = [judgment, *([fix] * fixes), judgment]
         self.assertEqual(self.calls("clippy"), expected)
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Find local Claude quota refusals and start safe, account-grouped moves."""
 from __future__ import annotations
 try:

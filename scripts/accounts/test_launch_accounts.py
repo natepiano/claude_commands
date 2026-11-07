@@ -443,7 +443,7 @@ def session_launch(identity: str):
                 ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
                 ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
                  + 'open_window claude -n "$session_name" /berth_fix'),
-                ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
+                ("fixtures/background.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
             with self.subTest(path=path):
                 self.assertTrue(any("no resolved account" in problem
                                     for problem in shell_launch_account_violations(source, path)))

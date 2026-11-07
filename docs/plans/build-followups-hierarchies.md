@@ -566,23 +566,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 21 — A transfer's message reaches the moved unit  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- `transfer_unit.py apply` sends the moved unit's message to the bare staff id. The `staff:<id>` address is gone, because `send.py` does not take it.
+- `test_transfer_unit.py` expects the bare staff id. One new test checks that `send.resolve_staff_recipient` resolves that value to the moved unit's staff row, so a fake sender cannot hide a wrong address.
+- `commands/showrunner/transfer_unit.md` now says what the script does: the staff parent change, the one message and the tab move.
+- No other check, guard or refusal is added.
+- The live proof passed on main 04ea6cd03. Both transfers printed `told zz-tr-mike`, and the transcript records the notice once. The status line and the pane name the new production. The tab takes its A-Z place. A rerun sends no second notice. The live staff record did not change.
 
-**Goal:** the message from Phase 20 reaches the moved unit. In the live proof on 2026-11-05 (main 3b42139d0: hierarchies-unit to builds and back to sdlc), both transfers printed `could not tell hierarchies-unit: send.py: absence of staff:<id> here is not proven`. The tab moves were correct both ways.
+**Files:** `scripts/production/transfer_unit.py`, `scripts/production/test_transfer_unit.py`, `commands/showrunner/transfer_unit.md`.
 
-**Cause (found by the unit director):** `transfer_unit.py apply` sends to `staff:<member id>`. `send.py` does not take a `staff:` address: `resolve_staff_recipient` looks up the whole text as a staff id, finds nothing, and the roster lookup then fails. `send.py --to <member id>` (the bare staff id) resolves the row and delivers; a live probe proved it. The Phase 20 test replaced the sender with a fake, so it did not see this.
-
-**Spec:**
-1. `scripts/production/transfer_unit.py` `apply`: send to the bare staff id (`str(request.member.id)`), not `staff:<id>`.
-2. `scripts/production/test_transfer_unit.py`: the expected `--to` value is the bare staff id. Add one test that `send.resolve_staff_recipient` resolves that value to the moved unit's staff row, so a fake sender cannot hide a wrong address again.
-3. `commands/showrunner/transfer_unit.md` (the unit director writes this): it still describes a stop, a relaunch, a plan-header commit and a journal. Make it say what `transfer_unit.py` does now: the staff parent change, the one message, and the tab move.
-4. Add no other check, guard or refusal. Do not edit `scripts/production/unit_lookup.py`.
-
-**Acceptance gate:**
-- The unittest module `scripts/production/test_transfer_unit.py` passes, and basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- Live, from main after the merge: transfer hierarchies-unit to builds and back to sdlc. Each transfer prints `told hierarchies-unit`, the unit gets the message, its status line names the new production, and its tab is in its A-Z place.
+**Gotchas:** the Work Order named a live transfer of hierarchies-unit. The proof ran on TEST rows and tabs instead, because the user does not allow tests to act on a live unit. The proof script is not in the repo. It is at `phases/21/proof/` in the run folder of 2026-11-06.
 
 ### Phase 22 — Displays read workers through observe  · status: done
 
@@ -627,3 +621,78 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
 
 **Gotchas:** the gate on this checkpoint was red in 4 modules: `test_progress_history`, `test_session_pane`, `test_roles_audit` and `test_stop_resume`. The cause is outside this phase. Tests with a private staff record read the real timer folder, and the sdlc-devtools fix ec4762af6 repairs it.
+
+### Phase 24 — A worker list prints each run anomaly once  · status: done
+
+#### As-built
+
+- `unit_runs.report_anomaly` prints each anomaly line once per process. `unit_runs.director` and `worker_admission.parent` use it.
+- `unit_runs` and `scripts.lib.unit_runs` are one module through `sys.modules.setdefault`, so both names share that record.
+- One list makes one run scan. herdr phase 14d owns this: `worker._read_workers` reads the held runs once and `progress_history.dispatch_reads` shares them, so `dispatch_role(row)` scans nothing. Phase 24's own `dispatch_role(row, run)` form was dropped at the merge with 14d.
+- `worker_lifecycle.locked_state`: a shared read of a missing folder creates nothing. A writer still creates its folder and lock.
+- `worker_admission.parent` looks up a showrunner only when a production name is known. With no name, the error is a whole sentence that names what is missing.
+- No folder is deleted by code, and no check, guard or refusal is added. The cause of the mangled folder names is workers that retype a run path. sdlc gave herdr that design note.
+
+**Files:** `scripts/lib/unit_runs.py`, `scripts/production/worker_admission.py`, `scripts/agents/worker_lifecycle.py` and their test modules, and `scripts/production/test_worker.py`.
+
+**Gotchas:**
+- Do not run 223 test modules in one process. That run gave 214 failures and 60 errors from tests that interfere. Use `merge_gate.py --checkout <tree> --tests-only`.
+- A merge can bring a new caller of a changed signature. The sdlc merge brought `pane_moves.py`, and only the full gate found it.
+- `ROSTER_RUN_ROOT` selects the scanned runs in a worker list. The `test_worker` fixture sets it to its root folder.
+
+### Phase 25 — A new tab takes its place past saved worker tabs  · status: done
+
+#### As-built
+
+- `herdr.tab_order` places a tab that is not saved after the last placed tab with an equal or lower rule. With no such tab, it goes at `start`. Saved tabs keep their order, and the first tab stays first.
+- `_bind_row_tab` and `order_tabs` both use `tab_order`, so one change corrects a transfer, a new tab and a full reorder.
+- Tests: `test_a_new_unit_takes_its_place_past_a_saved_worker_tab` and `test_moved_unit_takes_its_place_past_a_saved_worker_tab`. The second test checks the live order and the saved order. Both fail on the old scan. `assert_moved_unit_order` holds the shared setup and assertions for the two move tests.
+- No check, guard or refusal is added.
+
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+
+### Phase 26 — An answer replay after a rename names the current production and unit  · status: done
+
+#### As-built
+
+- No production code changed. The design already holds on origin/sdlc 016475b0f through devtools 7u and 8a.
+- `outstanding_file` and `outstanding_path` key the list and its answered record by the owner's staff id. `remove_open_item` stores `asked_by` as a staff id. `answer` and `relay_line` read current names from staff.
+- `test_update_registration_answers.py` proves a replay after three changes: the asking unit is renamed, the production owner is renamed, and the asking unit moves to another production. Each replay prints `already answered <time>` with the original time, names the current destination, and leaves the answered record's bytes unchanged.
+- Mutations proved that the tests detect a stored name and a name-keyed answer file.
+- The 48-hour life of the answered record stays. It is the replay's own rule, not a rename rule.
+- `rename.py`, `rename_unit.py` and `rename_state.py` are unchanged.
+
+**Files:** `scripts/production/test_update_registration_answers.py`.
+
+### Phase 27 — A worker list numbers each row  · status: done
+
+#### As-built
+
+- Each text row of `worker.py list` starts with its number, right-aligned to the width of the count. The last number is the count.
+- `list --json`, the row order and the other fields do not change. An empty list prints nothing.
+- No code reads the text rows. `design_roles.py` reads the JSON.
+- This closes the feedback on change C1142.
+
+**Files:** `scripts/production/worker.py`, `scripts/production/test_worker.py`, `commands/unit/worker.md`.
+
+### Phase 28 — A retired unit leaves no gate copies  · status: done
+
+#### As-built
+
+- natedev-verify phase 41 landed the removal first: `retire_unit` and `tidy_wrapped` remove unit copies through `copies.unit_owner`. A busy copy refuses the retire. This phase kept that code and added no second owner rule.
+- `test_tidy_wrapped.py` now proves that a wrap removes `alpha-unit` and retired `beta-unit` copies and keeps a `live-unit` copy.
+- A rename removes nothing: `remove_trees` would end a live worker's copy. Queue re-keys copy owners by staff row id, and the rename call joins that work.
+- Copy owners on disk are `<name>-unit`, and staff names are bare.
+
+### Phase 29 — A staff row keeps a field that its code does not know  · status: done
+
+#### As-built
+
+- Cause: at 16:54 EST on 2026-11-06, launchers with `staff.py` from before 810931239 failed in `StaffRow.from_json`. That code refused any field it did not know, and hana had just written `paused` on 8 rows.
+- `StaffRow`, the four location types and `Paused` keep each field they do not know in `unknown_fields`. `to_json` writes those fields back unchanged. The required fields stay required.
+- `_keep_location_fields` keeps a location's fields on each change to that location: a new path or state, a retirement and a restore. The owner applies it, so a change from the Mac gives the same result. No command option changed.
+- A new pause record starts with no kept fields, because it replaces the old record.
+- A change that old code cannot read safely still takes a new schema number.
+- Limit: this protects only processes that start after it lands. No live Mac call was run. The test gives the owner the same input that the remote command gives.
+
+**Files:** `scripts/production/staff.py`, `scripts/production/test_staff.py`, `docs/as-built/staff-accessors.md`.

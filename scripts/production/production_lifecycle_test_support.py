@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import re
@@ -122,12 +124,12 @@ class LifecycleFixture(unittest.TestCase):
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.staff.register_production("example", self.doc)
-        owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+        owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(remote.local_machine(), self.doc))
         self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
                    f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {owner.id}\n")
         for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
             _ = fixture_member("unit", name=name, parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), folder))
 
     def remove_fixture(self) -> None:
         """Release the next fixture path before removal can fail."""
@@ -232,10 +234,10 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
         runner = fixture_member("showrunner", name="example",
-                              doc=staff.LiveDoc("natedev", self.doc))
+                              doc=staff.LiveDoc(remote.local_machine(), self.doc))
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
             row = fixture_member("unit", name=name, parent=runner.id,
-                               worktree=staff.PresentWorktree("natedev", worktree))
+                               worktree=staff.PresentWorktree(remote.local_machine(), worktree))
             _ = unit_config.write(worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
             self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
@@ -309,8 +311,8 @@ class LifecycleFixture(unittest.TestCase):
         doc = self.root / f"{production_name}-production.md"
         self.write(doc, f"# {production_name}\n")
         owners = [row for row in staff.find(kind="showrunner") if row.name == production_name]
-        owner = (staff.set_doc(owners[0].id, staff.LiveDoc("natedev", doc)) if owners
-                 else fixture_member("showrunner", name=production_name, doc=staff.LiveDoc("natedev", doc)))
+        owner = (staff.set_doc(owners[0].id, staff.LiveDoc(remote.local_machine(), doc)) if owners
+                 else fixture_member("showrunner", name=production_name, doc=staff.LiveDoc(remote.local_machine(), doc)))
         self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         if live:

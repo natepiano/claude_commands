@@ -6,6 +6,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
@@ -823,6 +824,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
+        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
@@ -849,7 +851,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "register_mac_wait",
-            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "ssh_reserve_hook",
+            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "remote_step_kind", "ssh_reserve_hook",
             "try_reserved_target", "check_mac_only_result", "mac_only_refuse",
             "route_test", "check_routing_hold")
         functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",
@@ -885,7 +887,7 @@ MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_VERB_ARGS=() MAC_FINISH_CALL=1 MAC_PASSE
 MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 PINNED_TARGET="" STEP_FORCE_MAC=0
-STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=mac_allowed
+STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
 VERDICT_KEY="" VERDICT_TREE_KEY="" CALL_NOTED=0

@@ -29,7 +29,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertEqual(events.read_text().splitlines(), ["RUSTFMT"])
 
     def test_clean_tree_runs_one_judgment_without_repairs_or_rustdoc(self) -> None:
-        result = self.verify("lint", "--workspace")
+        result = self.verify("lint")
         self.assertEqual(self.calls("clippy"), [[
             "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
         ]])

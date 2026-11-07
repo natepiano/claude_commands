@@ -159,12 +159,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
-    wire = "free_gib=1000\nhost=aws-build\nrustc=rustc fixture\nnextest=nextest fixture\n"
+    wire = "free_gib=1000\nhost=aws-build\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
     if mode == "disk":
         wire = wire.replace("free_gib=1000", "free_gib=0")
     if mode == "version-mismatch":
-        wire = wire.replace("rustc=rustc fixture", "rustc=rustc other")
+        wire = wire.replace("nextest=nextest fixture", "nextest=nextest other")
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()

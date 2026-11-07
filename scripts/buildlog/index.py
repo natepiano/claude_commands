@@ -253,7 +253,7 @@ CALL_COLUMNS: list[Column] = [
     ("caller", "TEXT", "verify for verify.sh (NULL before 2026-10-02), cargo-port for port-lint"),
     ("command", "TEXT", "'lint hana', 'test hana_diegetic', 'port-lint clippy', ..."),
     ("verb", "TEXT", "verify.sh: check, test, lint, fmt, example, example-test, final; port-lint: clippy, mend, sweep"),
-    ("package", "TEXT", "the package named"),
+    ("package", "TEXT", "the named package, or workspace"),
     (
         "outcome",
         "TEXT",

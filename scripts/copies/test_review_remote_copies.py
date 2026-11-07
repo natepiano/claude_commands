@@ -50,7 +50,7 @@ class RemoteEntryTests(unittest.TestCase):
         root = Path(cls.enterClassContext(tempfile.TemporaryDirectory())).resolve()
         with local_remote_transport(root):
             cls.source_seed = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",
-                                                     {"source.txt": "content\n"})
+                                                     {"Cargo.toml": "[workspace]\n", "source.txt": "content\n"})
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)

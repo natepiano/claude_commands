@@ -1,6 +1,8 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import tempfile
@@ -41,7 +43,7 @@ class StaffRoutingTests(unittest.TestCase):
         self.top = fixture_member("showrunner", name="top")
         self.child = fixture_member("showrunner", name="child", parent=self.top.id)
         self.unit = fixture_member("unit", name="builder", parent=self.child.id,
-            worktree=staff.PresentWorktree("natedev", self.root / "builder"))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root / "builder"))
 
     def router(self, record: staff.StaffSnapshot | None = None) -> change_routing.StaffRouting:
         return change_routing.StaffRouting(record or staff.snapshot(), {})
@@ -49,7 +51,7 @@ class StaffRoutingTests(unittest.TestCase):
     def configured_root_document(self) -> Path:
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n")
         _ = write_config_fixture(config / "change_review.conf")
@@ -72,6 +74,21 @@ class StaffRoutingTests(unittest.TestCase):
     def test_an_empty_producer_uses_the_list_showrunner(self) -> None:
         self.assertEqual(self.router().owner({"#": "C1", "Merged": "abcdef12"}, self.root / "change-review - top.md"),
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+
+    def test_a_production_cell_uses_the_unit_id_after_rename_and_transfer(self) -> None:
+        row = {"#": "C1", "Production": self.unit.id}
+        _ = staff.rename(self.unit.id, "renamed")
+        _ = staff.move(self.unit.id, staff.ReportsTo(self.top.id))
+        _ = fixture_member("unit", name="builder", parent=self.child.id,
+                           runtime_id=fixture_runtime_id("replacement-builder"))
+        self.assertEqual(self.router().owner(row, self.root / "change-review - child.md"),
+                         change_routing.StaffRoutedChange(self.unit.id, self.top.id, "top"))
+
+    def test_a_stored_production_name_goes_to_the_list_owner(self) -> None:
+        row = {"#": "C1", "Production": self.child.name}
+        owner = self.router().owner(row, self.root / "change-review - top.md")
+        self.assertEqual(owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+        cast(mock.Mock, self.alert).assert_not_called()
 
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
         _ = self.enterContext(production_staff_record())
@@ -158,7 +175,7 @@ class StaffRoutingTests(unittest.TestCase):
         row = {"#": "C1", "Producer": self.unit.id}
         before = self.router().owner(row, self.root / "change-review - top.md")
         _ = staff.rename(self.unit.id, "renamed")
-        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "builder"),
+        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree(remote.local_machine(), self.root / "builder"),
                                    expected=self.unit.worktree)
         self.assertEqual(self.router().owner(row, self.root / "change-review - top.md"), before)
 
@@ -178,12 +195,12 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_owner_document_does_not_require_a_list_document(self) -> None:
         doc = self.root / "child-production.md"
         _ = doc.write_text("# Child")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), doc))
         listing = self.root / "change-review - missing.md"
         assignment = self.router().owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "child")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         assignment = self.router().owner_and_production(self.root / "change-review - top.md", {"#": "C2"})
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "top")
@@ -199,7 +216,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_a_missing_staff_document_uses_the_supplied_production_document(self) -> None:
         doc = self.root / "supplied.md"
         _ = doc.write_text("# Supplied")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", self.root / "missing.md"))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.root / "missing.md"))
         router = change_routing.StaffRouting(staff.snapshot(), {"child": doc})
         self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
                          {"#": "C1", "Producer": self.unit.id}).production, doc)
@@ -238,7 +255,7 @@ class StaffRoutingTests(unittest.TestCase):
         listing = self.root / "change-review - top.md"
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         config.mkdir()
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
@@ -256,7 +273,7 @@ class StaffRoutingTests(unittest.TestCase):
         listing = self.root / "change-review - orphan.md"
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         config.mkdir()
         setting = config / "review_links.conf"
@@ -363,7 +380,7 @@ class StaffRoutingTests(unittest.TestCase):
         supplied, authoritative = self.root / "supplied.md", self.root / "staff.md"
         _ = supplied.write_text("# Supplied")
         _ = authoritative.write_text("# Staff")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", authoritative))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), authoritative))
         router = change_routing.StaffRouting(staff.snapshot(), {"child": supplied})
         self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
                          {"#": "C1", "Producer": self.unit.id}).production, authoritative)
@@ -385,10 +402,10 @@ class StaffRoutingTests(unittest.TestCase):
         listing = self.root / "change-review - top.md"
         for name, doc in docs.items():
             _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", docs["top"]))
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", docs["child"]))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), docs["top"]))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), docs["child"]))
         retired = fixture_member("unit", name="retired", parent=self.child.id,
-                                worktree=staff.RemovedWorktree("natedev", self.root / "removed"))
+                                worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed"))
         _ = staff.rename(self.unit.id, "renamed")
         _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
             date(2026, 11, 2), "", docs["top"],

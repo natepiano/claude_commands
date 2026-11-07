@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import head_facts
+from scripts.build_queue import head_facts, queue_lines
 from scripts.build_queue.queue_lines import age, field
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
 from scripts.lib.build_steps import StepNames
@@ -162,8 +162,8 @@ def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
         if not release.ended:
             text = "no running step needs to end"
         else:
-            ended = [explanation.running[index].step for index in release.ended]
-            ended_steps = [step_labels(step, labels).session + " " + names.prose(step.step) for step in ended]
+            ended_steps = [step_labels(explanation.running[index].step, labels).session
+                           + " " + queue_lines.step_prose(explanation.running[index].step, names) for index in release.ended]
             text = (f"{' + '.join(ended_steps)} end (keep-aside drops {gib(release.growth_drop)}; "
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
@@ -235,7 +235,7 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
         observed = memory.peak_history
         phase = (f"; tests started: need {gib(gate.test_phase_charge(observed))} "
                  f"(test peak {gib(observed.peak_so_far)}, history {gib(observed.need.bytes)} x {observed.need.margin:g})")
-    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {names.prose(running.step.step)}: {started}; "
+    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {queue_lines.step_prose(running.step, names)}: {started}; "
             + evidence + phase + swap)
 
 

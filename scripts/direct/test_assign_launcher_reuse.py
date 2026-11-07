@@ -18,6 +18,93 @@ setUpModule = mesh_fixture.setUpModule
 
 @final
 class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
+    def use_fixture_server_start(self) -> None:
+        directory = self.session_dir.parent / "restart-server"
+        directory.mkdir()
+        _ = (directory / "sitecustomize.py").write_text("\n".join((
+            "import json, sys",
+            "from pathlib import Path",
+            "def enter(frame, event, argument):",
+            "    if event != 'call' or frame.f_code.co_name != 'main' or not frame.f_code.co_filename.endswith('/agents/codex_mesh.py'): return",
+            "    sys.setprofile(None)",
+            "    mesh = sys.modules['__main__']",
+            "    def start_server(session_dir, workers_home, *extra):",
+            f"        Path(session_dir, mesh.SERVER_FILE).write_text(json.dumps({{'pid': {os.getpid()}, 'port': {self.server.port}, 'codex_home': str(workers_home), 'auto_compact_tokens': mesh.AUTO_COMPACT_TOKENS, 'dev_shell_worktree': {str(self.project)!r}}}))",
+            f"        return {self.server.port}",
+            "    mesh._start_server = start_server",
+            "    mesh._start_watcher = lambda *args: mesh.ExistingServerWatcher()",
+            "sys.setprofile(enter)",
+        )) + "\n")
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "PYTHONPATH": os.pathsep.join((str(directory), str(launcher_fixture.ROOT))),
+        })))
+
+    def test_a_dead_launcher_and_server_recover_the_same_thread_for_named_dispatch(self) -> None:
+        _ = self.successful()
+        name, original = next(iter(self.assignment_records().items()))
+        original.update({"status": "running", "launcher_pid": 99999999, "turn_id": "lost-turn"})
+        self.write_pool_roster({name: original})
+        respond = self.server.respond
+        self.server.close()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.server = mesh_fixture.StubAppServer(respond)
+        self.server.hang_guard = self.hang_guard
+        self.use_fixture_server_start()
+        _ = self.successful("implement", "--to", name)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
+        self.assertEqual(self.methods("thread/start"), [])
+        resumed = [cast(dict[str, object], request["params"])["threadId"]
+                   for request in self.methods("thread/resume")]
+        self.assertTrue(resumed)
+        self.assertEqual(set(resumed), {original["thread_id"]})
+        self.assertEqual(cast(dict[str, object], self.methods("turn/start")[-1]["params"])["threadId"],
+                         original["thread_id"])
+        self.assertEqual(self.turn_starts, 2)
+
+    def test_an_ended_worker_dispatches_again_on_its_recorded_thread(self) -> None:
+        _ = self.successful()
+        name, original = next(iter(self.assignment_records().items()))
+        code, output, errors = self.run_mesh(["end", "--to", name])
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(self.assignment_records()[name]["status"], "ended")
+        self.use_fixture_server_start()
+        _ = self.successful("implement", "--to", name)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(cast(dict[str, object], self.methods("turn/start")[-1]["params"])["threadId"],
+                         original["thread_id"])
+        self.assertEqual(self.turn_starts, 2)
+
+    def assert_reopened_dispatch_keeps_a_thread_when_resume_fails(self, status: str) -> None:
+        _ = self.successful()
+        name, original = next(iter(self.assignment_records().items()))
+        original.update({"status": status, "launcher_pid": 99999999})
+        self.write_pool_roster({name: original})
+        respond = self.server.respond
+
+        def refuse_resume(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "result": {"data": [original["thread_id"]], "nextCursor": None}}]
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "no rollout found for thread id " + str(original["thread_id"])}}]
+            return respond(request)
+
+        self.server.respond = refuse_resume
+        result = self.launch("implement", "--to", name,
+                             execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no rollout found", result.stderr)
+        self.assertTrue(self.methods("thread/resume"))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
+
+    def test_a_dead_launchers_reopened_dispatch_refuses_a_missing_thread_without_replacement(self) -> None:
+        self.assert_reopened_dispatch_keeps_a_thread_when_resume_fails("running")
+
+    def test_an_ended_workers_reopened_dispatch_refuses_a_missing_thread_without_replacement(self) -> None:
+        self.assert_reopened_dispatch_keeps_a_thread_when_resume_fails("ended")
+
     def test_named_dispatch_reuses_a_thread_and_advances_the_manifest_number(self) -> None:
         self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))

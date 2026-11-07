@@ -163,12 +163,17 @@ def _settings() -> ConfigRead:
     return conf.read_or_repository("build_folders")
 
 
-def repository_key(repository: Path) -> str:
-    """Distinguish repositories with equal basenames using their canonical paths."""
+def repository_key_for(name: str, identity: str) -> str:
+    """Append the configured identity hash to a readable repository name."""
     from hashlib import sha256
 
+    return f"{name}-{sha256(os.fsencode(identity)).hexdigest()[:_settings().whole('names.repository_key_length')]}"
+
+
+def repository_key(repository: Path) -> str:
+    """Distinguish repositories with equal basenames using their canonical paths."""
     canonical = repository.resolve()
-    return f"{canonical.name}-{sha256(os.fsencode(canonical)).hexdigest()[:_settings().whole("names.repository_key_length")]}"
+    return repository_key_for(canonical.name, str(canonical))
 
 
 def build_folder_path(spec: BuildFolderSpec) -> Path:

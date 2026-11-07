@@ -28,6 +28,33 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 class ProtocolTests(unittest.TestCase):
 
+    def test_codec_reuses_shared_records_only_within_one_encode(self) -> None:
+        shared = {"name": "private", "values": [1, 2]}
+        encoded = cast(list[object], codec.snapshot_value([shared, shared]))
+        self.assertEqual(encoded, [shared, shared])
+        self.assertIs(encoded[0], encoded[1])
+        shared["name"] = "changed"
+        again = cast(list[object], codec.snapshot_value([shared, shared]))
+        self.assertEqual(again, [shared, shared])
+        self.assertIsNot(again[0], encoded[0])
+        for scalar in (None, True, 3, 2.5, "private"):
+            self.assertIs(codec.snapshot_value(scalar), scalar)
+
+    def test_reply_bytes_keep_the_existing_domain_representation(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = fixture.server.handle_request(request)[0]
+            viewed = fixture.server.handle_request(wire.ViewRequest())[0]
+            explained = fixture.server.handle_request(wire.ExplainRequest())[0]
+            for reply, name in ((grant, "admitted"), (viewed, "view"), (explained, "explain")):
+                with self.subTest(name=name):
+                    expected = json.dumps({"v": wire.VERSION, "type": name,
+                        "data": codec.snapshot_value(reply)}, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False) + "\n"
+                    self.assertEqual(wire.encode_reply(reply), expected)
+                    self.assertEqual(wire.parse_reply(expected), reply)
+            self.assertIsInstance(grant, wire.Admitted)
+
     def test_service_estimate_request_carries_identity_without_a_client_estimate(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.service_request()

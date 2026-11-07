@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
@@ -15,7 +17,6 @@ from pathlib import Path
 from typing import cast, final
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
@@ -56,7 +57,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(len(steps), 2)
             self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
-            self.assertEqual(steps[1].command[-3:], ["example", "aws-routing-proof", "demo"])
+            self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
     def test_example_without_a_manifest_has_no_step(self) -> None:
@@ -160,7 +161,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / "removed"), expected=row.worktree)
             _ = unit_membership("example", "standby")
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)

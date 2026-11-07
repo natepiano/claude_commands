@@ -10,16 +10,18 @@
 # at once -- rather than N-1 point-to-point sends that can each fail.
 #
 # Usage:
-#   board.sh post    <session_dir> <agent> <kind> <message...>
-#   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
+#   board.sh post    [<session_dir>] <agent> <kind> <message...>
+#   board.sh read    [<session_dir>] [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS] [--pid PID]
-#   board.sh role    <session_dir> <slot> <role> [note...]
+#   board.sh role    [<session_dir>] <slot> <role> [note...]
 #   board.sh roles   <session_dir>
 #   board.sh locks   <session_dir>
+#
+# post, read, and role use UNIT_RUN_DIR when the first argument is not an absolute path.
 #
 # Post kinds (a closed set, so peers can scan for what concerns them):
 #   register  — "I am <slot>, opening in <role>". The launcher stamps the same
@@ -618,6 +620,14 @@ main() {
   local command="${1:-}"
   [[ -n "$command" ]] || die "usage: board.sh {post|read|acquire|release|renew|role|roles|locks} <session_dir> ..."
   shift
+  case "$command" in
+    post|read|role)
+      if [[ "${1:-}" != /* ]]; then
+        [[ -n "${UNIT_RUN_DIR:-}" ]] || die "$command needs <session_dir> or UNIT_RUN_DIR"
+        set -- "$UNIT_RUN_DIR" "$@"
+      fi
+      ;;
+  esac
   case "$command" in
     post)    cmd_post "$@" ;;
     read)    cmd_read "$@" ;;

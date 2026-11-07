@@ -174,6 +174,7 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Waiting Test")
         _ = self.git("config", "user.email", "waiting@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "README.md", "base\n")
         self.write(self.checkout / "shared.txt", "base\n")
         self.production_doc()
@@ -264,11 +265,11 @@ class WaitingTests(unittest.TestCase):
         )))
 
         owner = showrunner_relationship("showrunner-example")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), self.doc))
         _ = write_timer(self.root / "notifier", owner.name, owner.id, "", self.doc)
         for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
             row = unit_membership("showrunner-example", unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(local_machine(), folder), expected=row.worktree)
             if folder.exists():
                 write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
 

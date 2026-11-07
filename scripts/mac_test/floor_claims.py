@@ -194,8 +194,6 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
 
 def serve() -> int:
     """Use the claim writer's lock and decoder without deleting stale records."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     mac_test = cast(ClaimReader, cast(object, import_module('scripts.mac_test.mac_test')))
 
     paths = mac_test.state_paths()

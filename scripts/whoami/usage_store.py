@@ -10,7 +10,6 @@ import fcntl
 import json
 import math
 import os
-import sys
 import tempfile
 from dataclasses import dataclass
 from collections.abc import Generator
@@ -20,7 +19,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
 from scripts.whoami.note_file import canonical_label

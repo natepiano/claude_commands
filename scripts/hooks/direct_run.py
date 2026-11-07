@@ -13,6 +13,10 @@ marker's mtime -- see `_recently_active`.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
@@ -25,7 +29,7 @@ if TYPE_CHECKING:
     from ..direct.worker_state import worker_status_paths
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import unit_runs
+    from scripts.lib import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
     from worker_state import worker_status_paths
 

@@ -25,7 +25,6 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production.merge_checkpoint import promote, request_from
 from scripts.production import merge_checkpoint
 from scripts.production import change_review

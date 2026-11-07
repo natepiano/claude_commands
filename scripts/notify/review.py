@@ -39,7 +39,7 @@ from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAc
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
-    from ..accounts import accounts
+    from scripts.accounts import accounts
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
@@ -660,8 +660,6 @@ def validate(value: object, draft: Draft, revision: bool,
 
 def reviewer_environment() -> tuple[dict[str, str], str]:
     # Import the shared account modules from this checkout, not the writer's login.
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
     environment = dict(os.environ)
@@ -1353,7 +1351,6 @@ class QuestionRegistrationsIncomplete:
 def registered_questions(since: datetime) -> list[str] | QuestionRegistrationsIncomplete:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    sys.path.insert(0, str(ROOT))
     question_store = importlib.import_module("scripts.production.update_registration")
     read_fields = cast(Callable[[], Sequence[Mapping[str, str]]], question_store.read_all_open_fields)
     try:

@@ -48,8 +48,7 @@ def main() -> None:
     # this hook's start-up time.
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from banned_words_lib import (
+    from scripts.hooks.banned_words_lib import (
         COUNTER_STATE,
         STYLE_GUIDE,
         bump_counters,

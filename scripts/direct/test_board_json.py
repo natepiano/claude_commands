@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_unit
 
 import json
@@ -31,7 +33,7 @@ import io
 from scripts.herdr import worker_panes
 from scripts.herdr import herdr
 from scripts.shutdown import pane_record
-import display_cells
+from scripts.production import display_cells
 
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"
@@ -94,7 +96,7 @@ class BoardJsonTests(unittest.TestCase):
         child = self.production("wrapped", running=False)
         self.attach(child.name, root.name)
         old = next(row for row in staff.find(kind="showrunner") if row.name == child.name)
-        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", child.document))
+        _ = staff.set_doc(old.id, staff.WrappedDoc(remote.local_machine(), child.document))
         _, documents = self.generate("--production", root.name)
         self.assertEqual([document["production"] for document in documents], [root.name])
         retained = staff.by_id(old.id)
@@ -116,6 +118,10 @@ class BoardJsonTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         self.history = self.root / "history"
         (self.history / "runs").mkdir(parents=True)
         self.run_root = self.root / "unit"
@@ -182,7 +188,7 @@ class BoardJsonTests(unittest.TestCase):
         self.plan(fixture)
         _ = recorded_unit(name, unit_name, worktree, document, plan="plan.md")
         row = next(row for row in staff.find(kind="showrunner") if row.name == name)
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", document))
+        _ = staff.set_doc(row.id, staff.LiveDoc(remote.local_machine(), document))
         _ = fake_showrunner.write_timer(self.notifier, name, row.id, "UTC", document)
         if running:
             process_ids = (os.getpid(), os.getppid(), 1)
@@ -337,6 +343,7 @@ class BoardJsonTests(unittest.TestCase):
     def session_files(self, name: str = "current", *, former: bool = False) -> Path:
         directory = (self.former_root if former else self.run_root) / name
         directory.mkdir(exist_ok=True)
+        write_text_atomic(directory / "worker_transport", "mesh\n")
         _ = (directory / "mesh_roster.json").write_text(json.dumps({
             "alpha-impl": {"slot": "1", "role": "impl", "status": "running",
                            "thread_id": "thread-one", "turn_id": "turn-one",
@@ -529,7 +536,7 @@ class BoardJsonTests(unittest.TestCase):
         second_parent = next(row for row in staff.find(kind="showrunner") if row.name == second.name)
         other = self.unit_member(second.name)
         _ = staff.rename(other.id, "unrelated")
-        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
+        _ = staff.set_worktree(other.id, staff.RemovedWorktree(remote.local_machine(), second.worktree), expected=other.worktree)
         moved = staff.move(unit.id, staff.ReportsTo(second_parent.id))
         self.staff_launch(moved, moved.id, pane="newer")
 
@@ -730,7 +737,7 @@ class BoardJsonTests(unittest.TestCase):
         document = self.root / "unregistered-production.md"
         _ = document.write_text("# Production — unregistered\n")
         _ = fixture_member("showrunner", name="unregistered", parent=child_row.id,
-                           doc=staff.LiveDoc("natedev", document))
+                           doc=staff.LiveDoc(remote.local_machine(), document))
         response, documents = self.generate("--production", root.name)
 
         self.assertEqual([doc["production"] for doc in documents],
@@ -1927,7 +1934,7 @@ class BoardJsonTests(unittest.TestCase):
 
 class PaneBoardTests(StaffTestCase):
     def pane_run(self) -> tuple[Path, staff.StaffRow, staff.StaffRow]:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id)
         run = self.root / "run"
         run.mkdir()
@@ -2003,7 +2010,7 @@ class PaneBoardTests(StaffTestCase):
         world = PaneWorld()
         for index in range(2):
             parent = fixture_member("unit", name=f"unit-{index}", parent=runner.id,
-                                    worktree=staff.PresentWorktree("natedev", self.root / str(index)))
+                                    worktree=staff.PresentWorktree(remote.local_machine(), self.root / str(index)))
             worker = fixture_worker("reader", parent.id)
             world.add(worker, f"w1:p{index}")
             world.locations[f"w1:p{index}"]["agent_status"] = herdr.AgentStatus.WORKING

@@ -25,29 +25,19 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from scripts.message.sessions import addressed, live_sessions  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.lib import unit_runs
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.build_hold import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_queue import admission_service
-    from ..buildlog import store
-    from ..message import session_send
-else:
-    from scripts.build_queue import admission_service
-    from scripts.buildlog import store
-    from scripts.message import session_send
+from scripts.build_queue import admission_service
+from scripts.buildlog import store
+from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -1768,7 +1758,7 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module('scripts.build_targets.build_targets'), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])

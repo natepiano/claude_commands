@@ -601,10 +601,12 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                 rank: str = "", owners: Sequence[Path] = (),
                 producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
-                on_hold: Callable[[PublicationChange], None] | None = None) -> list[str]:
+                on_hold: Callable[[PublicationChange], None] | None = None,
+                merge_changes: Sequence[PublicationChange] = ()) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
+    merge_changes supplies every change of this merge routed to this list.
     """
     if not changes:
         return []
@@ -620,10 +622,11 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
 
     def write(lines: list[str]) -> list[str]:
         existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
+        covered = _merge_covered(existing, merge_changes, repo, merged)
         selected: list[int] = []
         for index, change in enumerate(changes):
             if isinstance(change, PublicationChange):
-                if _covered(existing, change, repo):
+                if change in covered or (not merge_changes and _covered(existing, change, repo)):
                     continue
                 if isinstance(change.item.readiness, AfterStep) and on_hold is not None:
                     on_hold(change)
@@ -685,6 +688,32 @@ def _covered(rows: list[dict[str, str]], change: PublicationChange, repo: Path) 
         if ancestor.returncode == 0:
             return True
     return False
+
+
+def _merge_covered(rows: list[dict[str, str]], changes: Sequence[PublicationChange],
+                   repo: Path, merged: str) -> list[PublicationChange]:
+    """Use text matches first, then pair merge rows with ready changes and held changes from one step."""
+    covered: list[PublicationChange] = []
+    used: set[int] = set()
+    for change in changes:
+        for index, row in enumerate(rows):
+            if _covered([row], change, repo):
+                covered.append(change)
+                used.add(index)
+                break
+    uncovered = [change for change in changes if change not in covered]
+    ready = [change for change in uncovered if isinstance(change.item.readiness, ReadyNow)]
+    held = [change for change in uncovered if isinstance(change.item.readiness, AfterStep)]
+    steps = {change.item.readiness.step for change in held if isinstance(change.item.readiness, AfterStep)}
+    remaining = iter(ready + (held if len(steps) == 1 else []))
+    for index, row in enumerate(rows):
+        found = _HASH.search(row.get("Merged", ""))
+        if index not in used and found is not None and (found[0].startswith(merged) or merged.startswith(found[0])):
+            change = next(remaining, None)
+            if change is None:
+                break
+            covered.append(change)
+    return covered
 
 
 def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: str) -> str:
@@ -1533,6 +1562,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         commits = [commit for commit in merge_commits(repo, merge) if not _named_in(commit, foreign)]
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
         routed: dict[tuple[Path, Path], list[PublicationChange]] = {}
+        merge_changes: dict[Path, list[PublicationChange]] = {}
         noted: set[str] = set()
 
         def note(change: PublicationChange) -> None:
@@ -1552,9 +1582,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                     else UNKNOWN_PRODUCER)
         for change in publication_changes(commits, production, record=record, known_producer=producer):
             readiness = change.item.readiness
-            if isinstance(selection, CompletedStep):
-                if not isinstance(readiness, AfterStep) or readiness.step != selection.step:
-                    continue
+            if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
                 matched_step = True
             owner_doc = credited(change.source.production if isinstance(change.source, UnitSource) else production, record)
             path = review_list if review_list is not None else list_path(owner_doc, record=record)
@@ -1563,9 +1591,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             if path is None:
                 continue
             routed.setdefault((path, owner_doc), []).append(change)
+            merge_changes.setdefault(path, []).append(change)
         for (path, owner_doc), changes in routed.items():
-            rows.extend(append_rows(path, changes, today(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None))
+            selected = changes
+            if isinstance(selection, CompletedStep):
+                selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
+                            and change.item.readiness.step == selection.step]
+            rows.extend(append_rows(path, selected, today(), short, owner_doc, record=record, repo=repo,
+                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                    merge_changes=merge_changes[path]))
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows

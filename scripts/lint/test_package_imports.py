@@ -1,6 +1,7 @@
 """Check import conversion and shared module identity in a private checkout."""
 from __future__ import annotations
 
+import ast
 from contextlib import redirect_stdout
 import io
 import os
@@ -14,6 +15,291 @@ from scripts.lint import package_imports
 
 
 class PackageImportTests(unittest.TestCase):
+    def test_conversion_keeps_an_elif_with_originally_equal_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "records.py").write_text("class CallRecord: pass\nclass NoCallRecord: pass\n")
+            caller = folder / "caller.py"
+            path_change = "sys.path.append(__file__)\n"
+            source = ('''import sys
+from scripts.alpha.records import CallRecord, NoCallRecord
+''' + path_change + '''VERSION = sys.version_info.major
+def record(call, fields):
+    if call.get("kind") == CallRecord.__name__ and isinstance(call.get("call_id"), str):
+        fields["call_id"] = call["call_id"]
+    elif call.get("kind") == NoCallRecord.__name__:
+        fields["call_id"] = None
+    else:
+        fields["call_id"] = None
+''')
+            _ = caller.write_bytes(source.encode())
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), source.replace(path_change, "", 1).encode())
+
+    def test_conversion_collapses_branches_made_equal_by_import_rewrites(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 1\n")
+            caller = folder / "caller.py"
+            _ = caller.write_text('''import sys
+sys.path.append(__file__)
+if sys.version_info.major == 3:
+    import worker
+else:
+    from scripts.alpha import worker
+print(worker.VALUE)
+''')
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_text(), "from scripts.alpha import worker\nprint(worker.VALUE)\n")
+
+    def assert_conversion_refuses_dynamic_path(self, path_change: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 'repository worker'\n")
+            caller = folder / "caller.py"
+            source = ('''#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+''' + path_change + '''
+import worker
+print(worker.VALUE)
+''').encode()
+            _ = caller.write_bytes(source)
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), source)
+            self.assertRegex(
+                report.getvalue(),
+                r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*: dynamic sys\.path change$",
+            )
+
+    def test_conversion_refuses_a_path_assignment_from_the_current_directory(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path[0] = os.getcwd()')
+
+    def test_conversion_refuses_an_unsupported_file_directory_call(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path.insert(0, os.path.dirname(__file__))')
+
+    def test_conversion_refuses_a_path_slice_with_a_vendor_directory(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path[:0] = [str(Path(__file__).parent), "/opt/vendor"]')
+
+    def test_conversion_refuses_to_select_a_repository_import_after_a_plugin_path(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path.insert(0, os.environ["PLUGIN_DIR"])')
+
+    def test_conversion_removes_an_extend_list_of_file_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 'repository worker'\n")
+            caller = folder / "caller.py"
+            path_change = 'sys.path.extend([str(ROOT)])\n'
+            source = ('''import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+''' + path_change + '''import worker
+print(worker.VALUE, ROOT, sys.version_info.major)
+''')
+            _ = caller.write_bytes(source.encode())
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            expected = source.replace(path_change, "", 1).replace("import worker\n", "from scripts.alpha import worker\n", 1)
+            self.assertEqual(caller.read_bytes(), expected.encode())
+            self.assertNotRegex(report.getvalue(), r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*:")
+
+    def assert_conversion_refuses_source(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            caller = root / "scripts/alpha/caller.py"
+            caller.parent.mkdir(parents=True)
+            original = source.encode()
+            _ = caller.write_bytes(original)
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), original)
+            self.assertRegex(report.getvalue(), r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*: .+$")
+
+    def test_conversion_refuses_to_delete_a_function_that_has_a_caller(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+def configure():
+    sys.path.insert(0, __file__)
+configure()
+''')
+
+    def test_conversion_refuses_to_leave_a_decorator_without_its_class(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+def decorate(value):
+    return value
+@decorate
+class Configured:
+    sys.path.insert(0, __file__)
+instance = Configured()
+''')
+
+    def test_conversion_refuses_a_path_change_on_a_line_with_a_kept_return(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+def configure(): sys.path.append(__file__); return 1
+print(configure())
+''')
+
+    def test_conversion_refuses_binding_cleanup_that_would_empty_a_function(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+def configure():
+    folder = __file__
+    sys.path.append(folder)
+configure()
+''')
+
+    def test_conversion_refuses_to_delete_a_loop_binding_read_after_the_loop(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+for directory in ("a",):
+    sys.path.insert(0, __file__)
+print(directory)
+''')
+
+    def test_conversion_keeps_a_refused_entry_unchanged_without_a_bootstrap(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+from scripts.alpha import worker
+def configure():
+    sys.path.insert(0, __file__)
+if __name__ == "__main__":
+    configure()
+    print(worker.VALUE)
+''')
+
+    def test_conversion_removes_a_builtin_str_guard_for_a_resolved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            caller = root / "scripts/alpha/caller.py"
+            caller.parent.mkdir(parents=True)
+            guard = '''    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+'''
+            source = ('''import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+def reviewer_environment():
+''' + guard + '''    return 1
+print(reviewer_environment(), ROOT, sys.version_info.major)
+''')
+            _ = caller.write_bytes(source.encode())
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            converted = caller.read_bytes()
+            _ = ast.parse(converted)
+            self.assertEqual(converted, source.replace(guard, "", 1).encode())
+            self.assertNotRegex(report.getvalue(), r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*:")
+
+    def test_conversion_refuses_a_path_guard_that_calls_a_root_function(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+from pathlib import Path
+def get_root():
+    return Path(__file__).resolve().parents[2]
+def reviewer_environment():
+    if str(get_root()) not in sys.path:
+        sys.path.insert(0, str(get_root()))
+    return 1
+print(reviewer_environment())
+''')
+
+    def test_conversion_refuses_a_path_guard_for_a_function_parameter(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+def reviewer_environment(value):
+    if str(value) not in sys.path:
+        sys.path.insert(0, str(value))
+    return 1
+print(reviewer_environment(__file__))
+''')
+
+    def test_conversion_refuses_a_path_guard_when_str_is_rebound(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+str = repr
+def reviewer_environment():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    return 1
+print(reviewer_environment())
+''')
+
+    def test_conversion_refuses_a_while_header_call_around_a_path_change(self) -> None:
+        self.assert_conversion_refuses_source('''import sys
+while str("x"): sys.path[:] = [__file__]
+print("reached")
+''')
+
+    def test_conversion_removes_a_loop_whose_body_only_changes_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            caller = folder / "caller.py"
+            loop = '''for directory in ("production", "shutdown"):
+    sys.path.insert(0, __file__)
+    sys.path.insert(0, __file__)
+'''
+            source = 'import sys\n# Keep this comment.\nVERSION = sys.version_info.major\n' + loop + '\nRESULT = "unchanged"  # Keep this spacing.\n'
+            _ = caller.write_bytes(source.encode())
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            converted = caller.read_bytes()
+            _ = ast.parse(converted)
+            self.assertEqual(converted, source.replace(loop, "", 1).encode())
+
+    def test_conversion_keeps_a_mixed_loop_when_a_nested_path_loop_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            caller = folder / "caller.py"
+            path_change = '    sys.path.insert(0, __file__)\n'
+            nested_loop = '''    for added in ("production", "shutdown"):
+        sys.path.insert(0, __file__)
+'''
+            source = ('import sys\n# Keep the mixed loop.\nfor directory in ("alpha", "beta"):\n'
+                      + path_change + nested_loop
+                      + '    print(directory, sys.version_info.major)  # Keep this statement.\n')
+            _ = caller.write_bytes(source.encode())
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            converted = caller.read_bytes()
+            _ = ast.parse(converted)
+            self.assertEqual(converted, source.replace(path_change, "", 1).replace(nested_loop, "", 1).encode())
+
+    def test_conversion_keeps_the_file_when_path_removal_would_empty_one_if_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            caller = folder / "caller.py"
+            source = '''import sys
+if sys.version_info.major == 3:
+    sys.path.insert(0, __file__)
+else:
+    print("Keep the other branch.")
+'''
+            _ = caller.write_bytes(source.encode())
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), source.encode())
+            self.assertRegex(report.getvalue(), r"(?m)^scripts/alpha/caller\.py:2: .+$")
+
     def test_bootstrap_preserves_the_docstring_future_imports_and_nested_entry_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -198,7 +484,7 @@ def check():
             self.assertNotIn("import sys", converted)
             self.assertNotIn("from pathlib import Path", converted)
             self.assertNotIn("ROOT =", converted)
-            self.assertTrue(converted.startswith("#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py\n"))
+            self.assertTrue(converted.startswith("#!/usr/bin/env python3\n"))
             self.assertIn("outside: scripts/beta/consumer.py", report.getvalue())
             self.assertIn("sys.path.insert", (beta / "consumer.py").read_text())
             result = subprocess.run([sys.executable, "-c", '''from scripts.alpha import caller

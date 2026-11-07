@@ -410,11 +410,15 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
+    kind = pane_launch.agent_kind(entry)
+    program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
+    if kind == "codex":
+        environment["CODEX_HOME"] = entry["config_dir"]
+        program = ["codex"]
     return ["env", *(argument for key in unset for argument in ("-u", key)),
             *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
-            sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
+            *program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
@@ -422,7 +426,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     """Replace the foreground command with the saved account launch."""
     command = _pane_command(tab, entry, account)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, *([message] if message else [])])
+    os.execvp(command[0], [*command, *([message] if message and pane_launch.agent_kind(entry) == "claude" else [])])
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
@@ -700,9 +704,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["environment"] = names.environment(entry)
         from scripts.whoami.account import named_account_environment
 
-        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
+        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label

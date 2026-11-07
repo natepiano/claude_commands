@@ -16,7 +16,6 @@ import sys
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.shutdown import stop_resume
@@ -39,10 +38,9 @@ from scripts.production.merge_checkpoint import (
 from scripts.production import production_doc
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
-import berth_board
+from scripts.lib import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
 

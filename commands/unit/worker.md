@@ -8,7 +8,7 @@ Run `scripts/lib/py scripts/production/worker.py` from the unit's session.
 The caller's native identity selects the parent.
 Use the supplied arguments: `$ARGUMENTS`.
 
-1. Use `list [--json]` to show names, dispatch roles, worker states, and activity.
+1. Use `list [--json]` to show names, dispatch roles, worker states, and activity. Text rows start with row numbers.
 2. Use `add <role> [--name <name>] [--json]` to create a worker or reconcile named creation.
 3. Use `end <name>` to close a worker and remove its row after confirmed closure.
 4. Use `restore` to resume retained workers on their recorded native sessions.

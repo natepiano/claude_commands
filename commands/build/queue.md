@@ -6,7 +6,13 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGU
 
 The admission service supplies the queue through `memory_admit.queue_read()`. The view and cards use the service's stored decision.
 The budget bar shows free (`░`) and taken (`█`) GiB. Running rows precede waiting rows in one table.
-`run` marks running steps with their showrunner, unit, step, minutes since start, and reserve. Live use follows the reserve when space permits.
+`run` marks running steps with their showrunner, unit, step, minutes since start, machine, pid, and reserve.
+The machine column follows `min` and precedes `pid` in the table of the view and of each card.
+A card's running record names the machine after the pid.
+It uses `scripts.buildlog.store.host_name()`, the shared short host name.
+A narrow view omits the machine column before it reduces name space.
+Waiting rows have no machine value. Services lines do not change.
+Live use follows the reserve when space permits.
 Waiting rows keep positions 1..N and show their wait and need.
 `▸` marks your steps. The head shows its free memory, reserve, need, and queue window.
 Unowned scopes show their memory as separate rows.

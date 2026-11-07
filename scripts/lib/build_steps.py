@@ -17,5 +17,9 @@ class StepNames:
         return self.settings.get(f"prose.{step}", self.shown(step))
 
 
+# Show each step as the queue records it, for a caller that reads no configuration.
+RECORDED_STEP_NAMES = StepNames(MappingProxyType({}))
+
+
 def read_step_names() -> StepNames:
     return StepNames(MappingProxyType(conf.read_or_repository("build_steps").values()))
