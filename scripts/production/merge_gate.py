@@ -163,6 +163,7 @@ class SharedMachine:
 @dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
+    module_seconds: dict[str, float] = field(default_factory=dict[str, float])
 
 
 SHARED_MACHINE = SharedMachine()
@@ -988,7 +989,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     scope_prefix = suite_scope_prefix() if shared else []
     state_directory = gate_state_dir() if shared else tmpfs
     timings_path = state_directory / "module_seconds.json"
-    timings = read_measures(timings_path) if shared else {}
+    timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
     cpu_path = state_directory / "module_cpu_seconds.json"
     cpu_measures = read_measures(cpu_path) if shared else {}
     run_cpu: dict[str, float] = {}

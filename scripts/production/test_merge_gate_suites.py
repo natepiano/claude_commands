@@ -19,6 +19,33 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
+        path = self.state / "module_seconds.json"
+        content = json.dumps({"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+        self.write(path, content)
+        machine = merge_gate.WholeMachine(merge_gate.read_measures(path))
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              mock.patch.object(merge_gate, "save_measures", side_effect=AssertionError("measure write")),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = merge_gate.run_suites(self.checkout, machine=machine)
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["hooks", "direct"])
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(machine.module_seconds, {"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_without_times_keeps_the_discovery_order(self) -> None:
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = merge_gate.run_suites(self.checkout, machine=merge_gate.WholeMachine())
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["direct", "hooks"])
+
     @gate_suites("lib")
     def test_whole_machine_uses_all_cpus_without_shared_admission_or_holds(self) -> None:
         self.write(self.state / "barrier", "two")

@@ -655,13 +655,22 @@ Start with one small run:
 6. Run all discovered test modules and the script type check through `run_suites` with `WholeMachine`.
 7. Terminate each instance when its attempt ends.
 
-The tool shell includes `taplo`, `zsh`, `bash`, `gh`, and Git.
-Before the guest starts, it links `/bin/bash` and `/bin/zsh` to the installed shells.
+The host reads the root `nixpkgs` input revision from `/etc/nixos/flake.lock` before it creates trial resources.
+Every guest tool uses that revision, including Python, basedpyright, SQLite, and `google-chrome` for headless chart tests.
+The tool shell also includes `taplo`, `zsh`, `bash`, `gh`, and Git.
+Root prepares `/bin/bash`, `/bin/zsh`, and Python at `/run/current-system/sw/bin/python3` through a temporary bind mount.
+The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
+Its shell reads `/etc/profile` before tests start, then restores the tool PATH.
+The exported NixOS environment marker prevents child zsh shells from replacing fixture paths.
+Tool preparation time includes these packages and setup. Its change remains to be measured.
 
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.
 The instance uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
 The `WholeMachine` mode uses the instance CPU count as its maximum parallel job count.
+The host sends its recorded module times from `~/.local/state/merge-gate/module_seconds.json` as a separate S3 object.
+`WholeMachine` uses `module_order` with these times, which places unknown modules first, then measured modules from slowest to fastest.
+A missing or unreadable host file keeps the discovery order. The guest writes no module times back.
 It records this value as `max_running_jobs` in JSON and text.
 It limits each module to `gate_trial_module_limit_s` seconds, with a default of 600, and disables reruns.
 The JSON report retains each module's status, time, and stopped flag.
@@ -726,7 +735,11 @@ The bucket has public access blocked and a one-day object lifetime.
 User data schedules `shutdown -h +30` before other commands by default.
 It runs the tool shell directly and creates no systemd unit.
 The guest uploads `boot.log`, `gate.log`, `timeline.log`, and the current UTC time every `gate_trial_log_push_s` seconds.
-Each timeline line records the UTC time, load, available memory, and process count.
+Each timeline line records the UTC time, load, available memory, process count, and CPU busy percent since the previous sample.
+CPU busy time excludes idle and iowait from the aggregate counters in `/proc/stat`.
+The result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
+CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
+The text table shows CPU use percent for each size and run.
 Each upload includes the current process snapshot, with at most 60 lines and 200 characters per line.
 The snapshot excludes lines that contain `curl` and is not stored between uploads.
 The default interval is 30 seconds. A failed upload does not stop later uploads.

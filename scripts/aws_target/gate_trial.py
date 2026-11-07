@@ -30,6 +30,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, execute_comman
 from scripts.aws_target.config import read_settings
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.merge_gate import gate_state_dir, read_measures
 
 
 @dataclass(frozen=True, repr=False)
@@ -57,8 +58,20 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
     return f'https://{host}{path}?{query}&X-Amz-Signature={signature}'
 
 
+NIXOS_LOCK = Path('/etc/nixos/flake.lock')
+
+
+def host_nixpkgs_revision() -> str:
+    """Read the host's locked nixpkgs input before creating trial resources."""
+    lock = ledger.mapping(cast(object, json.loads(NIXOS_LOCK.read_text())))
+    nodes = ledger.mapping(lock['nodes'])
+    inputs = ledger.mapping(ledger.mapping(nodes[ledger.text(lock, 'root')])['inputs'])
+    locked = ledger.mapping(ledger.mapping(nodes[ledger.text(inputs, 'nixpkgs')])['locked'])
+    return ledger.text(locked, 'rev')
+
+
 # This program runs inside the instance's tool shell, not on natedev.
-GUEST = r'''import contextlib, json, os, pathlib, subprocess, sys, threading, time, traceback, urllib.request
+GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback, urllib.request
 root = pathlib.Path('/var/lib/gate-trial')
 links = json.loads((root / 'links.json').read_text())
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
@@ -69,6 +82,9 @@ def put(url, content):
         response.read()
 def publish(name):
     put(links[name], json.dumps(result).encode())
+def busy_cpu_seconds():
+    ticks = list(map(int, pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
+    return (sum(ticks) - ticks[3] - ticks[4] - ticks[7]) / os.sysconf('SC_CLK_TCK')
 def sample_memory():
     try:
         fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
@@ -83,11 +99,13 @@ def monitor_memory(stop):
             return
 memory_stop = threading.Event()
 memory_thread = None
+cpu_started = None
 try:
     result['tools'] = {}
-    for name in ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv'):
+    for name in ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3'):
         version = subprocess.run([name, '--version'], capture_output=True, text=True)
         result['tools'][name] = (version.stdout or version.stderr).strip()
+    result['tools']['python_sqlite'] = sqlite3.sqlite_version
     if links['step'] == 'start':
         result['tools_ready_at'] = time.time()
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
@@ -97,27 +115,34 @@ try:
         subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(root / 'repo')], check=True)
         repo = root / 'repo'
         subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
-        pathlib.Path('/root/.claude').mkdir(exist_ok=True)
-        pathlib.Path('/root/.claude/config').symlink_to(repo / 'config', target_is_directory=True)
+        home = pathlib.Path.home() / '.claude'
+        home.mkdir(exist_ok=True)
+        (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
         sys.path.insert(0, str(repo))
         from scripts.production import merge_gate
+        timings = {}
+        if 'module_seconds' in links:
+            with urllib.request.urlopen(links['module_seconds'], timeout=60) as response:
+                timings = json.loads(response.read())
         preparation = merge_gate.typecheck_python()
         if isinstance(preparation, str):
             raise RuntimeError(preparation)
         result['tools_ready_at'] = time.time()
-        result['gate_started_at'] = time.time()
         result['module_time_limit_s'] = links['module_time_limit_s']
         result['max_running_jobs'] = os.cpu_count() or 1
+        result['vcpus'] = result['max_running_jobs']
         sample_memory()
         memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
         memory_thread.start()
         with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             with merge_gate.rollback_signals():
-                gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True, machine=merge_gate.WholeMachine(),
+                cpu_started = busy_cpu_seconds()
+                result['gate_started_at'] = time.time()
+                gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True, machine=merge_gate.WholeMachine(timings),
                                              module_time_limit_s=links['module_time_limit_s'])
-        result['gate_finished_at'] = time.time()
-        result['gate_s'] = gate.seconds
+                result['gate_finished_at'] = time.time()
+                cpu_finished = busy_cpu_seconds()
         result['verdict'] = 'pass' if gate.passed else 'fail'
         result['modules'] = []
         for job in gate.jobs:
@@ -132,11 +157,19 @@ try:
 except BaseException:
     if 'gate_started_at' in result:
         result['gate_finished_at'] = time.time()
+        cpu_finished = busy_cpu_seconds()
     result['verdict'] = 'error'
     result['error'] = traceback.format_exc()
     with log.open('a') as output:
         output.write(result['error'])
 finally:
+    if cpu_started is not None:
+        if 'gate_finished_at' not in result:
+            result['gate_finished_at'] = time.time()
+            cpu_finished = busy_cpu_seconds()
+        result['gate_s'] = result['gate_finished_at'] - result['gate_started_at']
+        result['busy_cpu_s'] = cpu_finished - cpu_started
+        result['cpu_use_percent'] = 100 * result['busy_cpu_s'] / (result['vcpus'] * result['gate_s'])
     if memory_thread is not None:
         memory_stop.set()
         memory_thread.join()
@@ -169,8 +202,14 @@ def log_upload(links: dict[str, str]) -> str:
 
 def log_push_loop(links: dict[str, str], interval_s: float) -> str:
     return f'''push_logs() {{
+    cpu_ticks() {{ awk '/^cpu / {{for (i=2;i<=9;i++) t+=$i; printf "%.0f %.0f\\n", t, $5+$6+$9; exit}}' /proc/stat; }}
+    set -- $(cpu_ticks)
+    previous_total=$1 previous_idle=$2
     while sleep {interval_s:g}; do
-        printf '%s loadavg=%s %s processes=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" >> /var/lib/gate-trial/timeline.log || :
+        set -- $(cpu_ticks)
+        busy=$(awk -v total="$(($1-previous_total))" -v idle="$(($2-previous_idle))" 'BEGIN {{printf "%.2f", (total>0 ? 100*(total-idle)/total : 0)}}')
+        previous_total=$1 previous_idle=$2
+        printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> /var/lib/gate-trial/timeline.log || :
         {log_upload(links)}
     done
 }}
@@ -200,13 +239,27 @@ trap boot_failed EXIT
 '''
 
 
-def user_data(links: dict[str, str], release: str, lifetime_minutes: int, log_push_s: float,
+def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
     packages = ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
                 'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux',
-                'taplo', 'zsh', 'bash', 'gh')
-    tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/nixos-{release}#{name}') for name in packages)
+                'taplo', 'zsh', 'bash', 'gh', 'sqlite', 'google-chrome', 'util-linux')
+    tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
+    session = '''ln -sf "$(command -v bash)" /bin/bash
+ln -sf "$(command -v zsh)" /bin/zsh
+mkdir -p /run/gate-trial-bin
+cp -as /run/current-system/sw/bin/. /run/gate-trial-bin/
+ln -sf "$(command -v python3)" /run/gate-trial-bin/python3
+mount --bind /run/gate-trial-bin /run/current-system/sw/bin
+chown -R gate-trial:users /var/lib/gate-trial
+runuser -u gate-trial -- env HOME=/home/gate-trial XDG_RUNTIME_DIR=/run/user/$(id -u gate-trial) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u gate-trial)/bus bash -c '
+tool_path=$PATH
+unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
+. /etc/profile
+export PATH="$tool_path:$PATH"
+exec python3 /var/lib/gate-trial/guest.py'
+'''
     return f'''#!/bin/sh
 shutdown -h +{lifetime_minutes}
 set -eu
@@ -220,14 +273,12 @@ GATE_LINKS
 cat > /var/lib/gate-trial/guest.py <<'GATE_GUEST'
 {GUEST}
 GATE_GUEST
-export HOME=/root
-export XDG_RUNTIME_DIR=/run/user/0
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+touch /var/lib/gate-trial/timeline.log
+id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
+loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
-loginctl enable-linger root
-nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec 'ln -sf "$(command -v bash)" /bin/bash
-ln -sf "$(command -v zsh)" /bin/zsh
-exec python3 /var/lib/gate-trial/guest.py'
+export NIXPKGS_ALLOW_UNFREE=1
+nix --extra-experimental-features 'nix-command flakes' shell --impure {tools} --command bash -ec {shlex.quote(session)}
 '''
 
 
@@ -375,6 +426,8 @@ class GateTrial:
         self.commit = ''
         self.object_bytes = 0
         self.interrupted = False
+        self.module_seconds: dict[str, float] = {}
+        self.nixpkgs_revision = ''
 
     def cancel(self) -> None:
         with self.changed:
@@ -583,6 +636,12 @@ class GateTrial:
                 json.dumps({'Rules': [{'ID': 'trial-expiry', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Expiration': {'Days': 1}}]}), service='s3api')
             _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'source.bundle', '--body', str(bundle), service='s3api')
             self.puts += 1
+            if self.module_seconds:
+                timings = bundle.with_name('module_seconds.json')
+                _ = timings.write_text(json.dumps(self.module_seconds))
+                _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'module_seconds.json',
+                                  '--body', str(timings), service='s3api')
+                self.puts += 1
             reply = self.api.call('create-security-group', '--group-name', 'gate-trial-' + self.run_id,
                                  '--description', 'Disposable gate trial; egress only', '--vpc-id', self.settings.vpc)
             self.group = ledger.text(reply, 'GroupId')
@@ -594,6 +653,7 @@ class GateTrial:
             return presign(method, host, name, self.settings.region, self.signing, datetime.fromtimestamp(self.clock(), UTC),
                            conf.read(self.settings.path).whole('gate_trial_url_lifetime_s'))
         return {'step': step, 'commit': self.commit, 'boot': 'cold', 'source': url('GET', 'source.bundle'),
+                **({'module_seconds': url('GET', 'module_seconds.json')} if self.module_seconds else {}),
                 **{name: url('PUT', key + '/' + name) for name in ('result', 'log', 'ready-cold', 'ready-warm')}}
 
     def state(self, instance: str) -> str:
@@ -704,7 +764,7 @@ class GateTrial:
         with tempfile.TemporaryDirectory() as folder:
             data = Path(folder) / 'user-data'
             minutes = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes')
-            _ = data.write_text(user_data(self.links(key, step), self.settings.release, minutes,
+            _ = data.write_text(user_data(self.links(key, step), self.nixpkgs_revision, minutes,
                                          self.option('log_push_s'), self.option('module_limit_s')))
             lifetime = minutes * 60
             try:
@@ -835,6 +895,7 @@ class GateTrial:
         return (f'{attempt.size} | {attempt.attempt} | {attempt.method} | {attempt.zone} | {times} | ${attempt.dollars:.4f} | '
                 + f'{attempt.result.get("tests", "-")} | {attempt.result.get("skips", "-")} | {attempt.memory_peak_bytes} | '
                 + f'{attempt.result.get("max_running_jobs", "-")} | {attempt.verdict} | '
+                + f'{attempt.result.get("cpu_use_percent", "-")} | '
                 + f'{attempt.result.get("failed_modules", [])} | {attempt.error.replace(chr(10), "; ")} | {attempt.log_path} | '
                 + json.dumps(attempt.capacity_refusals))
 
@@ -856,7 +917,7 @@ class GateTrial:
                 'dollars': self.spent + self.s3_cost, 'cleanup_errors': self.cleanup_errors, 'interrupted': self.interrupted, 'remaining': self.remaining(),
                 'cost_basis': 'Read prices and observed seconds. Final rows share the S3 cost. Confirm costs with the AWS bill.'}
             text = ('Commit: ' + self.commit + '\nFamily: ' + self.settings.family + '\nsize | attempt | method | zone | request to running | running to tools ready | '
-                    + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | peak machine memory bytes | max_running_jobs | verdict | failed modules | error | log | capacity refusals\n'
+                    + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | peak machine memory bytes | max_running_jobs | verdict | CPU use percent | failed modules | error | log | capacity refusals\n'
                     + '\n'.join(self.row(row) for row in self.attempts) + '\nMedians:\n'
                     + '\n'.join(name + ': ' + json.dumps(values, sort_keys=True) for name, values in medians.items())
                     + f'\nCheapest size at most {self.option("target_gate_s"):g} s: {report["cheapest_size"]}\nBatch: not measured\n'
@@ -947,6 +1008,9 @@ class GateTrial:
         bundle_bytes = 0
         try:
             with tempfile.TemporaryDirectory() as folder:
+                self.nixpkgs_revision = host_nixpkgs_revision()
+                print('Guest nixpkgs revision: ' + self.nixpkgs_revision, flush=True)
+                self.module_seconds = read_measures(gate_state_dir() / 'module_seconds.json')
                 bundle = Path(folder) / 'source.bundle'
                 self.commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
                 print('Commit: ' + self.commit, flush=True)

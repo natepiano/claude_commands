@@ -181,6 +181,19 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 It uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
 Both modes use one launch loop with the same commands, test environments, timeouts, tripwires, and process cleanup.
 `WholeMachine` prints each completed job's name, exit status, and seconds.
+`WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
+Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
+The gate trial sends the host's module times as a separate S3 object.
+The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
+All guest tools use that revision, including Python, basedpyright, SQLite, and `google-chrome` for headless chart tests.
+Root prepares the shell links and a temporary system profile bind mount with Python at `/run/current-system/sw/bin/python3`.
+The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
+Its shell reads `/etc/profile` before tests, then restores the tool PATH.
+The NixOS environment marker prevents child zsh shells from replacing fixture paths.
+The guest timeline records CPU busy percent between samples from the aggregate `/proc/stat` counters, excluding idle and iowait.
+The guest result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
+CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
+The trial text table shows CPU use percent for each size and run.
 The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
