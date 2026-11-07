@@ -132,13 +132,13 @@ def decide(raw: str) -> int:
             return _refuse("binding reservation ledger is unreadable") if held else 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-        acquisition = phase_reservation.own_acquisition(answer, root, phases, session_id)
-        if phase is not None and acquisition is not None:
-            try:
-                _ = phase_reservation.record_active(phase.directory, acquisition)
-            except OSError:
-                # The edit is protected either way; the checkpoint's backstop records Active.
-                pass
+        if phase is None:
+            continue
+        try:
+            _ = phase_reservation.record_own_acquisition(answer, root, phases, session_id, phase)
+        except OSError:
+            # The edit stays protected. The checkpoint backstop records Active later.
+            pass
     return 0
 
 

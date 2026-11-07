@@ -650,6 +650,31 @@ class StaffTests(StaffTestCase):
         assert current is not None
         self.assertIsInstance(current.paused, staff.Paused)
 
+    def test_production_pause_refuses_an_unmatched_exclusion_without_a_write(self) -> None:
+        owner = self.tree()[0]
+        excluded = fixture_member("unit", name="kept", parent=owner.id)
+        before = self.staff_state()
+        result = self.cli("pause", "--production", owner.name, "--except", excluded.name,
+                          "--except", "unknown-unit", "--why", "review the selected units", code=2)
+        self.assertIn("StaffRefused", result.stderr)
+        self.assertIn("unknown-unit", result.stderr)
+        self.assertIn(owner.name, result.stderr)
+        self.assertEqual(self.staff_state(), before)
+
+    def test_production_pause_refuses_another_productions_unit_without_a_write(self) -> None:
+        owner = self.tree()[0]
+        other = fixture_member("showrunner", name="other")
+        foreign = fixture_member("unit", name="foreign", parent=other.id)
+        before = self.staff_state()
+        for reference in (foreign.name, str(foreign.id)):
+            with self.subTest(reference=reference):
+                result = self.cli("pause", "--production", owner.name, "--except", reference,
+                                  "--why", "review the selected units", code=2)
+                self.assertIn("StaffRefused", result.stderr)
+                self.assertIn(reference, result.stderr)
+                self.assertIn(owner.name, result.stderr)
+                self.assertEqual(self.staff_state(), before)
+
     def test_rename_and_move_preserve_the_pause_record(self) -> None:
         owner, unit, worker = self.tree()
         destination = fixture_member("showrunner", name="hana")

@@ -22,6 +22,7 @@ from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopF
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
+from scripts.whoami import agent_accounts
 
 
 class WorkerRow(Protocol):
@@ -183,7 +184,9 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         projected = names.resume(original) if original is not None else None
         kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
             if original is not None else session_launch(str(row.current_session), row.name))
-        selected = stop_resume.resume_account(kind, row, to=target_account)
+        selected = stop_resume.resume_account(kind, row, to=target_account or (
+            accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(Path(original["config_dir"])),
+                                         Path(original["config_dir"])) if kind == "codex" and original is not None else ""))
         if isinstance(selected, accounts.NamedAccount):
             _ = stop_resume.heal_account_trust(folder, selected.dir,
                 Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
@@ -383,7 +386,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
                      for space in herdr.saved_layout(client.session)["workspaces"]
                      for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
-        for row, pane in row_panes(selected, client):
+        visible = row_panes(list(record.rows) if stop_all else selected, client)
+        for row, pane in visible:
+            if row not in selected:
+                continue
             try:
                 workspace, index, tab = client.pane_tab(pane)
                 positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
@@ -391,6 +397,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _anomaly(row, error)
         for row in selected:
             print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
+        for row in {row.id: row for row, _pane in visible if row not in selected}.values():
+            print(f"{row.name}: left alone; no proved local restart target")
         return 0
     errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []

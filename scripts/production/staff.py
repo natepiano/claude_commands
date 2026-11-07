@@ -417,10 +417,12 @@ class StaffSnapshot:
     current_sessions_recorded: bool = field(default=True, compare=False)
     # True only when snapshot() reads the production record.
     production: bool = field(default=False, compare=False)
+    # The session ids a caller already read. None reads the session registry at use.
+    running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
     @cached_property
     def backends(self) -> Mapping[StaffId, ClaudeBackend | CodexBackend]:
-        return _found_backends(self.rows)
+        return _found_backends(self.rows, self.running_sessions)
 
     @cached_property
     def rows_by_id(self) -> dict[StaffId, StaffRow]:
@@ -908,7 +910,8 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
     return _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE)
 
 
-def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | CodexBackend]:
+def _found_backends(rows: Sequence[StaffRow],
+                    running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each home."""
     from scripts.message import sessions
 
@@ -929,8 +932,9 @@ def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | C
                         _ = found.setdefault(identity, CodexBackend(home))
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
-    running = ({record["sessionId"] for record in sessions.running_sessions()}
-               if any(identity not in found for identity in wanted.values()) else set[str]())
+    if running is None:
+        running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
+                   if any(identity not in found for identity in wanted.values()) else frozenset())
     for current, identity in wanted.items():
         if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
@@ -1460,10 +1464,10 @@ def _pause_units(arguments: _Arguments) -> int:
     if arguments.production:
         members = cast(Callable[[str], tuple[StaffRow, ...]],
                        import_module("scripts.production.staff_sources").production_units)
-        resolve_exclusions = cast(Callable[[tuple[StaffRow, ...], Sequence[str]], set[StaffId]],
+        resolve_exclusions = cast(Callable[[tuple[StaffRow, ...], Sequence[str], str], set[StaffId]],
                                  import_module("scripts.production.session_staff").excluded_unit_ids)
         production = members(arguments.production)
-        excluded = resolve_exclusions(production, arguments.excluded)
+        excluded = resolve_exclusions(production, arguments.excluded, arguments.production)
         references = [str(row.id) for row in production if row.id not in excluded]
     else:
         references = [arguments.target]

@@ -43,6 +43,7 @@ class Round(TypedDict):
     started_at: float
     finished_at: float
     cause: Cause
+    ledger_rounds: list[int]
     fix_seconds: float
     passes: int
     fix_passes: list[int]
@@ -240,7 +241,11 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
         result.append(Round(
             round=0, started_at=started,
             finished_at=max(repair["finished_at"] for repair in group) if all(repair["finished_at"] for repair in group) else 0.0,
-            cause=cause, fix_seconds=sum(repair["seconds"] for repair in group),
+            cause=cause, ledger_rounds=sorted(
+                ({_integer(batch.get("round")) for batch in ledger}
+                 | {repair["ledger_round"] for repair in group if repair["ledger_round"] > 0}) - refunded
+            ),
+            fix_seconds=sum(repair["seconds"] for repair in group),
             passes=len(group), fix_passes=numbers, activities=activities, covered=covered,
         ))
     result.sort(key=lambda repair: repair["started_at"])

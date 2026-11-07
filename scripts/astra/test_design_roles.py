@@ -9,6 +9,7 @@ from scripts.production.staff_test_support import (
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.server_test_support import owned_server_record
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib import conf
 
@@ -508,7 +509,7 @@ class DurableRolesTests(HeldRolePaneCase):
             roster[row.name] = {"staff_id": row.id, "status": "done", "launcher_pid": 0,
                                 "held_design_id": design.placement.design_id, "held_role": role}
             write_text_atomic(path, json.dumps(roster))
-            write_mesh_server_record(mesh, self.root / "codex-home")
+            self.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
             if self.lose_creation_ack:
                 self.lose_creation_ack = False
                 raise TimeoutError("creation acknowledgement lost")
@@ -1920,12 +1921,15 @@ class DurableRolesTests(HeldRolePaneCase):
                     for path in (directory / folder).rglob("*") if path.is_file()}
         authority_before = self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
                                                    "host": "natedev"})
+        mesh = design_roles.mesh_directory(design_id)
+        process = self.enterContext(owned_server_record(mesh / "mesh_server.json"))
         _ = self.panes.world.foreground.pop("w1:p1")
         _ = self.panes.world.foreground.pop("w1:p2")
         first = design_roles.end(design_id + "/designer")
         self.assertIsInstance(self.instance(first, "designer").lifecycle, design_roles.RoleEnded)
         self.assertIsInstance(self.instance(first, "reviewer").lifecycle, design_roles.RoleOpen)
         self.assertEqual(len(self.panes.world.closed), 1)
+        self.assertIsNone(process.poll())
         reviewer = cast(design_roles.RoleOpen, self.instance(first, "reviewer").lifecycle)
         self.assertIsNotNone(staff.by_id(reviewer.staff_id))
         ended = design_roles.end(design_id + "/reviewer")
