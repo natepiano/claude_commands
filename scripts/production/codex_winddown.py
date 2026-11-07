@@ -5,6 +5,10 @@ A running Codex agent is one live `codex_mesh.py start|follow` turn or one plain
 `codex exec`. It belongs to the nearest ancestor that is a named Claude session.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json

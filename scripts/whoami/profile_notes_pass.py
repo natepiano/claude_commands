@@ -9,6 +9,10 @@ Action counters include zeroes. Read-only children run normally; only their firs
 two command words appear in the report. Pass messages and child output stay private.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import builtins

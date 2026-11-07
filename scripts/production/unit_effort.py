@@ -11,6 +11,10 @@ is skipped and reported. The registry's `production.director` row keeps its mode
 level, through default_models.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import re

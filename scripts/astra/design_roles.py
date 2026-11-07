@@ -5,6 +5,10 @@ Only the pinned authority changes placements. Local lifecycle actions keep threa
 assignment evidence and pending messages when a server or acknowledgement is lost.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import configparser

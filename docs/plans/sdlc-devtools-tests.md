@@ -1196,7 +1196,7 @@ Source: sdlc [c27b7d82] 2026-11-05 (the item); plan by a read-only worker at `a7
 **Spec:**
 1. **Imports.** Every repository import is `from scripts.<folder> import module` or `from scripts.<folder>.<module> import name`. Convert bare imports (2,276 in 499 files), relative imports (338), import names built in strings, and mock patch targets. At `a74569610`: 758 `sys.path` calls in Python (409 per folder, 322 to the package root, 27 dynamic), 21 in shell, 124 inside Python strings and generated fixtures.
 2. **One package root.** The `scripts/lib/py` shim sets the root, before both its cached and uncached exits. For a script path it uses that script's checkout; for `-m`, `-c` and stdin it uses the shim's checkout. It keeps the caller's working directory, the `CLAUDE_PYTHON` override, the interpreter cache and the version floor. Today both exits (`py:42` cached, `py:74` resolved) exec with no package root. The two statusline `-I` calls (`statusline.sh:66`, `:76`) use one central isolated form that keeps isolation. Keep the startup hooks that `test_simplify_lens.py:75` and `merge_gate.py:714` use.
-3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
+3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). The one exception is `scripts/lib/package_root.py`, which each entry file loads by path so that bare `python3 <path>` works (phase 8n). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
 4. **Entries through the shim.** Every managed entry runs through the shim: hook commands in `settings.json`, transient systemd commands (`accounts/unit_watchdog.py:219` runs `-m`, `build_hold/hold_enforcer.py:449`, `build_queue/queue_place.py:309`, `agents/mesh_runs.py:398`), shell lines that call `python3` (`statusline/statusline.sh:66`), `sys.executable` calls by path, `-m` and `-c` (`production/merge_gate.py:722`), shebang scripts (`agents/codex_mesh.py:1`), and command documents and their generated skill copies (`commands/producer/to_production.md:127` runs bare `berth.work_order`). `herdr.py:2722` starts a native server through `Herdr.argv`; it stays a non-Python command. Two entries keep a foreign interpreter: `banned_word_analysis/banned-word-gradient.py` (`uv`, for Pillow) and the Blender script in `commands/blender/bake_textures.md:12` (`bpy`). Their launch line sets `PYTHONPATH` to the checkout; the file has no `sys.path` line (`banned-word-gradient.py:36` goes).
 5. **Rewrite script, committed.** One script converts plain imports, patch targets and inserts in a tree with one command. Each unit converts its own branch with it at its next merge. Run it on the newest sdlc tip just before each hash. The last hash deletes it, when no `sys.path` line is left.
 6. **Guard.** Dropped (sdlc [e00ba3f9]): no guard test.
@@ -1439,3 +1439,51 @@ Source: sdlc [1225326b]. `direct/test_end_session` went red in the fix-rounds ga
 **State:** none.
 
 **Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line.
+
+### Phase 8n — Entry scripts run under bare python3  · status: done
+
+Source: sdlc [9c7948fb], [1690c7b8]. Main 2271a9572 brought 3z and 8i. After it, every `python3 ~/.claude/scripts/<x>.py` call failed with `ModuleNotFoundError: No module named 'scripts'` (measured: `send.py`, `update_registration.py`, `change_review.py`, `style_sync.py`). Cause: 3z converted imports to `from scripts.<folder> import <module>`, and only `scripts/lib/py` puts the checkout root on `sys.path`. Bare `python3 <path>` puts only the script's own folder there. sdlc reverted main to 0a1794c67's tree as c2852a093. This phase reverts that revert and adds the fix, so 8i, 3z and the `test_new_account` fix land again.
+
+**Depends on:** none. It branches from origin/sdlc c2852a093. 8l and 8m stack on it after it lands.
+
+#### Work Order
+
+**Goal:** every entry script runs under bare `python3 <path>` from any working directory, with no change to a doc or a caller.
+
+**Spec:**
+1. **One shared bootstrap.** Add `scripts/lib/package_root.py`. When it runs, it puts the checkout root (the folder above `scripts/`, from its own resolved `__file__`) on `sys.path` directly after the script's own folder, the same place the shim's `PYTHONPATH` gives it. It adds nothing when an entry of `sys.path` already resolves to that root. It imports only the standard library and defines no public names. It is the one file that changes `sys.path` for the package root.
+2. **One line in each entry file.** Every non-test Python file under `scripts/` that runs as a program (a `__name__ == "__main__"` block or a shebang) and has a `scripts.` import anywhere loads the bootstrap by path in one block, before its first import other than `from __future__`:
+
+   ```python
+   try:
+       with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+   except FileNotFoundError:
+       pass
+   ```
+
+   with one `../` for each folder level below `scripts/`. The path also works when `__file__` has no folder part, as under `runpy.run_path("send.py")`. A copy of an entry file outside the checkout (a test fixture, a launcher runtime) finds no bootstrap and runs as it did before this phase, with the root from `PYTHONPATH`. The block has no `sys.path` text, returns no value and costs under 2 ms for each start (measured 0.9 ms; a `runpy` and `pathlib` form cost 15 ms). A file still has its old `sys.path` lines if its folder is not converted; leave them.
+3. **The rewrite script keeps it.** `scripts/lint/package_imports.py` gets one function that adds the line to an entry file that lacks it and changes nothing else. A `scripts.` import counts when it is an `import` statement or a call of `__import__` or `importlib.import_module` with a `scripts.` string. The function replaces an older form of the block. `convert` runs it over every entry file under `scripts/`, so a rerun after an interrupted conversion adds each missing block, and one command runs it over a tree. Run that command once over this tree to add the line.
+4. **The import rule.** The rule check, wherever it is, accepts `scripts/lib/package_root.py` and the bootstrap line, and refuses every other `sys.path` change as before. Phase 3z Spec item 3 names the exception.
+5. **Out of scope.** No change to a command doc, hook command, `settings.json` line or other caller. No change to `scripts/lib/py`. No conversion of a folder that 3z has not converted.
+
+**Acceptance:**
+- A new test runs a sample of entry scripts with bare `python3 <tree>/scripts/<folder>/<file>.py --help`, from a working directory outside the tree and with no `PYTHONPATH`: `message/send.py`, `production/update_registration.py`, `production/change_review.py`, `style/style_sync.py`, and one entry from each of `direct`, `agents`, `hooks`, `accounts`, `whoami` and `lib`. Each exits 0 and prints no `ModuleNotFoundError`.
+- `scripts/lint/test_package_imports.py` covers the new function and `convert`'s use of it.
+- The bootstrap costs under 2 ms for each start, measured with `python3 -X importtime` or a timer around the line.
+- basedpyright reports no new diagnostic on a changed file, compared with the same file at 84fb8bd01, and `0 errors, 0 warnings, 0 notes` on each new file. The full gate passes.
+
+**Files:**
+- `scripts/lib/package_root.py` — the bootstrap.
+- `scripts/lint/package_imports.py` — the line function and its command.
+- `scripts/` — the one line in every entry file (written by the command), and the import rule check.
+- `scripts/lib/test_package_root.py` — the bare-run test.
+- `scripts/lint/test_package_imports.py` — the rewrite tests.
+- `docs/plans/sdlc-devtools-tests.md` — 3z Spec item 3 names the exception.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the bootstrap, the rewrite script, the line in every entry file, the rule check.
+- `test` — `scripts/lib/test_package_root.py`, `scripts/lint/test_package_imports.py`.
+
+**State:** none.
+
+**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`. Phase 3t: run test modules alone or in small groups, through `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>`. Phase 8e: `staff.py` defers its imports into functions; keep each deferred import where it is.
