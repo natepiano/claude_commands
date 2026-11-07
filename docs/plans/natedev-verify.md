@@ -302,36 +302,23 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Ruled out:** a pinned step that waits on every busy answer — it waited on leftovers that no live session holds.
 
-### Phase 8a — Resolve the token holder from recorded identities  · status: todo
+### Phase 8a — Resolve the token holder from recorded identities  · status: done
 
 **Depends on:** Phase 8.
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 8 review findings F009 and F010, routed under the landing rule at repair round 7, with the Astra review of 2026-11-06.
-
-**Goal:** a recorded token wait names the token owner on a current run, for the director and for each worker record form. Phase 8's acceptance line "the recorded wait names the token owner" stays open until this checkpoint: a director-held token and a slot with only a saved worker record do not name a session after Phase 8.
-
-**Spec:**
-
-1. **Run owner.** The `director` token owner already resolves through `unit_runs.director` (`verify.sh:1413`), which reads `owner_staff_id` through `unit_runs.run_owner` and the staff record; keep it, and pin it with a regression test. The unit fallback still reads the state's `unit` field, which `_set_owner` removes when it stores `owner_staff_id`. Resolve that fallback through `unit_runs.run_owner` and remove the `unit` read.
-2. **Worker identity.** Read the writers of `locks/cargo.d/holder`, `mesh_roster.json` and `impl_worker_*.json`, and state in the summary which forms they write. Resolve through the recorded `staff_id` and the staff record. An exact mapping wins: a roster key equal to the owner, then an `impl_worker_*` record whose `slot` or file stem equals the owner, then a roster entry whose `slot` equals the owner. Keep a `-<owner>` suffix match only if a production writer needs it; `fixture-first` in `verify_token_wait_test_support.py` is test setup, not that evidence. More than one match at one step gives no session.
-3. **Occupied slot, no answer.** A lookup that finds no holder for an occupied slot records no holder and tries again on the next pass. An absent holder and the slot `unknown` need no lookup. A steady named token wait starts no process.
+- The token branch of `phase_wait_holder_flags` resolves the holder in this order: a `mesh_roster.json` key equal to the holder; an `impl_worker_*.json` record whose `slot` or file stem equals it; a roster entry whose `slot` equals it; then the herdr pass record in `progress_history_state.json` under the holder key, else the one pass record whose `worker_name` equals the holder. One match gives its `staff_id` or `worker_id`, read through the staff record's `current_session`; no match or several matches give no session.
+- With no worker session, the wait names the run owner's unit through `unit_runs.run_owner` (`--holder-unit`). The `director` holder resolves through `unit_runs.director`.
+- `phase_wait_start` caches the holder per `slot:holder_pid` observation and looks up again on the next pass when a lookup found no identity. An absent holder and the slot `unknown` need no lookup.
 
 **Files:**
-- `scripts/direct/verify.sh` — the token branch of `phase_wait_holder_flags`, and `phase_wait_start`.
-- `scripts/direct/test_verify_wait_holder.py`
+- `scripts/direct/verify.sh` — the token holder lookup and its cache in `phase_wait_start`.
+- `scripts/direct/test_verify_wait_holder.py` — 29 tests, among them the recorded-identity cases through the real `phase_wait_start`.
 
-**Workers:** 1 integration writer + 1 tester.
+**Gotchas:** a herdr pass record is keyed by its dispatch slot (`--to`, `--new-worker` or the role), but the pane's `UNIT_TEAM_ROLE`, which `board.sh` writes as the token holder, is the worker name; the two differ when a retained worker takes another slot.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- The constraints in Phase 8 apply. Token ownership and the step token boundary stay as they are.
-
-**Acceptance gate:**
-- Tests through the real `phase_wait_start`, in one fixture set: a director-held token with `owner_staff_id` and no `director` file; a saved worker record with no roster entry; an exact match beside a second suffix match; a recorded worker reference with no matching staff row and a valid run owner, which gives the owner row's unit (`StaffRow.current_session` requires a valid identifier, so no fixture makes a staff row with no session); an occupied slot that resolves on a later pass.
-- `test_verify_python_starts`, the verify token suites and `test_verify_wait_holder.py` pass.
-- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+**Ruled out:** the `-<holder>` suffix match on roster names and the state's `unit` field — no production writer needs the suffix, and `_set_owner` removes `unit`.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
 
@@ -1078,7 +1065,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 3. **The probe owns the target mark.** `probe_mac` is the one writer. An `UnavailableProbe` result with no `detail` writes the mark, from each of its return points. A good `ProbeSnapshot` removes it. `UnresolvedSlotStartup` and `InterruptedTargetStatus` leave it as it is.
 4. **`free_now` answers not free.** `free_now` and `FreeNowAnswer` are in `scripts/mac_test/mac_test.py` (near lines 2280 and 427). Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no.
 5. **A new step still tries, and a waiting step does not leave.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` accepts `"bad"` as it accepts `"free"`. The `reserve` command refuses `"bad"` unless it receives a new flag `--new-step`. `ssh_retry_hook` calls `reserve` directly for a route that allows SSH (`any_target`), so its command never carries the flag. The first pass of `route_test` (`retry` 0) adds the flag to its own `reserve` call, and no later pass adds it. The timed backoff keeps its current effect on new steps.
-5a. **A new step probes a marked target** (builds, 2026-11-07, Answer A). Since Phase 41h, the first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target never gets `reserve --new-step`. In a new step's eligibility read (`ssh_target_eligibility`, `build_targets.py:369`), a target that answers `"bad"` starts one detached probe (builds, 2026-11-07). It takes the target claim as `claimed_run` (`offload.py:1923`) does, runs `copy_tracked_scripts`, runs `probe_mac`, and releases the claim. The script copy is needed because `probe_mac` compares the remote `scripts_commit` stamp (`offload.py:1317`), and an old stamp fails the probe. It copies no repository tree: the target mark is per target, and only `run_offload`'s match removes a repository's version record. A busy claim skips the probe; the mark stays, and the next new step tries again. A good probe removes the mark; a failed probe keeps it. At most one probe runs on a target at a time: a second new step reads the mark as it is. The probe never makes the step wait: the step routes on the current answer. Steps already in a wait never probe. A new step is each step's first eligibility read, not each call: `initialize_step_record` (defined at `verify.sh:2238`, called at `:3131`) runs once per call, so a call with several steps (a `lint` with local steps) gives each step its own first read. The repeated eligibility reads of a pinned wait (`verify.sh:2651`) start no probe.
+5a. **A new step probes a marked target** (builds, 2026-11-07, Answer A). Since Phase 41h, the first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target never gets `reserve --new-step`. In a new step's eligibility read (`ssh_target_eligibility`, `build_targets.py:369`), a target that answers `"bad"` starts one detached probe (builds, 2026-11-07). It takes the target claim as `claimed_run` (`offload.py:1923`) does, runs `copy_tracked_scripts`, runs `probe_mac`, and releases the claim. The script copy is needed because `probe_mac` compares the remote `scripts_commit` stamp (`offload.py:1317`), and an old stamp fails the probe. It copies no repository tree: the target mark is per target, and only `run_offload`'s match removes a repository's version record. A busy claim skips the probe; the mark stays, and the next new step tries again. A good probe removes the mark; a failed probe keeps it. At most one probe runs on a target at a time: a second new step reads the mark as it is. The probe never makes the step wait: the step routes on the current answer. Steps already in a wait never probe. A new step is each step's first eligibility read, not each call: `initialize_step_record` (defined at `verify.sh:2245`, called at `:3138`) runs once per call, so a call with several steps (a `lint` with local steps) gives each step its own first read. The repeated eligibility reads of a pinned wait (`verify.sh:2658`) start no probe.
 6. **One line in the log.** The `could not reach` reason is the last non-empty line of the remote stderr. A traceback never reaches the log.
 7. **Status tells the truth.** `/build:status` (`targets.py` `target_state` at line 302, its AWS status branch at 328) and `mac_test.py status` report a target with the mark as unreachable, not free.
 8. **Docs.** Update `docs/as-built/mac-test-offload.md`: the probe, the decline list and the two records.
