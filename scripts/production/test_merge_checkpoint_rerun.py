@@ -7,14 +7,12 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from types import ModuleType
 from typing import final
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production import staff
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment

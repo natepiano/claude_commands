@@ -1,6 +1,8 @@
 """One private repository and home for unit configuration recovery tests."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import os
 from pathlib import Path
 import subprocess
@@ -40,7 +42,7 @@ class UnitConfigFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
         owner = fixture_member("showrunner", name="configuration")
         row = fixture_member("unit", name="worker", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", self.worktree))
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.worktree))
         self.unit = row.id
         self.source = self.worktree / ".unit.toml"
         self.parked = self.home / ".local/state/staff/units" / f"{self.unit}.toml"

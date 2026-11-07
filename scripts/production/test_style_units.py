@@ -1,10 +1,11 @@
 """The style units table reads ticket work, dated builds and approved work left."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -14,11 +15,10 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import live_units
 from scripts.production import proposal_issue
-import style_units
+from scripts.production import style_units
 from scripts.style import style_ledger
 from scripts.production import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
@@ -55,7 +55,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
         self.doc = self.root / "style-production.md"
         _ = self.doc.write_text("# Production\n")
-        owner = fixture_member("showrunner", name="style-owner", doc=staff.LiveDoc("natedev", self.doc))
+        owner = fixture_member("showrunner", name="style-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
         self.owners = {name: fixture_member("unit", name=name, parent=owner.id)
                        for name in ("names", "types")}
 
@@ -128,7 +128,7 @@ class StyleUnitsTests(unittest.TestCase):
         _ = self.ticket(number="14")
         other_doc = self.root / "other-production.md"
         _ = other_doc.write_text("# Production\n")
-        other = fixture_member("showrunner", name="other-style", doc=staff.LiveDoc("natedev", other_doc))
+        other = fixture_member("showrunner", name="other-style", doc=staff.LiveDoc(remote.local_machine(), other_doc))
         unit = fixture_member("unit", name="names", parent=other.id)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO tickets SELECT '15',?,kind,family,rule,crate,files,sites,rules,finding_ids,state,created_at,updated_at "

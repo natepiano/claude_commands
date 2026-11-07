@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -233,7 +235,7 @@ class WasteWatchTests(unittest.TestCase):
         _ = doc.write_text("# Loose production\n")
         owner = recorded_showrunner("loose-owner", doc)
         _ = fixture_member("unit", name="loose", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", Path("/invented/loose")))
+                           worktree=staff.PresentWorktree(remote.local_machine(), Path("/invented/loose")))
         self.request("loose", 0, 900_000, folder="/invented/loose")
         self.wait("loose", 1, 500_000, folder="/invented/loose")
         output = self.run_watch()

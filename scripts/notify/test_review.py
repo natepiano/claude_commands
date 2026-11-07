@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import hashlib
 import io
 import json
@@ -171,7 +173,7 @@ class LocalReviewTests(unittest.TestCase):
         folder.mkdir(parents=True, exist_ok=True)
         document = self.root / f"{name}-production.md"
         _ = document.write_text(f"# Production — {name}\n\n- **Proposals:** `{folder}`\n")
-        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", document))
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), document))
         record = folder / "question-fixture.md"
         fields = {**fields, "asked_by": owner.id}
         _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"

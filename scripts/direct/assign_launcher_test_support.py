@@ -1,6 +1,8 @@
 """Share assignment setup with the recorder and loopback server."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import fcntl
 import json
 import os
@@ -117,7 +119,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         assert parent is not None
         _ = staff.rename(parent.id, "fixture-production")
         owner = staff.rename(owner.id, "fixture")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.project), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.project), expected=owner.worktree)
         _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"

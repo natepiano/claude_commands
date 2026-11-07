@@ -6,6 +6,7 @@ import json
 import fcntl
 import math
 import os
+import shutil
 import sys
 import time
 import subprocess
@@ -38,7 +39,8 @@ class PaneWorld(herdr.Herdr):
     """A private pane server supplies process facts to the real shared scan."""
 
     def __init__(self) -> None:
-        super().__init__("agents")
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            super().__init__("agents")
         self.process_directory = TemporaryDirectory(prefix="pane-world-proc-")
         self.process_cleanup = finalize(self, self.process_directory.cleanup)
         self.locations: dict[str, dict[str, object]] = {}
@@ -385,6 +387,11 @@ class PaneWorld(herdr.Herdr):
 class WorkerPaneTests(StaffTestCase):
     world: PaneWorld = PaneWorld()
     parent_id: staff.StaffId = staff.StaffId("")
+
+    def test_fake_pane_server_does_not_need_herdr_on_path(self) -> None:
+        with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value=None):
+            world = PaneWorld()
+        self.assertEqual(world.binary, "/nonexistent/herdr")
 
     @property
     def parent(self) -> staff.StaffRow:

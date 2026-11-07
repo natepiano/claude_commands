@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
-from dailies_input import StillWaiting
+from scripts.production.dailies_input import StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):

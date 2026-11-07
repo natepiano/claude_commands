@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import unittest
@@ -110,7 +112,7 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "question", str(unit))
         owner_id = self.fixture_staff_id()
         asker_id = self.fixture_staff_id("alpha")
-        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
@@ -135,7 +137,7 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "other-question-owner", str(other))
         _ = self.git("worktree", "add", "-b", "ambiguous-question-caller", str(caller))
         second = fixture_member("showrunner", name="other-question-owner",
-                                doc=staff.LiveDoc("natedev", other / relative))
+                                doc=staff.LiveDoc(remote.local_machine(), other / relative))
         return caller / relative, self.fixture_staff_id(), second.id
 
     def test_ask_uses_the_staff_name_when_checkouts_share_a_document_path(self) -> None:
@@ -183,7 +185,7 @@ class RegistrationTests(RegistrationFixture):
         unit = self.root / "unit-checkout"
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
-        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes()
         for checkout, title in ((unit, "Unit checkout question"), (main, "Main checkout question")):
