@@ -10,13 +10,13 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
@@ -58,7 +58,7 @@ class DirectorWaitFixture:
 
 @contextmanager
 def director_wait_fixture() -> Generator[DirectorWaitFixture]:
-    with tempfile.TemporaryDirectory(dir="/tmp/claude") as temporary, ExitStack() as resources:
+    with short_socket_directory("turn-wait-") as temporary, ExitStack() as resources:
         root = Path(temporary)
         run = root / "run"
         run.mkdir()
