@@ -227,9 +227,15 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
     if dependencies is not None:
         dependencies(staff.record_path())
         dependencies(run / STATE_FILE)
+    admission = import_module("scripts.production.worker_admission")
+    missing_owner = cast(type[ValueError], admission.RunOwnerUnavailable)
     try:
-        find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
+        find_parent = cast(Callable[..., staff.StaffRow], admission.parent)
         return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
+    except missing_owner as error:
+        if _has_resumable_workers(run, record=record):
+            print(f"anomaly: {run}: {error}", file=sys.stderr)
+        return ""
     except (OSError, ValueError) as error:
         print(f"anomaly: {run}: {error}", file=sys.stderr)
         return ""
@@ -247,6 +253,45 @@ def run_folders(root_override: str | Path | None = None) -> list[Path]:
             if folder != root / "active" and folder.is_dir():
                 _ = folders.setdefault(folder.resolve(), folder)
     return list(folders.values())
+
+
+def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffAtUse) -> bool:
+    from scripts.direct import worker_state
+    from scripts.production import staff
+
+    def read_record(path: Path) -> dict[str, object]:
+        try:
+            return _json_object(path.read_text())
+        except (OSError, UnicodeError):
+            return {}
+
+    state = read_record(run / STATE_FILE)
+    if state.get("status") == "ended":
+        return False
+    names: set[str] = set()
+    for path in worker_state.worker_status_paths(run):
+        names.add(path.name.split("_status", 1)[0])
+        try:
+            if path.read_text().strip() in ("implementing", "running"):
+                return True
+        except OSError:
+            continue
+    roster = read_record(run / "mesh_roster.json")
+    if any(
+        isinstance(entry, dict)
+        and (cast(dict[str, object], entry).get("status") in tuple(worker_state.ROSTER_LIVE)
+             or cast(dict[str, object], entry).get("paused_turn") is True)
+        for entry in roster.values()
+    ):
+        return True
+    if not names:
+        return False
+    snapshot = staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record
+    recorder = import_module("scripts.direct.progress_history")
+    read_dispatch = cast(Callable[[staff.StaffId, Path], object], recorder.active_dispatch)
+    active_dispatch_type = cast(type[object], recorder.ActiveDispatch)
+    return any(isinstance(read_dispatch(row.id, run), active_dispatch_type)
+               for row in snapshot.find(kind="worker") if row.name in names)
 
 
 def held_by_session(root_override: str | Path | None = None, *,

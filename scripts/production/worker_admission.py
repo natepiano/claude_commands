@@ -25,6 +25,10 @@ class AdmissionRefused(ValueError):
     """Permission or native publication failed; no work may be dispatched."""
 
 
+class RunOwnerUnavailable(ValueError):
+    """The run records identify no staff owner."""
+
+
 @dataclass(frozen=True)
 class NewWorkerSlot:
     """The slot has no staff row yet."""
@@ -139,7 +143,8 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
     sources = sources if sources is not None else session_staff.member_sources()
     found = sources.member(session_staff.ShowrunnerMember(production), record)
     if isinstance(found, session_staff.NoSuchMember):
-        raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
+        error = RunOwnerUnavailable if run is not None else ValueError
+        raise error(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
     return found.row
 
 

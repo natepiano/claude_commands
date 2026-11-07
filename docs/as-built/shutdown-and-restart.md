@@ -6,7 +6,9 @@ Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 It reads the session identity, pid, and start time before TERM.
 It checks the current conversation before each signal.
 It checks exit every 0.1 seconds and sends KILL after two seconds when the conversation proof remains valid.
-If TERM removes that proof, stop prints an anomaly and waits up to five more seconds without another signal.
+Registry loss after TERM is quiet.
+Stop waits up to five more seconds with the saved pid and birth proof.
+Other read errors print an anomaly.
 It waits up to five seconds after KILL.
 Registry removal alone does not prove exit.
 A surviving process returns `StopFailed` and does not resume.
@@ -64,6 +66,9 @@ The restore paths use these causes:
 
 The relaunch supervisor preserves explicit prompts.
 The pane path marks prompt delivery as `pane` to prevent a second automatic prompt.
+Before launch, the prompt cursor skips complete old rows without parsing JSON.
+Owner scans retain runs with idle workers.
+Owner scans print no missing-owner anomaly for ended runs or runs without an active dispatch.
 
 `ClaudeUp` means the registry reports a live Claude within 20 seconds.
 Resume makes one attempt.

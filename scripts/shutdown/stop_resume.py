@@ -345,6 +345,8 @@ def _stop(session: str, kind: str = "") -> StopResult:
                     return StopFailed(identity, "process identity changed; no signal sent")
             except ProcessLookupError:
                 return Stopped(identity, live.pid)
+            except herdr.NativeRegistryUnavailable:
+                pass
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
             else:
@@ -443,7 +445,14 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     settings = conf.read("shutdown")
     start_seconds = settings.number("START_SECONDS")
     _ = settings.number("STAY_SECONDS")
+    transcript = herdr.SessionTranscript(Path(entry["config_dir"]), entry["session_id"])
+    cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+    if message:
+        cursor = herdr.TranscriptCursor(transcript, datetime.now(timezone.utc))
+        cursor.skip_existing_turns()
     launched_at = datetime.now(timezone.utc)
+    if isinstance(cursor, herdr.TranscriptCursor):
+        cursor.since = launched_at
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + operation_deadline.remaining(start_seconds)
@@ -466,7 +475,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     if identity != entry["session_id"]:
         print(f"{entry['session_id']}: prompt identity anomaly: observed {identity}", file=sys.stderr)
         return live
-    opening = herdr.OpeningPrompt(message, herdr.SessionTranscript(Path(entry["config_dir"]), identity))
+    opening = herdr.OpeningPrompt(message, transcript, cursor=cursor)
     outcome = client.submit_opening_prompt(tab.pane_id, opening, launched_at, int(operation_deadline.remaining(start_seconds) * 1000))
     if isinstance(outcome, herdr.PromptNotSubmitted):
         print(f"{identity}: prompt anomaly: {outcome.reason}", file=sys.stderr)

@@ -1121,6 +1121,45 @@ class PromptSubmissionTests(unittest.TestCase):
             herdr.PromptNotSubmitted("empty visible screen", ""))),
             herdr.PromptNotSubmitted("empty visible screen", ""))
 
+    def test_prelaunch_cursor_skips_complete_history_without_parsing_json(self) -> None:
+        self.write_turn("old context", kind="assistant", seconds_after_launch=-1)
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        with patch.object(json, "loads", side_effect=AssertionError("historical JSON read")):
+            cursor.skip_existing_turns()
+        self.assertEqual(cursor.offsets[self.path], self.path.stat().st_size)
+        self.assertEqual(cursor.read_turns(), [])
+        self.write_turn("resume the saved work")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+
+    def test_prelaunch_cursor_keeps_an_incomplete_final_row(self) -> None:
+        text = "resume the saved work – saved context"
+        row = (json.dumps({
+            "type": "user",
+            "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat(),
+            "message": {"role": "user", "content": script_prompt(text)},
+        }, ensure_ascii=False) + "\n").encode()
+        split = row.index("–".encode()) + 1
+        _ = self.path.write_bytes(row[:split])
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        cursor.skip_existing_turns()
+        self.assertEqual(cursor.offsets[self.path], 0)
+        with self.path.open("ab") as stream:
+            _ = stream.write(row[split:])
+        self.assertIsInstance(cursor.submitted_prompt(text), herdr.PromptSubmitted)
+
+    def test_prompt_submission_keeps_the_prelaunch_cursor(self) -> None:
+        self.write_turn("old context", kind="assistant", seconds_after_launch=-1)
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        cursor.skip_existing_turns()
+        before = cursor.offsets[self.path]
+        self.submit_on_type = True
+        result = self.client.submit_opening_prompt(
+            "destination:p1", herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor),
+            self.launched_at, 1000,
+        )
+        self.assertIsInstance(result, herdr.PromptSubmitted)
+        self.assertGreater(cursor.offsets[self.path], before)
+
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
         first_size = self.path.stat().st_size
