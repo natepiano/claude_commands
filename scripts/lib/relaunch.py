@@ -17,7 +17,7 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
-from scripts.production import session_staff
+from scripts.production import session_staff, staff, worker
 from scripts.shutdown import pane_record
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment
@@ -43,8 +43,6 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     entry = session_staff.record_membership(entry)
     restored = {**environment, **entry["environment"]}
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
-        from scripts.production import staff, worker
-
         workers = NO_WORKERS
         try:
             record = staff.snapshot()
