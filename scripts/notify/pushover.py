@@ -34,6 +34,10 @@ usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent afte
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json

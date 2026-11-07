@@ -14,6 +14,10 @@ Run backfill-production [--list PATH] [--write] to resolve empty cells from reco
 List writes hold the directory lock. Normal writes update metadata and commit only the list.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl

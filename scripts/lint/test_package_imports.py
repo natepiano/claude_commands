@@ -10,16 +10,153 @@ import sys
 import tempfile
 import unittest
 
-from scripts.lint.package_imports import convert
+from scripts.lint import package_imports
 
 
 class PackageImportTests(unittest.TestCase):
+    def test_bootstrap_preserves_the_docstring_future_imports_and_nested_entry_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bootstrap = root / "scripts/lib/package_root.py"
+            bootstrap.parent.mkdir(parents=True)
+            _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
+            source = '''#!/usr/bin/env python3
+"""Keep the entry documentation.
+
+Keep its second paragraph.
+"""
+from __future__ import annotations
+from __future__ import division
+
+from scripts.alpha import value
+if __name__ == "__main__":
+    print(__doc__, value.VALUE)
+'''
+            value = root / "scripts/alpha/value.py"
+            value.parent.mkdir()
+            _ = value.write_text("VALUE = 'loaded from the checkout'\n")
+            old_line = 'with open(__file__.rpartition("/")[0] + "/../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})\n'
+            for relative in ("alpha/entry.py", "alpha/nested/entry.py", "alpha/legacy.py"):
+                with self.subTest(entry=relative):
+                    entry = root / "scripts" / relative
+                    entry.parent.mkdir(parents=True, exist_ok=True)
+                    original = source.replace("\nfrom scripts.alpha", "\n" + old_line + "from scripts.alpha", 1) if relative == "alpha/legacy.py" else source
+                    _ = entry.write_text(original)
+                    self.assertTrue(package_imports.add_bootstrap(entry))
+                    converted = entry.read_text()
+                    lines = converted.splitlines(keepends=True)
+                    position = next(index for index, line in enumerate(lines) if "/lib/package_root.py" in line)
+                    inserted = "".join(lines[position - 1:position + 3])
+                    self.assertEqual(converted.replace(inserted, "", 1), source)
+                    self.assertEqual(entry.read_bytes().replace(inserted.encode(), b"", 1), source.encode())
+                    self.assertNotIn(old_line, converted)
+                    self.assertLess(converted.index("from __future__ import division"), converted.index(inserted))
+                    self.assertLess(converted.index(inserted), converted.index("from scripts.alpha import value"))
+                    self.assertFalse(package_imports.add_bootstrap(entry))
+                    self.assertEqual(entry.read_text(), converted)
+                    result = subprocess.run(
+                        [sys.executable, str(entry)], cwd=root.parent,
+                        env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "Keep the entry documentation.\n\nKeep its second paragraph.\n loaded from the checkout\n")
+
+    def test_bootstrap_leaves_tests_and_modules_without_an_entry_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "scripts/alpha"
+            folder.mkdir(parents=True)
+            sources = {
+                "test_entry.py": '#!/usr/bin/env python3\nif __name__ == "__main__":\n    print("test")\n',
+                "library.py": 'VALUE = "library"\n',
+                "standalone.py": '#!/usr/bin/env python3\nimport sys\nif __name__ == "__main__":\n    print(sys.version)\n',
+            }
+            for name, source in sources.items():
+                with self.subTest(file=name):
+                    path = folder / name
+                    _ = path.write_text(source)
+                    self.assertFalse(package_imports.add_bootstrap(path))
+                    self.assertEqual(path.read_text(), source)
+                    self.assertEqual(path.read_bytes(), source.encode())
+
+    def test_conversion_makes_each_entry_importable_under_bare_python(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            bootstrap = root / "scripts/lib/package_root.py"
+            bootstrap.parent.mkdir()
+            _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
+            _ = (folder / "worker.py").write_text("VALUE = 'converted entry'\n")
+            entries = (folder / "shebang.py", folder / "main.py")
+            _ = entries[0].write_text('#!/usr/bin/env python3\nimport worker\nprint(worker.VALUE)\n')
+            _ = entries[1].write_text('import worker\nif __name__ == "__main__":\n    print(worker.VALUE)\n')
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [folder])
+            for entry in entries:
+                with self.subTest(entry=entry.name):
+                    result = subprocess.run(
+                        [sys.executable, str(entry)], cwd=root.parent,
+                        env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "converted entry\n")
+
+    def test_conversion_bootstraps_an_entry_with_only_a_dynamic_sibling_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            bootstrap = root / "scripts/lib/package_root.py"
+            bootstrap.parent.mkdir()
+            _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
+            _ = (folder / "worker.py").write_text("VALUE = 'dynamic entry'\n")
+            entry = folder / "entry.py"
+            _ = entry.write_text('#!/usr/bin/env python3\nworker = __import__("worker")\nprint(worker.VALUE)\n')
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [folder])
+            result = subprocess.run(
+                [sys.executable, str(entry)], cwd=root.parent,
+                env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "dynamic entry\n")
+
+    def test_conversion_rerun_bootstraps_an_unchanged_caller_outside_the_selected_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            bootstrap = root / "scripts/lib/package_root.py"
+            bootstrap.parent.mkdir()
+            _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
+            _ = (folder / "worker.py").write_text("VALUE = 'outside caller'\n")
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [folder])
+            entry = root / "scripts/beta/caller.py"
+            entry.parent.mkdir()
+            _ = entry.write_text('#!/usr/bin/env python3\nfrom scripts.alpha import worker\nprint(worker.VALUE)\n')
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [folder])
+            result = subprocess.run(
+                [sys.executable, str(entry)], cwd=root.parent,
+                env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "outside caller\n")
+
     def test_conversion_keeps_comments_aliases_and_one_module_for_patches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             alpha, beta = root / "scripts/alpha", root / "scripts/beta"
             alpha.mkdir(parents=True)
             beta.mkdir()
+            bootstrap = root / "scripts/lib/package_root.py"
+            bootstrap.parent.mkdir()
+            _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
             sources = {
                 alpha / "worker.py": "def result():\n    return 'original'\n",
                 alpha / "caller.py": '''#!/usr/bin/env python3
@@ -54,7 +191,7 @@ def check():
                 _ = path.write_text(source)
             report = io.StringIO()
             with redirect_stdout(report):
-                convert(root, [alpha])
+                package_imports.convert(root, [alpha])
             converted = (alpha / "caller.py").read_text()
             self.assertIn("# Keep this comment.", converted)
             self.assertNotIn("sys.path", converted)
@@ -72,7 +209,7 @@ print(caller.check(), consumer.check())
             self.assertEqual(result.stdout.strip(), "('patched', 'patched') outside")
             before = {path: path.read_bytes() for path in sources}
             with redirect_stdout(io.StringIO()):
-                convert(root, [alpha])
+                package_imports.convert(root, [alpha])
             self.assertEqual({path: path.read_bytes() for path in sources}, before)
 
     def test_an_ambiguous_import_stays_and_reports_its_source_line(self) -> None:
@@ -86,7 +223,7 @@ print(caller.check(), consumer.check())
             _ = caller.write_text("import shared\n")
             report = io.StringIO()
             with redirect_stdout(report):
-                convert(root, [caller])
+                package_imports.convert(root, [caller])
             self.assertIn("scripts/caller.py:1: ambiguous module shared", report.getvalue())
             self.assertEqual(caller.read_text(), "import shared\n")
 
@@ -98,7 +235,7 @@ print(caller.check(), consumer.check())
             caller = folder / "caller.py"
             _ = caller.write_text('print("""#!/usr/bin/env python3\n""", end="")\n')
             with redirect_stdout(io.StringIO()):
-                convert(root, [caller])
+                package_imports.convert(root, [caller])
             result = subprocess.run([sys.executable, str(caller)], capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "#!/usr/bin/env python3\n")
@@ -120,7 +257,7 @@ print(peer is other, other.VALUE)
 ''')
             report = io.StringIO()
             with redirect_stdout(report):
-                convert(root, [folder])
+                package_imports.convert(root, [folder])
             self.assertIn("scripts/alpha/caller.py:4: dynamic module name", report.getvalue())
             self.assertNotIn("sys", caller.read_text())
             result = subprocess.run([sys.executable, "-m", "scripts.alpha.caller"], cwd=root,
@@ -149,7 +286,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "beta"))
 import shared
 ''')
             with redirect_stdout(io.StringIO()):
-                convert(root, [caller, entry])
+                package_imports.convert(root, [caller, entry])
             result = subprocess.run([sys.executable, "-c", '''from scripts.alpha import caller
 from scripts import entry
 print(caller.shared.VALUE, entry.shared.VALUE)

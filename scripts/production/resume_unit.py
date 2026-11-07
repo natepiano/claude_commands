@@ -7,6 +7,10 @@ A preview changes no files. A repeated command preserves completed steps.
 Exit 0 on success, 1 on refusal or failure, and 2 on invalid arguments.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import subprocess

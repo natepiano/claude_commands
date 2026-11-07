@@ -19,6 +19,10 @@ score of its proposed stars, its prerequisite the first of its `depends_on`. The
 `--next` prints the one proposal /next shows and pins it until it leaves the waiting rows.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import math
