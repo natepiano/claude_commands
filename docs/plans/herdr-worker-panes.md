@@ -2986,6 +2986,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 33: `worker_pass` picks the newest matching pass by `started_at`, never the last in dict order. Keep this when the short mesh slots go.
 - Phase 32: every launch destination runs `unalias <kind>` through `Herdr.run_in_pane` before `agent start`. Keep the one step when the launch path changes; a test fake pane shows an empty shell first.
 - Phase 35: a pane worker's Codex launch carries no `model_auto_compact_token_limit`. Do not bring back an in-turn compaction option; `UNIT_COMPACT_ABOVE_TOKENS` is for compaction between turns only.
+- Phase 37: `send.py` delivers to a herdr Codex pane through `CodexPaneRecipient` and `_prompt_pane`, by name and by `codex:<thread>`. When the `codex_mesh` route goes, a `codex:` address with no daemon and no pane still fails, and a staff row with no live entry still gets `QueuedStaffRecipient`.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3274,6 +3275,8 @@ sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane
 
 The second case (a Codex session in a pane, such as morty) moved to Phase 37 (sdlc [787d4c6f], 2026-11-07: start it now). This phase reuses the pane recipient that Phase 37 adds.
 
+**Constraint from Phase 37:** `send.py` has one pane submit helper, `_prompt_pane(place, text, *, target, timeout)` (herdr `prompt` with `SubmitStarts`); `deliver_worker_text` and `CodexPaneRecipient` both call it. Route a pane worker's `--codex` message through `deliver_worker_text` or that helper; add no second submit. A staff row with no live roster entry resolves to `ClaudeRecipient` only when the notifier registry holds its running Claude record; otherwise to `QueuedStaffRecipient`. An explicit `codex:` address with no live daemon or pane fails before that queue.
+
 **Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A test fake pane shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
 
 The Work Order is written at the phase start.
@@ -3304,38 +3307,30 @@ A pane worker's Codex launch has no in-turn compaction option. `worker_panes._po
 
 ### Phase 37 — A message reaches a Codex session in a pane  · status: done
 
-**Depends on:** Phase 35 (it runs right after the Phase 35 checkpoint, before Phase 29; sdlc [787d4c6f], 2026-11-07). Phase 31 waits for this phase (both edit `scripts/message/send.py`).
+#### As-built
 
-Defect (user via sdlc, 2026-11-07 15:38 EST): `send.py --to morty` answers `QUEUED: no live session answers to session:01a18dbb-…`. Morty is a Codex TUI in herdr pane w2C:p1 (`codex … resume 01a18dbb-…`). `--to codex:01a18dbb-…` fails with `no live Codex daemon has thread … loaded`. Cause:
+`send.py --to morty` and `send.py --to codex:<thread>` deliver to an interactive Codex session in a herdr pane. `Herdr.agents` decodes each agent's `agent_session` into `ReportedAgentSession(session_id)` (kind `id`) or `NoReportedAgentSession`; a malformed report raises. `roster._herdr_codex_panes` reads `worker_panes.agent_inventory`, and a Codex pane with a reported id becomes `Messageable("codex:<thread>")` with `thread=CodexThread(<thread>)` and `pane=HerdrPlace(session, pane)`; the snapshot keeps `pane`. A pane with no reported id stays `CannotReceiveMessages`. A staff row matches that entry through its thread in `_staff_transport_matches`.
 
-1. `roster._herdr_codex_panes` (`scripts/message/roster.py:1362`) builds each herdr Codex pane entry with no `thread` and `reach=CannotReceiveMessages("interactive Codex in a herdr pane")`, though `herdr agent list` reports the thread as `agent_session.value`.
-2. So `send._staff_transport_matches` (`scripts/message/send.py:1910`) finds no entry for morty's staff row, and `resolve_recipient` falls back to `ClaudeRecipient("session:<id>")` (`send.py:2046`). No Claude session answers, and the message is queued.
-3. The `codex:` path reads only app-server daemons (`codex_daemon.daemons`), so a TUI in a pane is never found.
+`CodexPaneRecipient(address, place, thread_id)` delivers through `_prompt_pane(place, text, *, target, timeout)`, the one herdr `prompt` call with `SubmitStarts`; `deliver_worker_text` uses the same helper. A herdr error reports `FAILED: <error>`.
 
-#### Work Order
+`resolve_recipient` order after no roster match:
+1. `worker:` → usage error.
+2. `codex:` → `RecipientLookupFailed`; an explicit `codex:` address with no live daemon or pane keeps its failure.
+3. A staff row → `ClaudeRecipient("session:<id>")` when the notifier registry holds its running Claude record; else `QueuedStaffRecipient`, which prints `QUEUED: no live Claude or Codex session answers to <name> (<id>), so it is kept for it` and keeps the same `session-<id>` queue file.
+4. `session:` → `ClaudeRecipient`.
 
-**Goal:** `send.py --to morty` and `send.py --to codex:<thread>` deliver to a Codex session in a herdr pane.
+Live check on 2026-11-07 17:00 EST: both sends printed `SENT: codex:01a18dbb-… at agents:w2C:p1`, and both texts showed in morty's pane.
 
-**Spec:**
+**Files:**
+- `scripts/herdr/herdr.py` — `ReportedAgentSession`, `NoReportedAgentSession`, `AgentOccupant.agent_session`, the decode in `Herdr.agents`.
+- `scripts/message/roster.py` — `NoHerdrPane`, `RosterEntry.pane`, the pane thread in `_herdr_codex_panes`, snapshot `pane`.
+- `scripts/message/send.py` — `CodexPaneRecipient`, `QueuedStaffRecipient`, `_prompt_pane`, the fallback order.
+- `scripts/production/rename_test_support.py` — the fake agent row carries `agent_session`.
+- Tests: `scripts/herdr/test_herdr.py` (session decode, absent and malformed reports), `scripts/message/test_roster.py` (pane thread and snapshot pane), `scripts/message/test_send.py` (`test_codex_pane_agent_resolves_by_staff_and_thread_and_submits_once`, `test_codex_pane_failure_reports_the_herdr_error`, `test_absent_staff_recipient_keeps_its_queue_until_claude_returns`).
 
-1. In `_herdr_codex_panes`, set the entry's `thread` to `CodexThread(<agent_session.value>)` when herdr reports a Codex `agent_session` of kind `id`, and make the entry messageable at `codex:<thread>`. Keep the entry's herdr session name and pane id on the entry.
-2. Add one recipient type for that entry. It delivers with `herdr.Herdr(<session>).prompt(<pane>, text, target=<thread>, proof=herdr.SubmitStarts(<timeout ms>))`, the call that `deliver_worker_text` uses (`send.py:3000`). Add no second submit path ([c827351d]).
-3. `_messageable_recipient` and the `codex:` lookup in `resolve_recipient` return this recipient for such an entry. A staff row whose `current_session` is that thread matches it through `_staff_transport_matches`, with no new match rule.
-4. A pane entry with no reported Codex session id stays `CannotReceiveMessages`, as today.
-5. A delivery failure reports `FAILED` with the herdr error, as other routes do.
-6. Wrong-family fallback (the user via morty, 2026-11-07: "Repair the actual TUI route and wrong-family fallback"; sdlc [02c751da]: pick no family without a source, and add no new staff field). A staff row has no family field. When a staff row matches no live roster entry, `resolve_recipient` (`send.py:2046`) returns a family-neutral queued recipient, not `ClaudeRecipient("session:<id>")`. It keeps the message in the same queue file as today (`queue_for` key `session-<id>`, so a Claude row that comes back still receives it). Its result line names the row and id with no `session:` form: `QUEUED: no live Claude or Codex session answers to <name> (<id>), so it is kept for it`. A live entry of either family still wins through `_staff_transport_matches`.
-7. Add no check, refusal, validation, retry or wait that this list does not name.
+**Binds later work:** a message to a pane worker goes through `_prompt_pane` or `deliver_worker_text`; add no second submit. A test fake for `Herdr.agents` rows sets `agent_session`.
 
-**Files:** `scripts/message/roster.py`, `scripts/message/send.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py` (or the send test module that covers `resolve_recipient`).
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- A unit test: a herdr Codex pane with `agent_session` id T and no app-server gives a roster entry with thread T, messageable at `codex:T`.
-- A unit test: a staff `agent` row with `current_session` T resolves to the pane recipient, and delivery calls `Herdr.prompt` once with that pane and target T.
-- A unit test: `--to codex:T` resolves to the same recipient.
-- The changed modules pass; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
-- Live check by the director after the checkpoint: `send.py --from herdr-unit --to morty --text "<one-line ping>"` prints `SENT` and the text shows in morty's pane. Morty belongs to the user; send one ping only.
+**Gotchas:** roster test fakes omit live Claude rows, so a staff fallback change needs a full `test_send` run, not selected tests.
 
 ### Phase 38 — One worker's assign reads only its own pane and row · status: todo
 
