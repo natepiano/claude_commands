@@ -1254,35 +1254,19 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Depends on:** Phase 41i.
 
-#### Work Order
+#### As-built
 
-**Source:** fix16's check run in phase 41i, 2026-11-06. Builds placed it after the 41i tip and before 41h, 21:35 EST.
-
-**Goal:** a signal during a Mac or SSH step leaves no temp log file, under any load.
-
-**Defect:** `verify.sh` starts `tee "$MAC_LOG_FILE"` and `tee -a "$MAC_LOG_FILE"` as process substitutions. Under load a tee can open the file after `forward_mac_runner_signal` removes it, so the name comes back and one temp file stays. Forced proof on 8b5df1f3f: a one-second delay before tee fails `test_signal_before_runner_start_removes_result_without_local_work` 3 of 3. Seen once without force; a rerun passes.
-
-**Spec:**
-
-1. The parent shell opens the Mac log file once, on a file descriptor, before it starts the runner. Both tee processes write through `/dev/fd/<N>` of that descriptor, so a late tee creates no name.
-2. Each place that removes `MAC_LOG_FILE` also closes the descriptor. The pass record reads the same file as today.
-3. A regression test delays tee start (the forced form of the proof) and shows that a stop leaves no temp file. It fails on the old code.
+- `verify.sh` opens `MAC_LOG_FILE` on descriptor 9 before it starts a Mac or SSH runner. Both tee processes append through `/dev/fd/9`, so a late tee creates no file name.
+- Each removal of `MAC_LOG_FILE` closes descriptor 9. `record_mac_pass` closes it before it reads, removes or moves the log.
+- `test_signal_before_delayed_tee_opens_leaves_no_temp_log` delays both tee calls and sends TERM after the runner boundary. It requires exit 143, no runner or local work, no token record and an empty temp folder.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_mac_signal_boundaries.py`
+- `scripts/direct/verify.sh` — the Mac log descriptor and its closes.
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — the delayed-tee test and the shared `check_signal_before_runner_start` helper.
 
-**Workers:** 1 writer, in its own tree from the builds tip that holds 41i.
+**Gotchas:** a tee released from a DEBUG observation inside signal cleanup never runs. The test releases it after the log name is gone.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test makes its project in a tempdir at run time.
-- A move of a `verify.sh` function reaches each test whose DEBUG trap watches its commands. Search `trap .* DEBUG` and `BASH_COMMAND`, and run those modules.
-- Phase 41h edits `verify.sh` in another tree. Merge whichever lands second.
-
-**Acceptance gate:**
-- The new test fails on the old code and passes on the new code.
-- `test_verify_mac_signal_boundaries.py` and the other Mac step modules pass. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Ruled out:** a fixed sleep to order tee and cleanup.
 
 ### Phase 41k — The Linux disk probe test passes on every run  · status: done
 
@@ -1396,7 +1380,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Importing `offload.py` loads no build coordination modules (resources' Phase 67 test).
 - Phase 41e edits `route_test`, `free-now` and `reserve` in its own tree. Merge whichever lands second.
 - Phase 41i edits the saved-result key and the remote environment path of `verify.sh` in its own tree. Merge whichever lands second.
-- Merge order: aws `46329bd70` and natest `7a94df6ca` land on `builds` first. Then verify-env merges `builds`, with Phases 41i, 41j and 41k. This phase merges that result. Keep 41i's renewer trap (`kill $(jobs -p)`, then `wait`) and 41j's Mac log file descriptor.
+- Merge order: aws `46329bd70` and natest `7a94df6ca` land on `builds` first. Then verify-env merges `builds`, with Phases 41i, 41j and 41k. This phase merges that result. Keep 41i's renewer trap (`kill $(jobs -p)`, then `wait`) and 41j's Mac log file descriptor: the parent opens `MAC_LOG_FILE` on descriptor 9 before it starts a Mac or SSH runner, both tee processes append through `/dev/fd/9`, and each removal of the log (and `record_mac_pass`) closes descriptor 9. Each runner start that this phase adds or moves uses the same descriptor.
 - Phase 41i sets the fixed values and carries the result variables only when `CMD == test` (`verify.sh` near line 1461). A remote nextest step of `final` must carry the same values.
 - A Mac disk exclusion reaches `mac_idle.py` only as `NatedevOnly("disk")` (near line 236), local compilation included. If eligibility emits `AnyTarget` for a disk exclusion, that evidence is lost. Keep it through eligibility, `step_record.read` and the disk alert.
 - `StepRecord` stores a `PackageSelection`. Its constructor takes only `WorkspacePackages` or `NamedPackage`; JSON and CLI values convert at their boundaries. Name each changed caller in the summary.
