@@ -2978,6 +2978,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 24: a worker's herdr agent is `<unit>-<worker>` (`worker_panes._start_locked`, `agent_name=`); `_agent_name` hashes a name above 32 characters. Keep the staff lookup on the session id and the worker name.
 - Phase 25: a herdr launch with a phase runs `assign_claude.claim_phase` before `worker.py assign` (not for `review`). Keep the one claim call when the launch path changes.
 - Phase 26: every unfinished run pins herdr; a finished run can still hold a `mesh` pin file. Phase 19 removes the reader, so no pin file is read after it.
+- Phase 30: herdr adds no draft restore step after a submit; Claude keeps the draft itself. A draft lost in a stop and resume is the agents unit's fix.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3253,31 +3254,18 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 - The full gate passes.
 
 
-### Phase 30 — A stashed draft comes back after a delivered prompt  · status: todo
+### Phase 30 — A stashed draft comes back after a delivered prompt  · status: done
 
-**Depends on:** Phase 23 and Phase 24 (the same two files). sdlc (2026-11-07): it lands right after Phase 24 and Phase 25, before Phase 27.
+#### As-built
 
-Defect (natedev and accounts, through sdlc [d4982d9a], 2026-11-07): at 11:52 EST the move path delivered fastest's resume message. `wait_for_prompt_input` (`scripts/herdr/herdr.py:2161`) sent `ctrl+s` and stashed the user's draft 'restart impl2 now, don't wait for herdr'. After the turn ended at 11:53 the composer was empty, and the draft was not in the transcript. So the Phase 23 claim "Claude puts the stashed draft back after a submit that is not a slash command" fails live. That claim came from a read of the Claude Code 2.1.319 source, not from a live proof. The resume message was a multi-line script prompt, which Claude shows as pasted content. sdlc: "a user's lost typing is a fault the user sees."
+`Herdr.submit_opening_prompt` adds no draft restore step. A live measurement of Claude Code 2.1.319 in 7 cases with no stop (idle, generating, SessionStart hooks, a running tool, two queued prompts) shows that Claude keeps or restores a stashed draft by itself after a submit. `PromptSubmissionTests.test_proved_submission_returns_without_waiting_for_the_turn_or_restoring_the_stash` proves that a proved submission returns at once: it does not wait for the turn and does not send `ctrl+s` again.
 
-#### Work Order
+**Files:**
+- `scripts/herdr/test_herdr.py` — the submission test above.
 
-**Goal:** when herdr stashes a draft to deliver a prompt, the user sees the same draft in the composer after the turn.
+**Gotchas:** a stop and resume loses the draft: the SIGTERM in `stop_resume._stop` (`scripts/shutdown/stop_resume.py:332`) ends the Claude process that holds it. The agents unit owns that fix (its pause and exit phase); herdr adds only a pane-read helper if that unit asks for one.
 
-**Spec:**
-
-1. Find the cause live before any edit, in a throwaway Claude pane (Acceptance gate). Measure the composer just after the submit, during the turn and after the turn, for a multi-line script prompt and a one-line prompt. Read the Claude Code 2.1.319 stash restore condition in its source. Record the cause in the summary.
-2. Fix in the one submit path (`Herdr.submit_opening_prompt` and `wait_for_prompt_input`). When this call stashed a draft and the submit is proved, put the draft back with Claude's own stash key: `ctrl+s` on an empty composer restores the stash. Send it once, only when the composer is empty. If step 1 shows that this does not restore the draft, post blocked with the measured evidence.
-3. Add no check, refusal, validation or retry that this list does not name.
-
-**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- A unit test: a submit that stashed a draft sends `ctrl+s` again once after the proved submit when the composer is empty, and sends nothing when the composer holds the draft.
-- A live proof in a throwaway pane: draft in the composer, a multi-line script prompt submitted through `submit_opening_prompt`, the same draft in the composer after the turn. The pane is a tab named `zz-proof-draft` in the agents herdr session, with its working directory under `/home/natepiano/scratch/herdrcheck/`. Close only the ids that the proof opened.
-- `PromptSubmissionTests` and `HerdrTests` pass; basedpyright on both files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
-
+**Ruled out:** a `ctrl+s` restore after a proved submit — it made each delivery wait for the turn end.
 
 ### Phase 31 — A message to a pane worker goes to its pane  · status: todo
 
@@ -3286,6 +3274,16 @@ Defect (natedev and accounts, through sdlc [d4982d9a], 2026-11-07): at 11:52 EST
 sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane worker fails with exit 3, `FAILED: codex_mesh.py send: codex_mesh: tool-based-ui-demo-fix2 is ended; message not delivered`. `send.py` (`codex`, `scripts/message/send.py:2234`) still sends every Codex message through `codex_mesh.py send`, which reads the old mesh roster entry as ended. sdlc's rule: `send.py` delivers to a pane worker through the one pane delivery function that assign uses, with no second copy. The `codex_mesh` route goes with Phase 19.
 
 The Work Order is written at the phase start.
+
+### Phase 32 — A launch keeps the caller's Codex home  · status: todo
+
+**Depends on:** none. Placed after the Phase 27 and 30 checkpoints and before Phase 29 (director's call, sent to sdlc 2026-11-07). Phase 19 waits for this phase.
+
+sdlc reported a finding from the agents unit's live proof (2026-11-07): `herdr.launch_agent` called with `CODEX_HOME=~/.codex2` started the Codex process on `~/.codex1`. Account moves to a second Codex account depend on this value. The code keeps the value through `agent_base_environment` and `nix_env.ensure` (`scripts/herdr/herdr.py:4826-4853`), and `Herdr.open_tab` passes it to the new pane as `tab create --env` (`:1362`). So the loss is after herdr.py hands it to herdr: in the pane shell start, or in `herdr agent start --kind codex` (`:1920`).
+
+The agents unit's evidence (2026-11-07, `/tmp/claude/unit/fac3cc89-6c14-4c9a-9d7d-1c7c22403037/phases/morty-workers/proof/`): `live_proof_3.log` (12:15:49 EST) and `live_proof_4.log` (12:20:23-12:23:45 EST) called `herdr.launch_agent(..., {'CODEX_HOME': '/home/natepiano/.codex2'}, 'codex', [...], NoOpeningPrompt(), ...)` into a `NewTab`. The Codex process read `CODEX_HOME=/home/natepiano/.codex1` from its environment at launch. `live_proof_7.log` started on codex2 because it ran `env CODEX_HOME=~/.codex2 codex ...` in a plain pane with `run_in_pane`, not through `launch_agent`.
+
+The Work Order is written at the phase start. Step 1 measures `CODEX_HOME` in the pane shell and in the Codex process of a throwaway zz-proof pane; the fix goes where the value is lost.
 
 ## Reference
 
