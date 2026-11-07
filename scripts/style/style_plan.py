@@ -36,6 +36,7 @@ from typing import Literal, assert_never, cast, override
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.lib import berth_board
+from scripts.lib.git_blob import git_blob_id
 from scripts.style import coverage_report
 from scripts.style import bulk_rename
 from scripts.style import finding_sites
@@ -2069,7 +2070,7 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     rule_paths = {pinned.rule_id: plan.parent.parent / "rules" / (pinned.blob + ".md") for pinned in texts}
     for pinned in texts:
         path = rule_paths[pinned.rule_id]
-        if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
+        if not path.exists() or git_blob_id(path.read_bytes()) != pinned.blob:
             atomic_write(path, pinned.text)
     waived = _waived_ticket_findings(ledger, ticket, rule_paths)
     review = ticket_review_scope(ledger.repo, ticket, held) if ticket["kind"] == "proposal" else ReviewScope.PRODUCTION
