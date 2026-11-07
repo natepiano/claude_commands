@@ -2880,7 +2880,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 ### Phase 19 — Delete the mesh and rename the detached runs  · status: todo
 
-**Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, and the drain gate below.
+**Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, Phase 22, Phase 23, Phase 24, and the drain gate below.
 Require the devtools-unit 3t checkpoint, with the `implement.sh` and `review.sh` Codex branches deleted, merged to sdlc.
 Unrelated staff stores and deletions can follow panes without the whole-4g barrier.
 
@@ -3081,6 +3081,117 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 **Gotchas:** `submit_opening_prompt` proves only Claude sessions: `TranscriptCursor` reads Claude `projects` files, and the composer parser and recipient check read Claude screens and the Claude session registry. A running Codex worker has the nudge flag only after its next launch or restart; the launch passes `--model`, so a restart also restores a model that the popup changed. `Herdr.run` caps each call at 10 s, and the 5 s stall fits inside it.
 
 **Ruled out:** `submit_opening_prompt` for Codex workers (Claude-only proof); a retry or a transcript wait loop in the message path (sdlc: no new check).
+
+### Phase 22 — A lost detached result does not hold a finished pass  · status: todo
+
+**Depends on:** Phase 21. Phase 19 waits for this phase.
+
+sdlc ordered it (2026-11-07): "a finished detached run whose result line is missing must not hold a pass forever. Read the run's own finished record. Add no new check." The fastest unit's worker `hana_catalyst-build-speed-tests-impl2` wrote `DONE 31c4086f-…`, but each launcher rerun exited 3. Its run `20261107T083017-444209-2a25` finished and records `sent: worker … at w14:pW`. The Codex model popup took that delivery before Phase 21, so the `Detached run:` line never reached the transcript. `worker.dispatch_receipt` counts every finished run that records a pane delivery as pending until its marker is in the transcript, so the receipt stays `DispatchWaitingForRuns` and every quiet wait returns `NO_DONE`.
+
+#### Work Order
+
+**Goal:** a dispatch whose worker wrote its DONE reply and is idle completes when its only pending runs are finished. One anomaly line names each finished run whose result is not in the transcript. A live run still holds the pass.
+
+**Spec:**
+
+1. `DispatchWaitingForRuns` (`scripts/production/worker.py:59`) gains `reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply`, the transcript receipt. `dispatch_receipt` (`:165`) fills it.
+2. In `_dispatch_turn` (`:319`), at the quiet-wait return (`:374`): when the receipt is `DispatchWaitingForRuns` with `has_live_run` false, its `reply` is `DispatchComplete`, and the worker is idle or done, print `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` once per run to stderr, then return the reply. Every other case keeps `ExitCode.NO_DONE`.
+   The finished record is the evidence that the run ended. The quiet wait comes first, so a result that is still on its way reaches the transcript before this decision.
+3. Do not change `transcript_receipt`, `mesh_runs.deliver`, `delivered_worker_results` or `live_runs`. Add no check, refusal, validation, retry or new wait.
+
+**Files:**
+- `scripts/production/worker.py` — Spec items 1 and 2.
+- `scripts/production/test_worker.py` — `test_a_delivered_result_absent_from_the_transcript_waits_only_while_its_run_is_live` (`:694`) now pins the new outcome. Rename it for the behavior. For both subtests the dispatch returns `ExitCode.OK`, prints the anomaly line once with the run id, submits no prompt and keeps the DONE reply. The live subtest still waits until its run finishes. Add one test: a worker reply without DONE and a finished run absent from the transcript still returns `NO_DONE`. Keep every other test in the module.
+
+**Workers:** `1 writer` — `impl`: both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 21: `send.deliver_worker_text` proves the turn start with `SubmitStarts`, and a stall goes to the holder, so a `sent` record after Phase 21 means the turn started. Keep the Phase 15 settle and busy tests and the detached dispatch tests in `test_worker.py`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/production -p 'test_worker.py'` passes.
+- `-s scripts/herdr -p 'test_worker_panes.py'` and `-s scripts/agents -p 'test_mesh_runs.py'` pass.
+- basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
+
+### Phase 23 — A draft in the composer does not block an opening prompt  · status: todo
+
+**Depends on:** Phase 22. Phase 19 waits for this phase.
+
+sdlc ordered it (2026-11-07), from the user: "it is unacceptable for the user to do any work to move any unit or showrunner to a different account other than to say 'move'". After the units moved to claude3 at 10:0x EST, the resume resend skipped fastest because its composer held unsent text. `Herdr.submit_opening_prompt` (`scripts/herdr/herdr.py:2185`) waits in `wait_for_prompt_input` (`:2148`) for an empty composer, and `prompt_input_state` (`:2130`) reports a composer with text as `PromptInputNotReady("destination has no empty composer")`. The wait runs to its deadline, and the message is not sent. The accounts unit fixes the missing-resume cause on branch `move-anomalies`; this phase does not touch it.
+
+Claude Code 2.1.319 has a prompt stash: `ctrl+s` (`chat:stash`) moves a non-empty composer into the stash and clears the composer. When a prompt that is not a slash command is submitted, Claude puts the stashed text back in the composer and shows "Draft restored". After a slash command submit, the text stays in the stash, and `ctrl+s` on the empty composer restores it.
+
+#### Work Order
+
+**Goal:** an opening prompt reaches a Claude pane whose composer holds a draft. The draft stays the user's: Claude puts it back after the submit. The submit path stays one path.
+
+**Spec:**
+
+1. Add `PromptInputHoldsDraft(screen)` beside `PromptInputNotReady` (`herdr.py:278`). `prompt_input_state` returns it when the pane is ready and the composer holds text. Every other result does not change.
+2. `wait_for_prompt_input` (`:2148`): on `PromptInputHoldsDraft`, send `ctrl+s` once with `self._send_keys(pane, "ctrl+s")`, then keep waiting for the empty composer as now. Send it at most once per call. A second draft in the same call waits, as an occupied composer waits now.
+3. Do not change `check_target`, the "destination input contains other text" failures after the first typing, or the retype and Enter logic. They see the empty composer after the stash.
+4. Add no check, refusal, validation or retry. Add no new wait.
+
+**Files:**
+- `scripts/herdr/herdr.py` — Spec items 1 and 2.
+- `scripts/herdr/test_herdr.py`:
+  - Repin `test_untracked_pane_with_text_in_the_composer_is_not_ready` (`:4252`): the state is `PromptInputHoldsDraft`; rename it for the behavior.
+  - Add a test: `submit_opening_prompt` on a ready pane with a draft sends `ctrl+s` once, then types and submits the prompt. The fixture screen shows an empty composer after the `ctrl+s`.
+  - Add a test: a composer that holds text again after the `ctrl+s` gets no second `ctrl+s` and ends with the existing "destination never became ready for input" failure.
+  - Keep every other test in the module.
+
+**Workers:** `1 writer` — `impl`: both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 21: Codex panes use the native `herdr agent prompt --wait` proof, not `submit_opening_prompt`. Callers in `scripts/production` (`add_unit.py`, `add_showrunner.py`, `promote_showrunner.py`) and `scripts/shutdown/stop_resume.py` keep their calls.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/herdr -p 'test_herdr.py'` passes.
+- `-s scripts/shutdown -p 'test_stop_resume.py'`, `-p 'test_pane_restore.py'`, and `-s scripts/production -p 'test_add_unit_rerun.py'`, `-p 'test_add_showrunner.py'`, `-p 'test_promote_showrunner.py'` pass.
+- basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
+
+### Phase 24 — Long worker names stay unique agent names  · status: todo
+
+**Depends on:** Phase 23 (the same two files). Phase 19 waits for this phase.
+
+sdlc ordered it (2026-11-07), a defect from builds: herdr cuts an agent name to 32 characters. `_agent_name` (`scripts/herdr/herdr.py:4745`) maps the name and returns `mapped[:32]`. The verify unit's workers `claude-build-followups-verify-review4`, `-review5` and `-review6` all become `claude-build-followups-verify-re`. With review5 live, review4 and review6 exit 8 (`agent_name_taken`). `Herdr.start_agent` (`:1903`) turns the failure into `PromptNotSubmitted`, and `launch_prepared_agent` (`:4859`) keeps the pane it opened, so each failed start leaves a pane.
+
+A new worker has no staff id before its first start, so the short name comes from the full name. Recovery finds a worker pane by its label, which keeps the full name, so the agent name has no other reader.
+
+#### Work Order
+
+**Goal:** two different worker names always give two different herdr agent names of 32 characters or fewer. A start that fails before the agent runs closes the pane that this launch opened.
+
+**Spec:**
+
+1. `_agent_name`: a mapped name of 32 characters or fewer does not change. A longer one becomes its first 23 characters, `-`, and the first 8 hex digits of the SHA-256 of the mapped name. Add no refusal.
+2. Add `AgentNotStarted(PromptNotSubmitted)` beside `PromptNotSubmitted` (`:313`): the `agent start` command failed, and no agent runs in the pane. The `except HerdrFailure` branch of `Herdr.start_agent` returns it in place of `PromptNotSubmitted`. Callers that match `PromptNotSubmitted` keep their behavior.
+3. `launch_prepared_agent`: when the outcome is `AgentNotStarted` and the destination is `NewTab` or `SplitPane`, close the pane as the `AgentExited` branch does (`close_agent` for `NewTab`, `client.close_retained_pane` for `SplitPane`). Print `herdr <name>:<pane>: agent start failed: <reason>; pane closed`. An `ExistingPane` stays open: this launch did not open it.
+4. Add no check, refusal, validation, retry or new wait.
+
+**Files:**
+- `scripts/herdr/herdr.py` — Spec items 1-3.
+- `scripts/herdr/test_herdr.py`:
+  - Repin `test_agent_names_are_valid_for_method_and_module_launches` (`:4207`): the `"X" * 40` case gives the 23-character prefix, `-` and the hash digits.
+  - Add a test: the three verify names give three different agent names, each of 32 characters or fewer.
+  - Add a test: an `agent_name_taken` start into a `SplitPane` closes the pane and returns `AgentNotStarted`; the same failure into an `ExistingPane` keeps the pane.
+  - Keep every other test in the module.
+
+**Workers:** `1 writer` — `impl`: both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 23 changes the same files; this phase starts after its checkpoint. Phase 7: a failed start into an `ExistingPane` leaves the labelled pane at its shell for a rerun; keep it.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/herdr -p 'test_herdr.py'` and `-p 'test_worker_panes.py'` pass.
+- `-s scripts/shutdown -p 'test_stop_resume.py'`, `-p 'test_pane_restore.py'`, and `-s scripts/production -p 'test_add_unit_rerun.py'`, `-p 'test_worker.py'` pass.
+- basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
 
 ## Reference
 
