@@ -19,7 +19,7 @@ REFUSAL = 'Start workers through assign.sh from the director session.'
 
 def assign_role(role: str) -> str:
     """Return the role name accepted by assign.sh."""
-    return "implement" if role == "impl" else role
+    return {"impl": "implement", "astra-designer": "implement", "astra-reviewer": "review"}.get(role, role)
 
 
 def assign_command(run_dir: str, worker: str, role: str, options: list[tuple[str, str]]) -> str:

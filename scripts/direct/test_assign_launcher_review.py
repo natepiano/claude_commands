@@ -55,7 +55,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         def observe_review(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = original(request)
             if request.get("method") == "turn/start":
-                held.extend(astra_roles.live_roles())
+                held.extend(astra_roles.live_roles(staff.snapshot()))
                 published.extend(row for row in staff.snapshot().find(kind="worker") if row.name == "astra-reviewer")
                 if frames is not None:
                     params = cast(dict[str, object], request["params"])
@@ -69,7 +69,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
             result = self.managed_astra_review()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(astra_roles.live_roles(), [])
+            self.assertEqual(astra_roles.live_roles(staff.snapshot()), [])
         member, = published
         role, = held
         self.assertEqual((role["role"], role["staff_id"], role["thread_id"]),
@@ -89,7 +89,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
             result = self.managed_astra_review()
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertEqual(astra_roles.live_roles(), [])
+            self.assertEqual(astra_roles.live_roles(staff.snapshot()), [])
         self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
         self.assertEqual(self.turn_starts, 1)
 
@@ -399,9 +399,6 @@ class PaneAstraReviewTests(HeldRolePaneCase):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
-        session = self.panes.command_case.fixture.parent.current_session
-        write_text_atomic(Path.home() / ".codex/sessions" / f"{session}.jsonl",
-                          json.dumps({"type": "turn_context", "payload": {"model": "fixture", "effort": "high"}}) + "\n")
         self.panes.command_case.agent.final = "Verdict: clear."
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 

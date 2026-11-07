@@ -14,9 +14,11 @@ from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import assign
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib.server_test_support import owned_server_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
@@ -98,6 +100,8 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        write_text_atomic(self.session_dir / "worker_transport", "mesh\n")
+        _ = self.enterContext(owned_server_record(self.session_dir / "mesh_server.json"))
         self.lifecycle_clock.freeze()
         self.hang_guard = LauncherHangGuard(self.id())
         self.server.hang_guard = self.hang_guard

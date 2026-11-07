@@ -116,6 +116,10 @@ class BoardJsonTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         self.history = self.root / "history"
         (self.history / "runs").mkdir(parents=True)
         self.run_root = self.root / "unit"
@@ -337,6 +341,7 @@ class BoardJsonTests(unittest.TestCase):
     def session_files(self, name: str = "current", *, former: bool = False) -> Path:
         directory = (self.former_root if former else self.run_root) / name
         directory.mkdir(exist_ok=True)
+        write_text_atomic(directory / "worker_transport", "mesh\n")
         _ = (directory / "mesh_roster.json").write_text(json.dumps({
             "alpha-impl": {"slot": "1", "role": "impl", "status": "running",
                            "thread_id": "thread-one", "turn_id": "turn-one",

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
@@ -193,6 +194,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     @override
     def start_phase(self, name: str) -> Path:
         session = super().start_phase(name)
+        write_text_atomic(session / "worker_transport", "mesh\n")
         state_file = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_file.read_text()))
         state["owner_staff_id"] = self.staff_parent

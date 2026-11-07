@@ -18,16 +18,7 @@ setUpModule = mesh_fixture.setUpModule
 
 @final
 class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
-    def test_a_dead_launcher_and_server_recover_the_same_thread_for_named_dispatch(self) -> None:
-        _ = self.successful()
-        name, original = next(iter(self.assignment_records().items()))
-        original.update({"status": "running", "launcher_pid": 99999999, "turn_id": "lost-turn"})
-        self.write_pool_roster({name: original})
-        respond = self.server.respond
-        self.server.close()
-        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
-        self.server = mesh_fixture.StubAppServer(respond)
-        self.server.hang_guard = self.hang_guard
+    def use_fixture_server_start(self) -> None:
         directory = self.session_dir.parent / "restart-server"
         directory.mkdir()
         _ = (directory / "sitecustomize.py").write_text("\n".join((
@@ -44,8 +35,22 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
             "    mesh._start_watcher = lambda *args: mesh.ExistingServerWatcher()",
             "sys.setprofile(enter)",
         )) + "\n")
-        with patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((str(directory), str(launcher_fixture.ROOT)))}):
-            _ = self.successful("implement", "--to", name)
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "PYTHONPATH": os.pathsep.join((str(directory), str(launcher_fixture.ROOT))),
+        })))
+
+    def test_a_dead_launcher_and_server_recover_the_same_thread_for_named_dispatch(self) -> None:
+        _ = self.successful()
+        name, original = next(iter(self.assignment_records().items()))
+        original.update({"status": "running", "launcher_pid": 99999999, "turn_id": "lost-turn"})
+        self.write_pool_roster({name: original})
+        respond = self.server.respond
+        self.server.close()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.server = mesh_fixture.StubAppServer(respond)
+        self.server.hang_guard = self.hang_guard
+        self.use_fixture_server_start()
+        _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
         self.assertEqual(self.methods("thread/start"), [])
         resumed = [cast(dict[str, object], request["params"])["threadId"]
@@ -62,6 +67,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         code, output, errors = self.run_mesh(["end", "--to", name])
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.assignment_records()[name]["status"], "ended")
+        self.use_fixture_server_start()
         _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
         self.assertEqual(len(self.methods("thread/start")), 1)

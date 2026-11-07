@@ -26,9 +26,15 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+
+if __name__ == "unit_runs":
+    _ = sys.modules.setdefault("scripts.lib.unit_runs", sys.modules[__name__])
+elif __name__ == "scripts.lib.unit_runs":
+    _ = sys.modules.setdefault("unit_runs", sys.modules[__name__])
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
@@ -125,6 +131,9 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
         except FileNotFoundError:
             selected = conf.read("direct").text("WORKER_TRANSPORT")
             selected = _transport(selected, run)
+            if selected == "mesh":
+                print("unit_runs: new runs require herdr; refusing a new mesh pin", file=sys.stderr)
+                raise SystemExit(2)
             write_text_atomic(pin, selected + "\n")
         return _transport(selected, pin)
 
@@ -222,6 +231,12 @@ def marker_must_stay(path: Path) -> bool:
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
+@cache
+def report_anomaly(message: str) -> None:
+    """Print each run anomaly once per process."""
+    print(message, file=sys.stderr)
+
+
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
              record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> str:
     """Read the run owner's current session from staff."""
@@ -234,7 +249,7 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
         find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
         return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
     except (OSError, ValueError) as error:
-        print(f"anomaly: {run}: {error}", file=sys.stderr)
+        report_anomaly(f"anomaly: {run}: {error}")
         return ""
 
 

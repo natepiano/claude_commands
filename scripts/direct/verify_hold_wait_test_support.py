@@ -30,6 +30,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
 
 
@@ -394,6 +395,7 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

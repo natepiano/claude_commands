@@ -32,7 +32,7 @@ class UnitListing(NamedTuple):
     anomalies: tuple[str, ...]
 
 
-def read_units(production_name: str, *scans: Callable[[staff.StaffSnapshot, unit_lookup.MemberSources], None],
+def read_units(production_name: str, *,
                check: Callable[[int, str], session_staff.ReportProcessIdentity] | None = None) -> UnitListing:
     """Return staff units and every anomaly from this observation."""
     record = staff.snapshot()
@@ -42,8 +42,6 @@ def read_units(production_name: str, *scans: Callable[[staff.StaffSnapshot, unit
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
     with session_staff.anomalies(check) as lines:
         every = unit_lookup.every_labeled_session(record=record, sources=sources)
-        for scan in scans:
-            scan(record, sources)
     units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()))
     return UnitListing(units, tuple(lines))
 

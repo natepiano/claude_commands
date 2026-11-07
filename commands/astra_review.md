@@ -29,7 +29,9 @@ changes no file.
    The launcher uses the review run's transport pin.
    If worker end fails, its staff row remains visible in `worker.py list`.
    The exec hold ends with the launcher process.
-   A review outside the staff hierarchy keeps its one-turn `codex exec` path.
+   A review outside the staff hierarchy uses `assign.sh --target consultation-pane --operation astra-review`.
+   Its consultation pane uses Codex `gpt-6-astra` at `xhigh` with read-only access and approval `never`.
+   The launcher reads the review from the transcript, then closes the pane.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output

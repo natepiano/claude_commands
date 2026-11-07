@@ -87,7 +87,7 @@ models_registry_store() {
 }
 
 models_agent_environment() {
-    unset MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_EDIT_BASE
+    unset MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_EDIT_BASE STAFF_OPERATION_FD
 }
 
 # With an output variable, trim in this shell. Without one, keep the printed API.

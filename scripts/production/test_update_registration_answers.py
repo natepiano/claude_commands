@@ -12,7 +12,7 @@ import sys
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 
 from scripts.lib import names
@@ -22,6 +22,8 @@ from scripts.production.update_registration_test_support import RegistrationFixt
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 
 
 class RegistrationTests(RegistrationFixture):
@@ -167,6 +169,50 @@ class RegistrationTests(RegistrationFixture):
 
     def test_answer_rerun_recovers_relay_after_list_replacement_completed_then_stopped(self) -> None:
         self.check_answer_write_interruption(after_replace=True)
+
+    def test_answer_replay_names_the_renamed_asking_unit(self) -> None:
+        self.check_answer_replay_after_staff_change("unit rename")
+
+    def test_answer_replay_names_the_renamed_production_owner(self) -> None:
+        self.check_answer_replay_after_staff_change("production rename")
+
+    def test_answer_replay_names_the_asking_units_new_production(self) -> None:
+        self.check_answer_replay_after_staff_change("unit move")
+
+    def check_answer_replay_after_staff_change(
+            self, change: Literal["unit rename", "production rename", "unit move"]) -> None:
+        self.timer("kid")
+        self.attach("kid", "example")
+        owner = self.fixture_staff_id(name="kid")
+        unit = fixture_member("unit", name="requester", parent=owner)
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "retry?",
+                                    "question": "Retry it?", "asked_by": unit.id})
+        first = self.run_command("answer", "--item", "retry?")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        path = next((self.state / "showrunner/outstanding").glob("*.answered.jsonl"))
+        before = path.read_bytes()
+        saved = cast(dict[str, str], json.loads(before))
+        answered_at = datetime.fromisoformat(saved["time"])
+        if change == "unit rename":
+            unit = staff.rename(unit.id, "renamed-requester")
+            destination, item_owner = "kid", "kid"
+        elif change == "production rename":
+            renamed = staff.rename(owner, "renamed-kid")
+            destination, item_owner = renamed.name, renamed.name
+        else:
+            moved_owner = fixture_member("showrunner", name="elsewhere")
+            unit = staff.move(unit.id, staff.ReportsTo(moved_owner.id))
+            destination, item_owner = moved_owner.name, "kid"
+
+        repeated = self.run_command("answer", "--item", "retry?")
+
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout.splitlines(), [
+            f"already answered {answered_at:%a %b %d %H:%M}",
+            f"relay: to the showrunner of {destination}, for {unit.name} (staff {unit.id})",
+            f"answer: ok — {item_owner}: retry?",
+        ])
+        self.assertEqual(path.read_bytes(), before)
 
     def test_answer_rerun_removes_open_item_after_answer_record_was_saved(self) -> None:
         self.check_answer_write_interruption(after_replace=False)

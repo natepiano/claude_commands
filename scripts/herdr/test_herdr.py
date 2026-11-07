@@ -280,6 +280,24 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(observed, observation)
         native.assert_called_once_with(998075, "codex")
 
+    def test_held_pane_row_proves_the_native_process_and_session_without_another_pane_read(self) -> None:
+        identity = fixture_runtime_id("held-pane-report")
+        row = {"pane_id": "w1:p1", "agent_session": {"value": identity}, "agent_type": "codex"}
+        observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start",
+                                               {"UNIT_RUN_DIR": str(self.root)})
+        payload = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 998075, "argv": ["codex"]}]}}}
+        result = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
+        client = herdr.Herdr("agents")
+        with (patch.object(herdr, "run_program", return_value=result),
+              patch.object(herdr, "native_process", return_value=observation) as native,
+              patch.object(client, "panes", side_effect=AssertionError("held pane was read again"))):
+            process = client.native_pane_process("w1:p1", "codex", 1, pane_row=row)
+            self.assertEqual(process.current_identity, identity)
+            self.assertEqual(process.environment, observation.environment)
+            self.assertEqual(client.native_session("w1:p1", "codex", 1, pane_row=row), identity)
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
+
     def test_codex_native_process_proves_the_open_thread_instead_of_the_launch_thread(self) -> None:
         launch = fixture_runtime_id("native-launch-thread")
         current = fixture_runtime_id("native-replaced-thread")
@@ -4265,16 +4283,22 @@ class HerdrTests(unittest.TestCase):
     def test_readiness_and_wait_states(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         self.assertEqual(self.herdr.readiness("pane-1"), {"agent_status": "idle", "interactive_ready": True})
-        arguments = ["agent", "wait", "pane-1", "--until", "done", "--timeout", "20"]
+        arguments = ["agent", "wait", "pane-1", "--until", "done", "--until", "idle", "--timeout", "20"]
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "done"}}}))
-        self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.ObservedAgentState(herdr.AgentStatus.DONE))
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.ObservedAgentState(herdr.AgentStatus.DONE))
         self.configure_herdr(arguments, code=1, stderr=json.dumps({"error": {"code": "timeout", "message": "deadline"}}))
-        self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.WaitTimedOut())
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.WaitTimedOut())
         with patch.object(herdr, "run_program", side_effect=subprocess.TimeoutExpired("fake", 1)):
-            self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.WaitTimedOut())
+            self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.WaitTimedOut())
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))
         with self.assertRaises(herdr.AgentBlocked):
-            _ = self.herdr.wait_until("pane-1", "done", 20)
+            _ = self.herdr.wait_turn_end("pane-1", 20)
+
+    def test_wait_turn_end_requests_done_and_idle(self) -> None:
+        arguments = ["agent", "wait", "pane-1", "--until", "done", "--until", "idle", "--timeout", "20"]
+        self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.ObservedAgentState(herdr.AgentStatus.IDLE))
+        self.assertEqual(self.commands(), [["--session", "fixture", *arguments]])
 
     def test_pane_reads_share_the_absolute_deadline_and_keep_the_default_timeout(self) -> None:
         reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")
@@ -5718,39 +5742,55 @@ class RowTabTests(StaffTestCase):
         alpha = fixture_member("unit", name="alpha", parent=parent.id)
         zulu = fixture_member("unit", name="zulu", parent=parent.id)
         other = fixture_member("worker", name="another-tab", parent=parent.id)
+        source = dict(self.client.tabs[0])
+        for saved_order in (False, True):
+            with self.subTest(saved_order=saved_order):
+                self.client.tabs = [dict(source)]
+                self.assert_moved_unit_order((parent, alpha, zulu, other),
+                    [parent, alpha, self.rows["unit"], zulu, other], saved_order=saved_order)
+
+    def test_moved_unit_takes_its_place_past_a_saved_worker_tab(self) -> None:
+        parent = self.rows["parent"]
+        alpha = fixture_member("unit", name="alpha", parent=parent.id)
+        bravo = fixture_member("unit", name="bravo", parent=parent.id)
+        zulu = fixture_member("unit", name="zulu", parent=parent.id)
+        worker = fixture_member("worker", name="review", parent=bravo.id)
+        self.assert_moved_unit_order((parent, alpha, worker, bravo, zulu),
+            [parent, alpha, worker, bravo, self.rows["unit"], zulu], saved_order=True)
+
+    def assert_moved_unit_order(self, members: tuple[staff.StaffRow, ...], expected: list[staff.StaffRow],
+                                *, saved_order: bool) -> None:
+        parent = self.rows["parent"]
         initial = [dict(self.client.tabs[0])]
-        for index, member in enumerate((parent, alpha, zulu, other), 1):
+        for index, member in enumerate(members, 1):
             initial.append({"pane_id": f"destination-p{index}", "tab_id": f"destination-t{index}",
                 "workspace_id": "w2", "label": member.name, "session_id": member.current_session,
                 "terminal_id": f"destination-terminal-{index}"})
-        for saved_order in (False, True):
-            with self.subTest(saved_order=saved_order):
-                self.client.tabs = [dict(pane) for pane in initial]
-                self.client.focused_pane = "p0"
-                saved = herdr.SavedLayout(at=time.time(), workspaces=[])
-                if saved_order:
-                    saved["workspaces"] = [
-                        herdr.SavedSpace(name="old-production", seen=time.time(), tabs=[
-                            herdr.SavedName(name=self.rows["unit"].id, seen=time.time())]),
-                        herdr.SavedSpace(name=parent.name, seen=time.time(), tabs=[
-                            herdr.SavedName(name=member.id, seen=time.time())
-                            for member in (parent, alpha, zulu, other)])]
-                path = herdr.layout_path("fixture")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text(json.dumps(saved))
+        self.client.tabs = [dict(pane) for pane in initial]
+        self.client.focused_pane = "p0"
+        saved = herdr.SavedLayout(at=time.time(), workspaces=[])
+        if saved_order:
+            saved["workspaces"] = [
+                herdr.SavedSpace(name="old-production", seen=time.time(), tabs=[
+                    herdr.SavedName(name=self.rows["unit"].id, seen=time.time())]),
+                herdr.SavedSpace(name=parent.name, seen=time.time(), tabs=[
+                    herdr.SavedName(name=member.id, seen=time.time())
+                    for member in members])]
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
 
-                self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
 
-                expected = [parent, alpha, self.rows["unit"], zulu, other]
-                self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
-                                 [member.name for member in expected])
-                destination = next(space for space in herdr.saved_layout("fixture")["workspaces"]
-                                   if space["name"] == parent.name)
-                if saved_order:
-                    self.assertEqual([tab["name"] for tab in destination["tabs"]],
-                                     [member.id for member in expected]
-                                     + [self.rows[key].id for key in ("split", "stopped", "worker")])
-                self.assert_complete_rerun()
+        self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                         [member.name for member in expected])
+        destination = next(space for space in herdr.saved_layout("fixture")["workspaces"]
+                           if space["name"] == parent.name)
+        if saved_order:
+            self.assertEqual([tab["name"] for tab in destination["tabs"]],
+                             [member.id for member in expected]
+                             + [self.rows[key].id for key in ("split", "stopped", "worker")])
+        self.assert_complete_rerun()
 
     def test_record_layout_binds_the_native_row_instead_of_a_stale_mark(self) -> None:
         self.client.tabs = self.client.tabs[:1]
@@ -6316,6 +6356,12 @@ class SavedLayoutTests(unittest.TestCase):
         saved = [herdr.SavedName(name=title, seen=100.0) for title in ("boss", "zulu", "apple", "mike")]
         order = herdr.tab_order("boss", titles, saved, {"mike", "zulu"})
         self.assertEqual([titles[index] for index in order], ["boss", "zulu", "apple", "mike"])
+
+    def test_a_new_unit_takes_its_place_past_a_saved_worker_tab(self) -> None:
+        titles = ["boss", "a-unit", "worker", "m-unit", "z-unit"]
+        saved = [herdr.SavedName(name=title, seen=100.0) for title in titles[:-1]]
+        order = herdr.tab_order("boss", titles, saved, {"a-unit", "m-unit", "z-unit"})
+        self.assertEqual([titles[index] for index in order], titles)
 
     def test_new_units_and_terminals_take_their_places_after_the_first_saved_tab(self) -> None:
         titles = ["performance", "zulu", "apple", "mike", "banana"]
