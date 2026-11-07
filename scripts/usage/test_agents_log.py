@@ -51,7 +51,7 @@ class AgentsLogTests(unittest.TestCase):
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), *arguments],
+            [sys.executable, str(SCRIPT), *arguments],
             cwd=REPOSITORY,
             env=os.environ.copy(),
             capture_output=True,

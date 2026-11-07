@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Write and inspect the current, user-visible feature log."""
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
-from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+from atomic_file import write_text_atomic  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):

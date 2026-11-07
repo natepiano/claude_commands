@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Publish and refresh files at short review links on this machine's tailnet."""
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from string import Template, ascii_lowercase, digits
 from typing import cast
 from urllib.parse import quote
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, conf
 
 

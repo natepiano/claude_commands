@@ -7,22 +7,23 @@ import gzip
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-from scripts.buildlog import port_lint
-from scripts.buildlog import store
-from scripts.buildlog import treekey
-from scripts.buildlog.port_lint import Process, ProbeRow
+import port_lint
+import store
+import treekey
+from port_lint import Process, ProbeRow
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.buildlog.test_index import Record, encode, point_root_at, step
-from scripts.buildlog.test_treekey import GIT_ENVIRONMENT
+from test_index import Record, encode, point_root_at, step
+from test_treekey import GIT_ENVIRONMENT
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -226,7 +227,7 @@ class CommandTests(unittest.TestCase):
 
     def port_lint(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT), *args],
+            [sys.executable, str(SCRIPT), *args],
             cwd=self.repo,
             env=self.environment(),
             capture_output=True,

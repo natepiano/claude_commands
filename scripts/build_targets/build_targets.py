@@ -20,11 +20,12 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import Literal, Protocol, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
-from scripts.build_hold import override_guard
-from scripts.build_targets import target_config
-from scripts.message import roster
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
+import target_config
 
 
 class CliArguments(argparse.Namespace):
@@ -92,7 +93,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-from scripts.build_targets.targets import (
+from targets import (
     ANY_ELIGIBLE_TARGET,
     AwsStatusRow,
     RemovalPending,
@@ -119,15 +120,24 @@ from scripts.build_targets.targets import (
     target_state,
     target_eligibility,
 )
-from scripts.mac_test import mac_test, offload
-from scripts.lib import conf
-from scripts.lib.atomic_file import write_text_atomic
-from scripts.build_hold import build_hold
-from scripts.lib.user_zone import user_zone
-from scripts.lib import process_start as process_identity
-from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
-from scripts.buildlog import mac_idle_alert
-from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
+import offload
+import mac_test
+import conf
+from atomic_file import write_text_atomic
+import build_hold
+from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+    from ..direct.step_record import Pinned, ROUTED, TargetSelection
+    from ..buildlog import mac_idle_alert
+    from ..message import roster
+    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
+else:
+    from scripts.lib import process_start as process_identity
+    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+    from scripts.buildlog import mac_idle_alert
+    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
+
 
 
 class ActiveWaitProcess(TypedDict):
@@ -230,6 +240,7 @@ def format_aws_status(row: AwsStatusRow) -> str:
 
 
 def command_status(probe: bool = False) -> int:
+    from scripts.message import roster
 
     try:
         targets = read_targets()

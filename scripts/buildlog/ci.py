@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.buildlog import store
+import store
 
 REPOS = ("natepiano/hana",)
 PER_PAGE = 100

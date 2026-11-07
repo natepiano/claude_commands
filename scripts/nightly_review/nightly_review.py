@@ -208,7 +208,7 @@ def messages(since: datetime) -> list[str]:
     if TYPE_CHECKING:
         from scripts.notify import review
     else:
-        from scripts.notify import review
+        import review
 
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]

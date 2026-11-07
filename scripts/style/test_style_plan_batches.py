@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
+import sys
 import subprocess
 import unittest
 from dataclasses import replace
@@ -11,18 +12,19 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style import approved_renames
-from scripts.style import style_footprint
-from scripts.style import style_plan
-from scripts.style import style_proposals
+import approved_renames
+import style_footprint
+import style_plan
+import style_proposals
 
-from scripts.lib import berth_board
-from scripts.style import rules
-from scripts.style import style_ledger
-from scripts.production.issues import Issue, frontmatter
+import berth_board
+import rules
+import style_ledger
+from issues import Issue, frontmatter
 
-from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final

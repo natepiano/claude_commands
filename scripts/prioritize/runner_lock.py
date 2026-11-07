@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Run one watcher process under a crash-safe, nonblocking runner lock."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
-from scripts.prioritize import writer_lock
+import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 
 
 BUSY_EXIT = 75

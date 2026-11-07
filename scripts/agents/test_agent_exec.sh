@@ -106,7 +106,7 @@ run_dry() {
 }
 
 # Keep command discovery independent of the machine's installed Claude binary.
-claude_command="$SCRIPT_DIR/../lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
+claude_command="$HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
@@ -129,7 +129,7 @@ assert_equal "claude readonly command is wrong" \
     "$claude_readonly"
 
 simplify_readonly="$(run_dry direct.simplify readonly)"
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_readonly" <<'PYTHON'
+python3 - "$simplify_readonly" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -145,7 +145,7 @@ assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
 simplify_session="$(AGENT_EXEC_EXTRA_ARGS='--session-id abcdef12-0000-4000-8000-000000000001' run_dry direct.simplify readonly)"
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_session" <<'PYTHON'
+python3 - "$simplify_session" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -299,7 +299,8 @@ _ = (root / "staff-environment").write_text("".join(
 PYTHON
 source "$TEST_DIR/staff-environment"
 cat > "$TEST_DIR/send.py" <<'PYTHON'
-import os
+import os, sys
+sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production import staff
 assert staff.by_id(staff.StaffId(os.environ["FAKE_CLAUDE_SESSION_ID"])) is not None
 print("SENT: fixture")
@@ -310,6 +311,7 @@ run_background_fixture() {
 import os, subprocess, sys
 from pathlib import Path
 root = Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(root))
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 command, environment = backend_fixture_command(
     Path(sys.argv[1]), ["bash", str(root / "scripts/agents/agent_bg.sh"), *sys.argv[3:]], dict(os.environ))

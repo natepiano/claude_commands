@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import unittest
 import json
-from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
 from typing import cast
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
+class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
     def test_new_claude_worker_uses_registry_effort(self) -> None:
         for row, expected_effort in (("sonnet:low", "low"), ("sonnet", "")):
             with self.subTest(row=row):

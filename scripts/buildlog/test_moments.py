@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -14,13 +15,15 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import index
-from scripts.buildlog import memory, moments, report
-from scripts.buildlog import store
-from scripts.buildlog import test_report as report_fixtures
-from scripts.buildlog import test_memory_window as memory_fixtures
-from scripts.buildlog.test_index import Record, call, sample, step
-from scripts.buildlog.test_memory_window import write_lint_config
+import index
+import memory
+import moments
+import report
+import store
+import test_report as report_fixtures
+import test_memory_window as memory_fixtures
+from test_index import Record, call, sample, step
+from test_memory_window import write_lint_config
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
@@ -52,7 +55,7 @@ def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.Comple
     database = index.index_path()
     before = database.read_bytes()
     result = subprocess.run(
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("cli.py")), *args],
+        [sys.executable, str(Path(__file__).with_name("cli.py")), *args],
         env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
     )
     test.assertEqual(result.returncode, 0, result.stderr)
@@ -567,7 +570,7 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-from scripts.buildlog import index, memory, moments, report
+import index, memory, moments, report
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)
@@ -578,7 +581,7 @@ with index.read_only() as connection:
     print("\\n".join(report.moments_section(connection, "2026-10-11")))
 '''
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
+            [sys.executable, "-c", program], capture_output=True, text=True, check=False,
             timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                              "PYTHONPATH": str(Path(report.__file__).parent)},
         )

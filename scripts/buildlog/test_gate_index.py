@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING, cast, override
 import unittest
 from unittest import mock
 
-from scripts.buildlog import index
-from scripts.buildlog.index import GATE_TABLES
-from scripts.buildlog.test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
+import index
+from index import GATE_TABLES
+from test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))

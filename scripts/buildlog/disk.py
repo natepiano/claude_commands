@@ -13,13 +13,13 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-from scripts.lint import sweep
+import sweep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from scripts.lib import conf
-from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+import conf
+from cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 
-from scripts.buildlog import store
-from scripts.buildlog import filesystem
+import store
+import filesystem
 
 
 class DiskRow(TypedDict):

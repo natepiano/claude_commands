@@ -5,25 +5,28 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import change_review
-from scripts.production import footer_counts
-from scripts.production import next_item
-from scripts.production import proposal_issue
-from scripts.production import proposals_folder
-from scripts.production.update_registration import QuestionStaff
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import change_review
+import footer_counts
+import next_item
+import proposal_issue
+import proposals_folder
+from update_registration import QuestionStaff
 from scripts.production import showrunners
-from scripts.production import showrunner_tree
+import showrunner_tree
 from scripts.production import staff
 from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
-from scripts.production.footer_counts import FooterCounts
+from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, production_staff_record,
     recorded_showrunner, source_environment, unit_membership,

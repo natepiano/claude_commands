@@ -46,13 +46,22 @@ class Refused(NamedTuple):
 
 def _remaining_timeout(cap: float) -> float:
     """Load deadline support only when a subprocess needs a timeout."""
-    from scripts.lib import operation_deadline
+    repository_root = str(Path(__file__).resolve().parents[2])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    if __package__:
+        from . import operation_deadline
+    else:
+        import operation_deadline  # pyright: ignore[reportImplicitRelativeImport]
 
     return operation_deadline.remaining(cap)
 
 
 def _settings() -> ConfigRead:
-    from scripts.lib import conf
+    if __package__:
+        from . import conf
+    else:
+        import conf  # pyright: ignore[reportImplicitRelativeImport]
 
     return conf.read("nix_env")
 
@@ -117,6 +126,9 @@ def registered_copy(envrc: Path) -> bool:
         if not stat.S_ISREG(envrc.lstat().st_mode):
             return False
         folder = envrc.parent.resolve(strict=True)
+        repository_root = str(Path(__file__).resolve().parents[2])
+        if repository_root not in sys.path:
+            sys.path.insert(0, repository_root)
         from scripts.lib import copy_record
 
         record_path = copy_record.record_path(folder)

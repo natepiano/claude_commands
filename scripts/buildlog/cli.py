@@ -114,7 +114,7 @@ def print_table(names: list[str], rows: list[tuple[object, ...]]) -> None:
 
 
 def query(args: list[str]) -> int:
-    from scripts.buildlog import index
+    import index
 
     as_json = "--json" in args
     words = [word for word in args if word != "--json"]
@@ -149,8 +149,8 @@ def query(args: list[str]) -> int:
 
 
 def schema() -> int:
-    from scripts.buildlog import index
-    from scripts.buildlog import store
+    import index
+    import store
 
     print(f"buildlog: records in {store.root()}, index {index.index_path()}")
     print("Times are UTC ISO strings; use date(x, 'localtime') or datetime(x, 'localtime') for local.")
@@ -174,8 +174,9 @@ def schema() -> int:
 
 
 def day_report(args: list[str]) -> int:
-    from scripts.buildlog import index
-    from scripts.buildlog import launches, report
+    import index
+    import launches
+    import report
 
     day = args[0] if args else date.today().isoformat()
     try:
@@ -195,8 +196,8 @@ def day_report(args: list[str]) -> int:
 
 
 def moments_report(args: list[str]) -> int:
-    from scripts.buildlog import index
-    from scripts.buildlog import report
+    import index
+    import report
 
     day = args[0] if args else date.today().isoformat()
     try:
@@ -217,18 +218,19 @@ def moments_report(args: list[str]) -> int:
 def screenshot_hourly() -> int:
     command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
     return subprocess.run(
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(command), "hourly"],
+        [sys.executable, str(command), "hourly"],
         check=False,
         timeout=SCREENSHOT_HOURLY_TIMEOUT_SECONDS,
     ).returncode
 
 
 def hourly() -> int:
-    from scripts.buildlog import ci
-    from scripts.buildlog import index
-    from scripts.buildlog import rust_release
-    from scripts.buildlog import store
-    from scripts.buildlog import sync, vault_pull
+    import ci
+    import index
+    import rust_release
+    import store
+    import sync
+    import vault_pull
 
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
@@ -250,7 +252,7 @@ def hourly() -> int:
 def run_in_user_zone() -> None:
     """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from scripts.lib.user_zone import user_zone_name
+    from user_zone import user_zone_name
 
     os.environ["TZ"] = user_zone_name()
     time.tzset()
@@ -266,18 +268,18 @@ def main(argv: list[str]) -> int:
     if command == "report":
         return day_report(rest)
     if command == "costs":
-        from scripts.buildlog import costs
+        import costs
 
         return costs.main(rest)
     if command == "charts":
-        from scripts.buildlog import charts
+        import charts
 
         return charts.main(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":
-        from scripts.buildlog import index
-        from scripts.buildlog import report
+        import index
+        import report
 
         if len(rest) > 1:
             print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
@@ -296,11 +298,11 @@ def main(argv: list[str]) -> int:
             connection.close()
         return 0
     if command == "mac-report":
-        from scripts.buildlog import mac_report
+        import mac_report
 
         return mac_report.main(rest)
     if command == "launches":
-        from scripts.buildlog import launches
+        import launches
 
         if rest:
             print("usage: buildlog launches", file=sys.stderr)
@@ -308,7 +310,7 @@ def main(argv: list[str]) -> int:
         print(f"buildlog launches: {launches.collect().summary()}")
         return 0
     if command == "tree-key":
-        from scripts.buildlog import treekey
+        import treekey
 
         key = treekey.tree_key(rest[0] if rest else os.getcwd())
         if key is None:
@@ -316,13 +318,13 @@ def main(argv: list[str]) -> int:
         print(key)
         return 0
     if command == "reindex":
-        from scripts.buildlog import index
+        import index
 
         lines = index.reindex()
         print(f"buildlog reindex: {lines} records indexed in {index.index_path()}")
         return 0
     if command == "sync":
-        from scripts.buildlog import sync
+        import sync
 
         if not rest:
             return sync.sync()
@@ -333,18 +335,18 @@ def main(argv: list[str]) -> int:
         print("usage: buildlog sync [pause <why> | resume]", file=sys.stderr)
         return 2
     if command == "ci":
-        from scripts.buildlog import ci
+        import ci
 
         return ci.ci()
     if command == "vault":
-        from scripts.buildlog import vault_pull
+        import vault_pull
 
         if rest:
             print("usage: buildlog vault", file=sys.stderr)
             return 2
         return vault_pull.vault()
     if command == "disk":
-        from scripts.buildlog import disk
+        import disk
 
         try:
             disk.write_snapshot(disk.snapshot())
@@ -353,7 +355,8 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     if command == "sample":
-        from scripts.buildlog import sample, mac_idle
+        import sample
+        import mac_idle
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
@@ -366,7 +369,7 @@ def main(argv: list[str]) -> int:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
-        from scripts.buildlog import memory
+        import memory
 
         if rest:
             print("usage: buildlog snapshot", file=sys.stderr)
@@ -374,13 +377,13 @@ def main(argv: list[str]) -> int:
         print(json.dumps(memory.snapshot(), separators=(",", ":")))
         return 0
     if command == "memory":
-        from scripts.buildlog import memory
+        import memory
 
         return memory.memory_command(rest)
     if command == "hourly":
         return hourly()
     if command == "backfill-verify":
-        from scripts.buildlog import record
+        import record
 
         return record.main(["backfill-verify", *rest])
     print(__doc__, file=sys.stderr)

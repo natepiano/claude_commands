@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 
-from scripts.production.merge_checkpoint import (
+from merge_checkpoint import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
 from scripts.production.production_doc import ProductionDocument
-from scripts.message import sessions
+import sessions
 
 
 def run_gate(path: Path) -> int:

@@ -6,7 +6,7 @@ import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from scripts.model_study.turns import Turn
+from turns import Turn
 
 
 @dataclass(frozen=True)

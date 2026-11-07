@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Read style rules and emit focused evaluation units without changing state."""
 
 from __future__ import annotations

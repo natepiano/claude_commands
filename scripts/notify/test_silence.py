@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.notify import push_texts, silence
+import silence
+import push_texts
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.user_zone import user_zone
+from user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -83,7 +84,9 @@ import os
 from pathlib import Path
 import sys
 from urllib.parse import parse_qs
-from scripts.notify import pushover, push_texts, silence
+import pushover
+import push_texts
+import silence
 
 def post(url, data):
     with Path(os.environ["FIXTURE_POSTED"]).open("a") as output:
@@ -160,7 +163,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
         self.assertEqual(silence.read_kept(), [])
 
     def test_manual_off_keeps_automatic_silence_when_the_end_log_fails(self) -> None:
-        from scripts.notify import auto_silence
+        import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}
@@ -177,7 +180,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
         self.assertEqual(silence.kept_file().read_bytes(), kept)
 
     def test_manual_on_preserves_automatic_silence_when_its_end_log_fails(self) -> None:
-        from scripts.notify import auto_silence
+        import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}

@@ -16,15 +16,25 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, NamedTuple, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
-from scripts.mac_test.offload_test_support import mirror_use_payload
-from scripts.lint import sweep
-from scripts.lint.memory_test_support import write_config_fixture
+if TYPE_CHECKING:
+    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+    from . import linux_runner, mac_test, offload, test_target_slots
+    from .offload_test_support import mirror_use_payload
+    from ..lint import sweep
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+    import linux_runner
+    import mac_test
+    import offload
+    import test_target_slots
+    from offload_test_support import mirror_use_payload
+    import sweep
+    from scripts.lint.memory_test_support import write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -214,7 +224,7 @@ class LinuxShellTests(unittest.TestCase):
 
     def execute(self, request: offload.OffloadRequest, *, interrupt: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = shlex.split(self.command(request))
-        self.assertEqual(arguments[:3], [".claude/scripts/lib/py", ".claude/scripts/mac_test/linux_runner.py", "run"])
+        self.assertEqual(arguments[:3], ["python3", ".claude/scripts/mac_test/linux_runner.py", "run"])
         output, errors = io.StringIO(), io.StringIO()
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
@@ -853,7 +863,7 @@ class LinuxProcessTests(unittest.TestCase):
 
     def selector_output(self) -> subprocess.CompletedProcess[str]:
         script = linux_runner.mirror_selector_script(str(self.mirror))
-        command = next(shlex.split(line) for line in script.splitlines() if " -c " in line)
+        command = next(shlex.split(line) for line in script.splitlines() if line.strip().startswith("python3 "))
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", ["-c", str(self.mirror)]), \
                 redirect_stdout(output), redirect_stderr(errors):
@@ -1072,8 +1082,6 @@ class LinuxProcessTests(unittest.TestCase):
         self.use_private_processes()
         kill_log = self.root / "kill-list"
         cleanups: list[subprocess.CompletedProcess[str]] = []
-        selector_runner = dispatch.fixture.root / ".claude/scripts/lib/py"
-        selector_runner.parent.mkdir(parents=True)
 
         def cleanup(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if argv[0] != "ssh":
@@ -1081,14 +1089,11 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.commands.append(argv)
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
-            _ = selector_runner.write_text(
-                "#!/bin/bash\nprintf '%s' " + shlex.quote(selector.stdout)
-                + "; printf '%s' " + shlex.quote(selector.stderr)
-                + " >&2; exit " + str(selector.returncode) + "\n"
-            )
-            selector_runner.chmod(0o755)
             stubs = (
-                "kill() { printf '%s\\n' \"$*\" >> " + shlex.quote(str(kill_log)) + "; }\n"
+                "python3() { printf '%s' " + shlex.quote(selector.stdout)
+                + "; printf '%s' " + shlex.quote(selector.stderr)
+                + " >&2; return " + str(selector.returncode) + "; }\n"
+                + "kill() { printf '%s\\n' \"$*\" >> " + shlex.quote(str(kill_log)) + "; }\n"
                 + "sleep() { :; }\n"
             )
             with mock.patch.object(subprocess, "Popen", open_process):

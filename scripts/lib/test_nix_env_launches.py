@@ -11,15 +11,26 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
-from scripts.herdr import herdr, herdr_sessions
-from scripts.production import add_unit, add_showrunner
-from scripts.notify import review
-from scripts.notify.user_action import NoActionRequired
+for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
+    sys.path.insert(0, str(ROOT / "scripts" / dependency))
+sys.path.insert(0, str(ROOT))
+if TYPE_CHECKING:
+    from scripts.herdr import herdr, herdr_sessions
+    from scripts.production import add_unit, add_showrunner
+    from scripts.notify import review
+    from scripts.notify.user_action import NoActionRequired
+else:
+    import herdr
+    import add_unit
+    import add_showrunner
+    import herdr_sessions
+    import review
+    from user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.accounts import accounts
 from scripts.lib import nix_env
@@ -250,6 +261,9 @@ class ShellLaunchTests(NixFixture):
             else:
                 _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
         (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
+        py = self.scripts / "lib/py"
+        _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
+        py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
         _ = (self.scripts / "agents/models_config.sh").write_text(
             (ROOT / "scripts/agents/models_config.sh").read_text()

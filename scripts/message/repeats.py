@@ -22,9 +22,9 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from scripts.message import repeat_guard
+import repeat_guard
 from scripts.shutdown import remote
-from scripts.lib.user_zone import user_zone  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 
 
 @dataclass

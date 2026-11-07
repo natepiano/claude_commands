@@ -5,6 +5,7 @@ import ast
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+import importlib
 import io
 import json
 import os
@@ -17,22 +18,23 @@ from typing import Protocol, cast, override
 
 
 # Reuse the existing scratch policy behind this combined front.
+HOOKS = Path(__file__).resolve().parents[1] / "hooks"
+sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(HOOKS.parents[1]))
 
 from scripts.copies import shell_syntax as syntax
-from scripts.lib.file_module import load_file_module
 
 
 class ShellCommands(Protocol):
     def main(self) -> None: ...
 
 
-SHELL = cast(ShellCommands, cast(object, load_file_module(
-    "scratch_guard", Path(__file__).resolve().parents[1] / "hooks/pre-tool-use-scratch-guard.py")))
+SHELL = cast(ShellCommands, cast(object, importlib.import_module("pre-tool-use-scratch-guard")))
 # Fixture repositories are disposable test inputs, never operational gate checkouts.
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner verify "
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run --owner verify "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
     + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
 )

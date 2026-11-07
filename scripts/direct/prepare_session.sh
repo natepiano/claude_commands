@@ -5,7 +5,7 @@
 #
 # Produces:
 #   /tmp/claude/unit/<uuid>/   — unique session directory
-#   /tmp/claude/unit/active/<director-session-id>  — run-active marker
+#   /tmp/claude/unit/active/<claude-session-id>  — run-active marker
 #
 # Runs started before the rename keep /tmp/claude/delegate/ until they end; a
 # new run in the same Claude session replaces that session's marker there.
@@ -30,10 +30,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 SESSION_DIR="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py" stable --unit-root --name "${SESSION_ID}")"
 
-DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
-if [[ -n "${DIRECTOR_SESSION_ID}" ]]; then
-  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/unit_runs.py" activate "$SESSION_DIR" "$DIRECTOR_SESSION_ID"
-  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${DIRECTOR_SESSION_ID}" --role director || true
+if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/unit_runs.py" activate "$SESSION_DIR" "$CLAUDE_CODE_SESSION_ID"
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${CLAUDE_CODE_SESSION_ID}" --role director || true
 fi
 
 echo "Session ready at ${SESSION_DIR}"

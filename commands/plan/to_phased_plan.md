@@ -367,7 +367,7 @@ remaining `todo` phase. Do not validate archived `done` Work Orders; their
 byte-preserved historical format is outside the live Work Order contract:
 
 ```sh
-~/.claude/scripts/lib/py -m scripts.berth.work_order \
+PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
   --repository-root "${PLAN_REPOSITORY_ROOT}" validate --document "${DEST}" \
   --phase <todo-phase>
 ```

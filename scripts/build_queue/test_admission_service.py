@@ -36,13 +36,13 @@ if TYPE_CHECKING:
     from scripts.buildlog import store
     from scripts.buildlog import record as buildlog_record
 else:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
+    import store
+    import record as buildlog_record
 
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
-    from scripts.lib import conf
+    import conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic

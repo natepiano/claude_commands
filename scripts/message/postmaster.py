@@ -21,8 +21,8 @@ from scripts.lib import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from scripts.message import sessions  # noqa: E402
-from scripts.lib.user_zone import user_zone  # noqa: E402
+import sessions  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 
 RELAY_ONLY_SENDERS = frozenset({"shutdown"})
 MAX_SAFE_INTEGER = 9007199254740991

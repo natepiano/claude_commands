@@ -8,6 +8,7 @@ import tempfile
 import sqlite3
 import socket
 import subprocess
+import sys
 import unittest
 from io import StringIO
 from unittest import mock
@@ -18,20 +19,21 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style import bulk_run as run
-from scripts.style import style_sync
-from scripts.style import bulk_rename as bulk
-from scripts.style import fake_fmt
-from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
+import bulk_run as run
+import style_sync
+import bulk_rename as bulk
+import fake_fmt
+from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
-from scripts.style.style_plan_test_support import unit_staff_id
-from scripts.lib import berth_board
-from scripts.style import rules
-from scripts.style.ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
-from scripts.style import style_ledger as ledger_api
-from scripts.style.approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
-from scripts.style.test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
+from style_plan_test_support import unit_staff_id
+import berth_board
+import rules
+from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
+import style_ledger as ledger_api
+from approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
+from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
 
 
 class FakeRunner:
@@ -372,7 +374,7 @@ class WorkspaceRunTests(CargoProjectTests):
             return run.main(["--repo", str(self.repo), *arguments])
 
     def test_crate_cli_runs_lifecycle_and_resume_advances_second_crate_without_selection(self) -> None:
-        from scripts.style import crate_run
+        import crate_run
 
         ledger, definition, _ = self.setup_findings()
         self.addCleanup(ledger.close)
@@ -401,7 +403,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_repeated_crate_cli_arguments_advance_serially_in_one_frozen_run(self) -> None:
-        from scripts.style import crate_run
+        import crate_run
 
         ledger, definition, _ = self.setup_findings()
         self.addCleanup(ledger.close)
@@ -2372,7 +2374,7 @@ class StyleChildAdmissionTests(unittest.TestCase):
         self.assertTrue(all(place.closed for place in self.queue.places))
 
     def test_queue_refusal_stops_each_style_start_with_exit_two(self) -> None:
-        from scripts.style import style_plan
+        import style_plan
         config = self.repo / "lint.conf"
         starts: tuple[tuple[str, Callable[[], object]], ...] = (
             ("rust-analyzer", lambda: bulk.RustAnalyzer(self.repo)),
@@ -2397,7 +2399,7 @@ class StyleChildAdmissionTests(unittest.TestCase):
         self.assertEqual(self.queue.places, [])
 
     def test_plan_cargo_format_starts_at_the_shared_place(self) -> None:
-        from scripts.style import style_plan
+        import style_plan
         _ = (self.state / "cargo/stdout").write_text("Formatting src/lib.rs\n")
         result = style_plan.cargo_format(self.repo)
         self.assertEqual(result.visited, frozenset({self.repo / "src/lib.rs"}))

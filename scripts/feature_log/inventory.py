@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Freeze backfill evidence and track each source record's review outcome."""
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
-from scripts.feature_log.feature_log import PROJECTS, locked, state_dir, vault_dir
+from feature_log import PROJECTS, locked, state_dir, vault_dir
 
 
 RecordKind = Literal["phase", "asbuilt", "changelog", "tag", "merge", "commit"]

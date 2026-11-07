@@ -8,9 +8,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN_LAUNCHERS = frozenset({"assign.sh", "assign.py"})
-WORKER_LAUNCHERS = ASSIGN_LAUNCHERS | {"review.sh"}
+WORKER_LAUNCHERS = ASSIGN_LAUNCHERS | {"implement.sh", "review.sh"}
 ASSIGN = ROOT / 'scripts/direct/assign.py'
 LAUNCHERS = {
+    ROOT / 'scripts/direct/implement.sh',
     ROOT / 'scripts/direct/review.sh',
     ROOT / 'scripts/agents/agent_bg.sh',
     ROOT / 'scripts/agents/agent_exec.sh',

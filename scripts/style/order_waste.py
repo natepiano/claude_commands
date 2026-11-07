@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Measure wasted style work by rule pair (A, B): A's fix changed code that B's finding or fix had to read again.
 
 Reads a style ledger and its repository; writes nothing to either.
@@ -20,8 +20,8 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-from scripts.style import style_ledger
-from scripts.style.style_ledger import DeclarationGone, DuplicateOf, ExceptionVerdict, JudgedAgain, WaiveProvenance
+import style_ledger
+from style_ledger import DeclarationGone, DuplicateOf, ExceptionVerdict, JudgedAgain, WaiveProvenance
 
 
 class OrderWasteError(Exception):

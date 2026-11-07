@@ -15,10 +15,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-from scripts.production import session_pane
-from scripts.herdr import herdr
+import session_pane
+import herdr
 from scripts.message.relay_identity import relay_session_name
-from scripts.production.unit_lookup import Place
+from unit_lookup import Place
 from scripts.hooks import hook_dispatch
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt

@@ -28,7 +28,11 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
-from scripts.buildlog import store, parse
+if __package__:
+    from . import store, parse
+else:
+    import store
+    import parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:

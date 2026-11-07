@@ -35,11 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 else:
-    from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
+    from memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.mac_test import mac_test
-from scripts.lib import conf
+import mac_test
+import conf
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from ..production.cli_fixture import invoke_cli
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    from scripts.production.cli_fixture import invoke_cli
+    from cli_fixture import invoke_cli
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 
 
@@ -498,7 +498,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             script = self.bin_directory / command[0]
             stub_arguments = command[1:]
             for name in ("sessions.py", "send.py"):
-                if command[:2] == [str(SCRIPT.resolve().parents[1] / "lib/py"), str(self.stub_directory / name)]:
+                if command[:2] == [sys.executable, str(self.stub_directory / name)]:
                     # Tests of blocked/timed-out delivery keep the actual child.
                     if name == "send.py" and any((self.stub_directory / flag).exists()
                                                 for flag in ("send-hold", "send-delay")):
@@ -837,7 +837,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         arguments = calls[0]
         self.assertEqual(arguments[:5], ["--user", "--collect", "--quiet", "--no-block", "--unit"])
         self.assertTrue(arguments[5].startswith("mac-test-claim-watch-"))
-        self.assertEqual(arguments[-3:], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT.resolve()), "watch-claim"])
+        self.assertEqual(arguments[-3:], [sys.executable, str(SCRIPT.resolve()), "watch-claim"])
         self.assertIn(f"MAC_TEST_STATE_DIR={self.state_directory}", arguments)
         self.assertIn(f"MAC_TEST_CONFIG={self.config_path}", arguments)
 
@@ -3031,7 +3031,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         text = (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
+            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
             + f"--worktree '{self.root}' --remote 'claim-mac' (see /build:mac)."
         )
         self.assertEqual(send.call_args.args[4], text)
@@ -3053,7 +3053,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + f"~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
+            + f"python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
             + "(see /build:mac)."
         ))
 
@@ -3067,7 +3067,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha\'s tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
+            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
             + "--what 'alpha'\"'\"'s tests' --worktree '/work/alpha'\"'\"'s tree' --remote 'host'\"'\"'s name' "
             + "(see /build:mac)."
         ))

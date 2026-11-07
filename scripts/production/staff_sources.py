@@ -15,6 +15,11 @@ import sys
 from pathlib import Path
 from typing import cast
 
+# These source modules still use sibling imports; keep their existing module identity.
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import showrunners  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
@@ -24,13 +29,13 @@ from scripts.shutdown import remote  # noqa: E402
 
 
 # Matchers live in unit_lookup, so lower readers use the same join without an import cycle.
-from scripts.production.unit_lookup import (  # noqa: E402
+from unit_lookup import (  # noqa: E402
     ShowrunnerMember as ShowrunnerMember, UnitMember as UnitMember, ObservedUnit as ObservedUnit,
     MemberSelector as MemberSelector, MemberFound as MemberFound, NoSuchMember as NoSuchMember,
     UnitProduction as UnitProduction, MemberSources as _MemberSources,
     member_sources as _member_sources,
 )
-from scripts.production import unit_lookup  # noqa: E402
+import unit_lookup  # noqa: E402
 
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
@@ -165,7 +170,7 @@ class CodexProcessThreads:
         self.threads: dict[Path, dict[str, str]] = {}
 
     def thread(self, pid: int, environment: Mapping[str, str]) -> str:
-        from scripts.herdr import herdr
+        import herdr
         from scripts.message import codex_daemon
 
         if identity := environment.get("CODEX_THREAD_ID", ""):
@@ -200,7 +205,7 @@ class CodexProcessThreads:
 
 
     def check(self, pid: int, identity: str) -> session_staff.ReportProcessIdentity:
-        from scripts.herdr import herdr
+        import herdr
 
         try:
             native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
@@ -276,7 +281,7 @@ class _WorkerSources:
         self.native_running: dict[str, dict[str, str]] = {
             identity: {"claude": identity} for identity in self.running}
         from scripts.message import process_table
-        from scripts.herdr import herdr
+        import herdr
         try:
             processes = process_table.snapshot()
         except (OSError, ValueError, subprocess.SubprocessError) as error:

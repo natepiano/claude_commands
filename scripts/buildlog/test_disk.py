@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-from scripts.buildlog import cli, disk, filesystem, report
-from scripts.buildlog import store
-from scripts.lint import sweep
-from scripts.buildlog import test_index
+import cli
+import disk
+import filesystem
+import report
+import store
+import sweep
+import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -213,7 +216,7 @@ class DiskTests(unittest.TestCase):
         self.assertEqual([row["device"] for row in result.get("filesystems", [])], ["1:1", "2:1"])
 
     def test_filesystem_total_preserves_reserved_blocks_and_top_layer_identity(self) -> None:
-        from scripts.buildlog import cgroup_capture
+        import cgroup_capture
 
         base = self.base()
         devices = base / "sys/dev/block"

@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources  # noqa: E402
-from scripts.herdr import herdr  # noqa: E402
+import herdr  # noqa: E402
 
 
 @dataclass(frozen=True)

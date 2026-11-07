@@ -35,7 +35,7 @@ changes no file.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
    - **Pane or mesh worker:** start it with
-     `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
+     `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
      End your turn; the result arrives as your next message.
      This detached-run command serves pane runs and existing mesh-pinned runs.
      Exit 3 means the caller is not a worker; run attached in one call only for that exit.

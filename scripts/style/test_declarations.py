@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from scripts.style import declarations
+import sys
+import declarations
 import unittest
+from pathlib import Path
 from typing import final
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style.declarations import Declaration, DeclaredItem, ImplOrTraitItem, ModuleItem, NoDeclarationAtLine, read_declarations
+from declarations import Declaration, DeclaredItem, ImplOrTraitItem, ModuleItem, NoDeclarationAtLine, read_declarations
 
 SOURCE = """use std::fmt;
 

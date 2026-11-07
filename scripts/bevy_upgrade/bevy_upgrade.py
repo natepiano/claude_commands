@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Start a Bevy upgrade watch and record the user's crate-specific answers."""
 from __future__ import annotations
 
@@ -9,16 +9,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.bevy_upgrade import pins
+import pins
 from scripts.production import staff
-from scripts.bevy_upgrade import upstream
-from scripts.bevy_upgrade import upgrade_check
-from scripts.bevy_upgrade import upgrade_record
-from scripts.bevy_upgrade import upgrade_report
-from scripts.bevy_upgrade import upgrade_schedule
+import upstream
+import upgrade_check
+import upgrade_record
+import upgrade_report
+import upgrade_schedule
 
 
 class UpgradeUpdate(TypedDict):

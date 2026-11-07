@@ -8,11 +8,14 @@ import subprocess
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict
 
-from scripts.buildlog import store
-from scripts.buildlog import cgroup_capture, filesystem
-from scripts.lib.boot_identity import parse_boot_id as parse_boot_id
-from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
-from scripts.buildlog.cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
+import store
+import cgroup_capture
+import filesystem
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from boot_identity import parse_boot_id as parse_boot_id
+from cargo_output import CargoOutputRoots, read_cargo_output_roots
+from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
 
@@ -170,7 +173,7 @@ def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
-    from scripts.buildlog.memory import read_zram
+    from memory import read_zram
 
     at = time.time()
     host = store.host_name()

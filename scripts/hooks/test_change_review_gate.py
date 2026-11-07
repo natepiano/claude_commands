@@ -4,6 +4,7 @@ Every test stages files in a temporary git repository; none commits or reads the
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shlex
@@ -14,15 +15,13 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
 
-from scripts.lib.file_module import load_file_module
 from scripts.production import change_review
 from scripts.hooks import checkpoint_gate
 from unittest import mock
 
 
 HOOK = Path(__file__).with_name("pre-tool-use-change-review-gate.py")
-module = load_file_module("change_review_gate", HOOK)
-spec = module.__spec__
+spec = importlib.util.spec_from_file_location("change_review_gate", HOOK)
 assert spec is not None and spec.loader is not None
 
 
@@ -30,6 +29,8 @@ class Gate(Protocol):
     def refusal(self, command: str, cwd: Path) -> str: ...
 
 
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 gate = cast(Gate, cast(object, module))
 SEE = ("Change-Review: The grid fades more gently | Run `hana` in a natedev terminal"
        + " | The grid lines fade out farther away")

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import ClassVar, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from scripts.lib import unit_runs
+import unit_runs  # noqa: E402
 
 
 type MetricKey = Literal[
@@ -216,7 +216,7 @@ def progress_events() -> tuple[ProgressFinish, ...]:
     elif os.environ.get("BUILDLOG_DIR"):
         root = Path(os.environ["BUILDLOG_DIR"]) / "progress"
     else:
-        from scripts.buildlog import store
+        import store
 
         if store.host_name() != "natedev":
             return ()

@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
-from scripts.buildlog import index
-from scripts.buildlog import launches, mac_report
-from scripts.buildlog import mac_outcome
-from scripts.buildlog import store
+import index
+import launches
+import mac_report
+import mac_outcome
+import store
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
@@ -26,10 +27,10 @@ if TYPE_CHECKING:
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
     from scripts.lint.memory_test_support import config_environment
-from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
-from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
-from scripts.buildlog.test_report import MeasuredCliRun, measure_cli_work
-from scripts.lib.user_zone import user_zone
+from test_holds import hold_event, timed_hold_events, write_mac_block
+from test_index import Record, call, encode, point_root_at, step
+from test_report import MeasuredCliRun, measure_cli_work
+from user_zone import user_zone
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -577,7 +578,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("| Blocked | natedev held |", output)
 
     def test_mac_report_cli_accepts_custom_hours_without_collecting_launches(self) -> None:
-        from scripts.buildlog import cli
+        import cli
 
         with patch.object(launches, "collect", side_effect=AssertionError("launch collection must not run")):
             with patch("builtins.print") as printed:
@@ -585,7 +586,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("## Last 2 hours", str(printed.call_args))
 
     def test_mac_report_cli_rejects_invalid_hours_before_updating_index(self) -> None:
-        from scripts.buildlog import cli
+        import cli
 
         for args in (["--hours", "0"], ["--hours", "nan"], ["--hours", "-1"], ["--hours"], ["--day", "today"]):
             with self.subTest(args=args):

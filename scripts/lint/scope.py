@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Resolve which cargo packages a lint run should cover.
 
 Reads the cargo argv the caller is building, and prints the package-selection

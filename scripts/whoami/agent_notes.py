@@ -32,12 +32,12 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.whoami import codex_pacer
-from scripts.whoami import five_hour
+import codex_pacer
+import five_hour
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami.session_table import SessionsSection, KeepSections, KEEP_SECTIONS
@@ -49,14 +49,14 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             ScheduledUsageReads, UnscheduledUsageReads, UNSCHEDULED_USAGE_READS,
                             claude_on_disk, codex_email_on_disk, codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
-from scripts.whoami.quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
+from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown,
                          StoppedWorkerCommand, StoppedCommandUnknown)
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
 from scripts.maintenance.settings import positive, usage_only_interval
-from scripts.lib.user_zone import user_zone
+from user_zone import user_zone
 
 
 # Expand at refresh time so callers can use a scratch home.
@@ -427,7 +427,7 @@ def urgent_usage_read(notes: list[Note], selection: ClaudeAccountsInUse, workers
             except ValueError:
                 pass
     # A fallback can restore workers as soon as its reset passes.
-    from scripts.whoami import quota_alert
+    import quota_alert
     try:
         saved = cast(object, json.loads(quota_alert.STATE.read_text(encoding="utf-8")))
         return isinstance(saved, dict) and bool(cast(dict[str, object], saved).get("switch"))
@@ -673,7 +673,10 @@ def main() -> None:
     from scripts.accounts import accounts
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-    from scripts.herdr import herdr
+    if TYPE_CHECKING:
+        from scripts.herdr import herdr
+    else:
+        import herdr
 
     from scripts.accounts import refusal_watch
 

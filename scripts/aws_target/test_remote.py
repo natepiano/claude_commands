@@ -1,11 +1,20 @@
 """Remote permission, interruption, and stop evidence protect AWS work."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stdout
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
 import signal
@@ -14,9 +23,11 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
+
 from scripts.aws_target import config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
-from scripts.lib import conf, process_start as process_identity
+from scripts.lib import conf
 from scripts.mac_test import linux_runner, mac_test
 
 

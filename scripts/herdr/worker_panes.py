@@ -18,7 +18,12 @@ from enum import Enum, IntEnum
 from importlib import import_module
 from typing import cast, final
 
-from scripts.herdr import herdr, pane_launch
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import herdr
+import pane_launch
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
 from scripts.agents import worker_lifecycle

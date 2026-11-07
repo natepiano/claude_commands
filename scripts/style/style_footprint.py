@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Conservatively separate mechanical style diffs from findings needing review."""
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
-from scripts.style.candidate_generators import boilerplate_allows, mask_source
+from candidate_generators import boilerplate_allows, mask_source
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9A-Fa-f_]+\}|\\x[0-9A-Fa-f]{2}|\\.|[^'\\\n])' ''',

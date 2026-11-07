@@ -29,8 +29,10 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, NamedTuple, TypedDict, cast
 
-from scripts.production import change_review
-from scripts.lib import scratch
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import change_review
+import scratch  # on the path once change_review has put scripts/lib there
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -39,13 +41,12 @@ from scripts.production import merge_gate, production_doc, session_staff, staff,
 from scripts.shutdown import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.message import sessions  # noqa: E402
+import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
-PYTHON = str(Path(__file__).resolve().parents[1] / "lib/py")
 TREE_CHANGED_STATUS = 77
 
 
@@ -63,6 +64,17 @@ class PushedTip(NamedTuple):
 
 class NotYetPushed(NamedTuple):
     pass
+
+
+class ChangesReadBeforePush(NamedTuple):
+    changes: list[change_review.PublicationChange]
+
+
+class ReadChangesWhenWriting(NamedTuple):
+    pass
+
+
+_READ_CHANGES_WHEN_WRITING = ReadChangesWhenWriting()
 
 
 class PromotionAlreadyAtTip(NamedTuple):
@@ -430,21 +442,49 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
     return checkout / path
 
 
-def record_publication_changes(production: ProductionDocument, *, report_unchanged: bool = True,
+def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
+                   changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
+    record_publication_changes(request.production, commits, merge_head, changes=changes, record=request.staff_record)
+
+
+def record_publication_changes(production: ProductionDocument, commits: list[change_review.Commit], merge_head: str,
+                               *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
+                               report_unchanged: bool = True,
                                record: staff.StaffSnapshot | None = None) -> None:
-    """Scan published merges after every promotion step succeeds."""
+    """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc, record=record)
     if doc is None:
         if report_unchanged:
             report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
-    try:
-        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record)
-    except (change_review.ChangeReviewError, OSError) as error:
-        report("change review", "failed", f"{doc} not written: {error}; retry after the repair")
+    done = checkpoint_step_record(production.checkout, merge_head, "change-review")
+    if done.exists():
+        if report_unchanged:
+            report("change review", "ok", "checkpoint changes already recorded")
         return
-    if rows or report_unchanged:
-        report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
+    merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
+    try:
+        # A stop after the list write but before the receipt must not add it twice.
+        record = staff.snapshot() if record is None else record
+        publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
+                       else change_review.publication_changes(commits, production.doc, record=record))
+        existing = change_review.pending(doc) if doc.exists() else []
+        held = {row["Change"] for row in existing
+                if any(sha.startswith(merged) or merged.startswith(sha)
+                       for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
+        rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
+            doc, publication, datetime.now(production.zone).date(), merged, production.doc, record=record)
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.touch()
+        drifted = change_review.drift(production.checkout, production.merge_branch,
+                                      change_review.read(doc), change_review.LANDED,
+                                      change_review.foreign_units(production.doc, record=record))
+    except (change_review.ChangeReviewError, OSError) as error:
+        report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
+        return
+    report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
+    for line in drifted:
+        report("change review", "drift", line)
 
 
 def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:
@@ -899,7 +939,7 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
 
 def send_queued_zone() -> None:
     """Send a /zone change queued while the Mac was offline: the pull just done carried its commit."""
-    done = subprocess.run([PYTHON, str(ZONE_SCRIPT), "drain", "--pulled"],
+    done = subprocess.run([sys.executable, str(ZONE_SCRIPT), "drain", "--pulled"],
                           capture_output=True, text=True, check=False)
     for line in done.stdout.splitlines():
         report("promote", "ok", line)
@@ -993,7 +1033,7 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         merged = good(git(request.production.checkout, "show", "-s", "--format=%cI", merge_head), "record")
         script = tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
-        review_command = [PYTHON, script]
+        review_command = [script] if os.access(script, os.X_OK) else [sys.executable, script]
         command = [*review_command, "add", "--unit", request.unit.name, "--plan", request.unit.plan.as_posix(),
                    "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
@@ -1035,9 +1075,10 @@ def notify_style(checkout: Path, branch: str, tip: str) -> bool:
     try:
         script = tool("style_sync.py", Path(__file__).resolve().parents[1] / "style/style_sync.py",
                       "MERGE_CHECKPOINT_STYLE_SYNC")
+        python = shutil.which("python3") or sys.executable
         _ = sys.stdout.flush()
         result = subprocess.run(
-            [PYTHON, script, "notify", "--repo-dir", str(checkout), "--branch", branch, "--tip", tip],
+            [python, script, "notify", "--repo-dir", str(checkout), "--branch", branch, "--tip", tip],
             capture_output=True, text=True, check=False, timeout=30,
         )
         if result.returncode or result.stdout.strip() or result.stderr.strip():
@@ -1054,7 +1095,7 @@ def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
     if os.environ.get(PROBE_ENV) == "1":
         yield
         return
-    recorder = [PYTHON, str(Path(progress_history.__file__))]
+    recorder = [sys.executable, str(Path(progress_history.__file__))]
     wait_id = ""
     try:
         started = subprocess.run([*recorder, *arguments], capture_output=True, text=True, check=False)
@@ -1197,7 +1238,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                     if not address:
                         raise ValueError(f"no current {recipient} address for {current['name']}/{current['unit']}")
                     result = subprocess.run(
-                        [PYTHON, script, "--to", address, "--from", current["name"], "--text", text],
+                        [sys.executable, script, "--to", address, "--from", current["name"], "--text", text],
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:
@@ -1259,7 +1300,7 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
             with log.open("a", encoding="utf-8") as output:
                 try:
                     process = subprocess.Popen(
-                        [PYTHON, str(Path(__file__).with_name("bump_gate.py").resolve()), "--record", str(path)],
+                        [sys.executable, str(Path(__file__).with_name("bump_gate.py").resolve()), "--record", str(path)],
                         cwd=request.production.checkout, stdin=subprocess.DEVNULL,
                         stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
                     )
@@ -1296,6 +1337,7 @@ def deliver_gate_result(request: MergeRequest, merge_head: str, tip: str) -> Non
 def bump_gate_addresses(name: str, unit: str) -> tuple[str, str]:
     """Resolve recipients through the production's current unit and showrunner lookup."""
     from scripts.production import showrunners
+    import unit_lookup
 
     unit_address = ""
     showrunner_address = ""
@@ -1346,9 +1388,10 @@ def run(request: MergeRequest) -> int:
             for step in steps:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
+        changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
-                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record)
+                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc, record=request.staff_record))
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
@@ -1401,8 +1444,8 @@ def run(request: MergeRequest) -> int:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
+                record_changes(request, commits, merge_head, changes)
                 notify_published_style(request.production, merge_head, tip)
-        record_publication_changes(request.production, record=request.staff_record)
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()
         record(request, merge_head, tests_green)
@@ -1449,7 +1492,7 @@ class ChildHandoffRequest(NamedTuple):
 def child_runner(action: str, *arguments: str) -> str:
     script = tool("showrunners.py", Path(__file__).with_name("showrunners.py"), "MERGE_CHECKPOINT_SHOWRUNNERS")
     result = subprocess.run(
-        [PYTHON, script, action, *arguments],
+        [sys.executable, script, action, *arguments],
         capture_output=True, text=True, check=False, timeout=10,
     )
     if result.returncode:
@@ -1519,9 +1562,10 @@ def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
     try:
         script = tool("style_ledger.py", Path(__file__).resolve().parents[1] / "style/style_ledger.py",
                       "MERGE_CHECKPOINT_STYLE_LEDGER")
+        python = shutil.which("python3") or sys.executable
         _ = sys.stdout.flush()
         result = subprocess.run(
-            [PYTHON, script, "handoff", "merged", "--repo", str(request.child.checkout),
+            [python, script, "handoff", "merged", "--repo", str(request.child.checkout),
              "--checkpoint", request.checkpoint, "--merge-commit", merge_head],
             capture_output=True, text=True, check=False, timeout=30,
         )
@@ -1539,7 +1583,7 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         if not address:
             raise Refusal(f"no address for {request.child.name}")
         result = subprocess.run([
-            PYTHON, script, "--to", address, "--from", request.production.name,
+            sys.executable, script, "--to", address, "--from", request.production.name,
             "--text", f"From the showrunner of {request.production.name}: hand-off {request.checkpoint[:7]} merged as {merge_head[:7]}.",
             "--timeout", "10",
         ], capture_output=True, text=True, check=False, timeout=15)
@@ -1593,6 +1637,8 @@ def notify_published_style(production: ProductionDocument, merge_head: str, tip:
 def record_handoff_publication(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
     record_pushed_merges(request.production, merge_head, request.checkpoint, tip,
                          phase_id="", issue=f"{request.child.name} hand-off")
+    record_publication_changes(request.production, change_review.merge_commits(request.production.checkout, merge_head),
+                               merge_head, report_unchanged=False)
     notify_published_style(request.production, merge_head, tip)
 
 
@@ -1622,7 +1668,6 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             finish_handoff_promotion(request, delivery.merge_head)
         finally:
             record_handoff_publication(request, delivery.merge_head, tip)
-        record_publication_changes(request.production, report_unchanged=False)
         record_handoff_completion(request, delivery.merge_head, tip)
         finish_handoff(request, delivery.merge_head)
         return 0
@@ -1671,7 +1716,6 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     finally:
         if tip:
             record_handoff_publication(request, merge_head, tip)
-    record_publication_changes(request.production, report_unchanged=False)
     record_handoff_completion(request, merge_head, tip)
     finish_handoff(request, merge_head)
     print(f"hand-off {checkpoint[:7]} merged as {merge_head[:7]}", flush=True)

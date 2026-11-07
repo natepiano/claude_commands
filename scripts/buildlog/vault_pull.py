@@ -12,15 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-from scripts.buildlog import rust_release
-from scripts.buildlog import store
-from scripts.buildlog import sync
-from scripts.lib import conf
+import rust_release
+import store
+import sync
+import conf
 
 if TYPE_CHECKING:
     from ..notify import push_texts
 else:
-    from scripts.notify import push_texts
+    import push_texts
 
 STATE_NAME = "vault_pull.json"
 PUSH_TEXT_ID = "vault.stopped"

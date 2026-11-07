@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-from scripts.style import style_admin
+import style_admin
 
 
 @final

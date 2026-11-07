@@ -101,7 +101,7 @@
       "Bash(date)",
       "Bash(true)",
       "Bash(git ls-files)",
-      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [

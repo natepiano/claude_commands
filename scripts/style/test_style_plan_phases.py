@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from typing import final
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style import style_plan
-from scripts.style import unit_plans
+import style_plan
+import unit_plans
 
-from scripts.style import mechanical_classes
-from scripts.style import rules
-from scripts.style import style_ledger
+import mechanical_classes
+import rules
+import style_ledger
 
-from scripts.style.style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -140,7 +142,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
+            [sys.executable, str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
              "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob",
              next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule),
              "--verdict", "clean", "--ticket", "outside", "--worker", "test", "--input-scope", "rule",

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 else:
     from scripts.buildlog import store
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from scripts.lib import conf
+    import conf
 
 
 @dataclass(frozen=True)

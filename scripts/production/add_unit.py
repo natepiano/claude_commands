@@ -16,21 +16,29 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
-from scripts.herdr import herdr
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.production import autocompact
-from scripts.message import sessions
-from scripts.production import unit_names
+sys.path.insert(0, str(SCRIPTS.parent))
+sys.path.insert(0, str(SCRIPTS / "hooks"))
+sys.path.insert(0, str(SCRIPTS / "message"))
+sys.path.insert(0, str(SCRIPTS / "shutdown"))
+
+import autocompact
+import sessions
+import unit_names
 from scripts.production.production_doc import Production, Refusal, read_production
 
-from scripts.lib.atomic_file import write_text_atomic
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from atomic_file import write_text_atomic
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 if TYPE_CHECKING:
+    import herdr
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
@@ -561,7 +569,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
 
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
-    from scripts.shutdown import inventory
+    import inventory
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -612,7 +620,8 @@ def attached_pid(handoff: RunningSessionHandoff) -> int:
 def finish_attach(handoff: StoppedSessionHandoff,
                   selected: ClaudeLaunchAccount, outcome: herdr.PromptSubmitOutcome, timeout: float) -> int:
     del selected
-    from scripts.shutdown import restart
+    import restart
+    import herdr
 
     if isinstance(outcome, herdr.PromptNotSubmitted):
         raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: {outcome.reason}")
@@ -735,6 +744,7 @@ def prompt_for(request: UnitLaunch) -> str:
 
 def attach_hint(request: UnitLaunch) -> str:
     """Where the user finds the unit: its tab in the production's workspace of the shared session."""
+    import herdr
 
     production = request.production
     tab = request.identity.session
@@ -743,6 +753,7 @@ def attach_hint(request: UnitLaunch) -> str:
 
 def host_session_name(request: UnitLaunch) -> str:
     """Name the unit destination from its production and staff name."""
+    import herdr
 
     production_name = request.production.name
     name = request.identity.session
@@ -760,6 +771,7 @@ def launch_session(
     autocompact_window: str = "",
 ) -> herdr.PromptSubmitOutcome:
     """Start Claude in a tab of the shared herdr session, carrying its session labels."""
+    import herdr
     from scripts.accounts import accounts
     from scripts.shutdown.launch_names import LaunchNames
     from scripts.whoami.account import named_account_environment
@@ -845,6 +857,7 @@ class NoPendingOpening(NamedTuple):
 
 def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
     """Finish the opening for this live session, without starting a second session."""
+    import herdr
 
     pending = opening_record(request.production, request.unit_id)
     if not pending.exists():
@@ -879,6 +892,7 @@ def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted
     The staff row, .unit.toml and worktree stay: the same command finds them and starts the session
     again. A prompt typed even once may have started work, so that session stays open.
     """
+    import herdr
 
     if not outcome.never_typed:
         return ""
@@ -927,6 +941,7 @@ def _pending_launch(request: UnitLaunch | RequestedUnitLaunch) -> NoOpeningRecor
 
 def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFound | NoLabeledSession:
     """Find the unit session through its pending opening or native runtime identity."""
+    import herdr
 
     name = request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit
     pending = _pending_launch(request)
@@ -950,7 +965,7 @@ def registry_remote_control(claude: unit_lookup.Claude) -> bool:
     The record does not scroll off, as the pane's "/remote-control is active" line does
     once the opening prompt starts work.
     """
-    from scripts.message import sessions
+    import sessions
 
     if not isinstance(claude, unit_lookup.LiveClaude):
         return False
@@ -1000,7 +1015,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     from scripts.accounts import accounts
     try:
         if isinstance(request.session, ResumedSession) and not config_dir:
-            from scripts.production import unit_move
+            import unit_move
 
             conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
             if source_fallback and (not isinstance(conversation, unit_move.UnitConversation)
@@ -1079,7 +1094,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return ""
     if explicit:
         return explicit
-    from scripts.shutdown import pane_record
+    import pane_record
     try:
         entry = pane_record.launch_for_session(request.session.session_id)
     except (OSError, ValueError) as error:
@@ -1286,6 +1301,7 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
+    import herdr
     try:
         request = launch_request(args)
         with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)

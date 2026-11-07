@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import showrunner_parent
-from scripts.production import showrunner_tree
+import showrunner_tree
 from scripts.production import showrunners
 import test_showrunners
 from scripts.lib.atomic_file import write_text_atomic

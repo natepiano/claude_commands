@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """List and stop test Hana processes on natedev and the Mac."""
 
 from __future__ import annotations
@@ -17,8 +17,12 @@ import sys
 import time
 from typing import cast
 
+ROOT = Path(__file__).resolve().parents[2]
 PROC_ROOT = Path("/proc")
+sys.path.insert(0, str(ROOT))
 # offload shares sibling modules with its CLI; keep that existing import boundary.
+sys.path.insert(0, str(ROOT / "scripts" / "mac_test"))
+sys.path.insert(0, str(ROOT / "scripts" / "lint"))
 
 from scripts.lib import conf
 from scripts.lib.conf import UseConfiguredValue
@@ -224,7 +228,8 @@ def run_local(command: list[str]) -> subprocess.CompletedProcess[str]:
 def remote_environment(pid: int, ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> dict[str, str]:
     from scripts.mac_test import offload
     # Reuse herdr's stable argv/environment boundary on the machine being inspected.
-    program = ("import json; "
+    program = ("import json,sys; from pathlib import Path; "
+               "sys.path.insert(0,str(Path.home()/'.claude')); "
                "from scripts.herdr.herdr import darwin_process_environment; "
                f"print(json.dumps(darwin_process_environment({pid})))")
     result = ssh_runner([*offload.ssh_prefix(offload.read_config()),

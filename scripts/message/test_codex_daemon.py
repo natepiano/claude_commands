@@ -14,11 +14,11 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.message import codex_daemon
+import codex_daemon
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
+from codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
 
 
 class CodexDaemonTests(unittest.TestCase):

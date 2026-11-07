@@ -15,7 +15,7 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             observe_workers_home as resolve_workers_home, NoWorkersHome)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from scripts.lib.user_zone import user_zone  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 
 
 def reset_time(value: datetime | None) -> str:

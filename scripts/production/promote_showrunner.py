@@ -19,22 +19,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote, stop_resume
 from scripts.agents import worker_lifecycle
 
-from scripts.lib.atomic_file import write_text_atomic
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from atomic_file import write_text_atomic
 
-from scripts.production import add_showrunner
+import add_showrunner
 from scripts.production import showrunners
-from scripts.production import unit_effort
-from scripts.production import unit_lookup
-from scripts.message import sessions
-from scripts.lib import unit_runs
-from scripts.herdr import herdr
-from scripts.production.session_pane import HerdrFailure, read_place
+import unit_effort
+import unit_lookup
+import sessions
+import unit_runs
+import herdr
+from session_pane import HerdrFailure, read_place
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, read_new_production, read_production
+
 
 
 class Promotion(NamedTuple):
@@ -320,7 +324,7 @@ def _main(argv: list[str]) -> int:
         new_member = staff_sources.MemberFound(staff.promote_unit(
             retained.id if retained is not None else native, name=promotion.child.name, parent=parent_row.id, doc=document))
     try:
-        from scripts.production import showrunner_parent
+        import showrunner_parent
         showrunner_parent.save_notice(promotion.child.name, showrunner_parent.PendingParentNotice("attach", promotion.parent.name))
         if was_pending and showrunners.current_name(promotion.child.name):
             started = showrunners.main(["attach", promotion.child.name, promotion.parent.name])

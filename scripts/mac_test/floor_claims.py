@@ -137,7 +137,7 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
         1,
     )
     commands = (
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--serve"],
+        [sys.executable, str(Path(__file__).resolve()), "--serve"],
         ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}",
          "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "natedev",
          "~/.claude/scripts/lib/py -c " + shlex.quote(remote_source)],

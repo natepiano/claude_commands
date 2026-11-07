@@ -15,17 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
-from scripts.production import live_units
-from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import live_units
+from scripts.production import showrunners, staff, unit_lookup, session_staff, staff_sources
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.shutdown import remote
 from scripts.lib import conf
 from scripts.lib.process_failure import failure_detail
 
-from scripts.direct import phase_table
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+import phase_table
 from scripts.direct import plan_history
 
-from scripts.production import display_cells
+import display_cells
 
 # A task longer than this is cut, so one verification command cannot widen the whole table.
 TASK_WIDTH = 80
@@ -87,7 +90,7 @@ def is_style_production(doc: Path) -> bool:
 
 def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str, Path]:
     """Resolve ledgers from the staff rows, even when phase records fail."""
-    from scripts.style import style_ledger
+    import style_ledger
 
     try:
         rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
@@ -150,7 +153,7 @@ def main(arguments: list[str]) -> int:
             if not units:
                 output = "no live units"
             elif style:
-                from scripts.production import style_units
+                import style_units
                 output = style_units.table(units, records, doc=doc, ledger_paths=paths)
             else:
                 output = table(units, records)

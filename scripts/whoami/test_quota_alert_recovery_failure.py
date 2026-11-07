@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import cast
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
-from scripts.whoami import quota_alert
+import quota_alert
 from scripts.accounts import moves
 
 setUpModule = support.setUpModule

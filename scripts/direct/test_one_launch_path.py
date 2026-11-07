@@ -18,8 +18,8 @@ from scripts.lib.code_kind import is_test_code
 
 
 ROOT = Path(__file__).resolve().parents[2]
-LAUNCHERS = {"scripts/direct/assign.sh", "scripts/direct/assign.py", "scripts/direct/assign_claude.py"}
-GATED_HOPS = {"scripts/direct/review.sh"}
+LAUNCHERS = {"scripts/direct/assign.sh", "scripts/direct/assign.py"}
+GATED_HOPS = {"scripts/direct/implement.sh", "scripts/direct/review.sh"}
 MESH_STARTS = {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}
 NO_REFERENCES: frozenset[str] = frozenset()
 
@@ -27,7 +27,7 @@ NO_REFERENCES: frozenset[str] = frozenset()
 def starts_worker(words: list[str]) -> bool:
     for index, word in enumerate(words):
         name = Path(word).name
-        if name == "review.sh":
+        if name in {"implement.sh", "review.sh"}:
             return True
         if name == "codex_mesh.py" and index + 1 < len(words) and words[index + 1] in MESH_STARTS:
             return True
@@ -148,7 +148,7 @@ class OneLaunchPathTests(unittest.TestCase):
                         f'MESH = ROOT / "scripts/agents/codex_mesh.py"\ncommand = [python, str(MESH), "{verb}"]\n')
                     _ = (root / "caller.sh").write_text(f'MESH="${{DIR}}/codex_mesh.py"\n"$PY" "$MESH" {verb}\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:2", "caller.sh:2"])
-            for launcher in ("review.sh", "agent_bg.sh"):
+            for launcher in ("implement.sh", "review.sh", "agent_bg.sh"):
                 with self.subTest(launcher=launcher):
                     _ = (root / "caller.py").write_text(f'command = ["bash", str(ROOT / "{launcher}")]\n')
                     _ = (root / "caller.sh").write_text(f'AGENT_BG_ROLE=impl bash "${{DIR}}/{launcher}" --to worker\n')
@@ -219,9 +219,9 @@ class OneLaunchPathTests(unittest.TestCase):
                              "scripts/launch_test_support.py", "scripts/recorder_fixture.py"):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text('command = ["agent_bg.sh"]\n')
+                _ = path.write_text('command = ["implement.sh"]\n')
             _ = (root / "inspect.py").write_text(
-                '# codex_mesh.py start\ntext = "agent_bg.sh --attach worker"\n' +
+                '# codex_mesh.py start\ntext = "implement.sh --to worker"\n' +
                 'command = ["codex_mesh.py", "end"]\n')
             _ = (root / "inspect.sh").write_text(
                 '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')
@@ -231,18 +231,15 @@ class OneLaunchPathTests(unittest.TestCase):
 class ResumeAssignmentTests(unittest.TestCase):
     def test_saved_shell_commands_resume_through_assign_with_their_role_and_phase(self) -> None:
         for launcher, role, arguments in (
-            ("assign.sh", "impl", ["--role", "implement", "--prompt", "/old/prompt"]),
-            ("assign.sh", "fix", ["--role", "fix", "--prompt", "/old/prompt", "--fix-cause", "resume after a move"]),
+            ("implement.sh", "impl", ["impl", "the task", "impl", "writing", "0", "impl"]),
+            ("implement.sh", "fix", ["fix", "the repair", "fix", "repairing", "1", "impl"]),
             ("review.sh", "review", ["review", "the review", "reviewing", "3"]),
         ):
             with self.subTest(launcher=launcher, role=role):
                 command = ["bash", str(ROOT / "scripts/direct" / launcher), "--phase", "3t"]
                 if role == "review":
                     command.extend(("--lens", "contract"))
-                if launcher == "assign.sh":
-                    command.extend(("--session-dir", "/old/run", "--cwd", "/old/tree", *arguments))
-                else:
-                    command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
+                command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
                 seat = PausedSeat(run_dir="/run", seat="worker", role=role, staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(resume_message.resume_worker_command(seat, "/current/tree"))

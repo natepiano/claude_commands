@@ -308,7 +308,7 @@ Invalid argument counts print usage and return 1.
 
 | Consumer | Configuration use |
 |---|---|
-| `assign.py`, `assign_claude.py`, `review.sh` | Share one launch configuration across allocation and delivery. |
+| `assign.py`, `implement.sh`, `review.sh` | Share one launch configuration across allocation and delivery. |
 | `workers.py` | Reads a configuration only when it opens a worker. |
 | `codex_mesh.py` | Uses one configuration for each turn submission. |
 | `agent_exec.sh`, `cli_agent.sh` | Resolve task values before removing the operation snapshot. |

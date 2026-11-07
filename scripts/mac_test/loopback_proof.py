@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from scripts.mac_test import linux_runner
-from scripts.lib import conf
+import linux_runner
+import conf
 
 if TYPE_CHECKING:
     from ..lint import memory_admit
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lint'))
-    from scripts.lint import memory_admit
+    import memory_admit
 
 
 REMOTE_PROOF = r"""

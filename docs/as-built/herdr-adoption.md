@@ -267,7 +267,7 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
   trap 'rm -rf "$test_home"' EXIT
   env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
     HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
-    PYTHONDONTWRITEBYTECODE=1 ./scripts/lib/py -m unittest \
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
     scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
     scripts.shutdown.test_restart scripts.shutdown.test_account_move \
     scripts.production.test_add_unit scripts.production.test_add_unit_accounts \

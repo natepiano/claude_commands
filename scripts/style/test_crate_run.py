@@ -1,7 +1,7 @@
 """Serial crate lifecycle tests: temporary Git and ledger, fake planner and verification."""
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
 import json
 import io
@@ -18,18 +18,20 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style import bulk_rename as bulk
-from scripts.lib import berth_board
-from scripts.style import bulk_run as run
-from scripts.style import crate_run as crates
-from scripts.style import coverage_report
-from scripts.style import rules
-from scripts.style import style_ledger as ledger_api
-from scripts.style.approved_renames import BindingRename
-from scripts.style.ledger_test_support import machine_rename_fixture
-from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
-from scripts.style.style_child_test_support import install_refusal_tools
+import bulk_rename as bulk
+import berth_board
+import bulk_run as run
+import crate_run as crates
+import coverage_report
+import rules
+import style_ledger as ledger_api
+from approved_renames import BindingRename
+from ledger_test_support import machine_rename_fixture
+from test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
+from style_child_test_support import install_refusal_tools
 from scripts.build_queue import queue_place
 from scripts.copies import copies
 from scripts.lib import copy_record, scratch
@@ -427,7 +429,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertFalse(worker.exists())
 
     def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
-        from scripts.style import style_sync as owner_resolver
+        import style_sync as owner_resolver
         self.freeze(paths=("src/lib.rs",))
         observed: set[Path] = set()
         resolver = owner_resolver.gate_owner

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_models_registry import write_registry
 
@@ -31,23 +33,25 @@ from types import ModuleType
 from collections.abc import Callable, Iterator
 from unittest.mock import patch
 
-from scripts.production import add_unit
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+import add_unit
 from scripts.production import staff, unit_config
-from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
-from scripts.hooks import conversation_pause
-from scripts.production import unit_lookup
-from scripts.message import sessions
-from scripts.shutdown import inventory
-from scripts.shutdown import restart
-from scripts.herdr.herdr import HerdrPlace
+from cli_fixture import ImmutableGitSeed, invoke_cli
+import conversation_pause
+import unit_lookup
+import sessions
+import inventory
+import restart
+from herdr import HerdrPlace
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
-from scripts.herdr import herdr
+import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, process as write_process, private_process_registry
 from scripts.whoami.account_test_support import stored_room
-from scripts.shutdown.test_support import registry_confirmation, ShutdownTestCase
+from test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -337,6 +341,7 @@ class AddUnitTestCase(ShutdownTestCase):
         source = source.replace("raise SystemExit(main(sys.argv[1:]))", "raise SystemExit(submitting_main(sys.argv[1:]))")
         hook = r'''def submitting_main(argv):
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
+        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
         path = Path(os.environ["FAKE_HERDR_RESPONSES"])
@@ -348,6 +353,7 @@ class AddUnitTestCase(ShutdownTestCase):
         shell = Path(os.environ["HERDR_PROC"]) / os.environ["FAKE_SHELL_PID"]
         (shell / "environ").write_text("HERDR_SESSION=" + argv[1] + "\0HERDR_PANE_ID=w1:p1")
     if result == 0 and argv[2:4] == ["agent", "start"]:
+        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.add_unit_test_support import fixture_agent_started
         fixture_agent_started(argv)
     if result == 0 and argv[2:4] == ["agent", "prompt"]:
@@ -366,6 +372,7 @@ class AddUnitTestCase(ShutdownTestCase):
     return result
 
 '''
+        hook = hook.replace('os.environ["FIXTURE_CHECKOUT"]', repr(str(SCRIPT.resolve().parents[2])))
         source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
         _ = fake_path.write_text(source)
         fake_path.chmod(0o755)
@@ -444,7 +451,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
-        from scripts.shutdown import pane_record
+        import pane_record
         with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
             pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
                 {"CLAUDE_CONFIG_DIR": str(directory)},
@@ -505,6 +512,7 @@ class AddUnitTestCase(ShutdownTestCase):
         responses["--session default session list --json"] = CommandResponse(
             code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
         if isinstance(request, add_unit.UnitLaunch):
+            self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
             self.env["FAKE_CLAUDE_PID"] = str(FAKE_CLAUDE_PID)
             registry = Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
             if registry.exists():

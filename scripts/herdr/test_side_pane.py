@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
+from scripts.herdr import side_pane, worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -18,6 +18,9 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.accounts import accounts
+
+import herdr
+import pane_launch
 
 
 class SidePaneTests(StaffTestCase):

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
 import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -17,10 +18,10 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.style import coverage_report
-from scripts.style import rules
-from scripts.style import style_ledger
-from scripts.style import style_rules
+import coverage_report
+import rules
+import style_ledger
+import style_rules
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, unit_membership
 
 
@@ -132,7 +133,7 @@ class CoverageReportTests(unittest.TestCase):
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("coverage_report.py")),
+            [sys.executable, str(Path(__file__).with_name("coverage_report.py")),
              "--repo", str(self.repo), *arguments],
             check=False, capture_output=True, text=True,
         )

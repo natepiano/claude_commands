@@ -14,12 +14,17 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+import sys
 
 from scripts.buildlog import store
 from scripts.lib.cargo_target_config import cargo_path_argument
 
-from scripts.lib.test_phase import TEST_STEPS as TEST_STEPS
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+if TYPE_CHECKING:
+    from scripts.lib.test_phase import TEST_STEPS as TEST_STEPS
+else:
+    from test_phase import TEST_STEPS as TEST_STEPS
 
 
 @dataclass(frozen=True)

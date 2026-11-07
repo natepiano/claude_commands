@@ -302,7 +302,7 @@ byte-identical.
    Orders, which this command must leave byte-identical:
 
    ```sh
-   ~/.claude/scripts/lib/py -m scripts.berth.work_order \
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
      --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
      --phase <todo-phase>
    ```

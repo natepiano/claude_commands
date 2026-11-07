@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """git clean filter: drop generated backlog fields from issue frontmatter.
 
 Reads a note on stdin and writes it to stdout with the ``backlog_score`` and

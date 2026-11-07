@@ -20,7 +20,7 @@ else:
     from scripts.lib import test_hang_guard
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.build_hold.override_guard import require_checkout
+from override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

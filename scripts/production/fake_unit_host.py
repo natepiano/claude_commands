@@ -5,17 +5,22 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import unittest
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast, final
+from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 
-from scripts.production import unit_lookup
-from scripts.herdr import herdr
-from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
+if TYPE_CHECKING:
+    import herdr
+    import unit_lookup
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+import herdr
+from fake_herdr import CommandResponse, herdr_listener
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PANE_RESULT = herdr.Herdr.result
@@ -24,7 +29,7 @@ PANE_RESULT = herdr.Herdr.result
 @contextmanager
 def private_process_registry() -> Generator[None]:
     """Read private process generations and retain normal reads for other processes."""
-    from scripts.message import sessions
+    import sessions
     from scripts.message import sessions as runtime_sessions
 
     original_start = runtime_sessions.process_start
@@ -247,7 +252,9 @@ class PaneShellFixture:
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
                  live: bool, production_name: str = "demo", unit: str = "alpha",
                  env: dict[str, str] | None = None) -> None:
-        from scripts.production import unit_move
+        import herdr
+        import unit_lookup
+        import unit_move
         self.production_name: str = production_name
         self.unit: str = unit
         self.worktree: Path = worktree
@@ -307,6 +314,7 @@ class PaneShellFixture:
                 session=self.shell, cwd=self.worktree)
 
     def stopped(self) -> None:
+        import unit_lookup
         self.lifecycle.append("director exited")
         shutil.rmtree(Path(self.environment["HERDR_PROC"]) / str(self.director), ignore_errors=True)
         _write_children(Path(self.environment["HERDR_PROC"]))

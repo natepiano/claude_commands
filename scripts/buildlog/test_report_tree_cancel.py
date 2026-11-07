@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from typing import override
 
-from scripts.buildlog import index
-from scripts.buildlog import report
-from scripts.buildlog.test_index import call, encode, local_day, point_root_at, STAMP
+import index
+import report
+from test_index import call, encode, local_day, point_root_at, STAMP
 
 
 class CancelledReportTests(unittest.TestCase):

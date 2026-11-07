@@ -5,16 +5,15 @@ from __future__ import annotations
 import unittest
 import json
 import os
-import re
 from dataclasses import replace
 from typing import cast
 from unittest.mock import patch
-from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_worker, isolated_staff_file, transcript_fixture, stopped_worker_module
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
+class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
     def test_codex_slot_uses_claude_start_and_receives_the_extract_after_publication(self) -> None:
         run = self.start_phase("codex-to-claude")
         with isolated_staff_file(self.root / "staff.json", {}):
@@ -67,8 +66,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         before = (run / "progress_history_state.json").read_bytes()
         _ = (self.root / "staff.json").write_text("{invalid staff")
         result = self.claude_launch(run, "sonnet:low")
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertRegex(result.stderr, rf"^staff: {re.escape('impl')}: not opened: [^\n]+\n$")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertRegex(result.stderr, r"^staff: [^\n]+: not opened: [^\n]+\n$")
         self.assertEqual(summary.read_text(), "previous summary\n")
         self.assertEqual((run / "progress_history_state.json").read_bytes(), before)
         self.assertFalse((run / "impl_claim_impl.json").exists())
@@ -82,8 +81,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         before = (run / "progress_history_state.json").read_bytes(), transcript.read_bytes()
         _ = (self.root / "staff.json").write_text("{invalid staff")
         result = self.worker_launch(run, to="fixture-impl", behavior="queued")
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertRegex(result.stderr, rf"^staff: {re.escape('impl')}: not opened: [^\n]+\n$")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertRegex(result.stderr, r"^staff: fixture-impl: not opened: [^\n]+\n$")
         self.assertEqual(((run / "progress_history_state.json").read_bytes(), transcript.read_bytes()), before)
         self.assertFalse((run / "impl_claim_impl.json").exists())
         self.assertEqual((run / "impl_status_impl").read_text(), "implemented\n")

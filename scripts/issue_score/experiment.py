@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 from typing import cast
 
-from scripts.issue_score import client, questions
+from . import client, questions
 
 VariantSets = dict[str, dict[str, questions.Question]]
 

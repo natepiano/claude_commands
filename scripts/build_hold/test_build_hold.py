@@ -24,12 +24,12 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.build_hold import build_hold
-from scripts.build_hold import hold_enforcer
-from scripts.lib import unit_runs
-from scripts.message.sessions import SessionRecord
+import build_hold
+import hold_enforcer
+import unit_runs
+from sessions import SessionRecord
 
-from scripts.build_hold.build_hold_test_support import (
+from build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
@@ -495,7 +495,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if argv[:1] == ["git"]:
                 return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(argv[:2], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(expected_script)])
+            self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
             calls.append(argv[2:])
@@ -2028,7 +2028,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(sent, ["one", "two", "two", "three"])
 
     def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
-        from scripts.build_targets import build_targets
+        import build_targets
         self.begin()
         cycle = self.cycle()
         cycle["holders"]["holder"]["released_at"] = self.now.isoformat()

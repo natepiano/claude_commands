@@ -24,6 +24,7 @@ from a PreToolUse hook, so an allow is an exit 0 with no output.
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import os
@@ -36,9 +37,6 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast, override
 
 
-from scripts.lib.file_module import load_file_module
-
-
 class SessionTempPaths(Protocol):
     """The session-start hook's path and session id rules."""
 
@@ -47,8 +45,7 @@ class SessionTempPaths(Protocol):
     def temp_root(self, session_id: str) -> Path: ...
 
 
-SESSION_TEMP = cast(SessionTempPaths, cast(object, load_file_module(
-    "session_start_temp_root", Path(__file__).with_name("session-start-temp-root.py"))))
+SESSION_TEMP = cast(SessionTempPaths, cast(object, importlib.import_module("session-start-temp-root")))
 
 PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")

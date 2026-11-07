@@ -11,14 +11,15 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
-from scripts.production.proposals_folder import issues_folder  # noqa: E402
+from proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
-    from scripts.production.update_registration import QuestionStaff
+    from update_registration import QuestionStaff
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -48,7 +49,7 @@ def can_hold_questions(document: Path) -> bool:
 
 def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Close the production's questions and delete its state files."""
-    from scripts.production.update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
+    from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
     identities = identities if identities is not None else QuestionStaff.read()
     row = identities.owner(document) if document is not None else showrunners.owner_for(production_name, identities.record)
@@ -105,7 +106,7 @@ def main(argv: list[str]) -> int:
     if not argv:
         print("usage: tidy_wrapped.py <production doc>...", file=sys.stderr)
         return 2
-    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
+    from update_registration import QuestionStaff, RegistrationFailure
 
     identities: QuestionStaff | None = None
     failed = False

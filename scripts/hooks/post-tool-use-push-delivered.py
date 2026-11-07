@@ -5,9 +5,12 @@ from __future__ import annotations
 import fcntl
 import json
 import sys
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-from scripts.hooks._push_fallback import fallback_matches, marker_path, object_record, text
+if TYPE_CHECKING:
+    from ._push_fallback import fallback_matches, marker_path, object_record, text
+else:
+    from _push_fallback import fallback_matches, marker_path, object_record, text
 
 
 def main() -> None:

@@ -14,16 +14,21 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
-from scripts.lib.code_kind import is_test_code  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from code_kind import is_test_code  # noqa: E402
 
-from scripts.notify import gpu_xid
-from scripts.notify import push_texts
-from scripts.message import session_send
-from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+import gpu_xid
+import push_texts
+if TYPE_CHECKING:
+    from ..message import session_send
+else:
+    from scripts.message import session_send
+from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
@@ -269,7 +274,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
-                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, meaning + "\n")
@@ -278,7 +283,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
         for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
             with self.subTest(code=code):
-                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")

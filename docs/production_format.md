@@ -105,12 +105,8 @@ The showrunner staff row gives its path. The row's `name` is the production name
   document file name (`change-review - natedev.md`); a child production names its root's
   list. `change_review.py` resolves the list from the root showrunner while it runs and
   falls back to this path when it does not, warning when the two differ.
-  All merge callers use `change_review.list_ready` after the final promotion step succeeds, including the Mac pull.
-  It adds missing checkpoint changes only when they reach `origin/main` and become live.
-  A fourth field, `after <step>`, waits for `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
-  The session that completes the step runs `live`.
-  The command requires both arguments and releases only the named step.
-  `/change_review add` adds other ready changes. A missing file is created on its first row with
+  `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
+  `/change_review` adds the rest; a missing file is created on its first row with
   frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
   list of production doc paths, `showrunner`), and every write moves `date_modified`
   and adds the writing production's doc to `productions`
@@ -431,8 +427,4 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
-    A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
-    Until then, add no row.
-    Merge callers share `list_ready`, which fetches `origin main` before it adds missing rows.
-    A fourth field, `after <step>`, holds the line until the session completes the step and runs `change_review.py live --merged <hash> --step <step>`.
 </ProductionUnit>

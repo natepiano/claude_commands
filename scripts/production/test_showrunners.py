@@ -13,20 +13,23 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import fake_unit_host
+import fake_unit_host
 from scripts.production import showrunners, staff_sources
-from scripts.message.sessions import SessionRecord
-from scripts.production.fake_unit_host import HostedUnit
+from sessions import SessionRecord
+from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
@@ -187,7 +190,7 @@ raise SystemExit(1)
     @override
     def cli(self, *args: str, pane: str = "", caller: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
         del code
-        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args], env=self.environment(pane, caller),
+        return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(pane, caller),
                               capture_output=True, text=True, check=False)
 
     def successful(self, *args: str, pane: str = "", caller: str = "") -> str:

@@ -14,23 +14,43 @@ import sys
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
-from scripts.buildlog import store
+import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.message import send_budget, session_send
+sys.path.insert(0, str(SCRIPTS.parent))
+sys.path.insert(0, str(SCRIPTS / "message"))
+if TYPE_CHECKING:
+    from ..message import send_budget, session_send
+else:
+    import send_budget
+    from scripts.message import session_send
+sys.path.insert(0, str(SCRIPTS / "mac_test"))
+sys.path.insert(0, str(SCRIPTS / "notify"))
 
-from scripts.lint import memory_admit
-from scripts.build_queue import admission_client, admission_protocol
-from scripts.direct import step_record
-from scripts.mac_test import mac_test
-from scripts.notify import push_texts
-from scripts.notify.push_catalog import mac_idle_reservation
-from scripts.buildlog import mac_idle_alert
-from scripts.lib.process_failure import failure_detail
-from scripts.lib.user_zone import user_zone
-from scripts.message.unit_labels import unit_labels_for
+if TYPE_CHECKING:
+    from ..lint import memory_admit
+    from ..build_queue import admission_client, admission_protocol
+    from ..direct import step_record
+    from ..mac_test import mac_test
+    from ..notify import push_texts
+    from ..notify.push_catalog import mac_idle_reservation
+    from . import mac_idle_alert
+    from ..lib.process_failure import failure_detail
+    from ..lib.user_zone import user_zone
+    from ..message.unit_labels import unit_labels_for
+else:
+    from scripts.lint import memory_admit
+    from scripts.build_queue import admission_client, admission_protocol
+    from scripts.direct import step_record
+    import mac_test
+    import push_texts
+    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.buildlog import mac_idle_alert
+    from scripts.lib.process_failure import failure_detail
+    from scripts.lib.user_zone import user_zone
+    from scripts.message.unit_labels import unit_labels_for
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -277,7 +297,7 @@ def outage_repeat_minutes(since: float, now: float, settings: mac_idle_alert.Mac
 
 def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = REPAIR_MESSAGE) -> bool:
     try:
-        result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
+        result = subprocess.run([sys.executable, str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
                                 capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
         address = result.stdout.strip()
         if result.returncode != 0 or not address:

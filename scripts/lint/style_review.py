@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Prepare immutable style inputs and capture a read-only reviewer's result."""
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from string import Template
 from typing import Literal, cast, final
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import worker_lifecycle

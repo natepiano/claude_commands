@@ -15,11 +15,11 @@ from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.nightly_review import candidates
-from scripts.nightly_review.candidates import Candidate, TimeGain, TokenGain, Unmeasured
+import candidates
+from candidates import Candidate, TimeGain, TokenGain, Unmeasured
 
 # Importable once candidates has put scripts/lib on the path.
-from scripts.lib import urgency
+import urgency
 from scripts.lib import conf
 
 

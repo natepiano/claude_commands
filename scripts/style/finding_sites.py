@@ -10,8 +10,8 @@ from enum import Enum, auto
 import re
 from typing import final
 
-from scripts.style import declarations
-from scripts.style import style_footprint
+import declarations
+import style_footprint
 
 
 @final

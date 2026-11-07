@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Show repository test times and gate module times for the current host."""
 from __future__ import annotations
 
@@ -14,17 +14,19 @@ import statistics
 import sys
 from typing import TYPE_CHECKING, Literal, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from scripts.buildlog import index as index, parse, store, treekey
-    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    from ..buildlog import index as index, parse, store, treekey
+    from ..buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 else:
-    from scripts.buildlog import index
-    from scripts.buildlog import parse
-    from scripts.buildlog import store
-    from scripts.buildlog import treekey
-    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    import index
+    import parse
+    import store
+    import treekey
+    from mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
 TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TOOL_REPOSITORY))
 from scripts.lib import conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
@@ -422,7 +424,10 @@ def main(argv: list[str] | None = None) -> int:
         host = store.host_name()
         match request.command:
             case "top":
-                from scripts.buildlog import repository
+                if TYPE_CHECKING:
+                    from ..buildlog import repository
+                else:
+                    import repository
 
                 repo = request.repo.expanduser().resolve()
                 repo = Path(treekey.worktree(str(repo)) or str(repo))

@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from scripts.style import style_footprint as rust
+import style_footprint as rust
 
 
 class ConstantFinding(Protocol):

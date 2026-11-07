@@ -14,8 +14,12 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.prioritize import renumber
-from scripts.prioritize import writer_lock
+SCRIPTS_DIR = Path(__file__).parents[2]
+PRIORITIZE_DIR = Path(__file__).parents[1]
+sys.path.insert(0, str(SCRIPTS_DIR))
+sys.path.insert(0, str(PRIORITIZE_DIR))
+from prioritize import renumber
+import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 
 
 GOALS = """# prioritization goals

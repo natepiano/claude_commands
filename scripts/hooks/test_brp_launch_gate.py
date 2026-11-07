@@ -126,7 +126,6 @@ class BrpLaunchGateTests(unittest.TestCase):
         lint = self.root / "lint"
         hooks.mkdir()
         lint.mkdir()
-        (self.root / "lib").symlink_to(HOOK.parent.parent / "lib", target_is_directory=True)
         self.hook = hooks / HOOK.name
         _ = self.hook.write_text(HOOK.read_text())
         _ = (lint / "memory_gate.sh").write_text(

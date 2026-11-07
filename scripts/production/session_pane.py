@@ -9,11 +9,11 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "message"))
-from scripts.herdr import herdr  # noqa: E402
-from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
-from scripts.herdr.herdr import HerdrFailure as HerdrFailure  # noqa: E402
-from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from scripts.production.unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
+import herdr  # noqa: E402
+from herdr import AgentBlocked, Herdr  # noqa: E402
+from herdr import HerdrFailure as HerdrFailure  # noqa: E402
+from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <production_name> <unit>|session <id>> "

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Run an SSH command in a fixture home and optionally interrupt its stream."""
 
 from __future__ import annotations

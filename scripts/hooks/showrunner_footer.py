@@ -15,13 +15,16 @@ from enum import Enum
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from scripts.lib.user_zone import user_zone_name  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
 
-from scripts.production.update_registration import ReportItem as ReportItem, reports_path as reports_path
-from scripts.production.update_registration import QuestionStaff
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+from update_registration import ReportItem as ReportItem, reports_path as reports_path
+from update_registration import QuestionStaff
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 
+DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
 
 
@@ -57,7 +60,7 @@ def key_values(path: Path) -> dict[str, str]:
 
 
 def outstanding_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
-    from scripts.production.update_registration import outstanding_file
+    from update_registration import outstanding_file
 
     return outstanding_file(name, identities=identities)
 
@@ -120,8 +123,9 @@ def read_production(instance_dir: Path) -> Production | None:
 
 def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None) -> int | None:
     """Count due questions and report unavailable ownership or unreadable records."""
-    from scripts.production.update_registration import RegistrationFailure, read_open_items
-    from scripts.production.dailies_render import InputError, due
+    sys.path.insert(0, str(DAILIES.parent))
+    from update_registration import RegistrationFailure, read_open_items
+    from dailies_render import InputError, due
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -147,8 +151,9 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
 
 def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
     """Return the first deferred time from readable stores and report unavailable stores."""
-    from scripts.production.update_registration import RegistrationFailure, read_open_items
-    from scripts.production.dailies_render import InputError, DeferredUntil
+    sys.path.insert(0, str(DAILIES.parent))
+    from update_registration import RegistrationFailure, read_open_items
+    from dailies_render import InputError, DeferredUntil
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -170,8 +175,11 @@ def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | N
 
 def counts_line(productions: list[Production], questions: int) -> str | None:
     """The status line's counts line: each production's counts and the open questions."""
+    production_scripts = str(DAILIES.parent)
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
     # The counts read the production scripts, which import this module, so this one imports late.
-    from scripts.production import footer_counts
+    import footer_counts
 
     from scripts.production import staff
 

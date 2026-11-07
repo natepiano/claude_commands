@@ -1,4 +1,4 @@
-"""Test assignment compaction through assign."""
+"""Test assignment compaction cases formerly tested through implement.sh."""
 from __future__ import annotations
 
 

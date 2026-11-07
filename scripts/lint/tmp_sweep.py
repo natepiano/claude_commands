@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Delete idle agent scratch under /tmp once an hour.
 
 Agents leave shots, traces, gate copies and scratch builds in /tmp/claude and in
@@ -99,6 +99,7 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402

@@ -64,12 +64,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-from scripts.notify import push_texts  # noqa: E402
-from scripts.notify import review  # noqa: E402
-from scripts.message import sessions  # noqa: E402
+import push_texts  # noqa: E402
+import review  # noqa: E402
+import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
-from scripts.notify import silence  # noqa: E402
-from scripts.lib.user_zone import user_zone  # noqa: E402
+import silence  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"

@@ -42,11 +42,11 @@ def main() -> None:
             return
 
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from scripts.message import roster
-        from scripts.message import send
+        import roster
+        import send
         from scripts.production import staff
-        from scripts.message import sessions
-        from scripts.message.relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
+        import sessions
+        from relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
 
         membership = staff.snapshot()
         observed = roster.roster(os.environ, roster.ThisMachine(), membership=membership)

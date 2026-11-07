@@ -106,7 +106,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         args = assign.Arguments(role="review", to="project-review", lens="contract", pass_number=2)
         environment = os.environ.copy()
         with patch("scripts.direct.assign.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as launched:
-            code = assign.execute_claude(args, self.session_dir, "7", self.project, self.prompt, environment, "opus", "xhigh")
+            code = assign.execute_claude(args, self.session_dir, "7", self.project, self.prompt, environment)
         self.assertEqual(code, 0)
         launched.assert_called_once_with(
             ["bash", str(assign.SCRIPTS / "review.sh"), "--phase", "7", str(self.session_dir),

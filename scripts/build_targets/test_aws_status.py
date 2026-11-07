@@ -21,8 +21,9 @@ else:
 from unittest import mock
 import unittest
 
-from scripts.build_targets import build_targets
-from scripts.mac_test import mac_test, offload
+import build_targets
+import mac_test
+import offload
 
 if TYPE_CHECKING:
     from ..aws_target import aws_target, ledger, config as aws_config

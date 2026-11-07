@@ -389,14 +389,6 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
-`assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
-Each recorder slot counts as one worker, even when its pass records no worker name.
-For Claude, this slot must record a new `pass_started` event during the launch.
-The launcher keeps the phase reservation and the launch exit code.
-After this end, omit `--session-dir` to start a new run on retry.
-An explicit `--session-dir` retains the existing retry behavior for that folder.
-For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
-
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
 A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
@@ -625,7 +617,7 @@ recording the result.
 </VerificationNarration>
 
 <FindingsLedger>
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py <command> --session-dir
+Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,
 including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
@@ -1157,7 +1149,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1185,7 +1177,7 @@ always may — early launch is opportunistic, never required.
 Every path that ends an early launch before its real pass starts also drops the
 row it was given:
 
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+`python3 ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
 and `EARLY_REVIEW`. The
@@ -1582,7 +1574,7 @@ For `herdr`, retain worker rows and panes for the next phase.
 Use `worker.py end <name>` only when permanent removal is required.
 
 For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
+`python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
 It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
 <LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their

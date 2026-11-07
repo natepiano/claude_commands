@@ -15,8 +15,11 @@ import socket
 import shlex
 import subprocess
 import sys
-from typing import Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
@@ -27,8 +30,10 @@ from scripts.message.session_send import session_send_argv
 from scripts.lib.user_zone import user_zone
 from scripts.build_queue import admission_records as records
 
-from scripts.lib import conf
-from scripts.buildlog import store
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
 
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
@@ -662,6 +667,10 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
     from scripts.build_queue import step_estimator
+    if TYPE_CHECKING:
+        from scripts.buildlog import store
+    else:
+        import store
 
     config = records.read_memory_config()
     estimate = step_estimator.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
@@ -733,7 +742,11 @@ def down_alert() -> int:
         release_outcomes = ("failed", "refused", "retry")
         retained = session_outcome not in release_outcomes
         if session_outcome != "sent":
-            from scripts.notify import push_texts
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+            if TYPE_CHECKING:
+                from scripts.notify import push_texts
+            else:
+                import push_texts
             command = push_texts.user_send_argv(push_texts.render("alert.blocked",
                 sender="build-admission", title="Build queue service is down",
                 action=f"On natedev, run: {restart}",

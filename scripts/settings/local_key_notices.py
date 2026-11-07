@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Literal, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import send_result, send_budget, session_send

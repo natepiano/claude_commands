@@ -13484,10 +13484,8 @@ sys.argv = [script, *arguments]
 runpy.run_path(script, run_name='__main__')
 ''')
         shim.chmod(0o755)
-        end_environment = os.environ.copy()
-        del end_environment["CODEX_THREAD_ID"]
         ended = subprocess.run(["bash", str(Path(codex_mesh.__file__).parents[1] / "direct" / "end_session.sh")],
-            capture_output=True, text=True, check=False, timeout=LauncherHangGuard('assert_run_end_keeps_directed_workers').remaining(), env=end_environment)
+            capture_output=True, text=True, check=False, timeout=LauncherHangGuard('assert_run_end_keeps_directed_workers').remaining(), env=os.environ.copy())
         self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
         self.assertFalse(marker.exists())
         for name, expected in roster.items():
@@ -15083,7 +15081,8 @@ class ReplyDeliveryTests(unittest.TestCase):
         self.assertIn("Done.", self.replies.read_text(encoding="utf-8"))
 
     def test_a_summary_the_worker_never_wrote_is_filled_from_the_reply(self) -> None:
-        # assign.py clears the summary at launch. An empty summary needs the reply text.
+        # implement.sh truncates the file at launch, so empty at exit means the
+        # worker skipped its last act and the reply is all there is.
         _ = self.summary.write_text("", encoding="utf-8")
         codex_mesh._finish_summary(  # pyright: ignore[reportPrivateUsage]
             self.summary, self.replies, "worker", 1, "Done."
@@ -17758,7 +17757,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertEqual(environment["CODEX_HOME"], str(self.home / ".codex1"))
 
     def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
-        # assign.py can reach a server whose environment names another run.
+        # implement.sh's claim step can start the server before the launcher exports the run.
         with patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)):
             for caller in ({}, {"UNIT_RUN_DIR": str(self.home / "other-run")}):
                 with self.subTest(caller=caller):

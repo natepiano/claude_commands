@@ -18,11 +18,11 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("message", "production", "notify", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from scripts.lib import detached
+import detached
 from scripts.shutdown.stop_results import shutdown_state_root
-from scripts.production import session_pane
-from scripts.message import sessions
-from scripts.herdr.herdr import AgentBlocked
+import session_pane
+import sessions
+from herdr import AgentBlocked
 
 FLAG_WAIT = 60.0
 ATTEMPT_WAIT = 30.0

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Specification tests for the feature-log note writer and reader."""
 
 from __future__ import annotations
@@ -17,12 +17,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.feature_log import feature_log
-from scripts.feature_log.feature_log import locked, state_dir, vault_dir
-from scripts.lib import test_hang_guard
+import feature_log
+from feature_log import locked, state_dir, vault_dir
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 TODAY = "2026-10-10"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,11 @@ from typing import cast, final
 from unittest import mock
 
 
-from scripts.prioritize import snapshot
+SCRIPTS_DIR = Path(__file__).parents[2]
+PRIORITIZE_DIR = Path(__file__).parents[1]
+sys.path.insert(0, str(SCRIPTS_DIR))
+sys.path.insert(0, str(PRIORITIZE_DIR))
+from prioritize import snapshot
 
 
 @final
@@ -32,7 +37,7 @@ class SnapshotTests(unittest.TestCase):
         }
         canonical = {"backlog_impact": ("9 - Canonical",)}
 
-        with mock.patch("scripts.prioritize.renumber.RUBRIC_DOMAINS", canonical):
+        with mock.patch("renumber.RUBRIC_DOMAINS", canonical):
             errors = list(snapshot.completeness_errors(candidate))
 
         self.assertEqual(errors, [])

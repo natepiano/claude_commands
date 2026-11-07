@@ -29,7 +29,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
-from scripts.production import change_review
+import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case

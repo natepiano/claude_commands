@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
@@ -18,14 +19,16 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 from unittest.mock import Mock, patch
 
-from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
-from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
+from test_support import ShutdownSendLeaf, ShutdownTestCase
+import shutdown
+from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.herdr import worker_panes
 from scripts.lib.atomic_file import write_text_atomic
+import inventory
 from scripts.production import staff
 from scripts.agents import codex_mesh
 from scripts.whoami.account import UnreadableAccount
-from scripts.shutdown.inventory import Inventory
+from inventory import Inventory
 
 
 LOGIN = "owner@example.com"

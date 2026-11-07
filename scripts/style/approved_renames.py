@@ -26,11 +26,11 @@ from functools import cache
 from typing import cast
 from pathlib import Path, PurePosixPath
 
-from scripts.style import finding_sites
-from scripts.style import style_footprint
-from scripts.style.candidate_generators import snake_case
-from scripts.style.declarations import ITEM_KEYWORDS, type_path
-from scripts.style.git_process import run_git
+import finding_sites
+import style_footprint
+from candidate_generators import snake_case
+from declarations import ITEM_KEYWORDS, type_path
+from git_process import run_git
 
 # The keywords that declare an item with a name that other names can sit under.
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})

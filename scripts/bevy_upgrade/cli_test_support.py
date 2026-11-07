@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import shutil
 import socket
@@ -17,17 +18,22 @@ import unittest
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.bevy_upgrade import upgrade_record as upgrade_record
-from scripts.bevy_upgrade import bevy_upgrade
-from scripts.bevy_upgrade import upstream
+import upgrade_record as upgrade_record
+import bevy_upgrade
+import upstream
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
-from scripts.lib import test_hang_guard
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,9 +263,11 @@ class CliFixture(unittest.TestCase):
 
     def run_cli_process(self, *arguments: str, explicit_production: bool = True,
                 count_saves: bool = False) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, str(SCRIPT)]
         counter = (
-            "import fcntl\nimport os\nfrom pathlib import Path\n"
-            + "from scripts.bevy_upgrade import upstream\n"
+            "import fcntl\nimport os\nimport sys\nfrom pathlib import Path\n"
+            + "sys.path.append(str(Path(sys.argv.pop(1)).parent))\n"
+            + "import upstream\n"
             + "factory = upstream.fixture_fetch\n"
             + "def traced_factory(path: Path) -> upstream.Fetch:\n"
             + "    fetch = factory(path)\n"
@@ -269,7 +277,7 @@ class CliFixture(unittest.TestCase):
             + "        return fetch(url)\n"
             + "    return traced_fetch\n"
             + ("upstream.fixture_fetch = traced_factory\n" if count_saves else "")
-            + "from scripts.bevy_upgrade import bevy_upgrade, upgrade_record\n"
+            + "import bevy_upgrade\nimport upgrade_record\n"
             + "save = upgrade_record.save\n"
             + "def counted_save(current: upgrade_record.Record) -> None:\n"
             + "    lock = upgrade_record.record_path(current['staff_id']).with_suffix('.lock')\n"
@@ -286,7 +294,7 @@ class CliFixture(unittest.TestCase):
             + ("upgrade_record.save = counted_save\n" if count_saves else "")
             + "raise SystemExit(bevy_upgrade.main())\n"
         )
-        command = [str(SCRIPT.parents[1] / "lib/py"), "-c", counter]
+        command = [sys.executable, "-c", counter, str(SCRIPT)]
         if explicit_production:
             command.extend(["--production", "demo"])
         result = subprocess.run(command + list(arguments), cwd=self.checkout, env=self.env,

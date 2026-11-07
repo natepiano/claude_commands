@@ -9,12 +9,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch
 from scripts.usage import agents_log
-from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, fixture_session, isolated_staff_file, stopped_worker_module, transcript_fixture
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
+class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
     def test_failed_switch_delivery_retries_the_saved_handoff_before_the_assignment(self) -> None:
         session_dir = self.start_phase("claude-switch-retry")
         transcript = self.claude_worker(session_dir)
@@ -59,7 +59,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             "from pathlib import Path",
             "read_text = Path.read_text",
             "def read(path, *args, **kwargs):",
-            f"    if path == Path({str(run / 'mesh_roster.json')!r}) and any(frame.function == '_switch' for frame in inspect.stack()) and any(frame.function == 'dispatch_record' for frame in inspect.stack()):",
+            f"    if path == Path({str(run / 'mesh_roster.json')!r}) and sys.argv[1:2] == ['switch'] and any(frame.function == 'dispatch_record' for frame in inspect.stack()):",
             "        Path.read_text = read_text",
             "        raise PermissionError('fixture roster read failed')",
             "    return read_text(path, *args, **kwargs)",
@@ -127,7 +127,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             result = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads((self.root / "delivered-role.json").read_text()), "impl")
-        self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "completed")
+        self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
 
     def test_claude_follow_counts_turn_completed_before_first_poll(self) -> None:
         session_dir = self.start_phase("claude-short-turn")
@@ -137,8 +137,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 2)
-        self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "completed")
-        self.assertIn("impl_summary_fixture-impl.txt", (
+        self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
+        self.assertIn("impl_summary_impl.txt", (
             self.root / "delivered_message.txt"
         ).read_text(encoding="utf-8"))
 
@@ -149,7 +149,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         result = self.worker_launch(session_dir, to="fixture-impl", behavior="unreadable_once")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "completed")
+        self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
 
     def test_claude_queued_send_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-queued")
@@ -159,7 +159,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 1)
-        self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "error")
+        self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "error")
         self.assertIn("blocked:", (
             session_dir / "board.log"
         ).read_text(encoding="utf-8"))
@@ -171,7 +171,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         result = self.worker_launch(session_dir, to="fixture-impl", behavior="gone")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "error")
+        self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "error")
 
 
 if __name__ == "__main__":

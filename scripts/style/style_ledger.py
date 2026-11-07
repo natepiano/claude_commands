@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Store style judgments and derive coverage at a repository's synced tip."""
 
 from __future__ import annotations
@@ -28,31 +28,33 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
-from scripts.production.issues import Issue, frontmatter
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from issues import Issue, frontmatter
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
 
-from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
+from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
                          LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
 
-from scripts.style import rules as rule_catalog
-from scripts.style import style_footprint
-from scripts.style import declarations
-from scripts.style import finding_sites
-from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
+import rules as rule_catalog
+import style_footprint
+import declarations
+import finding_sites
+from finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
                            RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
-from scripts.style import style_rules
-from scripts.style import approved_renames
-from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
+import style_rules
+import approved_renames
+from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from scripts.style.candidate_generators import enumerate_candidates
-from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+from candidate_generators import enumerate_candidates
+from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
-from scripts.style.rules import Family, InputScope, MemberReach, Rule, Tier
+from rules import Family, InputScope, MemberReach, Rule, Tier
 
 
 @dataclass(frozen=True)

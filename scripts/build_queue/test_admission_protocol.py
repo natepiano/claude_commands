@@ -160,14 +160,13 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"
-            for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh", "lib/py"):
+            for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh"):
                 target = scripts / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _ = target.write_bytes((source / relative).read_bytes())
-                target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
             environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
-            command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
+            command = '''BUILDLOG_ADMISSION_CODE_VERSION="$(python3 "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"
 printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
@@ -177,7 +176,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 '''
             result = subprocess.run(["bash", "-c", command, "bash", str(scripts / "lint/memory_gate.sh"),
                                      str(scripts / "build_queue/admission_code.py"),
-                                     str(source / "build_queue/admission_client.py"), str(source / "lib/py")],
+                                     str(source / "build_queue/admission_client.py")],
                                     env=environment, capture_output=True, text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [before, before])

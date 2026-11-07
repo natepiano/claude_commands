@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
+import sys
 import unittest
+from pathlib import Path
 from typing import final
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.style import style_ledger
+import style_ledger
 
-from scripts.style.style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture
 
 
 @final

@@ -39,9 +39,11 @@ if TYPE_CHECKING:
     from ..build_hold import build_hold
     from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
-    from scripts.build_targets import build_targets, targets
-    from scripts.mac_test import mac_test, offload
-    from scripts.build_hold import build_hold
+    import build_targets
+    import targets
+    import mac_test
+    import offload
+    import build_hold
     from scripts.aws_target import ledger
     from scripts.aws_target.ledger_test_support import (
         REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,

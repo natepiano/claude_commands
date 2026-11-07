@@ -150,9 +150,9 @@ always=
             functions = cast(dict[tuple[str, int, str], object], getattr(pstats.Stats(str(stats)), "stats"))
             self.assertTrue(any(Path(file).name == "unit_watchdog.py" and name == "run"
                                 for file, _, name in functions))
-            self.assertEqual(measured.calls["scripts.whoami.agent_notes.write_note"], 1)
-            self.assertEqual(measured.calls["scripts.whoami.agent_notes.write_sessions_seen"], 1)
-            self.assertEqual(measured.calls["scripts.whoami.codex_pacer.write_atomic"], 3)
+            self.assertEqual(measured.calls["agent_notes.write_note"], 1)
+            self.assertEqual(measured.calls["agent_notes.write_sessions_seen"], 1)
+            self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
             self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)
             self.assertTrue(measured.children)

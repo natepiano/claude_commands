@@ -13,16 +13,26 @@ from zoneinfo import ZoneInfo
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses)
 
-from scripts.buildlog import parse
-from scripts.lib import conf
-from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
-                                   TestPhaseChargeUse as TestPhaseChargeUse)
+if TYPE_CHECKING:
+    from scripts.buildlog import parse
+    from scripts.lib import conf
+    from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
+                                       TestPhaseChargeUse as TestPhaseChargeUse)
+else:
+    import parse
+    import conf
+    from test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
+                            TestPhaseChargeUse as TestPhaseChargeUse)
 
 GIB = 1 << 30
 

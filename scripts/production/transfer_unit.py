@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 import subprocess
 import sys
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production

@@ -22,24 +22,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+    from memory_test_support import config_environment, write_config_fixture
 
-from scripts.build_targets import targets
-from scripts.build_hold import build_hold
-from scripts.mac_test import mac_test
+import targets
+import build_hold
+import mac_test
 if TYPE_CHECKING:
     from ..lib import process_start as process_identity
 else:
     from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import offload
+import offload
 if TYPE_CHECKING:
     from . import target_config
 else:
-    from scripts.build_targets import target_config
+    import target_config
 
 
-from scripts.build_hold.override_guard import require_checkout
+from override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

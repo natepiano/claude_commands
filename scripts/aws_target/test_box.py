@@ -251,7 +251,7 @@ class BoxTests(unittest.TestCase):
                                       'HOME': str(self.root / 'home'),
                                       'BUILDLOG_DIR': str(self.root / 'buildlog'), 'PATH': str(bin_path) + os.pathsep + os.environ['PATH']})))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.directory)))
-        _ = cast(object, self.enterContext(mock.patch('scripts.build_targets.target_config.ssh_target_state_directory', return_value=self.directory)))
+        _ = cast(object, self.enterContext(mock.patch('target_config.ssh_target_state_directory', return_value=self.directory)))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),))))
         registry = self.root / 'home/.claude/config/build_targets.conf'
         registry.parent.mkdir(parents=True)

@@ -30,22 +30,26 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings
 from scripts.production import staff
 from scripts.message import send_budget, session_send
-from scripts.notify import push_texts
-from scripts.notify import push_reference
+import push_texts
+import push_reference
 if TYPE_CHECKING:
-    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+    from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
 else:
     from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                 codex_account, workers_home)
-from scripts.notify.user_action import ActionRequired, NoActionRequired, UserAction
+from user_action import ActionRequired, NoActionRequired, UserAction
 
 if TYPE_CHECKING:
-    from scripts.message.send import Need
+    from send import Need
 
 STATE = Path(os.environ.get("ESCALATE_STATE_DIR")
              or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "escalate")
@@ -502,7 +506,7 @@ def reconcile_codex_holds(home: Path, login: str) -> None:
 
 def deliver(held: HeldMessage, key: str) -> str:
     """Send one held message to the user; the empty string when sent, else send.py's own line."""
-    from scripts.notify import review
+    import review
 
     if not isinstance(held, RegisteredHold):
         return "template revision required"

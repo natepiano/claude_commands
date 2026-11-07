@@ -10,7 +10,7 @@ using it).
 ## Step 1 — revert
 
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/hooks/banned_words_lib.py --revert
+python3 ~/.claude/scripts/hooks/banned_words_lib.py --revert
 ```
 
 The script copies `forbidden-word-counts.json.bak` back over the live counter

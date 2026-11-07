@@ -124,7 +124,7 @@ production format, with status `planned`:
 Validate every `todo` phase in every unit plan:
 
 ```sh
-~/.claude/scripts/lib/py -m scripts.berth.work_order \
+PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
   --repository-root "${REPO}" validate --document "<unit plan>" --phase <N>
 ```
 

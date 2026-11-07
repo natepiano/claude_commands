@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import unittest
 import subprocess
+import sys
 from pathlib import Path
 
-from scripts.style import style_footprint
-from scripts.style import approved_renames
-from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
+import style_footprint
+import approved_renames
+from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
                               Declarations, FileReader, FileRename, Folder, MissingFile, NoAppliedCheck, NoBindingRename,
                               NoBindingScope, NoFileRename, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_scope, resolution_scope, declaration_sites, file_rename,
@@ -129,7 +130,7 @@ class AppliedCheckTests(unittest.TestCase):
                         self.assertFalse(result.covers("row", pair, "src/lib.rs", source))
 
     def test_signature_changes_cannot_map_a_local_rename_inside_an_unread_body(self) -> None:
-        from scripts.style import finding_sites
+        import finding_sites
         for label, source in UNREAD_LOCAL_BODIES:
             with self.subTest(body=label):
                 item, = finding_sites.SourceSites(source).items
@@ -151,7 +152,7 @@ class AppliedCheckTests(unittest.TestCase):
                 self.assertTrue(read_item.body_reading.tokens)
 
     def test_proved_item_names_keep_their_exemption_with_unread_bodies(self) -> None:
-        from scripts.style import finding_sites
+        import finding_sites
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
                 item, = finding_sites.SourceSites(source).items
@@ -203,7 +204,7 @@ class AppliedCheckTests(unittest.TestCase):
             authority, "row", pair, "src/lib.rs", TRUE_FIELD_BINDING), approved_renames.NonLocalReferenceCompanion)
 
     def assert_admitted_local_capability_is_bound_to_anchor_version_pair_path_and_snapshot(self) -> None:
-        from scripts.style.approved_renames import (AdmittedLocalRename, AnchoredRenameSource, RenameAnchorUnavailable,
+        from approved_renames import (AdmittedLocalRename, AnchoredRenameSource, RenameAnchorUnavailable,
                                       admit_anchored_rename, OuterBindingBlocked, OuterBindingUnproved)
         source = "fn label() {\n    map(|g| g + 1)\n}\n"
         pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
@@ -316,7 +317,7 @@ class AppliedCheckTests(unittest.TestCase):
 
     def test_syntax_and_site_modules_import_without_an_initialization_cycle(self) -> None:
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-B", "-c", "from scripts.style import approved_renames, finding_sites, declarations"],
+            [sys.executable, "-B", "-c", "import approved_renames; import finding_sites; import declarations"],
             cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -1107,7 +1108,7 @@ class BindingRenameTests(unittest.TestCase):
 
 class MachineRuleTests(unittest.TestCase):
     def test_machine_rule_contract_rejects_extra_conditions_in_body_or_metadata(self) -> None:
-        from scripts.style.git_process import run_git
+        from git_process import run_git
         original = approved_renames.TYPE_NAMED_PARAMETER_RULE
         for text, allowed in ((original, True), (original + "Only in functions returning bool.\n", False),
                               (original.replace("input_scope: file", "input_scope: file\nonly_return: bool"), False)):

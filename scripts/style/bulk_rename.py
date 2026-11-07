@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Apply approved local renames with rust-analyzer, the shared proof and crate verification.
 
 Nothing is committed. Refused findings return to ordinary tickets; kept findings become built at the normal merge.
@@ -34,14 +34,16 @@ from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import BinaryIO, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_place
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-from scripts.lib import berth_board
-from scripts.style import style_footprint
-from scripts.style import style_ledger
-from scripts.style import approved_renames
-from scripts.style.approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
+import berth_board
+import style_footprint
+import style_ledger
+import approved_renames
+from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
                               backtick_mentions, identifier_mentions, field_sites)

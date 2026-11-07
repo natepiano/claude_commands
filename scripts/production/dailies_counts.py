@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-from scripts.production.issues import open_issues
+from issues import open_issues
 
 LABEL = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 

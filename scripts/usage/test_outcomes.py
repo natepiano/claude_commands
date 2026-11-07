@@ -790,8 +790,7 @@ class MacOutcomeTests(OutcomeFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
-            "${HOME}/.claude/scripts/lib/py", str(Path(__file__).resolve().parents[1] / "lib/py")))
+        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
         ssh.chmod(0o700)
 
     def mac_collect(self, behavior: SshBehavior = "complete") -> MacRun:

@@ -151,7 +151,7 @@ class RemoveWorkersTest(unittest.TestCase):
             SHUTDOWN_STATE_DIR=str(self.state_root),
             PROCESS_TABLE_PS="true",
         )
-        command = [str(SCRIPT.parent.parent / "lib/py"), "-c", OWNER_CLI, str(SCRIPT), "--run-root", str(self.root)]
+        command = [sys.executable, "-c", OWNER_CLI, str(SCRIPT), "--run-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
             command += ["--session-dir", str(run)]
         result = subprocess.run(

@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import store
-from scripts.buildlog.test_index import use_test_log
+import store
+from test_index import use_test_log
 
 use_test_log()
 

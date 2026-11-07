@@ -30,7 +30,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import sessions
 from scripts.usage import agents_log
 
-from scripts.herdr import herdr
+import herdr
 
 
 @final

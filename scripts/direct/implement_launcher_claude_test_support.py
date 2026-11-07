@@ -10,10 +10,11 @@ import sys
 import tempfile
 from typing import ClassVar, override
 
-from scripts.direct import assign_claude_test_support as support
+from scripts.direct import implement_launcher_test_support as support
 
 
-# The fake CLI uses shell builtins for repeated agents and logs commands.
+# The real launcher remains Bash. Only the fake CLI's repeated agents/logs
+# commands use shell builtins and cat instead of starting another interpreter.
 CLAUDE_REPLY_SHIM = r'''#!/bin/bash
 set -euo pipefail
 root="$STUB_CLAUDE_ROOT"
@@ -39,7 +40,7 @@ fi
 '''
 
 
-class ClaudeLauncherFixture(support.AssignClaudeLauncherFixture):
+class ClaudeLauncherFixture(support.ImplementLauncherFixture):
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
 
@@ -85,7 +86,7 @@ class ClaudeLauncherFixture(support.AssignClaudeLauncherFixture):
         self.working_dir: Path = self.root / "project"
         self.config_file: Path = self.root / "direct.conf"
         self.prompt_file: Path = self.root / "implementation_prompt.md"
-        self.assign_script: Path = self.root / "scripts/direct/assign.sh"
+        self.implement_script: Path = self.root / "scripts/direct/implement.sh"
         _ = self.staff_parent
         _ = (self.root / "claude-bin").write_text(self.cli_shim())
 

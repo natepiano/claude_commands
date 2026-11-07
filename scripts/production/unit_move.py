@@ -21,13 +21,17 @@ from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from scripts.direct import progress_history  # noqa: E402
-from scripts.production import tidy_wrapped  # noqa: E402
-from scripts.production import unit_lookup  # noqa: E402
-from scripts.herdr import herdr  # noqa: E402
-from scripts.shutdown import pane_record  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
+import progress_history  # noqa: E402
+import tidy_wrapped  # noqa: E402
+import unit_lookup  # noqa: E402
+import herdr  # noqa: E402
+import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.production.rename_state import RenameRefused, read_json, write_json  # noqa: E402
+from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402

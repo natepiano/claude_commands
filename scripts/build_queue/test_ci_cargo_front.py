@@ -24,7 +24,7 @@ from unittest import mock
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records, step_estimator
 from scripts.buildlog import store
-from scripts.lib import conf
+import conf
 
 request = wire.parse_request(sys.stdin.readline())
 output = client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
@@ -81,7 +81,7 @@ import signal
 from unittest import mock
 from scripts.build_queue import admission_records as records, step_estimator
 from scripts.buildlog import store
-from scripts.lib import conf
+import conf
 faulthandler.register(signal.SIGUSR2)
 with mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
      mock.patch.object(step_estimator, 'step_estimate', side_effect=PermissionError('runner history')), \\

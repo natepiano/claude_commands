@@ -124,44 +124,13 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
         self.assertNotRegex(result.stdout, r"(?m)^notify:")
 
-    def test_modules_use_only_the_checked_tree_pythonpath(self) -> None:
+    def test_modules_preserve_the_callers_pythonpath(self) -> None:
         caller_path = self.root / "caller-pythonpath"
         caller_path.mkdir()
         self.environment.update({"PYTHONPATH": str(caller_path), "MERGE_GATE_TEST_PYTHONPATH": str(caller_path),
                                  "MERGE_GATE_TEST_ISOLATION": "1"})
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    @gate_suites("hooks", "message")
-    def test_caller_modules_fail_and_plain_python_children_import_the_checked_tree(self) -> None:
-        caller_path = self.root / "caller-pythonpath"
-        self.write(caller_path / "caller_only.py", 'VALUE = "caller"\n')
-        self.environment["PYTHONPATH"] = str(caller_path)
-        del self.environment["MERGE_GATE_PYTHON"]
-        self.write(self.checkout / "scripts/hooks/test_first.py", "import caller_only\n")
-        identity = self.checkout / "scripts/message/checkout_identity.py"
-        self.write(identity, 'VALUE = "checked tree"\n')
-        marker = self.state / "plain-python-import"
-        self.write(self.checkout / "scripts/message/test_first.py", f'''import subprocess
-import sys
-import unittest
-from pathlib import Path
-
-class ChildImports(unittest.TestCase):
-    def test_child_imports_the_checked_tree(self):
-        result = subprocess.run(
-            [sys.executable, "-c", "from scripts.message import checkout_identity; print(checkout_identity.__file__)"],
-            capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), {str(identity)!r})
-        Path({str(marker)!r}).write_text(result.stdout.strip())
-''')
-        result = self.run_gate("--tests-only", "--full", own_process=True, type_dirs=())
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("No module named 'caller_only'", result.stdout)
-        self.assertIn("hooks: RED", result.stdout)
-        self.assertIn("message: OK", result.stdout)
-        self.assertEqual(marker.read_text(), str(identity))
 
     @gate_suites("lib")
     def test_modules_use_private_build_logs_and_remove_them(self) -> None:

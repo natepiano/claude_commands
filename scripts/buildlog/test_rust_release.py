@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from scripts.message import session_send
 from unittest import mock
 
-from scripts.buildlog import rust_release
+import rust_release
 if TYPE_CHECKING:
     from ..lib import cargo_output, scratch
     from ..lib.cargo_output_test_support import fake_cargo_output_roots
@@ -27,10 +27,10 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import cargo_output, scratch
     from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-    from scripts.notify import review
-    from scripts.notify.push_texts import RenderedPush, render, user_send_argv
-    from scripts.notify.user_action import ActionRequired
-from scripts.buildlog.test_index import point_root_at
+    import review
+    from push_texts import RenderedPush, render, user_send_argv
+    from user_action import ActionRequired
+from test_index import point_root_at
 
 
 def channel(version: str = "1.100.0", day: str = "2026-11-12") -> bytes:
@@ -659,7 +659,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertIsNone(state["pin"])
         self.assertEqual([], rust_release.report_line())
         result = subprocess.CompletedProcess(["git"], 0, '[toolchain]\nchannel = "nightly-2026-10-01"\n', "")
-        with mock.patch("scripts.buildlog.rust_release.subprocess.run", return_value=result):
+        with mock.patch("rust_release.subprocess.run", return_value=result):
             self.assertIsNone(rust_release.pinned_version())
 
     def test_timed_out_process_kills_background_child(self) -> None:

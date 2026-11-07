@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-from scripts.model_study.stats import request_cost
-from scripts.model_study.turns import Turn
+from stats import request_cost
+from turns import Turn
 
 
 SCRIPT = Path(__file__).with_name("model_study.py")

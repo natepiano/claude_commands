@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 import unittest
@@ -192,7 +193,7 @@ class QueueTests(NotificationGuardedTestCase):
         environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         for name in ("build_queue.py",):
             with self.subTest(script=name):
-                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name(name)), "--help"],
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name(name)), "--help"],
                     env=environment, capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

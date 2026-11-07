@@ -21,7 +21,7 @@ from scripts.shutdown import remote
 from scripts.lib import conf
 from scripts.message import sessions
 
-from scripts.production import add_unit
+import add_unit
 import retire_unit
 import unit_lookup
 import unit_names

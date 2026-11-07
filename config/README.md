@@ -338,7 +338,7 @@ The saved `deployment.json` record identifies the instance and retained data vol
 Replacement uses its saved `DataVolumeId`. Configuration contains no instance or volume ID.
 `spot_max_usd_per_hour` limits the Spot request price.
 `deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
-Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
+Run `python3 scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
 The command records stage results and times in `up.json` beside `deployment.json`.
 It checks live state before each stage. It always refreshes the price.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.

@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request
 
-from scripts.bevy_upgrade import crates_io_pacer
+import crates_io_pacer
 
 Fetch = Callable[[str], bytes]
 LookupResult = TypeVar("LookupResult")

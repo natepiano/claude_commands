@@ -27,13 +27,13 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import broadcast
-from scripts.message import process_table
+import broadcast
+import process_table
 from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget
 from scripts.lib.process_failure import failure_detail
-from scripts.production.live_units import live_unit_names
-from scripts.message.sessions import SessionRecord, live_sessions
+from live_units import live_unit_names
+from sessions import SessionRecord, live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
@@ -410,8 +410,8 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                 return
         machine = socket.gethostname()
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-        from scripts.notify.push_texts import render, user_send_argv
-        from scripts.notify import review
+        from push_texts import render, user_send_argv
+        import review
 
         push = render("codex.reset_ready", machine=machine)
         command = user_send_argv(push)

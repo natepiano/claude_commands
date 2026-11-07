@@ -17,14 +17,26 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
-from scripts.build_hold import build_hold
-from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+import build_hold
+from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
 
-from scripts.direct import step_record
-from scripts.buildlog import store
-from scripts.lib.boot_identity import boot_identity
+if TYPE_CHECKING:
+    from ..direct import step_record
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+    import step_record
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
+
+if TYPE_CHECKING:
+    from ..buildlog import store
+    from ..lib.boot_identity import boot_identity
+else:
+    import store
+    from scripts.lib.boot_identity import boot_identity
+
 
 
 @dataclass(frozen=True)
@@ -424,7 +436,7 @@ class StopBuildsAndTests:
 def start() -> None:
     """Keep an active unit; otherwise start the service or one detached fallback."""
     script = Path(__file__).resolve()
-    python = str(script.parents[1] / "lib/py")
+    python = str(Path(sys.executable).resolve())
     if shutil.which("systemctl"):
         try:
             active = subprocess.run(["systemctl", "--user", "is-active", "build-hold-enforcer"],

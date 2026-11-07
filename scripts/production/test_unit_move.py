@@ -28,7 +28,7 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
-from scripts.herdr import herdr
+import herdr
 
 
 def setUpModule() -> None:
@@ -38,8 +38,8 @@ def setUpModule() -> None:
 
 class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
-        from scripts.production import add_unit
-        from scripts.production import unit_lookup
+        import add_unit
+        import unit_lookup
         from scripts.shutdown.test_pane_restore import FakeClient
         from datetime import datetime, timezone
 
@@ -70,7 +70,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with (mock.patch.object(pane_record, "RECORD_DIR", records),
-              mock.patch("scripts.shutdown.pane_record.RECORD_DIR", records),
+              mock.patch("pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
             pane_record.write("agents", original)
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
@@ -131,7 +131,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assert_finished_rerun(backend)
 
     def test_resume_in_a_new_pane_closes_the_old_terminal_and_keeps_a_reused_pane(self) -> None:
-        from scripts.herdr import herdr
+        import herdr
 
         restore = self.enterContext(saved_fixture(self.root))
         for resumed_pane, close_fails in (("w1:p3", False), ("w1:p1", False), ("", False), ("w1:p3", True)):
@@ -232,7 +232,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assert_finished_rerun(backend)
 
     def test_real_restart_resumes_each_family_in_the_destination_and_keeps_the_terminal(self) -> None:
-        from scripts.herdr import herdr
+        import herdr
         from scripts.message import sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
@@ -303,7 +303,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 restore()
 
     def test_a_foreign_native_session_receives_no_stop_signal(self) -> None:
-        from scripts.herdr import herdr
+        import herdr
         from scripts.shutdown import stop_resume
 
         client = herdr.Herdr("agents")
@@ -337,8 +337,8 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
     def test_move_reads_only_members_and_resumes_their_current_sessions(self) -> None:
-        from scripts.herdr import herdr
-        from scripts.message import sessions
+        import herdr
+        import sessions
 
         worker = fixture_worker("impl1", self.owner.id)
         other = fixture_member("unit", name="other", parent=self.owner.parent,
@@ -397,7 +397,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         kill.assert_not_called()
 
     def test_unsafe_resume_sends_no_keystroke_or_second_session(self) -> None:
-        from scripts.herdr import herdr
+        import herdr
         from scripts.message import sessions as native_sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume

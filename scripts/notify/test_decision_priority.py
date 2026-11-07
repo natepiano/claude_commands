@@ -14,12 +14,12 @@ from unittest.mock import patch
 if TYPE_CHECKING:
     from . import decision_priority
 else:
-    from scripts.notify import decision_priority
-from scripts.notify import silence
-from scripts.notify import pushover
-from scripts.notify import push_texts
-from scripts.notify import review
-from scripts.notify.user_action import ActionRequired
+    import decision_priority
+import silence
+import pushover
+import push_texts
+import review
+from user_action import ActionRequired
 
 
 class DecisionPriorityTests(unittest.TestCase):

@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 
+sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
+sys.path.insert(0, str(Path(__file__).parents[2]))
 from scripts.lib.process_group import send_process_group
 from scripts.shutdown.test_support import ShutdownTestCase
 from scripts.lib import relaunch

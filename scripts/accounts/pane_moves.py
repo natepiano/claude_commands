@@ -9,7 +9,8 @@ from uuid import uuid4
 
 from scripts.accounts import accounts, moves, refusal_watch
 from scripts.accounts.accounts import SessionMoveOutcome
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import worker_panes
+import herdr
 from scripts.direct import progress_history
 from scripts.lib import conf
 from scripts.lib.resume_message import AccountMove, BusyPass, resume_message

@@ -1148,7 +1148,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), copies.CommittedSource('H
     def test_command_keeps_busy_lock_after_wrapper_is_killed(self) -> None:
         command = "import os,sys; print(os.getpid(), flush=True); sys.stdin.read(1)"
         process = subprocess.Popen(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(copies.__file__)), "run", "--owner", "verify-unit",
+            [sys.executable, str(Path(copies.__file__)), "run", "--owner", "verify-unit",
              "--repo", str(self.source), "--commit", "HEAD", "--", sys.executable, "-c", command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:

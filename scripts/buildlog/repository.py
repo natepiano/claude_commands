@@ -8,7 +8,7 @@ import subprocess
 if __package__:
     from . import store
 else:
-    from scripts.buildlog import store
+    import store
 
 GIT_TIMEOUT_S = 5
 

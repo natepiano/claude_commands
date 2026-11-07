@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import ci
-from scripts.buildlog.test_index import point_root_at
+import ci
+from test_index import point_root_at
 
 
 class CiPollTests(unittest.TestCase):

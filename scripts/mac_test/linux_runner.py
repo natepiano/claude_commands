@@ -460,10 +460,11 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
 def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) -> str:
     """Select the runner and its children even outside the slot directory."""
     code = ("import sys; from pathlib import Path; "
-            + "from scripts.mac_test.linux_runner import print_slot_processes; "
+            + "sys.path.insert(0, str(Path.home()/'.claude/scripts/mac_test')); "
+            + "from linux_runner import print_slot_processes; "
             + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
     return ('select_leftovers() {\n'
-            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
+            + f'    python3 -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
             + '}\n')
 
 
@@ -493,7 +494,7 @@ def nextest_words_with_skip(
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
                    words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
-    arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
+    arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
@@ -503,7 +504,7 @@ def command_script(mirror: str, values: dict[str, str], repository: str, verb: s
 
 
 def probe_command_script(mirror: str, values: dict[str, str], repository: str) -> str:
-    return shlex.join(['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'probe',
+    return shlex.join(['python3', '.claude/scripts/mac_test/linux_runner.py', 'probe',
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
 
 

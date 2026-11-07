@@ -14,8 +14,8 @@ from scripts.production.staff_test_support import fixture_worker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import retire_unit
-from scripts.production import unit_lookup
-from scripts.production import unit_move
+import unit_lookup
+import unit_move
 from scripts.production import staff_sources
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_unit_location, recorded_showrunner,

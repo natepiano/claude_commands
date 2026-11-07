@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import NamedTuple
 
-from scripts.production import session_staff, showrunners, staff
-from scripts.production import unit_lookup
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners, staff, session_staff
+import unit_lookup
 
 
 class LiveUnit(NamedTuple):

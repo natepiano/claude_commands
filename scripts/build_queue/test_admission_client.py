@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
-    from scripts.lib import conf
+    import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
@@ -115,7 +115,6 @@ class ClientTests(unittest.TestCase):
                 child_environment = dict(os.environ)
                 _ = child_environment.pop("TEST_SENDER_GUARD", None)
                 _ = child_environment.pop("HERDR_BIN", None)
-                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
                 message = "The build queue service has not answered. Builds wait."
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,

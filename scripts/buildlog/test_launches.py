@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -13,8 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
-from scripts.buildlog import launches
-from scripts.buildlog.test_index import Record, point_root_at
+import launches
+from test_index import Record, point_root_at
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -107,7 +108,7 @@ class LaunchTests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(CLI.resolve().parents[1] / "lib/py"), str(CLI), *args], env=self.environment, capture_output=True,
+            [sys.executable, str(CLI), *args], env=self.environment, capture_output=True,
             text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 

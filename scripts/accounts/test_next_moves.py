@@ -19,7 +19,7 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.whoami import run_out, usage_store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
-from scripts.whoami import quota_alert
+import quota_alert
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
 

@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.shutdown import pane_record
 from scripts.production import staff
-from scripts.herdr import herdr
-from scripts.message import sessions
+import herdr
+import sessions
 from scripts.shutdown.test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
@@ -429,7 +431,7 @@ class PaneRecordTests(unittest.TestCase):
         from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        from scripts.message import sessions
+        import sessions
 
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),
@@ -493,7 +495,7 @@ class PaneRecordTests(unittest.TestCase):
         from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        from scripts.message import sessions
+        import sessions
 
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),

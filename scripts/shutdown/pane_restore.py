@@ -13,8 +13,14 @@ import sys
 from pathlib import Path
 from typing import cast
 
-from scripts.herdr import herdr, pane_launch
-from scripts.shutdown import pane_record
+SCRIPTS = Path(__file__).resolve().parent.parent
+for dependency in ("whoami", "message", "herdr", "lib"):
+    sys.path.insert(0, str(SCRIPTS / dependency))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import herdr  # noqa: E402
+import pane_record  # noqa: E402
+import pane_launch
 from scripts.lib import conf
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.whoami import agent_accounts

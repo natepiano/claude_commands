@@ -27,17 +27,20 @@ from typing import TYPE_CHECKING, Literal, Never, Protocol, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
+for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
+    sys.path.insert(0, str(SCRIPTS / dependency))
 
-from scripts.herdr import herdr
+import herdr
 from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
-from scripts.shutdown import pane_record
+import pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
-from scripts.herdr import pane_launch
+import pane_launch
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS,
     ResumeWorkers as ResumeWorkers,
@@ -53,7 +56,7 @@ from scripts.shutdown.stop_results import (
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
-from scripts.message import sessions
+import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
@@ -528,7 +531,7 @@ def _member_machine(member: StaffRow) -> str:
 
 def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
     """Select close names from local units and showrunners."""
-    from scripts.shutdown import remote
+    import remote
 
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
@@ -611,7 +614,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     if len(matches) > 1:
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
-        from scripts.shutdown import remote
+        import remote
 
         member = matches[0]
         machine = _member_machine(member)
@@ -879,9 +882,9 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
     from datetime import datetime, timezone
-    from scripts.whoami import quota_alert
-    from scripts.lib.probe_session import PROBE_ENV
-    from scripts.shutdown import remote
+    import quota_alert
+    from probe_session import PROBE_ENV
+    import remote
 
     try:
         record = staff.snapshot()

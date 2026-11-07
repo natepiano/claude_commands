@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from scripts.lib.test_phase import (
+from test_phase import (
     CallRecord,
     NoCallRecord,
     TestPhaseChargeUse as TestPhaseChargeUse,
@@ -77,13 +77,24 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture, store, step_context
-from scripts.buildlog.repository import (
-    GIT_TIMEOUT_S as GIT_TIMEOUT_S,
-    output as output,
-    remote_identity as remote_identity,
-    repository_key as repository_key,
-)
+if __package__:
+    from . import cgroup_capture, store, step_context
+    from .repository import (
+        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+        output as output,
+        remote_identity as remote_identity,
+        repository_key as repository_key,
+    )
+else:
+    import cgroup_capture
+    import store
+    import step_context
+    from repository import (
+        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+        output as output,
+        remote_identity as remote_identity,
+        repository_key as repository_key,
+    )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -151,20 +162,20 @@ def _target_hosts(values: Mapping[str, str], target: str) -> tuple[str, ...]:
 
 
 def mac_targets() -> tuple[str, ...]:
-    from scripts.build_targets.target_config import SshTarget, read_targets
+    from target_config import SshTarget, read_targets
 
     return tuple(target.name for target in read_targets()
                  if isinstance(target, SshTarget) and target.platform == "macos")
 
 
 def configured_targets() -> tuple[str, ...]:
-    from scripts.build_targets.target_config import read_targets
+    from target_config import read_targets
 
     return tuple(target.name for target in read_targets())
 
 
 def local_targets() -> tuple[str, ...]:
-    from scripts.build_targets.target_config import LocalTarget, read_targets
+    from target_config import LocalTarget, read_targets
 
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
@@ -523,7 +534,7 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    from scripts.buildlog import parse
+    import parse
 
     words = ["rustc"]
     chosen = parse.toolchain(argv)
@@ -684,7 +695,7 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    from scripts.buildlog import parse
+    import parse
 
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
@@ -936,8 +947,8 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 def step(args: list[str]) -> None:
     import hashlib
-    from scripts.buildlog import parse
-    from scripts.buildlog import treekey
+    import parse
+    import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
     argv = args[6:]
@@ -1221,7 +1232,7 @@ def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
-    from scripts.build_targets.target_config import SshTarget, read_targets
+    from target_config import SshTarget, read_targets
 
     event, target, key, holder, reason, at = args[:6]
     if event not in ("began", "ended") or len(args) not in (6, 7):

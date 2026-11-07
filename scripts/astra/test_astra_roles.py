@@ -103,7 +103,7 @@ class AstraRolesTests(StaffTestCase):
             row = staff.by_id(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))
             assert row is not None
             world.add(row, "w1:p1", live=False)
-            with mock.patch("scripts.herdr.herdr.Herdr", return_value=world):
+            with mock.patch("herdr.Herdr", return_value=world):
                 live = astra_roles.live_roles()
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
                              [("99340615-2159-5777-b1c8-71572890df55", self.parent.current_session, "idle")])

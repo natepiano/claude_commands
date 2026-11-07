@@ -1,4 +1,4 @@
-#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+#!/usr/bin/env python3
 """Record a short MP4 of one X11 window selected by title."""
 
 from __future__ import annotations

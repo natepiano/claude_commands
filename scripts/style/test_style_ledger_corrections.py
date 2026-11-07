@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from ledger_test_support import ticket_owner_id
 
 import json
 import sqlite3
@@ -10,9 +10,9 @@ from contextlib import closing
 from pathlib import Path
 from typing import cast, final
 
-from scripts.style import rules
-from scripts.style import style_ledger
-from scripts.style.ledger_test_support import LedgerTestCase
+import rules
+import style_ledger
+from ledger_test_support import LedgerTestCase
 
 
 @final
