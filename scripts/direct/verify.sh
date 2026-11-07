@@ -1594,6 +1594,7 @@ cancel_tree_run() {
     if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
         rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
     fi
+    exec 9>&-
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
     local changed_path=""
@@ -1795,6 +1796,7 @@ forward_mac_runner_signal() {
         fi
     fi
     if [[ -n "$MAC_LOG_FILE" ]]; then
+        exec 9>&-
         rm -f "$MAC_LOG_FILE"
     fi
     note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
@@ -1856,6 +1858,8 @@ try_mac_test() {
         set_verdict_keys
     fi
     MAC_LOG_FILE="$(mktemp)"
+    # Both tee processes inherit this descriptor before a signal can remove the name.
+    exec 9>>"$MAC_LOG_FILE"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         step_state on_ssh "$selected_target"
     fi
@@ -1881,7 +1885,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         fi
         VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-    ) > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
+    ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
@@ -1930,6 +1934,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
         BUILDLOG_MAC_HOLDER=""
+        exec 9>&-
         rm -f "$MAC_LOG_FILE"
         MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
@@ -1954,6 +1959,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     case "$result_word" in
         declined|lost)
+            exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
@@ -1961,6 +1967,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed)
+            exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then return "$runner_status"; fi
@@ -1971,6 +1978,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
                 if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
                 printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
+                exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 note_event failed "$SECONDS" 0 "" 0 2
@@ -1978,6 +1986,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             fi
             MAC_PASSED=1
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then
+                exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 return 0
@@ -2785,6 +2794,7 @@ cache_record() {
 # seconds, what a reuse saves.
 record_mac_pass() {
     local log=$1 mac_seconds=${2%%.*}
+    exec 9>&-
     if [[ -z "${CACHE_DIR}" ]] || ! mkdir -p "${CACHE_DIR}"; then
         rm -f "$log" "${RUN_LOG}"
         RUN_LOG=""

@@ -1250,7 +1250,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Gotchas:** `test_verify_mac_only.py` compares the whole forwarded map, which holds the user's `--env` name plus the automatic values. `test_offload_forward.py` finds the forwarded values after the clear line, not at a fixed word index.
 
-### Phase 41j — A stop leaves no Mac log file  · status: todo
+### Phase 41j — A stop leaves no Mac log file  · status: done
 
 **Depends on:** Phase 41i.
 
@@ -1305,39 +1305,21 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Depends on:** Phase 41k.
 
-#### Work Order
+#### As-built
 
-**Source:** builds, 2026-11-06 23:35 EST: "the idle watch alerts only when the waiter itself has waited past the limit, not on Mac idle time alone. Put it after 41k. A false alert reaches every showrunner, so it has a cost."
-
-**Goal:** The Mac idle watch sends its outage message, its push and its `idle_with_waiter` message only for a waiting call whose own wait is longer than `alert_seconds`. Mac idle time alone sends nothing.
-
-**Defect:** `watch_once` in `scripts/buildlog/mac_idle.py` (near line 503) alerts when the Mac idle time passes `alert_seconds` and any call waits. It does not read how long the call has waited. Call `v20261107T043436-3692814-29883` entered `waiting_hold` at 04:34:36Z. The alert fired at 04:34:40Z, 4 seconds into the wait. The call left for the Mac at 04:34:42Z. Routing had no gap; the alert was false.
-
-**Spec:**
-
-1. A waiting call's wait starts at the step record's `updated` time when the watch first sees the call in the set `waiting_calls` returns. The watch keeps that start in its state folder, keyed by call id and process start, while the call stays in that set. A rewrite of the state file does not move the start: a failed Mac attempt rewrites `waiting_mac` every 180 s, so the current `updated` time alone loses a long wait. The watch drops the start when the call leaves the set.
-2. Apply one filter in `watch_once`, right after `waiting_calls`: keep only calls whose wait time is at least `alert_seconds`. Every later step reads only the kept calls: the `waiting` count, the disk exclusion detail, the outage message, the push and the per-call causes.
-3. An `updated` time that does not parse counts as past the limit, so a bad record still alerts.
-4. Take the limit from `mac_idle_alert.read_idle_config()`. Add no new setting.
+- `VerifyCall` carries `updated`; `waiting_calls` fills it from the step record.
+- `calls_past_wait_limit(paths, calls, now, alert_seconds)` in `scripts/buildlog/mac_idle.py` keeps the first-seen wait start of each waiting call in `wait_starts.json` in the watch state folder. The key is the call id and the process start. It drops the start of a call that left the waiting set, and returns only the calls that waited at least `alert_seconds`.
+- An `updated` time that does not parse counts as past the limit.
+- `watch_once` applies the filter right after `waiting_calls`. The waiting count, the disk detail, the outage message, the push and the per-call causes read only the kept calls.
+- The limit is `mac_idle_alert.read_idle_config().alert_seconds`. There is no new setting.
 
 **Files:**
-- `scripts/buildlog/mac_idle.py`
-- `scripts/buildlog/test_mac_idle.py`
+- `scripts/buildlog/mac_idle.py` — the wait filter and its state file.
+- `scripts/buildlog/test_mac_idle.py` — a fresh call, the limit, a state file rewrite, a call that comes back, a mixed count, and an `updated` time that does not parse.
 
-**Workers:** 1 writer, the check worker, in the verify-env tree.
+**Gotchas:** `step_record.read` takes `updated` from the state file mtime, and a failed Mac attempt rewrites that file every 180 s. Only the first-seen start measures a real wait.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test makes its project in a tempdir at run time.
-- Phase 41h also edits `test_mac_idle.py` in the verify-plain tree. The second to land merges.
-
-**Acceptance gate:**
-- A call 4 seconds into `waiting_hold`, with the Mac idle for longer than `alert_seconds`, sends no outage message, no push and no `idle_with_waiter` message. This test fails on the old code.
-- The same call at `alert_seconds` plus 1 second sends the outage message.
-- A call first seen waiting longer ago than `alert_seconds`, whose state file was rewritten 10 seconds ago, sends the outage message. This test fails on the code that read only the current `updated` time.
-- A call that leaves the waiting set and comes back starts a new wait.
-- One fresh call and one call past the limit give a message that counts 1 waiting call.
-- `test_mac_idle.py` passes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Ruled out:** measuring the wait from the current `updated` time — a retry every 180 s resets it, so a long outage never alerts.
 
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 

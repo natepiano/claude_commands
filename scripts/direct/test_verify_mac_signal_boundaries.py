@@ -20,15 +20,27 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
                 self.assertEqual(self.runner_events(), [])
 
     def test_signal_before_runner_start_removes_result_without_local_work(self) -> None:
+        self.check_signal_before_runner_start(delay_tee=False)
+
+    def test_signal_before_delayed_tee_opens_leaves_no_temp_log(self) -> None:
+        self.check_signal_before_runner_start(delay_tee=True)
+
+    def check_signal_before_runner_start(self, *, delay_tee: bool) -> None:
         marker = self.runner_state / "before-runner"
         gate = self.root / "debug-gate.sh"
+        tee_gate = '''tee() {
+    "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_TEE_RELEASE"
+    command tee "$@"
+}
+''' if delay_tee else ""
         _ = gate.write_text(
             "set -T\n"
+            + tee_gate
             + "before_mac_runner() {\n"
             + "    if [[ \"$BASH_COMMAND\" == *'\"$MAC_RUNNER\"'* "
             + "&& \"$BASH_COMMAND\" == *'\"${runner_args[@]}\"'* ]]; then\n"
             + "        trap - DEBUG\n"
-            + "        : > \"$TEST_BEFORE_RUNNER_MARKER\"\n"
+            + '        printf \'%s\\n\' "$MAC_LOG_FILE" > "$TEST_BEFORE_RUNNER_MARKER"\n'
             + '        "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_RUNNER"\n'
             + "    fi\n"
             + "}\n"
@@ -43,17 +55,24 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
                 "BASH_ENV": str(gate),
                 "TEST_BEFORE_RUNNER_MARKER": str(marker),
                 "TEST_CONTINUE_RUNNER": str(self.runner_state / "continue-runner"),
+                "TEST_TEE_RELEASE": str(self.runner_state / "release-tee"),
             },
         )
         try:
-            self.wait_for_path(marker)
+            self.wait_until(lambda: marker.exists() and bool(marker.read_text()),
+                            "the runner boundary", (process,), directory=marker.parent)
             process.send_signal(signal.SIGTERM)
             # Bash handles a queued trap after its foreground command returns.
             # Release that command by event; the pending TERM must still stop
             # verify before the runner command itself can execute.
             (self.runner_state / "continue-runner").touch()
+            if delay_tee:
+                log = Path(marker.read_text().strip())
+                self.wait_until(lambda: not log.exists(), "the Mac log removal", directory=log.parent)
+                (self.runner_state / "release-tee").touch()
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except BaseException:
+            (self.runner_state / "release-tee").touch()
             self.stop_verify(process)
             raise
 
