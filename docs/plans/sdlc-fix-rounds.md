@@ -360,3 +360,40 @@ From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink
 Git proves the merge. A shrink passes when its parent commit is an ancestor of the merge branch. This path no longer reads events. Add no new check. Add one test for each case.
 
 As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.
+
+### Phase 10c — `/unit:direct` loads a core and reads other sections when they apply  · status: in progress
+
+From the user, through accounts and the sdlc showrunner, 2026-11-07 15:10 EST: "tell sdlc to cut direct.md down to the core so that it loads other instructions as it needs them". A director reads `commands/unit/direct.md` (116 KB, about 29k tokens) again after each compaction. A core of 30-40 KB saves about 20k tokens per cycle.
+
+1. Keep in the core only what every run needs. Move each section that only one mode or one moment needs to its own file under `docs/direct/`. Use the existing `<TagReferenceContract/>` stub pattern: a table row and a stub that names the file and the moment to read it.
+2. Move text; do not copy it. Each rule stays in one place.
+3. The compaction hooks and `<CompactionContract/>` name the core and the stub files that a live moment needs.
+4. herdr edits `direct.md` after this phase lands. herdr moves its later edits into the new layout.
+
+The moved groups:
+
+| New file | Sections | Read when |
+| --- | --- | --- |
+| `repair_rounds.md` | FindingsLedger, PassOwnership, Synthesize, FixDispatch | a review, gate or verification result returns; before each repair dispatch |
+| `early_review.md` | EarlyReviewArm | at each implementation or fix dispatch |
+| `phase_reservation.md` | PhaseReservationContract, RetainPhaseReservation, CoordinatePhaseReservation | at phase start, at checkpoint release, and after compaction with a live reservation |
+| `verification.md` | VerificationContract, VerificationNarration | before a verification run |
+| `ux_review.md` | UXReview, RunApplicationSmokeTest | when a phase has a UX review or an application smoke test |
+| `launch_failure.md` | WorkerLaunchFailure | when a dispatch fails |
+| `authorization.md` | AuthorizationContract | when an action needs user authorization |
+| `held_astra_roles.md` | HeldAstraRoles | when the run holds an Astra role |
+| `standing_plan_refill.md` | StandingPlanRefill | when the plan header carries `**Standing:**` |
+| `berth_decisions.md` | BerthDecisions | when a cargo-berth decision applies |
+| `codex_dispatch_wait.md` | CodexDispatchWait | when the director is Codex |
+| `final_gate_commit.md` (exists) | FinalGate, RunSummary | at the final gate |
+
+### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: todo
+**Depends on:** Phase 10c
+
+From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges main, `merge_checkpoint` adds a row for every Change-Review line in the merged commits, with builds as Producer. So rows C1179-C1183 (merge 429d1528) show the builds session, and the user asks builds about sdlc work.
+
+Fix where the rows are made:
+1. A merge adds rows only for its own production's checkpoints.
+2. Each row's Producer is the unit that made the checkpoint.
+
+Add no new check.
