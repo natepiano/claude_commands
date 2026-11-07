@@ -861,10 +861,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -2463,10 +2476,16 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
