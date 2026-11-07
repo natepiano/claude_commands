@@ -127,6 +127,9 @@ class RosterTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
 
+        transport_config = self.root / "config"
+        transport_config.mkdir()
+        write_text_atomic(transport_config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
@@ -149,6 +152,7 @@ class RosterTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
+            "CONF_DIR": str(transport_config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "USAGE_STATE_DIR": str(self.root / "usage"),
@@ -266,6 +270,7 @@ class RosterTests(unittest.TestCase):
         server_pid: int | None = None,
     ) -> None:
         run.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(run / "worker_transport", "mesh\n")
         _ = (run / "mesh_server.json").write_text(json.dumps({
             "port": 45_678,
             "pid": os.getpid() if server_pid is None else server_pid,

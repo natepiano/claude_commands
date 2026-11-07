@@ -280,6 +280,24 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(observed, observation)
         native.assert_called_once_with(998075, "codex")
 
+    def test_held_pane_row_proves_the_native_process_and_session_without_another_pane_read(self) -> None:
+        identity = fixture_runtime_id("held-pane-report")
+        row = {"pane_id": "w1:p1", "agent_session": {"value": identity}, "agent_type": "codex"}
+        observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start",
+                                               {"UNIT_RUN_DIR": str(self.root)})
+        payload = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 998075, "argv": ["codex"]}]}}}
+        result = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
+        client = herdr.Herdr("agents")
+        with (patch.object(herdr, "run_program", return_value=result),
+              patch.object(herdr, "native_process", return_value=observation) as native,
+              patch.object(client, "panes", side_effect=AssertionError("held pane was read again"))):
+            process = client.native_pane_process("w1:p1", "codex", 1, pane_row=row)
+            self.assertEqual(process.current_identity, identity)
+            self.assertEqual(process.environment, observation.environment)
+            self.assertEqual(client.native_session("w1:p1", "codex", 1, pane_row=row), identity)
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
+
     def test_codex_native_process_proves_the_open_thread_instead_of_the_launch_thread(self) -> None:
         launch = fixture_runtime_id("native-launch-thread")
         current = fixture_runtime_id("native-replaced-thread")
@@ -4265,16 +4283,22 @@ class HerdrTests(unittest.TestCase):
     def test_readiness_and_wait_states(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         self.assertEqual(self.herdr.readiness("pane-1"), {"agent_status": "idle", "interactive_ready": True})
-        arguments = ["agent", "wait", "pane-1", "--until", "done", "--timeout", "20"]
+        arguments = ["agent", "wait", "pane-1", "--until", "done", "--until", "idle", "--timeout", "20"]
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "done"}}}))
-        self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.ObservedAgentState(herdr.AgentStatus.DONE))
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.ObservedAgentState(herdr.AgentStatus.DONE))
         self.configure_herdr(arguments, code=1, stderr=json.dumps({"error": {"code": "timeout", "message": "deadline"}}))
-        self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.WaitTimedOut())
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.WaitTimedOut())
         with patch.object(herdr, "run_program", side_effect=subprocess.TimeoutExpired("fake", 1)):
-            self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.WaitTimedOut())
+            self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.WaitTimedOut())
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))
         with self.assertRaises(herdr.AgentBlocked):
-            _ = self.herdr.wait_until("pane-1", "done", 20)
+            _ = self.herdr.wait_turn_end("pane-1", 20)
+
+    def test_wait_turn_end_requests_done_and_idle(self) -> None:
+        arguments = ["agent", "wait", "pane-1", "--until", "done", "--until", "idle", "--timeout", "20"]
+        self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+        self.assertEqual(self.herdr.wait_turn_end("pane-1", 20), herdr.ObservedAgentState(herdr.AgentStatus.IDLE))
+        self.assertEqual(self.commands(), [["--session", "fixture", *arguments]])
 
     def test_pane_reads_share_the_absolute_deadline_and_keep_the_default_timeout(self) -> None:
         reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")

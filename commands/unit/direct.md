@@ -32,8 +32,10 @@ Use one `design_roles.py` designer and at most one reviewer per design.
 `models.conf` selects the role's model and effort.
 Held roles use `worker.py` with explicit `astra-designer` or `astra-reviewer` roles.
 Keep the worker's row, native conversation, and pane across rounds, phases, and runs.
-An ad hoc Astra review outside the staff hierarchy keeps its one-turn `codex exec` path.
-Ask-a-friend uses `side_pane.py open|send|close` beside its caller and creates no staff row.
+An ad hoc Astra review outside the staff hierarchy uses a consultation pane through `assign.sh`.
+Ask-a-friend opens a consultation pane through `assign.sh` beside its caller.
+The consultation creates no staff row.
+`side_pane.py send|close` uses the same terminal for later questions and closure.
 `design_roles.py` saves each headed prompt and reply. Do not also use `astra_work.py brief` for that role.
 For another designer, include `config/design_roles/designer.md` in its brief.
 Save the brief with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
@@ -163,7 +165,14 @@ Exit 2 means refused.
 Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
 Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
 After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
-Apply the same recovery when a quiet wait returns exit 3 (`NO_DONE`).
+A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
+So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
+1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
+   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
+2. Read the worker's reply in the pane. Check the result and the DONE line.
+3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
+A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
+When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
 After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
 Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
 Read-only pane reviewers post no board lines and run no suites.
@@ -187,6 +196,15 @@ For an existing `mesh` pin, keep each worker's thread through the existing unit 
 Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
 A failed compaction keeps the thread available for its own compaction.
 Never create another reviewer while its retained thread exists.
+At the next phase start, the director of a run with a `mesh` pin must follow these steps:
+
+1. Finish the current pass, or record the unfinished work in the plan.
+2. Keep the run's history, saved launcher arguments, and durable design bindings.
+3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
+4. Confirm with one `ps` read that no process of that run remains.
+   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
+   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
+5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.

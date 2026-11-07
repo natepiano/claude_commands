@@ -19,6 +19,7 @@ from scripts.message import process_table
 from scripts.production import staff
 from scripts.production.staff_test_support import OWNER_CLI, StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
 from scripts.agents import worker_lifecycle
+from scripts.lib.atomic_file import write_text_atomic
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
 
@@ -81,6 +82,7 @@ class RemoveWorkersTest(unittest.TestCase):
         selected = root or self.root
         run = selected / name
         run.mkdir()
+        write_text_atomic(run / "worker_transport", "mesh\n")
         parent = unit_membership("cleanup", name)
         if orchestrator is not None:
             parent = staff.update_current_session(parent.current_session, staff.native_id(orchestrator))
@@ -395,7 +397,7 @@ class RemoveWorkersTest(unittest.TestCase):
         self.assertEqual(self.remove_workers(), (1, []))
 
     def test_failed_session_listing_never_runs_the_destructive_server_sweep(self) -> None:
-        own = self.root / "own"
+        own = self.run_dir("own", [])
         arguments = [
             os.fspath(SCRIPT),
             "--session-dir",
