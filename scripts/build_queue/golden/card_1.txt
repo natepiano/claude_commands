@@ -1,45 +1,45 @@
 Build queue · 10:46
 
 queue priority: cables (captured priority)
-                                                                              cap 26.6
-                                                             ███░░░░··········│▒████████████████████
+                                                                                        cap 26.6
+                                                                               ██░░·····│███████████
 
 Cap 26.6 GiB; anonymous use 5.1 GiB + free 24.5 GiB − safety 3.0 GiB; kept aside 6.0 GiB; room 15.5
   GiB
-  # showrunner        unit              step    min pid      GiB: kept/use; need
-run tool-based-ui     widget            nextest   0 pid 900  █████▏░░░░░░ 6.0 / 5.1
-  1 tool-based-ui     ●cables           mend     36 pid 1005 ███████▋ 7.6 ↑ pressure
-  2 tool-based-ui     ●cables           nextest   6 pid 1001 ███████████▌ 11.5
-  3 tool-based-ui     ●cables           nextest   6 pid 1002 ███████████▌ 11.5
-  4 tool-based-ui     hana-migration    mend     39 pid 1003 ███████▋ 7.6
-  5 cargo-liner       berth             clippy   37 pid 1004 ██▉ 2.9
-  6 tool-based-ui     lfo               nextest  35 pid 1006 ██████████▊ 10.8
-  7 cargo-liner-style modules           doc      35 pid 1007 ███▌ 3.5
-  8 cargo-liner-style —                 nextest  33 pid 1008 █▊ 1.8
-  9 performance       metrics-gathering mend     32 pid 1009 ███████▋ 7.6
- 10 tool-based-ui     —                 clippy   31 pid 1010 ██████▊ 6.8
- 11 cargo-liner-style types             doc      31 pid 1011 ███▌ 3.5
- 12 tool-based-ui     geometry-material nextest  30 pid 1012 █ 1.0
- 13 tool-based-ui     trunk             doc      30 pid 1013 ████▍ 4.4
- 14 cargo-liner       handler           clippy   30 pid 1014 ███ 3.0
- 15 tool-based-ui     demo              clippy   27 pid 1015 ██████▊ 6.8
- 16 tool-based-ui     trunk             doc      24 pid 1016 ████▍ 4.4
- 17 cargo-liner       port              mend     24 pid 1017 ███▎ 3.2
- 18 cargo-liner       port              nextest  24 pid 1018 █▊ 1.8
- 19 tool-based-ui     inspectors        nextest  21 pid 1019 ███████████▌ 11.5
- 20 tool-based-ui     demo              mend     20 pid 1020 ███████▋ 7.6
- 21 tool-based-ui     startup           nextest  14 pid 1021 ██████████▊ 10.8
- 22 tool-based-ui     geometry-material clippy   14 pid 1022 ██████▏ 6.1
- 23 tool-based-ui     hana-migration    nextest  10 pid 1023 ████████████▏ 12.1
- 24 performance       metrics-gathering nextest  10 pid 1024 ████████████▏ 12.1
- 25 cargo-liner       handler           nextest   9 pid 1025 █▊ 1.8
- 26 performance       metrics-gathering nextest   8 pid 1026 ████████▌ 8.5
- 27 performance       benchmark         nextest   8 pid 1027 ████████████▏ 12.1
- 28 cargo-liner       tile              nextest   6 pid 1028 ██████████▊ 10.8
- 29 tool-based-ui     lfo               nextest   3 pid 1029 █ 1.0
- 30 tool-based-ui     trunk             nextest   2 pid 1030 ██████████▊ 10.8
- 31 tool-based-ui     fastest           clippy    1 pid 1031 ██████▊ 6.8
- 32 tool-based-ui     assembly          clippy    0 pid 1032 ██████▊ 6.8
+  # showrunner        unit              step         min machine      pid      GiB: kept/use; need
+run tool-based-ui     widget            hana nextest   0 fixture-host pid 900  █████▏ 6.0 / 5.1
+  1 tool-based-ui     ●cables           mend          36              pid 1005 ██████ 7.6 ↑ pressure
+  2 tool-based-ui     ●cables           nextest        6              pid 1001 ██████ 11.5
+  3 tool-based-ui     ●cables           nextest        6              pid 1002 ██████ 11.5
+  4 tool-based-ui     hana-migration    mend          39              pid 1003 ██████ 7.6
+  5 cargo-liner       berth             clippy        37              pid 1004 ██▉ 2.9
+  6 tool-based-ui     lfo               nextest       35              pid 1006 ██████ 10.8
+  7 cargo-liner-style modules           doc           35              pid 1007 ███▌ 3.5
+  8 cargo-liner-style —                 nextest       33              pid 1008 █▊ 1.8
+  9 performance       metrics-gathering mend          32              pid 1009 ██████ 7.6
+ 10 tool-based-ui     —                 clippy        31              pid 1010 ██████ 6.8
+ 11 cargo-liner-style types             doc           31              pid 1011 ███▌ 3.5
+ 12 tool-based-ui     geometry-material nextest       30              pid 1012 █ 1.0
+ 13 tool-based-ui     trunk             doc           30              pid 1013 ████▍ 4.4
+ 14 cargo-liner       handler           clippy        30              pid 1014 ███ 3.0
+ 15 tool-based-ui     demo              clippy        27              pid 1015 ██████ 6.8
+ 16 tool-based-ui     trunk             doc           24              pid 1016 ████▍ 4.4
+ 17 cargo-liner       port              mend          24              pid 1017 ███▎ 3.2
+ 18 cargo-liner       port              nextest       24              pid 1018 █▊ 1.8
+ 19 tool-based-ui     inspectors        nextest       21              pid 1019 ██████ 11.5
+ 20 tool-based-ui     demo              mend          20              pid 1020 ██████ 7.6
+ 21 tool-based-ui     startup           nextest       14              pid 1021 ██████ 10.8
+ 22 tool-based-ui     geometry-material clippy        14              pid 1022 ██████ 6.1
+ 23 tool-based-ui     hana-migration    nextest       10              pid 1023 ██████ 12.1
+ 24 performance       metrics-gathering nextest       10              pid 1024 ██████ 12.1
+ 25 cargo-liner       handler           nextest        9              pid 1025 █▊ 1.8
+ 26 performance       metrics-gathering nextest        8              pid 1026 ██████ 8.5
+ 27 performance       benchmark         nextest        8              pid 1027 ██████ 12.1
+ 28 cargo-liner       tile              nextest        6              pid 1028 ██████ 10.8
+ 29 tool-based-ui     lfo               nextest        3              pid 1029 █ 1.0
+ 30 tool-based-ui     trunk             nextest        2              pid 1030 ██████ 10.8
+ 31 tool-based-ui     fastest           clippy         1              pid 1031 ██████ 6.8
+ 32 tool-based-ui     assembly          clippy         0              pid 1032 ██████ 6.8
 Head: free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB
 
 #1 of 32 · pid 1005 · tool-based-ui · cables · work-pan · mend · 7.6 GiB
@@ -61,8 +61,8 @@ Host: available RAM 24.5 GiB; total RAM 60.0 GiB
 Host load: unavailable
 queue priority: cables (captured priority)
 Running:
-pid 900 · tool-based-ui / widget / widget-enhancements-title, nextest: admitted 10:45 (0 min ago);
-  need 11.1 GiB; anonymous use 5.1 GiB; held slot 0.0 GiB; kept aside 6.0 GiB
+pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, hana nextest: admitted
+  10:45 (0 min ago); need 11.1 GiB; anonymous use 5.1 GiB; held slot 0.0 GiB; kept aside 6.0 GiB
 Total current use: 5.1 GiB
 
 Need source: source not recorded

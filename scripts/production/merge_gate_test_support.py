@@ -472,6 +472,7 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(self.checkout, "remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
         self.write(self.checkout / "scripts/test_times/module_run.py",
                    (SCRIPT.parents[1] / "test_times/module_run.py").read_text())

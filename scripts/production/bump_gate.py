@@ -39,7 +39,7 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["name"], Path(record["checkout"]), copies.CommittedSource(record["tip"])) as clone:
+        with copies.standing(record["owner_id"], Path(record["checkout"]), copies.CommittedSource(record["tip"])) as clone:
             production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
             os.environ["BUILDLOG_UNIT"] = record["unit"]
