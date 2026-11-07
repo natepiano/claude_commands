@@ -807,7 +807,7 @@ def _watch_resume(identity: str, pane: str, account: str,
             pid = started.pid
         generation = sessions.process_start(pid)
         if generation:
-            _detach(["stay", "--session", identity, "--pane", pane,
+            _ = _detach(["stay", "--session", identity, "--pane", pane,
                      "--account", account, "--pid", str(pid), "--generation", generation, "--why", why,
                      *(["--requester", requester] if requester else [])], "stay")
         else:
@@ -816,8 +816,11 @@ def _watch_resume(identity: str, pane: str, account: str,
         print(f"{identity}: observer anomaly: {error}", file=sys.stderr)
 
 
-def _detach(arguments: list[str], task: str) -> None:
-    """One detached process boundary for batch coordination and the post-start check."""
+_STOP_RESUME_PROGRAM = Path(__file__).resolve()
+
+
+def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM) -> Path:
+    """Run lifecycle work outside the caller's stop boundary."""
     from scripts.production import showrunners
 
     # Capture the registry identity before the child loses the caller's session id.
@@ -831,7 +834,7 @@ def _detach(arguments: list[str], task: str) -> None:
     log = logs / f"{task}-{uuid4().hex}.log"
     environment = dict(os.environ)
     _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
-    command = [sys.executable, str(Path(__file__).resolve()), arguments[0], "--log", str(log), *arguments[1:]]
+    command = [sys.executable, str(program), arguments[0], "--log", str(log), *arguments[1:]]
     if sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -840,12 +843,16 @@ def _detach(arguments: list[str], task: str) -> None:
                             "env", "-u", "CLAUDE_CODE_SESSION_ID", *command],
                            env=environment, stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, check=True, timeout=15)
+    return log
+
+
+detach = _detach
 
 
 def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int, cause: moves.MoveCause,
                    source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> None:
     # Options precede the positional list so session names cannot become options.
-    _detach(["batch", "--target", target, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
+    _ = _detach(["batch", "--target", target, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
              *(arg for identity, label in source_accounts.items() for arg in ("--source-account", f"{identity}={label}")),
              "--", *selected], "move")
 

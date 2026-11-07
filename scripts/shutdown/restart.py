@@ -1,27 +1,58 @@
 """Stop live staff rows, then resume their current sessions in their saved tabs."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import argparse
+import io
 import math
 import os
 import subprocess
 import sys
 import time
 from collections.abc import Iterable
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, cast
 from importlib import import_module
 
 from scripts.herdr import herdr
-from scripts.message import sessions
+from scripts.message import sessions, codex_daemon
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.shutdown import member_account, shutdown_record, pane_record
 from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
+
+
+@dataclass(frozen=True)
+class AllRestartAccounts:
+    """Select rows without an account filter."""
+
+
+ALL_RESTART_ACCOUNTS = AllRestartAccounts()
+
+
+def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str],
+                    account: accounts.AccountSelection) -> bool:
+    if isinstance(account, accounts.NamedAccount):
+        return kind == "claude" and Path(environment.get("CLAUDE_CONFIG_DIR") or
+            accounts.main_config_dir()).expanduser().resolve() == account.dir.resolve()
+    return kind == "codex" and Path(environment.get("CODEX_HOME") or
+        accounts.accounts_home() / ".codex").expanduser().resolve() == account.home.resolve()
+
+
+class WorkerRestartScope(Enum):
+    FOLLOW_OWNER = "restore the owner's workers"
+    SELECTED_ROWS = "restart only selected rows"
 
 
 class WorkerRow(Protocol):
@@ -39,7 +70,12 @@ class WorkerRestore(Protocol):
     def restore(self, parent: staff.StaffId) -> int: ...
 
 
+class AgentsCommand(Protocol):
+    def main(self, argv: list[str]) -> int: ...
+
+
 class MemberLifecycle(Protocol):
+    def detach(self, arguments: list[str], task: str, *, program: Path) -> Path: ...
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
     def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
@@ -155,16 +191,13 @@ def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> b
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               present: bool = False, target_account: str | accounts.AccountSelection = "", deadline: float = math.inf,
-              resolver: session_staff.RowResolver | None = None) -> str:
+              resolver: session_staff.RowResolver | None = None,
+              worker_scope: WorkerRestartScope = WorkerRestartScope.FOLLOW_OWNER) -> str:
     with operation_deadline.within(deadline):
-        if row.kind == "worker":
-            parent = record.parent_of(row)
-            if parent is not None and pane_workers(parent):
-                return start_row(parent, record, client, present=present, target_account=target_account,
-                                 deadline=deadline, resolver=resolver)
         live = herdr.read_conversation(str(row.current_session))
         if isinstance(live, herdr.LiveConversation):
-            _restore_workers(row, record)
+            if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                _restore_workers(row, record)
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(live, herdr.UnknownConversation):
@@ -214,7 +247,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         # Read liveness again immediately before the launch.
         current = herdr.read_conversation(str(row.current_session), kind)
         if isinstance(current, herdr.LiveConversation):
-            _restore_workers(row, record)
+            if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                _restore_workers(row, record)
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
@@ -246,7 +280,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 client.close_startup_workspaces(result.pane.split(":", 1)[0])
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
-        _restore_workers(row, record)
+        if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+            _restore_workers(row, record)
         print(f"{row.name}: restarted")
         return result.pane
 
@@ -274,12 +309,17 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
 
 def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                  resolver: session_staff.RowResolver | None = None,
-                 codex: herdr.CodexConversations | None = None) -> list[staff.StaffRow]:
+                 codex: herdr.CodexConversations | None = None,
+                 account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
     from scripts.shutdown import remote
 
     selected: list[staff.StaffRow] = []
     shared_unknown = 0
+    hosted = {session.thread_id: read.owner.home
+              for read in codex_daemon.read_daemons(os.environ)
+              if not isinstance(read.sessions, codex_daemon.DaemonUnreadable)
+              for session in read.sessions} if not isinstance(account, AllRestartAccounts) else {}
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     for row in rows:
         try:
@@ -295,7 +335,17 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
             else:
                 observed = herdr.read_conversation(str(row.current_session), codex=codex)
             if isinstance(observed, herdr.LiveConversation):
-                selected.append(row)
+                if (isinstance(account, AllRestartAccounts)
+                        or any(account_matches(observed.kind, herdr.process_environment(pid), account)
+                               for pid in observed.pids)
+                        or not observed.pids and observed.kind == "codex"
+                        and isinstance(account, accounts.CodexWorkersAccount)
+                        and (home := hosted.get(str(row.current_session))) is not None
+                        and home.resolve() == account.home.resolve()):
+                    selected.append(row)
+                elif row.kind == "worker" and not observed.pids and (
+                        observed.kind == "claude" or str(row.current_session) not in hosted):
+                    print(f"{row.name}: left alone; account unknown")
             elif isinstance(observed, herdr.UnknownConversation):
                 if observed.shared_codex:
                     shared_unknown += 1
@@ -309,7 +359,8 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
 
 
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
-              resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+              resolver: session_staff.RowResolver | None = None,
+              account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     # The registry supplies candidate names; the reader proves each conversation.
     try:
@@ -329,10 +380,14 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for holder in record.rows:
         if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and pane_workers(holder):
             workers.update((state.row.id, state) for state in worker_panes.observe(holder.id, record))
-    selected = live_members((row for row in record.rows if row.id not in workers), record,
-                            resolver=resolver, codex=codex)
-    selected.extend(state.row for state in workers.values()
-                    if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker)))
+    active_workers = [state.row for state in workers.values()
+                      if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker))]
+    candidates_rows = [row for row in record.rows if row.id not in workers]
+    if not isinstance(account, AllRestartAccounts):
+        candidates_rows.extend(active_workers)
+    selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
+    if isinstance(account, AllRestartAccounts):
+        selected.extend(active_workers)
     if save_tabs:
         try:
             client.save_layout()
@@ -346,7 +401,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     return selected
 
 
-def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
+def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
+            account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -356,10 +412,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     client = herdr.Herdr(herdr.shared_session())
     selected: list[staff.StaffRow] = []
     if stop_all:
-        selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver)
+        selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account)
+        if only:
+            requested = {row.id for reference in only if (row := record.by_member_reference(reference)) is not None}
+            selected = [row for row in selected if row.id in requested]
     select_only = bool(only) and not stop_all
-    pending_ids = list(only) if select_only else shutdown_record.read()
-    if dry_run and not select_only and not stop_all:
+    pending_ids = (list(only) if select_only else
+                   [] if stop_all and (only or not isinstance(account, AllRestartAccounts)) else shutdown_record.read())
+    if dry_run and not select_only and not stop_all and isinstance(account, AllRestartAccounts):
         path = shutdown_record.record_path()
         saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
         print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
@@ -375,13 +435,21 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             print(f"{reference}: unknown or ambiguous staff row" if select_only else
                   f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
             continue
+        if not isinstance(account, AllRestartAccounts):
+            try:
+                kind, environment, _arguments = session_launch(str(row.current_session), row.name)
+                if not account_matches(kind, environment, account):
+                    continue
+            except (OSError, ValueError) as error:
+                _anomaly(row, error)
+                continue
         if row not in selected:
             selected.append(row)
     if dry_run:
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
                      for space in herdr.saved_layout(client.session)["workspaces"]
                      for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
-        visible = row_panes(list(record.rows) if stop_all else selected, client)
+        visible = row_panes(list(record.rows) if stop_all and not only and isinstance(account, AllRestartAccounts) else selected, client)
         for row, pane in visible:
             if row not in selected:
                 continue
@@ -398,18 +466,31 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []
     started: list[str] = []
+    worker_scope = (WorkerRestartScope.SELECTED_ROWS if only or not isinstance(account, AllRestartAccounts)
+                    else WorkerRestartScope.FOLLOW_OWNER)
     holders: dict[staff.StaffId, staff.StaffRow] = {}
+    members_by_holder: dict[staff.StaffId, list[str]] = {}
+    selected_ids = {row.id for row in selected}
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
-        holder = parent if parent is not None and pane_workers(parent) else row
+        holder = (parent if worker_scope is WorkerRestartScope.FOLLOW_OWNER
+                  and parent is not None and parent.id in selected_ids and pane_workers(parent) else row)
         holders[holder.id] = holder
+        members_by_holder.setdefault(holder.id, []).append(str(row.id))
+    callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
+    if stop_all and any(row.current_session in callers for row in selected):
+        arguments = ["restart", "--all", "--only", ",".join(str(row.id) for row in selected)]
+        if not isinstance(account, AllRestartAccounts):
+            arguments.append(account.label)
+        log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve())
+        print(f"restart continues outside this session; log: {log}")
+        return 0
     if stop_all:
         for holder in tuple(holders.values()):
             try:
                 with staff.row_operation(str(holder.id)):
-                    shutdown_record.update(started=[], pending=[str(row.id) for row in selected
-                        if row.id == holder.id or row.parent == staff.ReportsTo(holder.id)])
-                    if holder.kind in ("unit", "showrunner"):
+                    shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+                    if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
                         _ = stop_resume.stop_unit_workers(holder.id, record)
                     _ = stop_row(holder, client)
             except staff.StaffRefused as error:
@@ -426,8 +507,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     for holder in holders.values():
-        members = [str(row.id) for row in selected if row.id == holder.id or
-                   isinstance(row.parent, staff.ReportsTo) and row.parent.id == holder.id]
+        members = members_by_holder[holder.id]
         try:
             with staff.row_operation(str(holder.id)):
                 current_record = staff.initial_snapshot()
@@ -435,7 +515,12 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 if current is None:
                     raise ValueError("staff row no longer exists")
                 resolver.record = current_record
-                _ = start_row(current, current_record, client, present=present, resolver=resolver)
+                if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                    _ = start_row(current, current_record, client, present=present, resolver=resolver)
+                else:
+                    _ = start_row(current, current_record, client, present=present, resolver=resolver,
+                                  target_account="" if isinstance(account, AllRestartAccounts) else account,
+                                  worker_scope=worker_scope)
             started.extend(members)
             present = False
         except staff.StaffRefused as error:
@@ -451,3 +536,25 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     return 0
+
+
+def main() -> int:
+    """Run detached restart work and save its output."""
+    command = cast(AgentsCommand, cast(object, import_module("scripts.shutdown.shutdown")))
+
+    parser = argparse.ArgumentParser(add_help=False)
+    _ = parser.add_argument("--log", type=Path, required=True)
+    _ = parser.add_argument("--requester", default="")
+    options, arguments = parser.parse_known_args()
+    output = io.StringIO()
+    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+    _ = os.environ.pop("CODEX_THREAD_ID", None)
+    try:
+        with redirect_stdout(output), redirect_stderr(output):
+            return command.main(arguments)
+    finally:
+        write_text_atomic(cast(Path, options.log), output.getvalue())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
