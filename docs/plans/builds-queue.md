@@ -348,54 +348,27 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 ### Phase 18c — Gate copies belong to a staff row, and a rename removes nothing  · status: done
 
-**Depends on:** 18 and 18b on GitHub builds. Source: builds rulings, 2026-11-06, from hierarchies. This phase replaces Phase 10u, and it alone owns the staff id conversion.
+#### As-built
 
-#### Work Order
-
-**Goal:** A unit keeps its copies through a rename, and a retire removes only that unit's copies.
-
-**Spec:**
-
-1. **Owner type.** `scripts/copies/copies.py` holds one closed owner type: `StaffOwner(row_id)` for a staff row and `RoleOwner(name)` for a fixed role with no staff row. The configured `owner.<role>` values and the `toolchain-trial` owner in `rust_release.py` are role owners. `rust_release.py` stays frozen, so `standing()` reads its text at one boundary: a staff row id is a `StaffOwner`, all other text is a `RoleOwner`. Add no refusal.
-2. **What holds the id.** `GateRecord.owner`, `owner_unit`, the remote registry record and the remote mirror marker (`mark_mirror`) hold the row id. `remove_trees`, `owned_remote_mirrors` and the tree lookup compare owner types read from those records. Readers show the current staff name, looked up from the id at read time. No reader parses an owner from a folder name.
-3. **Folder names stay readable (director call, no user words).** A row id is a UUID, and the user sees gate folders in the project list, so a folder does not hold the id. A new gate folder takes `<staff name at creation>-gate` with the present suffixes. A role owner takes `<role>-gate`. A name that another owner's folder holds takes the next free suffix. A folder name never changes after creation. `fresh_tree`'s scratch word takes the same readable name. The tree lookup reads the records in `<root>/<repo>/`; give its measured cost in the summary.
-4. **Rename.** A rename removes nothing and changes no copy. There is one removal function, `remove_trees`; `remove_gate_trees` is not built.
-5. **Callers.** Every caller whose owner is a staff row passes the row id: `tidy_wrapped.py`, `retire_unit.py`, `end_session.sh`, `caller_owner`, `source_owner`, `fast_track.py`, `bump_gate.py`, `ci_points.py`, `waiting.py`, `merge_gate.py` `nightly_owner`, `style_sync.py` `gate_owner`, `mac_test/offload.py`, `mac_test/linux_runner.py`, `production/mac_run.sh`, and the mirror and clone command options. Retire keeps `RemoteMirrorKept`, and its two-name loop goes. `tidy_wrapped` calls `remove_trees(row.name)` today and misses `-unit` copies. Add `copies.py` and each new reader to `docs/as-built/staff-accessors.md`.
-6. **Deploy.** A program outside the repository, `<phase folder>/migrate_18c.py`, has a dry run. It converts each bare name and each `-unit` form to the row id, in local records, the remote registry and each mirror marker. It moves no folder, so no build output is lost. Role names stay. A name that no row holds, or that two rows hold, stays and prints one line. A busy tree stays and prints one line, and a rerun finishes the conversion. Main code keeps no old-record reader.
-7. **Proof.** Tests with a private staff file and a private gates root: a renamed unit shows its new name with no copy change, and its copy is then reused and removed; a retire leaves the copies of a same-named unit in another production; two same-named units get different folders; a role owner keeps its copy; a remote mirror is found and removed by row id; a dry run of the deploy program reports each form, and `--apply` converts them with no lost copy. The staff accessor test passes.
-8. **Pending bump gates (review ruling).** A pending bump-gate record saves `owner_id` and `unit_id`. `bump_gate.py` reads `owner_id`, not the production name. `merge_checkpoint.py` `send_result` reads the current sessions from the staff rows at each delivery attempt and sends from the current production name. The deploy program also converts completed records that still have an unsent notice.
-9. **Records with no owner (review ruling).** A `.removing` tombstone has no owner; `remove_trees` finishes each idle tombstone in its repository scope. A gate folder with no record is free: the tree lookup can claim it for the caller, and `remove_trees` selects it for no owner.
+- `scripts/copies/copies.py` holds one closed owner type: `StaffOwner(row_id)` for a staff row and `RoleOwner(name)` for a fixed role with no staff row (the `owner.<role>` values and `rust_release.py`'s `toolchain-trial`). `standing()` reads frozen `rust_release.py` text at one boundary: a staff row id is a `StaffOwner`, all other text is a `RoleOwner`.
+- `GateRecord.owner`, `owner_unit`, the remote registry record and the mirror marker (`mark_mirror`) hold the row id. `remove_trees`, `owned_remote_mirrors` and the tree lookup compare owner types from those records. Readers show the current staff name, read from the id at read time. No reader parses an owner from a folder name.
+- A new gate folder is `<staff name at creation>-gate` or `<role>-gate`, with the next free suffix when another owner holds the name. A folder name never changes. `fresh_tree`'s scratch word uses the same name. The tree lookup reads the records in `<root>/<repo>/`.
+- A rename removes nothing and changes no copy. `remove_trees` is the one removal function. Retire keeps `RemoteMirrorKept`.
+- Every staff-row caller passes the row id: `tidy_wrapped.py`, `retire_unit.py`, `end_session.sh`, `caller_owner`, `source_owner`, `fast_track.py`, `bump_gate.py`, `ci_points.py`, `waiting.py`, `merge_gate.py` `nightly_owner`, `style_sync.py` `gate_owner`, `mac_test/offload.py`, `mac_test/linux_runner.py`, `production/mac_run.sh`, and the mirror and clone options.
+- A pending bump-gate record saves `owner_id` and `unit_id`. `bump_gate.py` reads `owner_id`. `merge_checkpoint.py` `send_result` reads the current sessions from the staff rows at each delivery attempt and sends from the current production name. It skips recipients in `delivered_to` before it reads their rows.
+- A `.removing` tombstone has no owner; `remove_trees` finishes each idle tombstone in its repository scope. A gate folder with no record is free: the tree lookup can claim it, and `remove_trees` selects it for no owner.
+- The deploy program `<phase folder>/migrate_18c.py` (outside the repository; dry run, then `--apply`) converts bare and `-unit` names to row ids in local records, the remote registry, mirror markers and every bump-gate record that lacks the ids. It moves no folder. A name no row holds or two rows hold, or a busy tree, stays and prints one line; a rerun finishes. `prove_migration.py` proves it.
 
 **Files:**
-- `scripts/copies/copies.py`
-- `scripts/copies/test_copies.py`
-- `scripts/copies/test_remote_copies.py`
-- `scripts/production/tidy_wrapped.py`
-- `scripts/production/test_tidy_wrapped.py`
-- `scripts/production/retire_unit.py`
-- `scripts/production/test_retire_unit.py`
-- `scripts/direct/end_session.sh`
-- `scripts/direct/test_end_session.py`
-- `docs/as-built/gate-checkouts.md`
-- `docs/as-built/staff-accessors.md`
-- `scripts/production/fast_track.py`
-- `scripts/production/bump_gate.py`
-- `scripts/production/ci_points.py`
-- `scripts/production/waiting.py`
-- `scripts/production/merge_gate.py`
-- `scripts/style/style_sync.py`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/linux_runner.py`
-- `scripts/production/mac_run.sh`
-- `scripts/production/merge_checkpoint.py`
-- `scripts/production/merge_checkpoint_test_support.py`
-- `scripts/production/test_merge_checkpoint_bump.py`
+- `scripts/copies/copies.py` — owner type, records, lookup, `remove_trees`
+- `scripts/production/merge_checkpoint.py`, `scripts/production/bump_gate.py` — bump-gate ids and delivery by staff row
+- `scripts/production/tidy_wrapped.py`, `retire_unit.py`, `fast_track.py`, `ci_points.py`, `waiting.py`, `merge_gate.py`, `mac_run.sh`, `scripts/style/style_sync.py`, `scripts/mac_test/offload.py`, `linux_runner.py`, `scripts/direct/end_session.sh` — callers pass the row id
+- `docs/as-built/gate-checkouts.md`, `docs/as-built/staff-accessors.md` — current rules
+- `scripts/copies/test_copies.py`, `test_remote_copies.py`, `scripts/production/test_merge_checkpoint_bump.py`, `merge_checkpoint_test_support.py`, `test_tidy_wrapped.py`, `test_retire_unit.py`, `scripts/direct/test_end_session.py` — proofs
 
-**Workers:** `1 writer` — `impl2` owns the code, the tests, the callers, the docs and the deploy program.
+**Gotchas:** main code keeps no old-record reader, so old records read as unowned until the deploy runs. Tell hierarchies when this phase is on main.
 
-**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed file and each caller module, adversary and contract reviews.
-
-**Change-Review:** none — no visible change; a renamed unit keeps its copies. Tell hierarchies when this phase is on main.
+**Ruled out:** a second removal function (`remove_gate_trees`); row ids in folder names, because the user sees folder names in the project list.
 
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
@@ -604,7 +577,9 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 **Spec:**
 1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
 2. **Holder states (architect review of 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through 18c's row id), idle, or unavailable.
-3. **Proof.** List tests for remote-only records and mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name.
+3. **Owner and holder are two columns (architect review of 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2233`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
+4. **Owner name states (architect review of 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:82`). The list must not show a row id. The owner is in one of named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
+5. **Proof.** List tests for remote-only records and mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state.
 
 **Files:**
 - `scripts/copies/copies.py` — the list.
