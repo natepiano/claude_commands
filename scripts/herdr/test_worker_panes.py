@@ -546,6 +546,32 @@ class WorkerPaneTests(StaffTestCase):
         self.reply_to_dispatch(row, dispatch)
         return dispatch
 
+    def test_close_uses_the_newest_pass_when_an_older_short_slot_is_last(self) -> None:
+        for index, (older_start, newest_start) in enumerate(((10, 20), (None, -1), ("later", -1)), start=1):
+            with self.subTest(older_start=older_start):
+                row = self.worker(f"claude-queue-test-{index}")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane)
+                self.completed_dispatch(row, "impl")
+                run = self.root / "run"
+                path = run / "progress_history_state.json"
+                state = cast(dict[str, object], json.loads(path.read_text()))
+                passes = cast(dict[str, dict[str, object]], state["pass"])
+                newest = passes[row.name]
+                newest["started_at"] = newest_start
+                older: dict[str, object] = {"instance_id": "older-dispatch", "worker_name": row.name,
+                    "team_slot": "test", "kind": "impl", "status": "completed"}
+                if older_start is not None:
+                    older["started_at"] = older_start
+                passes["test"] = older
+                write_text_atomic(path, json.dumps(state))
+                self.assertEqual(worker_panes.worker_pass(row, run), newest)
+                closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+                self.assertIsInstance(closed, worker_panes.Closed)
+                self.assertIn(row.current_session, self.world.stops)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertNotIn(pane, self.world.locations)
+
     def test_a_worker_can_close_after_its_completed_pass_crosses_a_phase_boundary(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)

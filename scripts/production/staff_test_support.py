@@ -34,6 +34,23 @@ _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
 
 
+@contextmanager
+def foreign_hostname() -> Generator[None]:
+    """Use one foreign hostname in the test and its Python children."""
+    with tempfile.TemporaryDirectory() as directory:
+        startup = Path(directory) / "sitecustomize.py"
+        _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
+        pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
+        from scripts.production import production_lifecycle, retire_unit, update_registration
+
+        with (mock.patch.object(retire_unit, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(socket, "gethostname", return_value="gate-fixture"),
+              mock.patch.dict(os.environ, {"PYTHONPATH": pythonpath})):
+            yield
+
+
 def fixture_account_home(home: Path) -> Path:
     """Keep fixture sessions outside the login user's real account folders."""
     for candidate, login in ((Path(os.path.abspath(home)), _LOGIN_HOME), (home.resolve(), _LOGIN_HOME.resolve())):

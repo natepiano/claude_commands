@@ -1134,7 +1134,7 @@ Worker stops retain their panes at the shell and keep their conversations for re
 Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
 Worker account moves resume each conversation in its existing pane on the target account.
 Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
-See `commands/shutdown.md` and `docs/accounts.md`.
+See `commands/agents.md` and `docs/accounts.md`.
 </StopResume>
 
 ---
