@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
@@ -164,6 +165,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
             (
                 "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
+                "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
                 "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3", "# whole: 1..", "STALLED_ROUNDS=3",
                 "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
@@ -193,6 +196,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     @override
     def start_phase(self, name: str) -> Path:
         session = super().start_phase(name)
+        write_text_atomic(session / "worker_transport", "mesh\n")
         state_file = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_file.read_text()))
         state["owner_staff_id"] = self.staff_parent
@@ -231,13 +235,6 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             + "(root / 'staff-at-work.json').write_text(json.dumps(rows))\n"
             + "(root / 'opening-message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())\n"
             + "print('SENT: fixture')\n")
-        agent_bg = agents / "agent_bg.sh"
-        _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
-        _ = agent_bg.write_text(
-            agent_bg.read_text(encoding="utf-8").replace(
-                'POLL_SECS="${7:-15}"', 'POLL_SECS="${7:-0.05}"'
-            ), encoding="utf-8",
-        )
         return direct_dir / "assign.sh"
 
     @override
@@ -252,7 +249,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         from scripts.message import sessions
         environment["FIXTURE_BACKEND_PID"] = str(os.getpid())
         environment["FIXTURE_BACKEND_START"] = sessions.process_start(os.getpid()) or ""
-        environment["AGENT_BG_SEND_SCRIPT"] = str(self.root / "opening-send.py")
+        environment["CLAUDE_WORKER_SEND_SCRIPT"] = str(self.root / "opening-send.py")
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
@@ -352,7 +349,7 @@ printf '%s\\n' '{answer}'
                 transcript = next((self.root / ".claude/projects").rglob(f"{session_id}.jsonl"))
                 environment.update({"STUB_TRANSCRIPT": str(transcript),
                                     "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
-                                    "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
+                                    "CLAUDE_WORKER_SEND_SCRIPT": str(self.root / "send"),
                                     "STUB_SEND_BEHAVIOR": behavior})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
@@ -452,15 +449,11 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         return transcript
 
     def claude_launch(
-        self, session_dir: Path, registry_row: str, *, inherited_effort: str = "", kind: str = "impl"
+        self, session_dir: Path, registry_row: str, *, kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
         environment = self.launch_environment(session_dir)
-        if inherited_effort:
-            environment["AGENT_BG_EFFORT"] = inherited_effort
-        else:
-            _ = environment.pop("AGENT_BG_EFFORT", None)
         return subprocess.run(
             self.assign_command(session_dir, kind=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,

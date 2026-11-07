@@ -23,6 +23,20 @@ from scripts.statusline import counts_row
 
 
 class QuestionLibraryTests(unittest.TestCase):
+    def test_invalid_timer_text_does_not_hide_a_valid_staff_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            with (isolated_staff_file(root / "staff.json", {}),
+                  mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(root)})):
+                owner = fixture_member("showrunner", name="timer-owner")
+                invalid = root / "showrunner-invalid"
+                invalid.mkdir()
+                _ = (invalid / "conf").write_bytes(b"\xff")
+                valid = root / f"showrunner-{owner.id}"
+                valid.mkdir()
+                _ = (valid / "conf").write_text(f"TARGET=session:{owner.id}\n")
+                self.assertEqual(showrunner_footer.targeted_instances(owner.current_session), [valid])
+
     def test_read_production_uses_one_staff_read_and_the_timer_folder_owner(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

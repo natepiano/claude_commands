@@ -19,6 +19,7 @@ from scripts.direct import assign, workers
 from scripts.production import session_staff, staff, worker
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import process_start
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
@@ -54,7 +55,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         def observe_review(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = original(request)
             if request.get("method") == "turn/start":
-                held.extend(astra_roles.live_roles())
+                held.extend(astra_roles.live_roles(staff.snapshot()))
                 published.extend(row for row in staff.snapshot().find(kind="worker") if row.name == "astra-reviewer")
                 if frames is not None:
                     params = cast(dict[str, object], request["params"])
@@ -68,7 +69,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
             result = self.managed_astra_review()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(astra_roles.live_roles(), [])
+            self.assertEqual(astra_roles.live_roles(staff.snapshot()), [])
         member, = published
         role, = held
         self.assertEqual((role["role"], role["staff_id"], role["thread_id"]),
@@ -88,7 +89,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
             result = self.managed_astra_review()
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertEqual(astra_roles.live_roles(), [])
+            self.assertEqual(astra_roles.live_roles(staff.snapshot()), [])
         self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
         self.assertEqual(self.turn_starts, 1)
 
@@ -118,17 +119,27 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         name = next(iter(self.assignment_records()))
         original = self.server.respond
         claims: list[dict[str, object]] = []
+        starts: list[str] = []
 
         @self.hang_guard.callback
         def read_claim(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
-                claims.extend(read_object(path) for path in self.session_dir.glob("impl_claim_*.json"))
+                for path in self.session_dir.glob("impl_claim_*.json"):
+                    claim = read_object(path)
+                    claims.append(claim)
+                    pid = claim["pid"]
+                    assert isinstance(pid, int)
+                    started = process_start.process_start(pid)
+                    assert isinstance(started, process_start.Started)
+                    starts.append(started.start)
             return original(request)
 
         self.server.respond = read_claim
         self.review_launcher("--to", name, "2")
         claim, = claims
-        self.assertEqual(set(claim), {"pid", "worker"})
+        self.assertEqual(set(claim), {"pid", "started", "worker"})
+        started, = starts
+        self.assertEqual(claim["started"], started)
         self.assertEqual(claim["worker"], name)
         self.assertIsInstance(claim["pid"], int)
 
@@ -389,9 +400,6 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
-        session = self.panes.command_case.fixture.parent.current_session
-        write_text_atomic(Path.home() / ".codex/sessions" / f"{session}.jsonl",
-                          json.dumps({"type": "turn_context", "payload": {"model": "fixture", "effort": "high"}}) + "\n")
         self.panes.command_case.agent.final = "Verdict: clear."
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 

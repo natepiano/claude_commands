@@ -1223,6 +1223,8 @@ class ChangePageTests(unittest.TestCase):
         assert owner is not None
         _ = self.review_list.write_text(self.review_list.read_text().replace(
             written[0], written[0].replace(str(owner.id), "sdlc")))
+        row = next(row for row in change_review.pending(self.review_list) if row["#"] == "C4")
+        self.assertEqual(change_page.row_production(self.page, row), self.production)
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C4"], "page-owner")

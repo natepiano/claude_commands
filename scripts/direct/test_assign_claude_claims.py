@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
+from scripts.lib import process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -28,23 +30,72 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         session = self.start_phase("live-claim")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
-        saved = json.dumps({"pid": os.getpid(), "worker": "fixture-impl"})
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
+        saved = json.dumps({"pid": os.getpid(), "started": started.start, "worker": "fixture-impl"})
         _ = claim.write_text(saved)
         before = self.open_passes(session)
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("claimed by launcher", result.stderr)
+        self.assertIn(f"fixture-impl is claimed by launcher {os.getpid()}", result.stderr)
         self.assertEqual(self.open_passes(session), before)
+        self.assertEqual(self.launch_records(session, "pass_started"), [])
         self.assertEqual(claim.read_text(), saved)
         self.assertFalse((self.root / "delivered_message.txt").exists())
 
-    def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
-        session = self.start_phase("stale-claim")
+    def test_a_reused_live_pid_recovers_before_a_claude_follow(self) -> None:
+        session = self.start_phase("reused-pid-claim")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
-        _ = claim.write_text(json.dumps({"pid": 99999999, "worker": "fixture-impl"}))
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
+        _ = claim.write_text(json.dumps({
+            "pid": os.getpid(), "started": started.start + "-previous", "worker": "fixture-impl",
+        }))
+        _ = (session / "impl_status_fixture-impl").write_text("implementing\n")
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "impl_status_fixture-impl").read_text(), "implemented\n")
         self.assertFalse(claim.exists())
         self.assertTrue((self.root / "delivered_message.txt").exists())
+        started_pass, = self.launch_records(session, "pass_started")
+        self.assertEqual(started_pass["worker_name"], "fixture-impl")
+        finished_pass, = self.launch_records(session, "pass_finished")
+        self.assertEqual(finished_pass["status"], "completed")
+
+    def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
+        session = self.start_phase("stale-claim")
+        _ = self.claude_worker(session)
+        claim = session / "impl_claim_fixture-impl.json"
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+        _ = claim.write_text(json.dumps({"pid": child.pid, "started": "ended-launcher-start", "worker": "fixture-impl"}))
+        result = self.worker_launch(session, to="fixture-impl", behavior="complete")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "impl_status_fixture-impl").read_text(), "implemented\n")
+        self.assertFalse(claim.exists())
+        self.assertTrue((self.root / "delivered_message.txt").exists())
+
+    def test_a_malformed_claim_allows_an_idle_claude_worker_to_run(self) -> None:
+        session = self.start_phase("malformed-claim")
+        _ = self.claude_worker(session)
+        _ = (session / "impl_claim_fixture-impl.json").write_text("{bad json")
+        result = self.worker_launch(session, to="fixture-impl")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        started_pass, = self.launch_records(session, "pass_started")
+        self.assertEqual(started_pass["worker_name"], "fixture-impl")
+
+    def test_an_empty_claim_preserves_completed_status_when_the_worker_is_busy(self) -> None:
+        session = self.start_phase("empty-claim-busy")
+        _ = self.claude_worker(session)
+        _ = (session / "impl_claim_fixture-impl.json").write_text("{}")
+        status = session / "impl_status_fixture-impl"
+        _ = status.write_text("implemented\n")
+        _ = (self.root / "worker_state").write_text("busy\n")
+        result = self.worker_launch(session, to="fixture-impl")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("busy or gone", result.stderr)
+        self.assertEqual(status.read_text(), "implemented\n")
+        self.assertEqual(self.launch_records(session, "pass_started"), [])
+        self.assertFalse((self.root / "delivered_message.txt").exists())

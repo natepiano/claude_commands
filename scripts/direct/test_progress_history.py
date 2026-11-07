@@ -192,6 +192,7 @@ class ProgressHistoryTests(unittest.TestCase):
             with self.subTest(field=field):
                 identity = progress_history.resolve_production_unit({
                     "working_dir": str(self.working_dir), field: plan.name,
+                    "production": "old-production", "unit": "old-unit",
                 })
                 self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
         parent = recorded_showrunner("Receiving", document)
@@ -212,6 +213,21 @@ class ProgressHistoryTests(unittest.TestCase):
         for key in ("working_dir", "worktree", "branch"):
             _ = before.pop(key, None)
         self.assertEqual(after, before)
+
+    def test_set_unit_replaces_run_names_with_the_fixed_staff_id(self) -> None:
+        run = self.start_run("named-owner", 1760658000)
+        path = run / "progress_history_state.json"
+        state = self.read_state(run)
+        state.update(production="old-production", unit="old-unit")
+        _ = path.write_text(json.dumps(state))
+        parent = fixture_member("showrunner", name="receiving")
+        row = fixture_member("unit", name="builders", parent=parent.id)
+        _ = self.run_command("set-unit", "--session-dir", str(run), "--production", parent.name,
+                             "--unit", row.name, at=1760658001)
+        current = self.read_state(run)
+        self.assertEqual(current[unit_runs.OWNER_FIELD], row.id)
+        self.assertNotIn("production", current)
+        self.assertNotIn("unit", current)
 
     def test_set_unit_selects_the_staff_name_when_another_document_uses_that_name(self) -> None:
         run = self.start_run("staff-name-owner", 1760658000)
@@ -3214,13 +3230,13 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
                 self.assertEqual(phase["state"], "HistoryNotRecorded")
 
-    def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
+    def test_phase_start_reads_names_from_the_staff_row_and_ignores_run_state_names(self) -> None:
         name = "phase-partial-source"
         session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr")
         state_path = session / "progress_history_state.json"
-        for index, (field, value, production, unit) in enumerate((
-            ("unit", "assigned", "natedev", "assigned"),
-            ("production", "assigned-production", "assigned-production", "herdr"),
+        for index, (field, value) in enumerate((
+            ("unit", "assigned"),
+            ("production", "assigned-production"),
         )):
             with self.subTest(field=field):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3232,8 +3248,8 @@ with patch.object(fcntl, "flock", admission):
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Independent source fields", at=1010 + index)
                 started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], {"state": "Recorded", "value": production})
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": unit})
+                self.assertEqual(started["production"], {"state": "Recorded", "value": "natedev"})
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": "herdr"})
                 report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
                 self.assertEqual(cast(list[dict[str, object]], report["phases"])[-1]["production"], started["production"])
 
@@ -5170,47 +5186,96 @@ with patch.object(fcntl, "flock", admission):
                             for record in records))
         self.assertTrue(all(record["pass"] == 2 for record in records if record["kind"] == "closure"))
         self.assertTrue(all(cast(float, record["finished_at"]) >= cast(int, record["started_at"]) for record in records))
-        self.assertIn("code 3 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_300))
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_300))
         _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=71_310)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "next", "--phase-title", "Next", at=71_320)
         self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_330))
 
-    def phase_review_records(self, session: Path) -> tuple[str, Path]:
-        state = self.read_state(session)
-        instance = cast(str, cast(dict[str, object], state["phase"])["instance_id"])
-        records = self.history_dir / "review_turns" / session.name
-        records.mkdir(parents=True)
-        return instance, records
-
-    def write_review_record(
-        self, records: Path, name: str, instance: str, *, lens: str,
-        status: str, raised: int, started_at: int, elapsed: int,
-    ) -> None:
-        _ = (records / f"{name}.json").write_text(json.dumps({
-            "phase_instance_id": instance, "lens": lens, "kind": "broad", "status": status,
-            "raised": raised, "started_at": started_at, "finished_at": started_at + elapsed,
-        }), encoding="utf-8")
-
-    def trial_line(self, *, code_findings: int = 0, review_minutes: int = 0) -> str:
-        return (f"review trial: ux 0 findings, code {code_findings} findings, "
-                f"review-worker minutes {review_minutes}, ux check minutes 0, ux repair minutes 0")
-
-    def test_review_trial_reads_one_snapshot_for_code_counts(self) -> None:
+    def test_review_trial_ignores_numbered_answers_in_a_passing_closure(self) -> None:
         self.write_full_config()
-        session = self.start_run("review-snapshot", 71_500)
+        session = self.start_run("closure-answers", 71_500)
         self.start_phase(session, 71_510)
-        instance, records = self.phase_review_records(session)
-        for name, lens, status, raised in (
-            ("code", "contract", "reviewed", 4),
-            ("ux", "ux", "reviewed", 7),
-        ):
-            self.write_review_record(records, name, instance, lens=lens, status=status,
-                                     raised=raised, started_at=71_520, elapsed=60)
-        with patch.object(progress_history, "_phase_review_records",
-                          wraps=progress_history._phase_review_records) as reads:  # pyright: ignore[reportPrivateUsage]
-            trial = self.run_command("review-trial", "--session-dir", str(session), at=71_600)
-        self.assertEqual(trial, self.trial_line(code_findings=4))
-        reads.assert_called_once_with(session, instance)
+        _ = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "one ledger finding",
+            "--caught-by", "worker", "--lens", "contract", at=71_520,
+        )
+        state = self.read_state(session)
+        phase = cast(dict[str, object], state["phase"])
+        metadata = {"phase": phase["id"], "phase_instance_id": phase["instance_id"]}
+        reply = self.root / "closure.txt"
+        _ = reply.write_text("1. The repair is correct.\n2. The tests pass.\n3. No findings remain.\n")
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            progress_history.write_review_turn(
+                session, metadata, reviewer="contract", thread_id="thread", lens="contract",
+                pass_number=2, started_at=71_530, status="reviewed", raised=3,
+                details={"output": str(reply)},
+            )
+        self.assertIn("code 1 findings", self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_600,
+        ))
+
+    def test_review_trial_counts_ledger_entries_without_opening_events(self) -> None:
+        self.write_full_config()
+        session = self.start_run("missing-opening-events", 71_500)
+        self.start_phase(session, 71_510)
+        for lens in ("ux", "contract", "ux,craft"):
+            _ = self.run_findings(
+                session, "open", "--severity", "minor", "--title", f"finding from {lens}",
+                "--caught-by", "worker", "--lens", lens, at=71_520,
+            )
+        history = Path(cast(str, self.read_state(session)["history_file"]))
+        events = self.read_events("missing-opening-events")
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in events
+                                      if event.get("event_type") != "finding_opened"))
+        expected = "review trial: ux 2 findings, code 2 findings"
+        self.assertIn(expected, self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_530,
+        ))
+        _ = self.run_command("finish-phase", "--session-dir", str(session),
+                             "--status", "completed", at=71_540)
+        _ = self.run_command("start-phase", "--session-dir", str(session),
+                             "--phase-id", "4", "--phase-title", "Next phase", at=71_550)
+        _ = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "a different ledger",
+            "--caught-by", "worker", "--lens", "contract", at=71_560,
+        )
+        self.assertIn(expected, self.run_command(
+            "review-trial", "--session-dir", str(session), "--phase-id", "3", at=71_570,
+        ))
+        self.assertIn("ux 0 findings, code 1 findings", self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_580,
+        ))
+
+    def test_review_trial_keeps_a_routed_and_closed_finding(self) -> None:
+        self.write_full_config()
+        session = self.start_run("routed-trial", 71_500)
+        self.start_phase(session, 71_510)
+        finding = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "follow-up work",
+            "--caught-by", "worker", "--lens", "contract", at=71_520,
+        )
+        _ = self.run_findings(
+            session, "route", "--id", finding, "--reason", "spec-gap",
+            "--owner", "follow-up", "--work-order", "Repair the missing case",
+            "--due", "next phase", at=71_530,
+        )
+        self.assertIn("code 1 findings", self.run_command(
+            "review-trial", "--session-dir", str(session), at=71_540,
+        ))
+        state = self.read_state(session)
+        instance = cast(dict[str, object], state["phase"])["instance_id"]
+        run_id = Path(cast(str, state["history_file"])).stem
+        _ = self.run_command("finish-phase", "--session-dir", str(session),
+                             "--status", "completed", at=71_550)
+        _ = self.run_command("start-phase", "--session-dir", str(session),
+                             "--phase-id", "4", "--phase-title", "Receive routed work", at=71_560)
+        _ = self.run_findings(
+            session, "close-route", "--from", f"{run_id}:{instance}:{finding}",
+            "--evidence", "The receiving phase repaired the missing case", at=71_570,
+        )
+        self.assertIn("code 1 findings", self.run_command(
+            "review-trial", "--session-dir", str(session), "--phase-id", "3", at=71_580,
+        ))
 
     def test_review_trial_counts_each_code_finding_once(self) -> None:
         self.write_full_config()
@@ -5274,8 +5339,15 @@ with patch.object(fcntl, "flock", admission):
             )
             assert_trial_counts(ux_findings, code_findings, started_at + offset + 1)
 
-    def test_review_trial_counts_the_findings_the_reviewers_raised(self) -> None:
-        """A pool reviewer's findings count though the director opened none of them."""
+        history = Path(cast(str, self.read_state(session_dir)["history_file"]))
+        opened = next(event for event in self.read_events("code-findings")
+                      if event.get("event_type") == "finding_opened")
+        with history.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(opened) + "\n")
+        assert_trial_counts(2, 6, started_at + 60)
+
+    def test_review_trial_uses_the_ledger_despite_review_totals(self) -> None:
+        """Review totals do not replace the findings in the ledger."""
         self.write_full_config()
         started_at = 71_500
         session_dir = self.start_run("raised-findings", started_at)
@@ -5291,7 +5363,7 @@ with patch.object(fcntl, "flock", admission):
         def trial() -> str:
             return self.run_command("review-trial", "--session-dir", str(session_dir), at=started_at + 40)
 
-        # No turn record: the director's opened finding is the count.
+        # The ledger count stays the same when review records arrive.
         self.assertIn("code 1 findings", trial())
         records = self.history_dir / "review_turns" / session_dir.name
         records.mkdir(parents=True)
@@ -5309,11 +5381,11 @@ with patch.object(fcntl, "flock", admission):
         _ = (records / "torn.json").write_text("{", encoding="utf-8")
         self.assertEqual(
             trial(),
-            "review trial: ux 0 findings, code 6 findings, review-worker minutes 0, "
+            "review trial: ux 0 findings, code 1 findings, review-worker minutes 0, "
             + "ux check minutes 0, ux repair minutes 0",
         )
 
-    def test_a_recorded_zero_review_does_not_fall_back_to_director_findings(self) -> None:
+    def test_a_recorded_zero_review_does_not_erase_ledger_findings(self) -> None:
         self.write_full_config()
         started_at = 71_600
         session = self.start_run("zero-review-evidence", started_at)
@@ -5328,9 +5400,9 @@ with patch.object(fcntl, "flock", admission):
         _ = (records / "71620-123-0.json").write_text(json.dumps({
             "phase_instance_id": instance, "arm": "own", "kind": "broad", "status": "reviewed", "raised": 0,
         }))
-        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
+        self.assertIn("code 1 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
 
-    def test_pool_and_own_review_records_with_one_launcher_sequence_all_count(self) -> None:
+    def test_pool_and_own_review_records_add_no_findings_without_a_ledger(self) -> None:
         self.write_full_config()
         started_at = 71_700
         session = self.start_run("mixed-review-evidence", started_at)
@@ -5343,7 +5415,7 @@ with patch.object(fcntl, "flock", admission):
             _ = (records / f"71720-123-{sequence}.json").write_text(json.dumps({
                 "phase_instance_id": instance, "arm": arm, "kind": "broad", "status": "reviewed", "raised": raised,
             }))
-        self.assertIn("code 5 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
 
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
@@ -5380,6 +5452,10 @@ with patch.object(fcntl, "flock", admission):
         # Round 2 repairs a ux finding on two workers: 900 + 300 s is 20 minutes.
         repair("F002", "ux", 2, (("impl", 900), ("test", 300)), base + 3_000)
 
+        # Ledger rounds preserve the repair join when dispatch events are missing.
+        history = Path(cast(str, self.read_state(session_dir)["history_file"]))
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in self.read_events("uxcost")
+                                      if event.get("event_type") != "finding_batch_dispatched"))
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
@@ -7508,6 +7584,31 @@ with patch.object(fcntl, "flock", admission):
         if isinstance(owners, phase_reservation.Attribution):
             self.assertEqual([phase.phase for phase in owners.by_phase], ["57c"])
             self.assertEqual(owners.refused, [])
+
+    def test_explicit_phase_checkout_stays_selected_after_the_staff_folder_moves(self) -> None:
+        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
+        self.start_numbered_phase(run, "4a", 40_010)
+        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
+        checkout = self.root / "phase-repository"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], capture_output=True, check=True)
+        _ = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
+                           capture_output=True, check=True)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main([
+                "claim", "--session-dir", str(run), "--phase", "4a", "--repo", str(checkout),
+            ]), 0)
+        directory = phase_reservation.phase_directory(run, "4a")
+        state = run / unit_runs.STATE_FILE
+        before = state.read_bytes()
+        moved = self.root / "moved-home"
+        _ = self.working_dir.rename(moved)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", moved), expected=row.worktree)
+        with chdir(self.root):
+            self.assertEqual(phase_reservation.phase_worktree(directory).root, checkout)
+            self.assertEqual(phase_reservation.home_worktree(directory), moved)
+        self.assertEqual(state.read_bytes(), before)
 
     def test_reopening_a_phase_with_a_held_reservation_preserves_its_records(self) -> None:
         for kind in (phase_reservation.ACTIVE, phase_reservation.PENDING):

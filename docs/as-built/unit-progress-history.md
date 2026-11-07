@@ -238,7 +238,8 @@ when a phase stops, so the shipped values set where a phase starts being reporte
 as slow, not where it is cut off.
 
 A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
-A dispatch alone adds no round. Passes without a ledger round retain overlap grouping.
+A dispatch alone adds no round. Passes without a ledger batch add no round to `repair_round`.
+`history.py rounds` still reports their overlap groups, including gate, merge and live work.
 `dispatch` records the batch before the worker launch. Its `round` is a stable audit number.
 `repair_round` uses the fix pass history and its `launch_check.fix_cause.round` ledger number. Missing pass history gives no repair rounds.
 `abandon --reason "<launch refusal>"` refunds a refused launch's reserved fix attempt.

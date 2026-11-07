@@ -69,6 +69,10 @@ if args[0] == "status":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "new":
     instance.touch()
+    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / args[1]
+    timer.mkdir(parents=True, exist_ok=True)
+    target = args[args.index("--to") + 1] if "--to" in args else ""
+    (timer / "conf").write_text(f"TARGET={target}\\n", encoding="utf-8")
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
@@ -233,6 +237,7 @@ class RegistrationFixture(unittest.TestCase):
         return path
 
     def build_command_copy(self, tree: Path) -> None:
+        _ = self.question_instance()
         _ = shutil.copytree(SCRIPT.parent.parent, tree / "scripts",
                             ignore=shutil.ignore_patterns("__pycache__"))
         hooks = tree / "scripts/hooks"
@@ -270,9 +275,9 @@ class RegistrationFixture(unittest.TestCase):
         return output.getvalue()
 
     def question_instance(self) -> Path:
-        instance = self.state / "notifier/showrunner-example"
+        instance = self.state / "notifier" / f"showrunner-{self.owner_id}"
         instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text("TARGET=session:current-session-id\n")
+        _ = (instance / "conf").write_text(f"TARGET=session:{self.owner_id}\n")
         return instance
 
     def timer(self, name: str) -> None:

@@ -140,14 +140,21 @@ Run files keep staff references instead of copied native identities.
 
 - **Removed 2026-10-19.** `unit_notifier.sh`, `/unit:report on|off` and the `prepare_session.sh` instance step below no longer exist: unit reports come only when asked (`docs/as-built/session-notifier.md`, "Unit reports").
 
-- `assign_claude.py` passes `AGENT_BG_EFFORT="${AGENT_EFFORT:-}"` and `AGENT_BG_ROLE="${PASS_KIND}"` to `agent_bg.sh`.
+- `assign_claude.py` passes the effort and dispatch role directly to `scripts/direct/claude_worker.py`.
   A nonempty effort adds `--effort <level>` beside `--model`.
   An empty registry effort prevents the caller's environment from supplying another effort.
-  `--attach` preserves the worker's effort.
-  The wrapper records the dispatch role before delivery.
+  A continued worker keeps its effort.
+  The module records the dispatch role before delivery.
 - The [Claude coordinator](long-lived-workers.md#claude-coordinator-and-friends) proves the running session before publication and delivery.
 
-- When a worker leaves its summary file empty, `agent_bg.sh` fills it from the pane log in its embedded Python: decode UTF-8 with replacement; strip OSC (`ESC ]` to BEL, `ESC \`, or end of text), CSI (`ESC [ [0-?]* [ -/]* [@-~]`) and two- or three-character escapes (`ESC [ -/]* [0-~]`); strip control characters `\x00-\x08`, `\x0b-\x1f`, `\x7f-\x9f` (newline and tab stay); keep the last 4000 characters. With nothing readable left the summary is `The background agent <name> produced no summary.` `LOG_FILE` is never rewritten and a worker-written summary is never touched.
+- When a worker leaves its summary file empty, `scripts/direct/claude_worker.py` writes a summary from the pane log in the assign process.
+  It decodes UTF-8 with replacement.
+  It removes OSC sequences (`ESC ]` to BEL, `ESC \`, or the end of text).
+  It removes CSI sequences (`ESC [ [0-?]* [ -/]* [@-~]`) and other escape sequences (`ESC [ -/]* [0-~]`).
+  It removes control characters `\x00-\x08`, `\x0b-\x1f`, and `\x7f-\x9f`.
+  It retains newlines, tabs, and the last 4000 characters.
+  With no readable text, the summary is `The background agent <name> produced no summary.`
+  It preserves the log and any summary that the worker writes.
 - `scripts/direct/unit_notifier.sh <claude_session_id> [on|off]` reads the marker `<session id>` from `UNIT_ACTIVE_DIR`, else from `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (it names the session directory; its basename is the run id). No mode creates the `unit-<run id>` instance (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains) (`--every` from `UNIT_PROGRESS_INTERVAL_SECONDS` rounded up to minutes, `--hold`, check `direct_run.py check`); `off` runs `notifier.sh stop unit-<run id>` and prints `progress updates off: unit-<run id>`; `on` runs `notifier.sh start` and prints `progress updates on: unit-<run id> <next_due line>` (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains). A missing or empty marker exits 1 and changes nothing; a `notifier.sh` failure passes its message and status through; a bad mode word or more than two arguments prints the usage and exits 2.
 - `/unit:report [tables|on|off]` (`commands/unit/report.md`): `on` or `off` runs `zsh ~/.claude/scripts/direct/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`, relays its line and composes no report; a failure is relayed as printed. A Codex unit has no notifier, so the command says the switch is unavailable there.
 

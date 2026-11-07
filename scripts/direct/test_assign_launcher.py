@@ -7,10 +7,9 @@ import shutil
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO, TypedDict, cast, final, override
+from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
@@ -175,7 +174,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CLAUDE_BIN": str(binary),
             "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
-            "UNIT_WORKER_WAIT_ATTEMPTS": "1", "UNIT_WORKER_POLL_SECS": "0",
+            "UNIT_WORKER_POLL_SECS": "0",
         })))
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         return calls
@@ -321,6 +320,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.fixture = worker_fixture.WorkerCommandTests("runTest")
+        self.router = worker_fixture.PaneCommandRouter()
         self.ready = Path()
         self.phase = Path()
 
@@ -335,19 +335,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         opened = self.fixture.opened("impl", "impl")
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="impl", phase="8", role="impl",
             worker_name="impl", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
-        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-
-        def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            if len(command) > 1 and Path(command[1]).resolve() == ROOT / "scripts/production/worker.py":
-                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:],
-                                    cast(dict[str, str], options["env"]), ROOT)
-                output = cast(TextIO, options["stdout"])
-                _ = output.write(result.stdout + result.stderr)
-                return result
-            return run_process(command, **options)
-
-        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
-        _ = self.enterContext(patch.object(assign, "require_live_director"))
+        self.router.setup(self, self.fixture.fixture.root)
 
     def launch_review(self) -> subprocess.CompletedProcess[str]:
         arguments = ["--role", "review", "--to", "review", "--cwd", str(self.fixture.fixture.root),

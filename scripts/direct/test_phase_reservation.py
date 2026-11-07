@@ -376,6 +376,103 @@ class WorktreeAttributionTests(unittest.TestCase):
 
 
 @final
+class AcquisitionRecordingTests(unittest.TestCase):
+    repo: Path = Path()
+    session: Path = Path()
+    phases: list[phase_reservation.OpenPhase] = []
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        self.session = root / "session"
+        self.phases = []
+        for name in ("15", "16"):
+            directory = phase_reservation.phase_directory(self.session, name)
+            directory.mkdir(parents=True)
+            _ = phase_reservation.enroll(directory, name, "board_ready")
+            self.phases.append(phase_reservation.OpenPhase(
+                name, directory, phase_reservation.KnownPhaseWorktree(self.repo)))
+        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger.mkdir()
+        _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
+            "director": {"reservation_id": "r1", "coordination_run_id": "c1"},
+        }}))
+
+    def test_concurrent_phases_record_the_directors_reservation_only_once(self) -> None:
+        acquisition = phase_reservation.Acquisition("r1", "c1", "a" * 40)
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", acquisition,
+                                                phase_reservation.LEFT_UNMAPPED)
+        first_inside = Event()
+        release_first = Event()
+        second_observed = Event()
+        second_wrote = Event()
+        guard = LauncherHangGuard("concurrent reservation recording")
+        record = phase_reservation.record_active
+        acquire = worker_lifecycle.acquire_flock
+
+        def record_paused(directory: Path, owned: phase_reservation.Acquisition) -> bool:
+            if directory == self.phases[0].directory:
+                first_inside.set()
+                guard.event(release_first)
+            else:
+                second_wrote.set()
+                second_observed.set()
+            return record(directory, owned)
+
+        def contend(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            if first_inside.is_set():
+                try:
+                    acquire(handle, mode=mode | fcntl.LOCK_NB, deadline=deadline)
+                    return
+                except BlockingIOError:
+                    second_observed.set()
+            acquire(handle, mode=mode, deadline=deadline)
+
+        with guard.protect(), mock.patch.object(phase_reservation, "record_active", record_paused), \
+                mock.patch.object(worker_lifecycle, "acquire_flock", contend), \
+                ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(phase_reservation.record_own_acquisition, answer, self.repo,
+                                   self.phases, "director", self.phases[0])
+            try:
+                guard.event(first_inside)
+                second = workers.submit(phase_reservation.record_own_acquisition, answer, self.repo,
+                                        self.phases, "director", self.phases[1])
+                guard.event(second_observed)
+                self.assertFalse(second_wrote.is_set())
+                self.assertEqual(phase_reservation.read_state(self.phases[1].directory), {
+                    "kind": phase_reservation.AWAITING_FIRST_TOUCH, "phase": "16"})
+            finally:
+                release_first.set()
+            self.assertEqual(guard.result(first), acquisition)
+            self.assertIsNone(guard.result(second))
+        self.assertEqual(phase_reservation.read_state(self.phases[0].directory), {
+            "kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+                "reservation_id": "r1", "coordination_run_id": "c1", "phase": "15",
+                "phase_start_head": "a" * 40}})
+        self.assertFalse(second_wrote.is_set())
+        self.assertEqual(phase_reservation.read_state(self.phases[1].directory), {
+            "kind": phase_reservation.AWAITING_FIRST_TOUCH, "phase": "16"})
+
+    def test_a_mapped_acquisition_records_without_a_lock(self) -> None:
+        acquisition = phase_reservation.Acquisition("r2", "c1", "a" * 40)
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", acquisition)
+        with mock.patch.object(worker_lifecycle, "acquire_flock") as acquire:
+            result = phase_reservation.record_own_acquisition(
+                answer, self.repo, self.phases, "director", self.phases[0])
+        acquire.assert_not_called()
+        self.assertEqual(result, acquisition)
+        self.assertEqual(phase_reservation.read_state(self.phases[0].directory), {
+            "kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+                "reservation_id": "r2", "coordination_run_id": "c1", "phase": "15",
+                "phase_start_head": "a" * 40}})
+
+
+@final
 class PhaseStateTests(unittest.TestCase):
     session: Path = Path()
 

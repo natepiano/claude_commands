@@ -369,8 +369,7 @@ The shim resolves relative paths and parent segments without another process or 
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
 | `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `UNIT_WORKER_POLL_SECS` | `scripts/direct/assign_claude.py` (worker and turn probes) | `1` (s) | `0.01` |
-| `UNIT_WORKER_WAIT_ATTEMPTS` | `scripts/direct/assign_claude.py` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `CLAUDE_WORKER_POLL_SECS=15` (s), from `config/direct.conf` | `0.01` |
 | `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
@@ -383,7 +382,15 @@ The shim resolves relative paths and parent segments without another process or 
 
 `UNIT_ACTIVE_DIR` and its former name `PLAN_DELEGATE_ACTIVE_DIR` are on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when one of them, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
 
-Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN_DIR` was `PLAN_DELEGATE_BOARD_DIR`. A run that started before the rename still exports the former names, so each reader also reads them while such a run can be open. The bash scripts (`review.sh`, `verify.sh`, `board.sh`, `end_session.sh`, `agent_bg.sh`, `memory_gate.sh`) source `scripts/lib/unit_env.sh`, which exports each unset `UNIT_*` name from its former name. Python readers use `unit_runs.environ(<name>)` or read the former name after the new one; `unit_status.sh` does the same inline. The status line now reads assignments from staff rows rather than either set of environment names (`showrunner-automation.md`).
+Before the rename, each listed `UNIT_*` name had the prefix `PLAN_DELEGATE_*`.
+`UNIT_RUN_DIR` had the name `PLAN_DELEGATE_BOARD_DIR`.
+Runs that started before the rename still export the former names.
+Readers retain those names while such runs can remain open.
+The Bash scripts `review.sh`, `verify.sh`, `board.sh`, `end_session.sh`, and `memory_gate.sh` source `scripts/lib/unit_env.sh`.
+That file exports each unset `UNIT_*` name from its former name.
+Python readers use `unit_runs.environ(<name>)` or read the former name after the new name.
+`unit_status.sh` reads the former name inline.
+The status line reads assignments from staff rows instead of these environment names (`showrunner-automation.md`).
 
 ## Invariants
 

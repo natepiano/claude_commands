@@ -2,18 +2,18 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
@@ -24,80 +24,37 @@ else:
     from scripts.message import sessions
 
 
-class RunOwnerMigrationTests(StaffTestCase):
-    @override
-    def setUp(self) -> None:
-        lock = fcntl.flock
-
-        def fail_on_lock_wait(descriptor: int | IO[str], operation: int) -> None:
-            try:
-                lock(descriptor, operation | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise AssertionError(f"run-owner migration test would block on a file lock: {descriptor}") from error
-
-        _ = self.enterContext(patch.object(fcntl, "flock", side_effect=fail_on_lock_wait))
-        super().setUp()
-
-    def test_interrupted_owner_migration_repeats_after_clear_without_changing_history_or_finished_runs(self) -> None:
-        owner = fixture_member("showrunner", name="production")
-        row = fixture_member("unit", name="tools", parent=owner.id)
-        runs = self.root / "runs"
-        history = self.root / "history.jsonl"
-        _ = history.write_text('{"production":"former","unit":"tools"}\n')
-        for name, status in (("a", "active"), ("b", "active"), ("old", "completed")):
-            run = runs / name
-            run.mkdir(parents=True)
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
-                "status": status, "production": "production", "unit": "tools",
-                "main_agent": {"session_id": row.current_session}, "history_file": str(history)}))
-        finished = runs / "old" / unit_runs.STATE_FILE
-        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)]
-        publish = atomic_file.write_text_atomic
-        changed_session = fixture_runtime_id("run-owner-clear")
-        interrupted_once = False
-
-        def interrupted(path: Path, text: str) -> None:
-            nonlocal interrupted_once
-            publish(path, text)
-            if path != runs / "a" / unit_runs.STATE_FILE or interrupted_once:
-                return
-            interrupted_once = True
-            _ = staff.update_current_session(row.id, staff.StaffId(changed_session))
-            raise RuntimeError("migration interrupted")
-
-        with (patch.object(atomic_file, "write_text_atomic", side_effect=interrupted),
-              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
-            with self.assertRaisesRegex(RuntimeError, "migration interrupted"):
-                _ = unit_runs.migrate_owners(runs)
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(unit_runs.migrate_owners(runs), 0)
-        paths = [runs / name / unit_runs.STATE_FILE for name in ("a", "b")]
-        for path in paths:
-            fields = cast(dict[str, object], json.loads(path.read_text()))
-            self.assertEqual(fields["owner_staff_id"], row.id)
-            self.assertNotIn("production", fields)
-            self.assertNotIn("unit", fields)
-        published = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(unit_runs.migrate_owners(runs), 0)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], published)
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)], before)
-
-    def test_unproved_owner_keeps_the_active_run_and_reports_unavailable(self) -> None:
-        _ = fixture_member("showrunner", name="production")
-        run = self.root / "runs/unknown"
-        run.mkdir(parents=True)
-        path = run / unit_runs.STATE_FILE
-        _ = path.write_text('{"status":"active","main_agent":{"session_id":"gone"}}')
-        before = path.read_bytes(), path.stat().st_mtime_ns
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(unit_runs.migrate_owners(run.parent), 1)
-        self.assertIn("run owner is unavailable", errors.getvalue())
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-
-
 class UnitRunsTest(StaffTestCase):
+    def test_anomaly_prints_once_across_both_import_names(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repository / "scripts/lib"), str(repository)))}
+        for names in (("unit_runs", "scripts.lib.unit_runs"), ("scripts.lib.unit_runs", "unit_runs")):
+            with self.subTest(names=names):
+                command = f"import importlib; [importlib.import_module(name).report_anomaly('anomaly: import test') for name in {names!r}]"
+                result = subprocess.run([sys.executable, "-c", command], cwd=self.root, env=environment,
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["anomaly: import test"])
+
+    def test_director_prints_each_anomaly_once_but_keeps_changed_causes(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        _ = fixture_member("showrunner", name="anomaly-fixture")
+        first, second = self.root / "first", self.root / "second"
+        for run in (first, second):
+            run.mkdir()
+            write_text_atomic(run / unit_runs.STATE_FILE, "{}")
+        record = staff.snapshot()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            for run in (first, second, first, second):
+                self.assertEqual(unit_runs.director(run, record=record), "")
+            write_text_atomic(first / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: "gone"}))
+            self.assertEqual(unit_runs.director(first, record=record), "")
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
+            f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
+            f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
+
     def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
         runs, config = self.root / "runs", self.root / "config"
         config.mkdir()
@@ -175,6 +132,8 @@ class UnitRunsTest(StaffTestCase):
             config = root / "config"
             config.mkdir()
             run = root / "first"
+            run.mkdir()
+            write_text_atomic(run / "worker_transport", "mesh\n")
             with patch.dict(os.environ, {"CONF_DIR": str(config)}):
                 write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
                 self.assertEqual(unit_runs.worker_transport(run), "mesh")
@@ -185,7 +144,27 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(pin.read_text(), "mesh\n")
                 self.assertEqual(pin.stat().st_mtime_ns, unchanged)
                 self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
-                self.assertEqual((root / "second/worker_transport").read_text(), "herdr\n")
+                second_pin = root / "second/worker_transport"
+                self.assertEqual(second_pin.read_text(), "herdr\n")
+                second_before = second_pin.read_bytes(), second_pin.stat().st_mtime_ns
+                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
+                self.assertEqual((second_pin.read_bytes(), second_pin.stat().st_mtime_ns), second_before)
+
+    def test_new_mesh_run_exits_two_with_one_error_line_and_no_pin(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        run = self.root / "new-mesh"
+        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            with self.assertRaises(SystemExit) as failure:
+                _ = unit_runs.main(["worker-transport", str(run)])
+        self.assertEqual(failure.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("mesh", errors.getvalue())
+        self.assertFalse((run / "worker_transport").exists())
 
     def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -208,7 +187,7 @@ class UnitRunsTest(StaffTestCase):
     def staff_owner(self, run: Path, session_id: str) -> None:
         parent = showrunner_relationship("runs-fixture")
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
-        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name}))
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name, "owner_staff_id": owner.id}))
 
     def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
         production = fixture_member("showrunner", name="roster-production")

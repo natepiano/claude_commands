@@ -917,7 +917,7 @@ print(observed.row.id)
         parent = staff.snapshot().parent_of(row)
         assert parent is not None
         _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
-            "history_file": str(history), "production": parent.name, "unit": row.name}))
+            "history_file": str(history), "owner_staff_id": row.id}))
         first["main_agent"] = {"session_id": director}
         later = history.read_text().splitlines()[1:]
         _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")

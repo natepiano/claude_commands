@@ -75,6 +75,21 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(self.router().owner({"#": "C1", "Merged": "abcdef12"}, self.root / "change-review - top.md"),
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
 
+    def test_a_production_cell_uses_the_unit_id_after_rename_and_transfer(self) -> None:
+        row = {"#": "C1", "Production": self.unit.id}
+        _ = staff.rename(self.unit.id, "renamed")
+        _ = staff.move(self.unit.id, staff.ReportsTo(self.top.id))
+        _ = fixture_member("unit", name="builder", parent=self.child.id,
+                           runtime_id=fixture_runtime_id("replacement-builder"))
+        self.assertEqual(self.router().owner(row, self.root / "change-review - child.md"),
+                         change_routing.StaffRoutedChange(self.unit.id, self.top.id, "top"))
+
+    def test_a_stored_production_name_goes_to_the_list_owner(self) -> None:
+        row = {"#": "C1", "Production": self.child.name}
+        owner = self.router().owner(row, self.root / "change-review - top.md")
+        self.assertEqual(owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+        cast(mock.Mock, self.alert).assert_not_called()
+
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
         _ = self.enterContext(production_staff_record())
         _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))

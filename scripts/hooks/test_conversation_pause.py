@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.production import session_pane
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
@@ -71,6 +73,34 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
+        instance = self.create_instance("unit-native")
+        other = self.create_instance("showrunner-other", session_id="another-owner")
+        _ = (self.root / "staff.json").write_text("invalid staff JSON\n")
+        result = self.run_prompt("hello")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"conversation-pause: timer lookup: cannot read staff record {self.root / 'staff.json'}: invalid staff JSON:",
+            result.stderr,
+        )
+        reply = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(reply["systemMessage"],
+                         f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_staff_timer_is_found_after_the_showrunner_session_changes(self) -> None:
+        owner = fixture_member("showrunner", name="timer-owner")
+        timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+        current = staff.native_id(fixture_runtime_id("timer-owner-cleared"))
+        _ = staff.update_current_session(owner.current_session, current)
+        unit = self.create_instance("unit-native", session_id=current)
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(conversation_pause.session_reports(current), [
+                conversation_pause.Report(timer.name, True),
+                conversation_pause.Report(unit.name, True),
+            ])
+
     def test_session_lookup_hang_escapes_product_timeout_recovery(self) -> None:
         blocked = self.root / "blocked_lookup.py"
         _ = blocked.write_text("import signal\nsignal.pause()\n")

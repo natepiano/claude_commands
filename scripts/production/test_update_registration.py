@@ -32,6 +32,25 @@ from scripts.hooks import showrunner_footer
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_unreadable_timer_reports_and_continues_prompt_adoption(self) -> None:
+        timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
+        prompt = self.state / "showrunner" / self.owner_id / "prompt.txt"
+        prompt.parent.mkdir(parents=True)
+        _ = prompt.write_text("old prompt\n")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            lookup = showrunners.timer_scratch(self.owner_id, record=staff.snapshot())
+        self.assertIsInstance(lookup, showrunners.TimerConfigurationUnreadable)
+
+        result = self.run_command("log", "adopt the prompt")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("timer configuration unreadable", result.stderr)
+        self.assertIn("decode", result.stderr)
+        self.assertIn(f"rewrote {prompt} from produce.md", result.stdout)
+        self.assertIn(str(self.state / "showrunner" / self.owner_id / "session"), prompt.read_text())
+
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
         first = self.run_command("register")
