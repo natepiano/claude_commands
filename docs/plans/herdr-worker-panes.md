@@ -2976,6 +2976,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 22: `worker._dispatch_turn` completes a DONE dispatch whose only pending runs are finished, with one `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` line per run. Keep it and its two `test_worker.py` tests when `mesh_runs.py` becomes `detached_runs.py`.
 - Phase 23: `Herdr.wait_for_prompt_input` sends `ctrl+s` once when a ready Claude composer holds a draft (`PromptInputHoldsDraft`). Keep it in the one submit path.
 - Phase 24: a worker's herdr agent is `<unit>-<worker>` (`worker_panes._start_locked`, `agent_name=`); `_agent_name` hashes a name above 32 characters. Keep the staff lookup on the session id and the worker name.
+- Phase 25: a herdr launch with a phase runs `assign_claude.claim_phase` before `worker.py assign` (not for `review`). Keep the one claim call when the launch path changes.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3141,37 +3142,21 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 
 **Ruled out:** a change to names of 32 characters or fewer other than the worker form; a refusal of a taken name (sdlc: "add no refusal").
 
-### Phase 25 — A herdr launch claims its phase files before the worker opens  · status: todo
+### Phase 25 — A herdr launch claims its phase files before the worker opens  · status: done
 
-**Depends on:** none (other files than Phases 23 and 24). Phase 19 waits for this phase.
+#### As-built
 
-sdlc ordered it (2026-11-07), a defect from the cargo-liner handler unit, phase 34: the herdr launch path wrote no `phases/<id>/phase_baseline`, so the checkpoint backstop `record-active` refused. The handler unit wrote the baseline by hand with `phase_reservation.py claim`. The old Codex launcher (`implement.sh`, from 1fb33e8fb) and the Claude launcher (`assign_claude._run`, `scripts/direct/assign_claude.py:207`) run `phase_reservation.py claim --session-dir <run> --phase <id> --repo <cwd>` before the worker opens. The claim writes `phase_baseline`, `phase_baseline_status` and the reservation state. `assign.execute_herdr` (`scripts/direct/assign.py:693`) does not run it.
-
-#### Work Order
-
-**Goal:** a herdr launch with a phase runs the same claim as the Claude launch, before `worker.py assign`, so the phase baseline exists for the checkpoint.
-
-**Spec:**
-
-1. Move the claim block of `assign_claude._run` into one function, and call it from `assign_claude._run` and `assign.execute_herdr`. Keep its command, its log, its error line `ERROR: phase <id> could not claim its files before its worker opens; see <log>.`, its `error` status, its board line and exit 1. There is one copy of the claim call.
-2. `execute_herdr` calls it for every role except `review`, as the Claude path does, after the prompt files are written and before `worker.py assign` runs. A refused claim opens no worker.
-3. Do not change `phase_reservation.py`. Add no check, refusal, validation, retry or new wait.
+- `assign_claude.claim_phase(run, phase, cwd, log, status, slot, env)` is the one place for the phase file claim. It runs `phase_reservation.py claim --session-dir <run> --phase <id> --repo <cwd>` and writes its output to the launch log. The claim writes `phase_baseline`, `phase_baseline_status` and the reservation state.
+- A refused claim prints `ERROR: phase <id> could not claim its files before its worker opens; see <log>.`, writes `error` to the status file, posts a `blocked` board line and returns `False`. The launcher then exits 1, and no worker opens.
+- `assign_claude._run` and `assign.execute_herdr` both call it. `execute_herdr` calls it for every role except `review`, after it writes the prompt files and before `worker.py assign` runs. A launch with no phase makes no claim.
+- So the checkpoint backstop `record-active` finds the phase baseline for a herdr phase.
 
 **Files:**
-- `scripts/direct/assign_claude.py`, `scripts/direct/assign.py` — Spec items 1 and 2.
-- `scripts/direct/test_assign_launcher.py` — beside `test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend` (`:632`), add: (a) a herdr implement launch with `--phase` runs the claim before `worker.py assign`, and `phases/<id>/phase_baseline` holds the HEAD commit; (b) a refused claim exits 1 with the error line and runs no `worker.py assign`; (c) a herdr review launch runs no claim. Use the claim fixture that `test_assign_claude.py` uses (`test_phase_claim_precedes_the_claude_worker_open`, `:257`); do not copy it.
-- Keep `test_assign_claude.py` claim tests passing with no change.
+- `scripts/direct/assign_claude.py` — `claim_phase`; `_run` calls it.
+- `scripts/direct/assign.py` — `execute_herdr` calls it.
+- `scripts/direct/test_assign_launcher.py` — `test_herdr_assignment_claims_the_phase_before_the_worker_assignment`, `test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment`, `test_herdr_review_assigns_the_worker_without_a_phase_claim`.
 
-**Workers:** `1 writer` — `impl`: the three files.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 22 changed `scripts/production/worker.py`; this phase does not touch it.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher*.py'`, `-p 'test_assign_claude*.py'` and `-p 'test_phase_reservation.py'` pass.
-- basedpyright on the three files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
+**Ruled out:** a change to `phase_reservation.py`; a new check, retry or wait.
 
 ### Phase 26 — Live runs move to pane workers  · status: todo
 
@@ -3297,6 +3282,32 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 - New tests: a director with two runs whose names sort with the worker's run second; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
 - The changed test modules pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
 - The full gate passes.
+
+
+### Phase 30 — A stashed draft comes back after a delivered prompt  · status: todo
+
+**Depends on:** Phase 23 and Phase 24 (the same two files). sdlc (2026-11-07): it lands right after Phase 24 and Phase 25, before Phase 27.
+
+Defect (natedev and accounts, through sdlc [d4982d9a], 2026-11-07): at 11:52 EST the move path delivered fastest's resume message. `wait_for_prompt_input` (`scripts/herdr/herdr.py:2161`) sent `ctrl+s` and stashed the user's draft 'restart impl2 now, don't wait for herdr'. After the turn ended at 11:53 the composer was empty, and the draft was not in the transcript. So the Phase 23 claim "Claude puts the stashed draft back after a submit that is not a slash command" fails live. That claim came from a read of the Claude Code 2.1.319 source, not from a live proof. The resume message was a multi-line script prompt, which Claude shows as pasted content. sdlc: "a user's lost typing is a fault the user sees."
+
+#### Work Order
+
+**Goal:** when herdr stashes a draft to deliver a prompt, the user sees the same draft in the composer after the turn.
+
+**Spec:**
+
+1. Find the cause live before any edit, in a throwaway Claude pane (Acceptance gate). Measure the composer just after the submit, during the turn and after the turn, for a multi-line script prompt and a one-line prompt. Read the Claude Code 2.1.319 stash restore condition in its source. Record the cause in the summary.
+2. Fix in the one submit path (`Herdr.submit_opening_prompt` and `wait_for_prompt_input`). When this call stashed a draft and the submit is proved, put the draft back with Claude's own stash key: `ctrl+s` on an empty composer restores the stash. Send it once, only when the composer is empty. If step 1 shows that this does not restore the draft, post blocked with the measured evidence.
+3. Add no check, refusal, validation or retry that this list does not name.
+
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: a submit that stashed a draft sends `ctrl+s` again once after the proved submit when the composer is empty, and sends nothing when the composer holds the draft.
+- A live proof in a throwaway pane: draft in the composer, a multi-line script prompt submitted through `submit_opening_prompt`, the same draft in the composer after the turn. The pane is a tab named `zz-proof-draft` in the agents herdr session, with its working directory under `/home/natepiano/scratch/herdrcheck/`. Close only the ids that the proof opened.
+- `PromptSubmissionTests` and `HerdrTests` pass; basedpyright on both files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
 
 
 ### Job table (main at 7e85a74b)
