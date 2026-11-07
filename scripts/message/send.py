@@ -146,7 +146,7 @@ from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
-from scripts.message import send_budget
+from scripts.message import morty_identity, send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -2930,19 +2930,7 @@ def read_sender_stamp(value: object) -> SenderStamp:
 def morty_stamp(stamp: SenderStamp) -> bool:
     if isinstance(stamp, UnavailableSender):
         return False
-    config = conf.read("send")
-    # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
-        return False
-    try:
-        expected = config.text("MORTY_NATIVE_ID")
-        kind, _, identity = expected.partition(":")
-        if kind not in ("session", "codex"):
-            return False
-        _ = staff.native_id(identity)
-    except (conf.Unusable, staff.StaffRefused):
-        return False
-    return expected == sender_native_id(stamp)
+    return morty_identity.matches(sender_native_id(stamp))
 
 
 def sender_stamp_lines(stamp: SenderStamp) -> str:
@@ -3046,9 +3034,13 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    running = (sessions.running_sessions() if needs_recipient_roster or needs_sender_roster
-               or (options.to != USER and isinstance(options.selection, RosterLookup)) else [])
-    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, records=running) if needs_recipient_roster or needs_sender_roster
+    reads_registry = (needs_recipient_roster or needs_sender_roster
+                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+    registry = sessions.read_registry() if reads_registry else sessions.RegistryRead((), ())
+    running = sessions.running_records(registry)
+    if reads_registry:
+        membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
     if isinstance(options.selection, MeshWorker):

@@ -363,8 +363,18 @@ def _read_state(
     session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
-    path = _state_path(session_dir)
     instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
+    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+
+
+def read_phase_ledger(
+    session_dir: Path, instance_id: str, phase_id: str, now: float,
+) -> dict[str, object]:
+    """Read the selected instance's ledger without changing the current phase."""
+    path = _state_path(session_dir)
+    parked = _parked_path(session_dir, instance_id)
+    if not path.exists() and instance_id and parked.exists():
+        path = parked
     if not path.exists():
         return _fresh_state(instance_id, phase_id, now)
     try:
@@ -374,7 +384,6 @@ def _read_state(
     if state is None:
         raise SystemExit(f"Invalid findings state: {path}")
     if instance_id and _string(state.get("phase_instance_id")) != instance_id:
-        parked = _parked_path(session_dir, instance_id)
         if parked.exists():
             try:
                 kept = _json_object(parked.read_text(encoding="utf-8"))
@@ -430,7 +439,7 @@ def _history_root() -> Path:
 
 
 def _repair_round(state: dict[str, object], session_dir: Path) -> int:
-    """The next repair round, using the same groups as `history.py rounds`."""
+    """The next repair round, counting each started ledger batch once."""
     path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -441,7 +450,7 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     instance = _string(state.get("phase_instance_id"))
     events = [event for line in lines if (event := _json_object(line)) is not None
               and _string(event.get("phase_instance_id")) == instance]
-    return len(phase_rounds(events)) + 1
+    return len({number for repair in phase_rounds(events) for number in repair["ledger_rounds"]}) + 1
 
 
 def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:

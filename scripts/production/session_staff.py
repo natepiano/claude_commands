@@ -27,6 +27,7 @@ from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
+from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch, agent_kind
@@ -47,8 +48,7 @@ class AnomalyReport:
     check: Callable[[int, str], ReportProcessIdentity] | None
     lines: list[str] = field(default_factory=list)
     processes: dict[int, ReportProcessIdentity] = field(default_factory=dict)
-    observations: dict[int, list[str]] = field(default_factory=dict)
-    positions: dict[int, int] = field(default_factory=dict)
+    reported: set[int] = field(default_factory=set)
 
     def process(self, pid: int, identity: str) -> ReportProcessIdentity:
         if pid and pid in self.processes:
@@ -68,18 +68,12 @@ class AnomalyReport:
         identity = self.process(pid, "")
         if identity.is_morty:
             return
-        observations = self.observations.setdefault(pid, [])
-        if message not in observations:
-            observations.append(message)
-        text = "; ".join(observations)
-        if f"pid {pid}" not in text:
-            text = f"pid {pid}: {text}"
-        if identity.native_id and identity.native_id not in text:
-            text += f"; thread {identity.native_id}"
-        if pid not in self.positions:
-            self.positions[pid] = len(self.lines)
-            self.lines.append("")
-        self.lines[self.positions[pid]] = "anomaly: " + text
+        if pid in self.reported:
+            return
+        self.reported.add(pid)
+        if f"pid {pid}" not in message:
+            message = f"pid {pid}: {message}"
+        self.lines.append("anomaly: " + message)
 
 
 _anomaly_report: ContextVar[AnomalyReport | None] = ContextVar("unit_anomaly_report", default=None)
@@ -115,9 +109,7 @@ def report_anomaly(message: str, *, pid: int = 0) -> None:
 
 
 def morty_thread(identity: str) -> bool:
-    from scripts.message import send
-
-    return bool(identity) and send.morty_stamp(send.CodexSender(identity))
+    return bool(identity) and morty_identity.matches(f"codex:{identity}")
 
 
 WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
@@ -622,14 +614,15 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
     return MemberFound(matches[0]) if matches else NoSuchMember(selector)
 
 
-def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str]) -> set[staff.StaffId]:
+def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str], production: str) -> set[staff.StaffId]:
     """Resolve exclusions within the supplied production members."""
     record = staff.StaffSnapshot(members)
     excluded: set[staff.StaffId] = set()
     for value in values:
         match = unit_match(ObservedUnit(value), record, UnitExclusion(value))
-        if isinstance(match, MemberFound):
-            excluded.add(match.row.id)
+        if not isinstance(match, MemberFound):
+            raise staff.StaffRefused(f"{value}: no unit of production {production}")
+        excluded.add(match.row.id)
     return excluded
 
 
@@ -774,9 +767,14 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     shared_session = herdr.shared_session()
     parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[LabeledSession]]] = {}
-    observed = tuple(unit for unit in marked if not report_process(
-        process_pid(unit),
-        unit.identity.id if isinstance(unit.identity, LiveSession) else "").is_morty)
+    observed: list[LabeledSession] = []
+    for unit in marked:
+        identity = report_process(process_pid(unit), unit.identity.id if isinstance(unit.identity, LiveSession) else "")
+        if identity.is_morty:
+            continue
+        if identity.native_id and not isinstance(unit.identity, LiveSession):
+            unit = replace(unit, identity=LiveSession(identity.native_id))
+        observed.append(unit)
     pane_rows: dict[Place, set[staff.StaffId]] = {}
     for unit in observed:
         row = record.by_current_session(unit.identity.id) if isinstance(unit.identity, LiveSession) else None
@@ -785,16 +783,20 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     for unit in observed:
         runtime_row = record.by_current_session(unit.identity.id) if isinstance(unit.identity, LiveSession) else None
         if runtime_row is None:
-            reason = (f"{unit.identity.id}: no current staff row" if isinstance(unit.identity, LiveSession)
-                      else "process identity is unavailable")
-            report_anomaly(f"{holder_text(unit)}: {reason}",
-                           pid=process_pid(unit))
+            if isinstance(unit.identity, LiveSession):
+                continue
+            if (pid := process_pid(unit)) and pid not in process_table.snapshot():
+                continue
+            reason = "process identity is unavailable"
             candidates = set(pane_rows.get(unit.place, ()))
             for launch in launches:
                 if unit.place.session == shared_session and launch["pane_id"] == unit.place.pane:
                     owner = record.by_current_session(launch["session_id"])
                     if owner is not None:
                         candidates.add(owner.id)
+            if candidates:
+                report_anomaly(f"{holder_text(unit)}: cannot read its thread; staff status may be incomplete",
+                               pid=process_pid(unit))
             if len(candidates) != 1:
                 continue
             runtime_row = record.by_id(next(iter(candidates)))
