@@ -132,6 +132,8 @@ class UnitRunsTest(StaffTestCase):
             config = root / "config"
             config.mkdir()
             run = root / "first"
+            run.mkdir()
+            write_text_atomic(run / "worker_transport", "mesh\n")
             with patch.dict(os.environ, {"CONF_DIR": str(config)}):
                 write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
                 self.assertEqual(unit_runs.worker_transport(run), "mesh")
@@ -142,7 +144,27 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(pin.read_text(), "mesh\n")
                 self.assertEqual(pin.stat().st_mtime_ns, unchanged)
                 self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
-                self.assertEqual((root / "second/worker_transport").read_text(), "herdr\n")
+                second_pin = root / "second/worker_transport"
+                self.assertEqual(second_pin.read_text(), "herdr\n")
+                second_before = second_pin.read_bytes(), second_pin.stat().st_mtime_ns
+                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
+                self.assertEqual((second_pin.read_bytes(), second_pin.stat().st_mtime_ns), second_before)
+
+    def test_new_mesh_run_exits_two_with_one_error_line_and_no_pin(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        run = self.root / "new-mesh"
+        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            with self.assertRaises(SystemExit) as failure:
+                _ = unit_runs.main(["worker-transport", str(run)])
+        self.assertEqual(failure.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("mesh", errors.getvalue())
+        self.assertFalse((run / "worker_transport").exists())
 
     def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

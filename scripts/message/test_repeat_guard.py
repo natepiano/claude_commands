@@ -22,7 +22,6 @@ from unittest.mock import patch
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.message import send
 from scripts.message import repeat_guard as guard
 from scripts.message import repeats
@@ -237,7 +236,8 @@ print(json.dumps(held))
         site.mkdir()
         _ = (site / "guard_site_probe.py").write_text("ready = True\n")
         program = """import json, os
-import guard_site_probe, repeat_guard
+import guard_site_probe
+from scripts.message import repeat_guard
 print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
                   repeat_guard.GUARD_IO_CEILING_SECONDS]))
 """

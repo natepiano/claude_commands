@@ -123,7 +123,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         arguments = session / "poll-arguments"
         heartbeat_arguments = session / "heartbeat-arguments"
         environment = self.environment()
-        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+        for key in ("UNIT_WORKER_POLL_SECS",
                     "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],

@@ -26,6 +26,7 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
@@ -84,6 +85,8 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         home = self.root / "home"
         home.mkdir()
         (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)
@@ -324,6 +327,7 @@ esac
     def record_phase(self, session: Path) -> None:
         record_wait_workers(self.root, session, self.environment,
                             {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
                                  "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),

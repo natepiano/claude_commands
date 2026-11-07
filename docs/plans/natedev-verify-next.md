@@ -87,3 +87,19 @@
 1. Measure the baseline first, on one real plain-package run: processes by command name, CPU s and wall s. Name the method. The count above comes from fake tools, so it is not this baseline.
 2. Remove the starts that the measure shows give no needed answer, largest first. Keep each behavior and its tests.
 3. Measure the same run with the same method. Put before and after in the notice.
+4. Cut the cold imports of `build_targets.py` `eligible`, `reserve` and `release-wait`, with no behavior change. natest 4ed0a1d2 measured 128.4 of 249.6 CPU s in four SSH test files, 270 starts, upper bound of the cut 99.9 CPU s. Tables: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/66/slots/impl4/measure/`. Builds placed this here, 2026-11-06.
+5. Get queue-unit's review of the admission import split before the Work Order. `build_hold.py` stays frozen unless builds says otherwise. Send natest the hash. natest measures with same-load pairs.
+6. Move three parts of `verify.sh` to functions that the SSH target tests can call. natest 608af02f measured 146.1 CPU s in the four `test_verify_ssh_targets` files. Breakdown: Phase 66 as-built in `docs/plans/builds-natest.md`, on builds-natest at 6f496170f. Builds placed this here, 2026-11-06.
+   - An eligibility consumer from `initialize_step_record`. It accepts real eligibility output and starts no heavy target command.
+   - A result consumer from `try_mac_test`. It accepts the actual result, status and output, and gives the next step decision of `route_test`. This one decides the most: a stop after a busy result and the queue-age handoff have no narrow function now.
+   - The reservation and retry orchestration around `command_reserve`, claim recovery and target selection. It keeps the real admission result and queue sequence.
+
+## A stopped verify call waits for every process of its step
+
+**Source:** natest-unit, 2026-11-06, forced evidence on 5f56b92c4. Builds placed it here, 2026-11-07.
+
+**Today:** `verify.sh` signals the step's process group, then waits only for `RUN_STEP_PID`. The cargo token releases and `verify.sh` exits while a step member (rustc, cargo) can still run. Evidence: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/73/profile/impl3/cargo-survivor-evidence.jsonl`, a forced SIGSTOP case only.
+
+**Needed:**
+1. Measure a live stopped call. Record whether a step member outlives the token release.
+2. Only if one does: wait for the whole step process group before the token releases, with a test that fails on the old code.

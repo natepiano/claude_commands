@@ -7,12 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-if __package__:
-    from .process_identity import process_start
-else:
-    from process_identity import process_start
+from scripts.message.process_identity import process_start
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.boot_identity import boot_identity
 
 RELAY_PREFIX = "relay/"
@@ -85,7 +81,6 @@ def read_relay_sender(pid: int, directory: Path) -> SavedRelaySender | NoSavedRe
 def publish_relay_identity(pid: int, sender: str, directory: Path) -> None:
     """Publish the lifetime before its sender, before Claude can receive a reply."""
     # This module also runs in the small pre-exec launcher.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib.atomic_file import write_text_atomic
 
     lifetime = _process_lifetime(pid)

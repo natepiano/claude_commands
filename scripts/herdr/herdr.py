@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 import json
+import hashlib
 import ctypes
 import os
 import re
@@ -281,6 +282,11 @@ class PromptInputNotReady:
 
 
 @dataclass(frozen=True)
+class PromptInputHoldsDraft:
+    screen: str
+
+
+@dataclass(frozen=True)
 class PromptInputTimedOut:
     """The destination did not become ready before the launch deadline."""
 
@@ -310,6 +316,11 @@ class PromptNotSubmitted:
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
     # True only when the launcher never typed the prompt: the session then holds no work of it.
     never_typed: bool = False
+
+
+@dataclass(frozen=True)
+class AgentNotStarted(PromptNotSubmitted):
+    """The start command failed, and no agent runs in the pane."""
 
 
 @dataclass(frozen=True)
@@ -704,6 +715,14 @@ class ClaudeTrustConfiguration(TypedDict):
 @dataclass(frozen=True)
 class NoPane:
     label: str
+
+
+@dataclass(frozen=True)
+class PaneNotRead:
+    """The caller has not read the pane row."""
+
+
+PANE_NOT_READ = PaneNotRead()
 
 
 @dataclass(frozen=True)
@@ -1194,6 +1213,19 @@ class _LayoutLock:
     def __exit__(self, *_: object) -> None:
         if self.handle >= 0:
             os.close(self.handle)
+
+
+@dataclass(frozen=True)
+class SubmitUnproved:
+    """Submit without waiting for a turn state."""
+
+
+@dataclass(frozen=True)
+class SubmitStarts:
+    timeout_ms: int
+
+
+SUBMIT_UNPROVED = SubmitUnproved()
 
 
 class Herdr:
@@ -1910,7 +1942,7 @@ class Herdr:
             print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
             if screen:
                 print(screen, file=sys.stderr)
-            return PromptNotSubmitted(str(error))
+            return AgentNotStarted(str(error))
         if kind == "codex":
             try:
                 entry = self.codex_launch(pane, agent_arguments)
@@ -2042,10 +2074,11 @@ class Herdr:
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(shell), activity)
 
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> str:
         """Prove the backend identity from the exact foreground process."""
         try:
-            return self.native_pane_process(pane, kind, timeout).current_identity
+            return self.native_pane_process(pane, kind, timeout, pane_row=pane_row).current_identity
         except ValueError as error:
             raise HerdrFailure(str(error)) from error
 
@@ -2061,21 +2094,21 @@ class Herdr:
             raise HerdrFailure("native process pid is unavailable")
         return pid
 
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        pane_row: Mapping[str, object] = {}
-        if kind == "codex" and codex_without_session(info):
+        if isinstance(pane_row, PaneNotRead) and kind == "codex" and codex_without_session(info):
             try:
                 row = self.pane_row(pane)
                 if not isinstance(row, NoPane):
                     pane_row = row
             except HerdrFailure:
                 pass
-        return pane_native_process(info, kind, pane_row)
+        return pane_native_process(info, kind, {} if isinstance(pane_row, PaneNotRead) else pane_row)
 
     def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
         """Read the foreground agent identity, then confirm its terminal."""
@@ -2105,7 +2138,7 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2119,19 +2152,25 @@ class Herdr:
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
         screen = _prompt_screen(raw)
         composer = _composer_input(raw)
-        if isinstance(composer, ComposerInput) and not composer.text.strip():
+        if isinstance(composer, ComposerInput):
+            if composer.text.strip():
+                return PromptInputHoldsDraft(screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
     def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        draft_stashed = False
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
+            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
+                self._send_keys(pane, "ctrl+s")
+                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
@@ -2333,7 +2372,8 @@ class Herdr:
         except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
             return failure(str(error))
 
-    def prompt(self, pane: str, text: str, *, target: str) -> None:
+    def prompt(self, pane: str, text: str, *, target: str,
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2341,7 +2381,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-        self._prompt(pane, text)
+        self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
@@ -2350,18 +2390,22 @@ class Herdr:
             raise HerdrFailure(f"{pane}: terminal changed before prompt")
         self._prompt(pane, text)
 
-    def _prompt(self, pane: str, text: str) -> None:
+    def _prompt(self, pane: str, text: str, *,
+                proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        _ = self.run("agent", "prompt", pane, text)
+        arguments = ["agent", "prompt", pane, text]
+        if isinstance(proof, SubmitStarts):
+            arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
+        _ = self.run(*arguments)
 
-    def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
+    def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
         try:
-            result = run_program(self.argv("agent", "wait", pane, "--until", state,
+            result = run_program(self.argv("agent", "wait", pane, "--until", "done", "--until", "idle",
                                            "--timeout", str(timeout_ms)), timeout=timeout_ms / 1000 + 10)
         except subprocess.TimeoutExpired:
             return WaitTimedOut()
@@ -3320,6 +3364,17 @@ def codex_rollout_thread(pid: int) -> str:
     if len(identities) != 1:
         raise ValueError(f"pid {pid}: current Codex rollout is unavailable or ambiguous")
     return next(iter(identities))
+
+
+def codex_transcript(pid: int) -> Path:
+    """Find the open transcript of one proved Codex process."""
+    started = _process_birth(pid)
+    files = _open_codex_rollouts(pid)
+    identity = codex_rollout_thread(pid)
+    paths = {Path(target) for target in files.values() if target.endswith(f"-{identity}.jsonl")}
+    if _process_birth(pid) != started or _open_codex_rollouts(pid) != files or len(paths) != 1:
+        raise ValueError(f"pid {pid}: current Codex transcript is unavailable or ambiguous")
+    return next(iter(paths))
 
 
 def codex_resume_thread(pid: int) -> str:
@@ -4708,7 +4763,9 @@ def _agent_name(name: str) -> str:
     mapped = re.sub(r"[^a-z0-9_-]", "-", name.lower())
     if not mapped or not "a" <= mapped[0] <= "z":
         mapped = "a-" + mapped
-    return mapped[:32]
+    if len(mapped) <= 32:
+        return mapped
+    return mapped[:23] + "-" + hashlib.sha256(mapped.encode()).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
@@ -4807,10 +4864,15 @@ def prepare_session_environment(session_id: str, cwd: str, environment: dict[str
     return prepare_agent_environment(cwd, environment, unset_variables)
 
 
+class AgentNameSource(Enum):
+    MEMBER_REFERENCE = "member_reference"
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
-                          timeout_ms: int, *, agent: str, reported_unknown: str = "") -> AgentLaunched:
-    """Launch an already proved environment without another potentially slow load."""
+                          timeout_ms: int, *, agent: str, reported_unknown: str = "",
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+    """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
@@ -4863,7 +4925,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
             client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
-        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
     except AgentExited:
         if isinstance(destination, NewTab):
             close_agent(name, pane)
@@ -4875,6 +4938,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             raise
         print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
         return AgentLaunched(pane, PromptNotSubmitted(str(error)))
+    if isinstance(outcome, AgentNotStarted) and not isinstance(destination, ExistingPane):
+        if isinstance(destination, NewTab):
+            close_agent(name, pane)
+        else:
+            _ = client.close_retained_pane(pane)
+        print(f"herdr {name}:{pane}: agent start failed: {outcome.reason}; pane closed", file=sys.stderr)
     return AgentLaunched(pane, outcome)
 
 

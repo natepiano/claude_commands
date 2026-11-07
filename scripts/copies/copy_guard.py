@@ -36,7 +36,7 @@ SHELL = cast(ShellCommands, cast(object, load_file_module(
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner verify "
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
     + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
 )

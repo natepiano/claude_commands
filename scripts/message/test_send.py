@@ -7,6 +7,7 @@ import builtins
 import fcntl
 import hashlib
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -25,11 +26,12 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TextIO, cast, final, override
+from typing import TextIO, cast, final, override
 from unittest import mock
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
@@ -56,10 +58,7 @@ from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 from scripts.message import roster
 from scripts.message import sessions
-if TYPE_CHECKING:
-    from scripts.accounts import accounts
-else:
-    from scripts.accounts import accounts
+from scripts.accounts import accounts
 from scripts.shutdown.test_support import ShutdownTestCase
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
@@ -5485,6 +5484,38 @@ class PaneWorkerMessageTests(unittest.TestCase):
     def deliver(self, address: str, text: str) -> send.Result:
         return send.send(send.parse(["--here", "--to", address, "--from", "fixture",
                                      "--forwarded-shown-sender", "fixture", "--text", text]))
+
+    def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
+        message = "Detached run: private-run\nResult: PASS"
+        result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="mesh-runs", timeout=60)
+        self.assertIsInstance(result, send.PaneTextDelivered)
+        self.assertEqual(result.outcome, "sent", result.detail)
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
+                                    "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
+        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+
+    def test_stalled_prompt_routes_the_message_and_reason_to_the_holder(self) -> None:
+        from scripts.herdr import herdr
+
+        message = "Detached run: stalled-run\nResult: PASS"
+        pane_run = self.fixture.world.run
+
+        def run(*arguments: str, deadline: float = math.inf) -> str:
+            output = pane_run(*arguments, deadline=deadline)
+            if arguments[:2] == ("agent", "prompt"):
+                raise herdr.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
+            return output
+
+        with mock.patch.object(self.fixture.world, "run", side_effect=run):
+            result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="mesh-runs", timeout=60)
+        self.assertEqual(result.outcome, "queued", result.detail)
+        retained = send.pending(f"staff:{self.fixture.parent.id}")
+        self.assertIn("Worker impl: agent_prompt_stalled: no working or blocked state", retained)
+        self.assertIn(message, retained)
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
+                                    "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
 
     def test_short_worker_path_prefers_the_sender_showrunner_over_an_absolute_collision(self) -> None:
         collision = fixture_member("showrunner", name="unit")

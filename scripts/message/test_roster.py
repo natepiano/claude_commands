@@ -127,6 +127,9 @@ class RosterTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
 
+        transport_config = self.root / "config"
+        transport_config.mkdir()
+        write_text_atomic(transport_config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
@@ -149,6 +152,7 @@ class RosterTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
+            "CONF_DIR": str(transport_config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "USAGE_STATE_DIR": str(self.root / "usage"),
@@ -266,6 +270,7 @@ class RosterTests(unittest.TestCase):
         server_pid: int | None = None,
     ) -> None:
         run.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(run / "worker_transport", "mesh\n")
         _ = (run / "mesh_server.json").write_text(json.dumps({
             "port": 45_678,
             "pid": os.getpid() if server_pid is None else server_pid,
@@ -1129,6 +1134,32 @@ class RosterTests(unittest.TestCase):
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)
         peer.assert_not_called()
+
+    def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit"}))
+        lost = unit_labels.LiveRun(run, unit_labels.NoRunningDirector())
+        problems: list[str] = []
+
+        found = roster._worker_ledger(lost, problems, staff.snapshot())  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(found, [])
+        self.assertEqual(problems, [f"{run}: run owner missing-unit: unit staff row is unavailable"])
+
+    def test_a_stopped_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit", "status": "active"}))
+        self._write_mesh(run, {"lost-worker": {"thread_id": fixture_runtime_id("lost-worker"), "status": "done", "role": "impl"}})
+        _ = (run / unit_runs.HEARTBEAT).write_text("live\n", encoding="utf-8")
+
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertIn(f"{run}: run owner missing-unit: unit staff row is unavailable", found.problems)
+        self.assertNotIn("lost-worker", {entry.name for entry in found.entries})
+        self.assertTrue(found.entries, found.problems)
 
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:

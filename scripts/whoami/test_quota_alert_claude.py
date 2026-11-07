@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,7 +9,6 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts

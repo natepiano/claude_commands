@@ -32,9 +32,9 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     import script_prompts
-    import unit_runs
+    from scripts.lib import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    from relay_identity import message_sender_name
+    from scripts.message.relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -1010,7 +1010,7 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     scheduled_root = state_root() / "scheduled-prompts"
     try:

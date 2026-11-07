@@ -20,12 +20,10 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import ANY, MagicMock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib import conf
 from scripts.whoami.note_file import note_name
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami import agent_notes
 from scripts.whoami import note_file
@@ -36,7 +34,7 @@ from scripts.whoami import codex_pacer
 from scripts.whoami import five_hour
 from scripts.whoami import quota_alert
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
 from scripts.whoami.agent_notes import local_reset

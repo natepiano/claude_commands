@@ -1,5 +1,9 @@
 """Compare running systems with main and cache the last rebuild result."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -14,7 +18,6 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
 
@@ -181,7 +184,7 @@ def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
 
 def write(config: Path, run: Callable[[list[str]], str] = command_output) -> None:
     """Refresh the configured cache without concurrent evaluations."""
-    import counts_row
+    from scripts.statusline import counts_row
 
     try:
         cache = cache_path(config)

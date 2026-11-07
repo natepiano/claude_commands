@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for scratch.py: folders that belong to a task and go when it ends."""
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ class ScratchTests(unittest.TestCase):
 
     def test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
         seed = ImmutableGitSeed.create(self.base, "main", "Scratch tests", "scratch@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
             with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
@@ -561,6 +561,25 @@ print(scratch.target('gate:proof', 'tree', False))
         record = scratch.task_of(path)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["ended_task"], "gate:copy")
+
+    def test_folders_omits_a_sibling_removed_after_its_record_was_read(self) -> None:
+        vanished = scratch.new("gate:vanished", "proof")
+        remaining = scratch.new("gate:remaining", "proof")
+        task_of = scratch.task_of
+
+        def remove_after_read(path: Path, *, scratch_settings: conf.ConfigRead,
+        ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
+            record = task_of(path, scratch_settings=scratch_settings)
+            if path == vanished:
+                (path / copy_record.RECORD).unlink()
+                path.rmdir()
+            return record
+
+        with mock.patch.object(scratch, "task_of", side_effect=remove_after_read):
+            paths = [folder.path for folder in scratch.folders()]
+        self.assertNotIn(vanished, paths)
+        self.assertIn(remaining, paths)
+        self.assertFalse(vanished.exists())
 
     def test_end_rechecks_task_after_a_hand_over_between_snapshot_and_lock(self) -> None:
         path = self.copy(task="gate:old")

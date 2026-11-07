@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Prepare local evidence and deploy resources only through an explicit user command."""
 from __future__ import annotations
 try:
@@ -26,7 +26,6 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
@@ -106,12 +105,14 @@ def fingerprint(settings: DeploymentSettings, parameters: dict[str, str], templa
 class Deployment:
     def __init__(self, settings_path: Path, directory: Path, output: Path, *,
                  execute: AwsExecutor = execute_command, clock: Callable[[], float] = time.time,
+                 pause: Callable[[float], None] = time.sleep,
                  notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event) -> None:
         self.settings_path = settings_path
         self.directory = directory
         self.output = output
         self.execute = execute
         self.clock = clock
+        self.pause = pause
         self.notify = notify
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
@@ -187,6 +188,9 @@ class Deployment:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
         parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification, deployment_id)
+        image = box.saved_image(self._api(settings), self.directory)
+        if image.get('State') == 'available':
+            parameters['AmiId'] = ledger.text(image, 'ImageId')
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -536,7 +540,7 @@ class Deployment:
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key == 'Bootstrap' and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
             for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
         ]
@@ -908,6 +912,7 @@ class Deployment:
             UpStage('box-join', setup.join_present, setup.join),
             UpStage('box-configuration', setup.configuration_present, setup.configure),
             UpStage('checks', setup.checks_present, setup.checks),
+            UpStage('image', setup.image_present, setup.image),
             UpStage('idle-stop', setup.idle_stop_present, setup.idle_stop),
             UpStage('activation', setup.activation_present, setup.activate),
             UpStage('routing-proof', setup.routing_proof_present, setup.routing_proof),
@@ -979,9 +984,17 @@ class Deployment:
         state = self._api(settings).observe(instance, int(self.clock())).state
         if state in ('running', 'pending'):
             return state
-        _ = self.price()
-        _ = self.prepare()
-        return self.setup_start(approve_resources=True)
+        while True:
+            _ = self.price()
+            _ = self.prepare()
+            try:
+                return self.setup_start(approve_resources=True)
+            except AwsUnavailable as error:
+                if 'InsufficientInstanceCapacity' not in str(error):
+                    raise
+                delay = read_control_settings(self.settings_path).capacity_backoff_s
+                print(f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.')
+                self.pause(delay)
 
 
 def remote_configuration(path: Path) -> str:
@@ -1049,6 +1062,9 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['gate-trial']:
+        from scripts.aws_target import gate_trial
+        return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)

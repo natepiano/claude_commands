@@ -278,91 +278,47 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Ruled out:** `mac_test.py free-now` as the leave hook (an unlocked read lost the claim to another step).
 
-### Phase 8 — Name the holder of what a wait is on  · status: todo
+### Phase 8 — Name the holder of what a wait is on  · status: done
 
-**Depends on:** queue Phase 10h in `docs/plans/builds-queue.md`, which prints the `holder <json>` event, and queue-unit's work before it on the admission client. sdlc phases-unit Phase 11 (`start-wait --holder-*`, `wait-holder` in `progress_history.py`) is on builds. Hierarchies' wait experiment needs this phase.
+**Depends on:** Phase 41h and Phase 41m.
 
-#### Work Order
+#### As-built
 
-**Source:** sdlc hand-off, approved by builds 2026-10-29.
-
-**Goal:** every wait `verify.sh` records names who holds what it waits on.
-
-**Starting point:** checkpoint `4fa7a8738` on `natedev-verify-holder` holds older work on an older base. Reuse its slot and hold lookups and its test ideas where they fit. Do not reuse its `check` field parsing, its `buildlog_memory_poll_hook` or its background poller: `scripts/lint/memory_gate.sh` no longer parses `memory_admit.py check` fields.
-
-**Spec:**
-
-1. **Flags.** `phase_wait_start` (`verify.sh:1260`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
-2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1302`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
-   - The client prints `holder` after `first`, and again only when the holder changes.
-   - `{"kind":"session","session_id":…,"session_name":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-session <session_id>`.
-   - `{"kind":"unit","unit":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-unit <unit>`.
-   - `{"kind":"none"}` is an explicit absence: `wait-holder` with no flags.
-   - An unchanged holder prints no event, so a steady wait starts no process.
-3. **Same shell.** The event loop runs in the pipe's subshell, and each wait id is in `$HOLD_WAIT_DIR/phase-wait.<BASHPID>.<key>`. `first`, `holder`, `done` and `left` for one client run use that one subshell. Keep the holder state in that subshell.
-4. **Token holder.** In `acquire_token` (`verify.sh:3039`, wait starts near 3072 and 3110) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
-5. **Build hold.** At `verify.sh:2797` and `:3401`, and in the SSH route (`route_test` at `:2294`, wait at `:2420`; `:3279` copies that body to `route_test_without_renewal`, and `:3280` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
-6. **Mac busy.** For the Mac-only wait (`phase_wait_start hold "Mac busy"`), the holder is the session that holds the Mac claim, with kind `slot` and resource `mac`. Name it again on each poll.
-7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass. A routing pass that tries a reserved target closes its interval, as a refused Mac claim does in item 9, so the next interval's `start-wait` names the current holder; `wait-holder` applies while an interval stays open.
-8. **Recorder failure.** A failed `start-wait` or `wait-holder` prints the existing `NotRecorded` line. It never changes admission or the step's exit. The next `holder` event or pass tries again.
-9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1984-1989`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
+- `phase_wait_start` passes `--holder-resource-kind`, `--holder-resource` and `--holder-session` or `--holder-unit` to `progress_history.py start-wait`, all or none; none records `HolderNotNamed`. A changed holder calls `wait-holder` with the same flags, and a holder that went away calls it with none. No watcher process runs beside a wait.
+- `phase_wait_holder_flags` (inline Python, `VERIFY_PY_HELPER=PHASE_WAIT_HOLDER`) resolves each kind: `token` reads the roster or `impl_worker` record's `staff_id`, then the staff record's `current_session`, else the unit; `hold` reads `hold_waited_on`; `mac` and `target` read the claims that overlap the scope and belong to a live run of another session; `memory` reads the `holder <json>` event payload.
+- `buildlog_memory_event` handles `holder <json>` from `admission_client.py --wait-events` in the pipe's subshell: `session` and `unit` name the holder, `none` is an explicit absence, and an unchanged holder prints no event. Each interval runs from its own `first` to its `done` or `left`; a rejoin after a refused Mac claim opens a new interval and keeps the first queued time.
+- A failed memory close is kept as `phase-close.<pid>.memory.<id>`. The next memory `first` retries each pending close once and prints `NotRecorded` on a failure; `phase_wait_finish_all` also closes them.
+- `acquire_token` opens the `cargo token` interval and closes it before a reserved remote test starts, in both `ssh_retry` branches.
+- A pinned target wait records an interval, closed before the step runs on the target. `phase_wait_target_busy` decides the pinned path: a pinned step waits on `busy`, or on a reserve that returned non-zero, only while a live claim of another session holds the target. Every other busy or refused answer keeps its refusal. The Mac retry spacing is skipped when pinned.
 
 **Files:**
-- `scripts/direct/verify.sh` — the `holder` case, the lookups and the `wait-holder` calls.
-- `scripts/direct/test_verify_wait_holder.py` — new.
+- `scripts/direct/verify.sh` — the holder lookups, the `holder` event case, the pending close records and the pinned busy rule.
+- `scripts/direct/test_verify_wait_holder.py` — 17 tests through the real event pipe, token wait, pinned wait and memory close.
+- `docs/as-built/staff-accessors.md` — the `verify.sh` row (read: snapshot, by_id, StaffId, StaffRow).
 
-**Workers:** 1 integration writer + 1 tester.
-- `impl` — `scripts/direct/verify.sh`.
-- `test` — `scripts/direct/test_verify_wait_holder.py`, from this Spec alone. It reuses `shell_functions`, `VerifyTokenWaitFixture` and `VerifyHoldWaitFixture`; no second extractor or fixture copy.
+**Binds later work:** a pinned step waits on a busy target only while a live claim of another session holds it, also after a Linux reserve that returns 1 on a claim race; the target interval closes before the step runs. The token branch of `phase_wait_holder_flags` keeps a unit fallback that reads the state's `unit` field.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- Read `scripts/lint/memory_gate.sh`, `scripts/build_queue/admission_client.py` and `scripts/direct/progress_history.py` only; do not change them.
-- Phase 1: an inline helper in `verify.sh` runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`, so a `VERIFY_PY_TRACE` run names its start.
-- Phase 9: a step with no wait starts no new Python. `test_verify_python_starts` keeps its count.
-- Phase 14: a `--mac` wait polls with a Bash `sleep` held in `HOLD_WAITER_PID`, and `hold_interrupted` ends that `sleep`.
-- Phase 23: a group TERM of a lint run exits 143, repeated INT, TERM and HUP during cleanup are ignored, and no verify process, admission place or step record remains.
-- Phases 7, 28, 31 and 36: token ownership and the step token boundary stay as they are.
-- Phases 29 and 37: a tree-writing step stays on natedev and records `natedev_only` for its lifetime.
-- Phase 38: keep Bash state publication and cleanup. Read a step's state, target, `updated` and run location through `step_record.read`. A fixture that hides tools names `cmp` in its tool list.
-- verify help: a `verify.sh` header edit keeps the `# Usage:` and `# Help <command>:` blocks and the doc gate sentence.
+**Gotchas:** the Linux reserve returns 1 on a claim race, not a `busy` answer. The merge gate's staff accessor test fails on any reader of the staff record that `docs/as-built/staff-accessors.md` does not list.
 
-**Acceptance gate:**
-- Through the real event pipe, the recorded wait shows: a holder of each kind; a holder change; an explicit absence; a recorder failure and its retry; a rejoin after a refused Mac claim, with a new interval and the same first queued time; and an immediate admission with no interval and no holder call.
-- The recorded wait names the token owner, the hold's holder and the Mac claim's session, and a change on the next pass.
-- `test_verify_step_state.py`, `test_verify_tree_cancel_lint.py`, `test_verify_python_starts`, the verify token, memory-kill and Mac-step suites and `test_verify_lint_local_writes.py` pass.
-- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+**Ruled out:** a pinned step that waits on every busy answer — it waited on leftovers that no live session holds.
 
-### Phase 8a — Resolve the token holder from recorded identities  · status: todo
+### Phase 8a — Resolve the token holder from recorded identities  · status: done
 
 **Depends on:** Phase 8.
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 8 review findings F009 and F010, routed under the landing rule at repair round 7, with the Astra review of 2026-11-06.
-
-**Goal:** a recorded token wait names the token owner on a current run, for the director and for each worker record form. Phase 8's acceptance line "the recorded wait names the token owner" stays open until this checkpoint: a director-held token and a slot with only a saved worker record do not name a session after Phase 8.
-
-**Spec:**
-
-1. **Run owner.** The `director` token owner and the unit fallback resolve through `unit_runs.run_owner` and the staff record. No production writer creates a `director` file, and `_set_owner` removes the state's `unit` field when it stores `owner_staff_id`. Remove both reads.
-2. **Worker identity.** Read the writers of `locks/cargo.d/holder`, `mesh_roster.json` and `impl_worker_*.json`, and state in the summary which forms they write. Resolve through the recorded `staff_id` and the staff record. An exact mapping wins: a roster key equal to the owner, then an `impl_worker_*` record whose `slot` or file stem equals the owner, then a roster entry whose `slot` equals the owner. Keep a `-<owner>` suffix match only if a production writer needs it; `fixture-first` in `verify_token_wait_test_support.py` is test setup, not that evidence. More than one match at one step gives no session.
-3. **Occupied slot, no answer.** A lookup that finds no holder for an occupied slot records no holder and tries again on the next pass. An absent holder and the slot `unknown` need no lookup. A steady named token wait starts no process.
+- The token branch of `phase_wait_holder_flags` resolves the holder in this order: a `mesh_roster.json` key equal to the holder; an `impl_worker_*.json` record whose `slot` or file stem equals it; a roster entry whose `slot` equals it; then the herdr pass record in `progress_history_state.json` under the holder key, else the one pass record whose `worker_name` equals the holder. One match gives its `staff_id` or `worker_id`, read through the staff record's `current_session`; no match or several matches give no session.
+- With no worker session, the wait names the run owner's unit through `unit_runs.run_owner` (`--holder-unit`). The `director` holder resolves through `unit_runs.director`.
+- `phase_wait_start` caches the holder per `slot:holder_pid` observation and looks up again on the next pass when a lookup found no identity. An absent holder and the slot `unknown` need no lookup.
 
 **Files:**
-- `scripts/direct/verify.sh` — the token branch of `phase_wait_holder_flags`, and `phase_wait_start`.
-- `scripts/direct/test_verify_wait_holder.py`
+- `scripts/direct/verify.sh` — the token holder lookup and its cache in `phase_wait_start`.
+- `scripts/direct/test_verify_wait_holder.py` — 29 tests, among them the recorded-identity cases through the real `phase_wait_start`.
 
-**Workers:** 1 integration writer + 1 tester.
+**Gotchas:** a herdr pass record is keyed by its dispatch slot (`--to`, `--new-worker` or the role), but the pane's `UNIT_TEAM_ROLE`, which `board.sh` writes as the token holder, is the worker name; the two differ when a retained worker takes another slot.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- The constraints in Phase 8 apply. Token ownership and the step token boundary stay as they are.
-
-**Acceptance gate:**
-- Tests through the real `phase_wait_start`, in one fixture set: a director-held token with `owner_staff_id` and no `director` file; a saved worker record with no roster entry; an exact match beside a second suffix match; a worker with no session, which gives the owner row's unit; an occupied slot that resolves on a later pass.
-- `test_verify_python_starts`, the verify token suites and `test_verify_wait_holder.py` pass.
-- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+**Ruled out:** the `-<holder>` suffix match on roster names and the state's `unit` field — no production writer needs the suffix, and `_set_owner` removes `unit`.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
 
@@ -822,7 +778,7 @@ Checkpoint `d8b1b0c3c` on `verify-red-tests`.
 
 Checkpoint `ce12a797f` on `verify-copies-owner-end` (with Phase 18), merged to builds as `d1fc65123`.
 
-- `copies.py remove --owner O` with no `--repo` removes every tree the owner holds, in every repository and kind; `--repo` narrows it. The Python API takes a `RepositoryScope` with the same two forms.
+- `copies.py remove` with no `--repo` removes every tree the caller holds, in every repository and kind; `--repo` narrows it. The Python API takes a `RepositoryScope` with the same two forms.
 - `retire_unit.py` removes the unit's standing checkouts after it stops the unit's processes and before it writes the retired note. A busy tree refuses the retirement and names the holder's session (a pid only when no name exists) and the tree path.
 - `tidy_wrapped.py` removes the standing checkouts of the wrapped production and of each of its units.
 - A retry finishes an interrupted removal; a rerun after a full removal changes nothing and exits 0. An adopted borrower keeps its source.
@@ -1087,7 +1043,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41e — Answer not free for a target whose last probe failed  · status: todo
 
-**Depends on:** Phase 41b, and aws's `offload.py` work on `builds`.
+**Depends on:** Phase 8, Phase 41b, Phase 41m, and aws's `offload.py` work on `builds` (commit f0850070b; on 2026-11-07 it is on `origin/builds-aws` only).
 
 #### Work Order
 
@@ -1107,10 +1063,11 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 1. **A version mismatch is per repository.** Tools depend on the tree, so one repository's mismatch says nothing about another. The probe's `detail` branch and the stream path's `ToolVersionMismatch` branch write the existing `version-decline-<repository>` record, through one function shared with `run_offload`. Do not write the timed backoff here: it stops every repository on that target.
 2. **A failed reach is per target.** A new file `failed_probe` in `state_directory(target)`, beside `unreachable_until`, holds no time. Read it through a typed function in the form of `read_backoff`, with a state type in the form of `BackoffState`.
 3. **The probe owns the target mark.** `probe_mac` is the one writer. An `UnavailableProbe` result with no `detail` writes the mark, from each of its return points. A good `ProbeSnapshot` removes it. `UnresolvedSlotStartup` and `InterruptedTargetStatus` leave it as it is.
-4. **`free_now` answers not free.** Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no. Make no change to `verify.sh`.
-5. **A new step still tries.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` and the `reserve` command in `build_targets.py` accept `"bad"` as they accept `"free"`, and go on to their reach check and claim. The timed backoff keeps its current effect on new steps.
+4. **`free_now` answers not free.** `free_now` and `FreeNowAnswer` are in `scripts/mac_test/mac_test.py` (near lines 2280 and 427). Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no.
+5. **A new step still tries, and a waiting step does not leave.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` accepts `"bad"` as it accepts `"free"`. The `reserve` command refuses `"bad"` unless it receives a new flag `--new-step`. `ssh_retry_hook` calls `reserve` directly for a route that allows SSH (`any_target`), so its command never carries the flag. The first pass of `route_test` (`retry` 0) adds the flag to its own `reserve` call, and no later pass adds it. The timed backoff keeps its current effect on new steps.
+5a. **A new step probes a marked target** (builds, 2026-11-07, Answer A). Since Phase 41h, the first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target never gets `reserve --new-step`. In a new step's eligibility read (`ssh_target_eligibility`, `build_targets.py:369`), a target that answers `"bad"` starts one detached probe (builds, 2026-11-07). It takes the target claim as `claimed_run` (`offload.py:1923`) does, runs `copy_tracked_scripts`, runs `probe_mac`, and releases the claim. The script copy is needed because `probe_mac` compares the remote `scripts_commit` stamp (`offload.py:1317`), and an old stamp fails the probe. It copies no repository tree: the target mark is per target, and only `run_offload`'s match removes a repository's version record. A busy claim skips the probe; the mark stays, and the next new step tries again. A good probe removes the mark; a failed probe keeps it. At most one probe runs on a target at a time: a second new step reads the mark as it is. The probe never makes the step wait: the step routes on the current answer. Steps already in a wait never probe. A new step is each step's first eligibility read, not each call: `initialize_step_record` (defined at `verify.sh:2245`, called at `:3138`) runs once per call, so a call with several steps (a `lint` with local steps) gives each step its own first read. The repeated eligibility reads of a pinned wait (`verify.sh:2658`) start no probe.
 6. **One line in the log.** The `could not reach` reason is the last non-empty line of the remote stderr. A traceback never reaches the log.
-7. **Status tells the truth.** `/build:status` (`targets.py` `target_state`) and `mac_test.py status` report a target with the mark as unreachable, not free.
+7. **Status tells the truth.** `/build:status` (`targets.py` `target_state` at line 302, its AWS status branch at 328) and `mac_test.py status` report a target with the mark as unreachable, not free.
 8. **Docs.** Update `docs/as-built/mac-test-offload.md`: the probe, the decline list and the two records.
 
 **Not in this phase:** the toolchain on the aws box (aws owns it), a new timer, an SSH call from `free_now`, a change to `mac_idle.py`, a change to the controller's `version_decline_hold_s`.
@@ -1118,6 +1075,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Remaining risk, stated to builds:** a fixed target stays unused by steps already in the memory wait until the next step starts and probes it. With no new step, those steps run on natedev in their queue place, as they would with no target.
 
 **Files:**
+- `scripts/direct/verify.sh`
 - `scripts/mac_test/offload.py`
 - `scripts/mac_test/mac_test.py`
 - `scripts/build_targets/build_targets.py`
@@ -1128,87 +1086,226 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Workers:** 1 writer: fix16.
 
 **Constraints from prior phases:**
+- Importing `offload.py` loads no build coordination modules. Resources Phase 67 tests this, and moves the `build_hold` import into `holder_session`.
 - Add no guard, refusal or check that this Spec does not ask for.
 - A test project is made in a tempdir at run time. No test commits one.
 - Tests use a temporary state folder. Live state stays out of worker prompts.
 - natest owns the `test_verify*` files. Put new tests in the new file.
 - A merge commit on this branch carries no visible Change-Review line.
+- Phase 8: a pinned step waits on a busy target only while a live claim of another session holds it (`phase_wait_target_busy`), also after a Linux reserve that returns 1 on a claim race. Every other busy or refused answer keeps its refusal. The target wait interval closes before the step runs on the target. Keep these with the probe in place.
 
 **Acceptance gate:**
+- `test_verify_wait_holder.py` passes, including the Linux claim race case and the refusal with no live claim.
 - The hana sequence, in `test_failed_probe_mark.py`, through the real `probe_mac`, `free_now`, `free-now` and `reserve` with a fake SSH: a mismatch probe, then the end of the timed backoff, then `free-now` still exits 1 with `bad` for that repository and exits 0 for another. A failed reach, then the end of the timed backoff, then `free-now` exits 1 with `bad` for each repository. A good probe by a new step removes the mark, and `free-now` exits 0 with no waiting step involved.
+- With the mark set, the command that `ssh_retry_hook` prints for a route that allows SSH takes no reservation, and `reserve --new-step` goes on to its reach check and claim.
+- With the Mac unavailable and natedev free, a new step runs on natedev and its probe clears a healthy AWS mark; the next step sees AWS as before. A second new step during that probe starts no second probe. The new step does not wait for the probe. A `lint` call with two local steps probes at each step's first eligibility read. A pinned wait that reads eligibility again starts no probe. With an old remote script stamp and a stale repository mirror, and no remote build, the probe copies the scripts, clears the target mark and leaves the repository record as it was. A busy target claim starts no probe and keeps the mark. Measure the script copy plus probe time per new step and put it in the checkpoint notice.
 - `busy`, `blocked` and `off` keep their answers with the mark set. A remote stderr with a traceback prints one `could not reach` line that holds no `Traceback`.
+- With the mark set, the AWS status (`targets.target_state` returns it before the general unreachable logic, at line 328) and the Mac status each show the mark. After a good probe, each shows the target as free again.
 - Each case fails when the matching code is removed. Show this on a tempdir copy.
 - `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
 
-### Phase 41c — Send a lint that waits for memory to a free Mac  · status: todo
+### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
-**Depends on:** Phase 41b.
+#### As-built
 
-#### Work Order
-
-**Source:** builds showrunner, 2026-11-06: the accepted lint item, and natest request d76b7136.
-
-**Goal:** a lint that waits for memory at its first step uses a free Mac and does not wait on natedev. The lint sequence becomes functions that a test can call.
-
-**Spec:**
-
-1. **Function move first.** Move the lint judgment block and the main lint sequence of the `lint` case in `verify.sh` into functions callable through `shell_functions`. The move changes no behavior. natest's `test_verify_lint_judgment.py` and `test_verify_lint_scope.py` use these functions.
-2. **Leave the mend wait for a free Mac.** At the memory wait of the `mend --fix` step, a free Mac takes the lint onto the path that it takes under a hold: `lint-held`, `HOLD_LINT=1`, local fmt, then `mend --fail-on-warn` and clippy judgment on the Mac. Use the existing hold path and the existing retry hook. Add no new decision point. `step_writes_tree` still keeps every writing step on natedev.
-3. **A clean tree ends there.** The lint exits 0 with no `mend --fix` run.
-4. **A finding returns to natedev.** On a finding from the Mac, the lint returns to the natedev queue, and runs `mend --fix`, as a clippy finding does now.
-5. **Linux-only repositories stay.** A repository under `linux_only.<repo>` in `config/mac_test.conf`, hana for one, keeps its natedev path.
-6. **Docs.** Update `docs/as-built/mac-test-offload.md`: its text says that lint steps keep their local path outside a hold.
-
-**Risk accepted by the builds showrunner:** a Linux-only lint error can appear later, at the merge gate. The user accepted this on 2026-10-28 for a lint during a hold, and this item widens it.
+- `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` hold the lint judgment and sequence of `verify.sh`. A test calls them through `shell_functions`.
+- At the memory wait of the first `mend --fix`, `LINT_MEND_WAIT=1` arms `ssh_retry_hook` with `STEP_WRITES_TREE=0`. A free Mac makes the wait exit with `LINT_LEFT_QUEUE_STATUS`, and `run_step` sets `HOLD_LINT=1` and `lint-held`.
+- A clean Mac result exits 0 with no `mend --fix`. A finding returns to the natedev queue and runs `mend --fix`. A `linux_only` repository never leaves.
+- Upper bound of the saving, 2026-10-30 to 2026-11-06: 16 lint steps outside hana, 415 min of memory wait with a `mac_idle` record on the same call.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_lint_free_mac.py`
-- `docs/as-built/mac-test-offload.md`
+- `scripts/direct/verify.sh` — the function move, `LINT_MEND_WAIT`, the mend loop transition.
+- `scripts/direct/test_verify_lint_free_mac.py` — four real `verify.sh lint` runs.
+- `docs/as-built/mac-test-offload.md` — the memory transition.
 
-**Workers:** 1 writer: merge16. The director measures the Mac-idle minutes from the build index.
+**Gotchas:**
+- A Linux-only lint error can appear later, at the merge gate. Builds accepted this risk.
+- `verify_cleanup` does not remove `MEND_LOG`, so each exit path of the mend loop removes it.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test project is made in a tempdir at run time. No test commits one.
-- natest owns the other `test_verify*` files and may edit the support files after a36296ed2 lands. Put new tests in the new file, and import the support files. Name in the notice any support file that this phase must change.
-- A direct test reads a value where its consumer receives it. A retry or hold transition keeps a real `verify.sh` run.
-- This phase lands on `verify-plain`. A merge commit on this branch carries no visible Change-Review line.
+### Phase 41f — Keep the offload settings tests off the live Mac lease  · status: done
 
-**Acceptance gate:**
-- Real `verify.sh lint` runs with the existing fake tools, in `test_verify_lint_free_mac.py`: a memory wait with a free Mac and a clean tree runs no `mend --fix` and exits 0; a Mac finding runs `mend --fix` on natedev; no free Mac leaves the path as it is; a `linux_only` repository never leaves. Each case fails when the matching code is removed. Show this on a tempdir copy.
-- `test_verify_lint_judgment.py`, `test_verify_lint_scope.py`, `test_verify_tree_cancel_lint.py` and `test_verify_python_starts.py` pass.
-- The notice names the Mac-idle minutes this could have saved, measured from the `mac_idle` and `steps` tables, or says why they cannot be measured.
-- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+#### As-built
 
-### Phase 41d — Move the test argument parser to one function  · status: todo
-
-**Depends on:** Phase 41c.
-
-#### Work Order
-
-**Source:** natest request 4537b50f, 2026-11-06, for `test_verify_mac_only.py` (38 policy cases).
-
-**Goal:** a test can call the `test` argument parser of `verify.sh` through `shell_functions`.
-
-**Spec:**
-
-1. Move the routing-flag loop at the top of `verify.sh` (it starts under `# Remove routing flags before constructing command words and records.`) to one function. The function keeps each refusal text and each exit status.
-2. The move starts no process and changes no behavior.
-3. Add one test that calls the function through `shell_functions` for one accepted form and one refused form, with the exit status.
+- `OffloadSettingsTests`, `OffloadCommandFixture` and `RepositorySlotTests` use `copies_environment`, so each has a private copies root. No test in `scripts/mac_test` takes a lease in the live gates root.
+- `test_probe_mirror_lease_stays_under_the_temporary_root` reads the lease path of the mirror of the flaky test.
+- Proof on a tempdir copy with a pretend live root: with the lease held, the flaky test fails with `busy` when the fixture is removed, and passes with the fixture. 0 of 185 lease paths lie under the pretend root.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_argument_parser.py`
+- `scripts/mac_test/test_offload.py` — the `OffloadSettingsTests` fixture and the new test.
+- `scripts/mac_test/offload_test_support.py` — `OffloadCommandFixture`.
+- `scripts/mac_test/test_target_slots.py` — `RepositorySlotTests`.
 
-**Workers:** 1 writer: merge16.
+**Gotchas:**
+- `copies.config_settings` reads `COPIES_CONFIG`, else the repository's `config/copies.conf`. `CONF_DIR` does not reach it, and a `Path.home` patch does not reach `Path.expanduser`. A test that reaches a lease needs `COPIES_CONFIG`.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- natest changes `test_verify_mac_only.py`. Do not change it here.
-- This phase lands on `verify-plain`. After its checkpoint, send natest the hashes of Phases 41c and 41d in one message.
+### Phase 41d — Move the test argument parser to one function  · status: done
 
-**Acceptance gate:**
-- `test_verify_mac_only.py`, `test_verify_mac_arguments.py` and `test_verify_argument_parser.py` pass with no change to the first two.
-- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+#### As-built
+
+- `parse_routing_arguments` in `verify.sh` holds the routing-flag loop. The call is `parse_routing_arguments "$@"`, then `set -- "${ARGS[@]}"`.
+- Inputs: the arguments, `CMD`, `VERIFY_CALL_ENVIRONMENT`. Outputs: `ARGS`, `NO_CACHE`, `LOCAL_ONLY`, `LOCAL_REASON`, `MAC_ONLY`, `MAC_REASON`, `MAC_ENV_NAMES`, `VERIFY_MAC_ENVIRONMENT`, `MAC_FETCH`, `MAC_FETCH_GIVEN`, `PINNED_TARGET`. It exports `BUILDLOG_PINNED_TARGET`.
+- A refusal writes its text to stderr and exits 2. The move starts no process.
+- A reviewer compared 51 calls of the old and new forms and found no difference.
+
+**Files:**
+- `scripts/direct/verify.sh` — `parse_routing_arguments`.
+- `scripts/direct/test_verify_argument_parser.py` — calls the function through `shell_functions`, with one accepted form and one refused form.
+
+**Gotchas:**
+- The loop ran at the top level, so `exit` and `set --` acted on the script. The caller restores the positional arguments from `ARGS`.
+
+### Phase 41g — One form for every verify command  · status: done
+
+#### As-built
+
+- Every `verify.sh` command takes one form: `verify <command> [<package>] [flags]`. No package means the whole workspace. `parse_command_arguments` parses it, beside `parse_routing_arguments`.
+- Command forms: `check [<package>]`, `build [<package>]`, `test [<package>] [--test <name>]`, `lint [<package>] [--check]`, `doc [<package>]`, `example [<package>] [--name <name>]`, `final [<package>] [--saved] [--tree <tree>]`.
+- A package keeps the meaning that the command gave it before: `check` and `build` stay `--workspace`, and a named package owns the feature names without a slash.
+- `final <package>` runs the whole-workspace check and that package's nextest, and saves no pass. `final --saved` gives the answer and status of the old saved-pass command.
+- The removed forms are the old saved-pass command, `lint --workspace`, the positional example name and the positional integration test. Each exits 2 and prints a usage line that names the new form. No alias exists.
+- A record with no package names `workspace`. `scripts/buildlog/record.py` reads the package from the parsed form. A `test` with no package counts as a gate run in memory admission.
+- `verify_metadata.py` answers for a whole workspace. A workspace `test` with a `linux_only` member does not run on the Mac.
+- Each caller and doc uses the form. The script path stays `~/.claude/scripts/direct/verify.sh`.
+- This phase changed no route.
+
+**Files:**
+- `scripts/direct/verify.sh` — `parse_command_arguments`, the commands and the help text.
+- `scripts/direct/verify_metadata.py` — workspace answers.
+- `scripts/buildlog/record.py` — the package word of a record.
+- `scripts/mac_test/offload.py` — the `linux_only` check with an empty package.
+- `scripts/production/merge_checkpoint.py`, `scripts/style/style_sync.py` and the other callers — the new form.
+- `scripts/direct/test_verify_verbs.py` — each removed form and its usage line.
+- `commands/unit/direct.md`, `config/README.md`, `docs/as-built/` and the other docs — state the form.
+
+**Gotchas:**
+- The Phase 41c function move turned two tests with a DEBUG trap red, because a trap without functrace does not enter a function. Repaired in `test_verify_token_mac_step.py` and `test_verify_lint_local_writes.py`. A move of a `verify.sh` function reaches each test whose trap watches its commands: search `trap .* DEBUG` and `BASH_COMMAND`.
+- `verify_mac_offload_test_support.py` keeps its trap without functrace: `route_test` is a top-level call for `test`.
+
+### Phase 41i — A saved test pass holds the environment that changes test results  · status: done
+
+#### As-built
+
+- `scripts/direct/result_environment.py` reads three `config/direct.conf` keys at use: `VERIFY_RESULT_ENV_NAMES` (`NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG` and each `LC_` category except `LC_TERMINAL` and `LC_TERMINAL_VERSION`), `VERIFY_RESULT_ENV_PREFIXES` (`HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`) and `VERIFY_TEST_FIXED_ENV` (`TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, `LINES=24`).
+- `tree_watch.py`: for `test` only, the verdict key and the tree content key hold each selected variable, each `--env` value and the configured fixed values. An unset name and an empty name differ. The build key and each other command's key do not change, so a changed value reruns tests and rebuilds nothing. The key reads its environment from the fd named by `VERIFY_RESULT_ENVIRONMENT_FD`.
+- `verify.sh`: each test run, the test step of `final` included, sets the five fixed values on natedev, the Mac and each SSH target. A Mac, SSH or copy nextest run carries the fixed values, the selected variables, `RUST_LOG`, `RUST_BACKTRACE` and `RUST_LIB_BACKTRACE` through `VERIFY_MAC_ENVIRONMENT` and the runner's `--env` words.
+- `offload.py` accepts `--env` on a copy run; `copy_watch.py` and `linux_runner.py` `execute_slot` carry the values to the remote command.
+- The token renewer trap in `verify.sh` is `trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP`, so a stop between `sleep &` and the pid read leaves no live `sleep`.
+- `scripts/buildlog/record.py` does not import `step_record`; a row id loads no `tempfile` module, and the package field is the package name or `workspace`.
+
+**Files:**
+- `config/direct.conf`, `config/README.md` — the three keys and their documentation
+- `docs/as-built/mac-test-offload.md`, `scripts/direct/verify.sh` header — the saved-result environment rule
+- `scripts/direct/result_environment.py` — key reader and selection
+- `scripts/direct/tree_watch.py`, `scripts/direct/verify.sh` — keys, fixed values, forwarding, renewer trap
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/copy_watch.py` — remote forwarding
+- `scripts/buildlog/record.py` — row id without `step_record`
+- `scripts/direct/test_verify_result_environment.py` — real `verify.sh test --local` reruns and reuses by environment
+- `scripts/direct/test_verify_build_key.py`, `test_verify_mac_only.py`, `test_verify_tree_cancel_reacquire.py`, `test_verify_token_reclaim.py`, `scripts/mac_test/test_offload.py`, `test_linux_runner.py`, `test_offload_forward.py` — key, forwarding and trap tests
+
+**Binds later work:** a routing change keeps the `--env` path for an unpinned, `--mac`, `--target` and copy route; the refusal list for user `--env` names and the rule that a user `--env` needs `--mac` stay.
+
+**Gotchas:** `test_verify_mac_only.py` compares the whole forwarded map, which holds the user's `--env` name plus the automatic values. `test_offload_forward.py` finds the forwarded values after the clear line, not at a fixed word index.
+
+### Phase 41j — A stop leaves no Mac log file  · status: done
+
+**Depends on:** Phase 41i.
+
+#### As-built
+
+- `verify.sh` opens `MAC_LOG_FILE` on descriptor 9 before it starts a Mac or SSH runner. Both tee processes append through `/dev/fd/9`, so a late tee creates no file name.
+- Each removal of `MAC_LOG_FILE` closes descriptor 9. `record_mac_pass` closes it before it reads, removes or moves the log.
+- `test_signal_before_delayed_tee_opens_leaves_no_temp_log` delays both tee calls and sends TERM after the runner boundary. It requires exit 143, no runner or local work, no token record and an empty temp folder.
+
+**Files:**
+- `scripts/direct/verify.sh` — the Mac log descriptor and its closes.
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — the delayed-tee test and the shared `check_signal_before_runner_start` helper.
+
+**Gotchas:** a tee released from a DEBUG observation inside signal cleanup never runs. The test releases it after the log name is gone.
+
+**Ruled out:** a fixed sleep to order tee and cleanup.
+
+### Phase 41k — The Linux disk probe test passes on every run  · status: done
+
+**Depends on:** Phase 41i.
+
+#### As-built
+
+- The fake `df` in `scripts/mac_test/test_linux_runner.py` picks its output unit from option arguments only (arguments that start with `-`). A `G` in a path, such as the mirror path, no longer makes it print GiB.
+- `test_probe_disk_units_do_not_depend_on_the_mirror_path` puts a `G` in the mirror path and requires `free_gib` = 100.0.
+- The probe in `scripts/mac_test/linux_runner.py` is unchanged.
+
+**Files:**
+- `scripts/mac_test/test_linux_runner.py` — the fake `df` and the regression test.
+
+**Gotchas:** LinuxShellTests reach the real `rustc` through rustup. A copy with no default rustup toolchain fails 9 of them when the module runs alone; the merge gate run passes.
+
+**Ruled out:** a change to the probe in `linux_runner.py` — its `-BG` call was already correct.
+
+### Phase 41l — The Mac idle watch alerts only on a waiter that waited past the limit  · status: done
+
+**Depends on:** Phase 41k.
+
+#### As-built
+
+- `VerifyCall` carries `updated`; `waiting_calls` fills it from the step record.
+- `calls_past_wait_limit(paths, calls, now, alert_seconds)` in `scripts/buildlog/mac_idle.py` keeps the first-seen wait start of each waiting call in `wait_starts.json` in the watch state folder. The key is the call id and the process start. It drops the start of a call that left the waiting set, and returns only the calls that waited at least `alert_seconds`.
+- An `updated` time that does not parse counts as past the limit.
+- `watch_once` applies the filter right after `waiting_calls`. The waiting count, the disk detail, the outage message, the push and the per-call causes read only the kept calls.
+- The limit is `mac_idle_alert.read_idle_config().alert_seconds`. There is no new setting.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py` — the wait filter and its state file.
+- `scripts/buildlog/test_mac_idle.py` — a fresh call, the limit, a state file rewrite, a call that comes back, a mixed count, and an `updated` time that does not parse.
+
+**Gotchas:** `step_record.read` takes `updated` from the state file mtime, and a failed Mac attempt rewrites that file every 180 s. Only the first-seen start measures a real wait.
+
+**Ruled out:** measuring the wait from the current `updated` time — a retry every 180 s resets it, so a long outage never alerts.
+
+### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: done
+
+**Depends on:** Phase 41g, Phase 41j and Phase 41k.
+
+#### As-built
+
+- `build_targets.step_routing_rule` is the one routing rule. A step that writes the tree runs on natedev. An unpinned `build` or `final` runs on natedev, because this machine uses the binary and the saved pass. Every other step runs on the first eligible target in `config/build_targets.conf` order (`mac,natedev,aws`). `check`, `doc`, `example` and the `lint` judgment use that order from their first step, as `test` does.
+- `AnyTarget` in `scripts/direct/step_record.py` replaces `ssh_allowed` and `mac_allowed`; `verify.sh` reads the platform from the target table. `natedev_only` stays for tree-writing steps and unpinned `build` and `final`. A Mac disk exclusion stays `NatedevOnly("disk")` through eligibility and `step_record.read`, so the `mac_idle.py` disk alert fires, local compilation included.
+- `parse_routing_arguments` accepts `--target <name>`, `--mac "<reason>"` and `--local "<reason>"` on every command with one meaning: pin each movable step to that target, to the Mac only, or to natedev. A tree-writing step stays on natedev under each flag; `lint --mac` repairs on natedev and judges on the Mac. The refusal of a `--local` reason that names a reservation applies on every command.
+- Remote verbs: `test` → `nextest`, `check` → `check`, `doc` → `doc`, `lint` judgment → `clippy` and `mend-check`, `example` → `clippy` with the example words, `build` → `build`, `final` → `check` and `nextest`. Each remote request carries its `kind`; `linux_kind_permitted` in `offload.py` and `execute_slot` in `linux_runner.py` accept these verbs and kinds. `config/aws_target.conf` reads `kinds=test,check,doc,lint,example,build`, approved by the user on 2026-11-06. A `build` or `final` goes to AWS only when pinned.
+- A remote `build` prints `binary: <target>:<path>`. `scripts/lint/lint` build metadata reads `--manifest-path` (both forms) and `--target-dir` (as `CARGO_TARGET_DIR`).
+- A pinned `final` runs both steps on the target, keeps the clean tree check, and saves no pass: a saved pass answers only for this machine. An unpinned `final` keeps `final_pass.py`, with its clean tree and compiler identity.
+- Saved step records convert once at deploy with a program outside the repository, on natedev and on the Mac, while no verify writer runs. No reader of the old values remains.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — `step_routing_rule` and target eligibility.
+- `scripts/direct/step_record.py` — `AnyTarget`; `StepRecord` takes a `PackageSelection`.
+- `scripts/direct/verify.sh` — the flags on every command, routing through the target table, the remote verbs.
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py`, `scripts/lint/lint` — the `build` verb, kinds, build metadata.
+- `config/build_targets.conf`, `config/aws_target.conf`, `config/README.md` — target order and permitted kinds.
+- `scripts/direct/test_verify_routing_rule.py` — the rule for each command and flag, and real `verify.sh` calls with a fake SSH runner for `check`, `example`, `build` and `lint --mac`.
+- `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — the routing rule and the pinned `final` rule.
+
+**Binds later work:** `route_test` carries every movable command, so its waits and its `reserve` calls serve `check`, `doc`, `example`, the `lint` judgment, `build` and `final` as well as `test`. The first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target gets no `reserve` call from that step. The pinned-target wait in `route_test` (`waiting for target <name>`) records no wait interval.
+
+**Gotchas:** a tree's `verify.sh` sources the installed `memory_gate.sh`, which sets `BUILD_TARGETS_SCRIPT` to the installed copy and refuses an override, so a tree cannot run its own routing for real. The Mac accepts only repositories that `mac_test.conf` lists with `linux_only.<repo>` (hana, cargo-liner).
+
+### Phase 41m — One tree holds the routing rule and the work of Phases 41i to 41l  · status: done
+
+#### As-built
+
+- `verify-plain` holds Phase 41h and Phases 41i to 41l: the 41m checkpoint concludes the merge of `verify-env` (7eaa9db49). `verify-env` does not land on its own.
+- Each remote runner start (`test`, `check`, `doc`, `example`, the `lint` judgment, `build` and `final`, on the Mac and on a Linux target) opens after `exec 9>>"$MAC_LOG_FILE"`, and its tee processes append through `/dev/fd/9`. `record_mac_pass` and `cancel_tree_run` run `exec 9>&-` before they remove the log. The renewer trap is `kill $(jobs -p) 2>/dev/null || true; wait; exit 0`.
+- A `final` nextest step exports `VERIFY_TEST_ENVIRONMENT` and `VERIFY_TEST_ENV_NAMES`. `try_mac_test` adds them to its local copies of `MAC_ENV_NAMES` and `VERIFY_MAC_ENVIRONMENT` only when `CMD == final` and `MAC_VERB == nextest`, so a `check` step gets no added values. This holds on the pinned, unpinned and copy routes.
+- `run_step` keeps its output log in `HOLD_WAIT_DIR` (`step-output.XXXXXX`), with a `TMPDIR` fallback.
+- `linux_runner.py` takes six verbs. `command_script`, `run` and `execute_slot` take `test_environment` and `clear_environment` (`--env`, `--clear-environment`), applied to `nextest` only. The clear line comes from the result-environment policy.
+- `record.py` imports `step_record` inside `call`, so importing `record.py` does not load `tempfile`. `test_verify_routing_rule.py` imports `build_targets` and `targets` by package name, so one `LocalRequired` class exists.
+
+**Files:**
+- `scripts/direct/verify.sh` — descriptor 9 Mac log, the `final` nextest environment, the `run_step` log place.
+- `scripts/mac_test/linux_runner.py` — the nextest test environment and clear line.
+- `scripts/buildlog/record.py` — the `step_record` import inside `call`.
+- `scripts/buildlog/test_mac_idle.py` — the 41h package and target types with fixed 1970 clocks.
+- `scripts/direct/test_verify_routing_rule.py` — `FinalRemoteEnvironmentTests`.
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — a stop before the delayed tee leaves no log, for `test`, `check` and `build`.
+
+**Gotchas:** aws `04d845e5d` conflicts with this checkpoint in `scripts/aws_target/aws_target.py`, `scripts/aws_target/test_control.py` and `scripts/mac_test/linux_runner.py`; the builds merge after aws lands resolves them.

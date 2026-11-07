@@ -30,6 +30,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
 
 
@@ -373,7 +374,7 @@ exit "$status"
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
-    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = self.fixture.root / "hold-targets.py"
         _ = targets.write_text(f'''import os
 import runpy
@@ -383,7 +384,7 @@ import tempfile
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
     print("natedev\\teligible\\t-\\t-\\t-")
-    if {runs_on!r} == "mac_allowed":
+    if {runs_on!r} == "any_target":
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})
@@ -394,6 +395,7 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

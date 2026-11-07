@@ -52,13 +52,25 @@ Each stage checks the live state first. It acts only when the state is not compl
 8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and plain `rustc`, `cargo nextest` and `cargo mend` versions on both hosts.
 9. **Idle stop.** Confirm the box stops itself within `idle_stop_minutes` plus a margin, through EC2.
 10. **Activation.** Turn on routing to AWS from state outside the repository, then start `aws-target.service`. The registry rows land in the tracked config by a reviewed commit, with the user's approval of each value.
-11. **Routing proof.** Run the in-repository `scripts/aws_target/proof_crate` through the normal pinned queue. Confirm `target=aws` in its record.
+11. **Routing proof.** Write the crate from `scripts/aws_target/routing_proof.py` into a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run. Run it through the normal pinned queue. Confirm `target=aws` in its record.
+
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
 
 ## Phases
 
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
 3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+4. **Gate trial evidence.** In progress. A cloud gate trial passes clean at each size. The report gives each size's time in four parts: request to running, instance setup, tests, and teardown. It also gives CPU use during the tests. The test time is the time to expect from a prepared image. User, 2026-11-07.
+5. **Prepared trial image.** After phase 4. A saved image holds the tools, so a box starts without the setup step. The phase decides when to rebuild the image after natedev changes. The trial then measures setup again, to show the time saved. User, 2026-11-07.
 
 ## Removal status
 

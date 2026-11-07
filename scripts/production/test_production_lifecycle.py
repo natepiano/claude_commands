@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.staff_test_support import fixture_member
 
 import contextlib
@@ -36,7 +38,7 @@ class ProductionReaderTests(StaffTestCase):
     def test_reader_uses_the_staff_name_and_document_from_the_supplied_record(self) -> None:
         doc = self.root / "tool-based-ui-production.md"
         _ = doc.write_text(f"# Different title\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** production.log\n")
-        row = fixture_member("showrunner", name="hana", doc=staff.LiveDoc("natedev", doc))
+        row = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(remote.local_machine(), doc))
         record = staff.snapshot()
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("second staff read")):
             production = read_production(row.name, record)
@@ -66,9 +68,9 @@ class LifecycleTests(LifecycleFixture):
             parked = unit_config.read_parked(alpha.id)
         assert isinstance(parked, unit_config.UnitConfig)
         self.assertEqual(replace(parked, retired=unit_config.NoRetiredSession()), expected)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree("natedev", self.alpha)))
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree("natedev", self.beta)))
-        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.doc)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
+        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta)))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
 
     def test_wrap_refuses_a_permanent_child_before_any_file_or_staff_change(self) -> None:
@@ -195,10 +197,10 @@ class LifecycleTests(LifecycleFixture):
         with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.doc)))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         for row in (alpha, beta):
             assert isinstance(row.worktree, staff.PresentWorktree)
-            self.assertEqual(staff.by_id(row.id), replace(row, worktree=staff.RemovedWorktree("natedev", row.worktree.path)))
+            self.assertEqual(staff.by_id(row.id), replace(row, worktree=staff.RemovedWorktree(remote.local_machine(), row.worktree.path)))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(len(self.sent()), 1)
         data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
@@ -222,17 +224,17 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertTrue(any(call.args[0] == alpha.id for call in stops.call_args_list))
         self.assertIn(worker.id, result.stdout)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree("natedev", self.alpha)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
         self.assertEqual(staff.by_id(worker.id), worker)
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree("natedev", self.beta)))
+        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta)))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.snapshot().pending_retire, (alpha.id,))
         self.assertIn("wrapped", self.doc.read_text())
         _ = staff.retire(worker.id)
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree("natedev", self.alpha)))
-        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.doc)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.snapshot().pending_retire, ())
 
     def permanent_staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
@@ -240,7 +242,7 @@ class LifecycleTests(LifecycleFixture):
         folder = self.root / "nightly"
         self.write(folder / ".unit.toml", 'plan = "permanent"\nresponsibilities = []\n')
         permanent = fixture_member("unit", name="nightly", parent=runner.id,
-                                   worktree=staff.PresentWorktree("natedev", folder))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), folder))
         return runner, alpha, beta, child, permanent
 
     def test_permanent_wrap_keeps_every_row_and_edge_until_its_child_is_transferred(self) -> None:
@@ -978,7 +980,7 @@ class LifecycleTests(LifecycleFixture):
         self.doc = kept
 
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
 
@@ -1006,7 +1008,7 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
@@ -1038,7 +1040,7 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
@@ -1055,7 +1057,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertFalse(kept.exists())
         retained = staff.by_id(runner.id)
         assert retained is not None
-        self.assertEqual(retained.doc, staff.LiveDoc("natedev", kept))
+        self.assertEqual(retained.doc, staff.LiveDoc(remote.local_machine(), kept))
         with self.assertRaises(Refusal):
             _ = read_production("example")
         finished = self.run_lifecycle("wrap", "--no-ci")
@@ -1063,7 +1065,7 @@ class LifecycleTests(LifecycleFixture):
         archived = self.checkout / "archive/checkout/example/different-production.md"
         wrapped = staff.by_id(runner.id)
         assert wrapped is not None
-        self.assertEqual(wrapped.doc, staff.WrappedDoc("natedev", archived))
+        self.assertEqual(wrapped.doc, staff.WrappedDoc(remote.local_machine(), archived))
         self.assertIn("wrapped", archived.read_text())
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
@@ -1095,7 +1097,7 @@ class LifecycleTests(LifecycleFixture):
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
         other_doc = self.doc.with_name("other-production.md")
         self.write(other_doc, "# Production — other\n")
-        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc(remote.local_machine(), other_doc))
         folder = self.root / "questions"
         self.write(self.doc, self.doc.read_text().replace(
             "## Close-out", f"- **Proposals:** `{folder}`\n\n## Close-out"))
@@ -1117,7 +1119,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertFalse((self.state / "notifier" / f"showrunner-{self.owner_id()}").exists())
         self.assertIn("status: closed", own.read_text().splitlines())
         self.assertEqual((unrelated.read_bytes(), unrelated.stat().st_mtime_ns), unrelated_before)
-        owner_after_wrap = staff.snapshot().by_doc("natedev", self.doc)
+        owner_after_wrap = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         self.assertIsNotNone(owner_after_wrap)
         assert owner_after_wrap is not None
         self.assertEqual(owner_after_wrap.id, runner.id)
@@ -1131,7 +1133,7 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
         self.merged_units()
         state = self.state / "showrunner"
-        owner = staff.snapshot().by_doc("natedev", self.doc)
+        owner = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         assert owner is not None
         owner_id = owner.id
         own = (state / "footers-off" / owner_id, state / "review-paused" / f"{owner_id}.json",
@@ -1188,7 +1190,7 @@ class LifecycleTests(LifecycleFixture):
         self.showrunner("kid", live=True)
         timer = self.state / "notifier" / f"showrunner-{self.owner_id('kid')}" / "conf"
         self.write(timer, f"TARGET=session:{self.owner_id("kid")}\nCHECK=zsh /x/production_check.sh {self.owner_id('kid')}\n")
-        _ = staff.set_doc(self.owner_id("kid"), staff.LiveDoc("natedev", style_doc))
+        _ = staff.set_doc(self.owner_id("kid"), staff.LiveDoc(remote.local_machine(), style_doc))
         _ = self.reports_to("kid", "example")
         child_state = self.state / "showrunner" / self.owner_id("kid") / "prompt.txt"
         self.write(child_state, "standing work remains\n")
@@ -1275,6 +1277,6 @@ class PermanentUnitTests(StaffTestCase):
             _ = (self.root / name).mkdir()
             _ = (self.root / name / ".unit.toml").write_text(f'plan = "{plan}"\nresponsibilities = []\n')
             _ = fixture_member("unit", name=name, parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", self.root / name))
+                               worktree=staff.PresentWorktree(remote.local_machine(), self.root / name))
         with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "permanent child nightly-review: transfer it before wrapping"):
             _ = production_lifecycle.units(owner, staff.snapshot())

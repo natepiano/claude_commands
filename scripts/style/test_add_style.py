@@ -443,7 +443,7 @@ atomic_file.os.replace = interrupted_replace
             self.assertIn("~/.claude/docs/style_production.md", text)
             self.assertNotIn("### Phase", text)
             for verb in ("check", "test", "lint"):
-                self.assertIn(f"verify.sh {verb} <package>", text)
+                self.assertIn(f"verify.sh {verb} [<package>]", text)
             ignored = self.git("-C", str(self.checkout), "check-ignore", "--", str(plan), str(self.doc), str(self.checkout / "docs/sample-style-log.md"))
             self.assertIn(str(plan), ignored)
         excluded = (self.repo / ".git/info/exclude").read_text()

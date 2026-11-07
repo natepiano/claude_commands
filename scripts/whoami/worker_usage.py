@@ -20,8 +20,6 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 from typing import cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, usage_report, weights
 from scripts.whoami.note_file import NumberedAccountLabel, canonical_label, parse_account_label

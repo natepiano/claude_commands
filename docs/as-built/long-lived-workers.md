@@ -128,12 +128,16 @@ Its follow path does not restore a saved extract.
 
 ### Claude coordinator and friends
 
-`agent_bg.sh` keeps Bash as the parent and runs `worker_fill.py coordinate-claude` as a Python coprocess.
-The coordinator reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
+`scripts/direct/claude_worker.py` runs the Claude launch steps in the assign process.
+`assign_claude._run` calls its functions directly.
+The module has no command line or shell protocol.
+It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
 It verifies the destination against the running Claude registry before staff publication.
-The protocol reports `launch`, `attach`, or `unchanged`.
-`published <native id>` carries the destination id after publication.
-A failure prints its complete diagnostic before it reports `failed`.
+It records the role before delivery.
+Delivery starts one Python child through `scripts/lib/py`: `send.py --to session:<id> --from launcher --file <prompt>`.
+`CLAUDE_WORKER_SEND_SCRIPT` selects the delivery script.
+`assign_claude.py` records the worker after publication.
+The heartbeat watch follows the assign process during the wait.
 
 A retry that finds its original user prompt in the transcript records acceptance without another send.
 A complete transcript without that prompt permits delivery.
@@ -259,7 +263,7 @@ For Claude implementation, test, and repair work, it calls `assign_claude.py` in
 - The Claude path checks admission before it records the pass.
 - A claim protects a continued worker until the dispatch ends.
 - Each slot keeps its `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log`, and `impl_agent_<slot>` files.
-- `UNIT_WORKER_WAIT_ATTEMPTS` and `UNIT_WORKER_POLL_SECS` control the worker record probes.
+- `UNIT_WORKER_POLL_SECS` overrides the worker poll interval from `CLAUDE_WORKER_POLL_SECS`, which defaults to 15 seconds.
 - `assign_claude.py` releases the claim and stops the heartbeat watch when the dispatch ends.
 
 **Codex code review dispatch.** Use `assign.sh --role review --session-dir <run>

@@ -1,6 +1,8 @@
 """Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import contextlib
 import io
 import json
@@ -274,7 +276,7 @@ class UnitPhasesTests(unittest.TestCase):
     def production_document(self, doc: Path) -> None:
         _ = doc.write_text(doc.read_text() + f"\n- **Merge branch:** main\n"
                            + f"- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
-        _ = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("showrunner", name="show", doc=staff.LiveDoc(remote.local_machine(), doc))
 
     def test_main_keeps_plan_history_functions_intact_while_it_reads_and_renders(self) -> None:
         doc = self.root / "production.md"
@@ -340,9 +342,9 @@ class UnitPhasesTests(unittest.TestCase):
         self.production_document(doc)
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
                            timeout=10)
-        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc(remote.local_machine(), doc))
         _ = fixture_member("unit", name="names", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.root))
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         units = [unit("names", live("names"))]
         records: dict[str, object] = {"names": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
@@ -382,13 +384,13 @@ class UnitPhasesTests(unittest.TestCase):
         doc = self.root / "style-production.md"
         _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
         self.production_document(doc)
-        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc(remote.local_machine(), doc))
         for name, folder in (("names", self.root), ("types", self.root / "gone")):
             _ = fixture_member("unit", name=name, parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), folder))
         decision = self.root / "decision.md"
-        _ = decision.write_text("---\nstatus: open\nunit: names\nplan: approved\n---\n")
         names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
+        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\n---\n")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
@@ -422,7 +424,7 @@ class UnitPhasesTests(unittest.TestCase):
             _ = (directory / "conf").write_text(
                 f"TARGET={target}\nCHECK=zsh /opt/production_check.sh show\n", encoding="utf-8")
         caller = fixture_runtime_id("unit-phases-caller")
-        _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc(remote.local_machine(), doc))
         self.assertEqual(showrunners.production_of(caller, self.root), doc)
         self.assertIsNone(showrunners.production_of("nobody", self.root))
         self.assertIsNone(showrunners.production_of("", self.root))
