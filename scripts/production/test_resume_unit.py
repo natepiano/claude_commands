@@ -38,7 +38,7 @@ from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
-from scripts.production import staff, unit_config
+from scripts.production import completion_receipt, staff, unit_config, worker
 from scripts.production.staff_test_support import unit_membership
 
 RUN_COMMAND = retire_unit.run
@@ -57,6 +57,48 @@ def git(where: Path, *arguments: str) -> str:
 
 @final
 class ResumeUnitTests(unittest.TestCase):
+    def test_resume_restores_retained_workers(self) -> None:
+        from scripts.production import worker
+
+        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
+            code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        restore.assert_called_once()
+
+    def test_uncertain_worker_restore_keeps_the_director_resume_complete(self) -> None:
+        row = unit_membership("alpha", "alpha")
+        with mock.patch.object(worker, "restore", side_effect=[
+                worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore:
+            code, output = self.resume()
+            self.assertEqual(code, 8, output)
+            self.assertIn("alpha resumed", output)
+            self.assertFalse(unit_config.parked_path(row.id).exists())
+            unit = resume_unit.find_unit("alpha", "alpha")
+            self.assertIsInstance(unit, resume_unit.NoRecoveryRequired)
+            receipt = completion_receipt.read_receipt(
+                resume_unit.resume_record(unit.production, unit.name).with_suffix(".done"), staff.snapshot())
+            self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
+            assert isinstance(receipt, completion_receipt.OwnedReceipt)
+            self.assertEqual(receipt.owner.id, row.id)
+            self.assertEqual(receipt.fields["session_id"], row.current_session)
+            code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output, "alpha already resumed\n")
+        self.assertEqual(restore.call_args_list, [mock.call(row.id), mock.call(row.id)])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_completed_resume_dry_run_does_not_restore_workers(self) -> None:
+        from scripts.production import worker
+
+        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
+            code, output = self.resume()
+            self.assertEqual(code, 0, output)
+            restore.reset_mock()
+            code, output = self.resume("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output, f"{unit_membership('alpha', 'alpha').name} already resumed\n")
+        restore.assert_not_called()
+
     def test_resume_restores_the_staff_location(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)
@@ -128,7 +170,8 @@ class ResumeUnitTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = (self.root / "production.conf").write_text((CHECKOUT / "config/production.conf").read_text())
+        for name in ("shutdown", "production", "direct"):
+            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -264,6 +307,8 @@ class ResumeUnitTests(unittest.TestCase):
         code, output = retirement.retire()
         self.assertEqual(code, 0, output)
         self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", retirement.worktree)))
+        restore = self.enterContext(mock.patch.object(
+            worker, "restore", return_value=worker.ExitCode.OK))
         launched_ids: list[staff.StaffId] = []
         commands: list[list[str]] = []
 
@@ -284,6 +329,7 @@ class ResumeUnitTests(unittest.TestCase):
         with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(resumed):
             code = resume_unit.main(["alpha", "alpha"])
         self.assertEqual(code, 0, resumed.getvalue())
+        restore.assert_called_once_with(unit.id)
         self.assertEqual(launched_ids, [unit.id])
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
@@ -296,6 +342,7 @@ class ResumeUnitTests(unittest.TestCase):
         with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(io.StringIO()):
             code = resume_unit.main(["alpha", "alpha"])
         self.assertEqual(code, 0)
+        self.assertEqual(restore.call_args_list, [mock.call(unit.id), mock.call(unit.id)])
         self.assertEqual(len(commands), 1)
         self.assertEqual((retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
                           git(retirement.checkout, "for-each-ref")), before)

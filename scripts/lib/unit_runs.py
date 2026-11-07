@@ -35,6 +35,7 @@ RUN_TEMP_NAME = "tmp"
 # SCRATCH_ROOT also selects the parent folder for temporary unit runs.
 RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
 FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
+ASTRA_RUN_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.

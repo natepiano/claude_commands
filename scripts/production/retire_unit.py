@@ -24,10 +24,12 @@ from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
 from scripts.lib import process_group, conf
+from scripts.herdr import worker_panes
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 import berth_board
 import progress_history
+import herdr
 import unit_lookup
 import unit_move
 import unit_runs
@@ -532,15 +534,19 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
                                             row.current_session, unit_config.Branch(unit.branch)))
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = members(unit, record)
+    pane_run = worker_panes.worker_run(row)
+    pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
+    pane_ids = {item.row.id for item in pane_workers}
+    _ = stop_resume.stop_unit_workers(row.id, record)
     for member in owned:
-        if isinstance(record.backends.get(member.id), staff.CodexBackend):
+        if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
             continue
         try:
-            outcome = stop_resume.stop(member.current_session)
+            outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
             if isinstance(outcome, stop_resume.StopFailed):
                 print(f"anomaly: {member.name}: {outcome.reason}")
-        except (OSError, ValueError) as error:
-            print(f"anomaly: {member.name}: {error}")
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
     for key in holds({member.current_session for member in owned}):
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:
@@ -561,6 +567,9 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     refused = refusals(unit, settings=settings)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
+        return 1
+    remaining = worker_panes.observe(row.id, staff.snapshot()) if pane_workers else []
+    if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for item in remaining):
         return 1
     try:
         remove_unit_trees(row.name)

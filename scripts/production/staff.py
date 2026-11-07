@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
@@ -233,6 +234,30 @@ DOC_UNFILLED = DocUnfilled()
 
 
 @dataclass(frozen=True)
+class Active:
+    """The staff row has no pause record."""
+
+
+@dataclass(frozen=True)
+class Paused:
+    since: str
+    by: str
+    why: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"since": self.since, "by": self.by, "why": self.why}
+
+    @classmethod
+    def from_json(cls, value: object) -> Paused:
+        if not isinstance(value, dict):
+            raise StaffUnreadable("paused must contain since, by and why")
+        fields = cast(dict[str, object], value)
+        if set(fields) != {"since", "by", "why"} or not all(isinstance(item, str) for item in fields.values()):
+            raise StaffUnreadable("paused must contain since, by and why as strings")
+        return cls(cast(str, fields["since"]), cast(str, fields["by"]), cast(str, fields["why"]))
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -242,6 +267,8 @@ class StaffRow:
 
     worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = field(default_factory=WorktreeUnfilled)
     doc: LiveDoc | WrappedDoc | DocUnfilled = field(default_factory=DocUnfilled)
+
+    paused: Paused | Active = field(default_factory=Active)
 
     def reports_to(self, identity: StaffId) -> bool:
         return self.parent == ReportsTo(identity)
@@ -254,6 +281,8 @@ class StaffRow:
         if not isinstance(self.doc, DocUnfilled):
             value["doc"] = {"machine": self.doc.machine, "path": str(self.doc.path),
                             "state": "live" if isinstance(self.doc, LiveDoc) else "wrapped"}
+        if isinstance(self.paused, Paused):
+            value["paused"] = self.paused.to_json()
         return value
 
     @classmethod
@@ -261,7 +290,7 @@ class StaffRow:
         if not isinstance(value, dict):
             raise StaffUnreadable("staff row must be an object")
         fields = cast(dict[str, object], value)
-        if not {"id", "kind", "name", "parent"} <= set(fields) or set(fields) - {"id", "kind", "name", "parent", "current_session", "worktree", "doc"}:
+        if not {"id", "kind", "name", "parent"} <= set(fields) or set(fields) - {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused"}:
             raise StaffUnreadable("staff row must contain id, kind, name and parent")
         staff_id, kind, name, parent = (fields[key] for key in ("id", "kind", "name", "parent"))
         if not isinstance(staff_id, str) or not _valid_id(staff_id):
@@ -277,7 +306,8 @@ class StaffRow:
             raise StaffUnreadable("invalid current session")
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
-                   ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current))
+                   ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
+                   paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active())
 
 
 def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
@@ -1400,6 +1430,65 @@ def move(staff_id: StaffId, new_parent: ReportsTo | StaffRoot) -> StaffRow:
     return _transaction(edit)
 
 
+def _pause_row(reference: str, pause_record: Paused | Active) -> StaffRow:
+    if not is_owner():
+        arguments = (["pause", reference, "--why", pause_record.why, "--since", pause_record.since, "--by", pause_record.by]
+                     if isinstance(pause_record, Paused) else ["resume", reference])
+        return _remote_row(arguments)
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _lookup(rows, reference)
+        if row is None:
+            matches = [member for member in rows if member.kind == "unit" and member.name == reference]
+            row = matches[0] if len(matches) == 1 else None
+        if row is None:
+            raise StaffNotFound(StaffId(reference))
+        changed = replace(row, paused=pause_record) if isinstance(row.paused, Active) or isinstance(pause_record, Active) else row
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def pause(reference: str, why: str) -> StaffRow:
+    """Record a pause without stopping the unit."""
+    from scripts.lib.user_zone import user_zone
+    caller = by_current_session(runtime_id())
+    return _pause_row(reference, Paused(datetime.now(user_zone()).isoformat(), caller.name if caller else "", why))
+
+
+def resume(reference: str) -> StaffRow:
+    """Remove a pause record; a repeated resume succeeds."""
+    return _pause_row(reference, Active())
+
+
+def _pause_units(arguments: _Arguments) -> int:
+    if arguments.production:
+        members = cast(Callable[[str], tuple[StaffRow, ...]],
+                       import_module("scripts.production.staff_sources").production_units)
+        resolve_exclusions = cast(Callable[[tuple[StaffRow, ...], Sequence[str]], set[StaffId]],
+                                 import_module("scripts.production.session_staff").excluded_unit_ids)
+        production = members(arguments.production)
+        excluded = resolve_exclusions(production, arguments.excluded)
+        references = [str(row.id) for row in production if row.id not in excluded]
+    else:
+        references = [arguments.target]
+    rows: list[StaffRow] = []
+    for reference in references:
+        if arguments.verb == "resume":
+            rows.append(resume(reference))
+        elif arguments.since:
+            rows.append(_pause_row(reference, Paused(arguments.since, arguments.by, arguments.why)))
+        else:
+            rows.append(pause(reference, arguments.why))
+    if arguments.json:
+        print(json.dumps([row.to_json() for row in rows] if arguments.production else rows[0].to_json(), sort_keys=True))
+    else:
+        for row in rows:
+            print(f"{row.name}: {'paused' if isinstance(row.paused, Paused) else 'active'}")
+    return 0
+
+
 def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
                  expected: PresentWorktree | RemovedWorktree | WorktreeUnfilled) -> StaffRow:
     """Set one unit's worktree through the existing owner transaction."""
@@ -1684,6 +1773,11 @@ class _MoveCommand(Protocol):
 
 
 class _Arguments:
+    production: str = ""
+    excluded: list[str] = []
+    why: str = ""
+    since: str = ""
+    by: str = ""
     runtime_id: str = ""
     new_id: str = ""
     verb: str = ""
@@ -1714,6 +1808,17 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    for command in ("pause", "resume"):
+        pause_parser = verbs.add_parser(command)
+        selection = pause_parser.add_mutually_exclusive_group(required=True)
+        _ = selection.add_argument("target", nargs="?")
+        _ = selection.add_argument("--production", default="")
+        _ = pause_parser.add_argument("--json", action="store_true")
+        if command == "pause":
+            _ = pause_parser.add_argument("--why", required=True)
+            _ = pause_parser.add_argument("--except", dest="excluded", action="append", default=[])
+            _ = pause_parser.add_argument("--since", default="", help=argparse.SUPPRESS)
+            _ = pause_parser.add_argument("--by", default="", help=argparse.SUPPRESS)
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--live", action="store_true", help="show live member identities")
@@ -1843,6 +1948,8 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb in ("pause", "resume"):
+        return _pause_units(arguments)
     if arguments.verb == "move":
         if arguments.destination is not None:
             if arguments.parent is not None:
