@@ -6,6 +6,7 @@ from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -126,12 +127,21 @@ class AddStyleTests(unittest.TestCase):
     initial_tip: str = ""
     env: dict[str, str] = {}
 
+    repository_seed: Path = Path()
+
+    @classmethod
     @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
-        self.repo = self.root / "sample"
-        self.checkout = self.root / "sample-style"
-        self.doc = self.checkout / "docs/sample-style-production.md"
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(
+            tempfile.TemporaryDirectory(prefix="add-style-seed-"),
+        )) / "sample"
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        fixture.prepare_repository()
+        cls.initial_tip = fixture.initial_tip
+
+    def prepare_repository(self) -> None:
         self.repo.mkdir()
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("config", "user.name", "Style bootstrap tests")
@@ -145,6 +155,14 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", "Create sample repository")
         self.initial_tip = self.git("rev-parse", "HEAD")
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
+        self.repo = self.root / "sample"
+        self.checkout = self.root / "sample-style"
+        self.doc = self.checkout / "docs/sample-style-production.md"
+        _ = shutil.copytree(self.repository_seed, self.repo)
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
         for family in add_style.FAMILIES:
