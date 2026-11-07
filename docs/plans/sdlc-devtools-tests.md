@@ -1444,27 +1444,14 @@ Every entry script under `scripts/` runs under bare `python3 <path>` from any wo
 
 ### Phase 8o — Screen recording finds a window with no client list  · status: done
 
-Source: sdlc [10933f69] 2026-11-07, from the hana showrunner. At 03:3x EST on natedev, `scripts/screen_record/screen_record.py` found no Hana window: KWin Xwayland on `:0` published no `_NET_CLIENT_LIST`. demo-unit found the window with `xwininfo` and recorded it with ffmpeg x11grab. Run after the 3z accounts hash, with its own hash.
+#### As-built
 
-**Depends on:** none
-
-#### Work Order
-
-**Goal:** `screen_record.py` finds a window by title when the root window has no `_NET_CLIENT_LIST`.
-
-**Spec:**
-1. `find_window` reads `xprop -root _NET_CLIENT_LIST` as now. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes the window ids and titles from that output.
-2. The fallback keeps every current rule: the 10 s lookup limit, the poll, one match records, two or more matches stop before ffmpeg, and no match reports the titles seen.
-3. `xwininfo` is a required tool only on the fallback path. A missing `xwininfo` there gives one error line that names it.
+`find_window` in `screen_record.py` reads `xprop -root _NET_CLIENT_LIST`. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes each window id and title from `TREE_WINDOW`. The fallback keeps the 10 s lookup limit, the poll, the one-match rule, the stop before ffmpeg on two or more matches, and the list of titles seen on no match. Tree titles are read as printed, with literal quotes and backslashes. `xwininfo` is required only on the fallback path: a missing binary gives `screen_record: missing on PATH: xwininfo`.
 
 **Files:**
-- `scripts/screen_record/screen_record.py` — the fallback.
-- `scripts/screen_record/test_screen_record.py` — tests.
+- `scripts/screen_record/screen_record.py` — window lookup with the tree fallback.
+- `scripts/screen_record/test_screen_record.py` — fake `xprop` and `xwininfo`; tests for a missing and an empty client list, two matches, literal quotes, literal backslashes and a missing `xwininfo`.
 
-**Workers:** `1 writer + 1 tester`. `impl` owns `screen_record.py`; `test` owns `test_screen_record.py`.
+**Gotchas:** `xwininfo` prints a title with no escapes, so `TREE_WINDOW` reads to the last `": (` on the line. natedev has `xwininfo` only in the nix store, not on PATH.
 
-**Acceptance gate:**
-1. A test with a fake `xprop` that prints `_NET_CLIENT_LIST:  not found.` and a fake `xwininfo` tree finds and records the matching window.
-2. A test with an empty client list does the same.
-3. The existing `test_screen_record.py` tests pass with no assertion changed.
-4. basedpyright `0 errors, 0 warnings, 0 notes` on both files; the full gate passes.
+**Ruled out:** unescaping tree titles — `xwininfo` does not escape them.
