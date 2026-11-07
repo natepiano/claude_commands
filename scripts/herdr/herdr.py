@@ -1204,6 +1204,19 @@ class _LayoutLock:
             os.close(self.handle)
 
 
+@dataclass(frozen=True)
+class SubmitUnproved:
+    """Submit without waiting for a turn state."""
+
+
+@dataclass(frozen=True)
+class SubmitStarts:
+    timeout_ms: int
+
+
+SUBMIT_UNPROVED = SubmitUnproved()
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -2342,7 +2355,8 @@ class Herdr:
         except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
             return failure(str(error))
 
-    def prompt(self, pane: str, text: str, *, target: str) -> None:
+    def prompt(self, pane: str, text: str, *, target: str,
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2350,7 +2364,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-        self._prompt(pane, text)
+        self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
@@ -2359,13 +2373,17 @@ class Herdr:
             raise HerdrFailure(f"{pane}: terminal changed before prompt")
         self._prompt(pane, text)
 
-    def _prompt(self, pane: str, text: str) -> None:
+    def _prompt(self, pane: str, text: str, *,
+                proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        _ = self.run("agent", "prompt", pane, text)
+        arguments = ["agent", "prompt", pane, text]
+        if isinstance(proof, SubmitStarts):
+            arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
+        _ = self.run(*arguments)
 
     def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)

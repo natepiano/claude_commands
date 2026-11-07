@@ -578,7 +578,8 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
                       "-c", f'model_reasoning_effort="{settings.effort}"',
-                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}"]
+                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}",
+                      "-c", "notice.hide_rate_limit_model_nudge=true"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
         return arguments
