@@ -176,7 +176,6 @@ class StoreReadoutTests(OutcomeFixture):
         self.assertEqual(result.stdout, self.expected())
         script = f"""
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 from pathlib import Path
 from unittest.mock import patch
 from scripts.usage import collect
@@ -195,7 +194,7 @@ raise SystemExit(result)
     def test_readout_figures_freshness_and_sources_share_one_snapshot_during_a_writer_commit(self) -> None:
         self.mac_pass()
         expected = self.expected()
-        script = f"import sys\nsys.path.insert(0, {str(READOUT.resolve().parents[2])!r})\n" + SNAPSHOT_COMMIT_SCRIPT + """
+        script = "import sys\n" + SNAPSHOT_COMMIT_SCRIPT + """
 from scripts.whoami import worker_usage
 with patch.object(sqlite3, 'connect', snapshot_connect):
     result = worker_usage.run(sys.argv[1:])
@@ -245,9 +244,8 @@ raise SystemExit(result)
     def test_two_weight_cuts_deduplicate_simultaneous_starts_and_last_piece_without_checkpoint_is_unavailable(self) -> None:
         _ = shutil.copyfile(DAY1_FIXTURES / "extra-cuts.jsonl", self.codex_root / "2026/10/10/rollout-extra-cuts.jsonl")
         self.mac_pass()
-        script = f"""
+        script = """
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 from datetime import datetime, timezone
 from scripts.usage import weights
 from scripts.whoami import worker_usage
@@ -307,9 +305,8 @@ raise SystemExit(worker_usage.run(sys.argv[1:]))
 
 
     def function_calls(self) -> ReadoutFunctionCalls:
-        script = f"""
+        script = """
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 import json
 import sqlite3
 from collections import Counter
@@ -352,8 +349,8 @@ with patch.object(sqlite3, 'connect', counting_connect), \\
         result = worker_usage.run(sys.argv[1:])
     assert result == 0, result
     assert '| Before |' in output.getvalue()
-    print(json.dumps({{'calls': dict(calls), 'weighting_registered': registration.called,
-                      'sources_called': sources.call_count}}))
+    print(json.dumps({'calls': dict(calls), 'weighting_registered': registration.called,
+                      'sources_called': sources.call_count}))
 """
         result = self.readout(script=script)
         self.assertEqual(result.returncode, 0, result.stderr)
