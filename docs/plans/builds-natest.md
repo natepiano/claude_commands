@@ -1509,37 +1509,20 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 ### Phase 69 — The remote copies review test uses half its CPU  · status: done
 **Depends on:** Phase 64
 
-#### Work Order
+#### As-built
 
-**Source:** `show.py top` on 2026-11-06, ranked by median CPU. This module reached builds with verify's Phase 41 and is now the top live module that no phase holds.
+`copies/test_review_remote_copies.py` uses 65.7% less CPU, with all 28 tests and 152 assertion statements kept. Three same-time pairs on `/dev/shm`: CPU 350.0 to 120.2 s, wall 616.2 to 205.5 s, process starts 1,684 to 813, execs 2,308 to 842.
 
-**Goal:** `scripts/copies/test_review_remote_copies.py` (215.4 CPU s, 306.4 s wall, 28 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
-2. Look first for repeated expensive setup. Lesson from Phase 55: cuts add up, so a cut that cannot reach half alone still counts, and a floor comes only after the available cuts.
-3. Cut in the Speed method's order, direct calls first. Keep the real process runs that prove what no direct call can, such as a slot shell child that keeps a lease after both parents end.
-4. A cut in a production file goes to the director first, with the measured gain. Phase 44 changes `scripts/copies/copies.py`, which this module calls. Measure against this phase's base, and do not repeat Phase 44's cut.
-5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- Each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`.
+- `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source and entry points.
+- `seed_interpreter_cache` replaces repeated interpreter probes, with `CLAUDE_PYTHON` empty and `XDG_CACHE_HOME` set.
+- The threaded cancellation test keeps fresh subprocesses, and the real slot shell stays.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
-- `scripts/copies/remote_test_support.py` — its transport fixture
+- `scripts/copies/remote_test_support.py` — seed and warm transport; also imported by `test_retire_unit.py` and `test_tidy_wrapped.py`
 
-**Workers:** 1 writer on slot `impl3` (one module and its fixture)
-- `impl3` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Phase 56: an event wait uses one held descriptor and bounded reads. Same-load pairs run after the last repair lands.
-- Phase 64: `module_cost.py --tests 10 --commands 10` names the tests and the commands with the most CPU.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module green under `module_run.py`; every other module that imports a changed support file green; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:** warm fork children keep the module_run command name until an exec, so a command table credits their CPU to it. Two probes stay green on base and new: a claim reply with no mirrors, and a server with no admission lock. These cases have no test.
 
 ### Phase 70 — The token order test stops hanging  · status: done
 **Depends on:** none
