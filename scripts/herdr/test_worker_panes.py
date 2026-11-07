@@ -55,7 +55,9 @@ class PaneWorld(herdr.Herdr):
         self.layout_changes: list[tuple[str, float]] = []
         self.unreadable = False
         self.first_turn_timeout = False
+        self.turn_end_status = herdr.AgentStatus.DONE
         self.report_reads_before_publish = 0
+        self.report_reads_at_wait: list[int] = []
         self.disappear_after_launch = False
 
     def add(self, row: staff.StaffRow, pane: str, *, live: bool = True,
@@ -147,7 +149,9 @@ class PaneWorld(herdr.Herdr):
     @override
     def native_pane_process(self, pane: str, kind: str, timeout: float) -> herdr.NativeAgentProcess:
         del timeout
-        if self.report_reads_before_publish and self.locations[pane].get("agent_status") == "done":
+        if self.report_reads_before_publish and any(
+                command[:3] == ("agent", "prompt", pane) for command in self.commands):
+            self.locations[pane]["agent_status"] = self.turn_end_status.value
             self.report_reads_before_publish -= 1
             if self.report_reads_before_publish == 0:
                 process = self.processes[self.foreground[pane][0]]
@@ -276,12 +280,22 @@ class PaneWorld(herdr.Herdr):
         return ""
 
     @override
-    def wait_until(self, pane: str, state: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
-        self.commands.append(("agent", "wait", pane, "--until", state, "--timeout", str(timeout_ms)))
-        if self.first_turn_timeout:
-            return herdr.WaitTimedOut()
-        self.locations[pane]["agent_status"] = "done"
-        return herdr.ObservedAgentState(herdr.AgentStatus.DONE)
+    def wait_turn_end(self, pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+        def wait(arguments: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            del timeout
+            command = tuple(arguments[3:])
+            self.commands.append(command)
+            self.report_reads_at_wait.append(self.report_reads_before_publish)
+            states = {command[index + 1] for index, argument in enumerate(command[:-1]) if argument == "--until"}
+            if self.first_turn_timeout or self.turn_end_status.value not in states:
+                return subprocess.CompletedProcess(arguments, 1,
+                    json.dumps({"error": {"code": "timeout", "message": "deadline"}}), "")
+            self.locations[pane]["agent_status"] = self.turn_end_status.value
+            return subprocess.CompletedProcess(arguments, 0,
+                json.dumps({"result": {"agent": {"agent_status": self.turn_end_status.value}}}), "")
+
+        with patch.object(herdr, "run_program", side_effect=wait):
+            return super().wait_turn_end(pane, timeout_ms)
 
 
 class WorkerPaneTests(StaffTestCase):
@@ -874,12 +888,31 @@ class WorkerPaneTests(StaffTestCase):
         path = self.root / "conf/direct.conf"
         write_text_atomic(path, path.read_text().replace("Reply with ready. Do not use tools.", "Reply with configured-ready.")
                           .replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=45"))
-        result = self.start("reviewer", "review")
+        with patch.object(time, "monotonic", return_value=100.0):
+            result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
         prompt = self.prompts()[0]
         self.assertIn("Reply with configured-ready.", prompt[-1])
         wait = next(command for command in self.world.commands if command[:2] == ("agent", "wait"))
-        self.assertEqual(wait[-4:], ("--until", "done", "--timeout", "45000"))
+        self.assertEqual(wait[-6:], ("--until", "done", "--until", "idle", "--timeout", "45000"))
+
+    def test_first_turn_that_ends_at_idle_returns_the_session(self) -> None:
+        self.world.turn_end_status = herdr.AgentStatus.IDLE
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.status, herdr.AgentStatus.IDLE)
+        self.assertEqual(result.row.current_session,
+                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+
+    def test_first_turn_wait_starts_after_the_session_report_is_available(self) -> None:
+        self.world.report_reads_before_publish = 2
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.row.current_session,
+                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+        self.assertEqual(self.world.report_reads_at_wait, [0])
 
     def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
         path = self.root / "conf/direct.conf"

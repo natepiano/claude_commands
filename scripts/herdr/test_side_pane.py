@@ -52,7 +52,7 @@ class SidePaneTests(StaffTestCase):
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            "HERDR_PROC": str(self.root / "proc"), "AGENTS_CALLER_FAMILY": "",
+            "HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux", "AGENTS_CALLER_FAMILY": "",
         })))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
         _ = self.enterContext(patch.object(staff, "runtime_id", side_effect=lambda: self.caller_id))

@@ -639,21 +639,24 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
 
 
 def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
-    """Finish the first Codex turn before reading its session report."""
+    """Read the session report, then wait for the first Codex turn to end."""
     settings = conf.read("direct")
     text = settings.text("WORKER_FIRST_TURN_TEXT")
     seconds = settings.number("WORKER_FIRST_TURN_SECONDS")
     deadline = time.monotonic() + seconds
     client.prompt_terminal(pane, terminal, text)
-    if isinstance(client.wait_until(pane, "done", int(seconds * 1000)), herdr.WaitTimedOut):
-        raise herdr.HerdrFailure("first turn timed out; pane retained")
     failure = "first turn timed out"
     while time.monotonic() < deadline:
         try:
-            return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+            session = client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
         except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             failure = str(error)
-        _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            continue
+        remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+        if isinstance(client.wait_turn_end(pane, remaining_ms), herdr.WaitTimedOut):
+            raise herdr.HerdrFailure("first turn timed out; pane retained")
+        return session
     raise herdr.HerdrFailure(f"{failure}; pane retained")
 
 

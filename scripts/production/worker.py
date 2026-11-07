@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import io
 import json
 import os
@@ -18,7 +18,7 @@ from typing import cast, final
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.direct import board_json, progress_history
 from scripts.herdr import worker_panes
-from scripts.lib import atomic_file, unit_runs
+from scripts.lib import atomic_file, conf, unit_runs
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
@@ -255,6 +255,14 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
     if isinstance(receipt, DispatchComplete) and worker_panes.worker_pass(started.row, run).get("status") == "completed":
         return receipt
     if isinstance(receipt, DispatchNotSubmitted):
+        if current.status == herdr.AgentStatus.WORKING:
+            seconds = conf.read("direct").number("WORKER_SETTLE_SECONDS")
+            try:
+                settled = client.wait_turn_end(current.pane, int(seconds * 1000))
+            except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+                return _delivery_failure(error)
+            if isinstance(settled, herdr.ObservedAgentState):
+                current = replace(current, status=settled.status)
         if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
             print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
             return ExitCode.BUSY

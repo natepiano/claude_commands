@@ -1051,6 +1051,7 @@ class MeshCommandFixture(unittest.TestCase):
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
         self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
+        atomic_file.write_text_atomic(self.session_dir / "worker_transport", "mesh\n")
         from scripts.production import fake_unit_host
         host = fake_unit_host.environment(self.session_dir)
         fake_unit_host.write(host, [])
@@ -14717,6 +14718,7 @@ class DetachedRunWatchTests(StaffTestCase):
             _ = (session / codex_mesh.ROSTER_FILE).write_text(json.dumps(fixture_roster(cast(dict[str, object], {"worker": {
                 "thread_id": THREAD_ID, "status": "running", "launcher_pid": os.getpid(),
             }}), staff.native_id(os.environ["CODEX_THREAD_ID"]), Path(os.environ["CODEX_HOME"]))))
+            atomic_file.write_text_atomic(session / "worker_transport", "mesh\n")
             supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                                           stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             record = runs / "orphan.json"

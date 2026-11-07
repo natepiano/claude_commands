@@ -163,7 +163,14 @@ Exit 2 means refused.
 Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
 Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
 After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
-Apply the same recovery when a quiet wait returns exit 3 (`NO_DONE`).
+A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
+So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
+1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
+   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
+2. Read the worker's reply in the pane. Check the result and the DONE line.
+3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
+A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
+When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
 After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
 Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
 Read-only pane reviewers post no board lines and run no suites.

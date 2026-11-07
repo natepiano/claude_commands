@@ -2777,7 +2777,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Gotchas:** Plan mode allows an allowed Bash command, so a plan-mode friend can reply with `send.py`. Whether it stops at a prompt depends on the model's path. A reply with no prompt does not prove the policy.
 
-### Phase 15 — Pilot and default switch  · status: todo
+### Phase 15 — Pilot and default switch  · status: done
 
 **Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f, Phase 14g, Phase 14h. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
 
@@ -2785,12 +2785,20 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, end each open pane worker that predates the compaction option, under any holder. Read `worker.py list` for each holder. The director ends its own workers, and asks each other holder's owner to end that holder's workers. End a worker only when its pass is complete, because a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). A worker whose failed pass never reached its thread has no work to recover: its rollout holds no new user message. Type `/quit` in its pane, then run `worker.py end`, which accepts a stopped worker (done for `impl2`, 2026-11-06). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, end each open pane worker that predates the compaction option, under any holder. Read `worker.py list` for each holder. The director ends its own workers, and asks each other holder's owner to end that holder's workers. End a worker only when its pass is complete, because a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). A worker whose failed pass never reached its thread has no work to recover: its rollout holds no new user message. Type `/quit` in its pane, then run `worker.py end`, which accepts a stopped worker (done for `impl2`, 2026-11-06). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Before the switch, a one-off program pinned each run that held mesh records to mesh, and is then deleted. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
-- `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
+- `config/direct.conf` — `WORKER_TRANSPORT=herdr`; `WORKER_SETTLE_SECONDS`, the wait for a worker that shows `working` when a dispatch starts.
+- `scripts/production/worker.py` — the dispatch waits within `WORKER_SETTLE_SECONDS` before it returns busy.
+- `scripts/production/test_worker.py` — the settle tests.
+- `scripts/herdr/herdr.py` — `wait_turn_end` matches `done` or `idle`, because a pane in the focused tab ends its turn at `idle`.
+- `scripts/herdr/worker_panes.py` — the first turn reads the session report, then waits for the turn to end.
+- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_worker_panes.py` — the turn end tests.
+- `scripts/herdr/test_side_pane.py` — the fixture sets `HERDR_PLATFORM`, so the fake process reader also runs on the Mac.
+- `commands/unit/direct.md` — the recovery text for a turn with no DONE line and for a friend wait.
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_mesh_runs.py`, `scripts/message/test_roster.py`, `scripts/direct/assign_claude_test_support.py`, `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_board_json.py`, `scripts/direct/test_mesh_tree_cancel.py`, `scripts/direct/test_remove_workers.py`, `scripts/direct/verify_hold_wait_test_support.py`, `scripts/direct/verify_token_wait_test_support.py` — mesh test setups name their transport, because the default is now `herdr`.
 
-**Workers:** `1 writer` — the one config line; the pilot is the director's.
+**Workers:** `3 writers` — the settle and turn end repairs, and two for the test setups; the pilot, the config line and the other edits are the director's.
 
 **State:** `config/direct.conf`.
 
@@ -2865,6 +2873,12 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 
 17. **Live detached supervisors at the rename.** `mesh_run_process.supervises` matches the literal file name `mesh_runs.py`, and that also covers a pane worker's supervisor. Before the rename, wait until no such supervisor is live, or keep its recognition until the last one ends. Test that a supervisor from before the rename still blocks a worker close.
 
+18. **The config file takes the script's name (user, 2026-11-06, through queue-unit: "the config needs to match the script name - that's approvbed").** `config/mesh_runs.conf` becomes `config/detached_runs.conf` in the same commit as the rename of `mesh_runs.py` to `detached_runs.py`.
+
+19. **The word mesh leaves the names (user, 2026-11-06, through queue-unit: "i never approved the word mesh").** After this phase, no live file, config or run folder name holds the word: `mesh_run_process.py` and the `mesh_runs/` record folder also take the `detached_runs` name. Item 17's rule covers a live run at the rename. Add no new check.
+
+20. **Tell queue-unit at landing (queue-unit, 2026-11-06).** When this phase is on the builds branch, tell queue-unit. queue-unit then sets the group name `builds-detached.slice` in the renamed script. This phase changes nothing for it.
+
 **Files:**
 - `scripts/direct/board.sh` — find the run folder from the worker's identity or environment (Spec item 16).
 
@@ -2890,6 +2904,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
   Preserve pane-worker messages and complete account-move messages.
 - `scripts/message/send.py`, `scripts/message/test_send.py` — delete the pinned `MeshWorker` delivery retained by Phase 9.
 - `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — rename to `detached_runs.py` and its test, with every caller and the `worker_panes.py` import (moved from Phase 9; sdlc, 2026-11-05). Delete the pinned `MeshCaller` and `codex_mesh.hold_message` delivery retained by Phase 9. Test worker close after the rename; keep live-run blockers and completed close behavior. `scripts/agents/mesh_run_process.py` and its supervisor tests name the literal file name `mesh_runs.py`: rename that with the command, or a live supervisor reads as absent. `result_text` and `deliver` take `int | None`, where `None` means that the supervisor disappeared: use one type for a completed command and one for a lost supervisor, and convert the record field at the reader.
+- `config/mesh_runs.conf` — rename to `config/detached_runs.conf` with the script, and update each reader: `scripts/agents/mesh_runs.py`, its test, `commands/astra_review.md`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and `docs/as-built/build-memory-admission.md`.
 - `scripts/production/staff.py`, `scripts/production/session_staff.py` — inspect staff membership and discovered backend evidence; leave their readers unchanged.
 - `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — inspect Phase 13's converted display; assign no replacement deletion again.
   Preserve `RecordedWorker | WorkerBackendUnavailable` and incomplete output.

@@ -75,6 +75,7 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
+        write_text_atomic(self.session / "worker_transport", "mesh\n")
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
         self.stack.enter_context(patch.dict(os.environ, {
                                                         "HOME": str(self.root),
@@ -144,6 +145,7 @@ class MeshRunsTests(unittest.TestCase):
         role_root = self.root / "astra/design-roles"
         mesh = role_root / "design-one/mesh"
         mesh.mkdir(parents=True)
+        write_text_atomic(mesh / "worker_transport", "mesh\n")
         worker = self.record_worker("lasting-designer", LASTING_THREAD)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"lasting-designer": {
             "staff_id": worker.id, "status": "idle", "launcher_pid": 0}}))
