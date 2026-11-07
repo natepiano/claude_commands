@@ -1,4 +1,4 @@
-"""Real verify.sh Mac retry hold with disposable tools."""
+"""Check retry deadlines and hold transitions through verify.sh."""
 from __future__ import annotations
 
 import unittest
@@ -9,7 +9,7 @@ from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 
 @final
 class VerifyMacRetryHoldTests(VerifyMacOffloadFixture):
-    def test_runner_decline_retries_from_the_routing_wait(self) -> None:
+    def test_runner_decline_retries_only_at_each_deadline(self) -> None:
         self.check_temporary_mac_decline("routing", "none", "")
 
     def test_lost_mac_run_retries_from_a_later_hold_wait(self) -> None:

@@ -122,6 +122,25 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_active_dispatch_returns_saved_launcher(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        parent = fixture_member("unit", name="active-holder", parent=fixture_member("showrunner", name="active-owner").id)
+        worker = fixture_worker("impl", parent.id)
+        run = self.root / "active-run"
+        path = run / "progress_history_state.json"
+        command = ["bash", "assign.sh", "a path with spaces"]
+        fields = {"pass": {"impl": {"status": "active", "instance_id": "same-pass", "worker_name": "impl", "launcher_command": command}}}
+        write_text_atomic(path, json.dumps(fields))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatch("same-pass", tuple(command)))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        fields["pass"]["impl"]["status"] = "completed"
+        write_text_atomic(path, json.dumps(fields))
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.NoActiveDispatch)
+        write_text_atomic(path, "{broken")
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatchUnavailable)
+
     def test_config_digest_reads_without_catalog_sync_and_keeps_the_inherited_launch_text(self) -> None:
         settings = self.root / "digest-settings"
         settings.mkdir()
@@ -7898,6 +7917,8 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.read_state(session_dir)["open_phases"], [])
 
 
+
+
 class PhaseCountTests(unittest.TestCase):
     """A plan's phase headings take three forms; all three must be counted.
 
@@ -8369,6 +8390,20 @@ class LastDispatchTests(StaffTestCase):
         (run / unit_runs.STATE_FILE).unlink()
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
 
+    def test_last_dispatch_keeps_the_role_and_id_of_a_refused_fix_after_a_completed_review(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "review": {"instance_id": "review-pass", "worker_name": "dispatch-worker", "kind": "review",
+                       "started_at": 1, "finished_at": 2, "status": "completed", "phase": {"id": "14f"}},
+            "fix": {"instance_id": "refused-fix", "worker_name": "dispatch-worker", "kind": "fix",
+                    "started_at": 3, "status": "refused", "phase": {"id": "14f"}},
+        })
+        path = run / unit_runs.STATE_FILE
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "fix", "14f", missing, str(run / "phases/14f/files"), "refused-fix", "refused"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_last_dispatch_reads_the_older_single_pass_shape(self) -> None:
         run, worker = self.dispatch_fixture({"instance_id": "old", "worker_name": "dispatch-worker",
                                              "kind": "impl", "phase": {"id": "3t"}})
@@ -8460,6 +8495,8 @@ class LastDispatchTests(StaffTestCase):
         missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
         self.assertEqual(dispatch, progress_history.RecordedDispatch("test", missing, missing, missing, "finished", "completed"))
         self.assertEqual(calls.read_text(), "")
+
+
 
 
 class StaffProgressHistoryTests(StaffTestCase):

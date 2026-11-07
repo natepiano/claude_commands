@@ -5,9 +5,6 @@ import json
 from pathlib import Path
 from typing import NamedTuple, cast
 
-import live_units
-import unit_lookup
-
 NONE = "—"
 
 
@@ -18,18 +15,6 @@ class OpenStep(NamedTuple):
 
 class NoOpenStep(NamedTuple):
     pass
-
-
-def session_cell(unit: live_units.LiveUnit) -> str:
-    """The unit's session name now, or why there is none."""
-    if unit.session is None:
-        return "gone"
-    claude = unit.session.claude
-    if isinstance(claude, unit_lookup.LiveClaude):
-        return claude.name
-    if isinstance(claude, unit_lookup.ClaudeUnknown):
-        return "unknown"
-    return "not running"
 
 
 def open_step(events: list[dict[str, object]]) -> OpenStep | NoOpenStep:

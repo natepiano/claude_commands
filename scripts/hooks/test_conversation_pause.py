@@ -20,7 +20,7 @@ import herdr
 from scripts.message.relay_identity import relay_session_name
 from unit_lookup import Place
 from scripts.hooks import hook_dispatch
-from scripts.lib import test_hang_guard
+from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
     ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
@@ -270,6 +270,77 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertCountEqual([call[2] for call in calls],
                               ["ScriptPrompt", "ScriptPrompt", "PeerPrompt", "HarnessNotice", "UserTypedPrompt"])
         self.assertTrue(all(call[4] == SESSION for call in calls))
+
+    def test_wrapped_resume_prompt_records_script_activity_without_a_typed_stamp(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        resume = script_prompt("You were stopped and resumed because unit watchdog recovery.\nContinue where you stopped.")
+        for closing in ('</pasted_content id="7d9f">', '</pasted_content>'):
+            with self.subTest(closing=closing):
+                prompt = f'\n\n<pasted_content id="7d9f">\n{resume}\n{closing}\n'
+                result = self.run_prompt(prompt)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+                self.assertFalse((self.escalate_root / "typed").exists())
+                self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(2)], ["ScriptPrompt", "ScriptPrompt"])
+
+    def test_wrapped_script_with_literal_paste_tags_records_script_activity(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        for token in ("<pasted_content>", "</pasted_content>"):
+            for closing in ('</pasted_content id="outer">', '</pasted_content>'):
+                with self.subTest(token=token, closing=closing):
+                    script = script_prompt(f"Continue reviewing the literal `{token}` token.\n")
+                    prompt = f'<pasted_content id="outer">\n{script}\n{closing}'
+                    result = self.run_prompt(prompt)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+                    self.assertFalse((self.escalate_root / "typed").exists())
+                    self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(4)], ["ScriptPrompt"] * 4)
+
+    def test_two_pasted_script_envelopes_record_typed_activity(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        script = script_prompt("Continue where you stopped.")
+        prompt = (f'<pasted_content id="one">{script}</pasted_content>'
+                  + f'<pasted_content id="two">{script}</pasted_content>')
+        result = self.run_prompt(prompt)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(1)], ["UserTypedPrompt"])
+
+    def test_user_pastes_and_text_around_a_script_paste_record_typed_activity(self) -> None:
+        self.record_activity()
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        wrapped = f'<pasted_content id="one">{script_prompt("Continue where you stopped.")}</pasted_content>'
+        prompts = (
+            '<pasted_content id="one">Please explain this code.</pasted_content>',
+            f"Explain this: {wrapped}",
+            f"{wrapped} Explain this.",
+            f'{wrapped}<pasted_content id="two">Explain this.</pasted_content>',
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertEqual([call[2] for call in self.activity_calls(len(prompts))],
+                         ["UserTypedPrompt"] * len(prompts))
+
+    def test_wrapped_recorded_script_consumes_its_inner_text_evidence_once(self) -> None:
+        self.record_activity()
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        with patch.dict(os.environ, self.environment, clear=True):
+            script_prompts.record(f"session:{SESSION}", "/resume")
+        prompt = '<pasted_content id="one">\n/resume\n</pasted_content id="one">'
+        first = self.run_prompt(prompt)
+        self.assertEqual((first.returncode, first.stdout, first.stderr), (0, "", ""))
+        self.assertFalse((self.escalate_root / "typed").exists())
+        second = self.run_prompt(prompt)
+        self.assertEqual((second.returncode, second.stderr), (0, ""))
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertEqual([call[2] for call in self.activity_calls(2)], ["ScriptPrompt", "UserTypedPrompt"])
 
     def test_typed_stamp_failure_does_not_skip_report_pause(self) -> None:
         _ = self.escalate_root.write_text("not a directory")

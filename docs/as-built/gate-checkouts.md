@@ -19,10 +19,9 @@ below is required; the implementation has no fallback values.
 | `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
 | `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
 
-These are shipped configuration values, not defaults in code. `owner.nightly`
-(`nightly`) and `owner.style` (`style`) are required only when their caller needs
-a fallback owner because production context is unavailable. There is no
-configurable pool size: each owner and repository has exactly two checkout slots.
+These values come from configuration.
+`owner.nightly=nightly`, `owner.style=style`, and `owner.verify=verify` supply owners when production context is unavailable.
+Each owner and repository has exactly two checkout slots.
 
 The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
@@ -34,9 +33,11 @@ or `cargo-liner`. Linked worktrees use the main repository's name, so a unit
 worktree of `.claude` uses `.claude/verify-unit-gate`. The root under
 `~/worktrees` belongs to the existing trusted direnv root.
 
-Owners are unit or production names, such as `verify` or `builds`, and must
-match `[a-z0-9][a-z0-9-]*`. Use no phase, run, or session ids. The caller supplies
-the owner from its existing context; the helper does not consult a roster.
+Owners are unit or production names, such as `verify` or `builds`.
+Owners match `[a-z0-9][a-z0-9_-]*`.
+Use no phase, run, or session ids.
+The caller supplies the owner from its existing context.
+The helper does not consult a roster.
 
 ## Reset and build output
 
@@ -171,39 +172,105 @@ Script callers use the same implementation:
 ```python
 from scripts.copies import copies
 
-with copies.standing(owner, repo, commit,
-                     apply_uncommitted=worktree, merge=merge_ref) as tree:
+with copies.standing(owner, repo, copies.WorktreeSource(commit, worktree),
+                     merge=copies.MergeRevision(merge_ref)) as tree:
     run_gate(tree)
 ```
 
-Both keyword arguments default to `None`. `standing` yields a `Path` while
-holding the tree. `CopyError` represents a refusal; `PreparationError` is its
-subclass for apply or merge failures.
+The source policy is `CommittedSource(revision)`, `WorktreeSource(revision, worktree)`, or `StagedSource(tree)`.
+`StagedSource` requires a tree identity.
+The merge policy defaults to `NoMerge()`.
+`standing` yields a `Path` while it holds the lease.
+`CopyError` represents a refusal.
+`PreparationError` represents an application or merge failure.
+
+`hold --repo R` holds a staged checkout until its standard input closes.
+It computes the staged tree through a private index before it prepares the checkout.
+It accepts no staged-tree argument.
+It prints the tree identity first and the checkout path second.
+It reads the source owner, including the owner in a standing checkout's `.gate.json`.
+`verify.sh doc` reads both lines and retains the lease through descriptor 8.
+The source index and unchanged file modification times remain unchanged.
+`run` requires `--commit` and accepts no staged-source flags.
 
 ## Guard and exceptions
 
 `scripts/copies/copy_guard.py` owns the creation rule; `config/copies.conf` owns
 the allow list. The
 PreToolUse Bash dispatcher refuses direct repository cloning, worktree
-creation, and recursive repository copying, and points to `copies.py run` with
-an example. The repository scan applies the same allow list to script code.
+creation, and recursive repository copying. Its refusal gives a `copies.py run` example and the `make_worktree.sh <path> <branch>` command for a lasting phase tree.
+Run that command from the source repository. The repository scan applies the same allow list to script code.
 
 The guard distinguishes no forbidden operation, a specific detected repository-tree operation, and an unresolved relevant operation. One invocation decoder handles shell commands, tool argv and Python subprocess vectors. It distinguishes command text, stdin programs, script/module operands and informational invocations using interpreter-specific option semantics: CPython options and operands, Bash/Zsh invocation options, and portable POSIX sh meanings. Script stdin and informational invocation input are data, while executable outer expansions are inspected before exemptions. Ordered descriptor duplication through <& and >&, moves, closure and replacement determine selected stdin; an unknown selected input refuses with a specific unresolved reason. Nested parsing distinguishes program, array word-list, parameter and arithmetic context. Literal data stays data while executable substitutions are inspected recursively. Runtime unresolved relevant programs refuse; static abstract analysis may defer unknown interpreter input to concrete call sites. Known gaps remain interprocedural analysis, generated programs such as bash -c "$(printf ...)", aliases and sourced files. Supported syntax is bounded by the documented tested forms rather than a claim to implement every shell dialect.
 
 | Allowed creator | Reason |
 | --- | --- |
-| `scripts/copies/copies.py` | The standing gate checkout implementation. |
+| `scripts/copies/copies.py` | Creates standing checkouts, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
 | `scripts/production/resume_unit.py` | Restores original unit worktrees. |
-| `scripts/mac_test/offload.py` | Mac mirrors move in a later checkpoint. |
-| `scripts/production/mac_run.sh` | Mac mirrors move in a later checkpoint. |
-| `scripts/direct/verify.sh` | Its documentation checkout is already standing. |
 | `scripts/berth_fix/launch.sh` | Creates a standing original fixer worktree, not a build copy. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Before/after comparisons run in turn in one tree or use the second tree.
-Mac mirrors move in a later checkpoint. More than two simultaneous builds for
-one owner and repository wait. Old copies under `/tmp` are left for the existing
-floor sweep; this checkpoint does not delete them.
+Comparisons run in sequence in one tree or use the second tree.
+More than two simultaneous builds for one owner and repository wait.
+The existing floor sweep handles old copies under `/tmp`.
+
+## Remote mirrors
+
+`copies.py` creates and refreshes mirrors for Mac, Linux, and AWS targets.
+`offload.py` requests a mirror through this API.
+`mac_run.sh` creates and registers its test clone through the same implementation.
+Neither caller has a copy-creation exception.
+
+`remote_lease_path(mirror)` names the lease beside the mirror's registry record.
+The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
+A busy lease reads only its own registry record.
+The mirror lease precedes the floor claim lock, which precedes the copy-record lock.
+`mirror_metadata_locks` holds the claim and record locks inside the mirror lease.
+The remote command starts after these metadata locks close.
+It retains the mirror lease until it ends.
+
+`mark_mirror` writes the record, session, and mark.
+`floor_claims.read_mirror_record` reads a record path, including removal authority.
+`floor_claims` owns the metadata names and the sibling lock paths.
+Content removal deletes metadata last, with the record after the session and mark.
+`remote_rsync` protects these names through explicit exclusions.
+Receive recovery keeps the existing owner and preserves a complete replacement record.
+It publishes all metadata before it removes the removal authority.
+Successful use transfers ownership to the selected owner.
+Removal prefers the current record and uses removal authority only when the record is absent.
+The sweep finds marks and removal authority in the two supported mirror layouts.
+
+`register-remote` requires `--owner` and `--repository`.
+It accepts no source repository path.
+`unit_owner` preserves recorded names, including underscores, and appends one `-unit` suffix.
+
+Mirror checks use `tmp_sweep.process_paths` on Linux and `tmp_sweep.lsof_paths` on the Mac.
+A working directory, open file, or mapped file below the mirror keeps it busy.
+A path with only the same text prefix does not keep the mirror busy.
+`mirror_lease_set` takes candidate leases before one shared process scan.
+It classifies mirrors while it holds these leases.
+It releases busy mirrors and reports them as protected.
+`local_mirror_lease` scans after it acquires its own lease.
+An unreadable process in the recorded process group keeps the mirror busy.
+An unavailable scan also keeps the mirror busy.
+The lsof scanner accepts output only with exit status 0 or 1.
+Every other status makes the scan unavailable.
+The Linux scanner reports unreadable working directories during its single process scan.
+
+`target_config.slot_capacity` reads the slot capacity for claims and offload admission.
+Both callers raise `ConfigError` for a bad configured value, including an empty value.
+The required `missing` policy applies only when both capacity keys are absent.
+Mac claims still use one slot.
+Offload records use `build_hold.owning_session()` before the shell session fallback.
+Busy refusals can therefore name the unit director's session.
+
+After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.
+It removes the Mac's `localhost` record before the natedev record.
+`unregister-remote` accepts only `--host` and `--path`.
+`mirror-remove` accepts `--host`; receive and use accept the command arguments.
+A failed clone cleanup keeps both records.
+A marked mirror probe starts no remote Python and skips `mirror_local_path`.
+An unmarked probe keeps the existing path check and metadata creation.

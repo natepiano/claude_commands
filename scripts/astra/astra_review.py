@@ -20,8 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work, design_roles  # noqa: E402
-from scripts.production import staff
 from scripts.lib import unit_runs
+from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
@@ -31,9 +31,8 @@ COMPACT_ABOVE_TOKENS = 200_000
 # Lines of Codex's own output a failure prints.
 ERROR_TAIL_LINES = 40
 SCRIPTS = Path(__file__).resolve().parents[1]
-# Tests point these at a stub and a temporary folder.
+# Tests use a stub accounts command.
 ACCOUNTS_COMMAND = os.environ.get("ASTRA_REVIEW_ACCOUNTS") or ""
-RUNS_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
 
 
 def accounts_command() -> list[str]:
@@ -88,7 +87,7 @@ def codex_arguments(label: str, review: Path, working_dir: Path) -> list[str]:
 
 def run_folder() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    folder = RUNS_ROOT / f"{stamp}-{os.getpid()}"
+    folder = unit_runs.ASTRA_RUN_ROOT / f"{stamp}-{os.getpid()}"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
