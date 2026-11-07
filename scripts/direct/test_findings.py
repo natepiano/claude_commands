@@ -438,6 +438,22 @@ class FindingsLedgerTests(FindingsLedgerFixture):
             self.assertIsNone(payload["advisory"])
             self.assertIsNone(payload["consecutive_same_kind"])
 
+    def test_mixed_launch_metadata_counts_one_ledger_batch(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        self.close_round(["F001"], verdict="still_open")
+        records = self.events()
+        for record in records:
+            if record["event_type"] in {"pass_started", "pass_finished"}:
+                _ = record.pop("launch_check", None)
+        _ = self.history_file.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        self.record_repair_pass(launch=2)
+        self.assertEqual(self.gate()["repair_round"], 2)
+        self.assertEqual(self.run_command("dispatch", "--covers", "F001"), "round 2 covering F001")
+        dispatched = [event for event in self.events() if event["event_type"] == "finding_batch_dispatched"][-1]
+        self.assertEqual(dispatched["repair_round"], 2)
+
     def test_started_batches_without_dispatch_events_count_repair_rounds(self) -> None:
         self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")

@@ -203,18 +203,27 @@ class RepairRoundTests(unittest.TestCase):
         repairs = rounds.phase_rounds(events)
         self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
 
+    def test_mixed_launch_metadata_keeps_one_batch_number_in_two_groups(self) -> None:
+        events = ledger_events()
+        events += pass_events(BASE + 10, BASE + 20, name="first", number=1)
+        events += pass_events(BASE + 30, BASE + 40, name="retry", ledger_round=1)
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], [1]])
+        self.assertEqual([repair["cause"] for repair in repairs], ["review-code", "other"])
+        self.assertEqual([repair["passes"] for repair in repairs], [1, 1])
+
     def test_missing_dispatch_keeps_ledger_identity_and_refund_rules(self) -> None:
         events = pass_events(BASE, BASE + 10, name="batch", ledger_round=1)
         events += pass_events(BASE + 20, BASE + 30, name="retry", ledger_round=1)
         events += pass_events(BASE + 40, BASE + 50, name="gate", activity="run tests")
         repairs = rounds.phase_rounds(events)
-        self.assertEqual([repair["ledger_group"] for repair in repairs], [True, False])
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], []])
         self.assertEqual([repair["cause"] for repair in repairs], ["other", "gate"])
         self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
         events.append(dict(event("finding_batch_abandoned", BASE + 60), round=1, edits_landed=False))
-        self.assertEqual([repair["ledger_group"] for repair in rounds.phase_rounds(events)], [False])
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[]])
         events.append(dict(event("finding_batch_landed", BASE + 70), round=1))
-        self.assertEqual([repair["ledger_group"] for repair in rounds.phase_rounds(events)], [True, False])
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[1], []])
 
     def test_refunded_batch_adds_no_round_unless_it_later_lands(self) -> None:
         events = ledger_events() + pass_events(BASE + 10, BASE + 13, ledger_round=1, status="error")
