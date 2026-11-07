@@ -391,13 +391,17 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
-  - **Pause records:** `staff.py pause <unit> --why "<why>"` records `paused: {since, by, why}` on the staff row.
-    `pause --production <showrunner name> [--except <unit>...] --why "<why>"` uses the production membership reader.
-    `resume <unit>` and `resume --production <showrunner name>` remove that field.
-    Both operations are safe to repeat and stop nothing.
-    `since` uses the user zone.
-    `by` uses the caller's staff name through its runtime identity.
-    Staff row copies retain the field.
+  - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
+    The director finishes its current turn and holds at the prompt.
+    `agents exit <unit> --why "<why>"` records `exited: {since, by, why}` and stops the director and workers.
+    Both commands retain the staff rows and tabs.
+    Add `--finish-step` to wait for the workers' current tasks before stopping them.
+    `agents pause --production <showrunner name> [--except <unit>...] --why "<why>"` uses the production membership reader.
+    `agents resume <unit>` removes a pause and sends one continuation. Failed delivery restores the pause and returns failure.
+    For an exited unit, resume starts its retained conversation on the role account. Success removes the exit record.
+    `agents resume --production <showrunner name>` resumes the production's units.
+    `since` uses the user zone. `by` uses the caller's staff name.
+    Staff row copies retain the hold fields.
   - **Phase productions:** `| Unit | Status | Phase | Task |`.
     Phase comes from `phase_table.show_production`.
     It shows `<n> of <total> · <title>`, `between phases, <done> of <total> done`, `not started`, `plan done`, `no phases` or `no plan`.

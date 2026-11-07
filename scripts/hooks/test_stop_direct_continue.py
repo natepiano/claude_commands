@@ -72,13 +72,16 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         _ = marker.write_text(str(run), encoding="utf-8")
         config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
+        from scripts.lib.atomic_file import write_text_atomic
+
+        write_text_atomic(root / "staff.json", json.dumps({"schema": 1, "rows": []}))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
             "XDG_STATE_HOME": str(root / "state"), "UNIT_ACTIVE_DIR": str(active),
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"),
         }
         fixture = DirectorStopFixture(root, run, marker, root / "transcript.jsonl", environment)
         fixture.write_usage(160_000)

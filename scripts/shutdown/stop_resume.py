@@ -375,10 +375,15 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     from scripts.shutdown import restart
 
     holder = record.by_id(unit)
-    if not record.find(kind="worker", parent=unit) or holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
+    if not record.find(kind="worker", parent=unit):
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
+        if holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
+            from scripts.agents import codex_mesh
+
+            codex_mesh._pause_roster(str(worker_panes.worker_run(holder)), stop_servers=True, deadline=deadline)  # pyright: ignore[reportPrivateUsage]
+            return []
         states = worker_panes.observe(unit, record)
         unresolved = [f"{item.row.name}: {item.reason}" for item in states
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
@@ -389,7 +394,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr.HerdrFailure, SystemExit) as error:
         unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
         print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     return unresolved
@@ -399,8 +404,8 @@ def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
     return pane_record.resume_arguments(LaunchNames.read().resume(entry))
 
 
-def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
-    """Build the account command for both terminal paths."""
+def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> tuple[list[str], dict[str, str]]:
+    """Read the pane environment and remove inherited launch proofs."""
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
@@ -410,6 +415,12 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
+    return unset, environment
+
+
+def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
+    """Build the account command for a shell in another pane."""
+    unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.agent_kind(entry)
     if kind == "claude":
         herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
@@ -426,9 +437,38 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
                       account: str, message: str) -> Never:
     """Replace the foreground command with the saved account launch."""
-    command = _pane_command(tab, entry, account)
+    from scripts.production import staff
+
+    from scripts.lib.agent_program import resolve_program
+
+    kind = pane_launch.agent_kind(entry)
+    environment = accounts.launch_shell_environment(Path(entry["cwd"]))
+    unset, pane_environment = _pane_environment(tab, entry)
+    environment.update(pane_environment)
+    for key in unset:
+        _ = environment.pop(key, None)
+    if kind == "claude":
+        prepared = accounts.prepare_claude_launch(account, resume=True)
+        for key in prepared.remove:
+            _ = environment.pop(key, None)
+        environment.update(prepared.variables)
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
+    else:
+        environment["CODEX_HOME"] = entry["config_dir"]
+    program = resolve_program(kind, environment=environment)
+    command = [program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
+    if message and kind == "claude":
+        command.append(message)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, *([message] if message and pane_launch.agent_kind(entry) == "claude" else [])])
+    row = staff.initial_snapshot().by_member_reference(entry["session_id"])
+    if row is not None and isinstance(row.exited, staff.Exited):
+        _ = staff.resume(str(row.id))
+    try:
+        os.execvpe(program, command, staff.child_environment(environment))
+    except OSError:
+        if row is not None and isinstance(row.exited, staff.Exited):
+            _ = staff.set_hold(str(row.id), row.exited)
+        raise
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:

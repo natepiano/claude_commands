@@ -8,6 +8,7 @@ import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, cast
 from importlib import import_module
@@ -269,6 +270,10 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                         key=lambda entry: entry["written_at"], default=None)
             if entry is not None and entry["pane_id"] in pane_ids:
                 found.append((row, entry["pane_id"]))
+        missing = [row for row in rows if row.kind == "agent" and not any(item.id == row.id for item, _pane in found)]
+        if missing:
+            scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
+            found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))
         return found
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
@@ -311,6 +316,33 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
     return selected
 
 
+def _codex_conversations(client: herdr.Herdr) -> herdr.CodexConversations:
+    """Use the native pane reader for resumed Codex processes without open rollouts."""
+    observed = herdr.codex_conversations()
+    if not observed.unknown:
+        return observed
+    live = dict(observed.live)
+    unknown = list(observed.unknown)
+    try:
+        panes = client.listed("pane")
+    except (OSError, ValueError, herdr.HerdrFailure):
+        return observed
+    for pane in panes:
+        if pane.get("agent") != "codex":
+            continue
+        try:
+            pane_id = herdr.json_text(pane.get("pane_id"), "pane id")
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"),
+                                     "native pane processes")
+            identity = herdr.pane_native_process(info, "codex", pane).current_identity
+            _ = live.setdefault(identity, ())
+            name = client.pane_tab(pane_id)[2]["name"]
+            unknown = [reason for reason in unknown if reason != f"{name} (Codex thread unknown)"]
+        except (OSError, ValueError, herdr.HerdrFailure):
+            continue
+    return herdr.CodexConversations(live, tuple(unknown))
+
+
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
               resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
@@ -321,7 +353,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     except (OSError, ValueError) as error:
         print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
         candidates = {}
-    codex = herdr.codex_conversations()
+    codex = _codex_conversations(client)
     for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
         _ = candidates.setdefault(identity, identity)
     owned = {row.current_session for row in record.rows}
@@ -349,7 +381,17 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     return selected
 
 
-def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
+class AfterStop(Enum):
+    RESTART = "resume the selected rows"
+    KEEP_STOPPED = "keep the selected rows for the next restart"
+
+
+def stop_all(*, dry_run: bool = False) -> int:
+    return restart(stop_all=True, dry_run=dry_run, after_stop=AfterStop.KEEP_STOPPED)
+
+
+def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
+            after_stop: AfterStop = AfterStop.RESTART) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -361,7 +403,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     if stop_all:
         selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver)
     select_only = bool(only) and not stop_all
-    pending_ids = list(only) if select_only else shutdown_record.read()
+    pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
+                   list(only) if select_only else shutdown_record.read())
     if dry_run and not select_only and not stop_all:
         path = shutdown_record.record_path()
         saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
@@ -394,7 +437,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 _anomaly(row, error)
         for row in selected:
-            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
+            action = "; would stop and save" if after_stop == AfterStop.KEEP_STOPPED else ""
+            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}{action}")
         for row in {row.id: row for row, _pane in visible if row not in selected}.values():
             print(f"{row.name}: left alone; no proved local restart target")
         return 0
@@ -421,6 +465,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _anomaly(holder, error)
             except errors as error:
                 _anomaly(holder, error)
+    if after_stop == AfterStop.KEEP_STOPPED:
+        return 0
     present = False
     if holders:
         try:

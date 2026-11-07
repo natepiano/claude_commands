@@ -2,10 +2,30 @@
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `resume`, `restart`, and `stop`.
+The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
+Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+
+`agents pause NAME --why TEXT` stops the workers now.
+The director finishes its current turn and holds at the prompt.
+`agents exit NAME --why TEXT` stops the director and its workers.
+Both commands preserve the staff rows, tabs, and shells.
+Add `--finish-step` to wait for the workers' current tasks before stopping them.
+The staff row records the time, caller, and reason under `paused` or `exited`.
+The board shows that state.
+`agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
+`agents resume --production SHOWRUNNER` resumes its units.
+Resume removes a pause record and sends the director one continuation message.
+Queued or failed delivery restores the same pause record and returns failure.
+Resume starts an exited director through the shared role-account path and removes its exit record after success.
+The prompt hook retains a paused director's hold for every prompt source.
+It adds context without blocking or removing the message.
+An own-pane resume resolves the agent executable before it removes the exit record.
+It executes that path directly. A missing executable retains the exit record.
+The stop hook skips the automatic continuation for that director.
+Stop does not save or restore composer drafts.
 
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
@@ -147,9 +167,15 @@ The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
 
-`agents restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
-It stops each session, then starts each session.
-It saves only the row IDs whose starts failed.
+Before a power-off, run `agents stop --all`.
+After login, run `agents restart`.
+
+`agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
+The selection includes freestanding agents, such as brain and morty.
+It saves each row ID before its stop. It starts nothing.
+A live session without a staff row prints one anomaly line. Stop does not save it.
+`agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
+It keeps only the row IDs whose starts failed.
 A stop checks the current conversation before it sends a signal.
 A failed row prints one anomaly line. Other rows continue.
 
@@ -159,9 +185,10 @@ A row leaves the saved list when it starts or already runs.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
-`--dry-run` prints each selected name, row ID, kind, and saved tab position.
+`stop --all --dry-run` prints each selected name, row ID, kind, and tab position with `would stop and save`.
+`restart --dry-run` prints saved rows and identifies live rows outside the saved list.
 A row without a saved tab says so on the same line.
-The command changes nothing.
+Both commands change nothing.
 `--only ID[,ID...]` selects staff rows for callers that resume a moved unit.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
@@ -169,6 +196,8 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
+A freestanding agent without a recorded folder uses the home folder.
+The native pane reader identifies resumed Codex sessions without an open rollout file.
 It finds the transcript and its account by the current session ID.
 Claude uses `--resume ID`. Codex uses `resume ID` in the worktree.
 The launch sends no work prompt.
@@ -177,3 +206,9 @@ Restart does not send phone pushes or use `add_unit.py`.
 
 `restart_support.py` retains the continuation-message API for the quota watcher.
 `restart.wait_for_confirmation` supports the existing unit attachment path.
+
+Claude launches write folder trust in the target account before the process starts.
+The write uses the repository trust key, or the folder itself outside a repository.
+A failed write prints one anomaly with the folder, account file, and error.
+The launch then returns its failure result without a process start.
+A composer with a draft waits until the deadline without changes to the draft.

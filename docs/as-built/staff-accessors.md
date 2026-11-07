@@ -12,7 +12,7 @@ On the Mac, `staff.py` asks natedev over SSH.
 
 ## Staff identity and backends
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, and `unknown_fields`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, `exited`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
@@ -25,21 +25,26 @@ A live Claude session can supply backend evidence before its transcript exists.
 A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
 
 `StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
-JSON stores `paused: {since, by, why}` only for a paused row.
-`pause(reference, why)` records the time in the user zone and the caller's staff name.
-`resume(reference)` removes the field.
-The commands accept a unit or `--production <showrunner name>`.
-Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
-An unmatched `--except` value refuses the whole command before any write.
-The refusal names the value and the production. A unit of another production does not match.
-Both commands are safe to repeat. They stop no process.
-Rename, move, retire and restore retain the pause field.
+`StaffRow.exited` is `Exited(since, by, why)` or `Active()`.
+JSON stores each hold field only when that hold is active.
+`pause(reference, why)` and `exit(reference, why)` record the time, caller, and reason through `set_hold`.
+`resume(reference)` removes both hold fields through `set_hold`.
+These staff functions write the record. The `agents` program owns process control and continuation delivery.
 
-Rows, locations, and pause records keep fields that the reader does not know in `unknown_fields`.
+`agents pause NAME --why TEXT` stops the workers and holds the director at its prompt.
+`agents exit NAME --why TEXT` stops the director and workers.
+`--finish-step` waits for the workers' current tasks first.
+`agents resume NAME` sends a paused director one continuation or starts an exited director through the shared resume path.
+Failed continuation delivery restores the pause. A failed start retains the exit record.
+The production forms use `--production SHOWRUNNER` and accept repeated `--except UNIT` values for pause and exit.
+An unmatched exclusion refuses the production command before any write.
+Repeated holds retain the original metadata. Rename, move, retire, and restore retain the hold fields.
+
+Rows, locations, and hold records keep fields that the reader does not know in `unknown_fields`.
 Writes preserve these fields unchanged. Row changes also preserve them.
 The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
 Changes from the Mac use the same owner setters.
-A new pause record starts with no unknown fields because it replaces the old record.
+A new hold record starts with no unknown fields.
 Staff storage uses schema 2.
 A change that old code cannot read safely requires a new schema number.
 `staff_sources.live` emits observations with schema 3.
@@ -60,14 +65,14 @@ Each wait uses the smaller configured limit or remaining operation deadline.
 ## Accessor table
 
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
-They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, and `resume`.
+They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
 
 | File | Access | `staff` calls |
 |---|---|---|
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
-| `commands/showrunner/units.md` | write | staff.py pause, resume (shell) |
+| `commands/showrunner/units.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
-| `docs/as-built/showrunner-automation.md` | write | staff.py pause, resume (shell) |
+| `docs/as-built/showrunner-automation.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
@@ -111,7 +116,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
-| `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
+| `scripts/hooks/conversation_pause.py` | read | snapshot; LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
@@ -211,10 +216,10 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/shutdown/remote_control.py` | read | initial_snapshot |
 | `scripts/shutdown/restart.py` | read | initial_snapshot, row_operation |
 | `scripts/shutdown/session_types.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | read | initial_snapshot |
+| `scripts/shutdown/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/shutdown/shutdown_record.py` | read | snapshot |
 | `scripts/shutdown/stop_results.py` | read | StaffRow and backend types (type check only) |
-| `scripts/shutdown/stop_resume.py` | read | initial_snapshot, row_operation |
+| `scripts/shutdown/stop_resume.py` | write | initial_snapshot, row_operation, resume, set_hold, child_environment |
 | `scripts/shutdown/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |

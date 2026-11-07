@@ -1271,6 +1271,65 @@ class RestartTests(RestartTestCase):
         self.assertEqual(shutdown_record.read(), ["missing-row"])
         self.assertIn("missing-row: restart anomaly: in the restart record, no fixed staff id", errors.getvalue())
 
+    def test_stop_all_saves_each_row_before_stop_and_starts_nothing(self) -> None:
+        def stop(identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped:
+            row = next(row for row in self.rows if row.current_session == identity)
+            self.assertIn(str(row.id), shutdown_record.read())
+            return self.stop(identity, deadline=deadline)
+
+        with patch.object(stop_resume, "stop", side_effect=stop):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+        self.assertEqual(shutdown_record.read(), [str(row.id) for row in self.rows])
+        self.assertEqual(self.stops, [str(row.id) for row in self.rows])
+        self.assertEqual(self.launches, [])
+
+    def test_stop_all_keeps_a_freestanding_agent_for_its_saved_tab(self) -> None:
+        row = replace(self.rows[0], kind="agent", name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
+        self.rows = (row,)
+        record = staff.StaffSnapshot(self.rows)
+        with patch.object(staff, "initial_snapshot", return_value=record):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+            self.assertEqual(shutdown_record.read(), [str(row.id)])
+            self.assertEqual(self.launches, [])
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(self.stops, [str(row.id)])
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name))])
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_stop_all_dry_run_saves_nothing_and_names_each_row_once(self) -> None:
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["stop", "--all", "--dry-run"]), 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"{row.name}: {row.id}, {row.kind}, workspace live, tab {n + 1} ({row.name}); would stop and save"
+            for n, row in enumerate(self.rows)])
+        self.assertFalse(shutdown_record.record_path().exists())
+        self.assertEqual((self.stops, self.launches), ([], []))
+
+    def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
+        row = replace(self.rows[0], kind="agent", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        self.rows = (row,)
+        self.running.clear()
+        pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",
+                "terminal_id": "terminal-0", "agent": "codex"}
+        result = self.layout_result
+
+        def layout(*arguments: str) -> dict[str, object]:
+            if arguments == ("pane", "list"):
+                return {"panes": [pane]}
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": {"shell_pid": 990090, "foreground_process_group_id": 990100,
+                    "foreground_processes": [{"pid": 990100, "argv": ["codex", "resume", str(row.current_session)]}]}}
+            return result(*arguments)
+
+        with (patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                    {}, ("TEST-brain (Codex thread unknown)",))),
+              patch.object(herdr.Herdr, "result", side_effect=layout),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                    herdr.LaunchArgument(str(row.current_session)), "fixture-start", {})),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [row])
+        self.assertEqual(errors.getvalue(), "")
+
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
         with (patch.object(herdr.Herdr, "save_layout") as save,
               patch.object(herdr.Herdr, "remember_row_tab") as remember):
