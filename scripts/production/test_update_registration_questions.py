@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import proposal_issue, proposals_folder, staff
+from scripts.production.issues import Issue, frontmatter
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
@@ -19,6 +20,53 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_shared_proposals_and_questions_follow_staff_rename_and_transfer_without_rewrites(self) -> None:
+        owner_id = self.owner_id
+        unit_id = self.fixture_staff_id("alpha")
+        destination_doc = self.doc.with_name("other-production.md")
+        _ = destination_doc.write_text(self.doc.read_text())
+        destination = fixture_member("showrunner", name="destination",
+                                     doc=staff.LiveDoc("natedev", destination_doc))
+        proposal = self.root / "issues/layout-proposal.md"
+        _ = proposal.write_text("\n".join([
+            "---", "status: open", "tags: [issue, proposal]", "proposal_id: P1",
+            f"proposed_by: {unit_id}", f"unit: {unit_id}", "date_created: 2026-11-02",
+            "---", "A separate proposal.", "",
+        ]))
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            for title, asker in (("Choose the layout", str(unit_id)), ("Choose the colors", "")):
+                filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
+                                         "--unit", asker)
+                self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        questions = list((self.root / "issues").glob("question-*.md"))
+        self.assertEqual(len(questions), 2)
+        self.assertEqual({frontmatter(path)["production_id"][0] for path in questions}, {owner_id})
+        self.assertEqual({frontmatter(path)["asked_by"][0] for path in questions}, {owner_id, unit_id})
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in [proposal, *questions]}
+        _ = staff.rename(owner_id, "renamed-owner")
+        _ = staff.rename(unit_id, "renamed-unit")
+        for transferred in (False, True):
+            with self.subTest(transferred=transferred):
+                if transferred:
+                    _ = staff.move(unit_id, staff.ReportsTo(destination.id))
+                self.assertEqual([issue.path for issue in proposals_folder.open_proposals(self.doc)],
+                                 [] if transferred else [proposal])
+                self.assertEqual([issue.path for issue in proposals_folder.open_proposals(destination_doc)],
+                                 [proposal] if transferred else [])
+                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), "renamed-unit")
+                listed = self.run_command("questions-table")
+                self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+                for text in ("Choose the layout", "Choose the colors", "renamed-unit", "renamed-owner"):
+                    self.assertIn(text, listed.stdout)
+                self.assertNotIn("A separate proposal", listed.stdout)
+                other = invoke_cli(registration, registration.main,
+                                   ["questions-table", "--production", destination.name],
+                                   self.env, self.checkout, production_state=True)
+                self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+                self.assertEqual(other.stdout.strip(), "no open questions")
+                self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in before}, before)
+
     def check_question_reopening(self, minutes: int) -> tuple[str, str]:
         title = "Choose the layout"
         first = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)

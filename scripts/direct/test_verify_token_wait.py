@@ -148,7 +148,7 @@ trap advance_elapsed_clock DEBUG
                        "TEST_CLOCK_READS": str(clock_reads),
                        "UNIT_RUN_DIR": str(self.root / "clock-board"),
                        "UNIT_TEAM_ROLE": "clock"}
-        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+        for key in ("UNIT_WORKER_POLL_SECS",
                     "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         result = self.verify(environment)

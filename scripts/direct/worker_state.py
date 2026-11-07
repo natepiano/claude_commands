@@ -7,18 +7,65 @@ except FileNotFoundError:
 
 import fcntl
 import json
+import os
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle
+from scripts.lib import process_start
 
 
 ROSTER_LIVE = frozenset({"running", "starting"})
+
+
+@dataclass(frozen=True)
+class HeldWorkerClaim:
+    """The launcher still holds the claim, or its start is unreadable."""
+    pid: int
+
+
+@dataclass(frozen=True)
+class EndedWorkerClaim:
+    """The recorded launcher no longer holds the claim."""
+
+
+@dataclass(frozen=True)
+class NoWorkerClaim:
+    """No launcher is recorded."""
+
+
+def publish_worker_claim(path: Path, worker: str) -> None:
+    """Publish the launcher identity with its start when available."""
+    record: dict[str, object] = {"pid": os.getpid(), "worker": worker}
+    started = process_start.process_start(os.getpid())
+    if isinstance(started, process_start.Started):
+        record["started"] = started.start
+    else:
+        print(f"anomaly: {path}: launcher start is unavailable", file=sys.stderr)
+    worker_lifecycle.WorkerStateFile(path).publish(json.dumps(record))
+
+
+def read_worker_claim(path: Path) -> HeldWorkerClaim | EndedWorkerClaim | NoWorkerClaim:
+    """Compare the recorded launcher start with the live process."""
+    try:
+        record = worker_lifecycle.read_worker_state(path)
+    except worker_lifecycle.WorkerStateUnreadable:
+        return NoWorkerClaim()
+    pid, started = record.get("pid"), record.get("started")
+    if not isinstance(pid, int) or pid <= 0:
+        return NoWorkerClaim()
+    if isinstance(started, str) and started:
+        current = process_start.process_start(pid)
+        if isinstance(current, process_start.Unreadable) or (
+                isinstance(current, process_start.Started) and current.start == started):
+            return HeldWorkerClaim(pid)
+    return EndedWorkerClaim()
 
 
 def worker_status_paths(run: Path, pattern: str = "*_status*") -> list[Path]:

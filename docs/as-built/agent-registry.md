@@ -127,8 +127,8 @@ Operation snapshots reach helpers, but they never reach an agent or an app-serve
 Python agent and app-server starts use this filtered environment.
 
 `models_agent_environment` removes both variables from the current shell.
-`agent_exec.sh`, `agent_bg.sh`, and `cli_agent.sh` call it immediately before their agent starts.
-`agent_bg.sh` also excludes the variables from the Claude settings JSON.
+`agent_exec.sh` and `cli_agent.sh` call it immediately before their agent starts.
+`scripts/direct/claude_worker.py` filters the Claude start environment and settings JSON in the assign process.
 `nix_env.py exec` applies `agent_environment` after it obtains its final environment, immediately before `os.execvpe`.
 This prevents an environment restore from carrying an old snapshot into the agent.
 `review.sh` retains the snapshot until `agent_exec.sh` resolves its settings.
@@ -230,7 +230,7 @@ An executable invocation runs `assign_gate.py` before dispatch.
 `assign.sh` is the worker launch entry point.
 `assign.py` reads the run's transport pin.
 A mesh run uses `codex_mesh.py` for Codex workers; a herdr run uses `worker.py` and a pane.
-Claude workers of a mesh run use `agent_bg.sh` and the `worker_fill.py` coordinator.
+Claude workers of a mesh run use `scripts/direct/claude_worker.py` in the assign process.
 The [worker design](long-lived-workers.md) owns admission, staff identity, family switches, retries, messages, and server lifecycle.
 The plain `codex exec` worker fallback is absent.
 

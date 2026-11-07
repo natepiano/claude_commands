@@ -80,7 +80,7 @@ resolver before calling `exec`.
 | `shutdown/pane_restore.py` | Staff rows use `restart.start_row`. Saved panes without staff rows use `launch_agent`. Both routes preserve live conversations and retained accounts. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
-| `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
+| `direct/claude_worker.py` | Calls `nix_env.ensure` once in the assign process. The settings and the Claude start use the same loaded environment. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |

@@ -1229,41 +1229,24 @@ Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: 
 7. Each hash: the numstat check in item 8 shows a net delete, basedpyright `0 errors, 0 warnings, 0 notes`, and the full gate passes.
 8. Each hash notice lists each open unit branch, all productions on `~/.claude`, that conflicts with that hash, from `git merge-tree`.
 
-### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: todo
+### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: done
 
-Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3u and 3z. Reduced by the Phase 3t architect review (2026-11-05): most of both stores already shipped. Phase 8g's architect review names the two defects that remain: `phase_table.build` uses `Path.cwd()`, and `timer_scratch` collapses its outcomes into `None`.
+#### As-built
 
-**Depends on:** 3t (the doc from the row), 3z. Records stage of the rename track.
+`owner_staff_id` is the one owner field of a run. `_set_owner`, `resolve_production_unit` and the start path of `_start_phase` read only the staff row, and they accept no names. A saved event keeps its names as history. `phase_table.build` with no `working_dir` takes the folder from the staff row, and it reports a staff read error in the table result. It does not use `Path.cwd()`. `unit_runs.migrate_owners` does not exist.
 
-#### Work Order
-
-**Goal:** the two largest name-keyed stores hold the staff id with no reader left on the old key: the run owner in progress history and the update timer folders.
-
-**Spec:**
-1. **Run owner.** Already shipped: `progress_history.py:435` records the fixed owner, and `unit_runs.py:237` moves active run ownership and keeps history. Remaining: each reader that `grep -rln progress_history_state scripts` finds reads the staff id. The search misses `phase_table.build` (`phase_table.py:1245`), which reads the state through `plan_history.STATE_FILENAME` and uses `Path.cwd()` when `working_dir` is absent: it takes the folder from the staff row. The unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`; workers through `session_staff.py:144`). A separate phase checkout comes from `phase_reservation.py claim --repo`. No rule routes by an absolute Plan path or keeps a worker folder copy. Finished runs keep their recorded paths as history; worker threads stay.
-2. **Showrunner timers.** Already shipped: `update_registration.py:625-631` writes `showrunner-<staff id>` folders and staff-id `CHECK` lines, and `showrunners.py:146` reads timers by staff id. Remaining: every reader that a search of `scripts`, `commands` and the Codex mirror finds for the timer folder (`produce.md`'s `UPDATES` included) uses the staff-id folder. The two question readers already switched: `showrunner_footer.py:93,116` reads the document through staff ownership, and `tidy_wrapped.wrapped_owner` (`tidy_wrapped.py:98`) checks the staff-id timer folder. `showrunners.timer_scratch` (`showrunners.py:402`) returns one `Path | None` for an unreadable conf, an unknown owner and no scratch folder: it returns a named result for each, and `adopt_session_state` prints the unreadable case and keeps going. This adds no refusal.
-3. **Deployment evidence.** Phase 3t deleted `migrate_showrunner_timers.py`; sdlc ran that migration from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac is the migration proof; this phase runs no migration.
+`showrunners.timer_scratch` returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent` or `TimerScratchFound`. `adopt_session_state` prints the unreadable case and keeps going. Every reader of the timer folder uses `showrunner-<staff id>`.
 
 **Files:**
-- `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/production/update_registration.py`, `scripts/production/production_check.sh`, `scripts/production/showrunners.py`, `scripts/statusline/statusline.sh`, `scripts/production/rename.py` — the remaining readers; every other reader that a search for the two paths finds joins them.
-- `scripts/direct/test_progress_history.py`, `scripts/direct/test_phase_table.py`, `scripts/production/test_update_registration.py`, `scripts/production/test_showrunners.py`, `scripts/statusline/test_statusline.py`, `scripts/production/test_rename.py` — their tests.
-- `scripts/production/update_registration_test_support.py` — fixtures.
-- `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py` — the active run record (Phase 3h review).
-- `scripts/message/notifier.sh`, `scripts/message/test_notifier.py` — read only; the messaging unit owns them. A change there goes to that unit, and the checkpoint notice names it.
+- `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/lib/unit_runs.py` — the run readers.
+- `scripts/production/showrunners.py`, `scripts/production/update_registration.py`, `scripts/production/production_check.sh`, `scripts/production/rename.py`, `scripts/statusline/statusline.sh` — the timer readers.
+- `scripts/direct/test_progress_history.py`, `scripts/direct/test_phase_table.py`, `scripts/production/test_showrunners.py` — one test per result; fixtures store `owner_staff_id`.
 
-**Workers:** `2 writers`
-- `runs` — the run readers and their tests: `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/lib/unit_runs.py`, `scripts/direct/test_progress_history.py`, `scripts/direct/test_phase_table.py`, `scripts/lib/test_unit_runs.py`.
-- `timers` — the timer results, adoption reporting and their tests: the other non-messaging files above; hub: `scripts/production/showrunners.py` (`registered_showrunners`, the timer reader every caller uses).
+**Binds later work:** a test fixture for a run stores `owner_staff_id` with the staff row's id, and no name fields.
 
-**State:** none; the timer and run-owner migrations already ran.
+**Gotchas:** `run_owner` accepts only `unit` rows, so no run has a showrunner owner, and `parent`'s `showrunner` kind check after `run_owner` is unreachable. Active runs from before the owner code convert once at landing, on natedev and the Mac, by a program outside the repository.
 
-**Constraints from prior phases:** Phase 3t reads the document from the showrunner row. Staff records the director folder; each worker's run record holds its location. Phase 4p resolves relative question folders from the staff owner's document through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Keep the linked-checkout, ambiguous-owner, and shared-question tests. Staff rows hold canonical unit names from `unit_names.name`. A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions. Run-folder paths stay the same across `/clear`. Keep the native-session and socket resolution that shipped. Add no store registry, identity alias or live-rekey journal. Phase 3y: `progress_history.last_dispatch(staff_id)` takes no run, searches every run of the staff parent, and returns `RecordedDispatch`, `NoDispatchRecorded` or `DispatchDetailNotRecorded.UNRECORDED`; keep all three.
-
-**Acceptance gate:**
-1. `test_progress_history.py:8437` already shows the staff folder, `/clear` and finished history, and `:8492` the fixed owner: keep them. Add only what they lack: an explicit phase checkout, and an owner-only run that `phase_table.build` resolves from an unrelated folder after a staff folder move.
-2. After the reader switch, cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time. `timer_scratch` has one test for each outcome: an unreadable configuration, an unresolved target, an absent scratch folder and success. The unreadable case prints its message, and adoption continues.
-3. Every running showrunner's timer fires once on the landed tree; dailies and the status line show it. sdlc's migration output is cited in the notice.
-4. Keep the lookup, requested-checkpoint, and partial-report tests. basedpyright `0 errors, 0 warnings, 0 notes`. The full gate passes.
+**Ruled out:** a reader of the old name fields in main code.
 
 ### Phase 8f — A run whose only worker dies at launch ends itself  · status: done
 
@@ -1328,47 +1311,64 @@ A `Change-Review:` line takes an optional fourth field, `after <step>`. `Visible
 
 ### Phase 8i — A Claude worker starts only through assign  · status: done
 
-Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direct/implement.sh` into assign. `assign.py` runs it as its inner step. Move that code into assign, delete `implement.sh`, its second start path and its refusal, and update each caller, doc and test that names it. The order "It must be impossible to start a worker in more than one way" also applies.
+#### As-built
 
-**Depends on:** 3z, 8f
+`scripts/direct/implement.sh` does not exist. `assign.py` `execute_claude` calls `assign_claude.run(ClaudeLaunch)` in the same process, so `assign.sh` is the one start path for a Claude worker. `assign_claude.py` has no `__main__` and no argument parser. `ClaudeLaunch` is a frozen dataclass; its `worker` field holds `NewClaudeWorker` or `ClaudeFollowUp`.
 
-#### Work Order
+The order stays: admit, `worker_state.py`, switch check, claim, `phase_reservation.py claim`, status, pass start, heartbeat, board, `TMPDIR`, worker start, worker wait, heartbeat watch, finish. File names and contents of `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log` and `impl_agent_<slot>`, board lines, heartbeat lines and recorder events stay the same. The claim holds `os.getpid()`. `run` releases the claim in `finally`, and a TERM, INT or HUP raises `SystemExit` through `_interrupted`, so the finish records run on a signal. The launch uses the family, model and effort from `resolve_model`, with no second resolve. `--launcher-command` holds the `assign.sh` command of the launch, so a replay runs assign.
 
-**Goal:** the Claude worker start runs inside the assign process. `scripts/direct/implement.sh` does not exist. No shell or program can start a Claude worker except `assign.sh`.
-
-**Spec:**
-1. **One module, no door.** New `scripts/direct/assign_claude.py` holds the moved code. It has no `__main__` and no argument parser. `assign.py` `execute_claude` calls it in the same process and passes a frozen dataclass, not positional text.
-2. **Same behavior.** These stay byte for byte: the file names and contents of `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log` and `impl_agent_<slot>`; each board line; each heartbeat line; each recorder call and its order; the exit codes; the order admit, `worker_state.py`, switch check, claim, `phase_reservation.py claim`, status, pass start, heartbeat, board, `TMPDIR`, worker start, worker wait, heartbeat watch, finish. `UNIT_RESOLVES_ROUND`, `UNIT_WORKER_WAIT_ATTEMPTS`, `UNIT_WORKER_POLL_SECS`, `UNIT_TEAM_ROLE`, `UNIT_RUN_DIR` and `AGENT_BG_*` keep their meaning.
-3. **Real functions.** The `worker_record` heredoc becomes typed functions with no `sys.path` line. The claim holds `os.getpid()`. Remove `FOLLOW_LAUNCHER_PID` when no other reader exists. The release runs in `finally`. The heartbeat watch stops in `finally`.
-4. **One model answer.** Use the family, model and effort that `resolve_model` already returned. Remove the second resolve. `execute_claude` runs only for the Claude family, so the refusal `implement.sh: Codex workers must use assign.sh.` goes. `agents_resolve_claude_launcher` stays for `review.sh`, without the second argument only if that is simpler.
-5. **What assign cannot reach goes.** Remove the positional parser, the option parser, the tenth argument and the role checks that assign already makes. Remove the old board-prefix read only if no record of a live run needs it, and state the answer.
-6. **Recorded command.** `--launcher-command` holds the `assign.sh` command of this launch, so a replay runs assign.
-7. **The gate.** Remove `implement.sh` from `WORKER_LAUNCHERS` and `LAUNCHERS` in `scripts/direct/assign_gate.py`. `agent_bg.sh` now has assign as its direct parent: its gate accepts that and refuses everything else as before.
-8. **Stall watch.** Remove the name from `WORK` in `scripts/production/stall_watch.py`. A Claude worker under assign still counts as work: read how the set is used and keep that true.
-9. **Names.** Update each comment, doc and sample that names the file. Correct the as-built docs to state the assign form. Rename the test files to `test_assign_claude*.py` and the support files to `assign_claude*_test_support.py`.
-10. **Out of scope.** `review.sh` keeps its form. `settings.json` is a permission file and this phase does not edit it; the director reports its two stale lines. `docs/plans/` other plans are history and stay.
-
-**Acceptance:**
-- Real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary: a new worker and a `--to` follow-up, for implement, test and fix. Each reads the status, summary, log, board lines and recorder events. Existing assertions hold. Approved changes: a direct start of `implement.sh` no longer exists, so its refusal tests go, and the recorded launcher command names assign. Three refusal exit codes in those tests now read what `assign.py` already returned on the real path: 2 for a model resolve failure, 3 for an admission refusal.
-- A failed launch still ends through the 8f path: a run with no other worker ends, and the worker row stays.
-- `test_one_launch_path` passes with the new names and finds no second start path.
-- A fix round: `landed` on a clean exit, `abandon --edits-landed` on a failed exit.
-- Live check by the director: one real Claude worker on a small prompt through `assign.sh` with a copy of the models file that sets `direct=claude`. Register and done appear on the board.
-- `git grep -n "implement\.sh"` prints only `docs/plans/`, `settings.json`, any dated record, and the approved phone sample in `scripts/notify/`. That sample keeps its words because a change voids its user approval, and it starts nothing.
+`assign_gate.py` holds no `implement.sh` entry, and `agent_bg.sh` accepts assign as its direct parent. `stall_watch.py` `WORK` holds no `implement.sh`, and a Claude worker under assign still counts as work.
 
 **Files:**
-- `scripts/direct/assign.py`, `scripts/direct/assign_claude.py`, `scripts/direct/implement.sh`, `scripts/direct/assign_gate.py`, `scripts/production/stall_watch.py`, `scripts/agents/models_config.sh` — the move.
-- `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_implement_launcher_claims.py`, `scripts/direct/test_implement_launcher_claude.py`, `scripts/direct/test_implement_launcher_claude_accounts.py`, `scripts/direct/test_implement_launcher_claude_effort.py`, `scripts/direct/test_implement_launcher_claude_follow.py`, `scripts/direct/test_implement_launcher_claude_panes.py`, `scripts/direct/test_implement_launcher_compaction.py`, `scripts/direct/test_implement_launcher_follow.py`, `scripts/direct/test_implement_launcher_probes.py`, `scripts/direct/test_implement_launcher_records.py`, `scripts/direct/implement_launcher_test_support.py`, `scripts/direct/implement_launcher_claude_test_support.py`, `scripts/direct/test_assign_claude_door.py`, `scripts/direct/test_assign_gate.py`, `scripts/direct/test_one_launch_path.py`, `scripts/direct/recorder_fixture.py`, `scripts/direct/test_progress_history.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_roles_audit.py` — the tests.
-- `docs/as-built/agent-registry.md`, `docs/as-built/build-followups-fn-length-hook.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/staff-accessors.md`, `docs/as-built/unit-progress-history.md`, `docs/as-built/usage-ledger.md`, `docs/direct_footprint_review.md`, `commands/history.md`, `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/findings.py`, `scripts/direct/progress_history.py`, `scripts/direct/worker_name.sh`, `scripts/direct/review.sh`, `scripts/history/history.py`, `scripts/message/test_rca.py`, `scripts/message/test_send.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`, `scripts/production/test_codex_winddown.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_stop_resume.py`, `scripts/accounts/test_launch_accounts.py` — names only.
+- `scripts/direct/assign_claude.py` — the moved launch.
+- `scripts/direct/assign.py`, `scripts/direct/assign_gate.py`, `scripts/production/stall_watch.py`, `scripts/agents/models_config.sh` — the callers and the gates.
+- `scripts/direct/test_assign_claude*.py`, `scripts/direct/assign_claude*_test_support.py` — the real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary.
+- `docs/as-built/agent-registry.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/staff-accessors.md`, `docs/as-built/unit-progress-history.md`, `docs/as-built/usage-ledger.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-followups-fn-length-hook.md` — the assign form.
 
-**Workers:** `3 writers`. Three concerns.
-- `impl` — the move.
-- `test` — the tests.
-- `names` — comments, docs and samples.
+**Binds later work:** the launcher Python starts count from `agent_bg.sh`, `claude_account.sh` and `heartbeat_watch.sh`; `worker_record` is now in process. `_claim` trusts any live PID in `impl_claim_<slot>.json`.
 
-**State:** none. The phase writes no new lasting record.
+**Gotchas:** `git grep implement.sh` also prints `scripts/notify/` (the approved phone sample; a changed sample voids the user's approval), `docs/direct_footprint_review.md` (a dated review), `settings.json` and a negative assertion in `scripts/lib/test_relaunch.py`. A `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree.
 
+**Ruled out:** a compatibility shim for saved `implement.sh` commands; 0 of 20 records held one.
 
+### Phase 8j — A worker claim belongs to the process that made it  · status: done
+
+#### As-built
+
+`impl_claim_<slot>.json` holds `pid`, `started` and `worker`. `worker_state.publish_worker_claim` is the one writer, for `assign_claude._claim` and `assign.claim_worker`: it writes atomically, and with an unreadable own start it omits `started` and prints an anomaly line. `worker_state.read_worker_claim` is the one reader. It returns `HeldWorkerClaim(pid)` for the same start or an unreadable one, `EndedWorkerClaim` for a positive `pid` that is gone, a zombie, another start or has no recorded start, and `NoWorkerClaim` for an absent or malformed file or a record with no positive `pid`. A reused process id therefore no longer blocks a launch. `_release` and the interrupted path of `assign.py` compare only `pid` with `os.getpid()`.
+
+`remove_workers.removal_targets` gives `OWN_RUN_FINISHED` (`its run finished this phase`) to a worker of an own run and `DIRECTOR_NOT_LIVE` (`unit director is not live`) only to a sweep with no own run.
+
+**Files:**
+- `scripts/direct/worker_state.py`, `scripts/direct/assign.py`, `scripts/direct/assign_claude.py` — the claim.
+- `scripts/direct/remove_workers.py` — the removal reason.
+- `scripts/direct/test_worker_state.py`, `scripts/direct/test_assign_claude_claims.py`, `scripts/direct/test_assign_claude_claim_follow.py`, `scripts/direct/test_assign_launcher_review.py`, `scripts/direct/test_remove_workers.py` — one test per result; real-path tests through `assign.sh`.
+
+**Binds later work:** a fixture that writes a live claim adds `started` from `process_start`.
+
+**Gotchas:** a claim from a launcher that runs across the landing has no `started` and reads as ended. `assign.claim_worker` then refuses at `launcher_pid`. `assign_claude._claim` refuses at its idle check, except in two short moments, when a second launch can double-launch one Claude worker. A malformed claim on the Codex path counts as no claim.
+
+**Ruled out:** an old-shape reader or a conversion for the claim. A fix of `launcher_pid`: its refusal is in the detached-run server, and that code retires.
+
+### Phase 8k — A Claude worker launch runs in one Python process  · status: done
+
+#### As-built
+
+`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `worker_fill.py coordinate-claude`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
+
+`worker_admission.switch_worker` keeps its `start` and `dispatch` callbacks. The account step calls `accounts.account_for_unscoped_launch`. One `nix_env.ensure` serves the settings and the start. The id comes only from the `backgrounded` line of the banner, and `_registered` waits `CLAUDE_WORKER_REGISTER_WAIT_SECS` for the full id. `agents_log.append` runs before delivery, and delivery is one child: `send.py --to session:<id> --from launcher --file <prompt>`, with `CLAUDE_WORKER_SEND_SCRIPT` as its test override. `wait_for_turn` parses `claude agents --json` and `claude logs` in process each `CLAUDE_WORKER_POLL_SECS`, which `UNIT_WORKER_POLL_SECS` overrides.
+
+`assign_claude._run` runs `_record` in `finally` around the launch, before `heartbeat_watch.sh`, and writes nothing when no session is published. A signal after the banner stops the unpublished session with `claude stop`. Exit codes: 127 no binary, 2 refused or not delivered, 1 no banner, gone with no summary or any other launch error, 143, 130 and 129 on a signal. An unreadable log gives the fallback summary. A transcript record with no message object does not count as a turn.
+
+**Files:**
+- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `scripts/production/worker_fill.py`, `config/direct.conf` — the launch.
+- `scripts/direct/test_claude_worker.py`, `scripts/direct/test_assign_claude.py` — moved launcher behaviors and regression tests; other launcher tests use `fixtures/background.sh` or `assign.sh` with the fixture Claude binary.
+
+**Binds later work:** the recorder and resolver children of `assign_claude._run` are the remaining launcher Python, with `send.py` (180 ms) and the `heartbeat_watch.sh` digest (24 ms each minute).
+
+**Gotchas:** a `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree with the baseline commit fetched there.
+
+**Ruled out:** an in-process `send.py`: delivery has its own exit paths and an import still pays most of its cost. A port of `heartbeat_watch.sh`: `review.sh` and `assign.py` share it.
 ### Phase 8l — A worker whose launcher and server died recovers on its own thread  · status: done
 
 #### As-built
@@ -1436,3 +1436,17 @@ Every entry script under `scripts/` runs under bare `python3 <path>` from any wo
 **Gotchas:** `__file__.rpartition("/")[0]` is empty for a `__file__` with no folder part and gives `/../lib/...`; the block uses `rfind`. A `runpy` or `pathlib` form costs about 15 ms for each start; `open` + `exec` costs under 1 ms.
 
 **Ruled out:** hand-written blocks after the converter goes — they drift.
+
+### Phase 8o — Screen recording finds a window with no client list  · status: done
+
+#### As-built
+
+`find_window` in `screen_record.py` reads `xprop -root _NET_CLIENT_LIST`. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes each window id and title from `TREE_WINDOW`. The fallback keeps the 10 s lookup limit, the poll, the one-match rule, the stop before ffmpeg on two or more matches, and the list of titles seen on no match. Tree titles are read as printed, with literal quotes and backslashes. `xwininfo` is required only on the fallback path: a missing binary gives `screen_record: missing on PATH: xwininfo`.
+
+**Files:**
+- `scripts/screen_record/screen_record.py` — window lookup with the tree fallback.
+- `scripts/screen_record/test_screen_record.py` — fake `xprop` and `xwininfo`; tests for a missing and an empty client list, two matches, literal quotes, literal backslashes and a missing `xwininfo`.
+
+**Gotchas:** `xwininfo` prints a title with no escapes, so `TREE_WINDOW` reads to the last `": (` on the line. natedev has `xwininfo` only in the nix store, not on PATH.
+
+**Ruled out:** unescaping tree titles — `xwininfo` does not escape them.

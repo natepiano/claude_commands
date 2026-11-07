@@ -217,7 +217,6 @@ class EndSessionTests(unittest.TestCase):
         unused.mkdir()
         _ = (unused / ".scratch.json").write_text(json.dumps({"task": "run:run", "created": 1, "renewed": 1}))
         run = self.session_dir
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
         (run / "mesh_runs").mkdir()
         record = run / "mesh_runs" / "still-running.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
@@ -229,6 +228,7 @@ class EndSessionTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="demo")
         parent = fixture_member("unit", name="builders", parent=owner.id,
                                 worktree=staff.PresentWorktree("natedev", command_cwd))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({
             "worker": "w7", "status": "running", "pid": child.pid, "staff_id": member.id}))
