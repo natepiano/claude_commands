@@ -438,6 +438,33 @@ class FindingsLedgerTests(FindingsLedgerFixture):
             self.assertIsNone(payload["advisory"])
             self.assertIsNone(payload["consecutive_same_kind"])
 
+    def test_gate_fix_and_unledgered_relaunch_add_no_repair_round(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        self.close_round(["F001"], verdict="still_open")
+        with self.history_file.open("a", encoding="utf-8") as stream:
+            for number, activity in ((2, "run the merge gate"), (3, "relaunch the repair after a launcher fault")):
+                started = 1_200 + number * 20
+                event: dict[str, object] = {
+                    "event_type": "pass_started", "phase_instance_id": "instance-a",
+                    "pass_instance_id": f"unledgered-{number}", "pass_kind": "fix",
+                    "fix_pass": number, "pass_activity": activity,
+                    "pass_started_at": started, "timestamp_epoch": started,
+                }
+                _ = stream.write(json.dumps(event) + "\n")
+                _ = stream.write(json.dumps({
+                    **event, "event_type": "pass_finished", "status": "completed",
+                    "timestamp_epoch": started + 10, "pass_elapsed_seconds": 10,
+                }) + "\n")
+        payload = self.gate(at=1_500)
+        self.assertEqual(payload["repair_round"], 2)
+        self.assertEqual(payload["astra_review_due"], [])
+        self.assertEqual(self.run_command("dispatch", "--covers", "F001", at=1_500), "round 2 covering F001")
+        dispatched = [event for event in self.events() if event["event_type"] == "finding_batch_dispatched"][-1]
+        self.assertEqual(dispatched["repair_round"], 2)
+        self.assertEqual(dispatched["round"], 2)
+
     def test_distinct_ledger_batches_still_reach_the_consecutive_fix_advisory(self) -> None:
         self.write_progress_state("instance-a")
         self.write_pass_events("instance-a", [("fix", "repair", "completed")] * 3)
@@ -898,6 +925,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
 
     def test_astra_is_due_at_each_new_failed_attempt_and_clears_with_a_record(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         _ = self.open_finding("blocker", "retry never closes")
         self.assertEqual(self.gate()["astra_review_due"], [])
@@ -998,6 +1026,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(dispatched["accepted_checks"], "none: no accepted caller")
 
     def test_trial_exposures_keep_the_basis_decision_and_repair_round(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         for proposal, basis, decision in (
             ("P2", "Work Order changes retry lifecycle", ""),

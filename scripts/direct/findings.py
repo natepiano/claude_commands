@@ -435,7 +435,7 @@ def _history_root() -> Path:
 
 
 def _repair_round(state: dict[str, object], session_dir: Path) -> int:
-    """The next repair round, using the same groups as `history.py rounds`."""
+    """The next repair round, counting only history groups with a ledger batch."""
     path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -446,7 +446,7 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     instance = _string(state.get("phase_instance_id"))
     events = [event for line in lines if (event := _json_object(line)) is not None
               and _string(event.get("phase_instance_id")) == instance]
-    return len(phase_rounds(events)) + 1
+    return sum(repair["cause"] in ("review-code", "review-ux") for repair in phase_rounds(events)) + 1
 
 
 def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:
