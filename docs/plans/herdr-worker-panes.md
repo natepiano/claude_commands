@@ -3302,7 +3302,7 @@ A pane worker's Codex launch has no in-turn compaction option. `worker_panes._po
 - Tests: `scripts/herdr/test_worker_panes.py`, `test_side_pane.py`, `scripts/astra/test_astra_review.py`, `test_design_roles.py` check that the option is absent.
 - Docs: `commands/unit/direct.md` (LongLivedWorkers), `docs/as-built/long-lived-workers.md`.
 
-### Phase 37 — A message reaches a Codex session in a pane  · status: todo
+### Phase 37 — A message reaches a Codex session in a pane  · status: done
 
 **Depends on:** Phase 35 (it runs right after the Phase 35 checkpoint, before Phase 29; sdlc [787d4c6f], 2026-11-07). Phase 31 waits for this phase (both edit `scripts/message/send.py`).
 
@@ -3336,6 +3336,32 @@ Defect (user via sdlc, 2026-11-07 15:38 EST): `send.py --to morty` answers `QUEU
 - A unit test: `--to codex:T` resolves to the same recipient.
 - The changed modules pass; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
 - Live check by the director after the checkpoint: `send.py --from herdr-unit --to morty --text "<one-line ping>"` prints `SENT` and the text shows in morty's pane. Morty belongs to the user; send one ping only.
+
+### Phase 38 — One worker's assign reads only its own pane and row · status: todo
+
+**Depends on:** Phase 37 (it runs right after the Phase 37 checkpoint, before Phase 29; sdlc [b9d4c514], 2026-11-07).
+
+Defect (builds for natest, 2026-11-07 16:40 and 16:47 EST): `assign.sh` for natest's Phase 68 worker `claude-natedev-builds-natest-impl4` exits 8 (uncertain) twice while that worker works, and a rerun ends the same. The log names other sessions' panes (`agent argv is unavailable` w14:pA, w0:p2, w14:pT; `pane_not_found` w16:p2D, w14:p11; `current Codex rollout changed` w11:p11) and natest's closed rows impl3, fix1, rev10a, rev10c, fix2, port6, ft7, cr7 (`pane evidence is incomplete; absence is unproved`, `scripts/herdr/worker_panes.py:377`).
+
+#### Work Order
+
+**Goal:** one worker's assign depends only on that worker's own pane and staff row.
+
+**Spec:**
+
+1. Find each path by which another session's unreadable pane, or a closed sibling row, makes the assigned worker's result `UNCERTAIN` (8). Quote the log line and the source line for each.
+2. Fix it where the evidence is gathered: the assign reads and judges only the selected worker's row and its pane. The evidence of other rows and other panes does not change the selected worker's state or the assign exit code.
+3. `worker.py list` and `restore` keep their per-row states; a sibling's uncertain state stays on that sibling's line.
+4. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:** `scripts/herdr/worker_panes.py`, `scripts/production/worker.py`, `scripts/direct/assign.py` (only where an exit-8 path lives), and their tests.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: the selected worker's pane is open and working; another session's pane gives `agent argv is unavailable` and `pane_not_found`, and closed sibling rows have no pane. The assign does not exit 8.
+- A unit test: the selected worker's own pane evidence is unknown; the assign still exits 8.
+- The changed modules pass; basedpyright reads 0/0/0; the full gate passes.
 
 ### Phase 32 — A launch keeps the caller's Codex home  · status: done
 
