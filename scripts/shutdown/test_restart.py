@@ -393,6 +393,7 @@ class RestartTests(RestartTestCase):
                                                      "XDG_STATE_HOME": str(self.root), "HOME": str(self.root),
                                                      "CODEX_HOME": str(self.root / ".codex"),
                                                      "CLAUDE_CONFIG_DIR": str(config)})))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree("natedev", self.root)) for n in range(3))

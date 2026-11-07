@@ -93,7 +93,11 @@ def fixture_process_probe(pid: int, number: int) -> None:
 
 def fixture_foreground(shell: int) -> CommandResponse:
     """Report the shell until the private agent starts."""
-    running = (Path(os.environ["HERDR_PROC"]) / str(FAKE_CLAUDE_PID)).is_dir()
+    pane_shell = Path(os.environ["STUB_STATE"]) / "pane-shell"
+    if pane_shell.exists():
+        shell = int(pane_shell.read_text())
+    agent_stat = Path(os.environ["HERDR_PROC"]) / str(FAKE_CLAUDE_PID) / "stat"
+    running = agent_stat.exists() and int(agent_stat.read_text().rsplit(")", 1)[1].split()[1]) == shell
     pid = FAKE_CLAUDE_PID if running else shell
     command = "claude" if running else "zsh"
     return CommandResponse(code=0, stdout=json.dumps({"result": {"process_info": {
@@ -105,9 +109,9 @@ def fixture_agent_started(arguments: list[str]) -> None:
     """Publish the private agent after its start command succeeds."""
     from scripts.production.staff_test_support import record_fixture_claude_start
 
-    shell = int(os.environ["FAKE_SHELL_PID"])
     session = arguments[1]
     pane = arguments[arguments.index("--pane") + 1]
+    shell = int((Path(os.environ["STUB_STATE"]) / "pane-shell").read_text())
     marks = {"HERDR_SESSION": session, "HERDR_PANE_ID": pane}
     directory = Path(os.environ["HERDR_PROC"]) / str(shell) / "cwd"
     write_process(os.environ, FAKE_CLAUDE_PID, shell, ["claude"], marks, cwd=directory.resolve())
@@ -345,8 +349,15 @@ class AddUnitTestCase(ShutdownTestCase):
         write_text_atomic(path, json.dumps(responses))
     result = main(argv)
     if result == 0 and argv[2:4] == ["workspace", "create"]:
-        shell = Path(os.environ["HERDR_PROC"]) / os.environ["FAKE_SHELL_PID"]
-        (shell / "environ").write_text("HERDR_SESSION=" + argv[1] + "\0HERDR_PANE_ID=w1:p1")
+        from scripts.production.fake_unit_host import process
+        from scripts.lib.atomic_file import write_text_atomic
+        root = Path(os.environ["HERDR_PROC"])
+        shell = max(int(item.name) for item in root.iterdir() if item.name.isdecimal()) + 1
+        original = root / os.environ["FAKE_SHELL_PID"]
+        parent = int((original / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        process(os.environ, shell, parent, ["zsh"],
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"}, cwd=(original / "cwd").resolve())
+        write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
     if result == 0 and argv[2:4] == ["agent", "start"]:
         from scripts.production.add_unit_test_support import fixture_agent_started
         fixture_agent_started(argv)

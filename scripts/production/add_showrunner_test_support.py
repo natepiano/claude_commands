@@ -142,23 +142,36 @@ class AddShowrunnerFixture(unittest.TestCase):
         hook = r'''def submitting_main(argv):
     if argv[2:4] == ["pane", "process-info"]:
         pid = int(os.environ["FAKE_CLAUDE_PID"])
-        live = (Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json").exists()
-        foreground = pid if live else 998040
-        command = "claude" if live else "zsh"
         path = Path(os.environ["FAKE_HERDR_RESPONSES"])
         responses = json.loads(path.read_text())
+        pane_shell = Path(os.environ["STUB_STATE"]) / "pane-shell"
+        shell = int(pane_shell.read_text()) if pane_shell.exists() else 998040
+        agent_stat = Path(os.environ["HERDR_PROC"]) / str(pid) / "stat"
+        live = agent_stat.exists() and int(agent_stat.read_text().rsplit(")", 1)[1].split()[1]) == shell
+        foreground = pid if live else shell
+        command = "claude" if live else "zsh"
         responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {"process_info": {
-            "shell_pid": 998040, "foreground_process_group_id": foreground,
+            "shell_pid": shell, "foreground_process_group_id": foreground,
             "foreground_processes": [{"pid": foreground, "name": command, "argv": [command]}]}}})}
-        path.write_text(json.dumps(responses))
+        from scripts.lib.atomic_file import write_text_atomic
+        write_text_atomic(path, json.dumps(responses))
     result = main(argv)
+    if result == 0 and argv[2:4] == ["workspace", "create"]:
+        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+        from scripts.production.fake_unit_host import process
+        from scripts.lib.atomic_file import write_text_atomic
+        root = Path(os.environ["HERDR_PROC"])
+        shell = max(int(item.name) for item in root.iterdir() if item.name.isdecimal()) + 1
+        process(os.environ, shell, 1, ["zsh"], {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"})
+        write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
     if result == 0 and argv[2:4] == ["agent", "start"]:
         sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.staff_test_support import record_fixture_claude_start
         from scripts.production.fake_unit_host import private_process_registry, process
         from scripts.message import sessions
         pid = int(os.environ["FAKE_CLAUDE_PID"])
-        process(os.environ, pid, 998040, ["claude"],
+        shell = int((Path(os.environ["STUB_STATE"]) / "pane-shell").read_text())
+        process(os.environ, pid, shell, ["claude"],
                 {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": argv[argv.index("--pane") + 1]},
                 started=sessions.process_start(pid) or "1")
         with private_process_registry():
