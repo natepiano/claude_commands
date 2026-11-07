@@ -2,6 +2,10 @@
 """List Claude and Codex sessions on both workstations; --here reads only this one."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -1588,7 +1592,8 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
         name += " (you)"
     if context:
         name += " (context)"
-    details = [entry.kind, entry.status]
+    status = "background" if entry.kind == "claude" and entry.status == "shell" else entry.status
+    details = [entry.kind, status]
     if isinstance(shown.job, JobUnassigned):
         details.append(shown.job.reason)
     unit = _unit(entry)

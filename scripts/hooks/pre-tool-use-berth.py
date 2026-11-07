@@ -33,6 +33,10 @@ edit can collide with a foreign reservation, where a refused one only costs the 
 Codex accepts only a refusal from a PreToolUse hook: an allow is an exit 0 with no output.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os

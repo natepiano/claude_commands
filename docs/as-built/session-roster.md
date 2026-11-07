@@ -43,6 +43,11 @@ The [worker design](long-lived-workers.md#roster-fields) defines stored run fiel
 
 The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
 
+`codex_mesh.py end` keeps the staff row and its thread id.
+`assign.sh --to` reopens an ended worker or a worker whose launcher died, using the recorded thread.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+The unit ledger keeps ended workers until permanent removal retires their staff rows.
+
 ### How each row's role is derived
 
 A live run is a run directory with a marker whose director session is running, or a heartbeat younger than 600 s (then it has no running director).

@@ -15,6 +15,10 @@ through `push_texts.user_send_argv()` with its registered template. Holding a KE
 may hold on every check and `close` once the news stops being true.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
