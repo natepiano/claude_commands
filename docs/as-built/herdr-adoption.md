@@ -363,7 +363,9 @@ Pane worker account moves use the shared stop, resume, and prompt APIs. The move
 - `/tmp` is `/private/tmp`, so compare resolved paths.
 - Patching `sys.platform` after import does not change `herdr._PLATFORM`.
 - `test_support.py` sets the import path before importing `herdr`. Importing first breaks other suites.
-- `merge_gate.py` refuses on the Mac (no `/dev/shm`). Run Mac suites as `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+- `merge_gate.py` refuses on the Mac because `/dev/shm` is absent.
+  Run Mac suites from the clone root with `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+  Set no `PYTHONPATH`.
 - `list --on` runs the other machine's installed `~/.claude` code, so both machines need the promoted code before a remote list shows a change.
 
 **Trust.**

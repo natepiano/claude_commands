@@ -6,13 +6,14 @@ from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import Protocol, TypedDict, cast, final, override
 from unittest import mock
 
 from scripts.style import add_style
@@ -25,6 +26,7 @@ from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
 from scripts.production import change_review, staff
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 SCRIPT = Path(add_style.__file__)
@@ -98,6 +100,10 @@ with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.p
 '''
 
 
+class ScriptRunner(Protocol):
+    def __call__(self, script: Path, *arguments: str) -> None: ...
+
+
 class ScriptCall(TypedDict):
     command: str
     arguments: list[str]
@@ -118,12 +124,21 @@ class AddStyleTests(unittest.TestCase):
     initial_tip: str = ""
     env: dict[str, str] = {}
 
+    repository_seed: Path = Path()
+
+    @classmethod
     @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
-        self.repo = self.root / "sample"
-        self.checkout = self.root / "sample-style"
-        self.doc = self.checkout / "docs/sample-style-production.md"
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(
+            tempfile.TemporaryDirectory(prefix="add-style-seed-"),
+        )) / "sample"
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        fixture.prepare_repository()
+        cls.initial_tip = fixture.initial_tip
+
+    def prepare_repository(self) -> None:
         self.repo.mkdir()
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("config", "user.name", "Style bootstrap tests")
@@ -137,6 +152,14 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", "Create sample repository")
         self.initial_tip = self.git("rev-parse", "HEAD")
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="add-style-")))
+        self.repo = self.root / "sample"
+        self.checkout = self.root / "sample-style"
+        self.doc = self.checkout / "docs/sample-style-production.md"
+        _ = shutil.copytree(self.repository_seed, self.repo)
         rule_root = self.root / "nate_style"
         (rule_root / "rust").mkdir(parents=True)
         for family in add_style.FAMILIES:
@@ -159,6 +182,9 @@ class AddStyleTests(unittest.TestCase):
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
             "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
+            "ROSTER_RUN_ROOT": str(self.root / "roster"),
+            "UNIT_RUN_ROOT": str(self.root / "units"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
@@ -201,11 +227,38 @@ class AddStyleTests(unittest.TestCase):
         assert parent is not None and isinstance(parent.doc, staff.LiveDoc)
         return parent.doc.path
 
+    def bootstrap_arguments(self, arguments: tuple[str, ...], parent: Path | None) -> list[str]:
+        production = next(row.name for row in staff.snapshot().find(kind="showrunner")
+                          if isinstance(row.doc, staff.LiveDoc) and row.doc.path == (parent or self.parent))
+        return ["--production", production, "--model", "test-model", "--effort", "high", *arguments]
+
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
+        argv = self.bootstrap_arguments(arguments, parent)
+        real_run_script = cast(ScriptRunner, getattr(add_style, "_run_script"))
+
+        def run_script(script: Path, *script_arguments: str) -> None:
+            if script.name == "style_sync.py":
+                script = Path(self.env["TEST_STYLE_SYNC"])
+            real_run_script(script, *script_arguments)
+
+        def live_session_open(name: str, ending: object) -> bool:
+            del ending
+            return (Path(self.env["TEST_LIVE_SESSIONS"]) / name).exists()
+
+        with (
+            mock.patch.object(add_style, "LAUNCHER", Path(self.env["ADD_STYLE_LAUNCHER"])),
+            mock.patch.object(add_style, "SHOWRUNNERS", Path(self.env["ADD_STYLE_SHOWRUNNERS"])),
+            mock.patch.object(add_style, "_run_script", run_script),
+            mock.patch.object(add_style, "herdr_tab_open", live_session_open),
+        ):
+            result = invoke_cli(add_style, lambda: add_style.main(argv), argv, self.env, self.repo)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def run_bootstrap_process(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", BOOTSTRAP, str(SCRIPT), "--production", next(row.name for row in staff.snapshot().find(kind="showrunner")
-                                  if isinstance(row.doc, staff.LiveDoc) and row.doc.path == (parent or self.parent)),
-             "--model", "test-model", "--effort", "high", *arguments],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", BOOTSTRAP, str(SCRIPT), *self.bootstrap_arguments(arguments, parent)],
             env=self.env, cwd=self.repo, capture_output=True, text=True, check=False,
         )
         if success:
@@ -238,18 +291,14 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("commit", "-q", "-m", "Add workspace packages")
 
     def interrupted_bootstrap_publish(self, path: Path) -> None:
-        injection = """from scripts.lib import atomic_file
-real_replace = atomic_file.os.replace
-def interrupted_replace(source, destination):
-    if Path(destination) == Path(os.environ["TEST_STOP_FILE"]):
-        raise OSError("stopped before publish")
-    return real_replace(source, destination)
-atomic_file.os.replace = interrupted_replace
-"""
-        stopped_bootstrap = BOOTSTRAP.replace("real_run_script =", injection + "\nreal_run_script =", 1)
-        with mock.patch.dict(self.env, {"TEST_STOP_FILE": str(path)}), mock.patch.dict(
-            globals(), {"BOOTSTRAP": stopped_bootstrap}
-        ):
+        real_replace = os.replace
+
+        def interrupted_replace(source: str | Path, destination: str | Path) -> None:
+            if Path(destination) == path:
+                raise OSError("stopped before publish")
+            real_replace(source, destination)
+
+        with mock.patch.object(os, "replace", interrupted_replace):
             stopped = self.run_bootstrap(success=False)
         self.assertEqual(stopped.returncode, 2, stopped.stderr)
         self.assertIn("stopped before publish", stopped.stderr)
@@ -272,7 +321,7 @@ atomic_file.os.replace = interrupted_replace
         snapshot = self.root / "bootstrap-at-launch.json"
         self.env["TEST_BOOTSTRAP_AT_LAUNCH"] = str(snapshot)
 
-        _ = self.run_bootstrap("--pilot", "modules", "--pilot", "names=cargo-handler,cargo-port",
+        _ = self.run_bootstrap_process("--pilot", "modules", "--pilot", "names=cargo-handler,cargo-port",
                                "--pilot", "types=cargo-port")
 
         launched = cast(BootstrapAtLaunch, json.loads(snapshot.read_text()))
@@ -419,7 +468,7 @@ atomic_file.os.replace = interrupted_replace
 
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
         self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
-        _ = self.run_bootstrap()
+        _ = self.run_bootstrap_process()
 
         self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
         self.assertIn(str(self.checkout), self.git("worktree", "list", "--porcelain"))
