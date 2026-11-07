@@ -111,6 +111,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |

@@ -51,14 +51,25 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         self.assertEqual(errors.getvalue().splitlines(),
                          [f"anomaly: {run / unit_runs.STATE_FILE}: worker state unreadable: expected a JSON object"])
 
-    def test_run_without_owner_staff_id_resolves_its_known_unit(self) -> None:
+    def test_run_with_owner_staff_id_resolves_its_known_unit(self) -> None:
         production, unit, _ = self.tree()
-        run = self.root / "run-without-owner"
+        run = self.root / "run-with-owner"
         run.mkdir()
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
             "production": production.name, "unit": unit.name,
+            "owner_staff_id": unit.id,
         }))
         self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), unit)
+
+    def test_run_owner_resolves_the_renamed_unit_despite_old_state_names(self) -> None:
+        production, unit, _ = self.tree()
+        run = self.root / "renamed-owner"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            "production": production.name, "unit": unit.name, "owner_staff_id": unit.id,
+        }))
+        renamed = staff.rename(unit.id, "renamed-unit")
+        self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), renamed)
 
     def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:
         _, unit, worker = self.tree()
