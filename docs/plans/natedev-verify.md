@@ -317,6 +317,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
+- Before dispatch, refresh each `verify.sh` line reference against the Phase 41h checkpoint. Phase 41h moves `phase_wait_start`, `buildlog_memory_event`, `route_test` and `acquire_token`.
 - Read `scripts/lint/memory_gate.sh`, `scripts/build_queue/admission_client.py` and `scripts/direct/progress_history.py` only; do not change them.
 - Phase 1: an inline helper in `verify.sh` runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`, so a `VERIFY_PY_TRACE` run names its start.
 - Phase 9: a step with no wait starts no new Python. `test_verify_python_starts` keeps its count.
@@ -1142,6 +1143,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The hana sequence, in `test_failed_probe_mark.py`, through the real `probe_mac`, `free_now`, `free-now` and `reserve` with a fake SSH: a mismatch probe, then the end of the timed backoff, then `free-now` still exits 1 with `bad` for that repository and exits 0 for another. A failed reach, then the end of the timed backoff, then `free-now` exits 1 with `bad` for each repository. A good probe by a new step removes the mark, and `free-now` exits 0 with no waiting step involved.
 - With the mark set, the command that `ssh_retry_hook` prints for a route that allows SSH takes no reservation, and `reserve --new-step` goes on to its reach check and claim.
 - `busy`, `blocked` and `off` keep their answers with the mark set. A remote stderr with a traceback prints one `could not reach` line that holds no `Traceback`.
+- With the mark set, the AWS status (`targets.target_state` returns it before the general unreachable logic, near line 325) and the Mac status each show the mark. After a good probe, each shows the target as free again.
 - Each case fails when the matching code is removed. Show this on a tempdir copy.
 - `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
@@ -1225,67 +1227,28 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41i — A saved test pass holds the environment that changes test results  · status: done
 
-**Depends on:** Phase 41g.
+#### As-built
 
-#### Work Order
-
-**Source:** builds, 2026-11-06, a defect from cargo-liner's port unit: `verify.sh test tui_pane` reused a `--local` pass recorded under `NO_COLOR=1`.
-
-**Goal:** a saved test pass answers only a run under the same environment values that change test results. A remote run carries those values, so its pass proves what the key says.
-
-**Spec:**
-
-1. In `scripts/direct/tree_watch.py`, for the `test` command, the verdict key and the tree content key also hold each set variable named by two new keys in `config/direct.conf`, read at use:
-   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, and each locale category: `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, `LC_TELEPHONE`. `LC_TERMINAL` and `LC_TERMINAL_VERSION` change per pane and stay out.
-   - `VERIFY_RESULT_ENV_PREFIXES`: `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
-   - `RUST_LOG` and the other `RUST` names already reach the key.
-   - The build key does not change: a changed value reruns tests and rebuilds nothing. Each other command's key does not change.
-   - An unset name and an empty name differ.
-1a. Each test run sets `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` and `LINES` to one fixed value, on natedev, the Mac and each SSH target, so each pass is comparable and the saved result carries across panes and workers. The values live in a third new key in `config/direct.conf`, `VERIFY_TEST_FIXED_ENV`, read at use: `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, `LINES=24`. These five names are not keyed by their call values. The verdict key holds the configured fixed values, so a changed config value does not reuse an older pass.
-2. For `test`, the value of each name given with `--env` also goes in the verdict key and the tree content key, and not in the build key.
-3. A Mac or SSH nextest run carries the fixed values of item 1a, each set variable of item 1, and `RUST_LOG`, `RUST_BACKTRACE` and `RUST_LIB_BACKTRACE`, from the call. This holds for an unpinned route, a `--mac` route, a `--target` route and a copy run. It uses the `--env` path and its environment file: extend `VERIFY_MAC_ENVIRONMENT` and the runner's `--env` words. The refusal list for user `--env` names and the rule that a user `--env` needs `--mac` do not change. Remove the `--copy` limit in `offload.py` `main` only if a copy run needs it to carry them. A non-nextest verb carries nothing new.
-4. The `verify.sh` header comment and `docs/as-built/mac-test-offload.md` state the rule. Correct each other doc line that the search for the saved-result key finds wrong.
+- `scripts/direct/result_environment.py` reads three `config/direct.conf` keys at use: `VERIFY_RESULT_ENV_NAMES` (`NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG` and each `LC_` category except `LC_TERMINAL` and `LC_TERMINAL_VERSION`), `VERIFY_RESULT_ENV_PREFIXES` (`HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`) and `VERIFY_TEST_FIXED_ENV` (`TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, `LINES=24`).
+- `tree_watch.py`: for `test` only, the verdict key and the tree content key hold each selected variable, each `--env` value and the configured fixed values. An unset name and an empty name differ. The build key and each other command's key do not change, so a changed value reruns tests and rebuilds nothing. The key reads its environment from the fd named by `VERIFY_RESULT_ENVIRONMENT_FD`.
+- `verify.sh`: each test run, the test step of `final` included, sets the five fixed values on natedev, the Mac and each SSH target. A Mac, SSH or copy nextest run carries the fixed values, the selected variables, `RUST_LOG`, `RUST_BACKTRACE` and `RUST_LIB_BACKTRACE` through `VERIFY_MAC_ENVIRONMENT` and the runner's `--env` words.
+- `offload.py` accepts `--env` on a copy run; `copy_watch.py` and `linux_runner.py` `execute_slot` carry the values to the remote command.
+- The token renewer trap in `verify.sh` is `trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP`, so a stop between `sleep &` and the pid read leaves no live `sleep`.
+- `scripts/buildlog/record.py` does not import `step_record`; a row id loads no `tempfile` module, and the package field is the package name or `workspace`.
 
 **Files:**
-- `config/direct.conf`
-- `config/README.md`
-- `docs/as-built/mac-test-offload.md`
-- `scripts/direct/result_environment.py`
-- `scripts/direct/tree_watch.py`
-- `scripts/direct/verify.sh`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/linux_runner.py`
-- `scripts/mac_test/copy_watch.py`
-- `scripts/buildlog/record.py`
-- `scripts/direct/test_verify_build_key.py`
-- `scripts/direct/test_verify_result_environment.py`
-- `scripts/direct/test_verify_mac_only.py`
-- `scripts/direct/test_verify_tree_cancel_reacquire.py`
-- `scripts/direct/test_verify_token_reclaim.py`
-- `scripts/mac_test/test_offload.py`
-- `scripts/mac_test/test_linux_runner.py`
-- `scripts/mac_test/test_offload_forward.py`
+- `config/direct.conf`, `config/README.md` — the three keys and their documentation
+- `docs/as-built/mac-test-offload.md`, `scripts/direct/verify.sh` header — the saved-result environment rule
+- `scripts/direct/result_environment.py` — key reader and selection
+- `scripts/direct/tree_watch.py`, `scripts/direct/verify.sh` — keys, fixed values, forwarding, renewer trap
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/copy_watch.py` — remote forwarding
+- `scripts/buildlog/record.py` — row id without `step_record`
+- `scripts/direct/test_verify_result_environment.py` — real `verify.sh test --local` reruns and reuses by environment
+- `scripts/direct/test_verify_build_key.py`, `test_verify_mac_only.py`, `test_verify_tree_cancel_reacquire.py`, `test_verify_token_reclaim.py`, `scripts/mac_test/test_offload.py`, `test_linux_runner.py`, `test_offload_forward.py` — key, forwarding and trap tests
 
-**Gate repairs (builds, 2026-11-06, tip 2d040a08c):**
-- `scripts/buildlog/record.py` no longer imports `step_record`, so a row id loads no `tempfile` module. The package field is the package name or `workspace`.
-- The token renewer trap in `verify.sh` stops each background job and waits, so a stop between `sleep &` and the pid read leaves no live `sleep`. `test_stop_before_reading_the_sleep_pid_leaves_no_live_sleep` forces that stop.
-- `test_offload_forward.py` follows Spec item 3: a copy run with `--env` is no longer refused, and the byte test finds the forwarded values after the clear line. `test_named_environment_reaches_the_remote_copy_command` shows a copy run carries the value.
+**Binds later work:** a routing change keeps the `--env` path for an unpinned, `--mac`, `--target` and copy route; the refusal list for user `--env` names and the rule that a user `--env` needs `--mac` stay.
 
-**Workers:** fix16 holds all files, in its own tree.
-
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test makes its project in a tempdir at run time. A test that reaches a lease needs `COPIES_CONFIG`.
-- Importing `offload.py` loads no build coordination modules.
-- A move of a `verify.sh` function reaches each test whose DEBUG trap watches its commands. Search `trap .* DEBUG` and `BASH_COMMAND`, and run those modules.
-- Phase 41h edits routing in `verify.sh` in another tree. Merge whichever lands second.
-
-**Acceptance gate:**
-- `test_verify_result_environment.py` runs the real `verify.sh test sample --local` on a tempdir project with a fake cargo. Under `NO_COLOR=1` it runs; again under `NO_COLOR=1` it reuses the pass; with no `NO_COLOR` it runs. Same for `CLICOLOR`. A changed `--env` value under `--mac` runs again.
-- A real `verify.sh test` call that reaches a fake Mac runner under `NO_COLOR=1` shows `NO_COLOR=1` in the remote command, and a call that reaches a fake SSH runner shows it too.
-- A second call with a different `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` or `LINES` reuses the pass. The fake cargo on natedev, and the remote command on the fake Mac and SSH runners, show the fixed values and not the call's values.
-- `test_verify_build_key.py`: `NO_COLOR` changes the verdict key and not the build key. A `check` key does not change with `NO_COLOR`.
-- The modules that read the key pass. Assertion changes, all from item 3: `test_verify_mac_only.py` expected the forwarded map to hold only the user's `--env` name; it now holds that name and the automatic values, and the comparison stays a whole-map comparison. `test_offload_forward.py` drops the refused `--env ... --copy` case, and its byte test finds the three forwarded values after the clear line instead of at a fixed index. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Gotchas:** `test_verify_mac_only.py` compares the whole forwarded map, which holds the user's `--env` name plus the automatic values. `test_offload_forward.py` finds the forwarded values after the clear line, not at a fixed word index.
 
 ### Phase 41j — A stop leaves no Mac log file  · status: todo
 
@@ -1321,9 +1284,80 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The new test fails on the old code and passes on the new code.
 - `test_verify_mac_signal_boundaries.py` and the other Mac step modules pass. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
+### Phase 41k — The Linux disk probe test passes on every run  · status: done
+
+**Depends on:** Phase 41i.
+
+#### Work Order
+
+**Source:** queue, through builds, 2026-11-06 23:00 EST. Builds asked for the repair in the next verify-env hash.
+
+**Goal:** `test_probe_uses_linux_disk_units_and_reports_all_parity_fields` passes on every run, and the probe reports free disk in GiB on every run.
+
+**Defect:** `scripts/mac_test/test_linux_runner.py::test_probe_uses_linux_disk_units_and_reports_all_parity_fields` failed 2 of 7 runs on trees based on builds 6793e84a0, with `free_gib=9.5e-05`, expected `100.0`. It passed 5 of 5 on 24e1c2630. No commit between them touches `linux_runner.py` or its test. Logs: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/18c/`. The value is 100 divided by 1024 squared, so one unit step is lost.
+
+**Spec:**
+
+1. Find the cause from the logs and the code. Quote the failing log line and the source line that causes it.
+2. Repair the cause where it lives. If the cause is in the probe, the probe reports GiB on every run. If the cause is only in the test, the test controls the input it reads.
+3. A regression test forces the failing condition and fails on the old code.
+
+**Files:**
+- `scripts/mac_test/linux_runner.py`
+- `scripts/mac_test/test_linux_runner.py`
+
+**Workers:** 1 writer, in the verify-env tree, beside the phase 41j writer.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time.
+- aws tip 46329bd70 also edits `linux_runner.py`. The second to land resolves.
+
+**Acceptance gate:**
+- The new test fails on the old code and passes on the new code.
+- `test_linux_runner.py` passes 10 of 10 runs. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41l — The Mac idle watch alerts only on a waiter that waited past the limit  · status: todo
+
+**Depends on:** Phase 41k.
+
+#### Work Order
+
+**Source:** builds, 2026-11-06 23:35 EST: "the idle watch alerts only when the waiter itself has waited past the limit, not on Mac idle time alone. Put it after 41k. A false alert reaches every showrunner, so it has a cost."
+
+**Goal:** The Mac idle watch sends its outage message, its push and its `idle_with_waiter` message only for a waiting call whose own wait is longer than `alert_seconds`. Mac idle time alone sends nothing.
+
+**Defect:** `watch_once` in `scripts/buildlog/mac_idle.py` (near line 503) alerts when the Mac idle time passes `alert_seconds` and any call waits. It does not read how long the call has waited. Call `v20261107T043436-3692814-29883` entered `waiting_hold` at 04:34:36Z. The alert fired at 04:34:40Z, 4 seconds into the wait. The call left for the Mac at 04:34:42Z. Routing had no gap; the alert was false.
+
+**Spec:**
+
+1. A waiting call's wait starts at the step record's `updated` time when the watch first sees the call in the set `waiting_calls` returns. The watch keeps that start in its state folder, keyed by call id and process start, while the call stays in that set. A rewrite of the state file does not move the start: a failed Mac attempt rewrites `waiting_mac` every 180 s, so the current `updated` time alone loses a long wait. The watch drops the start when the call leaves the set.
+2. Apply one filter in `watch_once`, right after `waiting_calls`: keep only calls whose wait time is at least `alert_seconds`. Every later step reads only the kept calls: the `waiting` count, the disk exclusion detail, the outage message, the push and the per-call causes.
+3. An `updated` time that does not parse counts as past the limit, so a bad record still alerts.
+4. Take the limit from `mac_idle_alert.read_idle_config()`. Add no new setting.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py`
+- `scripts/buildlog/test_mac_idle.py`
+
+**Workers:** 1 writer, the check worker, in the verify-env tree.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time.
+- Phase 41h also edits `test_mac_idle.py` in the verify-plain tree. The second to land merges.
+
+**Acceptance gate:**
+- A call 4 seconds into `waiting_hold`, with the Mac idle for longer than `alert_seconds`, sends no outage message, no push and no `idle_with_waiter` message. This test fails on the old code.
+- The same call at `alert_seconds` plus 1 second sends the outage message.
+- A call first seen waiting longer ago than `alert_seconds`, whose state file was rewritten 10 seconds ago, sends the outage message. This test fails on the code that read only the current `updated` time.
+- A call that leaves the waiting set and comes back starts a new wait.
+- One fresh call and one call past the limit give a message that counts 1 waiting call.
+- `test_mac_idle.py` passes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
-**Depends on:** Phase 41g.
+**Depends on:** Phase 41g, Phase 41j and Phase 41k.
 
 #### Work Order
 
@@ -1396,8 +1430,14 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Importing `offload.py` loads no build coordination modules (resources' Phase 67 test).
 - Phase 41e edits `route_test`, `free-now` and `reserve` in its own tree. Merge whichever lands second.
 - Phase 41i edits the saved-result key and the remote environment path of `verify.sh` in its own tree. Merge whichever lands second.
+- Merge order: aws `46329bd70` and natest `7a94df6ca` land on `builds` first. Then verify-env merges `builds`, with Phases 41i, 41j and 41k. This phase merges that result. Keep 41i's renewer trap (`kill $(jobs -p)`, then `wait`) and 41j's Mac log file descriptor.
+- Phase 41i sets the fixed values and carries the result variables only when `CMD == test` (`verify.sh` near line 1461). A remote nextest step of `final` must carry the same values.
+- A Mac disk exclusion reaches `mac_idle.py` only as `NatedevOnly("disk")` (near line 236), local compilation included. If eligibility emits `AnyTarget` for a disk exclusion, that evidence is lost. Keep it through eligibility, `step_record.read` and the disk alert.
+- `StepRecord` stores a `PackageSelection`. Its constructor takes only `WorkspacePackages` or `NamedPackage`; JSON and CLI values convert at their boundaries. Name each changed caller in the summary.
 
 **Acceptance gate:**
 - `test_verify_routing_rule.py` calls the rule function for each command with no flag, `--target`, `--mac` and `--local`, and reads the route of each step.
+- A pinned and an unpinned `final` on a fake Mac, a fake SSH and a copy route show the fixed values and the set result variables in the remote nextest command. A non-nextest step carries none of them.
+- A step with a Mac disk exclusion records the exclusion, `step_record.read` returns it, and the disk alert fires. Local compilation included.
 - A real `verify.sh` call with a fake SSH runner reaches the target for `check`, `example` and `build`, and repairs on natedev under `lint --mac`.
 - The modules that read routing pass. An assertion changes only where this Spec changes a route, and the summary names each one. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.

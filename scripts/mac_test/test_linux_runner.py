@@ -96,7 +96,7 @@ if tool == "df":
     if "-g" in arguments:
         raise SystemExit("Linux must not use df -g")
     free = int(os.environ.get("FAKE_FREE_GIB", "100"))
-    if any("G" in argument for argument in arguments):
+    if any("G" in argument for argument in arguments if argument.startswith("-")):
         available = str(free) + "G"
     elif "-B1" in arguments:
         available = str(free * 1024 ** 3)
@@ -662,6 +662,23 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(values["mend"], "mend fixture")
         self.assertEqual(values["scripts_commit"], "fixture-commit")
         self.assertNotIn("-g", self.events("df")[-1]["args"])
+
+    def test_probe_disk_units_do_not_depend_on_the_mirror_path(self) -> None:
+        identity = offload.KnownRepository("phase-copy", "https://example.com/team/GiB")
+        mirror = self.root / offload.remote_mirror(identity, "aws", 2)
+        mirror.mkdir(parents=True)
+        for tool in ("rustc", "cargo", "hostname"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
+
+        result = subprocess.run(
+            ["bash", "-c", offload.probe_script(identity, "aws", 2)], cwd=self.root,
+            env=self.environment, text=True, capture_output=True, check=False, timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(float(values["free_gib"]), 100.0)
 
     def test_matching_shell_tools_run_when_the_base_environment_versions_differ(self) -> None:
         for tool in ("rustc", "cargo"):
