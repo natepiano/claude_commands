@@ -1627,37 +1627,20 @@ The verify hold and token wait fixtures keep every run root inside the test root
 **Gotchas:** `verify.sh:1272` reaches `progress_history.last_dispatch` (`ROSTER_RUN_ROOT`), and `unit_runs.held` and `progress_history._supplier_address` (`UNIT_RUN_ROOT`). `SCRATCH_ROOT` sets the `unit_runs` defaults at import, and `copy_record.py` reads it.
 
 ### Phase 77 — `style/test_crate_run.py` uses half its CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/style/test_crate_run.py` (70.7 CPU s per gate, 97 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`style/test_crate_run.py` uses 21% less CPU, with all 97 tests and their assertions kept. Three same-load pairs: CPU 67.62 to 53.25 s, processes 29,883 to 28,158, execs 31,009 to 29,476, wall 206.3 to 180.3 s (pair 1). The half-CPU target is not met; the rest is the measured floor of the production Git wrappers.
 
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Phase 40 measured the floor parts: `style/bulk_run.py` and `style/git_process.py` make 10,444 Git calls (60.9 s), and durable publications make 5,777 fsync calls (44.4 s). Phase 44 cut the `copies.py` part (71.98 to 63.80 CPU s). Measure each remaining part again, and send each production cut with its measured gain.
-2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `setUpClass` builds the full fixture once into a class seed. Each test copies the seed back to the original root path, then opens a fresh queue and ledger connection. Setup cost falls from 15.9 to 1.1 CPU s.
+- The production Git wrappers cost 40.8 CPU s: `bulk_run.py` and `git_process.py` make 10,224 Git calls (14.8 s), and `copies.py` makes 10,799 (26.0 s). Fsync costs 0.02 CPU s under `/dev/shm`.
 
 **Files:**
 - `scripts/style/test_crate_run.py` — the module
 
-**Workers:** 1 writer on slot `impl` (one module; the file does not split)
-- `impl` — all files above, role impl
+**Gotchas:** the seed copy keeps symlinks, and only `staff.json` holds the original root path, so each test restores the seed at that same path.
 
-**Constraints from prior phases:**
-- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
-- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
-- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Phase 40: a per-class seed gave no gain (128 s to 126 s).
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** more test-side cuts; the test bodies already call production functions directly. A production cut, reuse of the held validated checkout in `CrateRun.integrate` (upper bound 5.0 CPU s), belongs to natedev-style.
 
 ### Phase 78 — `production/test_staff.py` uses half its CPU  · status: done
 **Depends on:** none
@@ -1740,32 +1723,73 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 81 — Affected-module tests remove their Git repository without a race  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_affected_modules.py` removes each test repository with nothing writing into its `.git` folder, so `tempfile` cleanup never fails with "Directory not empty".
-
-**Spec:** The showrunner asked for this phase on 2026-11-07. Fix the cause; do not add a retry.
-1. The Phase 79 targeted test failed `test_deleted_and_renamed_python_sources_select_direct_importers` two times, also alone: `OSError: [Errno 39] Directory not empty: '/dev/shm/targeted-test-*/production-test_affected_modules-*/affected-test-*/.git'`, raised in `TemporaryDirectory.cleanup` from `setUp` (`test_affected_modules.py:26`). The module passed in two other targeted runs on the same base.
-2. Find which process writes into the test repository's `.git` folder after the test body ends. Look at the Git commands the test and `scripts/production/affected_modules.py` run (`git mv`, `git status`, `git diff`), and at Git background work they can start: `gc --auto`, `maintenance --auto`, `fsmonitor--daemon`, and a detached child of a command.
-3. Prove the cause: make the race happen on a tempdir copy, and show the file or process that the failure names.
-4. Fix the cause in the test fixture. For example, set the Git configuration in the test repository that stops the background work, or wait for the child that the fixture starts. A cause in `affected_modules.py` goes to the director first, with the evidence.
-5. Add no guard, refusal or check in production code (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+`production/test_affected_modules.py` sets `maintenance.auto false` in each test repository before its first commit. No Git process writes into `.git` after a test body ends, so `TemporaryDirectory` cleanup never fails with "Directory not empty". The module passes 20 runs in a row under load; the proof driver fails on the old fixture and passes 100 repetitions on the new one.
 
 **Files:**
 - `scripts/production/test_affected_modules.py` — the module
 
-**Workers:** 1 writer on slot `impl` (one module; the file does not split)
+**Gotchas:** `git commit` starts a detached `git maintenance run --auto`. Its repack writes `.git/objects/info/packs` after the commit exits, so any fixture that commits in a tempdir repository can race its own cleanup.
+
+**Ruled out:** a retry, a sleep or `ignore_cleanup_errors` in cleanup.
+
+### Phase 82 — The branch takes builds with its package imports  · status: todo
+**Depends on:** Phase 77, Phase 79
+
+#### Work Order
+
+**Goal:** one merge commit puts builds 756c9a6eb (main a9cf78be1, sdlc 3z package imports) into this branch, so the showrunner can merge phases 35 to 81 with one hash.
+
+**Spec:** The showrunner approved this phase on 2026-11-07.
+1. In a private clone at this branch's tip, run `git merge --no-ff origin/builds`. Git names 30 conflicted files. Enable `rerere` in the clone, so the merge can be made again on a later tip with the same resolutions.
+2. Resolve each conflict. Keep both sides' changes. Builds' change moves imports to the package form (`from scripts.<package>.<module> import ...`) and runs entry files through `scripts/lib/py`. Apply that form to this branch's added lines too: run `python3 scripts/lint/package_imports.py <clone> <paths>` on each Python file this branch changed since the merge base.
+3. For a file where this branch has no natest change since the merge base, take the builds side.
+4. After the conflicts are settled, run `python3 scripts/lint/package_imports.py bootstrap <clone>`.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `docs/as-built/gate-checkouts.md` — conflicted in the merge
+- `scripts/agents/test_agent_exec.sh` — conflicted in the merge
+- `scripts/berth_fix/capture.sh` — conflicted in the merge
+- `scripts/berth_fix/launch.sh` — conflicted in the merge
+- `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh` — conflicted in the merge
+- `scripts/build_hold/hold_enforcer.py` — conflicted in the merge
+- `scripts/build_hold/test_hold_shortcut.py` — conflicted in the merge
+- `scripts/buildlog/mac_idle.py` — conflicted in the merge
+- `scripts/direct/assign_claude_test_support.py` — conflicted in the merge
+- `scripts/direct/board.sh` — conflicted in the merge
+- `scripts/direct/test_assign_claude_records.py` — conflicted in the merge
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — conflicted in the merge
+- `scripts/hooks/test_brp_launch_gate.py` — conflicted in the merge
+- `scripts/lint/memory_gate.sh` — conflicted in the merge
+- `scripts/lint/test_memory_admit.py` — conflicted in the merge
+- `scripts/mac_test/test_offload.py` — conflicted in the merge
+- `scripts/production/change_review.py` — conflicted in the merge
+- `scripts/production/mac_run.sh` — conflicted in the merge
+- `scripts/production/merge_checkpoint.py` — conflicted in the merge
+- `scripts/production/merge_gate.py` — conflicted in the merge
+- `scripts/production/merge_gate_test_support.py` — conflicted in the merge
+- `scripts/production/test_change_review.py` — conflicted in the merge
+- `scripts/production/test_merge_checkpoint_rerun.py` — conflicted in the merge
+- `scripts/statusline/statusline.sh` — conflicted in the merge
+- `scripts/style/rules.py` — conflicted in the merge
+- `scripts/style/style_ledger.py` — conflicted in the merge
+- `scripts/style/test_crate_run.py` — conflicted in the merge
+- `scripts/style/test_git_process.py` — conflicted in the merge
+- `scripts/style/unit_files.py` — conflicted in the merge
+- `scripts/test_times/test_show.py` — conflicted in the merge
+- `scripts/` — entry files that `package_imports.py bootstrap` changes
+
+**Workers:** 1 writer on slot `impl` (one merge; it does not split)
 - `impl` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 47: runs use `TMPDIR` under `/dev/shm`.
+- Phases 77 and 79 are checkpointed under the merge.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py` 20 times in a row under load, with `TMPDIR` under `/dev/shm`
-- the proof shows the cause before the fix and its absence after
-- module CPU s before and after, from `module_cost.py`
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+- no conflict marker in the merged tree; a second `package_imports.py <clone> <paths>` run on the changed Python files prints `converted: 0 files`
+- `basedpyright` on each conflicted Python file prints `0 errors, 0 warnings, 0 notes`
+- the targeted test green on the merge commit
