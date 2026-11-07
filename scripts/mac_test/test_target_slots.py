@@ -21,6 +21,7 @@ from typing import cast, override
 from scripts.lib import process_start as process_identity
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_start_test_support import process_reader
+from scripts.copies.copies_test_support import copies_environment
 
 import unittest
 from unittest import mock
@@ -119,6 +120,7 @@ class RepositorySlotTests(unittest.TestCase):
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
