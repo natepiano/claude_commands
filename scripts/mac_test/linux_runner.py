@@ -491,12 +491,18 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
+                   test_environment: tuple[tuple[str, str], ...] = (),
+                   clear_environment: str = '') -> str:
     arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
         arguments.extend(['--repo-identity', repo_identity])
+    for name, value in test_environment:
+        arguments.extend(['--env', name + '=' + value])
+    if clear_environment:
+        arguments.extend(['--clear-environment', clear_environment])
     arguments.extend(['--', *words])
     return shlex.join(arguments)
 
@@ -616,12 +622,14 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     if permission_refused(values):
         return 75
     try:
         with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -725,12 +733,14 @@ def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
 
 
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
-    if verb not in ('nextest', 'check', 'doc'):
-        raise ValueError('Linux targets accept only test, check and doc')
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
+    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
+        raise ValueError('unsupported remote verb')
     if verb == 'nextest':
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = 'test' if verb == 'nextest' else verb
+    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)
@@ -763,6 +773,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),
     }
+    if verb == 'nextest':
+        environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
     if repo_identity:
@@ -804,6 +816,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                     + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
                     + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
                     + '\n'.join(parity) + '\n'
+                    + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
                     + f'export {assignments}\n'
                     + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
@@ -842,6 +855,8 @@ class RunnerArguments(argparse.Namespace):
         self.call_id: str = ''
         self.tree_key: str = ''
         self.repo_identity: str = ''
+        self.environment: list[str] = []
+        self.clear_environment: str = ''
         self.words: list[str] = []
 
 
@@ -858,6 +873,8 @@ def main() -> int:
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
     _ = runner.add_argument('--repo-identity', default='')
+    _ = runner.add_argument('--clear-environment', default='')
+    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -869,7 +886,10 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key, arguments.repo_identity)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity,
+               tuple((name, value) for entry in arguments.environment
+                     for name, _, value in (entry.partition('='),)),
+               arguments.clear_environment)
 
 
 if __name__ == '__main__':

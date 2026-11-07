@@ -374,7 +374,7 @@ exit "$status"
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
-    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = self.fixture.root / "hold-targets.py"
         _ = targets.write_text(f'''import os
 import runpy
@@ -384,7 +384,7 @@ import tempfile
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
     print("natedev\\teligible\\t-\\t-\\t-")
-    if {runs_on!r} == "mac_allowed":
+    if {runs_on!r} == "any_target":
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})

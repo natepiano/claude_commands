@@ -15,7 +15,7 @@ class ExampleCommandTests(SeededExampleWorkspaceFixture):
         integration.parent.mkdir()
         _ = integration.write_text("#[test]\nfn smoke() {}\n")
 
-        for args in (("test", "sample", "--filter", "smoke"), ("test", "sample", "smoke")):
+        for args in (("test", "sample", "--filter", "smoke"), ("test", "sample", "--test", "smoke")):
             with self.subTest(args=args):
                 result = self.verify(*args)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

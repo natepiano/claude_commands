@@ -85,6 +85,8 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         home = self.root / "home"
         home.mkdir()
         (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)

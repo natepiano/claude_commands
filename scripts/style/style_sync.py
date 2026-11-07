@@ -261,7 +261,7 @@ def unblock_held_signals() -> None:
 
 def verifier_command(directory: Path, owner: int) -> list[str]:
     return ["sh", "-c", VERIFIER_WRAPPER, "sh", str(directory / VERIFIER_FILE), str(owner),
-            "bash", str(VERIFY), "lint", "--workspace", "--check", "--no-cache"]
+            "bash", str(VERIFY), "lint", "--check", "--no-cache"]
 
 
 def verify_lint(directory: Path) -> tuple[int, str]:

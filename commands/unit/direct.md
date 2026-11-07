@@ -489,7 +489,7 @@ Codex only; no timer process:
 
 <BackgroundVerificationContract>
 Run every `verify.sh` call as one plain command,
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <command> [<package>] [flags]`,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
@@ -559,19 +559,37 @@ implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 </WritePromptContract>
 
 <VerificationContract>
-Rust workers run only exact prompt lines using
-`~/.claude/scripts/direct/verify.sh`:
+Rust workers run only exact prompt lines with this form:
+`bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
+Omit the package for the whole workspace. Give at most one positional word after the command.
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package> [--keep-going]` |
-| package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
-| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/direct/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
-| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint <package>` |
-| changed example | `bash ~/.claude/scripts/direct/verify.sh example <package> <name>` |
-| final workspace gate | `bash ~/.claude/scripts/direct/verify.sh final` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check [<package>] [--keep-going]` |
+| package or workspace tests | `bash ~/.claude/scripts/direct/verify.sh test [<package>]` |
+| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --test <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
+| a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
+| staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
+| example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
+| build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
+| final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
+| read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
+
+`check` and `build` keep Cargo's workspace selection, also with a named package.
+A named package owns feature names without a slash. Without a package, feature
+names pass unchanged. `doc` checks the whole staged workspace with the same
+feature rule. Its pass record stays the same.
+
+Without `--name`, `example` checks all examples in the selected package or workspace.
+With `--name` and no package, the example's member supplies its required features.
+`final` checks the whole workspace. A named package limits its nextest run and
+prevents a saved pass. `--tree` requires `--saved`.
+
+Use `--local` only for a test that cannot pass on macOS. A reservation reason
+is refused. Use `/build:hold hold <why> target mac` for a Mac hold.
+Before CI, either machine can answer a test, including merge gates.
 
 Rules:
 
@@ -1462,7 +1480,7 @@ A launch that needs a built binary — a smoke or shot helper's, or a launcher
 that takes a path — builds it with this one line, then starts the
 `binary: <path>` it prints:
 
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>]`
 
 It waits for a build hold, takes the cargo token and memory admission, and
 records the build, and its allow rule needs no approval. You and every helper
