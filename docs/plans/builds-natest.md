@@ -1717,6 +1717,10 @@ The verify hold and token wait fixtures keep every run root inside the test root
 3. For a file where this branch has no natest change since the merge base, take the builds side.
 4. After the conflicts are settled, run `python3 scripts/lint/package_imports.py bootstrap <clone>`.
 5. Add no guard, refusal or check (user rule, 2026-11-05).
+6. After the conflicts, run `package_imports.py bootstrap <checkout>`, then `env -C <checkout> python3 scripts/lint/package_imports.py <checkout> <changed .py files>`. The converter from devtools 314fa11a4 refuses `scripts/test_times/module_run.py` and leaves it unchanged; keep its `sys.path[0] = os.getcwd()`. Run `lint/test_memory_gate_wait.py`, `statusline/test_statusline.py` and `test_times/test_module_run.py` on the merge before the targeted test.
+7. Read every non-import line of the converter diff. Restore any control-flow change (showrunner, 2026-11-07: the converter once collapsed an if/elif). Restore `scripts/build_hold/build_hold.py` after the converter: it is frozen.
+8. `scripts/production/merge_gate.py` keeps this branch's mode (`SuiteMode`) and the aws machine (`SharedMachine | WholeMachine`). Bind `required: FullSuite | NoFullRunRequired = NoFullRunRequired()` before `if shared:`.
+9. Natest Phase 62 stops a timed-out module with TERM first. In `scripts/aws_target/test_gate_trial.py` (owner aws-unit), the stuck fixture expects exit `-signal.SIGTERM` and the log text `exit=-15`.
 
 **Files:**
 - `docs/as-built/gate-checkouts.md` — conflicted in the merge
@@ -1749,6 +1753,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - `scripts/style/test_git_process.py` — conflicted in the merge
 - `scripts/style/unit_files.py` — conflicted in the merge
 - `scripts/test_times/test_show.py` — conflicted in the merge
+- `scripts/aws_target/test_gate_trial.py` — the TERM exit expectation (owner aws-unit)
 - `scripts/` — entry files that `package_imports.py bootstrap` changes
 
 **Workers:** 1 writer on slot `impl` (one merge; it does not split)
@@ -1762,3 +1767,32 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - no conflict marker in the merged tree; a second `package_imports.py <clone> <paths>` run on the changed Python files prints `converted: 0 files`
 - `basedpyright` on each conflicted Python file prints `0 errors, 0 warnings, 0 notes`
 - the targeted test green on the merge commit
+
+### Phase 83 — The gate tests need no real type checker  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** no test module in `scripts/production/test_merge_gate_suites_types.py` runs the real `basedpyright`, so a gate host needs no type checker install to run the gate tests.
+
+**Spec:** User request, 2026-11-07, through aws-unit: "if basedpyright is not there the nightly check would fail and we would just fix that - i don't want to test these kinds of things ... it is wasted time - you should ask natest to remove it". The showrunner accepted this phase in the Phase 82 hash.
+1. Delete `MergeGateTypesTests.test_real_basedpyright_exits_zero_without_a_checkout_venv`.
+2. Delete `MergeGateTypesTests.test_type_check_uses_pinned_packages_when_the_checkout_has_a_venv`.
+3. Remove each import that only those two tests use (`import venv`). Keep `shutil`: another test uses it.
+4. Change no other test and no production code. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/test_merge_gate_suites_types.py` — the two tests and their unused import
+
+**Workers:** 1 writer on slot `impl` (two deletions in one file; it does not split)
+- `impl` — `scripts/production/test_merge_gate_suites_types.py`, role impl
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Run Python test modules with `python3 scripts/test_times/module_run.py scripts/<dir> <file>` from the tree.
+
+**Acceptance gate:**
+- `grep -n "shutil.which(\"basedpyright\")" scripts/production/test_merge_gate_suites_types.py` prints nothing
+- `python3 scripts/test_times/module_run.py scripts/production test_merge_gate_suites_types.py` passes
+- `basedpyright scripts/production/test_merge_gate_suites_types.py` prints `0 errors, 0 warnings, 0 notes`
+- the targeted test green
