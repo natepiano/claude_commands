@@ -1456,8 +1456,11 @@ def _pause_units(arguments: _Arguments) -> int:
     if arguments.production:
         members = cast(Callable[[str], tuple[StaffRow, ...]],
                        import_module("scripts.production.staff_sources").production_units)
-        references = [str(row.id) for row in members(arguments.production)
-                      if row.name not in arguments.excluded and str(row.id) not in arguments.excluded]
+        resolve_exclusions = cast(Callable[[tuple[StaffRow, ...], Sequence[str]], set[StaffId]],
+                                 import_module("scripts.production.session_staff").excluded_unit_ids)
+        production = members(arguments.production)
+        excluded = resolve_exclusions(production, arguments.excluded)
+        references = [str(row.id) for row in production if row.id not in excluded]
     else:
         references = [arguments.target]
     rows: list[StaffRow] = []
