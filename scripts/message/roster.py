@@ -1588,7 +1588,8 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
         name += " (you)"
     if context:
         name += " (context)"
-    details = [entry.kind, entry.status]
+    status = "background" if entry.kind == "claude" and entry.status == "shell" else entry.status
+    details = [entry.kind, status]
     if isinstance(shown.job, JobUnassigned):
         details.append(shown.job.reason)
     unit = _unit(entry)
