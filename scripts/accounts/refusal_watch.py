@@ -686,8 +686,11 @@ def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedH
         fingerprint = "|".join(candidate.to + blocked_next_move_reason_key(cause) for candidate, cause in blocked) if other_targets else blocked_next_move_reason_key(reason)
         if notices.get(rule.entry_id) != fingerprint:
             _ = notices.pop(rule.entry_id, None)
-            if (_notify_no_room(line, now) if other_targets else _notify_blocked_head(rule, reason, now)):
-                notices[rule.entry_id] = fingerprint
+            head = next((entry for entry in next_moves.read_next_moves() if entry.group == rule.group), None)
+            if (isinstance(head, next_moves.ClaudeGroupMove) and head.id == rule.entry_id and head.to == rule.to
+                    and head.fallback_targets == rule.fallback_targets):
+                if (_notify_no_room(line, now) if other_targets else _notify_blocked_head(rule, reason, now)):
+                    notices[rule.entry_id] = fingerprint
     return line
 
 

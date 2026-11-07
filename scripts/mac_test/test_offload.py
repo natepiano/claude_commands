@@ -37,6 +37,8 @@ else:
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
 RUN_SUBPROCESS = subprocess.run
@@ -161,6 +163,7 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = write_config_fixture(self.settings, "", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
+            **copies_environment(self.root),
             "MAC_TEST_CONFIG": str(self.settings), "CONF_DIR": str(Path(self.settings).parent),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
@@ -376,6 +379,12 @@ class OffloadSettingsTests(unittest.TestCase):
                 with redirect_stderr(warning):
                     self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
                 self.assertIn("leftover_timeout_s", warning.getvalue())
+
+    def test_probe_mirror_lease_stays_under_the_temporary_root(self) -> None:
+        request = offload.OffloadRequest(self.root, "hana", "probe-start", offload.NO_RESULT_FILE, (),
+                                         owner="verify", holder_session="fixture-session")
+        mirror = offload.request_mirror(offload.read_config(self.settings), request, offload.KnownRepository("hana"))
+        self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(self.root))
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
