@@ -1553,7 +1553,7 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 
 **Ruled out:** a retry in `rmtree`, because it hides the writer; one shared deadline for the two waits, because it could fail a slow passing test.
 
-### Phase 73 — Two stopped-call tests stop failing at random  · status: todo
+### Phase 73 — Two stopped-call tests stop failing at random  · status: done
 **Depends on:** none
 
 #### Work Order
