@@ -1196,7 +1196,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Gotchas:**
 - The loop ran at the top level, so `exit` and `set --` acted on the script. The caller restores the positional arguments from `ARGS`.
 
-### Phase 41g — One form for every verify command  · status: todo
+### Phase 41g — One form for every verify command  · status: done
 
 **Depends on:** Phase 41d.
 
@@ -1324,6 +1324,56 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - A search of the repository, outside `docs/plans`, finds none of the removed forms.
 - The modules that the writers change pass, and basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
+### Phase 41i — A saved test pass holds the environment that changes test results  · status: todo
+
+**Depends on:** Phase 41g.
+
+#### Work Order
+
+**Source:** builds, 2026-11-06, a defect from cargo-liner's port unit: `verify.sh test tui_pane` reused a `--local` pass recorded under `NO_COLOR=1`.
+
+**Goal:** a saved test pass answers only a run under the same environment values that change test results. A remote run carries those values, so its pass proves what the key says.
+
+**Spec:**
+
+1. In `scripts/direct/tree_watch.py`, for the `test` command, the verdict key and the tree content key also hold each set variable named by two new keys in `config/direct.conf`, read at use:
+   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`.
+   - `VERIFY_RESULT_ENV_PREFIXES`: `LC_`, `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
+   - `RUST_LOG` and the other `RUST` names already reach the key.
+   - The build key does not change: a changed value reruns tests and rebuilds nothing. Each other command's key does not change.
+   - An unset name and an empty name differ.
+1a. Each test run sets `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` and `LINES` to one fixed value, on natedev, the Mac and each SSH target, so each pass is comparable and the saved result carries across panes and workers. The values live in a third new key in `config/direct.conf`, `VERIFY_TEST_FIXED_ENV`, read at use: `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, `LINES=24`. These five names are not keyed by their call values. The verdict key holds the configured fixed values, so a changed config value does not reuse an older pass.
+2. For `test`, the value of each name given with `--env` also goes in the verdict key and the tree content key, and not in the build key.
+3. A Mac or SSH nextest run carries the fixed values of item 1a, each set variable of item 1, and `RUST_LOG`, `RUST_BACKTRACE` and `RUST_LIB_BACKTRACE`, from the call. This holds for an unpinned route, a `--mac` route, a `--target` route and a copy run. It uses the `--env` path and its environment file: extend `VERIFY_MAC_ENVIRONMENT` and the runner's `--env` words. The refusal list for user `--env` names and the rule that a user `--env` needs `--mac` do not change. Remove the `--copy` limit in `offload.py` `main` only if a copy run needs it to carry them. A non-nextest verb carries nothing new.
+4. The `verify.sh` header comment and `docs/as-built/mac-test-offload.md` state the rule. Correct each other doc line that the search for the saved-result key finds wrong.
+
+**Files:**
+- `scripts/direct/tree_watch.py`
+- `scripts/direct/verify.sh`
+- `scripts/mac_test/offload.py`
+- `scripts/direct/test_verify_build_key.py`
+- `scripts/direct/test_verify_result_environment.py`
+- `scripts/mac_test/test_offload.py`
+- `config/direct.conf`
+- `config/README.md`
+- `docs/as-built/mac-test-offload.md`
+
+**Workers:** fix16 holds all files, in its own tree.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time. A test that reaches a lease needs `COPIES_CONFIG`.
+- Importing `offload.py` loads no build coordination modules.
+- A move of a `verify.sh` function reaches each test whose DEBUG trap watches its commands. Search `trap .* DEBUG` and `BASH_COMMAND`, and run those modules.
+- Phase 41h edits routing in `verify.sh` in another tree. Merge whichever lands second.
+
+**Acceptance gate:**
+- `test_verify_result_environment.py` runs the real `verify.sh test sample --local` on a tempdir project with a fake cargo. Under `NO_COLOR=1` it runs; again under `NO_COLOR=1` it reuses the pass; with no `NO_COLOR` it runs. Same for `CLICOLOR`. A changed `--env` value under `--mac` runs again.
+- A real `verify.sh test` call that reaches a fake Mac runner under `NO_COLOR=1` shows `NO_COLOR=1` in the remote command, and a call that reaches a fake SSH runner shows it too.
+- A second call with a different `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` or `LINES` reuses the pass. The fake cargo on natedev, and the remote command on the fake Mac and SSH runners, show the fixed values and not the call's values.
+- `test_verify_build_key.py`: `NO_COLOR` changes the verdict key and not the build key. A `check` key does not change with `NO_COLOR`.
+- The modules that read the key pass. No assertion changes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
 **Depends on:** Phase 41g.
@@ -1355,7 +1405,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
    | `build` | `build` (new) | `build` |
    | `final` | `check`, `nextest` | `check`, `test` |
 
-   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. `config/aws_target.conf` adds `lint`, `example` and `build` to `kinds`, and `config/README.md` states the new list. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
+   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. **Held edit:** do not change the `kinds` line of `config/aws_target.conf` or its text in `config/README.md` in this edit round. The change would add `lint`, `example` and `build`. builds asked the user on 2026-11-06: approve, pinned only, or no. The director applies the answer as a separate edit. Until then a Linux target with today's `kinds` answers "target does not permit this command" for those steps, and no test reads the live `kinds` line. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
 5. `build` on another target prints `binary: <target>:<path>`.
 6. A pinned `final` runs both steps on the target, keeps the clean tree check, and saves no pass: a saved pass answers only for this machine. An unpinned `final` keeps `final_pass.py` unchanged, with its clean tree and compiler identity. Name this rule in the as-built.
 7. Update `verify help <command>`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md`.
@@ -1398,6 +1448,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Phases 29, 37 and 41c: a tree-writing step stays on natedev, and the first-mend leave hook stays.
 - Importing `offload.py` loads no build coordination modules (resources' Phase 67 test).
 - Phase 41e edits `route_test`, `free-now` and `reserve` in its own tree. Merge whichever lands second.
+- Phase 41i edits the saved-result key and the remote environment path of `verify.sh` in its own tree. Merge whichever lands second.
 
 **Acceptance gate:**
 - `test_verify_routing_rule.py` calls the rule function for each command with no flag, `--target`, `--mac` and `--local`, and reads the route of each step.
