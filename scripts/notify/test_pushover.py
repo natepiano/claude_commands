@@ -16,17 +16,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
-if TYPE_CHECKING:
-    from ..production import review_regime
-else:
-    from scripts.production import review_regime
+from scripts.production import review_regime
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,

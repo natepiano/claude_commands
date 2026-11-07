@@ -22,7 +22,7 @@ from scripts.production.staff_test_support import fixture_member, showrunner_rel
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
 
 import dailies_input
-import footer_counts
+from scripts.production import footer_counts
 import next_item
 import tidy_wrapped
 from scripts.hooks import showrunner_footer

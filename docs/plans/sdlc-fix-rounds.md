@@ -275,7 +275,7 @@ Design from the sdlc showrunner:
 
 **Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
 
-### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: in progress
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: done
 
 From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
 
@@ -284,6 +284,8 @@ From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-
 - One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
 - `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
 - After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+Landed on main in 9aa3b5526 (2fc784207), folded into the fix-rounds branch. devtools 8l keeps the staff row at `codex_mesh end`, so end stops the last worker's server and does not call `staff.retire`. The sweep on 2026-11-07 retired all 24 astra-reviewer rows through `staff.py retire`; none had a live process.
 
 ### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
 
@@ -347,3 +349,14 @@ The branch changes neither folder. The cause is a shared path the branch changes
 Cause: neither test failure came from this branch. `test_restart` read the live Astra root, because its fixture patched `unit_runs.run_roots` but not `unit_runs.ASTRA_RUN_ROOT`. Under load, `codex_mesh._reap` returned success while a zombie child app-server was not yet waitable, so end-friend left the consultation server alive. The fixture now patches the Astra root, and only `waitpid` confirms a child exit.
 
 The phase also folds retire-servers `7c0e6596f` (Phase 9r) into this branch. devtools 8l keeps the staff row at `codex_mesh end`, so the merge keeps the last-worker server reap and drops the retire call. The reap now also runs when an end of the last worker fails after it publishes `ended`. `scripts/message/morty_identity.py` holds the `MORTY_NATIVE_ID` rule for `send` and `session_staff`, which breaks the send → roster → session_staff → send import cycle.
+
+### Phase 10b — Git proves that a shrink's code checkpoint merged  · status: done
+
+From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink unless `merged_checkpoints` finds a `progress_history` checkpoint event for the phase. Today it held two shrinks whose code checkpoint was on sdlc:
+
+1. shutdown resume-codex-by-name: the phase ran on another branch, so its event names another worktree.
+2. herdr 21: the code checkpoint is the top hash, and it has no event.
+
+Git proves the merge. A shrink passes when its parent commit is an ancestor of the merge branch. This path no longer reads events. Add no new check. Add one test for each case.
+
+As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.

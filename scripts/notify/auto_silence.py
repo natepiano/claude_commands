@@ -31,21 +31,15 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import silence  # noqa: E402
 from scripts.notify.silence import Deliver, Run  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib.prompt_activity import PromptActivity, UserTypedPrompt, UnknownPrompt, SOURCES
-    from ..lib.session_paths import sessions_directory
-else:
-    from scripts.lib.prompt_activity import PromptActivity, UserTypedPrompt, UnknownPrompt, SOURCES
-    from scripts.lib.session_paths import sessions_directory
+from scripts.lib.prompt_activity import PromptActivity, UserTypedPrompt, UnknownPrompt, SOURCES
+from scripts.lib.session_paths import sessions_directory
 
 SENDER = "natedev"
 JOB = "auto-silence"
