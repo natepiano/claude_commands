@@ -11,18 +11,14 @@ import socket
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, TextIO, cast, override
+from typing import TextIO, cast, override
 from unittest.mock import Mock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.nix_env import heal
 from scripts.shutdown import stop_resume
-if TYPE_CHECKING:
-    from scripts.notify import push_texts
-else:
-    import push_texts
+from scripts.notify import push_texts
 from scripts.message import sessions
 from scripts.whoami import account
 

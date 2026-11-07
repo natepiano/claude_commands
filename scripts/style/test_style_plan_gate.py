@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 from scripts.production.cli_fixture import process_boundary
 
 import io
@@ -12,7 +12,6 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
@@ -20,25 +19,24 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_proposals
-import proposal_issue
-from issues import frontmatter
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.production import proposal_issue
+from scripts.production.issues import frontmatter
 
-import berth_board
-import fake_fmt
-import rules
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import fake_fmt
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
 class StylePlanTests(StylePlanFixture):
     def test_gate_and_checkpoint_use_only_current_parameter_blockers(self) -> None:
-        from test_approved_renames import PARAMETER_CHANGES
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
             with self.subTest(parameter=label):
                 case = StylePlanTests()
@@ -80,7 +78,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_unread_local_body_refuses_gate_and_checkpoint_after_a_signature_change(self) -> None:
-        from test_approved_renames import UNREAD_LOCAL_BODIES
+        from scripts.style.test_approved_renames import UNREAD_LOCAL_BODIES
         for label, source in UNREAD_LOCAL_BODIES:
             with self.subTest(body=label):
                 case = StylePlanTests()
@@ -113,7 +111,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_proved_item_with_unread_body_passes_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import UNREAD_ITEM_BODIES
+        from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
                 case = StylePlanTests()
@@ -139,7 +137,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_generic_parameters_refuse_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        from scripts.style.test_approved_renames import GENERIC_PARAMETER_BINDINGS
         self.assert_local_declarations_refuse_gate_and_checkpoint(GENERIC_PARAMETER_BINDINGS)
 
     def assert_local_declarations_refuse_gate_and_checkpoint(self, forms: tuple[tuple[str, str], ...]) -> None:
@@ -174,11 +172,11 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_field_expression_bindings_refuse_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        from scripts.style.test_approved_renames import FIELD_EXPRESSION_BINDINGS
         self.assert_local_declarations_refuse_gate_and_checkpoint(FIELD_EXPRESSION_BINDINGS)
 
     def test_gate_anchor_matrix_never_adopts_a_build_coordinate_or_current_sibling(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         for probe in ("missing_anchor", "later_field", "removed", "raw_pair"):
             with self.subTest(probe=probe):
                 case = StylePlanTests()
@@ -225,7 +223,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_gate_and_checkpoint_cannot_admit_an_identical_sibling_instead_of_the_recorded_item(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         source = IDENTICAL_BINDING_ITEMS
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         edited = source.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
@@ -244,7 +242,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
 
     def test_gate_and_checkpoint_refuse_a_duplicate_recorded_item_path(self) -> None:
-        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        from scripts.style.test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
         source = DUPLICATE_BINDING_ITEM_PATH
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         self.write(path, source.replace("|g| g", "|checkout_info| checkout_info", 1))
@@ -262,7 +260,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
 
     def test_gate_and_checkpoint_accept_a_precisely_proved_format_capture_rename(self) -> None:
-        from test_approved_renames import CAPTURE_BINDING_ITEM
+        from scripts.style.test_approved_renames import CAPTURE_BINDING_ITEM
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(CAPTURE_BINDING_ITEM)
         edited = CAPTURE_BINDING_ITEM.replace("g =", "checkout_info =").replace("{g}", "{checkout_info}")
         self.write(path, edited)
@@ -300,7 +298,7 @@ class StylePlanTests(StylePlanFixture):
         self.assert_inner_attribute_refuses_gate_and_checkpoint("trait")
 
     def assert_inner_attribute_refuses_gate_and_checkpoint(self, kind: str) -> None:
-        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        from scripts.style.test_approved_renames import INHERITED_INNER_ATTRIBUTES
         source = next(source for label, source in INHERITED_INNER_ATTRIBUTES if label == kind)
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         self.write(path, source.replace("|g| g", "|checkout_info| checkout_info"))
@@ -541,13 +539,13 @@ class StylePlanTests(StylePlanFixture):
         for path in paths:
             self.record(second, path, self.tip, "3001")
         self.record(rule, paths[0], self.tip, "3001")
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
                                  "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout), (1, f"unjudged: {rule} {paths[1]}\n"))
         with self.assertRaisesRegex(style_ledger.LedgerError, f"unjudged cells: {rule} {paths[1]}"):
             ledger.ticket_checkpoint("3001", self.tip)
         self.record(rule, paths[1], self.tip, "3001")
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
                                  "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
         ledger.ticket_checkpoint("3001", self.tip)
@@ -574,7 +572,7 @@ class StylePlanTests(StylePlanFixture):
         self.record(rule, path, self.tip, "3001")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", ("0" * 40, "3001"))
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
                                  "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertTrue(result.stdout.startswith("error: "), result.stdout)
@@ -591,7 +589,7 @@ class StylePlanTests(StylePlanFixture):
         self.record(rule, path, self.tip, "3001")
         _ = (self.unit / path).write_text("pub fn value()  {}\n")
         self.unformatted(path)
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
                                  "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout, result.stderr),
                          (1, f"mechanical\nreview: not formatted (rustfmt +nightly): {path}\n", ""))
@@ -1126,7 +1124,7 @@ class StylePlanTests(StylePlanFixture):
     def test_coverage_gate_excludes_direct_branch_point_work_taken_in_from_the_style_branch(self) -> None:
         ticket = self.take_style_work_into_judged_ticket()
         result = subprocess.run(
-            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
             capture_output=True, text=True, check=False,
         )
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
@@ -1137,7 +1135,7 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.take_style_work_into_judged_ticket()
         _ = (self.unit / ticket["files"][0]).write_text("pub fn value() { let count = 7; }\n")
         result = subprocess.run(
-            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 1, result)

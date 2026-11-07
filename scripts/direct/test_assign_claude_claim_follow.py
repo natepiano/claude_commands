@@ -4,14 +4,14 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from scripts.direct.implement_launcher_test_support import ImplementLauncherFixture
+from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 
 
-class ImplementLauncherFollowTests(ImplementLauncherFixture):
+class AssignClaudeLauncherFollowTests(AssignClaudeLauncherFixture):
     def test_busy_or_missing_worker_preserves_the_pass_and_status(self) -> None:
         session = self.start_phase("busy-or-gone")
         transcript = self.claude_worker(session)
-        status = session / "impl_status_impl"
+        status = session / "impl_status_fixture-impl"
         _ = status.write_text("previous\n")
         before = self.open_passes(session)
         original = transcript.read_bytes()
@@ -31,7 +31,7 @@ class ImplementLauncherFollowTests(ImplementLauncherFixture):
         sender = self.root / "send"
         _ = sender.write_text(sender.read_text().replace(
             "behavior = os.environ.get('STUB_SEND_BEHAVIOR', 'complete')",
-            "claim = pathlib.Path(os.environ['STUB_SUMMARY']).parent / 'impl_claim_impl.json'\n"
+            "claim = pathlib.Path(os.environ['STUB_SUMMARY']).parent / 'impl_claim_fixture-impl.json'\n"
             + "(root / 'claim-at-delivery.json').write_bytes(claim.read_bytes())\n"
             + "behavior = os.environ.get('STUB_SEND_BEHAVIOR', 'complete')"))
         result = self.worker_launch(session, to="fixture-impl")

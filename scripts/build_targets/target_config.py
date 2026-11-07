@@ -6,15 +6,13 @@ from dataclasses import dataclass
 from collections.abc import Mapping
 from enum import Enum, auto
 from pathlib import Path
-import sys
 import os
 import json
 from typing import Literal, cast
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "lib"))
-import conf
+from scripts.lib import conf
 
 
 Platform = Literal["linux", "macos"]

@@ -11,6 +11,10 @@ is skipped and reported. The registry's `production.director` row keeps its mode
 level, through default_models.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import re
@@ -19,8 +23,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import unit_lookup
-from session_pane import HerdrFailure, read_place, type_place
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, read_place, type_place
 from scripts.lib import models_registry
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"

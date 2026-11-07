@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
+from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
 from typing import cast
 import json
 
 
-class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
     def test_claude_control_only_pane_uses_no_summary_line(self) -> None:
         session_dir = self.start_phase("pane-controls-only")
         _ = (self.root / "pane.bin").write_bytes(

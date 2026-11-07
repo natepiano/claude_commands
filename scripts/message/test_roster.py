@@ -21,7 +21,6 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
@@ -42,25 +41,22 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "direct"))
 
-import codex_daemon
-from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
-import process_table
-import roster
-import send
-import unit_lookup
-import unit_runs
-import herdr
-from fake_herdr import CommandResponse, herdr_listener
-import sessions
-from relay_identity import relay_session_name
-from relay_test_support import write_relay_record
+from scripts.message import codex_daemon
+from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
+from scripts.message import process_table
+from scripts.message import roster
+from scripts.message import send
+from scripts.production import unit_lookup
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
+from scripts.message import sessions
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 from scripts.production import showrunners
 if TYPE_CHECKING:
-    from ..whoami import account, agent_accounts
+    from scripts.whoami import account, agent_accounts
 else:
     account = roster.account
     agent_accounts = roster.agent_accounts
@@ -575,6 +571,7 @@ class RosterTests(unittest.TestCase):
         assert registered is not None
         started = send.now()
         targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
+        no_backends: dict[staff.StaffId, staff.ClaudeBackend | staff.CodexBackend] = {}
         for target in targets:
             with self.subTest(target=target):
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
@@ -583,6 +580,8 @@ class RosterTests(unittest.TestCase):
                 with (mock.patch.object(send, "STATE", state),
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+                      # The staff backend lookup has its own registry read. This test counts send and roster.
+                      mock.patch.object(staff.StaffSnapshot, "backends", no_backends),
                       mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry,
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")

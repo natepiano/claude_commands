@@ -14,6 +14,10 @@ minute as the notifier job `auto-silence`, which `on` or a SPAN makes and `off` 
 state: on the Mac every subcommand runs there over ssh.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -30,10 +34,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import push_texts  # noqa: E402
-import silence  # noqa: E402
-from silence import Deliver, Run  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.notify.silence import Deliver, Run  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:

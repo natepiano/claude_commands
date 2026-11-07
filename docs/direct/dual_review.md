@@ -259,7 +259,7 @@ final diff only.
    diff to a file and run this read-only check in every repository, including Rust:
 
    ```sh
-   python3 ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
+   ~/.claude/scripts/lib/py ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
    ```
 
    `<diff>` is that saved diff, including new phase files, made with whole-file

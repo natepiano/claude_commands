@@ -33,7 +33,7 @@ A delay comes after the template name, in the user's plain words: `in ten minute
 `at 3pm`, `tomorrow at 9`. No delay: now. Delayed commands go through
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send_later.py" (--in <span> | --at <time>) [--run silence] -- <arguments>`,
 with a systemd span (`10min`, `1h`), or `--at "YYYY-MM-DD HH:MM"` in the user's zone, from
-`TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) date`.
+`TZ=$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py) date`.
 
 ## adhoc
 

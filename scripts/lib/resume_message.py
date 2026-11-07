@@ -171,12 +171,11 @@ def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
             options.append((option, value))
         position += 2
     if launcher not in assign_gate.ASSIGN_LAUNCHERS:
-        review = launcher == "review.sh"
         arguments = command[position:]
-        if len(arguments) < (3 if review else 9):
+        if len(arguments) < 3:
             raise ValueError("the saved command has incomplete task arguments")
-        options.append(("--role", "review" if review else arguments[5]))
-        if review and len(arguments) > 6:
+        options.append(("--role", "review"))
+        if len(arguments) > 6:
             options.append(("--pass", str(max(1, int(arguments[6])))))
             for offset, option in ((7, "--lens"), (8, "--early-ready")):
                 if len(arguments) > offset and arguments[offset] and option not in dict(options):

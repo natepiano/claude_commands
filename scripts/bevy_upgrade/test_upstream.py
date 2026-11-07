@@ -14,8 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 
-import crates_io_pacer
-import upstream
+from scripts.bevy_upgrade import crates_io_pacer
+from scripts.bevy_upgrade import upstream
 
 API = "https://crates.io/api/v1/crates"
 

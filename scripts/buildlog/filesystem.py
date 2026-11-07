@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-import cgroup_capture
+from scripts.buildlog import cgroup_capture
 
 
 @dataclass(frozen=True)

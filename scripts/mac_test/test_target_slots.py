@@ -16,37 +16,22 @@ import tempfile
 import threading
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..copies.copies_test_support import copies_environment
-    from ..lib.git_test_support import commit_repository
-    from ..lib.process_start_test_support import process_reader
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.copies.copies_test_support import copies_environment
-    from scripts.lib.git_test_support import commit_repository
-    from scripts.lib.process_start_test_support import process_reader
+from scripts.lib import process_start as process_identity
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_start_test_support import process_reader
+from scripts.copies.copies_test_support import copies_environment
 
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
-if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_hold import build_hold
-    from ..build_targets import targets
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    import mac_test
-    import offload
-    import build_hold
-    import targets
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import mac_test, offload
+from scripts.build_hold import build_hold
+from scripts.build_targets import targets
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class RepositoryKeyTests(unittest.TestCase):

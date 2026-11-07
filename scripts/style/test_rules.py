@@ -6,18 +6,16 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import rules
-import style_rules
-from candidate_generators import CandidatesSpecError, read_candidates_spec
+from scripts.style import rules
+from scripts.style import style_rules
+from scripts.style.candidate_generators import CandidatesSpecError, read_candidates_spec
 
 
 @final
@@ -187,7 +185,7 @@ class RuleTests(unittest.TestCase):
         self.assertFalse(loaded["tool"].mode_propose)
 
         environment = {**os.environ, "STYLE_HISTORY_NATE_STYLE_DIR": str(self.global_dir.parent)}
-        command = [sys.executable, str(Path(rules.__file__)), "list"]
+        command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(rules.__file__)), "list"]
         text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
         self.assertEqual(text.stdout.splitlines(), [
             "rule_id\tname\ttier\tfamily\tinput_scope\tsurface",
@@ -548,7 +546,7 @@ class RuleTests(unittest.TestCase):
             "STYLE_RULE_TEST_FILE": str(path),
         }
         output = subprocess.run(
-            [sys.executable, str(Path(style_rules.__file__)), "focused-eval",
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_rules.__file__)), "focused-eval",
              "--project-root", str(self.root), "--guideline", "listed"],
             env=environment, capture_output=True, text=True, check=True,
         )
@@ -564,7 +562,7 @@ class RuleTests(unittest.TestCase):
             "listed", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\n  surface: whole\n"
         )
         environment = {**os.environ, "STYLE_HISTORY_NATE_STYLE_DIR": str(self.global_dir.parent)}
-        command = [sys.executable, str(Path(rules.__file__)), "list"]
+        command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(rules.__file__)), "list"]
         text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
         self.assertEqual(text.stdout.splitlines(), [
             "rule_id\tname\ttier\tfamily\tinput_scope\tsurface", "global:rust/listed.md\tlisted\tB\tnames\tcrate\twhole",
@@ -852,7 +850,7 @@ class JudgedRuleTextTests(unittest.TestCase):
                                  check=True, capture_output=True, text=True).stdout.strip()
             _ = path.write_text("---\ntier: C\nfamily: names\napproval: always\n---\n# Body\n")
             current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
-            with mock.patch("rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
+            with mock.patch("scripts.style.rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
                 self.assertTrue(rules.judged_text_unchanged(old, current))
                 _ = subprocess.run(["git", "-C", str(repo), "read-tree", "--empty"], check=True)
                 self.assertTrue(rules.judged_text_unchanged(old, current))
@@ -890,7 +888,7 @@ class JudgedRuleTextTests(unittest.TestCase):
             blobs = [subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
                                     input=f"---\ntier: C\nfamily: names\ndate_modified: '[[2026-01-{index + 1:02}]]'\n---\n# Body\n".encode(),
                                     check=True, capture_output=True).stdout.decode().strip() for index in range(20)]
-            with mock.patch("rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
+            with mock.patch("scripts.style.rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
                 for blob in blobs * 3:
                     self.assertTrue(rules.judged_text_unchanged(blob, current))
             self.assertEqual(popen.call_count, 1)

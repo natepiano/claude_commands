@@ -44,7 +44,6 @@ from collections.abc import Awaitable
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 from scripts.lib import conf
 from scripts.maintenance.schedule import IntervalHistory

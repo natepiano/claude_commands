@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import re
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 from scripts.production import unit_config
-from unit_files import unit_worktrees
+from scripts.style.unit_files import unit_worktrees
 
 
 @dataclass(frozen=True)
