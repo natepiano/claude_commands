@@ -100,7 +100,7 @@ class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         judgment = [*scope, "--", "-D", "warnings"]
-        fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+        fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
         self.assertEqual(self.calls("clippy"), [judgment, *([fix] * fix_passes), judgment])
 
     def override_runner_killed_flag(self, flag: int) -> None:
