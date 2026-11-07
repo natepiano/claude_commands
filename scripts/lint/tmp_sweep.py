@@ -1106,7 +1106,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -1129,7 +1129,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
                 result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
                 return False
             pending = isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 result.keep(entry.path, git.value)
                 return False

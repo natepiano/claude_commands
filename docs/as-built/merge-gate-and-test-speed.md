@@ -125,7 +125,7 @@ A checkpoint rerun accepts its own recorded merge only for the same checkpoint, 
 
 **Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
 
-**Build holds.** Each mode waits before jobs, merging, and promotion while another session's natedev hold applies.
+**Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
 The gate checks the hold before each new job.
 A job stopped by a signal during an applicable hold returns to the front of the queue.
@@ -177,7 +177,32 @@ Without a calling session, the gate finds the registered production for the merg
 `--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 
-**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False) -> GateRun`):
+**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, machine=SharedMachine()) -> GateRun`):
+
+`SharedMachine` is the default and keeps the existing shared scheduling behavior.
+`WholeMachine` uses one job per CPU and runs every discovered module without reruns.
+It uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
+Both modes use one launch loop with the same commands, test environments, timeouts, tripwires, and process cleanup.
+`WholeMachine` prints each completed job's name, exit status, and seconds.
+`WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
+Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
+The gate trial sends the host's module times as a separate S3 object.
+The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
+The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
+The guest links `google-chrome` to Chromium before the system profile bind mount for headless chart tests.
+The host reads and prints its basedpyright version at trial start.
+The guest installs that version through uv and adds `$HOME/.local/bin` to PATH before the gate starts.
+The installation time counts in running to tools ready.
+Root prepares the shell links and a temporary system profile bind mount with Python at `/run/current-system/sw/bin/python3`.
+The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
+Its shell reads `/etc/profile` before tests, then restores the tool PATH.
+The NixOS environment marker prevents child zsh shells from replacing fixture paths.
+The guest timeline records CPU busy percent between samples from the aggregate `/proc/stat` counters, excluding idle and iowait.
+The guest result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
+CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
+The trial text table shows CPU use percent for each size and run.
+The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
+
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.

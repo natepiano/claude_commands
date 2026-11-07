@@ -389,6 +389,24 @@ class RepositorySlotTests(unittest.TestCase):
             if isinstance(answer, offload.FreshMacClaim):
                 self.assertEqual(answer.slot, self.claims("aws")[pid].get("slot"))
 
+    def test_linux_mirrors_use_the_build_folder_rule_without_percent_encoding_the_key(self) -> None:
+        cases = (
+            (offload.KnownRepository("checkout", "https://example.com/one/hana"), "hana-33d435bf"),
+            (offload.KnownRepository("checkout", "https://example.com/two/hana"), "hana-020748b0"),
+            (offload.KnownRepository("project", "git-root:" + "1" * 40), "project-c8446dca"),
+        )
+        mirrors: set[str] = set()
+        for repository, name in cases:
+            with self.subTest(repository=repository):
+                mirror = offload.remote_mirror(repository, "aws", 2)
+                self.assertEqual(mirror, f".local/state/build-target/mirror/{name}/aws-s2")
+                self.assertNotIn("%", mirror)
+                self.assertIn("%", repository.path_key)
+                mirrors.add(mirror)
+        self.assertEqual(len(mirrors), len(cases))
+        self.assertEqual(offload.remote_mirror(offload.KnownRepository("other-copy", cases[0][0].key), "aws", 2),
+                         offload.remote_mirror(cases[0][0], "aws", 2))
+
     def test_linux_mirrors_isolate_origins_slots_and_build_folders(self) -> None:
         first = self.repository("one/project", "ssh://git@example.com/a/project.git")
         second = self.repository("two/project", "https://example.com/b/project.git")
@@ -406,7 +424,7 @@ class RepositorySlotTests(unittest.TestCase):
             path = PurePosixPath(mirror)
             self.assertEqual(path.parts[:4], (".local", "state", "build-target", "mirror"))
             self.assertEqual(len(path.parts), 6)
-            self.assertEqual(path.name, str(slot))
+            self.assertEqual(path.name, f"aws-s{slot}")
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
         config = offload.read_config(self.root / "aws.conf")
@@ -514,7 +532,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertTrue((mac_test.state_paths("darwin").claims / "project.json").exists())
         _ = registry.write_text(registry.read_text().replace("platform.mac=macos", "platform.mac=linux"))
 
-        self.assertTrue(offload.remote_mirror(identity, "mac", 2).endswith("/2"))
+        self.assertTrue(offload.remote_mirror(identity, "mac", 2).endswith("/mac-s2"))
         self.assertEqual(self.claim("mac", root, 103)[0], 0)
         self.assertIn("slot", self.claims("mac")[103])
 

@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for the phase table built from worker state and durable events."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import io
 import json
@@ -220,7 +222,7 @@ class PhaseTableTests(unittest.TestCase):
         for unit, plan, worktree in rows:
             row = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
             if plan.startswith("retired"):
-                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", worktree), expected=row.worktree)
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree), expected=row.worktree)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
@@ -304,7 +306,7 @@ class PhaseTableTests(unittest.TestCase):
     def unit_id(self, production: str = "show", unit: str = "table") -> str:
         row = unit_membership(production, unit)
         if isinstance(row.worktree, staff.WorktreeUnfilled):
-            row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / row.id), expected=row.worktree)
+            row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / row.id), expected=row.worktree)
         return row.id
 
     def write_phase_note(

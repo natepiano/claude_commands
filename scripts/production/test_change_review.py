@@ -9,7 +9,6 @@ import io
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -19,9 +18,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import change_review
 from scripts.lib import copy_record
 from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
@@ -83,7 +80,7 @@ def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str]
     """Give the selected fixture rows Producer ids and staff records."""
     runners: dict[str, staff.StaffRow] = {}
     for name, doc in documents.items():
-        runners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        runners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
         text = doc.read_text() if doc.exists() else f"# {name}\n"
         if "**Showrunner checkout:**" not in text:
             text += f"\n- **Showrunner checkout:** `{root}`\n"
@@ -101,7 +98,7 @@ def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str]
                 continue
             name = "fixture-" + owner + "-" + path.stem.replace(" ", "-") + "-" + row["#"]
             member = fixture_member("unit", name=name, parent=runners[owner].id,
-                                    worktree=staff.PresentWorktree("natedev", root / name))
+                                    worktree=staff.PresentWorktree(remote.local_machine(), root / name))
             if "| Producer |" not in text:
                 lines = text.splitlines()
                 header = next(i for i, line in enumerate(lines) if line.startswith("| # |"))
@@ -1165,9 +1162,9 @@ class ActionTest(unittest.TestCase):
         _ = parent.write_text("- **Merge branch:** main\n", encoding="utf-8")
         style = self.path.parent / "parent-style-production.md"
         _ = style.write_text("- **Kind:** style\n- **Parent production:** /stale/parent-production.md\n", encoding="utf-8")
-        owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", parent))
+        owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc(remote.local_machine(), parent))
         _ = fixture_member("showrunner", name="parent-style", parent=owner.id,
-                           doc=staff.LiveDoc("natedev", style))
+                           doc=staff.LiveDoc(remote.local_machine(), style))
         record = staff.snapshot()
         self.assertEqual(change_review.credited(style, record), parent)
         self.assertEqual(change_review.credited(parent, record), parent)
@@ -2025,9 +2022,9 @@ class RepositoryTest(unittest.TestCase):
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
         _ = recorded_unit("kid", "u", self.repo / "u", kid, plan="docs/u-plan.md")
-        top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
+        top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
         tree = change_review.Tree([top, kid])
-        kid_owner = staff.snapshot().by_doc("natedev", kid)
+        kid_owner = staff.snapshot().by_doc(remote.local_machine(), kid)
         assert kid_owner is not None
         expected = ({"C1": kid_owner.id, "C2": top_owner.id}, {"C3": "no merge hash"})
         self.assertEqual(change_review.backfill(path, tree, write=False), expected)
@@ -2049,8 +2046,8 @@ class RepositoryTest(unittest.TestCase):
         _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
                              + f"- **Parent production:** {top}\n", encoding="utf-8")
         _ = recorded_unit("top-style", "u", self.repo / "u", style, plan="docs/u-plan.md")
-        owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
-        child = staff.snapshot().by_doc("natedev", style)
+        owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
+        child = staff.snapshot().by_doc(remote.local_machine(), style)
         assert child is not None
         _ = staff.move(child.id, staff.ReportsTo(owner.id))
         path = folder / "change-review - top.md"

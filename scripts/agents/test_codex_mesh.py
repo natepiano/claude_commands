@@ -12,6 +12,8 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production import worker_admission
 from scripts.shutdown import stop_results
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster, isolated_staff_file, isolated_source_readers, source_environment, unit_membership, StaffTestCase, fixture_worker_records, transcript_fixture
@@ -1074,7 +1076,7 @@ class MeshCommandFixture(unittest.TestCase):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, environment)))
         _ = self.patches.enter_context(isolated_source_readers())
         parent = unit_membership("natedev", "models")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = (self.session_dir / "prompt.txt").write_text("Original worker task", encoding="utf-8")
@@ -1965,9 +1967,9 @@ class MeshCommandFixture(unittest.TestCase):
         from scripts.production.staff_test_support import unit_membership
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert parent is not None
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.home / parent.name), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.home / parent.name), expected=parent.worktree)
         owner = unit_membership("demo", "design")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.session_dir), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=owner.worktree)
         _ = (self.session_dir / plan_history.STATE_FILENAME).write_text(json.dumps({"production": "demo", "unit": owner.name}))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session})))
         _ = fixture_worker("worker", owner.id, runtime_id=str(lifecycle.staff_id),
@@ -2030,7 +2032,7 @@ class MeshCommandFixture(unittest.TestCase):
         _ = self.patches.enter_context(patch.object(message_roster, "_production_places", return_value={"title-director": place}))
         production_membership("sdlc", "roles")
         parent = unit_membership("sdlc", "roles")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         yield
@@ -2536,7 +2538,7 @@ class StaffAdmissionTests(MeshCommandFixture):
         assert parent is not None
         worktree = self.session_dir / "staff-worktree"
         worktree.mkdir()
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", worktree), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=parent.worktree)
         _ = (self.session_dir / "mesh_dev_shell.json").write_text(json.dumps({"worktree": "/stale-shell"}))
         args = self.start_args()
         args.cwd = ""
@@ -3588,6 +3590,13 @@ class ShutdownDeadlineTests(MeshCommandFixture):
 
 @final
 class LifecycleClockTests(unittest.TestCase):
+    def test_hang_guard_uses_one_wall_clock_when_lifecycle_time_is_patched(self) -> None:
+        with patch.object(time, "monotonic", return_value=10.0):
+            guard = LauncherHangGuard("fresh machine")
+            remaining = guard.remaining()
+        self.assertGreater(remaining, 0)
+        self.assertLessEqual(remaining, TEST_HANG_GUARD_SECS)
+
     def test_registry_time_is_excluded_during_resolution_and_after_failure(self) -> None:
         ticks = [1000.0]
         clock = LifecycleTestClock()
@@ -3718,8 +3727,12 @@ class FixtureHomeSafetyTests(unittest.TestCase):
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
                   patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as temporary):
-                with self.assertRaisesRegex(AssertionError, name + " points into the real home"):
-                    MeshCommandFixture().setUp()
+                fixture = MeshCommandFixture()
+                try:
+                    with self.assertRaisesRegex(AssertionError, name + " points into the real home"):
+                        fixture.setUp()
+                finally:
+                    fixture.doCleanups()
                 temporary.assert_not_called()
 
     def test_metadata_guard_catches_a_bypassed_refusal_in_an_absent_or_existing_tree(self) -> None:
@@ -3823,7 +3836,7 @@ class StaffFolderTurnTests(unittest.TestCase):
             old, new = Path(scratch) / "old", Path(scratch) / "new"
             parent = fixture_member("showrunner", name="folder-production")
             unit = fixture_member("unit", name="folder", parent=parent.id,
-                                  worktree=staff.PresentWorktree("natedev", old))
+                                  worktree=staff.PresentWorktree(remote.local_machine(), old))
             worker = fixture_worker("impl1", unit.id)
             args = argparse.Namespace(session_dir=scratch, name="impl1", turn_cwd="")
             client = cast(codex_mesh.Client, cast(object, MagicMock()))
@@ -3833,7 +3846,7 @@ class StaffFolderTurnTests(unittest.TestCase):
                 start = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "First task"), "turn")
                 self.assertNotIn("cwd", cast(dict[str, object], request.call_args.args[2]))
-                _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", new), expected=unit.worktree)
+                _ = staff.set_worktree(unit.id, staff.PresentWorktree(remote.local_machine(), new), expected=unit.worktree)
                 self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "Next task"), "turn")
                 self.assertNotIn("cwd", cast(dict[str, object], request.call_args.args[2]))
                 self.assertEqual(request.call_args.args[2]["threadId"], worker.current_session)
@@ -6210,16 +6223,16 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         from scripts.production.staff_test_support import production_membership, showrunner_relationship
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert parent is not None
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.home), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.home), expected=parent.worktree)
         production_membership("sdlc", "roles")
         (self.session_dir / plan_history.STATE_FILENAME).unlink()
         owner = unit_membership("sdlc", "roles")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.session_dir), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=owner.worktree)
         showrunner = staff.local_snapshot().parent_of(owner)
         assert showrunner is not None
         doc = self.session_dir / "sdlc-production.md"
         _ = doc.write_text(f"- **Merge branch:** main\n- **Showrunner checkout:** {self.session_dir}\n- **Log:** log.md\n## Units\n")
-        _ = staff.set_doc(showrunner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(showrunner.id, staff.LiveDoc(remote.local_machine(), doc))
         private_staff = Path(os.environ["STAFF_FILE"])
         initial_staff = private_staff.read_bytes()
         for index, prefix in enumerate(("sdlc · roles", "sdlc")):
@@ -13804,7 +13817,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
         _ = self.patches.enter_context(isolated_staff_file(root / "director-staff.json", environment))
         owner = fixture_member("showrunner", name="demo")
         holder = fixture_member("unit", name="builders", parent=owner.id, runtime_id=old_session,
-                                worktree=staff.PresentWorktree("natedev", cwd))
+                                worktree=staff.PresentWorktree(remote.local_machine(), cwd))
         if changed_account:
             holder = staff.update_current_session(holder.current_session, staff.native_id(current_session))
         environment["CODEX_THREAD_ID"] = holder.current_session
@@ -14230,7 +14243,7 @@ class WorkerPauseTests(MeshCommandFixture):
         _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
         production_membership("demo", "builders")
         parent = unit_membership("demo", "builders")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=parent.worktree)
         session_staff.inbox_path(parent.id).parent.mkdir(parents=True, exist_ok=True)
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session})))
@@ -14283,7 +14296,7 @@ class WorkerPauseTests(MeshCommandFixture):
             (checkout / ".git").mkdir(parents=True)
             protected.append(checkout)
             parent = unit_membership("demo", f"command-{ordinal}")
-            _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", checkout), expected=parent.worktree)
+            _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), checkout), expected=parent.worktree)
             worker = fixture_member("worker", name="worker", parent=parent.id)
             record = records / f"command-{ordinal}.json"
             child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
@@ -14329,7 +14342,7 @@ class WorkerPauseTests(MeshCommandFixture):
         records = self.session_dir / "mesh_runs"
         records.mkdir()
         parent = unit_membership("demo", "held-command")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", checkout), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), checkout), expected=parent.worktree)
         worker = fixture_member("worker", name="worker", parent=parent.id)
         record = records / "held-command.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
@@ -14480,7 +14493,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         director.symlink_to(sys.executable)
         parent = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
         assert parent is not None
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir.parent),
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir.parent),
                                expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session})))
         (self.session_dir / plan_history.STATE_FILENAME).unlink()
@@ -14621,7 +14634,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         requested.mkdir()
         parent = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
         assert parent is not None
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir.parent),
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir.parent),
                                expected=parent.worktree)
         _ = (self.session_dir / "director").write_text(parent.current_session)
         arguments = ["workers.py", "resolve", "--session-dir", str(self.session_dir),
@@ -14687,7 +14700,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         _ = write_registry(registry, {"direct.codex": {"review": "gpt-fixture-sol:xhigh"}}, update=True)
         state = self.session_dir / plan_history.STATE_FILENAME
         parent = unit_membership("sdlc", "roles")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session})))
         _ = state.write_text(json.dumps({unit_runs.OWNER_FIELD: parent.id}))
         configured = fixture_names()
@@ -18533,7 +18546,7 @@ class DevShellServerTests(unittest.TestCase):
         private_worker_staff(self)
         parent = staff.local_snapshot().by_current_session(os.environ["CODEX_THREAD_ID"])
         assert parent is not None
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.worktree), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.worktree), expected=parent.worktree)
         _ = self.enterContext(scratch_accounts_config())
         _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
         _ = self.enterContext(patch.object(codex_mesh, "_design_context", return_value={}))
@@ -18947,7 +18960,7 @@ class DevShellServerTests(unittest.TestCase):
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
         parent = unit_membership("dev-production", "dev")
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.worktree), expected=parent.worktree)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.worktree), expected=parent.worktree)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
         args = argparse.Namespace(
             session_dir=str(self.session_dir), name="worker", cwd=str(self.worktree), resident=False,

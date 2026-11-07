@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib import test_hang_guard
 from scripts.lib.test_models_registry import ExactRows, registry_text
 from scripts.production import staff, unit_config
@@ -114,7 +116,7 @@ class ReviewLauncherFixture(LauncherFixture):
             member = unit_membership("fixture", "fixture")
             return staff.ensure("unit", name=member.name, parent=member.parent,
                                 runtime_id=member.current_session,
-                                worktree=staff.PresentWorktree("natedev", self.working_dir)).current_session
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.working_dir)).current_session
 
     @override
     def prepare_fixture(self) -> None:

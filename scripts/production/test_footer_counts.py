@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import contextlib
 import io
@@ -99,7 +101,7 @@ class FooterCountsTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
         _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
         self.production = fixture_member("showrunner", name="production",
-            doc=staff.LiveDoc("natedev", self.root / "production.md")).id
+            doc=staff.LiveDoc(remote.local_machine(), self.root / "production.md")).id
         # No live update timer names a production below this one, unless a test says so.
         self.tree = {}
         self.below = {}
@@ -148,7 +150,7 @@ class FooterCountsTests(unittest.TestCase):
     def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
         doc = self.root / "example-production.md"
         _ = doc.write_text("> **Status: PRODUCTION — running.** Example\n- **User zone:** UTC\n")
-        owner = fixture_member("showrunner", name="renamed-owner", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="renamed-owner", doc=staff.LiveDoc(remote.local_machine(), doc))
         state = self.root / "showrunner"
         folder = state / owner.id / "questions"
         folder.mkdir(parents=True)
@@ -299,7 +301,7 @@ class FooterCountsTests(unittest.TestCase):
                        f"- **Improvement queue:** {ledger}")
         self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
         empty_doc = self.doc()
-        owner = staff.snapshot().by_doc("natedev", empty_doc)
+        owner = staff.snapshot().by_doc(remote.local_machine(), empty_doc)
         assert owner is not None
         question_folder = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / owner.id / "questions"
         self.assertEqual(footer_counts.sources(empty_doc), [empty_doc, question_folder])
@@ -378,7 +380,7 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.root / "top-production.md"
         _ = doc.write_text(f"# Top\n- **Change review:** `{listing}`\n")
         self.tree = {"top": doc}
-        top = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        top = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), doc))
         one = fixture_member("unit", name="one", parent=top.id)
         _ = listing.write_text(LIST.replace("| How to check |", "| How to check | Producer |")
             .replace("| --- | --- | --- |", "| --- | --- | --- | --- |")
@@ -409,7 +411,7 @@ class FooterCountsTests(unittest.TestCase):
         self.below = {"top": ["kid", "grandkid"]}
         for name, doc in self.tree.items():
             _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n- **Showrunner checkout:** `{self.root}`\n")
-            _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
         with mock.patch.object(page_review, "lists_directory", return_value=self.root):
             forms = BrowserForms()
             forms.feed(change_browser.render(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root)).decode())
@@ -425,7 +427,7 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.root / "top-production.md"
         own_list = self.root / "change-review - top.md"
         _ = doc.write_text(f"# Top\n- **Change review:** `{own_list}`\n")
-        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), doc))
         self.tree = {"top": doc}
         config = self.root / "config"
         config.mkdir()

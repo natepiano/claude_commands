@@ -20,17 +20,15 @@ import io
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import offload
 if TYPE_CHECKING:
-    from ..build_targets import target_config
-    from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
+    from scripts.lib import copy_record, nix_env, scratch
+    from scripts.build_targets import target_config
+    from scripts.buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
+    from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
     from scripts.buildlog import sync as buildlog_sync
     from scripts.buildlog import health as buildlog_health
@@ -43,6 +41,21 @@ from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER,
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
+
+
+class GeneratedSourceTests(unittest.TestCase):
+    def test_no_envrc_source_requires_generated_source_outside_trusted_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, \
+             mock.patch.dict(os.environ, {'SCRATCH_ROOT': str(Path(temporary) / 'scratch')}):
+            folder = scratch.new('gate:offload-generated-source', 'proof')
+            self.assertIsNone(nix_env.nearest_envrc(folder))
+            self.assertFalse(offload.trusted_linux_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue(offload.trusted_linux_source(folder))
+            _ = (folder / '.envrc').write_text('use flake\n')
+            with mock.patch.object(nix_env, 'ensure', return_value=nix_env.Refused('not approved')):
+                self.assertFalse(offload.trusted_linux_source(folder))
 
 
 class LintVerbTests(unittest.TestCase):
@@ -150,6 +163,75 @@ class CompletedRunSyncTests(unittest.TestCase):
             self.assertEqual(exchange.call_args.args[0], buildlog_sync.SyncPeer("aws", "aws-build"))
             self.assertEqual(exchange.call_args.args[-2:], (7, 11))
             self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
+
+
+class LocalVersionPreflightTests(unittest.TestCase):
+    def test_recorded_versions_decline_before_claim_copy_or_ssh(self) -> None:
+        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True)
+
+    def test_matching_versions_continue_to_claim(self) -> None:
+        self.check_record('{"versions":{"rustc":" rustc 1.99.0 \\n"}}')
+
+    def test_later_match_removes_the_decline_record(self) -> None:
+        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True, later_match=True)
+
+    def test_missing_and_unreadable_records_continue_to_claim(self) -> None:
+        for content in (None, 'invalid json', '{"versions":[]}'):
+            with self.subTest(content=content):
+                self.check_record(content)
+
+    def test_only_recorded_keys_are_compared(self) -> None:
+        self.check_record('{"versions":{"nextest":"nextest fixture","mend":"mend fixture"}}')
+
+    def check_record(self, content: str | None, *, declined: bool = False, later_match: bool = False) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if content is not None:
+                _ = (root / "box-tools.json").write_text(content)
+            target = target_config.SshTarget("aws", "linux", root / "aws.conf")
+            config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1),
+                                          1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
+            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
+            controller = offload.ProcessController()
+            versions = {"rustc": "rustc 1.99.0", "nextest": "nextest fixture", "mend": "mend fixture", "git": "commit"}
+
+            def capture(arguments: Sequence[str], deadline: offload.CommandDeadline) -> offload.CommandOutput:
+                self.assertIsInstance(deadline, offload.CommandTimeLimit)
+                name = arguments[1] if arguments[0] == "cargo" else arguments[0]
+                return offload.CommandOutput(0, versions[name], "")
+
+            with (
+                mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                mock.patch.object(offload, "configured_ssh_target", return_value=target),
+                mock.patch.object(offload, "trusted_linux_source", return_value=True),
+                mock.patch.object(target_config, "ssh_target_state_directory", return_value=root),
+                mock.patch.object(controller, "capture", side_effect=capture),
+                mock.patch.object(offload, "claim_for_run", return_value=offload.MacClaimNotConfirmed("blocked", "", "")) as claim,
+                mock.patch.object(offload, "copy_tracked_scripts") as scripts_copy,
+                mock.patch.object(offload, "copy_tree_with_key") as tree_copy,
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No process expected")),
+                mock.patch.object(subprocess, "run", side_effect=AssertionError("No command expected")),
+                mock.patch.object(time, "monotonic", return_value=5),
+                mock.patch.object(time, "time", return_value=100),
+            ):
+                answer = offload.run_offload(controller, config, request, 1)
+                if declined:
+                    self.assertEqual(answer, offload.DeclinedMacRun("state", 4,
+                        "aws version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
+                    claim.assert_not_called()
+                    self.assertEqual(offload.linux_version_decline_path("aws", HANA.name), root / "version-decline-hana")
+                    self.assertTrue(offload.linux_version_declined_recently("aws", HANA.name, 60, 159))
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 160))
+                    if later_match:
+                        _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
+                        _ = offload.run_offload(controller, config, request, 1)
+                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                        self.assertFalse(offload.linux_version_decline_path("aws", HANA.name).exists())
+                else:
+                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 100))
+            scripts_copy.assert_not_called()
+            tree_copy.assert_not_called()
 
 
 class OffloadSettingsTests(unittest.TestCase):

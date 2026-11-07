@@ -9,25 +9,24 @@ import json
 from pathlib import Path
 import subprocess
 import time
-from typing import final
+from typing import cast, final
 
 from scripts.aws_target import admin_secrets, box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock
 from scripts.aws_target.config import deployment_record
-from scripts.build_targets import target_config
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.mac_test import mac_test
 
 
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
-down refuses while an AWS claim remains live.
+down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove compute resources, then the foundation stack and retained Budget.
 down would delete the data volume. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
-down keeps the spend ledger, charge history, disabled routing.json, and admin.gpg.
+down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
 
 
@@ -83,13 +82,8 @@ class TargetRemoval:
                             timeout=conf.read(self.settings).whole('deployment_timeout_s'), check=False)
 
     def routing(self) -> bool:
-        path = target_config.ssh_target_state_directory('aws') / 'routing.json'
-        desired: dict[str, object] = {'enabled': False, 'settings': str(self.settings.resolve())}
+        changed = box.close_routing(self.settings)
         paths = mac_test.state_paths('aws')
-        with mac_test.locked(paths.lock):
-            changed = not path.exists() or remote.read_record(path) != desired
-            if changed:
-                write_text_atomic(path, json.dumps(desired) + '\n')
         enabled = self._local(['systemctl', '--user', 'is-enabled', 'aws-target.service'])
         active = self._local(['systemctl', '--user', 'is-active', 'aws-target.service'])
         if enabled.stdout.strip() not in ('disabled', 'not-found') or active.stdout.strip() not in ('inactive', 'unknown'):
@@ -98,7 +92,7 @@ class TargetRemoval:
                 raise ValueError('could not disable aws-target.service; routing remains disabled')
             changed = True
         with mac_test.locked(paths.lock):
-            if mac_test.live_claims(paths):
+            if box.running_claims(paths):
                 raise ValueError('AWS claims remain live; routing is disabled; retry after their completion')
         return changed
 
@@ -377,6 +371,12 @@ class TargetRemoval:
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
+    def _kept_image(self) -> None:
+        path = self.directory / 'image.json'
+        if path.exists():
+            print('down: image kept: ' + ledger.text(ledger.mapping(cast(object, json.loads(path.read_text()))), 'image_id')
+                  + '; next up starts from it')
+
     def run(self) -> bool:
         stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('scaler-keys', self.scaler),
                   ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
@@ -386,6 +386,7 @@ class TargetRemoval:
                 if self.verify():
                     for name, action in stages:
                         print(f'{name}: present')
+                    self._kept_image()
                     return True
             except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                 print('identity: refused: ' + self.admin.redact(str(error)))
@@ -397,7 +398,7 @@ class TargetRemoval:
                         paths = mac_test.state_paths('aws')
                         _ = locks.enter_context(mac_test.locked(paths.lock))
                         _ = locks.enter_context(control_lock(self.directory))
-                        if mac_test.live_claims(paths):
+                        if box.running_claims(paths):
                             raise ValueError('AWS claims remain live; retry after their completion')
                     changed = action()
                     status = 'no device' if isinstance(changed, NeverJoined) else 'done' if changed else 'present'
@@ -405,4 +406,5 @@ class TargetRemoval:
                 except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     print(f'{name}: refused: ' + self.admin.redact(str(error)))
                     return False
+        self._kept_image()
         return True

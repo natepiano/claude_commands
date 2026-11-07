@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib import test_hang_guard
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import isolated_staff_file
@@ -151,7 +153,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         with isolated_staff_file(self.root / "staff.json", {}):
             parent = unit_membership("fixture", "fixture")
             from scripts.production import staff
-            parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.working_dir), expected=parent.worktree)
+            parent = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=parent.worktree)
         return parent.id
 
     @override

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from collections.abc import Callable
 import io
 import json
@@ -325,7 +327,7 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         doc = self.root / f"{name}-production.md"
         if not doc.exists():
             _ = doc.write_text(f"# {name}\n")
-        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
         return f"showrunner-{owner.id}"
 
     def create_instance(

@@ -20,7 +20,7 @@ from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command
 from scripts.style import mechanical_classes
 from scripts.style import style_ledger
-from scripts.style.style_plan_test_support import unit_staff_id
+from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
 from scripts.style import style_rules
 from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
@@ -55,7 +55,9 @@ class StandingCheckpointTests(unittest.TestCase):
         self.catalog.mkdir(parents=True)
         # The CLI checks the class list against this catalog, so each listed rule is here as a tier E rule, which has
         # no cells.
-        for rule in sorted({rule for entry in mechanical_classes.classes() for rule in entry.rules}):
+        with private_class_catalog(self.root):
+            listed = mechanical_classes.classes()
+        for rule in sorted({rule for entry in listed for rule in entry.rules}):
             self.write(self.catalog / f"{rule}.md", f"---\ntier: E\n---\n# {rule}\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()

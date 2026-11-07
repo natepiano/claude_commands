@@ -854,7 +854,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
 
     def test_service_command_and_other_events_pass_without_guard_refusal(self) -> None:
         for event, command in (
-            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit --repo . --commit HEAD -- true"),
+            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- true"),
             ("post_tool_use", "git clone source destination"),
         ):
             with self.subTest(event=event):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
@@ -39,7 +41,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "identity-staff.json", {}))
         owner = fixture_member("showrunner", name="style-owner")
         units = tuple(fixture_member("unit", name=name, parent=owner.id,
-            worktree=staff.PresentWorktree("natedev", self.repo.parent / name))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.repo.parent / name))
             for name in ("names", "types"))
         first, second = (staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id(row.name + "-current"))) for row in units)
@@ -286,9 +288,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         first, _ = self.fixed_style_units()
         other_parent = fixture_member("showrunner", name="other-style")
         second = fixture_member("unit", name=first.name, parent=other_parent.id,
-            worktree=staff.PresentWorktree("natedev", self.root / "other-names"))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-names"))
         ledger = self.ledger()
-        with mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"):
+        with mock.patch("scripts.shutdown.remote.local_machine", return_value=remote.local_machine()):
             for row in (first, second):
                 self.assertIsInstance(row.worktree, staff.PresentWorktree)
                 assert isinstance(row.worktree, staff.PresentWorktree)

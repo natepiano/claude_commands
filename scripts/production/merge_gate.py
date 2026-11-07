@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
 The queue reservation and the test runner governor use separate configuration keys.
@@ -13,6 +13,7 @@ builds.slice scope when its probe succeeds, unless disabled or already in that s
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host, or select affected modules from a
 certified ancestor. --full forces all modules; --nightly validates a shared clone.
+SharedMachine is the default. WholeMachine uses one job per CPU without shared admission or failure reruns.
 Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
@@ -34,7 +35,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -153,6 +154,20 @@ class GateJobKind(Enum):
 
 class NightlyRunState(Enum):
     NOT_STARTED = auto()
+
+
+@dataclass(frozen=True)
+class SharedMachine:
+    """Share the machine through admission, holds, memory limits, and CPU slots."""
+
+
+@dataclass(frozen=True)
+class WholeMachine:
+    """Use every CPU without shared admission, holds, or failure reruns."""
+    module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+
+
+SHARED_MACHINE = SharedMachine()
 
 
 @dataclass(frozen=True)
@@ -932,8 +947,12 @@ def module_runner(repo: Path) -> Path:
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
-               source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False) -> GateRun:
-    governor_gib = merge_gate_governor_gib()
+               source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
+               machine: SharedMachine | WholeMachine = SHARED_MACHINE) -> GateRun:
+    shared = isinstance(machine, SharedMachine)
+    governor_gib = merge_gate_governor_gib() if shared else 0.0
+    if isinstance(machine, WholeMachine):
+        max_running_jobs = os.cpu_count() or 1
     if module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
@@ -948,42 +967,50 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
-    hold = BuildHoldWait()
-    hold.wait_until_free()
-    initial_hold_seconds = hold.seconds
-    try:
-        tested_tree = clean_test_tree(repo)
-    except (GateRefused, OSError) as error:
-        tested_tree = UnrecordableTestTree(str(error))
-        print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
+    hold = BuildHoldWait() if shared else None
+    if hold is not None:
+        hold.wait_until_free()
+    initial_hold_seconds = hold.seconds if hold is not None else 0.0
     suites = sorted({suite for suite, _ in modules})
-    ledger = PassedTreeLedger(repo, source, tested_tree, suites)
-    required = full_required()
-    reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
-    selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
-    if not reused:
-        selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
-                     select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
-        report_selection(selection, len(modules))
-        if isinstance(selection, AffectedSelection):
-            selected = set(selection.modules)
-            modules = [(suite, path) for suite, path in modules if path in selected]
-    print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
-    scope_prefix = suite_scope_prefix()
-    timings_path = gate_state_dir() / "module_seconds.json"
-    timings = read_measures(timings_path)
-    cpu_path = gate_state_dir() / "module_cpu_seconds.json"
-    cpu_measures = read_measures(cpu_path)
+    ledger: PassedTreeLedger | None = None
+    reused = False
+    selection: AffectedSelection | FullSuite = FullSuite("whole machine")
+    if shared:
+        try:
+            tested_tree = clean_test_tree(repo)
+        except (GateRefused, OSError) as error:
+            tested_tree = UnrecordableTestTree(str(error))
+            print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
+        ledger = PassedTreeLedger(repo, source, tested_tree, suites)
+        required = full_required()
+        reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
+        selection = FullSuite("passed tree reused")
+        if not reused:
+            selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
+                         select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
+            report_selection(selection, len(modules))
+            if isinstance(selection, AffectedSelection):
+                selected = set(selection.modules)
+                modules = [(suite, path) for suite, path in modules if path in selected]
+        print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
+    else:
+        print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
+    scope_prefix = suite_scope_prefix() if shared else []
+    state_directory = gate_state_dir() if shared else tmpfs
+    timings_path = state_directory / "module_seconds.json"
+    timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
+    cpu_path = state_directory / "module_cpu_seconds.json"
+    cpu_measures = read_measures(cpu_path) if shared else {}
     run_cpu: dict[str, float] = {}
-    types_peaks_path = gate_state_dir() / "types_peak_mib.json"
-    types_peaks = read_measures(types_peaks_path)
+    types_peaks_path = state_directory / "types_peak_mib.json"
+    types_peaks = read_measures(types_peaks_path) if shared else {}
     types_key = " ".join(type_dirs)
-    module_peaks_path = gate_state_dir() / "module_peak_mib.json"
-    module_peaks = read_measures(module_peaks_path)
+    module_peaks_path = state_directory / "module_peak_mib.json"
+    module_peaks = read_measures(module_peaks_path) if shared else {}
     recorded_peaks = RecordedJobPeaks(module_peaks.copy(), types_peaks.copy(), types_key)
     slow_modules: list[str] = []
-    history_path = gate_state_dir() / "module_history.json"
-    history = read_history(history_path)
+    history_path = state_directory / "module_history.json"
+    history = read_history(history_path) if shared else {}
     pending = deque(GateJobRequest(suite, path, test_module_name(repo, suite, path))
                     for suite, path in (module_order(modules, timings, repo) if not reused else []))
     running: list[RunningGateJob] = []
@@ -994,7 +1021,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     rerunning = False
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
-    admission = SampledRSSAdmission(governor_gib * 1024)
+    admission = SampledRSSAdmission(governor_gib * 1024) if shared else None
     largest_module_peak_mib = 0.0
     largest_module = ""
     starting_load = one_minute_load()
@@ -1006,6 +1033,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     elapsed = 0.0
 
     def record(status: int, aborted: bool) -> None:
+        if ledger is None or hold is None or admission is None:
+            return
         waited = hold.waited_s()
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
@@ -1025,8 +1054,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
-          gate_reservation(repo, temporary, hold, type_dirs=type_dirs) as reservation,
-          shared_cpu_pool() as cpu_pool):
+          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs) if hold is not None else nullcontext(None)) as reservation,
+          (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
@@ -1042,7 +1071,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         progress_total = len(pending)
         progress_done = 0
         def publish_progress() -> None:
-            if progress_total:
+            if progress_total and reservation is not None:
                 progress_profile.publish_counter(reservation.sidecar,
                     progress_profile.ProgressCounter("suites:1", progress_done, progress_total))
 
@@ -1050,12 +1079,13 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         try:
             while pending or running:
                 now = time.monotonic()
-                if admission.sample_due(now):
+                if admission is not None and admission.sample_due(now):
                     maximum_load = max(maximum_load, one_minute_load())
                     sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
                     admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
-                    reservation.observe(int(admission.peak_mib * (1 << 20)), int(admission.latest_mib * (1 << 20)))
+                    if reservation is not None:
+                        reservation.observe(int(admission.peak_mib * (1 << 20)), int(admission.latest_mib * (1 << 20)))
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
                         job.peak_memory_mib = max(job.peak_memory_mib, measured)
@@ -1063,9 +1093,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.module}"
                 while (pending and len(running) < max_running_jobs
-                       and admission.admits(recorded_peaks.reservation_mib(pending[0]))
+                       and (admission is None or admission.admits(recorded_peaks.reservation_mib(pending[0])))
                        and (not rerunning or not running)):
-                    if not hold.admits():
+                    if hold is not None and not hold.admits():
                         if not running:
                             hold.wait_until_free()
                         break
@@ -1095,7 +1125,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         job_started = True
                     if job.kind is GateJobKind.TEST_MODULE:
                         _ = suite_started.setdefault(suite, job.started)
-                    admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
+                    if admission is not None:
+                        admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
                 for job in running[:]:
                     reap_gate_job(job)
                     status = job.process.returncode
@@ -1113,10 +1144,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         if isinstance(job.cpu_slot, SharedCPUSlot):
                             job.cpu_slot.release()
                     running.remove(job)
-                    admission.release(job.process.pid)
+                    if admission is not None:
+                        admission.release(job.process.pid)
+                    if not shared:
+                        print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
+                              + (" stopped" if result.killed_for else ""), flush=True)
                     cpu_key = f"{job.suite}/{result.module}"
                     run_cpu[cpu_key] = run_cpu.get(cpu_key, 0.0) + result.cpu_seconds
-                    if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
+                    if status < 0 and not job.killed_for and not result.tripwire_tripped and hold is not None and not hold.admits():
                         executions[-1] = replace(result, restart="hold")
                         pending.appendleft(requests[(job.kind, job.suite, job.module)])
                         print(f"{job.suite}/{result.module}: stopped during a natedev hold; queued again", flush=True)
@@ -1148,7 +1183,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         results.append(result)
                     if job.kind is GateJobKind.TEST_MODULE:
                         suite_finished[job.suite] = job.started + result.seconds
-                if not pending and not running and not rerunning:
+                if shared and not pending and not running and not rerunning:
                     failed = [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -1158,7 +1193,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     else:
                         first_runs = {(result.suite, result.module): result for result in failed}
                         pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
-                        if failed:
+                        if failed and reservation is not None:
                             progress_total = 0
                             progress_profile.clear_counter(reservation.sidecar)
                 if running or pending:
@@ -1171,14 +1206,18 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
-            save_measures(timings_path, timings)
-            save_measures(cpu_path, cpu_measures)
-            save_measures(types_peaks_path, types_peaks)
-            save_measures(module_peaks_path, module_peaks)
-            save_measures(history_path, history)
-        reservation.status = int(any(result.returncode for result in results))
-    elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
-    run = GateRun(tuple(results), elapsed, admission.peak_mib, reused,
+            if shared:
+                save_measures(timings_path, timings)
+                save_measures(cpu_path, cpu_measures)
+                save_measures(types_peaks_path, types_peaks)
+                save_measures(module_peaks_path, module_peaks)
+                save_measures(history_path, history)
+        if reservation is not None:
+            reservation.status = int(any(result.returncode for result in results))
+    hold_seconds = hold.seconds if hold is not None else 0.0
+    peak_mib = admission.peak_mib if admission is not None else 0.0
+    elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
+    run = GateRun(tuple(results), elapsed, peak_mib, reused,
                   isinstance(selection, AffectedSelection))
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
@@ -1208,17 +1247,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
     for slow in slow_modules:
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
-    if hold.seconds > 0:
-        print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
+    if hold_seconds > 0:
+        print(f"Gate hold wait: {hold_seconds:.2f}s (excluded from Gate tests)", flush=True)
     full_reason = f"; full suite: {reason}" if reason else ""
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
-          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory){full_reason}", flush=True)
+          + f"peak memory: {peak_mib / 1024:.3f} GiB (sampled memory){full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     most_cpu = sorted(run_cpu, key=lambda key: (-run_cpu[key], key))[:3]
     cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
-    if run.passed and not reused:
+    if run.passed and not reused and ledger is not None:
         ledger.record_pass(selection)
         if isinstance(selection, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
@@ -1558,7 +1597,7 @@ def nightly_owner(args: GateArguments) -> str:
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return unit_lookup.doc_owner(doc, staff.snapshot()).name
+    return str(unit_lookup.doc_owner(doc, staff.snapshot()).id)
 
 
 def type_check_summaries(output: str) -> list[str]:
@@ -1625,7 +1664,8 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
             if summaries:
                 detail += "\n" + summaries[-1]
-        outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
+        name = copies.owner_name(copies.copy_owner(nightly_owner(args)))
+        outcome = showrunners.tell(name, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
     except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:

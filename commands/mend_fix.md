@@ -18,7 +18,9 @@ cargo-mend source lives at `~/rust/cargo-liner/crates/cargo-mend`, a member of t
 - Don't ask what the failure is or which flags to use — go straight to `--fix-all` in STEP 3.
 
 **STEP 2 — Select the reproduction**
-- Resolve the owner and session scratchpad. In every command below, replace `/absolute/project`, `/absolute/repository`, `/absolute/session-scratch`, `mend-fix`, and `relative/project` with the concrete paths, owner and workspace-relative path before issuing a tool call. Do not combine discovery and execution in a shell branch or command array.
+- Resolve the repository and the session scratch folder.
+- Replace `/absolute/project`, `/absolute/repository`, `/absolute/session-scratch`, and `relative/project` before each command.
+- Keep discovery and execution in separate commands.
 - First discover whether the selected project is in Git (a nonzero exit selects the non-git route):
 ```bash
 git -C /absolute/project rev-parse --show-toplevel
@@ -39,7 +41,7 @@ git -C /absolute/session-scratch/work -c user.email=t@t -c user.name=t commit -q
 - Issue exactly the selected route, with concrete substitutions from STEP 2.
 Git route:
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner mend-fix --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- cargo mend --fix-all '{tree}/relative/project' > /absolute/session-scratch/repro.log 2>&1
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- cargo mend --fix-all '{tree}/relative/project' > /absolute/session-scratch/repro.log 2>&1
 echo "EXIT=$?" >> /absolute/session-scratch/repro.log
 ```
 Non-git route:
@@ -68,7 +70,7 @@ echo "EXIT=$?" >> /absolute/session-scratch/repro.log
 - Build the dev binary with `cargo +stable build` (`RUSTC_BOOTSTRAP=1` comes from `.cargo/config.toml`). Reset the selected reproduction and run the corresponding concrete command below. Replace `/absolute/cargo-liner` with its real path too.
 Git route:
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner mend-fix --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- sh -c '/absolute/cargo-liner/target/debug/cargo-mend --fix-all "{tree}/relative/project" && cd "{tree}/relative/project" && cargo check --workspace --all-targets'
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- sh -c '/absolute/cargo-liner/target/debug/cargo-mend --fix-all "{tree}/relative/project" && cd "{tree}/relative/project" && cargo check --workspace --all-targets'
 ```
 Non-git route:
 ```bash

@@ -16,10 +16,9 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import ci_points
+from scripts.production import ci_points
 from scripts.production.cli_fixture import invoke_cli
-from merge_checkpoint import merge_lock
+from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -172,7 +171,8 @@ class CiPointsTests(unittest.TestCase):
         _ = self.git("config", "user.email", "ci-points@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "README.md", "base\n")
-        _ = self.git("add", "README.md")
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
+        _ = self.git("add", "README.md", "Cargo.toml")
         _ = self.git("commit", "-m", "initial")
         _ = self.git("push", "-u", "origin", "main")
         _ = self.git("switch", "-c", "production")
@@ -296,6 +296,42 @@ PY
     def validation_observation(self) -> ValidationObservation:
         return cast(ValidationObservation, json.loads(
             (self.stub_state / "validation-observation.json").read_text(encoding="utf-8")))
+
+    def test_validation_without_a_build_cache_publishes_the_fix_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "production")
+        self.fixed_commit_validation(fix_commit=True)
+
+        result = self.start_point()
+
+        observed = self.validation_observation()
+        checkout = Path(observed["directory"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertEqual(observed["origin"], str(self.origin))
+        self.assertNotEqual(observed["validated"], observed["initial"])
+        self.assertEqual(ci_points.read_run(self.state).tip, observed["validated"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), observed["validated"])
+        self.assertIn("fast-forward push", result.stdout)
+        self.assertFalse(checkout.exists())
+
+    def test_failed_validation_without_a_build_cache_keeps_its_log_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "production")
+        self.fixed_commit_validation(fail=True)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        checkout = Path(self.validation_observation()["directory"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertFalse(checkout.exists())
+        log = self.state / "ci_validation.log"
+        self.assertIn(str(log), result.stdout)
+        self.assertIn("FAILED: fixed-commit validation", log.read_text())
+        self.assertNotIn(str(checkout), result.stdout)
+        self.assertFalse((self.state / "ci_run.json").exists())
 
     def test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing(self) -> None:
         initial = self.git("rev-parse", "HEAD")
