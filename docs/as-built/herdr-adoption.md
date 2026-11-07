@@ -287,7 +287,17 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-Pane worker account moves use the shared stop, resume, and prompt APIs. The move retains the conversation and the terminal. A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt. The resume message builder also retains the launcher prompt path for restored workers.
+After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
+Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
+Shutdown restart uses the shared worker restore.
+Pane worker account moves use the shared stop, resume, and prompt APIs.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+An open worker with an active dispatch keeps its conversation and terminal during an account move.
+A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
+The resume message builder retains the launcher prompt path for restored workers.
 
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - One herdr session, `agents` (user, 2026-10-26). Every launcher opens a tab there with `start_server(shared_session())` and `open_tab`. Probes and live checks run as tabs there too, never in a server of their own. `_require_shared` refuses a server start under any other name, and `test_one_session.py` fails on code that starts one or tells the user to attach to one.
