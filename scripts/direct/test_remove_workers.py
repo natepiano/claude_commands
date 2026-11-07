@@ -85,7 +85,7 @@ class RemoveWorkersTest(unittest.TestCase):
         if orchestrator is not None:
             parent = staff.update_current_session(parent.current_session, staff.native_id(orchestrator))
             _ = (selected / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": name}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         roster: dict[str, object] = {}
         for worker in workers:
             member = fixture_worker("worker-" + worker, parent.id, runtime_id=fixture_runtime_id(worker + "-full"))
@@ -197,11 +197,11 @@ class RemoveWorkersTest(unittest.TestCase):
         pane_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-pane")
         mesh_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-mesh")
         mesh_worker = staff.move(mesh_worker.id, staff.ReportsTo(parent.id))
-        _ = (mesh_run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": "pane-run"}))
+        _ = (mesh_run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = (pane_run / "worker_transport").write_text("herdr\n")
         _ = (mesh_run / "worker_transport").write_text("mesh\n")
         _ = (pane_run / "progress_history_state.json").write_text(json.dumps({
-            "production": "cleanup", "unit": "pane-run", "pass": {"impl": {
+            "owner_staff_id": parent.id, "pass": {"impl": {
                 "instance_id": "pane-dispatch", "worker_name": pane_worker.name,
             }},
         }))

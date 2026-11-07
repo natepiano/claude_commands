@@ -20,7 +20,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import json
 import os
 import sys
 import time
@@ -296,58 +295,6 @@ def held(session_id: str, root_override: str | Path | None = None,
     return runs
 
 
-def _json_object(text: str) -> dict[str, object]:
-    try:
-        raw = cast(object, json.loads(text))
-    except ValueError:
-        return {}
-    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-
-
-def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
-    """Replace active run names with proved staff ids; keep history files unchanged."""
-    from scripts.lib import atomic_file
-    from scripts.production import staff
-
-    unavailable = False
-    for path in sorted(root.glob(f"*/{STATE_FILE}")):
-        try:
-            with (path.parent / ".progress_history.lock").open("a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                fields = _json_object(path.read_text(encoding="utf-8"))
-                if not fields:
-                    raise ValueError(f"{path}: run state is unreadable")
-                if fields.get("status") != "active":
-                    continue
-                record = staff.snapshot()
-                owner = run_owner(fields, record)
-                if isinstance(owner, RunOwnerUnrecorded):
-                    production, unit = fields.get("production"), fields.get("unit")
-                    parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
-                    matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
-                               and isinstance(unit, str) and row.name == unit]
-                    if len(matches) != 1:
-                        raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
-                    owner = matches[0]
-                changed = dict(fields)
-                changed[OWNER_FIELD] = owner.id
-                folder = fields.get("working_dir")
-                for key in ("plan_doc", "project_plan_doc"):
-                    value = fields.get(key)
-                    if isinstance(folder, str) and isinstance(value, str) and value.startswith(folder + "/"):
-                        changed[key] = str(Path(value).relative_to(folder))
-                for key in ("production", "unit", "working_dir", "worktree", "branch"):
-                    _ = changed.pop(key, None)
-                if changed != fields:
-                    if not dry_run:
-                        atomic_file.write_text_atomic(path, json.dumps(changed, indent=2, sort_keys=True) + "\n")
-                    print(f"{'would migrate' if dry_run else 'migrated'} {path}: {owner.id}")
-        except (OSError, ValueError) as error:
-            unavailable = True
-            print(f"run owner unavailable: {error}", file=sys.stderr)
-    return int(unavailable)
-
-
 class FormerOwner(NamedTuple):
     session_id: str
     name: str
@@ -445,12 +392,6 @@ def main(argv: list[str]) -> int:
             print(f"unit_runs: {error}", file=sys.stderr)
             return 2
         return 0
-    if argv and argv[0] == "migrate-owners":
-        parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
-        _ = parser.add_argument("--root", type=Path, required=True)
-        _ = parser.add_argument("--dry-run", action="store_true")
-        args = parser.parse_args(argv[1:])
-        return migrate_owners(cast(Path, args.root), dry_run=cast(bool, args.dry_run))
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])

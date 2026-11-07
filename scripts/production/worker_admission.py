@@ -101,7 +101,7 @@ class PublishedWorker:
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the recorded run owner or run unit before the roster and caller."""
+    """Resolve the recorded run owner before the roster and caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
@@ -111,8 +111,6 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
         owner = unit_runs.run_owner(state, record)
         if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
             return owner
-        production = value if isinstance(value := state.get("production"), str) else ""
-        unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:
         found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
         if isinstance(found, session_staff.MemberFound):

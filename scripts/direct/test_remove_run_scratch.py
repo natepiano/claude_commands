@@ -23,20 +23,22 @@ SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
 
 class RemoveRunScratchTests(unittest.TestCase):
+    owner_id: str = ""
+
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
         self.enterContext(mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(root / "unit-workers")}))
         owner = fixture_member("showrunner", name="demo")
-        _ = fixture_member("unit", name="builders", parent=owner.id)
+        self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
 
     def make_run(self) -> tuple[Path, Path]:
         """A run folder with copies at several depths, and a folder outside it."""
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         run = root / "run"
         (run / "verify_cache").mkdir(parents=True)
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
         _ = (run / "verify_cache" / "pass").write_text("ok\n", encoding="utf-8")
         _ = (run / "workers").write_text("id\tname\n", encoding="utf-8")
         _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
@@ -90,7 +92,6 @@ class RemoveRunScratchTests(unittest.TestCase):
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"
         command_cwd = checkout / "target"
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
         records = run / "mesh_runs"
         records.mkdir()
         record = records / "verify.json"
@@ -102,6 +103,7 @@ class RemoveRunScratchTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="demo")
         parent = fixture_member("unit", name="builders", parent=owner.id,
                                 worktree=staff.PresentWorktree("natedev", command_cwd))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "staff_id": member.id}))
         with mock.patch.dict(os.environ, environment):
@@ -189,7 +191,7 @@ class RemoveRunScratchTests(unittest.TestCase):
         git("commit", "-q", "--allow-empty", "-m", "start")
         git("branch", "copy")
         run.mkdir()
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
         git("worktree", "add", "-q", str(run / "phases" / "p4" / "gate"), "copy")
         return source, run, run / "phases" / "p4" / "gate"
 
