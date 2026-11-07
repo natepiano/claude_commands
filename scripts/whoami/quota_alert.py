@@ -608,8 +608,19 @@ def showrunners_now() -> list[Showrunner]:
 
 def recipients(config: Config, here: str | None = None) -> list[str]:
     """Recipients for five-hour, Claude no-room and blocked next-head notices."""
+    from scripts.message import sessions
+
+    aliases: dict[str, str] = {}
+    for observation in sessions.read_registry().entries:
+        record = observation.record
+        address = "session:" + record["sessionId"]
+        for name in (record["sessionId"], address, record["name"], *record["formerNames"]):
+            if name:
+                aliases[name] = address
     names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
-    return list(dict.fromkeys(name for name in names if name != here))
+    excluded = aliases.get(here or "", here)
+    return list(dict.fromkeys(aliases.get(name, name) for name in names
+                             if aliases.get(name, name) != excluded))
 
 
 def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
