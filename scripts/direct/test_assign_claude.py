@@ -29,6 +29,35 @@ def configure_pane_account(home: Path, notes: Path) -> None:
 
 
 class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+    def test_term_after_the_start_banner_stops_the_unpublished_session(self) -> None:
+        session = self.start_phase("term-after-banner")
+        backend = self.root / "claude-bin"
+        text = backend.read_text().replace(
+            "    print(f'backgrounded · abc12345 · {name}')",
+            "    print(f'backgrounded · abc12345 · {name}', flush=True)\n"
+            + "    import signal\n"
+            + "    os.kill(os.getppid(), signal.SIGTERM)")
+        text = text.replace(
+            "elif sys.argv[1:3] == ['agents', '--json']:",
+            "elif sys.argv[1] == 'stop':\n"
+            + "    with (root / 'backend-stops').open('a') as output:\n"
+            + "        output.write('stop ' + sys.argv[2] + '\\n')\n"
+            + "elif sys.argv[1:3] == ['agents', '--json']:")
+        _ = backend.write_text(text)
+        result = self.worker_launch(session)
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual((self.root / "backend-stops").read_text().splitlines(), ["stop abc12345"])
+
+    def test_an_invalid_registry_wait_records_a_failed_pass_and_status(self) -> None:
+        session = self.start_phase("invalid-registry-wait")
+        _ = self.config_file.write_text(self.config_file.read_text().replace(
+            "CLAUDE_WORKER_REGISTER_WAIT_SECS=30", "CLAUDE_WORKER_REGISTER_WAIT_SECS=invalid"))
+        result = self.worker_launch(session)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        finished, = self.launch_records(session, "pass_finished")
+        self.assertEqual(finished["status"], "error")
+        self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
+
     def test_term_during_the_worker_wait_ends_the_agent_and_records_failure(self) -> None:
         session = self.start_phase("term-during-wait")
         stub = self.root / "claude-bin"
@@ -102,7 +131,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
         self.assertTrue(worker.current_session)
 
-    def test_agent_bg_has_assign_as_its_only_launcher_parent(self) -> None:
+    def test_delivery_has_assign_as_its_only_launcher_parent(self) -> None:
         session = self.start_phase("one-launcher")
         sender = self.root / "opening-send.py"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "\n".join((
@@ -115,13 +144,13 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         processes = {int(pid): (int(parent), command) for line in (self.root / "launch-processes").read_text().splitlines()
                      for pid, parent, command in [line.split(None, 2)]}
-        agent_pid, (launcher_pid, command) = next(
+        sender_pid, (launcher_pid, command) = next(
             (pid, row) for pid, row in processes.items()
-            if str(self.root) in row[1] and "agent_bg.sh" in row[1])
-        self.assertIn("agent_bg.sh", command)
+            if str(sender) in row[1])
+        self.assertIn(str(sender), command)
         parent_pid, launcher_command = processes[launcher_pid]
         self.assertIn(str(self.assign_script.with_suffix(".py")), launcher_command)
-        self.assertNotEqual(agent_pid, launcher_pid)
+        self.assertNotEqual(sender_pid, launcher_pid)
         self.assertNotIn("agent_bg.sh", processes[parent_pid][1])
 
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
@@ -265,12 +294,12 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         session = self.start_phase("identity-before-heartbeat")
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"
         _ = watcher.write_text('#!/bin/bash\ncat "$UNIT_RUN_DIR/impl_worker_impl.json" > "$UNIT_RUN_DIR/watcher-identity"\n')
-        sender = self.root / "opening-send.py"
-        _ = sender.write_text(sender.read_text().replace(
-            "print('SENT: fixture')",
-            "import subprocess\n"
-            + f"subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], {str(session / 'watcher-identity')!r}], check=True)\n"
-            + "print('SENT: fixture')"))
+        backend = self.root / "claude-bin"
+        _ = backend.write_text(backend.read_text().replace(
+            "elif sys.argv[1:3] == ['agents', '--json']:",
+            "elif sys.argv[1:3] == ['agents', '--json']:\n"
+            + "    import subprocess\n"
+            + f"    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], {str(session / 'watcher-identity')!r}], check=True)"))
         result = self.worker_launch(session)
         self.assertEqual(result.returncode, 0, result.stderr)
         identity = cast(dict[str, object], json.loads((session / "watcher-identity").read_text()))

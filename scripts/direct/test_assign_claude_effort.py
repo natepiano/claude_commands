@@ -14,7 +14,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             with self.subTest(row=row):
                 session_dir = self.start_phase(f"effort-{row.replace(':', '-')}")
                 result = self.claude_launch(
-                    session_dir, row, inherited_effort="xhigh"
+                    session_dir, row
                 )
 
                 self.assertEqual(result.returncode, 0, result.stderr)
