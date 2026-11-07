@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from scripts.direct.findings_test_support import FindingsLedgerFixture, findings
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class SimplifyFindingTests(FindingsLedgerFixture):
@@ -37,6 +38,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
         environment = self.environment(1_000)
         environment.update({"UNIT_ACTIVE_DIR": str(self.root / "active"),
                             "TZ": "UTC", "USER_ZONE": "UTC"})
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         for arguments in (
             ["start-run", "--working-dir", str(self.root),
              "--main-family", "codex", "--main-model", "fixture-model",

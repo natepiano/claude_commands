@@ -1550,7 +1550,7 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 
 **Ruled out:** WAL, because an unchanged update and a read then change the index files; a 1 s wait on the report connection, because a commit after selection then stops the report.
 
-### Phase 72 — Three gate tests stop failing from load and live staff  · status: todo
+### Phase 72 — Three gate tests stop failing from load and live staff  · status: done
 **Depends on:** none
 
 #### Work Order
