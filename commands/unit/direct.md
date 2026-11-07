@@ -1026,9 +1026,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    protects the paths but writes no state, so a first touch of your own leaves
    the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
    edit checks under your bare session id, and cargo-berth maps its reservation
-   there, so the phase's own check later answers `left_unmapped` with it. With
-   one open phase, the hook and the backstop record that reservation as the
-   phase's `Active`. With two
+   there, so the phase's own check later answers `left_unmapped` with it.
+   The hook and the backstop record it as `Active` when the bare session maps that reservation and run.
+   No other open phase may hold it.
+   A sibling holds it through an `Active` state, a pending release, or its berth session map.
+   With two
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
