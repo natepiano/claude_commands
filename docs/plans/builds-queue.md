@@ -79,17 +79,10 @@ only I can bump
 5. **Shown.** The queue view, the card and the memory page show the current budget, the floor, and why it moved last.
 6. **Proof.** A replay of the last 2 days of queue history: the wait time saved, and no step OOM-killed. Unit tests for raise, hold, drop to the floor, and the ceiling.
 7. **Constraints from 10r (checkpoint 64615a2c5).** Measured memory is resident only (cgroup memory.current minus inactive_file; RSS for processes); `swap_bytes` is kept apart and is never charged. Service rows (hana CI, compiler cache) are tagged in `scripts/build_queue/scope_activity.py`. An empty service row (no live process, zero RAM) is not a running step (`scripts/lint/memory_admit.py:1816`); idle CI with RAM still charges it. The design and rulings are in the session file phases/10t/design.md; ruling 8 adds `build_free_check_calm`.
-### Phase 10u — Gate copies belong to a staff row  · status: todo
+### Phase 10u — Gate copies belong to a staff row  · status: replaced by 18c
 
-**Depends on:** verify-unit Phase 35 on GitHub builds. At that checkpoint queue-unit takes `scripts/copies/` (copies.py, copy_guard.py, their tests, `docs/as-built/copies.md`), its cleanup and the `scripts/mac_test/floor_claims.py` lock order (mirror lease, then floor claim lock, then copy-record lock); confirmed to verify-unit 2026-11-05 under the builds ruling of 2026-11-03. It touches `scripts/copies/*` and its callers only, so it can run beside the admission phases.
+Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary and the Phase 18 command with no `--owner` flag. 10u's `--owner` flag that refuses unknown names is not built (architect review of 18, 2026-11-06).
 
-1. **The ask (user, 2026-11-04; sdlc ruling as staff owner; builds assigned copies.py to queue-unit).** Everything tracks back to the staff file.
-2. **The change.** `copies.py --owner` takes a staff row and refuses a name or id that staff.json does not hold. The copies registry stores the owner's staff id. Readers show the current staff short name, looked up from the id at read time. No reader parses the owner from a folder name.
-3. **Callers.** Switch every `copies.py` caller in the same change. Name each outside owner in the notice's also-touches line. Add copies.py and each new reader to `docs/as-built/staff-accessors.md` in the same commit.
-4. **Existing records.** `GateRecord.owner` stores a name today, and `tree_paths` puts that name in folder paths. Convert each existing record to the staff id with no lost copy, with a deploy program under the Delegation Context rule for stored records; the folder path does not change when the unit is renamed.
-5. **Proof.** Tests: an unknown owner is refused; the registry holds the id; a dry run of the deploy program converts each record; a renamed unit shows its new name with no copy change, and its copy is then reused and removed. The staff accessor test passes.
-
-**Workers:** `1 writer + 1 tester` — `impl` owns `scripts/copies/copies.py`, each caller's `--owner` call (outside owners named in the notice) and `docs/as-built/staff-accessors.md`; `test` owns `scripts/copies/test_copies.py`, the staff accessor test and each changed caller's suite.
 ### Phase 10w — A copy's origin is the source's GitHub remote  · status: done
 
 **Depends on:** none (split from 10u by builds, 2026-11-04; `scripts/copies/copies.py` only; runs beside 10t and before 10u).
@@ -337,35 +330,21 @@ only I can bump
 
 ### Phase 18 — A standing gate tree takes its owner from the staff row and its folder from the repository's identity  · status: done
 
-**Asked by:** the builds showrunner, 2026-11-05, from a user shot at 20:38: about 90 gate trees in the user's project list. Before other new work.
+#### As-built
 
-**Depends on:** 18a and 18b on GitHub builds. Merge both, with verify 35b's mirrors and locks, into this phase's tree before its gate.
+- `copies.py run` and `copies.py remove` take the owner from the calling session's staff row; a worker row uses its parent unit's name. The `--owner` flag is gone. A caller with no staff row gets a one-line error. `standing()` and `remove_trees()` keep an owner parameter for in-process callers (`merge_gate.py`, `style_sync.py`, `ci_points.py`, `bump_gate.py`); `rust_release.py` keeps its fixed owner (build freeze).
+- Retire (`retire_unit.py`) and the end of a unit run (`end_session.sh`) remove the unit's idle standing trees and workspaces with the shared call that `tidy_wrapped.py` uses. A busy tree prints one line and stays for the later cleanup. A kept remote mirror still refuses the retire: `remove_trees` raises `RemoteMirrorKept`.
+- `owned_workspaces` reads `repository_identity` from each workspace record (`workspace_repository`), so a workspace keeps its repository after its source is deleted.
+- Deploy step, 2026-11-06 22:54: a program outside the repository wrote `repository_identity` into 2 live workspace records whose origin was a deleted test project (identity = the origin path text). It skipped 10 landing copies that have no `owner_unit`. `migrate_18a.py` now plans nothing.
+- The copy guard's refusal text and the docs (`gate-checkouts.md`, `style-showrunner.md`, `style_production.md`, `mend_fix.md`, `adversarial.md`) name `copies.py run` with no flag.
 
-#### Work Order
+**Files:** `scripts/copies/copies.py`, `copy_guard.py` and their tests; `scripts/production/retire_unit.py`, `staff.py`, `tidy_wrapped.py` and their tests; `scripts/direct/end_session.sh`, `test_end_session.py`; the item 6 docs; one-line caller changes in `bevy_upgrade.py`, `build_queue.py`, `hana_shot.py`, `scratch.py`, `unit_runs.py`, `memory_admit.py`, `proposal_issue.py`, `worker_admission.py`, `session_types.py`, `crate_run.py`.
 
-**Goal:** Each standing tree has one known owner and one folder for its repository, and retire and end remove a unit's trees.
+**Binds later work:** 18c converts the same records from staff names to staff row ids; it keeps `repository_identity`, skips records with no `owner_unit`, and makes no lock file in a dry run.
 
-**Spec:**
-1. **Owner.** `copies.py run` and `copies.py remove` take the owner from the calling session's staff row. A worker row uses its parent unit's name. Delete the `--owner` flag (builds ruling, 2026-11-05: a command flag needs no user approval). A caller with no staff row gets a one-line error that says so. `standing()` and `remove_trees()` keep their owner parameter for in-process callers, whose owners are not free text: `merge_gate.py`, `style_sync.py`, `ci_points.py`, `bump_gate.py`. Do not edit `rust_release.py` (build freeze); report its fixed owner in the summary.
-2. **Retire and end.** Retire (`scripts/production/retire_unit.py`) and the end of a unit run (`scripts/direct/end_session.sh`) remove the unit's idle standing trees and workspaces with the one shared call that `scripts/production/tidy_wrapped.py:96` uses. A failure to remove a busy tree does not stop the retire or the end; it prints one line, and the existing cleanup takes the tree later. A kept remote mirror still refuses the retire before the worktree removal, because no sweep removes a mirror (director call, no user words): `remove_trees` raises `RemoteMirrorKept`.
-3. **Repository name.** Phase 18a owns `repository_name`. Keep its rule when merging, and add no second rule.
-4. **Old folders.** This phase removes no old folder and has no deploy step. Hierarchies Phase 28 deletes the stale gate folders (builds ruling, 2026-11-06). Delete `<phase folder>/migrate_18.py`.
-5. **Copy guard.** The refusal text in `scripts/copies/copy_guard.py:37` recommends `copies.py run --owner verify`. Change that command to the form with no `--owner`, and keep every guard decision.
-6. **Docs.** Update `docs/as-built/gate-checkouts.md`, `docs/as-built/style-showrunner.md`, `docs/style_production.md`, `commands/mend_fix.md` and `commands/adversarial.md` to the command with no `--owner`.
-7. **Report only.** Find the test that wrote style trees (`integration-<sha>`, `beta`, `bulk_sample`) into the real gates root on 2026-11-03 at 14:39. State whether a later isolation fix covers it, with evidence.
+**Gotchas:** live workspace records include copies of deleted test projects, so `repository_name` cannot resolve every origin. Landing copies under `/tmp/claude/scratch` carry `source_path` with no `owner_unit`.
 
-**Files:**
-- `scripts/copies/copies.py` — the owner, the name and the flag.
-- `scripts/copies/test_copies.py` — the tests.
-- `scripts/copies/copy_guard.py` — the refusal text.
-- `scripts/production/retire_unit.py`, `scripts/production/test_retire_unit.py` — retire.
-- `scripts/direct/end_session.sh`, `scripts/direct/test_end_session.py` — end.
-- `scripts/hooks/test_codex_hooks.py` — the command text in the hook test.
-- `docs/as-built/gate-checkouts.md`, `docs/as-built/style-showrunner.md`, `docs/style_production.md`, `commands/mend_fix.md`, `commands/adversarial.md` — item 6.
-
-**Workers:** `1 writer` — `impl2`, code, tests and docs. The item 7 report is complete.
-
-**Acceptance gate:** `copies.py run` with no owner flag makes a tree under `<gates root>/<identity>/<unit>-gate` in tests with a private staff file and a private gates root. Clone, worktree and main checkout of one repository give one name. Retire and end remove only that unit's trees, for a Rust repository's standing copy and a fresh copy of a repository with no build cache. Copies, retire, hook, scratch and sweep suites pass; basedpyright 0/0/0. Change-Review: the user's project list shows one folder per repository.
+**Ruled out:** a `--owner` flag that refuses unknown names (Phase 10u's design); a second repository-name rule beside 18a's.
 
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
@@ -406,8 +385,8 @@ only I can bump
 6. **Behavior.** Replies, wire shapes, stored records, config keys and printed text do not change. No assertion changes.
 7. **Proof.** A one-off walk in the phase's folder prints no caller of a moved name through `memory_admit`, and the notice carries that result. Add no new import test: a new check goes to the user first. All caller suites pass. The client start measurement stays: `release` still loads no `memory_admit`.
 
-**Files:** the 39 files of item 2, as the walk lists them on the merged tree, and:
-- `scripts/lint/memory_admit.py`
+**Files:**
+- `scripts/lint/memory_admit.py` — and the 39 files of item 2, as the walk lists them on the merged tree.
 
 **Workers:** `1 writer + 1 tester`
 - `impl2` — production callers and `memory_admit.py`.
@@ -527,7 +506,7 @@ only I can bump
 
 ### Phase 16 — The copy guard refuses only what makes a repository tree  · status: todo
 
-**Depends on:** verify P35 on GitHub builds, which hands `scripts/copies/` to queue-unit and edits `copy_guard.py`. First of the copies items (builds ruling, 2026-11-05: "A broken guard is fixed at once").
+**Depends on:** 18c, and verify P35 on GitHub builds, which hands `scripts/copies/` to queue-unit and edits `copy_guard.py`. Order of the copies items: 18c, then 16, then 17 (Phase 18 retrospective). The builds ruling of 2026-11-05 stands: "A broken guard is fixed at once".
 
 #### Work Order
 
@@ -550,7 +529,7 @@ only I can bump
 
 ### Phase 17 — copies.py list shows remote mirrors  · status: todo
 
-**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
+**Depends on:** 18c, 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
 
 #### Work Order
 
@@ -558,13 +537,14 @@ only I can bump
 
 **Spec:**
 1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
-2. **Proof.** List tests for remote-only records and mixed local and remote records.
+2. **Holder states (architect review of 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through 18c's row id), idle, or unavailable.
+3. **Proof.** List tests for remote-only records and mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name.
 
 **Files:**
 - `scripts/copies/copies.py` — the list.
-- `scripts/copies/test_copies.py` — the tests.
+- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
 
-**Workers:** `1 writer + 1 tester`.
+**Workers:** `1 writer + 1 tester` — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
 
 **Acceptance gate:** copies suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
 
@@ -605,21 +585,25 @@ only I can bump
 
 8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`, and `MemoryPage.cap` uses `None`). 10s already keeps the rows with no cap line (`memory_feed.py:295`, `memory_live.html:354`); this item replaces the `None` fields. Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text, for both `CapUnavailable(runs=())` (an old record) and named unavailable runs.
 9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`, `test_memory_hover.py`). It moves to `scripts/build_page/` (page, feed and tests). The feed takes `--code-root`, reads `captured.ci_use`, `captured.cap_use` and `room_text(captured)`, and imports `snapshot_codec`; its hover shows phase, percent done, keep-aside and reason. `memory_feed.pre10x.py` is deleted at the 10x deploy and does not move. The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
-10. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The page command restarts the feed when the installed admission code changes. Test: a feed that started before a schema update reads the new record after the restart.
+10. **Prototype behavior to keep (2026-11-06).** The Running table shows a Machine column after Duration and before Unit, from `scripts.buildlog.store.host_name()` (page round 16, the user's ask). When one view read misses the client's 0.5 s limit, the feed writes the last good reading plus `read_error` and `error_at`, and the page keeps its data; only the first read of a feed with no good reading shows "The queue did not answer" (page round 17, the user's blank-page report).
+11. **Browser proof (architect review of 18, 2026-11-06).** The browser proof today is `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/adhoc/memory_page7/verify.mjs`: Machine column order, a first read with no answer, a kept reading, and the stale-reading messages. It moves with the page, and the tester owns it.
+12. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The page command restarts the feed when the installed admission code changes. Test: a feed that started before a schema update reads the new record after the restart.
 
-**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py`. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
+**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
 ### Phase 10n — /build:queue retires when the build page covers it  · status: todo
 
 **Depends on:** 10m.
 
 1. **The ask.** C959 (above): retire /build:queue once the page covers it.
-2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the command and the view code that only it uses. Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). The queue card and the unit-board queue pane stay unless the user says otherwise.
+2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the view routes and the view code that only they use. `build_queue.py` also carries the `bump`, `clear` and `admit-head` controls, which the page does not have: these routes stay until the user approves a replacement (architect review of 18, 2026-11-06). Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). The queue card and the unit-board queue pane stay unless the user says otherwise.
 3. **Proof.** No caller of the removed code remains; the suites pass.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
 
-### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: todo
+### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: not landing
+
+**Not landing (user, 2026-11-06):** "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue". A unit's local Python test runs start at once. Cargo steps and gates keep their queue places. Detached Python runs move to `builds-detached.slice` in Phase 23. The text below is the old Work Order, kept for its findings.
 
 **Depends on:** 10z and 10x (same admission files; 10v's code starts after 10x is checkpointed).
 
@@ -1135,8 +1119,16 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Change-Review:** none — the queue view shows the same rows; the room rises by the margin while a registered CI job runs.
 
+### Phase 23 — Detached Python runs show under Other  · status: todo
+
+**Depends on:** herdr-unit Phase 18, which renames `config/mesh_runs.conf` to `config/detached_runs.conf` (user-approved, 2026-11-06).
+
+1. **The ask (user, 2026-11-06).** "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice`.
+2. **Outline.** Detached Python test runs start in `builds-detached.slice`, not `builds.slice`. They do not ask the queue (10v does not land). The memory page shows their memory in the Other group; `/build:queue` does not show them.
+3. The Work Order follows at phase start, after herdr's Phase 18 is on builds.
+
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
-**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`, which no other open phase changes).
+**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 18c also changes `linux_runner.py`, and 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06).
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
 
 **Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
@@ -1161,7 +1153,9 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
 6. Runs beside 10f where the file sets are disjoint.
 7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
-8. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
+9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
+10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
