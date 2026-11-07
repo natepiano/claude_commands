@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Print style coverage at the synced tip and remember the last report."""
 
 from __future__ import annotations
@@ -16,15 +16,11 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS.parent))
-
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 from scripts.production import staff, unit_lookup
-from user_zone import user_zone
-from add_style import NoStyleProduction, standing_style_production
+from scripts.lib.user_zone import user_zone
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 
 
 class RuleSnapshot(TypedDict):

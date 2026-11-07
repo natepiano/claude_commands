@@ -215,7 +215,7 @@ def marker_must_stay(path: Path) -> bool:
         from ..message import sessions
     else:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
+        from scripts.message import sessions
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
@@ -469,7 +469,7 @@ def main(argv: list[str]) -> int:
         from ..message.sessions import running_sessions
     else:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from sessions import running_sessions
+        from scripts.message.sessions import running_sessions
 
     return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
 

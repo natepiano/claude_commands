@@ -7,7 +7,7 @@ from collections.abc import Generator
 from unittest.mock import patch
 
 from scripts.production import staff, staff_sources
-from session_types import LegacyTmuxUnitHost, UnitHost, UnitPlan
+from scripts.shutdown.session_types import LegacyTmuxUnitHost, UnitHost, UnitPlan
 
 PARENTS: dict[str, staff_sources.UnitProduction] = {}
 

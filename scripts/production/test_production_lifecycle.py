@@ -10,22 +10,19 @@ import io
 import json
 import os
 import socket
-import sys
 import unittest
 from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import fake_unit_host
-import production_lifecycle
+from scripts.production import fake_unit_host
+from scripts.production import production_lifecycle
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
 from scripts.shutdown import stop_resume
-import showrunner_tree
-from fake_unit_host import HostedUnit
+from scripts.production import showrunner_tree
+from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import staff, unit_config
@@ -1126,7 +1123,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(owner_after_wrap.id, runner.id)
 
     def test_wrap_reuses_its_staff_context_for_question_cleanup(self) -> None:
-        from update_registration import QuestionStaff
+        from scripts.production.update_registration import QuestionStaff
 
         with mock.patch.object(QuestionStaff, "read", side_effect=AssertionError("Reuse the wrap staff context")):
             self.test_wrap_closes_document_owned_questions_after_its_timer_stops()

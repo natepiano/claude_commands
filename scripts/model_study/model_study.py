@@ -13,13 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from compare import compare, load_turns, markdown as compare_markdown
-from phases import markdown as phases_markdown, phases
-import report as study_report
-import results as study_results
-from turns import RECORDED_ZONE, Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
+from scripts.model_study.compare import compare, load_turns, markdown as compare_markdown
+from scripts.model_study.phases import markdown as phases_markdown, phases
+from scripts.model_study import report as study_report
+from scripts.model_study import results as study_results
+from scripts.model_study.turns import RECORDED_ZONE, Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from unit_runs import history_root  # noqa: E402
 
 DEFAULT_STATE = Path.home() / ".local/state/model-study"

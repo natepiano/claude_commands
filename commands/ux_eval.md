@@ -100,7 +100,7 @@ Then box one capital letter or digit (or a short piece of an edge), tight,
 with a little background around it, in full-size shot pixels:
 
 ```sh
-python3 ~/.claude/scripts/ux_style/measure_text.py <shot> --box X,Y,W,H --scale <scale>
+~/.claude/scripts/lib/py ~/.claude/scripts/ux_style/measure_text.py <shot> --box X,Y,W,H --scale <scale>
 ```
 
 Size floors hold in a 1440×900 logical window. For in-world text in a shot at

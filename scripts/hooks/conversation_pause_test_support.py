@@ -591,7 +591,7 @@ print("SENT: delivered")
         # under the temporary home, and restore the caller's alarm and stdin.
         with patch.dict(os.environ, environment, clear=True), patch.object(sys, "path", sys.path.copy()):
             sys.path.insert(0, str(LIBRARY.parents[1] / "message"))
-            import escalate
+            from scripts.message import escalate
             import direct_run
 
         with patch.object(sys, "stdin", io.StringIO(stdin)), patch.object(

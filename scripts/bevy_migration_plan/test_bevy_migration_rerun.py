@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bevy_migration_split_guide as splitter
+from scripts.bevy_migration_plan import bevy_migration_split_guide as splitter
 
 GUIDE = "### One\nFirst section.\n### Two\nSecond section.\n"
 

@@ -2,29 +2,26 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
-import sys
 from collections.abc import Callable
 from contextlib import redirect_stdout
 import unittest
-from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import declarations
-import approved_renames
-import style_footprint
-import style_ledger
-import style_plan
-import style_proposals
-import rules
-from unit_plans import AllCrates, PilotCrates
-from style_plan_test_support import StylePlanFixture
-from ledger_test_support import LedgerTestCase, PARENT_FILE
+from scripts.style import declarations
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_ledger
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.style import rules
+from scripts.style.unit_plans import AllCrates, PilotCrates
+from scripts.style.style_plan_test_support import StylePlanFixture
+from scripts.style.ledger_test_support import LedgerTestCase, PARENT_FILE
 
 
 @final

@@ -8,14 +8,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.lib.process_failure import failure_detail
 from scripts.production import staff
 from scripts.message import session_send
-from upgrade_record import Record
+from scripts.bevy_upgrade.upgrade_record import Record
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 

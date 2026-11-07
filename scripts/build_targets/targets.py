@@ -18,10 +18,9 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent
 for directory in ("build_hold", "mac_test", "lint", "lib"):
     sys.path.insert(0, str(SCRIPTS / directory))
-import build_hold
-import mac_test
-import offload
-from target_config import (
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test, offload
+from scripts.build_targets.target_config import (
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
     Platform as Platform,
@@ -36,7 +35,7 @@ if TYPE_CHECKING:
     from ..buildlog import record
 else:
     from scripts.aws_target import ledger as cost_ledger, measurement
-    import record
+    from scripts.buildlog import record
 
 
 @dataclass(frozen=True)

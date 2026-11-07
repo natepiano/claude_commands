@@ -10,7 +10,6 @@ import sys
 import time
 from typing import Final, Literal, TypedDict, cast, get_args
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
 

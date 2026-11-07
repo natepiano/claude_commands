@@ -40,7 +40,7 @@ completes.
    The worker command reuses idle or stopped workers and retains their native conversations.
    It refuses selection when all suitable workers are busy.
 
-   For an existing `mesh` pin, run `python3 ~/.claude/scripts/agents/codex_mesh.py list --session-dir "${SESSION_DIR}"`.
+   For an existing `mesh` pin, run `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py list --session-dir "${SESSION_DIR}"`.
    Pass the full registered name with `--to` when the slot has a reusable thread.
    Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
 
@@ -67,7 +67,13 @@ completes.
    Load the implementation summary into `${IMPL_SUMMARY}` and read the other worker's summary.
    For an existing mesh pin, these are `impl_status_<slot>` and `impl_summary_<slot>.txt` under `${PHASE_DIR}`.
    Apply <WorkerLaunchFailure/> before reporting a launch error.
-   A genuine error cancels early review under <EarlyReviewArm/> and applies <RetainPhaseReservation/>.
+   `assign.py` ends a run when its only worker command fails and no pass completed.
+   Each recorder slot counts as one worker. A Claude launch must add a `pass_started` event for its slot.
+   The director must hold only that run. A launcher signal does not trigger this path.
+   For herdr, only exit 2 qualifies. Exits 3 through 8 retain the run.
+   The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
+   It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
+   For other genuine errors, cancel early review under <EarlyReviewArm/> and apply <RetainPhaseReservation/>.
    Report the dispatch log, record `finish-run --status error`, and run `end_session.sh`.
    Stop and emit <RunSummary/> for a multi-phase run.
 8. A successful dispatch records worker completion; it does not pass the phase gate.

@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 import unittest
 
-import index
-import mac_outcome
-import report
-import record
-import store
-import sync
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import report
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 

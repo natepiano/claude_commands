@@ -1,23 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Nextest width selection at the shared cargo invocation boundary."""
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import final, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_hold.override_guard import require_checkout
-else:
-    from scripts.build_hold.override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

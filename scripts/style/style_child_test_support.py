@@ -10,7 +10,6 @@ import tempfile
 from typing import Unpack, cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_place
 from scripts.lint.memory_test_support import admission_configuration_fixture
 
@@ -116,13 +115,12 @@ def style_cli_command(script: Path, *arguments: str) -> list[str]:
     """Use the same queue fake in a child Python interpreter."""
     bootstrap = (
         "import runpy, sys; "
-        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
-        "from style_child_test_support import unqueued_style_children; "
+        "from scripts.style.style_child_test_support import unqueued_style_children; "
         "sys.argv = sys.argv[1:]\n"
         "with unqueued_style_children():\n"
         "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
     )
-    return [sys.executable, "-c", bootstrap, str(script), *arguments]
+    return [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", bootstrap, str(script), *arguments]
 
 
 def install_refusal_tools(root: Path) -> None:

@@ -311,7 +311,7 @@ class ClaudeBackendFixture:
     def launch(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str],
                kind: str, agent_arguments: list[str], opening: object, timeout_ms: int, *,
                agent: str) -> object:
-        import herdr
+        from scripts.herdr import herdr
 
         del name, space, title, cwd, kind, timeout_ms, agent
         if not isinstance(opening, herdr.OpeningPrompt):

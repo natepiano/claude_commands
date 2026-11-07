@@ -1,27 +1,6 @@
 #!/usr/bin/env bash
-# Find a python3 new enough for this repo, then exec it with our arguments.
-#
-# This repo uses Python 3.12 syntax (type parameter lists and type statements),
-# so it needs Python >= 3.12.
-# On macOS the `python3` on PATH is Apple's
-# /usr/bin/python3, which is 3.9 -- which is why the hooks used to hardcode
-# /opt/homebrew/bin/python3. That path does not exist on Linux, so every hook
-# silently failed there. Choosing by VERSION rather than by path works on both.
-#
-# Order: explicit override first, then PATH -- correct on NixOS, and on a Mac
-# whose PATH puts homebrew ahead of /usr/bin -- then the nix-darwin system and
-# per-user profiles (a session started before nix reached PATH still finds
-# them), then homebrew's usual locations for a Mac whose PATH does not.
-#
-# Resolution costs a python3 spawn per candidate tried, and the hooks come
-# through here several times a second -- the prioritize watcher alone accounted
-# for ~100 a minute, every one re-asking a question whose answer cannot change
-# while the interpreter stays put. So the winner is remembered by absolute path
-# and revalidated with a stat instead. A garbage-collected nix store path, or a
-# homebrew python that has been uninstalled, fails -x and falls through to a
-# full resolution; the cache key carries the version floor, so raising
-# NEED_MINOR invalidates it. CLAUDE_PYTHON is an explicit override and skips
-# the cache in both directions.
+# Select Python 3.12 or newer. Cache its absolute path unless CLAUDE_PYTHON is set.
+# Set the package root without another process or a working directory change.
 set -uo pipefail
 
 shim="${BASH_SOURCE[0]}"
@@ -38,27 +17,39 @@ for part in "${shim_parts[@]}"; do
 done
 root="${shim%/*/*/*}"
 
-# Inline programs import from this install before inherited Python paths.
-option_value=0
-for argument in "$@"; do
-    if (( option_value )); then
-        option_value=0
-        continue
-    fi
-    case "$argument" in
-        -|-c*|-m*)
-            export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-            set -- -P "$@"
-            break ;;
-        -W|-X|--check-hash-based-pycs) option_value=1 ;;
-        --) break ;;
-        -*) ;;
-        *) break ;;
-    esac
-done
-
 NEED_MAJOR=3
 NEED_MINOR=12
+
+isolated=0
+if [[ "${1:-}" == --isolated ]]; then
+    isolated=1
+    shift
+fi
+skip_argument=0
+options=1
+for argument in "$@"; do
+    if [[ "$skip_argument" == 1 ]]; then skip_argument=0; continue; fi
+    if [[ "$options" == 1 ]]; then
+        case "$argument" in
+            -c*|-m*|-) set -- -P "$@"; break ;;
+            -W|-X|--check-hash-based-pycs) skip_argument=1; continue ;;
+            --) options=0; continue ;;
+            -*) continue ;;
+        esac
+    fi
+    script="$argument"
+    [[ "$script" == /* ]] || script="$PWD/$script"
+    folder="${script%/*}"
+    while [[ -n "$folder" ]]; do
+        if [[ -f "$folder/scripts/lib/py" ]]; then root="$folder"; break; fi
+        folder="${folder%/*}"
+    done
+    break
+done
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+if [[ "$isolated" == 1 ]]; then
+    set -- -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); script = sys.argv.pop(1); sys.argv[0] = script; runpy.run_path(script, run_name="__main__")' "$root" "$@"
+fi
 
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
     cache_dir="$XDG_CACHE_HOME/claude"
