@@ -1271,7 +1271,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - A real `verify.sh test` call that reaches a fake Mac runner under `NO_COLOR=1` shows `NO_COLOR=1` in the remote command, and a call that reaches a fake SSH runner shows it too.
 - A second call with a different `TERM`, `COLORTERM`, `TERM_PROGRAM`, `COLUMNS` or `LINES` reuses the pass. The fake cargo on natedev, and the remote command on the fake Mac and SSH runners, show the fixed values and not the call's values.
 - `test_verify_build_key.py`: `NO_COLOR` changes the verdict key and not the build key. A `check` key does not change with `NO_COLOR`.
-- The modules that read the key pass. No assertion changes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+- The modules that read the key pass. One assertion change, which item 3 calls for: `test_verify_mac_only.py` expected the forwarded map to hold only the user's `--env` name. It now holds that name and the automatic values, and the comparison stays a whole-map comparison. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
