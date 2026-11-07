@@ -35,7 +35,8 @@ It skips busy mirrors and preserves their records.
 Cancellation closes its acquired descriptors.
 The lock files retain their inodes.
 
-`copies.py remove --owner O` includes that owner's remote mirrors within the repository scope.
+`copies.py remove` takes the owner from the caller's staff row and includes that owner's remote mirrors within the repository scope.
 Retirement and production cleanup use the same removal path before deleting source trees or production state.
 Busy removal names the holder session and mirror path.
+A kept remote mirror raises `RemoteMirrorKept`, and retire refuses before it removes the worktree, because no sweep removes a mirror. A kept local tree prints one line, the retire continues, and the sweep takes the tree later.
 Another owner's records remain.

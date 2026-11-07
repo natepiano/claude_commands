@@ -49,7 +49,9 @@ For active process redesigns, as we are currently undergoing with promotions and
   - `scripts/lib/user_zone.py` — user-facing times
   - `~/.claude/docs/decision_criteria.md` — what reaches the user
 - **Test lanes:** `scripts/direct/` — `test_*.py` beside the script.
-- **Test:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` from the worktree root (memory `shared-module-full-gate`).
+- **Test:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .` from the worktree root.
+  Memory: `shared-module-full-gate`.
 - **Lint:** `basedpyright scripts/direct scripts/production` passes when its output has the `0 errors, 0 warnings` line; the exit status says nothing.
 - **Invariants:**
   - Measuring reads every source read-only. It sends no message, push or alert, and starts no session (plan author: a measure must not add traffic).
@@ -249,7 +251,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:**
 - A launcher that never exits keeps its subscription to the worker thread and records the next compaction turn as work, so the worker reads busy and refuses follow-ups. End only the stale launcher pids.
-- Run a merge gate through `python3 ~/.claude/scripts/copies/copies.py run --owner <unit-or-production> --repo <source> --commit HEAD --merge origin/sdlc -- <gate command>`. For `--merge origin/<branch>`, `copies.py` first fetches the branch from the source's origin into the standing tree, then merges it; it does not update the source's refs.
+- Run a merge gate through `python3 ~/.claude/scripts/copies/copies.py run --repo <source> --commit HEAD --merge origin/sdlc -- <gate command>`. For `--merge origin/<branch>`, `copies.py` first fetches the branch from the source's origin into the standing tree, then merges it; it does not update the source's refs.
 
 **Ruled out:** the slot taken from a variable fixed at app-server start; the newest phase instance for an ambiguous checkpoint; checking a postmaster-forwarded reply against its log before the log exists (removed as containment).
 

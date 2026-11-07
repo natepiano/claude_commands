@@ -7,7 +7,6 @@ import json
 import os
 import tempfile
 import time
-import sys
 import subprocess
 import shlex
 import unittest
@@ -18,11 +17,10 @@ from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, overri
 from unittest import mock
 from scripts.lib.file_module import load_file_module
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
-    from ..notify import review, pushover
-    from ..notify.push_test_support import registered_send
-    from ..notify.user_action import ActionRequired
+    from scripts.notify import review, pushover
+    from scripts.notify.push_test_support import registered_send
+    from scripts.notify.user_action import ActionRequired
 else:
     from scripts.notify import review
     from scripts.notify import pushover

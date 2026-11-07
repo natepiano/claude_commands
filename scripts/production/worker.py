@@ -595,6 +595,16 @@ def restore(parent: StaffId) -> ExitCode:
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
+                if holder is None:
+                    continue
+                run = worker_panes.worker_run(holder)
+                active = progress_history.active_dispatch(state.row.id, run)
+                if isinstance(active, progress_history.ActiveDispatchUnavailable):
+                    print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
+                    outcome = ExitCode.UNCERTAIN
+                    continue
+                if not isinstance(active, progress_history.ActiveDispatch):
+                    continue
                 if not isinstance(state, worker_panes.OpenWorker):
                     role = worker_panes.dispatch_role(state.row)
                     result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
@@ -603,16 +613,9 @@ def restore(parent: StaffId) -> ExitCode:
                         outcome = code
                         continue
                     changed = True
-                if holder is not None:
-                    run = worker_panes.worker_run(holder)
-                    active = progress_history.active_dispatch(state.row.id, run)
-                    if isinstance(active, progress_history.ActiveDispatchUnavailable):
-                        print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
-                        outcome = ExitCode.UNCERTAIN
-                    elif isinstance(active, progress_history.ActiveDispatch):
-                        code = _resume_launcher(state.row, active)
-                        if code != ExitCode.OK:
-                            outcome = code
+                code = _resume_launcher(state.row, active)
+                if code != ExitCode.OK:
+                    outcome = code
             except (herdr.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN

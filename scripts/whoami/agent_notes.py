@@ -38,7 +38,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import codex_pacer
 from scripts.whoami import five_hour
@@ -350,7 +349,6 @@ def apply(
 
 @role_map_command
 def update(*, include_warnings: bool = True) -> list[str]:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     workers_home = resolve_workers_home()
@@ -673,10 +671,8 @@ def main() -> None:
         return
     if sys.argv[1:] not in ([], ["refresh"]):
         sys.exit("usage: agent_notes.py [refresh|usage-only|renew-logins|blocked]")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
     from scripts.herdr import herdr
 
     from scripts.accounts import refusal_watch

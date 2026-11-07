@@ -23,7 +23,9 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.lib import copy_record
-from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
+from scripts.production import (
+    showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
+)
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
@@ -214,6 +216,14 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.branch_unit("new", "unit", "branch-a", "branch-b.md")
         return self.branch_unit("second", "second", "branch-b", "second.md")
 
+    def unrelated_unit(self, name: str = "external-unit", plan: str = "external-plan.md") -> staff.StaffRow:
+        doc = self.root / "other.md"
+        _ = doc.write_text("# Other\n")
+        row = recorded_unit("other", name, self.root / "external", doc, plan=plan)
+        _ = subprocess.run(["git", "-C", str(self.root / "external"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        return row
+
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
         _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
@@ -226,6 +236,67 @@ class ProducerWriterTests(ProducerFixture):
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         merge_checkpoint.record_publication_changes(production)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], second.id)
+
+    def test_publication_writes_an_unrelated_units_producer_and_production(self) -> None:
+        other = self.unrelated_unit()
+        _ = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], other.id)
+        self.assertEqual(row["Production"], other.id)
+
+    def test_publication_uses_the_live_unit_before_a_retired_unit_with_the_same_branch(self) -> None:
+        retired = self.unrelated_unit(name="retired-unit")
+        live_doc = self.root / "live.md"
+        _ = live_doc.write_text("# Live\n")
+        live = recorded_unit("live", "live-unit", self.root / "live", live_doc)
+        _ = subprocess.run(["git", "-C", str(self.root / "live"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}))
+        parked = unit_config.parked_path(retired.id)
+        parked.parent.mkdir(parents=True)
+        _ = parked.write_text((self.root / "external/.unit.toml").read_text()
+            + f'\n[retired]\ndate = "2026-11-05"\nsession = "{retired.current_session}"\nbranch = "external-branch"\n')
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "external"),
+                              expected=retired.worktree)
+        _ = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], live.id)
+        self.assertEqual(row["Production"], live.id)
+
+    def test_unit_producer_resolves_the_exact_staff_name_across_productions(self) -> None:
+        other = self.unrelated_unit()
+        for name, expected in (("new", self.unit.id), ("external-unit", other.id),
+                               ("new-unit", change_review.UNKNOWN_PRODUCER), ("external", change_review.UNKNOWN_PRODUCER)):
+            with self.subTest(name=name):
+                self.assertEqual(change_review.unit_producer(name), expected)
+
+    def test_unit_producer_returns_unknown_for_duplicate_and_absent_names(self) -> None:
+        _ = self.unrelated_unit(name="new")
+        for name in ("new", "absent"):
+            with self.subTest(name=name):
+                self.assertIs(change_review.unit_producer(name), change_review.UNKNOWN_PRODUCER)
+
+    def test_publication_keeps_the_scoped_alias_when_another_production_has_it(self) -> None:
+        other = self.unrelated_unit(plan="old-plan.md")
+        _ = self.git("checkout", "-b", "checkpoints")
+        for name in ("external-branch", "old-plan"):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints")
+        _ = self.git("push", "origin", "main")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Producer"] for row in rows], [other.id, self.unit.id])
+        self.assertEqual([row["Production"] for row in rows], [other.id, self.unit.id])
 
     def test_a_checkpoint_with_an_unmatched_branch_pattern_keeps_the_row_values_aligned(self) -> None:
         _ = self.git("checkout", "-b", "old-branch")
@@ -258,6 +329,23 @@ class ProducerWriterTests(ProducerFixture):
         merge_checkpoint.record_publication_changes(production)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
         self.assertNotIn(self.unit.name, change_review.pending(self.listing)[0]["Producer"])
+
+    def test_unit_merge_with_an_unmatched_slug_writes_the_units_staff_id(self) -> None:
+        merged = self.merge("unmatched-checkpoint-slug")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        unit = merge_checkpoint.unit_from_row(
+            self.unit, session_staff.RowResolver(staff.snapshot()))
+        assert isinstance(unit, merge_checkpoint.Unit)
+        request = merge_checkpoint.MergeRequest(
+            production, unit, "1", merged, merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
+            (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
+        )
+        merge_checkpoint.record_publication_changes(
+            request.production, record=request.staff_record,
+            known_producer=change_review.KnownMergeProducer(merged, request.unit.staff_id))
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
 
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         _ = self.merge()

@@ -151,11 +151,15 @@ Apply mesh instructions only when that existing pin is `mesh`.
 
 For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
+After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
+The close keeps the thread and staff row; the next assign resumes that thread.
+If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
 The worker command selects idle workers and reuses stopped workers.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
@@ -181,11 +185,12 @@ A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a lau
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
-Restore resumes the same conversations through `worker.py restore`.
+Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves keep the same conversation on the destination account.
-A stopped worker keeps its pane and terminal; a closed worker resumes in a new pane.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+A stopped worker with an active dispatch keeps its pane and terminal.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -489,7 +494,7 @@ Codex only; no timer process:
 
 <BackgroundVerificationContract>
 Run every `verify.sh` call as one plain command,
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <command> [<package>] [flags]`,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
@@ -559,19 +564,37 @@ implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 </WritePromptContract>
 
 <VerificationContract>
-Rust workers run only exact prompt lines using
-`~/.claude/scripts/direct/verify.sh`:
+Rust workers run only exact prompt lines with this form:
+`bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
+Omit the package for the whole workspace. Give at most one positional word after the command.
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package> [--keep-going]` |
-| package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
-| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/direct/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
-| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint <package>` |
-| changed example | `bash ~/.claude/scripts/direct/verify.sh example <package> <name>` |
-| final workspace gate | `bash ~/.claude/scripts/direct/verify.sh final` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check [<package>] [--keep-going]` |
+| package or workspace tests | `bash ~/.claude/scripts/direct/verify.sh test [<package>]` |
+| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --test <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
+| a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
+| staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
+| example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
+| build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
+| final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
+| read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
+
+`check` and `build` keep Cargo's workspace selection, also with a named package.
+A named package owns feature names without a slash. Without a package, feature
+names pass unchanged. `doc` checks the whole staged workspace with the same
+feature rule. Its pass record stays the same.
+
+Without `--name`, `example` checks all examples in the selected package or workspace.
+With `--name` and no package, the example's member supplies its required features.
+`final` checks the whole workspace. A named package limits its nextest run and
+prevents a saved pass. `--tree` requires `--saved`.
+
+Use `--local` only for a test that cannot pass on macOS. A reservation reason
+is refused. Use `/build:hold hold <why> target mac` for a Mac hold.
+Before CI, either machine can answer a test, including merge gates.
 
 Rules:
 
@@ -1462,7 +1485,7 @@ A launch that needs a built binary — a smoke or shot helper's, or a launcher
 that takes a path — builds it with this one line, then starts the
 `binary: <path>` it prints:
 
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>]`
 
 It waits for a build hold, takes the cargo token and memory admission, and
 records the build, and its allow rule needs no approval. You and every helper
@@ -1598,8 +1621,7 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-For `herdr`, retain worker rows and panes for the next phase.
-Use `worker.py end <name>` only when permanent removal is required.
+For `herdr`, apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
 
 For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
 `~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.

@@ -174,6 +174,7 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Waiting Test")
         _ = self.git("config", "user.email", "waiting@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "README.md", "base\n")
         self.write(self.checkout / "shared.txt", "base\n")
         self.production_doc()
@@ -350,7 +351,7 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
-                                     "alpha-branch")
+                                     "alpha-branch", unit_membership("showrunner-example", ALPHA).id)
         request = merge_checkpoint.MergeRequest(
             replace(production, log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),

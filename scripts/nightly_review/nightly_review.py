@@ -31,10 +31,6 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 # The account reader and the production scripts sit one directory over.
 SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(SCRIPTS / "shutdown"))
-sys.path.insert(0, str(SCRIPTS / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
@@ -208,11 +204,7 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
 
 
 def messages(since: datetime) -> list[str]:
-    sys.path.insert(0, str(SCRIPTS / "notify"))
-    if TYPE_CHECKING:
-        from scripts.notify import review
-    else:
-        from scripts.notify import review
+    from scripts.notify import review
 
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]

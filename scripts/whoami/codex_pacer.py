@@ -52,7 +52,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 
 from scripts.whoami.note_file import InvalidReset, KnownReset, NoResetKnown, reset_time

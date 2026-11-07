@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
-import sys
 import io
 import json
 import os
@@ -15,7 +14,6 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 
 from scripts.whoami import quota_alert_test_support as support

@@ -26,9 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
@@ -297,7 +295,7 @@ def proposal_unit(issue: Issue) -> str:
 def calling_showrunner() -> str:
     """Read the calling showrunner's fixed staff id."""
     record = staff.snapshot()
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session = staff.caller_identity()
     row = record.by_current_session(session)
     if row is None or row.kind != "showrunner":
         raise Refusal("this session is no production's showrunner; approve and unapprove run in one")

@@ -68,7 +68,7 @@ def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Produc
         name = cast(str | None, args.production)
         if name is not None:
             return read_production(name, record)
-        runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        runtime = staff.caller_identity()
         row = record.by_current_session(runtime)
         if row is None or row.kind != "showrunner":
             raise Refusal("this session runs no production; pass --production <name>")

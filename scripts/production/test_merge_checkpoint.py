@@ -57,7 +57,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(len(steps), 2)
             self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
-            self.assertEqual(steps[1].command[-3:], ["example", "aws-routing-proof", "demo"])
+            self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
     def test_example_without_a_manifest_has_no_step(self) -> None:

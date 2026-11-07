@@ -244,11 +244,13 @@ Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write
         self.assertEqual(self.admission.history(), [])
         self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
 
-    def test_pinned_target_rejects_unknown_and_local_target_names(self) -> None:
-        for name in ("unknown", "natedev"):
-            with self.subTest(target=name):
-                result = self.verify("test", "sample", "--target", name)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("unknown SSH target: " + name, result.stderr)
+    def test_pinned_target_rejects_unknown_names_and_accepts_natedev(self) -> None:
+        result = self.verify("test", "sample", "--target", "unknown")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown SSH target: unknown", result.stderr)
         self.assertEqual(self.ssh_events(), [])
         self.assertEqual(self.local_runs(), [])
+        result = self.verify("test", "sample", "--target", "natedev")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.ssh_events(), [])
+        self.assertEqual(len(self.local_runs()), 1)

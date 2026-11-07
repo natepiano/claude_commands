@@ -11,7 +11,6 @@ import os
 import re
 import shlex
 import sys
-from pathlib import Path
 from typing import cast
 
 
@@ -45,7 +44,6 @@ def main() -> None:
                 or not re.match(rf"No agent named ['\"]{re.escape(name)}['\"] is reachable\.", message)):
             return
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
         from scripts.message import roster
         from scripts.message import send
         from scripts.production import staff

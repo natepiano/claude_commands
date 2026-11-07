@@ -22,7 +22,7 @@ import sys
 from typing import Callable, Protocol, cast
 import uuid
 
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_code, queue_lines
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.system_clock import SystemClock
 from scripts.build_queue.admission_records import reason_phrase
@@ -31,7 +31,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.lib.user_zone import user_zone
 from scripts.build_queue import admission_records as records
 
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 from scripts.buildlog import store
 
 BUILDS_SESSION = "builds"
@@ -624,7 +624,8 @@ class WaitOutput:
         self.last_position = reply.position
         if snapshot.head_need:
             text += f"; head {snapshot.head_label} needs {snapshot.head_need / records.GIB:.1f} GiB"
-        summary = ", ".join(f"{Path(item.folder).name} {item.step} in {item.folder}" for item in snapshot.running)
+        summary = ", ".join(("" if item.project else Path(item.folder).name + " ")
+            + f"{queue_lines.step_text(item, build_steps.RECORDED_STEP_NAMES)} in {item.folder}" for item in snapshot.running)
         reason_text = (records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(decision.pressure) if isinstance(decision.pressure, records.MemoryPressure) else "")

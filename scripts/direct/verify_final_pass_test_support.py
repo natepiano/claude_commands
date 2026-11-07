@@ -28,7 +28,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         builder.build_fixture()
         cls.addClassCleanup(builder.temporary.cleanup)
         cls.fixture_root = Path(builder.temporary.name)
-        seed = tempfile.TemporaryDirectory(prefix="final-pass-seed-")
+        seed = tempfile.TemporaryDirectory(prefix="final-seed-")
         cls.addClassCleanup(seed.cleanup)
         cls.fixture_seed = Path(seed.name) / "fixture"
         cls.fixture_environment = builder.environment.copy()
@@ -105,6 +105,6 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.pass_files(), [])
         self.assertIn("no final pass record was written: the tree is dirty", result.stdout)
-        answer = self.verify("final-pass")
+        answer = self.verify("final", "--saved")
         self.assertEqual(answer.returncode, 1, answer.stdout + answer.stderr)
         self.assertIn("the tree is dirty", answer.stderr)

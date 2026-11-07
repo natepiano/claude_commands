@@ -184,7 +184,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
         self.assertEqual((hook.event, hook.matcher), ("PreToolUse", "Bash"))
         for command, expected in (("git clone source destination", 2),
-                                  ("copies.py run --owner verify-unit --repo . --commit HEAD -- true", 0)):
+                                  ("copies.py run --repo . --commit HEAD -- true", 0)):
             with self.subTest(command=command):
                 result = self.run_bash_policy(command)
                 self.assertEqual(result.returncode, expected, result.stderr)

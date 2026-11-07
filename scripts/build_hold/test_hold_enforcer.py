@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold, hold_enforcer
@@ -26,10 +26,7 @@ from scripts.build_hold.override_guard import require_checkout
 require_checkout(Path(__file__))
 
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    from scripts.direct import step_record
+from scripts.direct import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
@@ -115,8 +112,8 @@ class HoldEnforcerTests(unittest.TestCase):
 
     def write_step(self, call_id: str, state: step_record.StepState, pid: int) -> None:
         step_record.write(step_record.StepRecord(
-            call_id, pid, step_record.process_start(pid), self.root, "check", None,
-            step_record.MacAllowed(), state, "2026-10-28T12:00:00+00:00",
+            call_id, pid, step_record.process_start(pid), self.root, "check", step_record.WorkspacePackages(),
+            step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
 
     def test_verify_controller_survives_every_live_state_while_local_compile_child_stops(self) -> None:

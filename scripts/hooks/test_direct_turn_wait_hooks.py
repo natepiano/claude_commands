@@ -107,8 +107,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         _ = session_lookup.write_text("\n".join((
             "import runpy, sys",
             "from pathlib import Path",
-            f"sys.path.insert(0, {str(HOOKS.parents[1])!r})",
-            f"sys.path.insert(0, {str(HOOKS)!r})",
+            f"with open({str(HOOKS.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
             "from scripts.message import sessions",
             "from unittest.mock import patch",
             "read_sessions = sessions.live_sessions",

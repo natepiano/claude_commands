@@ -1267,7 +1267,7 @@ class GuestTests(unittest.TestCase):
             self.assertEqual(measured['fixture/test_broken.py']['status'], 1)
             self.assertNotIn('types/basedpyright', measured)
             self.assertEqual(measured['fixture/test_stuck.py']['stopped'], True)
-            self.assertEqual(measured['fixture/test_stuck.py']['status'], -signal.SIGKILL)
+            self.assertEqual(measured['fixture/test_stuck.py']['status'], -signal.SIGTERM)
             self.assertIn('gate_started_at', payload)
             self.assertIn('gate_finished_at', payload)
             for _, path in modules:
@@ -1278,7 +1278,7 @@ class GuestTests(unittest.TestCase):
                     self.assertIn(key, environment)
             self.assertFalse((root / 'types-args').exists())
             content = uploads[links['log']].decode()
-            self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-9'))
+            self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-15'))
             self.assertIn(' stopped', content)
             self.assertNotIn('types/basedpyright', content)
             self.assertEqual(sum(line.startswith('fixture/test_broken.py exit=') for line in content.splitlines()), 1)
