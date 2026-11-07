@@ -181,7 +181,8 @@ After all repair workers complete successfully, run `findings.py landed` if the 
 Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
 Read-only pane reviewers post no board lines and run no suites.
 The director or a writer handles required board posts and suites.
-A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a launch option, and the launcher makes no compaction call.
+A pane worker has no in-turn compaction option.
+Codex keeps its own full-window limit.
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
