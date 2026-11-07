@@ -168,9 +168,37 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"send alpha: phase 2 merged and pushed as {shrink_merge}",
                       shrink_rerun.process.stdout)
     def test_shrink_holds_before_code_checkpoint(self) -> None:
+        _ = self.checkpoint()
         sha = self.checkpoint("docs/plans/alpha.md", "short as built\n")
         early = self.run_checkpoint(sha, "--shrink", review=False)
         self.assert_stopped_before_merge(early, "held", "phase 2")
+
+    def test_shrink_passes_after_code_merges_through_another_branch(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--ff-only", "alpha-branch", cwd=self.other)
+        _ = self.git("merge", "--no-ff", "-m", "Integrate work through beta", "beta-branch")
+        _ = self.git("push", "origin", "production")
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        _ = (runs / "checkpoints.jsonl").write_text(json.dumps({
+            "schema_version": 1, "event_type": "checkpoint", "working_dir": str(self.other),
+            "phase_id": "2", "checkpoint_commit": code,
+        }) + "\n")
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        result = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths", result.process.stdout)
+
+    def test_shrink_passes_when_parent_is_merge_branch_tip_without_a_checkpoint_event(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--ff-only", "alpha-branch")
+        _ = self.git("push", "origin", "production")
+        self.assertEqual(self.git("rev-parse", "HEAD"), code)
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        result = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths", result.process.stdout)
+
     def test_shrink_holds_with_unrelated_staged_path(self) -> None:
         code = self.checkpoint(content="actual code\n")
         self.assertEqual(self.run_checkpoint(code).process.returncode, 0)
