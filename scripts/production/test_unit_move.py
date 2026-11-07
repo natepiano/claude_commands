@@ -1044,7 +1044,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                     self.assertEqual((backend.starts, backend.stops), ([], []))
                     self.assertFalse(backend.live)
                     for row in (self.owner, worker):
-                        command = f"shutdown.py restart --only {row.id}"
+                        command = f"agents restart --only {row.id}"
                         lines = [line for line in (result.stdout + result.stderr).splitlines() if command in line]
                         self.assertEqual(len(lines), 1, result.stdout + result.stderr)
                         self.assertIn("info", lines[0].lower())
@@ -1053,7 +1053,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                     self.assertEqual(rerun.returncode, 0, rerun.stderr)
                     self.assertEqual(rerun.stdout, "unchanged\n")
                     self.assertEqual(rerun.stderr, "")
-                    self.assertNotIn("shutdown.py restart", rerun.stdout + rerun.stderr)
+                    self.assertNotIn("agents restart", rerun.stdout + rerun.stderr)
                     self.assertEqual(file_versions(self.root), before)
                     self.assertEqual((backend.starts, backend.stops), ([], []))
 
@@ -1068,7 +1068,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
             result = self.command()
         self.assertEqual(result.returncode, 0, result.stderr)
         start.assert_called_once()
-        command = f"shutdown.py restart --only {self.owner.id}"
+        command = f"agents restart --only {self.owner.id}"
         lines = [line for line in (result.stdout + result.stderr).splitlines() if command in line]
         self.assertEqual(len(lines), 1, result.stdout + result.stderr)
         self.assertIn("anomaly", lines[0].lower())
