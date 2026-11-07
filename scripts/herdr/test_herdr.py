@@ -4229,7 +4229,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_agent_names_are_valid_for_method_and_module_launches(self) -> None:
         for label, expected in (("Kept Runner", "kept-runner"), ("7runner", "a-7runner"),
-                                ("X" * 40, "x" * 32), ("", "a-7pane-1")):
+                                ("X" * 40, "x" * 23 + "-bd913ff6"), ("", "a-7pane-1")):
             for module_launch in (False, True):
                 with (self.subTest(label=label, module_launch=module_launch),
                       patch.object(herdr, "run_program", side_effect=self.run_fake)):
@@ -4245,6 +4245,78 @@ class HerdrTests(unittest.TestCase):
                         "--pane", "7pane-1", "--timeout", "10000", "--", "--model", "opus",
                     ])
                     self.assertEqual(prompt, ["--session", "fixture", "agent", "prompt", "7pane-1", script_prompt("continue")])
+
+    def test_long_worker_names_start_distinct_agents(self) -> None:
+        names: list[str] = []
+        for label in ("claude-build-followups-verify-review4",
+                      "claude-build-followups-verify-review5",
+                      "claude-build-followups-verify-review6"):
+            outcome = self.herdr.start_agent(label, "pane-1", "claude", [], herdr.NoOpeningPrompt(), 10_000)
+            self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
+            names.append(self.start_commands()[-1][4])
+        self.assertEqual(len(set(names)), 3)
+        self.assertTrue(all(len(name) <= 32 for name in names), names)
+
+    def test_worker_server_names_use_the_shared_mapping_and_keep_the_pane_label(self) -> None:
+        pane = "w1:p2"
+        self.configure_startup_shell(pane)
+        prepared = herdr.PreparedAgentEnvironment(self.root, {})
+        self.configure_herdr(["pane", "split", "w1:p1", "--direction", "right", "--ratio", "0.3",
+            "--cwd", str(self.root), "--no-focus", "--env", "HERDR_AGENT_PANE=1"],
+            json.dumps({"result": {"pane": {"pane_id": pane}}}))
+        for server_name, expected in (("unit-impl", "unit-impl"), ("second-unit-impl", "second-unit-impl"),
+                                     ("claude-build-followups-verify-impl", "claude-build-followups--e05490da")):
+            with self.subTest(server_name=server_name):
+                self.log.unlink(missing_ok=True)
+                launched = herdr.launch_prepared_agent("fixture", herdr.SplitPane("w1:p1", "right", 0.3, "impl"),
+                    prepared, "claude", [], herdr.NoOpeningPrompt(), 10_000, agent="impl", agent_name=server_name)
+                self.assertIsInstance(launched.outcome, herdr.PromptSubmissionNotRequired)
+                self.assertIn(["--session", "fixture", "agent", "start", expected, "--kind", "claude",
+                    "--pane", pane, "--timeout", "10000", "--"], self.commands())
+                self.assertIn(["--session", "fixture", "pane", "rename", pane, "impl"], self.commands())
+                self.assertLessEqual(len(expected), 32)
+
+    def test_name_taken_closes_a_new_split_but_keeps_an_existing_pane(self) -> None:
+        pane = "w1:p2"
+        self.configure_startup_shell(pane)
+        prepared = herdr.PreparedAgentEnvironment(self.root, {})
+        for destination in (herdr.SplitPane("w1:p1", "right", 0.3, "worker"),
+                            herdr.ExistingPane(pane, "terminal-one")):
+            with self.subTest(destination=destination):
+                self.log.unlink(missing_ok=True)
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                    {"pane_id": pane, "workspace_id": "w1", "terminal_id": "terminal-one"}]}}))
+                self.configure_herdr(["pane", "split", "w1:p1", "--direction", "right", "--ratio", "0.3",
+                    "--cwd", str(self.root), "--no-focus", "--env", "HERDR_AGENT_PANE=1"],
+                    json.dumps({"result": {"pane": {"pane_id": pane}}}))
+                self.configure_herdr(["agent", "start", "worker", "--kind", "claude", "--pane", pane,
+                    "--timeout", "10000", "--"], code=8,
+                    stderr=json.dumps({"error": {"code": "agent_name_taken", "message": "agent name is taken"}}))
+                closed_responses = {**self.responses, "--session fixture pane list": {
+                    "stdout": json.dumps({"result": {"panes": []}}), "code": 0}}
+                self.responses["--session fixture pane close " + pane] = {
+                    "stdout": "", "code": 0,
+                    "write_files": {str(self.responses_path): json.dumps(closed_responses)}}
+                write_text_atomic(self.responses_path, json.dumps(self.responses))
+                with redirect_stderr(io.StringIO()) as errors:
+                    launched = herdr.launch_prepared_agent("fixture", destination, prepared, "claude", [],
+                        herdr.NoOpeningPrompt(), 10_000, agent="worker")
+                self.assertEqual(launched.pane, pane)
+                assert isinstance(launched.outcome, herdr.AgentNotStarted)
+                self.assertIsInstance(launched.outcome, herdr.PromptNotSubmitted)
+                commands = self.commands()
+                if isinstance(destination, herdr.SplitPane):
+                    self.assertIn(["--session", "fixture", "pane", "rename", pane, "worker"], commands)
+                    self.assertEqual(commands.count(["--session", "fixture", "pane", "close", pane]), 1)
+                    self.assertEqual(self.herdr.panes(), [])
+                    self.assertIn(f"herdr fixture:{pane}: agent start failed: {launched.outcome.reason}; pane closed\n",
+                                  errors.getvalue())
+                else:
+                    self.assertFalse(any(command[2:4] in (["pane", "close"], ["tab", "close"], ["server", "stop"])
+                                         for command in commands))
+                    self.assertEqual([row["pane_id"] for row in self.herdr.panes()], [pane])
+                    self.assertNotIn("pane closed", errors.getvalue())
+                self.assertFalse(any(command[2:4] == ["agent", "prompt"] for command in commands))
 
     def test_pane_activity_distinguishes_shell_from_foreground_commands(self) -> None:
         for foreground, names, expected in (
