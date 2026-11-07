@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from contextlib import suppress
 from dataclasses import dataclass
 
 import json
@@ -298,7 +299,10 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             launcher_pid = int(delivery.recv(32))
                             if cancel:
                                 os.kill(launcher_pid, signal.SIGTERM)
-                            delivery.sendall(b"1")
+                                with suppress(BrokenPipeError, ConnectionResetError):
+                                    delivery.sendall(b"1")
+                            else:
+                                delivery.sendall(b"1")
                         if not cancel:
                             for status in (b"busy", b"idle"):
                                 with gate.accept()[0] as turn:

@@ -16,8 +16,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
 from scripts.production import staff, unit_move, unit_names

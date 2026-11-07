@@ -154,7 +154,8 @@ class AddShowrunnerFixture(unittest.TestCase):
         path.write_text(json.dumps(responses))
     result = main(argv)
     if result == 0 and argv[2:4] == ["agent", "start"]:
-        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+        with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root:
+            exec(package_root.read(), {"__file__": package_root.name})
         from scripts.production.staff_test_support import record_fixture_claude_start
         from scripts.production.fake_unit_host import private_process_registry, process
         from scripts.message import sessions

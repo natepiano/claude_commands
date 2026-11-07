@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
@@ -35,9 +33,7 @@ SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home(
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 PARENT_FILE = "parent"
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.user_zone import user_zone_name  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
@@ -603,7 +599,7 @@ def main(argv: list[str]) -> int:
                     print(f"{runner['name']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
                           + f"\t{runner['doc']}")
             elif action == "tree":
-                lines = cast(Callable[[list[Showrunner]], list[str]], import_module("showrunner_tree").tree_lines)(runners)
+                lines = cast(Callable[[list[Showrunner]], list[str]], import_module('scripts.production.showrunner_tree').tree_lines)(runners)
                 for line in lines:
                     print(line)
             else:
@@ -616,10 +612,10 @@ def main(argv: list[str]) -> int:
                 print(found)
             return runners.exit_code
         elif action in ("parent", "children", "root"):
-            return cast(Callable[[str, str], int], import_module("showrunner_tree").main)(
+            return cast(Callable[[str, str], int], import_module('scripts.production.showrunner_tree').main)(
                 action, cast(str, args.production_name))
         elif action in ("attach", "detach"):
-            return cast(Callable[[str, str, str], int], import_module("showrunner_parent").main)(
+            return cast(Callable[[str, str, str], int], import_module('scripts.production.showrunner_parent').main)(
                 action, cast(str, args.child), (cast(str | None, args.parent) or "") if action == "attach" else "")
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)

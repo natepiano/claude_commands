@@ -7,9 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
 from scripts.production import showrunner_tree

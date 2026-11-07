@@ -45,7 +45,8 @@ from pathlib import Path
 import sys
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
-sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_until
 state = Path(os.environ["MERGE_GATE_TEST_STATE"])
 name = Path(sys.argv[0]).name
@@ -566,11 +567,10 @@ class MergeGateFixture(unittest.TestCase):
         if ignored_signals:
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
-        source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   + "from scripts.production import merge_gate; \n"
+        source += ("from scripts.production import merge_gate; \n"
                    + preamble + "\n"
                    + "raise SystemExit(merge_gate.main(sys.argv[1:]))")
-        return [sys.executable, "-c", source]
+        return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
     def run_promote_only(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

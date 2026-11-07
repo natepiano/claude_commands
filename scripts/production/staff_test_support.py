@@ -450,7 +450,9 @@ def source_environment(source: Path) -> dict[str, str]:
 
 
 OWNER_CLI = """import os, runpy, sys
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+from pathlib import Path
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
@@ -531,7 +533,8 @@ def isolated_source_readers() -> Generator[None]:
 # canned response, so remote reads, writes, and error mapping must all agree.
 FAKE_SSH = """import json, os, runpy, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import source_environment
 arguments = sys.argv[1:]
@@ -558,7 +561,6 @@ os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
 source = Path(os.environ['STAFF_TEST_OWNER_SOURCE'])
 os.environ.update(source_environment(source))
 sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 from scripts.production import staff_sources

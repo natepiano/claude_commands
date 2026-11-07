@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
 import unittest
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production.rename_test_support import ProductionRenameFixture, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 

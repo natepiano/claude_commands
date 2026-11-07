@@ -711,7 +711,6 @@ def observed_lock(fd, operation):
             raise RuntimeError('expected the parent to hold the state lock')
     return original(fd, operation)
 fcntl.flock = observed_lock
-sys.path.insert(0, os.path.dirname(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
         lock_path = self.state / "eta_seen.json.lock"
