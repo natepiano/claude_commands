@@ -24,6 +24,33 @@ from scripts.shutdown import stop_resume
 
 
 class RecordedDirectorAdmissionTests(StaffTestCase):
+    def test_missing_run_owner_and_caller_report_what_is_missing(self) -> None:
+        _ = self.tree()
+        run = self.root / "ownerless-run"
+        run.mkdir()
+        record = staff.snapshot()
+        with self.assertRaises(ValueError) as missing_run:
+            _ = worker_admission.parent(record, run=run)
+        self.assertEqual(str(missing_run.exception),
+                         f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row")
+        with self.assertRaises(ValueError) as missing_caller:
+            _ = worker_admission.parent(record)
+        self.assertEqual(str(missing_caller.exception), "the caller has no staff row and names no unit or production")
+
+    def test_parent_prints_a_state_read_anomaly_once(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        _, unit, _ = self.tree()
+        run = self.root / "bad-state"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text("[]")
+        record = staff.snapshot()
+        with redirect_stderr(io.StringIO()) as errors:
+            for _ in range(2):
+                self.assertEqual(worker_admission.parent(record, staff_id=unit.current_session, run=run), unit)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"anomaly: {run / unit_runs.STATE_FILE}: worker state unreadable: expected a JSON object"])
+
     def test_run_with_owner_staff_id_resolves_its_known_unit(self) -> None:
         production, unit, _ = self.tree()
         run = self.root / "run-with-owner"

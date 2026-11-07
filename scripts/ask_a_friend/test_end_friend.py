@@ -84,6 +84,8 @@ class EndFriendTests(StaffTestCase):
         _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": server.pid, "port": port}))
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
               patch.object(staff, "retire", side_effect=staff.StaffRefused("fixture retirement refused")),
+              patch.object(codex_mesh, "_list_server_processes", return_value=
+                           f"{server.pid} 0 codex app-server --listen ws://127.0.0.1:{port}"),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             code = worker_fill.main(["end-friend", "--run", str(run)])
         self.assertEqual(code, 1, output.getvalue() + errors.getvalue())

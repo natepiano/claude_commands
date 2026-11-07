@@ -146,7 +146,7 @@ from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
-from scripts.message import send_budget
+from scripts.message import morty_identity, send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -2930,19 +2930,7 @@ def read_sender_stamp(value: object) -> SenderStamp:
 def morty_stamp(stamp: SenderStamp) -> bool:
     if isinstance(stamp, UnavailableSender):
         return False
-    config = conf.read("send")
-    # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
-        return False
-    try:
-        expected = config.text("MORTY_NATIVE_ID")
-        kind, _, identity = expected.partition(":")
-        if kind not in ("session", "codex"):
-            return False
-        _ = staff.native_id(identity)
-    except (conf.Unusable, staff.StaffRefused):
-        return False
-    return expected == sender_native_id(stamp)
+    return morty_identity.matches(sender_native_id(stamp))
 
 
 def sender_stamp_lines(stamp: SenderStamp) -> str:
@@ -3009,7 +2997,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
             try:
-                herdr.Herdr(herdr.shared_session()).prompt(state.pane, text, target=str(worker.current_session))
+                herdr.Herdr(herdr.shared_session()).prompt(
+                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr.HerdrFailure, OSError) as error:
                 reason = str(error)

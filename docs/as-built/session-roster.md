@@ -465,7 +465,8 @@ Release recalculates the priority of a kept decision.
 
 **Roster records**
 
-- A Claude worker ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
+- A Claude worker ledger id is the background id that `scripts/direct/claude_worker.py` reads from the start banner.
+  The id is a prefix of the `sessionId`.
 
 - Session records are one file per pid, indexed by `(sessionId, pid)`; the newest `updatedAt` wins. A pid-to-name map therefore cannot hold a stale name.
 

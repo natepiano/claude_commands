@@ -563,8 +563,7 @@ def showrunner(page: ReviewPage) -> str:
 def row_production(page: ReviewPage, row: dict[str, str]) -> Path:
     """Resolve the row's Production cell for the existing feature-log closeout rule."""
     record = staff.snapshot()
-    if not row.get("Verdict") and (row.get("Producer")
-                                  or record.by_id(staff.StaffId(row.get(change_review.PRODUCTION, ""))) is not None):
+    if not row.get("Verdict"):
         assignment = change_routing.StaffRouting(record, {}).owner_and_production(page.review_list, row)
         if isinstance(assignment.production, Path):
             return assignment.production
