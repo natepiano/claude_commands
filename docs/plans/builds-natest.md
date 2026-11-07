@@ -1738,3 +1738,34 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - module CPU s before and after, from `module_cost.py`
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 81 — Affected-module tests remove their Git repository without a race  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_affected_modules.py` removes each test repository with nothing writing into its `.git` folder, so `tempfile` cleanup never fails with "Directory not empty".
+
+**Spec:** The showrunner asked for this phase on 2026-11-07. Fix the cause; do not add a retry.
+1. The Phase 79 targeted test failed `test_deleted_and_renamed_python_sources_select_direct_importers` two times, also alone: `OSError: [Errno 39] Directory not empty: '/dev/shm/targeted-test-*/production-test_affected_modules-*/affected-test-*/.git'`, raised in `TemporaryDirectory.cleanup` from `setUp` (`test_affected_modules.py:26`). The module passed in two other targeted runs on the same base.
+2. Find which process writes into the test repository's `.git` folder after the test body ends. Look at the Git commands the test and `scripts/production/affected_modules.py` run (`git mv`, `git status`, `git diff`), and at Git background work they can start: `gc --auto`, `maintenance --auto`, `fsmonitor--daemon`, and a detached child of a command.
+3. Prove the cause: make the race happen on a tempdir copy, and show the file or process that the failure names.
+4. Fix the cause in the test fixture. For example, set the Git configuration in the test repository that stops the background work, or wait for the child that the fixture starts. A cause in `affected_modules.py` goes to the director first, with the evidence.
+5. Add no guard, refusal or check in production code (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/production/test_affected_modules.py` — the module
+
+**Workers:** 1 writer on slot `impl` (one module; the file does not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 47: runs use `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py` 20 times in a row under load, with `TMPDIR` under `/dev/shm`
+- the proof shows the cause before the fix and its absence after
+- module CPU s before and after, from `module_cost.py`
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`

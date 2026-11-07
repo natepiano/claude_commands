@@ -25,6 +25,7 @@ class AffectedModulesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="affected-test-")))
         _ = self.git("init", "-b", "main")
+        _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
         self.write(".gitignore", "__pycache__/\n")
