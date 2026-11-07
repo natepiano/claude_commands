@@ -278,7 +278,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Ruled out:** `mac_test.py free-now` as the leave hook (an unlocked read lost the claim to another step).
 
-### Phase 8 — Name the holder of what a wait is on  · status: todo
+### Phase 8 — Name the holder of what a wait is on  · status: done
 
 **Depends on:** Phase 41h and Phase 41m. Queue Phase 10h in `docs/plans/builds-queue.md`, which prints the `holder <json>` event, and queue-unit's work before it on the admission client. sdlc phases-unit Phase 11 (`start-wait --holder-*`, `wait-holder` in `progress_history.py`) is on builds. Hierarchies' wait experiment needs this phase.
 
@@ -318,8 +318,8 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
-- The `verify.sh` line references are at `2910cd61e` (the Phase 41m checkpoint, which holds Phases 41h to 41l).
-- Phase start: aws `04d845e5d` lands on builds first. The phase-start merge of builds then conflicts in `scripts/aws_target/aws_target.py`, `scripts/aws_target/test_control.py` and `scripts/mac_test/linux_runner.py`. The director resolves them in that merge commit, before dispatch. Keep the Phase 41h demand exclusions, aws's version-decline handling and the Phase 41m nextest environment. Refresh this Work Order's line references against the merge commit.
+- The `verify.sh` line references are at `2910cd61e` (the Phase 41m checkpoint, which holds Phases 41h to 41l). They hold at the phase-start merge `da369b0a6`, which changed one plan doc.
+- aws `04d845e5d` was not on builds at phase start. Its merge conflicts in `scripts/aws_target/aws_target.py`, `scripts/aws_target/test_control.py` and `scripts/mac_test/linux_runner.py`, outside this phase's files. When builds reports it landed, the director merges builds between worker passes and resolves those files. Keep the Phase 41h demand exclusions, aws's version-decline handling and the Phase 41m nextest environment.
 - Phase 41h: `check`, `doc`, `example`, the `lint` judgment, `build` and `final` reach `route_test` as `test` does, and `--target`, `--mac` and `--local` apply to each command. A holder line covers each movable command.
 - Read `scripts/lint/memory_gate.sh`, `scripts/build_queue/admission_client.py` and `scripts/direct/progress_history.py` only; do not change them.
 - Phase 1: an inline helper in `verify.sh` runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`, so a `VERIFY_PY_TRACE` run names its start.

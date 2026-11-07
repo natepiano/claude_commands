@@ -1367,12 +1367,182 @@ ROUTING_WAIT_STARTED=""
 # step subshells to the parent cleanup, which also ends interrupted waits.
 PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
+PHASE_TOKEN_OBSERVATION=""
+PHASE_TOKEN_HOLDER=""
+phase_wait_holder_flags() {
+    local record_script="${STEP_RECORD_SCRIPT:-$PHASE_WAIT_RECORDER}"
+    VERIFY_PY_HELPER=PHASE_WAIT_HOLDER "$PY" - "$1" "${2:-}" \
+        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" \
+        "$record_script" "${DOC_REPO_TOP:-$PWD}" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+from uuid import UUID
+
+kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
+sys.path.insert(0, str(Path(recorder).resolve().parents[2]))
+
+
+def text(value):
+    return value.strip() if isinstance(value, str) and not any(c in value for c in "\r\n\t\0") else ""
+
+
+def read(path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def fields(raw):
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+owner, owner_flag = "", "--holder-session"
+resource_kind, resource = "slot", "cargo"
+if kind == "token":
+    from scripts.production import staff
+    from scripts.lib import unit_runs
+
+    board = Path(board_name)
+    if payload == "director":
+        owner = unit_runs.director(board)
+    elif payload and payload != "unknown":
+        roster = fields(read(board / "mesh_roster.json"))
+        matches = [entry for name, entry in roster.items() if isinstance(entry, dict)
+                   and (name == payload or entry.get("slot") == payload or name.endswith("-" + payload))]
+        worker = matches[0] if len(matches) == 1 else {}
+        reference = text(worker.get("staff_id"))
+        if not reference and len(matches) <= 1:
+            references = set()
+            for path in board.glob("impl_worker_*.json"):
+                worker = fields(read(path))
+                if (text(worker.get("name")) == payload or text(worker.get("slot")) == payload
+                        or path.stem == "impl_worker_" + payload):
+                    if value := text(worker.get("staff_id")):
+                        references.add(value)
+            if len(references) == 1:
+                reference = references.pop()
+        state = fields(read(board / "progress_history_state.json"))
+        try:
+            record = staff.snapshot()
+            member = record.by_id(staff.StaffId(reference)) if reference else None
+            if member is not None:
+                owner = member.current_session
+            if not owner:
+                unit = unit_runs.run_owner(state, record)
+                owner_flag = "--holder-unit"
+                owner = unit.name if isinstance(unit, staff.StaffRow) else ""
+        except (OSError, ValueError):
+            pass
+        if not owner:
+            owner_flag, owner = "--holder-unit", text(state.get("unit"))
+elif kind == "hold":
+    from scripts.build_hold import build_hold
+    from scripts.build_targets import build_targets
+
+    resource = "natedev"
+    directory = Path(hold_name)
+    holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
+                                        build_hold.owning_session(), directory)
+    if isinstance(holder, build_hold.Holder):
+        try:
+            UUID(holder.key)
+            owner = holder.key
+        except ValueError:
+            owner_flag, owner = "--holder-unit", text(holder.name)
+elif kind in ("mac", "target"):
+    from scripts.mac_test import mac_test
+
+    resource = payload or "mac"
+    paths = mac_test.state_paths("" if resource == "mac" else resource)
+    scope = mac_test.target_claim_scope(paths, repository)
+    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    for claim in mac_test.read_claims(paths):
+        if mac_test.scopes_overlap(claim.scope, scope) and mac_test.run_is_live(claim.record):
+            candidate = text(claim.record.get("holder_session"))
+            if candidate and candidate != session:
+                owner = candidate
+                break
+elif kind == "memory":
+    resource_kind, resource = "memory", "memory"
+    holder = fields(payload)
+    if holder.get("kind") == "session":
+        owner = text(holder.get("session_id"))
+    elif holder.get("kind") == "unit":
+        owner_flag, owner = "--holder-unit", text(holder.get("unit"))
+if owner:
+    print("\n".join(("--holder-resource-kind", resource_kind, "--holder-resource", resource, owner_flag, owner)))
+PY
+}
+phase_wait_target_busy() {
+    local holder
+    holder="$(phase_wait_holder_flags target "$1")" || return 1
+    [[ -n "$holder" ]]
+}
 phase_wait_start() {
-    local key=$1 reason=$2 id file
+    local key=$1 reason=$2 id file holder="" holder_file previous="" flag
     [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
         && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && -n "$HOLD_WAIT_DIR" ]] || return 0
     file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
-    [[ ! -s "$file" ]] || return 0
+    holder_file="$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$key"
+    if [[ "$key" == memory && -z "${3:-}" ]]; then
+        local pending
+        for pending in "$HOLD_WAIT_DIR"/phase-close.*.memory.*; do
+            [[ -s "$pending" ]] || continue
+            read -r id < "$pending"
+            "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+                || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+            rm -f "$pending"
+        done
+    fi
+    local holder_kind=$key payload="${3:-}" observation="" slot="" holder_pid=""
+    if [[ "$key" == token ]]; then
+        if [[ -f "$BOARD_DIR/locks/cargo.d/holder" ]]; then
+            IFS= read -r slot < "$BOARD_DIR/locks/cargo.d/holder" || true
+        fi
+        if [[ -f "$BOARD_DIR/locks/cargo.d/holder_pid" ]]; then
+            IFS= read -r holder_pid < "$BOARD_DIR/locks/cargo.d/holder_pid" || true
+        fi
+        observation="$slot:$holder_pid"
+        if [[ "${PHASE_TOKEN_OBSERVATION:-}" == "$observation" ]]; then
+            holder="${PHASE_TOKEN_HOLDER:-}"
+        else
+            if ! holder="$(phase_wait_holder_flags token "$slot")"; then
+                printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+                return 0
+            fi
+            PHASE_TOKEN_OBSERVATION=$observation
+            PHASE_TOKEN_HOLDER=$holder
+        fi
+    elif [[ "$key" != memory || -n "$payload" ]]; then
+        if [[ "$reason" == "Mac busy" ]]; then holder_kind=mac; fi
+        if ! holder="$(phase_wait_holder_flags "$holder_kind" "$payload")"; then
+            printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+            return 0
+        fi
+    fi
+    local holder_args=()
+    if [[ -n "$holder" ]]; then
+        while IFS= read -r flag; do holder_args+=("$flag"); done <<< "$holder"
+    fi
+    if [[ -s "$file" ]]; then
+        previous=$(< "$holder_file")
+        if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
+        read -r id < "$file"
+        if "$PY" "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
+            --wait-id "$id" ${holder_args[@]+"${holder_args[@]}"}; then
+            printf '%s' "$holder" > "$holder_file"
+        else
+            printf 'verify.sh: wait history NotRecorded: cannot update %s holder\n' "$id" >&2
+        fi
+        return 0
+    fi
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
         --kind WaitingForMemoryOrSlot --reason "$reason")
     local owner="${CODEX_THREAD_ID:-}"
@@ -1381,26 +1551,32 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})" && [[ -n "$id" ]]; then
+        printf '%s' "$holder" > "$holder_file"
         printf '%s\n' "$id" > "$file"
     else
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
 }
 phase_wait_finish() {
+    if [[ "$1" == token ]]; then PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""; fi
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
     [[ -s "$file" ]] || return 0
     read -r id < "$file"
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
-        rm -f "$file"
+        rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+        if [[ "$1" == memory ]]; then
+            printf '%s\n' "$id" > "$HOLD_WAIT_DIR/phase-close.${BASHPID:-$$}.memory.$id"
+            rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.memory"
+        fi
     fi
 }
 phase_wait_finish_all() {
     local file id
     [[ -n "$HOLD_WAIT_DIR" ]] || return 0
-    for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
+    for file in "$HOLD_WAIT_DIR"/phase-wait.* "$HOLD_WAIT_DIR"/phase-close.*; do
         [[ -s "$file" ]] || continue
         read -r id < "$file"
         "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
@@ -1412,6 +1588,7 @@ phase_wait_finish_all() {
 buildlog_memory_event() {
     case "$1" in
         first) phase_wait_start memory "memory admission" ;;
+        holder\ *) phase_wait_start memory "memory admission" "${1#holder }" ;;
         done|left) phase_wait_finish memory ;;
     esac
 }
@@ -2506,7 +2683,8 @@ route_test() {
                     *) return "$admission" ;;
                 esac
             fi
-            if [[ -n "$PINNED_TARGET" && "$reason" == starting ]]; then
+            if [[ -n "$PINNED_TARGET" ]] && { [[ "$reason" == starting ]] \
+                || { [[ "$reason" == busy ]] && phase_wait_target_busy "$PINNED_TARGET"; }; }; then
                 remote_candidates=1
                 continue
             fi
@@ -2515,7 +2693,7 @@ route_test() {
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
-            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$platform" == macos ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" && "$platform" == macos ]]; then
                 retry_ready=0
                 eval "$(mac_retry_hook "$settings" "$MAC_RETRY_AFTER" reserve)" >/dev/null 2>&1 || retry_ready=$?
                 if [[ "$retry_ready" != 0 ]]; then
@@ -2531,6 +2709,8 @@ route_test() {
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
             eval "$(ssh_reserve_hook "$name" "$settings")" || reservation_status=$?
+            if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 ]] \
+                && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then
                 echo "verify.sh: target $PINNED_TARGET refused: admission changed." >&2
                 return 2
@@ -2539,10 +2719,13 @@ route_test() {
                 continue
             fi
             if [[ "$reservation_status" == 0 || "$MAC_ONLY" == 1 || ( "$reservation_status" == 11 && "$platform" == macos ) ]]; then
+                phase_wait_finish target
                 if [[ "$retry" == 1 ]]; then collect_routing_wait; fi
                 MAC_LEAVE_SETTINGS=$settings
                 try_reserved_target || return $?
                 if [[ "$MAC_PASSED" == 1 ]]; then return 0; fi
+                if [[ -n "$PINNED_TARGET" && "${LAST_TARGET_REASON:-}" == busy ]] \
+                    && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
                 if [[ -n "$PINNED_TARGET" ]]; then
                     printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "${LAST_TARGET_REASON:-runner}" >&2
                     return 2
@@ -2565,6 +2748,7 @@ route_test() {
                 echo "verify.sh: waiting for target $PINNED_TARGET." >&2
                 announced_reason=starting
             fi
+            phase_wait_start target "target $PINNED_TARGET" "$PINNED_TARGET"
             sleep "${BUILD_TARGETS_POLL_S:-15}"
             retry=1
             continue
@@ -3243,6 +3427,7 @@ acquire_token() {
         fi
         kill -0 "$$" 2>/dev/null || token_wait_orphaned
         count_token_waiters_ahead
+        if (( noted >= 0 )); then phase_wait_start token "cargo token"; fi
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
             phase_wait_start token "cargo token"
@@ -3274,10 +3459,12 @@ acquire_token() {
         fi
         if [[ "${1:-}" != local && "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
+            phase_wait_finish token
             try_reserved_target
         elif [[ "${1:-}" != local && "$CMD" != test ]] && step_can_retry \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
+            phase_wait_finish token
             return "$LINT_LEFT_QUEUE_STATUS"
         fi
         token_wait_clock
