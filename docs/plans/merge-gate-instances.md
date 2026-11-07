@@ -655,6 +655,9 @@ Start with one small run:
 6. Run all discovered test modules and the script type check through `run_suites` with `WholeMachine`.
 7. Terminate each instance when its attempt ends.
 
+The tool shell includes `taplo`, `zsh`, `bash`, `gh`, and Git.
+Before the guest starts, it links `/bin/bash` and `/bin/zsh` to the installed shells.
+
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.
 The instance uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.

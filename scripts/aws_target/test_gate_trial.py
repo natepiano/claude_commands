@@ -624,6 +624,13 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh'):
+            self.assertIn(f'github:NixOS/nixpkgs/nixos-26.05#{package}', data)
+        self.assertIn('--command bash -ec', data)
+        for shell in ('bash', 'zsh'):
+            link = f'ln -sf "$(command -v {shell})" /bin/{shell}'
+            self.assertIn(link, data)
+            self.assertLess(data.index(link), data.index('exec python3 /var/lib/gate-trial/guest.py'))
         self.assertNotIn('/etc/', data)
         self.assertNotIn('systemctl', data)
         self.assertNotIn('exec nix', data)

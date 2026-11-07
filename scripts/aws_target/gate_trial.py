@@ -204,7 +204,8 @@ def user_data(links: dict[str, str], release: str, lifetime_minutes: int, log_pu
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
     packages = ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
-                'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux')
+                'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux',
+                'taplo', 'zsh', 'bash', 'gh')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/nixos-{release}#{name}') for name in packages)
     return f'''#!/bin/sh
 shutdown -h +{lifetime_minutes}
@@ -224,7 +225,9 @@ export XDG_RUNTIME_DIR=/run/user/0
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
 export PYTHONUNBUFFERED=1
 loginctl enable-linger root
-nix --extra-experimental-features 'nix-command flakes' shell {tools} --command python3 /var/lib/gate-trial/guest.py
+nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec 'ln -sf "$(command -v bash)" /bin/bash
+ln -sf "$(command -v zsh)" /bin/zsh
+exec python3 /var/lib/gate-trial/guest.py'
 '''
 
 
