@@ -1461,13 +1461,13 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
 - `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
 - `scripts/direct/assign_launcher_test_support.py` — the assign fixture
-- `scripts/direct/implement_launcher_test_support.py` — the Phase 55 snapshot lines
+- `scripts/direct/assign_claude_test_support.py` — the Phase 55 snapshot lines (`AssignClaudeLauncherFixture.first_worker_launch`)
 
 **Workers:** 1 writer on slot `impl4` (one fixture family)
 - `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 55: `implement_launcher_test_support.py` repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in `assign_launcher_test_support.py` in this phase. Keep each fixture's own restoration: `first_assignment` restores server observations, and `first_worker_launch` restores `staff_parent`.
+- Phase 55: `assign_claude_test_support.py` (renamed from `implement_launcher_test_support.py` on builds) repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in `assign_launcher_test_support.py` in this phase. Keep each fixture's own restoration: `first_assignment` restores server observations, and `first_worker_launch` restores `staff_parent`.
 - Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
 - Phase 47's `/dev/shm` pairs do not reach this fixture through `TMPDIR`: `MeshCommandFixture.setUp` uses `dir="/tmp"` (`test_codex_mesh.py:1033`), the module setup patches `tempfile.tempdir` to `/tmp` (`:566`), and `AssignLauncherFixture.setUp` sets the child `TMPDIR` to `/tmp` (`assign_launcher_test_support.py:138`). Run each pair on `/tmp` at the same time, and state that in the result. Make no fixture-root option for the measure alone.
 - `assign.Dispatch` uses `None` for an absent worker claim and for a dispatch with no backend switch. The boundary belongs to the coordinator owner. New fixture helpers do not repeat those raw optional states.
@@ -1704,7 +1704,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 **Ruled out:** a retry, a sleep or `ignore_cleanup_errors` in cleanup.
 
-### Phase 82 — The branch takes builds with its package imports  · status: todo
+### Phase 82 — The branch takes builds with its package imports  · status: done
 **Depends on:** Phase 77, Phase 79, Phase 80
 
 #### Work Order
