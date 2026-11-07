@@ -22,10 +22,6 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
 from scripts.production import display_cells
 

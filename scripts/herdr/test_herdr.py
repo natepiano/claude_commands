@@ -638,6 +638,7 @@ class PromptSubmissionTests(unittest.TestCase):
     ready_at: float = 0
     typed: list[tuple[str, str, float]] = []
     enters: list[tuple[str, tuple[str, ...]]] = []
+    stashed_drafts: list[tuple[str, str]] = []
     ready_panes: list[str] = []
     screen: str = ""
     typed_screen: str = ""
@@ -665,6 +666,7 @@ class PromptSubmissionTests(unittest.TestCase):
         self.ready_at = 0.0
         self.typed = []
         self.enters = []
+        self.stashed_drafts = []
         self.ready_panes = []
         self.screen = "────────\n❯ \n────────"
         self.typed_screen = ""
@@ -746,6 +748,10 @@ class PromptSubmissionTests(unittest.TestCase):
             self.screen = self.typed_screen or f"────────\n❯ {text}\n────────"
 
     def enter_prompt(self, pane: str, *keys: str) -> None:
+        if keys == ("ctrl+s",):
+            self.stashed_drafts.append((pane, self.screen))
+            self.screen = "────────\n❯ \n────────"
+            return
         self.enters.append((pane, keys))
         if len(self.enters) == self.submit_on_enter:
             self.write_turn(self.typed[-1][1], seconds_after_launch=self.elapsed + 1)
@@ -770,6 +776,32 @@ class PromptSubmissionTests(unittest.TestCase):
 
         with patch.object(Path, "open", open_transcript):
             yield failures
+
+    def test_opening_prompt_stashes_a_draft_once_before_typing_and_submission(self) -> None:
+        draft = "────────\n❯ keep this draft\n────────"
+        self.screen = draft
+        self.submit_on_enter = 1
+        outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                         [("destination:p1", script_prompt("resume the saved work"))])
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+
+    def test_a_second_draft_waits_until_the_deadline_without_a_second_stash(self) -> None:
+        draft = "────────\n❯ keep this draft\n────────"
+        second_draft = "────────\n❯ keep this second draft\n────────"
+        self.screen = draft
+        self.events.append((0.1, lambda: setattr(self, "screen", second_draft)))
+        outcome = self.submit(timeout_ms=1000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).reason,
+                         "destination never became ready for input")
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).screen, second_draft)
+        self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
+        self.assertEqual(self.typed, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(self.elapsed, 1)
 
     def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
         self.submit_on_enter = 1
@@ -1047,8 +1079,10 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_other_text_in_the_composer_is_never_overwritten(self) -> None:
         self.screen = "────────\n❯ the user is editing this\n────────"
-        self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptNotSubmitted)
+        with patch.object(self.client, "_send_keys", side_effect=herdr.HerdrFailure("draft stash unavailable")):
+            self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptNotSubmitted)
         self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertEqual(self.screen, "────────\n❯ the user is editing this\n────────")
 
     def test_other_text_appearing_after_a_lost_prompt_blocks_retyping(self) -> None:
         self.drop_all = True
@@ -4270,12 +4304,12 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(path.read_text(), "")
 
-    def test_untracked_pane_with_text_in_the_composer_is_not_ready(self) -> None:
+    def test_untracked_ready_pane_with_text_in_the_composer_holds_a_draft(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ keep this draft\n────────")
         state = self.herdr.prompt_input_state("pane-1")
-        self.assertIsInstance(state, herdr.PromptInputNotReady)
-        self.assertEqual(cast(herdr.PromptInputNotReady, state).reason, "destination has no empty composer")
+        self.assertIsInstance(state, herdr.PromptInputHoldsDraft)
+        self.assertEqual(cast(herdr.PromptInputHoldsDraft, state).screen, "────────\n❯ keep this draft\n────────")
 
     def test_untracked_blocked_pane_is_not_ready(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))

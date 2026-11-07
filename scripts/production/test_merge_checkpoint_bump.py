@@ -5,13 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 import unittest
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import merge_checkpoint
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions

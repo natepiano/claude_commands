@@ -7,13 +7,11 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from types import ModuleType
 from typing import final
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production import staff

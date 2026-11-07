@@ -9,16 +9,10 @@ import math
 from pathlib import Path
 import signal
 import subprocess
-import sys
 import threading
 import time
-from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-if TYPE_CHECKING:
-    from scripts.lib import process_group
-else:
-    from scripts.lib import process_group
+from scripts.lib import process_group
 
 
 STARTUP_SIGNAL_ENV = "DETACHED_STARTUP_SIGNAL"

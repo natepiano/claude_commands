@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote
 from scripts.lib import conf

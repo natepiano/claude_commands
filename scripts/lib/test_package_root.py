@@ -59,6 +59,31 @@ class PackageRootTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertNotIn("ModuleNotFoundError", result.stderr)
 
+    def test_entry_selects_its_checkout_with_both_launchers_and_pythonpaths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            conflicting_checkout = folder / "conflicting"
+            conflicting_package = conflicting_checkout / "scripts/prioritize"
+            conflicting_package.mkdir(parents=True)
+            _ = (conflicting_package / "writer_lock.py").write_text(
+                'raise SystemExit("conflicting writer_lock imported")\n', encoding="utf-8",
+            )
+            entry = ROOT / "scripts/prioritize/runner_lock.py"
+            for launcher in ("python3", str(ROOT / "scripts/lib/py")):
+                for pythonpath in ("", str(conflicting_checkout)):
+                    with self.subTest(launcher=launcher, pythonpath=pythonpath):
+                        environment = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
+                        if pythonpath:
+                            environment["PYTHONPATH"] = pythonpath
+                        result = subprocess.run(
+                            [launcher, str(entry), "status", str(folder / "writer.lock")],
+                            cwd=folder, env=environment, capture_output=True,
+                            text=True, check=False, timeout=30,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, "free\n")
+                        self.assertEqual(result.stderr, "")
+
     def test_an_existing_package_root_keeps_its_position_without_a_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(

@@ -11,7 +11,6 @@ from unittest import mock
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import merge_checkpoint
 from scripts.production import staff
 from scripts.production.production_doc import read_new_production

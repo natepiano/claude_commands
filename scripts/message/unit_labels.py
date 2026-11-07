@@ -2,17 +2,12 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS / "lib", SCRIPTS.parent):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
 from scripts.production import session_staff
 from scripts.lib import unit_runs

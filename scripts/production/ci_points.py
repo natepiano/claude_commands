@@ -17,7 +17,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail

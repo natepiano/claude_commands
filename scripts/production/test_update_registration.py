@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
-
 import json
 import io
 import os
@@ -18,6 +16,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.production import rename, session_staff, staff, showrunners
+from scripts.shutdown import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship

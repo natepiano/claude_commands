@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
-
 from scripts.production.fake_unit_host import labeled as labeled_host
 from scripts.direct import progress_history
 
@@ -266,11 +264,11 @@ class WaitingTests(unittest.TestCase):
         )))
 
         owner = showrunner_relationship("showrunner-example")
-        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), self.doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), self.doc))
         _ = write_timer(self.root / "notifier", owner.name, owner.id, "", self.doc)
         for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
             row = unit_membership("showrunner-example", unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), folder), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(local_machine(), folder), expected=row.worktree)
             if folder.exists():
                 write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
 
