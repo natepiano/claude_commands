@@ -1373,3 +1373,40 @@ Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direc
 
 **State:** none. The phase writes no new lasting record.
 
+
+### Phase 8l — A worker whose launcher and server died recovers on its own thread  · status: done
+
+Source: sdlc, cargo-liner handler unit's lost work. A watchdog restart left `cargo-liner-handler-enh-impl` at roster status `running`, with a dead launcher and a dead app-server. `assign.sh --to` refused: "launcher died; no live server can prove the thread idle; pending work kept; use reopen to recover". `codex_mesh.py reopen` runs only through `assign.sh` (`assign_gate.require_assign`), and `assign.py:463` calls `reopen` only at status `ended`. The director then ran `codex_mesh.py end`. `command_end` retires the staff row (`codex_mesh.py:6420`), and the row is the only record of the thread id (`session_staff.worker_session`), so `reopen` then refused "missing thread id". The user's codex-mesh rule allows this fix because work was lost.
+
+**Depends on:** none. It stands on the main sync merge (origin/sdlc 123de793a + origin/main aa63173e5), not on 8j or 8k.
+
+#### Work Order
+
+**Goal:** a worker whose launcher died recovers on its recorded thread through one more `assign.sh --to` dispatch, and `codex_mesh.py end` keeps the thread id that `reopen` needs, and an account move resumes with no live server to interrupt.
+
+**Spec:**
+1. **Assign recovers a dead launcher.** In `assign.py`, a roster record whose status is live (`running`, `starting` or `waiting_capacity`) and whose recorded `launcher_pid` is not alive goes through `dispatch.mesh_call("reopen")` before `claim_follow`, the same as an `ended` record. `reopen` already proves the thread idle on a recorded server, or starts a server and resumes that exact thread. A `reopen` refusal refuses the dispatch with `reopen`'s own line. A live launcher still refuses with "already implementing". Use the existing `codex_mesh` names for the live statuses and for the launcher check; add no copy of them.
+2. **End keeps the staff row.** `codex_mesh.command_end` does not call `staff.retire`. The roster entry keeps `status: ended` and its `staff_id`, so `reopen` reads the thread id from the staff row. A second `end` on an ended worker retries the cleanup, as `docs/as-built/long-lived-workers.md` says.
+3. **Permanent removal retires.** The callers that remove a worker for good keep their own retire: unit retirement in `workers.py`, `remove_workers.py` and `worker.py end`. `worker_fill.end_friend` ends a consultation for good, so it retires the friend's row after `command_end` succeeds, with the same `staff.StaffRefused` handling that `command_end` has today.
+4. **An account move resumes without a live server.** Source: sdlc [b9133698], hana's fastest-unit after a watchdog restart: `assign.sh --operation resume-account-move` failed with "interrupt failed: Connection refused" (`codex_mesh.py:9039`), because `_interrupt_worker_for_account_move` connects to the recorded port of a dead server. When no recorded server of the run is live for that thread (the same evidence `reopen` uses), the turn stopped with its server: the move writes its marker from the roster's last `turn_id`, sends no queue move and no interrupt, and goes on to the resume on a new server. A live server keeps today's interrupt path.
+5. **Out of scope.** No new check, guard or refusal. No change to the refusal texts. No change to the herdr transport.
+
+**Acceptance:**
+- A real-path test through `bash scripts/direct/assign.sh --to <worker>` with the fixture server: a roster record at `running` with a dead `launcher_pid` and no live server dispatches, and the follow-up goes to the same thread id.
+- A test: `end`, then a dispatch through `assign.sh --to`, returns the worker on its same thread id.
+- A test: `end-friend` retires the friend's staff row.
+- A test: `resume-account-move` on a `running` worker whose recorded server is dead resumes on a new server on the same thread id, with no interrupt call.
+- Spec item 2 approves one kind of assertion change: a test that expected `end` to remove the worker's staff row now expects the row to stay. The summary lists each changed assertion.
+- basedpyright `0 errors, 0 warnings, 0 notes` on each worker's files. The full gate passes.
+
+**Files:**
+- `scripts/direct/assign.py`, `scripts/agents/codex_mesh.py`, `scripts/production/worker_fill.py`, `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — the source and docs.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source and doc files.
+- `test` — the test files.
+
+**State:** none. Rows that `end` already retired stay retired; a lost thread starts a fresh worker on the same tree.
+
+**Constraints from prior phases:** The import rule: `from scripts.<folder> import <module>`, no `sys.path` line. Phase 4a: run owners are staff ids.

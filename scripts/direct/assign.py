@@ -26,7 +26,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
+from scripts.direct.worker_state import ROSTER_LIVE, worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -460,7 +460,9 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 dispatch.board(slot, "status", f"launcher: compaction failed for {dispatch.worker}: {detail}; continuing follow-up")
             else:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")
-        if record.get("status") == "ended":
+        if record.get("status") == "ended" or (
+                record.get("status") in ROSTER_LIVE | {codex_mesh.WAITING_CAPACITY}
+                and not codex_mesh.worker_launcher_attached(record)):
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker}))

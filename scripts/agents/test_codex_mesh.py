@@ -1481,7 +1481,7 @@ class MeshCommandFixture(unittest.TestCase):
         if method == "thread/queue/list":
             return [_reply(request, {"data": self.queued.copy(), "nextCursor": None})]
         if method == "thread/loaded/list":
-            return [_reply(request, {"data": [], "nextCursor": None})]
+            return [_reply(request, {"data": [THREAD_ID] if self.live_turn else [], "nextCursor": None})]
         if method == "thread/unsubscribe":
             return [_reply(request, {}), _notice("thread/closed", {"threadId": params["threadId"]})]
         if method == "thread/queue/add":
@@ -7961,6 +7961,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         interrupts: list[tuple[str, float]] = []
         respond = self.respond
         def old(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": list(locations), "nextCursor": None})]
             params = _as_test_dict(request.get("params"))
             thread_id = str(params.get("threadId", ""))
             if request.get("method") == "thread/read":
@@ -8048,6 +8050,110 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_account_move_resume_prefers_the_dispatch_role_and_lens_to_the_role_log(self) -> None:
         self.assert_director_account_move(recorded_launcher=0, review_lens="craft", recorded_dispatch=True)
+
+    def test_an_account_move_interrupts_the_recorded_server_that_holds_the_thread(self) -> None:
+        new = self.prepare_running_account_swap()[1]
+        self.outcomes = ["completed"]
+        self.live_turn = "held-on-second-server"
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "turn_id": "stale-turn", "status": "running",
+            "role": "impl", "port": self.server.port, "launcher_pid": 99999999,
+        }})
+        agents_log.append(THREAD_ID, "impl", None, datetime.now(timezone.utc))
+        respond = self.respond
+
+        def idle_server(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [], "nextCursor": None})]
+            if request.get("method") == "thread/read":
+                return [_reply(request, {"thread": {"id": THREAD_ID, "status": {"type": "idle"}, "turns": []}})]
+            return respond(request)
+
+        def holding_server(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [THREAD_ID], "nextCursor": None})]
+            if request.get("method") == "turn/interrupt":
+                marker = _as_test_dict(cast(object, json.loads(
+                    (self.session_dir / "worker.account-move.json").read_text())))
+                self.assertEqual(marker["turn_id"], "held-on-second-server")
+            return respond(request)
+
+        self.server.respond = idle_server
+        holder = StubAppServer(holding_server)
+        self.addCleanup(holder.close)
+        former = current_server(self.session_dir)
+        record = {**former, "port": holder.port, "previous_servers": [former]}
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps(record))
+        with (contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+            result = codex_mesh.command_resume_account_move(argparse.Namespace(
+                session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual(result, 0, errors.getvalue())
+        interrupts = [request for request in holder.requests if request.get("method") == "turn/interrupt"]
+        self.assertEqual([request["params"] for request in interrupts],
+                         [{"threadId": THREAD_ID, "turnId": "held-on-second-server"}])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assert_account_move_continuation(new)
+
+    def test_an_account_move_refuses_an_unreadable_server_record_without_a_marker(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "turn_id": "last-turn", "status": "running",
+            "role": "impl", "port": self.server.port, "launcher_pid": 99999999,
+        }})
+        agents_log.append(THREAD_ID, "impl", None, datetime.now(timezone.utc))
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text("{bad json")
+        with (contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            result = codex_mesh.command_resume_account_move(argparse.Namespace(
+                session_dir=str(self.session_dir), to="worker"))
+        self.assertNotEqual(result, 0)
+        self.assertIn("server", errors.getvalue())
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_an_account_move_resumes_the_same_thread_after_its_server_dies(self) -> None:
+        new = self.prepare_running_account_swap()[1]
+        self.outcomes = ["completed"]
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            dead_port = cast(tuple[str, int], listener.getsockname())[1]
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "turn_id": "lost-turn", "status": "running",
+            "role": "impl", "port": dead_port, "launcher_pid": 99999999,
+        }})
+        agents_log.append(THREAD_ID, "impl", None, datetime.now(timezone.utc))
+        server_path = self.session_dir / codex_mesh.SERVER_FILE
+        server_record = current_server(self.session_dir)
+        server_record["pid"] = 99999999
+        server_record["port"] = dead_port
+        _ = server_path.write_text(json.dumps(server_record))
+        respond = new.respond
+
+        def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                marker = _as_test_dict(cast(object, json.loads(
+                    (self.session_dir / "worker.account-move.json").read_text())))
+                self.assertEqual(marker["turn_id"], "lost-turn")
+                self.assertEqual(marker["staff_id"], self.stored_worker_record()["staff_id"])
+            return respond(request)
+
+        new.respond = observe
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+            result = codex_mesh.command_resume_account_move(argparse.Namespace(
+                session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual((result, errors.getvalue()), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        for requests in (self.server.requests, new.requests):
+            self.assertFalse(any(request.get("method") in ("turn/interrupt", "thread/queue/delete")
+                                 for request in requests))
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
 
     def test_account_move_with_a_nonworker_dispatch_role_refuses_without_a_worker_turn(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed", "role": "impl",
@@ -10330,6 +10436,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
     def test_end_marks_a_finished_worker_ended_and_keeps_its_metadata(self) -> None:
         self.context_sizes = [123456]
         self.assertEqual(self.run_start()[0], 0)
+        row = staff.local_snapshot().by_id(staff.native_id(THREAD_ID))
+        assert row is not None
 
         with contextlib.redirect_stdout(io.StringIO()):
             code = codex_mesh.command_end(argparse.Namespace(
@@ -10339,8 +10447,30 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(code, 0)
         self.assertEqual(self.worker_record()["status"], "ended")
         self.assertEqual(self.worker_record()["staff_id"], THREAD_ID)
-        self.assertIsNone(staff.local_snapshot().by_id(staff.native_id(THREAD_ID)))
+        self.assertEqual(staff.local_snapshot().by_id(row.id), row)
         self.assertEqual(self.worker_record()["context_tokens"], 123456)
+
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertEqual(session_staff.worker_session(self.stored_worker_record()), row.current_session)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_a_second_end_retries_cleanup_on_the_ended_workers_thread(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.read_failure = "error"
+        code, output, errors = self.run_mesh(["end", "--to", "worker"])
+        self.assertEqual(code, 1, output + errors)
+        self.assertEqual(self.worker_record()["status"], "ended")
+        self.read_failure = ""
+        self.live_turn = "unfinished-turn"
+        code, output, errors = self.run_mesh(["end", "--to", "worker"])
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(self.live_turn, "")
+        interrupt, = self.methods("turn/interrupt")
+        self.assertEqual(cast(dict[str, object], interrupt["params"]),
+                         {"threadId": THREAD_ID, "turnId": "unfinished-turn"})
+        self.assertEqual(session_staff.worker_session(self.stored_worker_record()), THREAD_ID)
 
     def test_capacity_exhaustion_has_a_distinct_run_outcome(self) -> None:
         """Retry exhaustion is control state, not failure text."""
