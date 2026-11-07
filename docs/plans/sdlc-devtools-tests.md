@@ -1181,8 +1181,8 @@ Codex workers start only through `assign.sh`, and that path does what the old Co
 
 **Approved** (user via sdlc [93de1898] 2026-11-05: "duplication removal is something i approve of. there is no quiet time - figure out how to sequence it correctly and do it"). No guard test (sdlc [e00ba3f9]; Spec item 6 dropped). Land it in small hashes, each net negative, which sdlc merges at once:
 1. Shared hash, landed (`2304da03d`): the `scripts/lib/py` shim sets the package root, every managed entry runs through it, the rewrite script is committed, and `style`, `usage`, `prioritize`, `lint` and `settings` are converted. Old `sys.path` lines stay until their folder converts. The gate starts each test run through the checked tree's shim and drops the caller's `PYTHONPATH` (sdlc [4547aef2]).
-2. One hash per folder group that remains. Each converts that group's imports and deletes its `sys.path` lines. The `accounts` hash landed (`8d112025c`, with the `package_imports.py` repair in `faa97d24e`). `whoami` waits for `builds-report`, which changes 8 of its files. Run the script on the newest sdlc tip just before each hash. Files with a `sys.path` change on 2026-11-06: `production` 80, `direct` 39, `hooks` 36, `whoami` 23, `lib` 23, `buildlog` 21, `shutdown` 12, `message` 12, `agents` 10, `mac_test` 10, `astra` 8, `accounts` 6, `herdr` 6, `build_hold` 6, every other folder 5 or fewer.
-3. Group order: before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. Convert untouched groups first. Convert a group a unit is changing right after that unit's merge lands.
+2. One hash per folder group that remains. Each converts that group's imports and deletes its `sys.path` lines. The `accounts` hash landed (`8d112025c`, with the `package_imports.py` repair in `faa97d24e`). The `message` hash is on main (`e05e54ffb`; it deletes the converter's shebang rewrite). The `whoami` hash landed. The `hooks` hash (`0088c4e66`) and the `direct` hash (`3cdb0456c`, which holds the `hooks` hash) are queued at sdlc-merge-gate. Run the script on the newest sdlc tip just before each hash. Files with a `sys.path` change on 2026-11-06: `production` 80, `direct` 39, `hooks` 36, `whoami` 23, `lib` 23, `buildlog` 21, `shutdown` 12, `message` 12, `agents` 10, `mac_test` 10, `astra` 8, `accounts` 6, `herdr` 6, `build_hold` 6, every other folder 5 or fewer.
+3. Group order: `whoami`, `hooks`, then the rest, smallest overlap first (sdlc [193b07f3] 2026-11-07). Convert each group at once; do not wait for a unit merge. Each unit with an overlapping open branch runs the committed `package_imports.py` at its next merge. Before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. The notice lists each overlapping branch and its file count.
 4. Last step: convert `scripts/lib` and the other shared files (`hook_dispatch`, `merge_gate`, `fast_track`, `module_run`), because every folder imports `scripts/lib`. Then delete the import conversion from the rewrite script and its tests, when no `sys.path` line is left outside `scripts/lib/package_root.py`. Keep the `bootstrap` command and its tests.
 
 **Depends on:** Phase 3y
@@ -1226,6 +1226,14 @@ Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: 
 6. The shim resolves cold and cached on natedev and the Mac.
 7. Each hash: the numstat check in item 8 shows a net delete, basedpyright `0 errors, 0 warnings, 0 notes`, and the full gate passes.
 8. Each hash notice lists each open unit branch, all productions on `~/.claude`, that conflicts with that hash, from `git merge-tree`.
+
+### Phase 8q — Converter edits only import lines  · status: done
+
+#### As-built
+
+`scripts/lint/package_imports.py` `rewrite` records, before its edits, the offset of each `if` whose `body` and `orelse` differ. It moves those offsets through each edit and drops an offset inside an edited range. After the edits it collapses an `if` only when its line holds a recorded offset and its two branches are now equal. An `if` with equal branches in the original source stays, and so does each import its branches use. `test_package_imports.py` holds the `buildlog/record.py` `test_phase_context` case; it fails before the repair. Checkpoint `be3e0af4b`.
+
+**Gotchas:** On `origin/main` the `message` hash `e05e54ffb` collapsed three `if TYPE_CHECKING` blocks whose two branches held the same imports: `scripts/message/escalate.py:43`, `scripts/message/test_send.py:61` and `scripts/message/push_texts.py:13`. Behavior is the same, and they stay (sdlc [0f3d2d39]). `buildlog/record.py` on main was already restored by the verify unit.
 
 ### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: done
 
