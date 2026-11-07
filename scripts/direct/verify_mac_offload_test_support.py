@@ -41,9 +41,8 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the real claim CLI; its copy signals still cross the process boundary."""
-    with mock.patch.object(sys, "path", [str(VERIFY.parent.parent / "mac_test"), *sys.path]):
-        from scripts.mac_test import mac_test
-        return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
+    from scripts.mac_test import mac_test
+    return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
 
 
 def stub_build_tool_path(directory: Path) -> str:
@@ -271,7 +270,7 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
     (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "cargo-release")
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
@@ -382,7 +381,7 @@ if "--copy" in arguments:
     (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
     os.replace(root / "copy-started.tmp", root / "copy-started")
     if os.environ.get("TEST_COPY_WAIT") == "1":
-        sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+        with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "copy-release")
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
@@ -418,7 +417,7 @@ if os.environ.get("TEST_RUNNER_BUSY_UNTIL") and not Path(os.environ["TEST_RUNNER
     raise SystemExit(75)
 if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
     (root / "retry-running").write_text("running\n")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "continue-retry")
 
@@ -475,7 +474,7 @@ import runpy
 import sys
 import time
 
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2]))
+with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 
 command = sys.argv[1]
@@ -486,7 +485,6 @@ if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not
     with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
         output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
     write_text_atomic(root / "local-wait-added", "added\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).parent))
 status = 0
 try:
     runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
@@ -586,7 +584,7 @@ if sys.argv[1:2] == ["call"]:
              "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
     with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
         output.write(json.dumps(event) + "\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
+with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 

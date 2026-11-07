@@ -104,9 +104,11 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         self.admission.server.line_filter = self.failure_line
 
     def restore_client(self) -> None:
-        _ = self.memory.write_text("import sys\n" +
-            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n" +
-            "from scripts.build_queue.admission_client import main\nraise SystemExit(main())\n")
+        shim = str(Path(__file__).resolve().parents[1] / "lib/py")
+        _ = self.memory.write_text(
+            f"import os, sys\nos.execv({shim!r}, [{shim!r}, '-c', "
+            + "\"from scripts.build_queue.admission_client import main; raise SystemExit(main())\", *sys.argv[1:]])\n"
+        )
 
     def failure_line(self, line: str) -> str:
         mode = self.fixture.environment.get("TEST_MEMORY_FAILURE", "")

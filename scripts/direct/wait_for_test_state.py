@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct.local_release_wait import IntervalReleasePolling, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 

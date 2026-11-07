@@ -35,7 +35,7 @@ import json
 import os
 from pathlib import Path
 import sys
-sys.path.insert(0, os.environ["TEST_STATE_REPOSITORY"])
+with open(Path(os.environ["TEST_STATE_REPOSITORY"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.test_verify_step_state import read_step_row
 from scripts.direct import step_record
 call_id = os.environ.get("BUILDLOG_CALL_ID", "")

@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest import mock
 
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
@@ -18,10 +17,7 @@ from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixtu
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 
 mac_test = eligibility_support.mac_test

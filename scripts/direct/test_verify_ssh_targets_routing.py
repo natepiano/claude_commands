@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import TypedDict, cast
 from unittest import mock
 
 from scripts.direct import verify_ssh_targets_test_support as support
-from scripts.direct.verify_ssh_targets_test_support import REPOSITORY, VerifySshTargetsFixture
+from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class MacWaitRegistration(TypedDict):
@@ -33,8 +32,7 @@ import sys
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
-sys.path.insert(0, str(source / "scripts/buildlog"))
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.buildlog import mac_idle
 from scripts.direct import step_record
 
@@ -144,8 +142,7 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "aws",
                                          "BUILDLOG_PINNED_TARGET": "aws"}), \
              mock.patch.object(store, "host_name", return_value="aws-build"), \
-             mock.patch.object(os, "getcwd", return_value=str(self.root)), \
-             mock.patch.object(sys, "path", [str(REPOSITORY / "scripts/buildlog"), *sys.path]):
+             mock.patch.object(os, "getcwd", return_value=str(self.root)):
             record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog/aws-build").glob("*.jsonl")
@@ -205,8 +202,7 @@ import os
 from pathlib import Path
 records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))
 assert len(records) == 1
-import sys
-sys.path.insert(0, str(Path.home() / ".claude"))
+with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.test_verify_step_state import read_step_row
 row = read_step_row(records[0].stem)
 Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))

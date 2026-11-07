@@ -16,13 +16,9 @@ import socket
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 from scripts.lib.boot_identity import boot_identity
 

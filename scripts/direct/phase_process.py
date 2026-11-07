@@ -15,7 +15,6 @@ import math
 import sqlite3
 import statistics
 import subprocess
-import sys
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -28,8 +27,6 @@ from pathlib import Path
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "history"))
 from scripts.direct import plan_history  # noqa: E402
 from scripts.history import rounds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -43,7 +40,7 @@ class HistoryLabels(Protocol):
     def _clean_label(self, label: str) -> str: ...
 
 
-history = cast(HistoryLabels, cast(object, importlib.import_module("history")))
+history = cast(HistoryLabels, cast(object, importlib.import_module('scripts.history.history')))
 MEASURE_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "pass_started",
                             "pass_finished", "activity_started", "activity_finished",
                             "finding_opened", "finding_batch_dispatched"))

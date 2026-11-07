@@ -124,11 +124,11 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         target.mkdir()
         metadata["target_directory"] = str(target)
         probe = self.root / "probe-freshness.py"
-        _ = probe.write_text(f"""import json, os, sys
+        _ = probe.write_text(f"""import json, os
 from datetime import UTC, datetime
 from pathlib import Path
-sys.path.insert(0, {str(support.SCRIPTS / 'lint')!r})
-import memory_admit as gate
+with open({str(support.SCRIPTS / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
+from scripts.lint import memory_admit as gate
 from scripts.lib.cargo_output import CargoOutputRoots
 output_roots = CargoOutputRoots(Path.cwd(), Path(os.environ['BUILDLOG_TEST_TARGET_DIR']),
     Path(os.environ['BUILDLOG_TEST_BUILD_DIR']))

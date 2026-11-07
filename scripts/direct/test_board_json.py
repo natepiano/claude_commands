@@ -31,7 +31,7 @@ import io
 from scripts.herdr import worker_panes
 from scripts.herdr import herdr
 from scripts.shutdown import pane_record
-import display_cells
+from scripts.production import display_cells
 
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"

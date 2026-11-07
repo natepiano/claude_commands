@@ -297,7 +297,6 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module
@@ -1525,7 +1524,7 @@ doc_tree() {
     VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.copies import copies
 print(copies.staged_tree(Path.cwd()))
 PYDOC
@@ -1767,7 +1766,6 @@ with open(3, "rb") as handoff:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
 sys.argv = sys.argv[1:]
-sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (
@@ -3183,7 +3181,7 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
