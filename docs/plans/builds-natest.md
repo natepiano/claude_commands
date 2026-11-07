@@ -1626,7 +1626,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 **Gotchas:** `verify.sh:1272` reaches `progress_history.last_dispatch` (`ROSTER_RUN_ROOT`), and `unit_runs.held` and `progress_history._supplier_address` (`UNIT_RUN_ROOT`). `SCRATCH_ROOT` sets the `unit_runs` defaults at import, and `copy_record.py` reads it.
 
-### Phase 77 — `style/test_crate_run.py` uses half its CPU  · status: todo
+### Phase 77 — `style/test_crate_run.py` uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
