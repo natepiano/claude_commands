@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, cast, override
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
-    from tool_call_text import ToolInput
+    from scripts.hooks.tool_call_text import ToolInput
 
 
 HOOK = Path(__file__).with_name("post-tool-use-banned-words.py")

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Sample production waits and perform the mechanical work that clears them."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -22,7 +26,7 @@ from scripts.production import session_staff, staff, unit_lookup
 from scripts.production.production_doc import Production, Refusal, read_production
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from merge_checkpoint import Stop, git, report as merge_report
+from scripts.production.merge_checkpoint import Stop, git, report as merge_report
 from scripts.direct import progress_history
 from scripts.lib.user_zone import user_zone
 

@@ -14,7 +14,6 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import module_cost, task_cpu
 

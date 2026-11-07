@@ -14,11 +14,10 @@ from unittest import mock
 from urllib import parse, request
 from urllib.error import URLError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import bevy_migration_dependency_check as checker
+from scripts.bevy_migration_plan import bevy_migration_dependency_check as checker
 
-import crates_io_pacer
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 TARGET = "0.20.0"

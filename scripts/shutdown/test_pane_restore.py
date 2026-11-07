@@ -28,14 +28,13 @@ from scripts.lib import unit_runs
 from scripts.shutdown import pane_record as restart_records
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
-import unit_move
+from scripts.production import unit_move
 
-import pane_restore  # first: it puts the herdr scripts on the path
-import herdr  # noqa: E402
-import pane_record  # noqa: E402
-import pane_launch
-import sessions  # noqa: E402
-from test_support import conversation_liveness
+from scripts.shutdown import pane_restore
+from scripts.herdr import herdr  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
+from scripts.herdr import pane_launch
+from scripts.message import sessions  # noqa: E402
 
 END_HOOK = Path(__file__).resolve().parent.parent / "hooks/session-end-pane-record.py"
 SETTINGS = '{"disableAgentView": true}'
@@ -214,7 +213,7 @@ class PaneRestoreTests(unittest.TestCase):
             write_text_atomic(configuration / source.name, source.read_text())
 
         _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((self.row,))))
-        _ = self.enterContext(mock.patch("remote.local_machine", return_value="natedev"))
+        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("demo", "alpha")))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
@@ -238,7 +237,6 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.dict(os.environ, {"HOME": str(self.root),
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
-                        mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
                         mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
@@ -469,7 +467,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc))
         _ = self.enterContext(mock.patch.object(restart_records, "RECORD_DIR", self.root / "saved-panes"))
         _ = self.enterContext(mock.patch.object(accounts, "accounts_home", return_value=self.root))
-        _ = self.enterContext(mock.patch("remote.local_machine", return_value=machine))
+        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value=machine))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))

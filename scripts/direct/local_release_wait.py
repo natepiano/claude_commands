@@ -1,6 +1,10 @@
 """Wake a routing retry on a local hold change, or its retry deadline."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from contextlib import AbstractContextManager
 import errno
@@ -12,8 +16,6 @@ import time
 from typing import final, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 
 from scripts.lib import inotify
 

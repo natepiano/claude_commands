@@ -2,6 +2,10 @@
 """See docs/as-built/long-lived-workers.md for worker and server operations."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import base64
@@ -2966,9 +2970,9 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
 
-    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
-    cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
-    already have started this server. A run folder is known here, so the server names it itself.
+    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR.
+    assign.py can reach a server that another run started.
+    This server sets its run folder directly.
     A mesh directory outside the run roots keeps the caller's environment unchanged.
     """
     environment = staff.child_environment(os.environ)

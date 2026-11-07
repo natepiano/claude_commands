@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Select staff workers and dispatch work through their native conversations."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from contextlib import redirect_stderr
@@ -15,9 +19,6 @@ import subprocess
 import sys
 from typing import cast, final
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.direct import board_json, progress_history
 from scripts.herdr import worker_panes
@@ -26,7 +27,7 @@ from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_P
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
 
-import herdr
+from scripts.herdr import herdr
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName

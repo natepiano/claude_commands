@@ -725,6 +725,7 @@ class RoleTests(unittest.TestCase):
         library.mkdir()
         _ = shutil.copy2(PROGRAM.parents[1] / "lib/py", library / "py")
         (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
+        (scripts.parent / "lib").symlink_to(PROGRAM.parent.parent / "lib", target_is_directory=True)
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}

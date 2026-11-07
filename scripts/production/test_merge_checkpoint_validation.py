@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
@@ -98,7 +98,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
@@ -108,6 +108,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
         self.assertIn(change_review.COVERS, result.process.stdout)
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
+        self.promotions = str(self.promote)
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
@@ -186,7 +187,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         original_notify = merge_checkpoint.notify_style
 
         def malformed_notification(checkout: Path, branch: str, tip: str) -> bool:
-            with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
+            with mock.patch("scripts.production.merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
                 return original_notify(checkout, branch, tip)
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,

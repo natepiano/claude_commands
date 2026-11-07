@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Count production CI points, verify their runs, and send one review alert."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -18,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
 from scripts.production.production_doc import Production, Refusal, read_production
-from merge_checkpoint import git, merged_checkpoints, merge_lock
+from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
 
 
 class CiDue(NamedTuple):

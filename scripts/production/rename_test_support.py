@@ -22,25 +22,26 @@ from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
-import fake_herdr
-import herdr
+from scripts.herdr import fake_herdr
+from scripts.herdr import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
-import sessions as stop_sessions
+from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
 import rename
 from scripts.production import showrunners
-import tidy_wrapped
-import unit_move
+from scripts.production import tidy_wrapped
+from scripts.production import unit_move
 import unit_names
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
+READ_HERDR_PANES = herdr.Herdr.panes
 
 
 class RenameDisplays:
@@ -95,6 +96,7 @@ class RenameDisplays:
         from scripts.herdr import herdr
 
         with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "panes", READ_HERDR_PANES),
               mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
               mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
@@ -256,7 +258,6 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
-        _ = self.enterContext(mock.patch("pane_record.RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")

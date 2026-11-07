@@ -1,6 +1,10 @@
 """Repair known reasons an eligible verify call waits while the Mac is idle."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Iterable, Mapping
 import fcntl
@@ -16,20 +20,16 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-import store
+from scripts.buildlog import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "message"))
-sys.path.insert(0, str(SCRIPTS / "mac_test"))
-sys.path.insert(0, str(SCRIPTS / "notify"))
 
 if TYPE_CHECKING:
-    from ..lint import memory_admit
-    from ..direct import step_record
-    from ..mac_test import mac_test
-    from . import mac_idle_alert
-    from ..message.unit_labels import UnitLabels
+    from scripts.lint import memory_admit
+    from scripts.direct import step_record
+    from scripts.mac_test import mac_test
+    from scripts.buildlog import mac_idle_alert
+    from scripts.message.unit_labels import UnitLabels
 else:
     from scripts.direct import step_record
     from scripts.buildlog import mac_idle_alert
@@ -155,10 +155,7 @@ class AdmissionQueryFailed:
 
 
 def admission_waiters() -> AdmissionWaiters | AdmissionQueryFailed:
-    if TYPE_CHECKING:
-        from ..build_queue import admission_client, admission_protocol
-    else:
-        from scripts.build_queue import admission_client, admission_protocol
+    from scripts.build_queue import admission_client, admission_protocol
 
     try:
         return AdmissionWaiters([row for _, row in admission_client.view().ordered])
@@ -284,17 +281,17 @@ def outage_repeat_minutes(since: float, now: float, settings: mac_idle_alert.Mac
 
 def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = REPAIR_MESSAGE) -> bool:
     if TYPE_CHECKING:
-        from ..message import send_budget, session_send
-        from ..notify import push_texts
-        from ..lib.process_failure import failure_detail
+        from scripts.message import send_budget, session_send
+        from scripts.notify import push_texts
+        from scripts.lib.process_failure import failure_detail
     else:
-        import send_budget
+        from scripts.message import send_budget
         from scripts.message import session_send
-        import push_texts
+        from scripts.notify import push_texts
         from scripts.lib.process_failure import failure_detail
 
     try:
-        result = subprocess.run([sys.executable, str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
+        result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
                                 capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
         address = result.stdout.strip()
         if result.returncode != 0 or not address:
@@ -353,10 +350,7 @@ class MacStateUnreadable:
 
 def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | MacUnreachable | MacStateUnreadable:
     """Use the claim owner's live rule and its saved work reading; never contact the Mac."""
-    if TYPE_CHECKING:
-        from ..mac_test import mac_test
-    else:
-        import mac_test
+    from scripts.mac_test import mac_test
 
     try:
         # read_run is the single JSON boundary for claim records.
@@ -393,10 +387,7 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,
                   calls: tuple[VerifyCall, ...], live: dict[int, LiveProcess],
                   admission: AdmissionWaiters | AdmissionQueryFailed) -> bool:
-    if TYPE_CHECKING:
-        from ..lib.user_zone import user_zone
-    else:
-        from scripts.lib.user_zone import user_zone
+    from scripts.lib.user_zone import user_zone
 
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
     waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
@@ -408,16 +399,10 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
-    if TYPE_CHECKING:
-        from ..notify import push_texts
-        from ..notify.push_catalog import mac_idle_reservation
-        from ..lib.process_failure import failure_detail
-        from ..lib.user_zone import user_zone
-    else:
-        import push_texts
-        from scripts.notify.push_catalog import mac_idle_reservation
-        from scripts.lib.process_failure import failure_detail
-        from scripts.lib.user_zone import user_zone
+    from scripts.notify import push_texts
+    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.lib.process_failure import failure_detail
+    from scripts.lib.user_zone import user_zone
 
     holder, detail = saved["holder"] or "none", saved["detail"] or "no block and no claim"
     blocked = saved["cause"] == "blocked"
@@ -458,20 +443,14 @@ def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float
 
 def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
     """Load holder labels when the watch needs them. Keep the test patch point."""
-    if TYPE_CHECKING:
-        from ..message import unit_labels
-    else:
-        from scripts.message import unit_labels
+    from scripts.message import unit_labels
 
     return unit_labels.unit_labels_for(session_ids, environment)
 
 
 def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
     """Save the one idle reading, notify its outage and repair free-Mac waits."""
-    if TYPE_CHECKING:
-        from ..mac_test import mac_test
-    else:
-        import mac_test
+    from scripts.mac_test import mac_test
 
     paths.state.mkdir(parents=True, exist_ok=True)
     with (paths.state / "watch.lock").open("a+") as lock:

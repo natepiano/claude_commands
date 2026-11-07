@@ -2,6 +2,10 @@
 """Inventory the live Claude work belonging to one account on this machine."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -15,33 +19,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-# Sibling imports need this folder. Append it so a caller's own modules
-# (buildlog's record) keep precedence over shutdown's.
-if str(SCRIPTS / "shutdown") not in sys.path:
-    sys.path.append(str(SCRIPTS / "shutdown"))
-for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
 from scripts.shutdown import remote
-from probe_session import PROBE_ENV
-import unit_runs
-import herdr
-import sessions
-from sessions import process_start as _process_start
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
 from scripts.usage import agents_log
 from scripts.direct.worker_state import ROSTER_LIVE, worker_status_path
 from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable, WorkerResume
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from session_types import (
+from scripts.shutdown.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,

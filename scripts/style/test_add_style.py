@@ -9,7 +9,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -17,12 +16,12 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast, final, override
 from unittest import mock
 
-import add_style
-import add_unit
-import rules
-import style_ledger
-import unit_plans
-import style_rules
+from scripts.style import add_style
+from scripts.production import add_unit
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import unit_plans
+from scripts.style import style_rules
 from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
@@ -36,7 +35,6 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
 from scripts.production.production_doc import read_new_production, read_production
 from scripts.production.staff_test_support import recorded_showrunner, showrunner_relationship
 
@@ -86,8 +84,7 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(sys.argv[1]).parent))
-import add_style
+from scripts.style import add_style
 
 real_run_script = add_style._run_script
 def run_script(script, *arguments):
@@ -185,7 +182,6 @@ class AddStyleTests(unittest.TestCase):
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
             "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
-            "STYLE_TEST_CHECKOUT": str(SCRIPT.parents[2]),
             "ROSTER_RUN_ROOT": str(self.root / "roster"),
             "UNIT_RUN_ROOT": str(self.root / "units"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
@@ -262,7 +258,7 @@ class AddStyleTests(unittest.TestCase):
 
     def run_bootstrap_process(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, "-c", BOOTSTRAP, str(SCRIPT), *self.bootstrap_arguments(arguments, parent)],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", BOOTSTRAP, str(SCRIPT), *self.bootstrap_arguments(arguments, parent)],
             env=self.env, cwd=self.repo, capture_output=True, text=True, check=False,
         )
         if success:
@@ -530,7 +526,7 @@ class AddStyleTests(unittest.TestCase):
         catalog = rules.load_rules(self.checkout)
         self.assertEqual({rule.rule_id for rule in catalog if rule.origin == "local"}, {"local:docs/style/local.md"})
         listing = subprocess.run(
-            [sys.executable, str(SCRIPT.with_name("rules.py")), "list", "--repo", str(self.checkout), "--json"],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT.with_name("rules.py")), "list", "--repo", str(self.checkout), "--json"],
             check=True, capture_output=True, text=True, env=self.env,
         )
         rows = cast(list[rules.RuleListing], json.loads(listing.stdout))

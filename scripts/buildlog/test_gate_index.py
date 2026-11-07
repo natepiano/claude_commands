@@ -7,30 +7,22 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
-import index
-from index import GATE_TABLES
-from test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
+from scripts.buildlog import index
+from scripts.buildlog.index import GATE_TABLES
+from scripts.buildlog.test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-if TYPE_CHECKING:
-    from . import record, store
-    from ..test_times import gate_record
-    from ..test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from ..test_times.gate_record_test_support import gate_run, remove_run_measurements
-else:
-    from scripts.buildlog import record, store
-    from scripts.test_times import gate_record
-    from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+from scripts.buildlog import record, store
+from scripts.test_times import gate_record
+from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
+from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"

@@ -12,6 +12,10 @@ first.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator
@@ -36,10 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import process_group
-import override_guard
-import mac_test
-import offload
+from scripts.lib import process_group
+from scripts.build_hold import override_guard
+from scripts.mac_test import mac_test, offload
 if TYPE_CHECKING:
     from ..lib import build_folders, process_start as process_identity
     from ..direct import step_record
@@ -334,7 +337,7 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
 def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     result.unlink(missing_ok=True)
     command = [
-        sys.executable, str(request.runner), "run", "--copy",
+        str(Path(__file__).resolve().parents[1] / "lib/py"), str(request.runner), "run", "--copy",
         "--repo-root", str(request.repo_root),
         "--package", request.package,
         "--call-id", request.call_id,

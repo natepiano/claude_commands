@@ -6,7 +6,7 @@ set -uo pipefail
 # by VERSION rather than by path. These scripts used to pin "$PY" --
 # Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
 # the tests in tests/ import typing.override and cannot run under 3.9 at all.
-PY="$HOME/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"
 RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"

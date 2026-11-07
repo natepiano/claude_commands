@@ -1,5 +1,9 @@
 """The single admission loop owns reservations and durable queue state."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections import deque
@@ -17,10 +21,8 @@ import struct
 import subprocess
 import sys
 import threading
-from typing import TYPE_CHECKING, Callable, Protocol, cast
+from typing import Callable, Protocol, cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
@@ -35,10 +37,7 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape

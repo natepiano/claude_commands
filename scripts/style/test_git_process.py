@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import errno
 import subprocess
-import sys
 import tempfile
 import unittest
 from io import BytesIO
-from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from git_process import (GitBlob, GitExitAnswers, GitReadFailed, MalformedBlobReply, MissingBlob,
+from scripts.style.git_process import (GitBlob, GitExitAnswers, GitReadFailed, MalformedBlobReply, MissingBlob,
                          TruncatedBlobReply, parse_status_z, read_batch_blob, run_git)
 
 

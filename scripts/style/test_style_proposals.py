@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import errno
 import io
@@ -23,22 +23,21 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import rules
-import coverage_report
-import style_ledger
-import style_proposals
-import unit_plans
-import add_style
-import approved_renames
-import style_rules
-import footer_counts
-import proposal_issue
-import proposals_table
-from issues import Issue, frontmatter, open_issues
-from ledger_test_support import style_staff_fixture, style_unit_id
-from style_proposals import FilingResult
+from scripts.style import rules
+from scripts.style import coverage_report
+from scripts.style import style_ledger
+from scripts.style import style_proposals
+from scripts.style import unit_plans
+from scripts.style import add_style
+from scripts.style import approved_renames
+from scripts.style import style_rules
+from scripts.production import footer_counts
+from scripts.production import proposal_issue
+from scripts.production import proposals_table
+from scripts.production.issues import Issue, frontmatter, open_issues
+from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id
+from scripts.style.style_proposals import FilingResult
 from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member
 from scripts.production import staff, unit_names
 

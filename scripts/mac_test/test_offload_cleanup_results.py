@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from offload_cleanup_test_support import SeededCleanupFixture
+from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):

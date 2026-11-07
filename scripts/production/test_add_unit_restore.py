@@ -10,10 +10,10 @@ from typing import final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
+from scripts.production import add_unit
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 
 
 def setUpModule() -> None:

@@ -11,8 +11,8 @@ from uuid import uuid4
 from scripts.lib import conf
 from scripts.lib.conf import UseConfiguredValue
 
-from . import evaluate, questions, vault
-from .records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, state_dir as configured_state_dir
+from scripts.issue_score import evaluate, questions, vault
+from scripts.issue_score.records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, state_dir as configured_state_dir
 
 Disagreement = tuple[vault.Issue, str | int, str | int]
 

@@ -12,6 +12,10 @@ An empty or missing LOG is not copied, so an emptied LOG never pushes out a good
 since the newest copy is not copied again, so the copies kept span KEEP changes.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys

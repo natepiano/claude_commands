@@ -173,7 +173,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if "$BOARD_DIR/../lib/py" -c 'import fcntl, sys
+  if "${BASH_SOURCE[0]%/*}/../lib/py" -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:

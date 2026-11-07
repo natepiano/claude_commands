@@ -2,7 +2,7 @@
 description: Show suite, module and test times.
 ---
 
-Run `python3 ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged.
 
 - `top [--limit N] [--repo PATH] [--host NAME]`: rank the slowest tests of the working repository, or of PATH. This is the default command.
 - `suites [--days N]`: show recent gate runs.

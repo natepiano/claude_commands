@@ -32,13 +32,12 @@ else:
     from scripts.lib.socket_test_support import short_socket_directory
     from scripts.lib.shell_test_support import shell_function, shell_functions
 
-import record as recorder
-import step_context
-import index
-import report
-import sample
-import store
-from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
+from scripts.buildlog import record as recorder
+from scripts.buildlog import step_context
+from scripts.buildlog import index
+from scripts.buildlog import report, sample
+from scripts.buildlog import store
+from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 if TYPE_CHECKING:
     from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -48,7 +47,7 @@ else:
     from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
     from scripts.lint.memory_test_support import fake_memory_readings
-from test_index import point_root_at
+from scripts.buildlog.test_index import point_root_at
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -182,7 +181,7 @@ class RecordTests(unittest.TestCase):
         self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
             input=input,
             env=self.environment(**(extra or {})),
@@ -288,7 +287,7 @@ class RecordTests(unittest.TestCase):
         for entry_point in (["-m", "scripts.buildlog.step_context"], [str(CONTEXT_SCRIPT.resolve())]):
             with self.subTest(entry_point=entry_point):
                 result = subprocess.run(
-                    [sys.executable, "-B", *entry_point, "step-context", "cargo", "check"],
+                    [str(repository / "scripts/lib/py"), "-B", *entry_point, "step-context", "cargo", "check"],
                     cwd=workspace, env=environment, input="", capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )

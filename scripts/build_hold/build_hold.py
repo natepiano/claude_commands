@@ -2,6 +2,10 @@
 """One holder file per session; decide when builds are quiet and may resume."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -25,15 +29,15 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import addressed, live_sessions  # noqa: E402
+from scripts.message.sessions import addressed, live_sessions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from process_failure import failure_detail
-from user_zone import user_zone
-import unit_runs
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
+from scripts.lib import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import override_guard
+from scripts.build_hold import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import ConfigError, SshTarget, read_targets
+from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
@@ -270,7 +274,7 @@ class MacHoldResult:
 
 def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult:
     script = Path(__file__).resolve().parent.parent / "mac_test" / "mac_test.py"
-    result = subprocess.run([sys.executable, str(script), *arguments, "--target", target], capture_output=True, text=True)
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), *arguments, "--target", target], capture_output=True, text=True)
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
@@ -592,7 +596,7 @@ class HoldEnforcer(Protocol):
 def hold_enforcer() -> HoldEnforcer:
     # The enforcer uses these audit types; load it after this module is ready.
     import importlib
-    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+    return cast(HoldEnforcer, cast(object, importlib.import_module('scripts.build_hold.hold_enforcer')))
 
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
@@ -909,7 +913,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 def start_hold_recorder(event: NatedevHoldEvent) -> None:
     until = event.holder.release.at.isoformat() if isinstance(event.holder.release, KnownReleaseEta) else ""
-    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
                "hold-event", event.kind, "natedev", event.holder.key, event.holder.name, event.holder.purpose,
                event.at.astimezone(timezone.utc).isoformat(), until]
     start_recorder(command)
@@ -1410,7 +1414,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
         if attempt:
             time.sleep(LOOKUP_RETRY_S)
         try:
-            result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
+            result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
         except OSError as error:
             reason = str(error)
             continue
@@ -1438,7 +1442,7 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
 
 def send_release_broadcast() -> None:
     script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
-    result = subprocess.run([sys.executable, str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
                             capture_output=True, text=True)
     if result.returncode:
         raise OSError(f"release broadcast: {failure_detail(result)}")

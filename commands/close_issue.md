@@ -91,7 +91,7 @@ Use `apply_patch` to make the smallest possible edit to the selected issue's top
 Do not directly edit `backlog_score` or `backlog_rank`. After the closure edit succeeds, run:
 
 ```bash
-/usr/bin/python3 ~/.claude/scripts/prioritize/renumber.py --apply
+~/.claude/scripts/lib/py ~/.claude/scripts/prioritize/renumber.py --apply
 ```
 
 This removes live score/rank fields from the closed issue and immediately recalculates the positions of every valid open issue. The background watcher may observe the same edit afterward; when the positions are already current, its check makes no further changes.

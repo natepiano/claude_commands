@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
 

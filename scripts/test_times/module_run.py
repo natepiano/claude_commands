@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run unittest discovery and record each test's time."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import time
 
@@ -339,7 +343,6 @@ def main() -> None:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
     # Match the import path of python -m unittest from the current folder.
-    sys.path[0] = os.getcwd()
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
@@ -365,7 +368,6 @@ class RunnerInterrupted(BaseException):
 def run_with_descendant_cleanup() -> None:
     """Run tests in a child while the parent reaps their orphaned processes."""
     global startup_cpu_s
-    sys.path[0] = str(Path(__file__).resolve().parents[2])
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():

@@ -17,7 +17,6 @@ import textwrap
 from typing import ClassVar, cast, override
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -171,6 +170,7 @@ def setUpModule():
     sys.addaudithook(last_guard)
 
 real_sender = Path(session_send.__file__).resolve().with_name("send.py")
+python = str(real_sender.parents[1] / "lib/py")
 
 # This safety hook permits only harmless probes and blocks network delivery.
 def last_guard(event, arguments):
@@ -206,7 +206,7 @@ class SenderRequest(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True).start()
             session_send_test_support.forbid_real_sender()
             self.assertIs(session_send_test_support.refusal_marker, marker)
-            result = subprocess.run([sys.executable, str(real_sender), "--help"],
+            result = subprocess.run([python, str(real_sender), "--help"],
                                     env=child_environment, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertEqual(os.environ, {})
@@ -214,16 +214,16 @@ class SenderRequest(unittest.TestCase):
             self.assertEqual(marker.path.read_text(), "real sender refused\\n")
         elif MODE == "caught":
             with self.assertRaises(subprocess.CalledProcessError):
-                subprocess.run([sys.executable, str(real_sender), "--help"], check=True)
+                subprocess.run([python, str(real_sender), "--help"], check=True)
         else:
             if MODE == "cd":
-                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(sys.executable)} send.py --help"
+                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(python)} send.py --help"
                 directory = None
             elif MODE == "module":
-                command = [sys.executable, "-m", "scripts.message.send", "--help"]
+                command = [python, "-m", "scripts.message.send", "--help"]
                 directory = real_sender.parents[2]
             else:
-                command = [sys.executable, str(real_sender), "--help"]
+                command = [python, str(real_sender), "--help"]
                 directory = None
             result = subprocess.run(command, cwd=directory, shell=MODE == "cd", capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

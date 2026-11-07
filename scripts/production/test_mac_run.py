@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise mac_run.sh coordination with disposable state and command stand-ins."""
 
 from __future__ import annotations
@@ -248,7 +248,7 @@ class MacRunTests(unittest.TestCase):
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(MAC_TEST), *arguments],
+            [str(SCRIPT.parents[1] / "lib/py"), str(MAC_TEST), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,

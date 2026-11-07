@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Refuse build calls from sessions subject to natedev's hold."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -9,12 +13,10 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tool_call_text import scan_text
+from scripts.hooks.tool_call_text import scan_text
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
@@ -136,11 +138,7 @@ def decide(raw: str) -> str:
     except FileNotFoundError:
         return ""
     # Load the hold reader only for a build call with a possible hold.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    if TYPE_CHECKING:
-        from ..build_hold.hold_applies import HoldStateReadError, hold_applies
-    else:
-        from hold_applies import HoldStateReadError, hold_applies
+    from scripts.build_hold.hold_applies import HoldStateReadError, hold_applies
 
     if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
         os.environ["CLAUDE_CODE_SESSION_ID"] = payload.get("session_id", "")

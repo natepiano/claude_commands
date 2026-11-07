@@ -25,14 +25,12 @@ from types import SimpleNamespace
 from typing import BinaryIO, Literal, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import herdr
-import pane_launch
-import fake_herdr
+from scripts.herdr import herdr
+from scripts.herdr import pane_launch
+from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
-from fake_herdr import CommandResponse
+from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -42,6 +40,7 @@ from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
+BASH_BINARY = shutil.which("bash") or "bash"
 NATIVE_PROCESS_START = "Tue Nov  3 08:00:00 2026"
 NATIVE_PROCESS_MICROSECONDS = 1793692800123456
 DARWIN_BSD_INFO = herdr._DarwinProcessBSDInfo  # pyright: ignore[reportPrivateUsage]
@@ -2117,7 +2116,7 @@ class HerdrTests(unittest.TestCase):
             yield
 
     def test_failed_source_record_prevents_prompt_submission(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         client = self.herdr
         with (self.prompt_target(client, "w1:p1", "fixture-submission"),
@@ -2129,7 +2128,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_timed_out_prose_keeps_its_source_in_the_delayed_hook(self) -> None:
         from scripts.hooks import conversation_pause
-        import script_prompts
+        from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
                       herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
@@ -2149,7 +2148,7 @@ class HerdrTests(unittest.TestCase):
                 self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
 
     def test_timed_out_slash_command_keeps_its_source_record(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
                       herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
@@ -2800,11 +2799,13 @@ class HerdrTests(unittest.TestCase):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
-        probe = (
-            "import sys; sys.path.insert(0,sys.argv[1]); import herdr; "
+        probe = isolated.parent.parent / "probe.py"
+        _ = probe.write_text(
+            "from scripts.herdr import herdr; " +
             "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
         )
-        result = subprocess.run([sys.executable, "-I", "-c", probe, str(isolated)],
+        result = subprocess.run([BASH_BINARY, str(isolated.parent / "lib/py"), "--isolated", str(probe)],
+                                env={**os.environ, "CLAUDE_PYTHON": sys.executable},
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "ClientsAttached(count=1)\n")
@@ -4523,7 +4524,7 @@ class HerdrTests(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID": unit.current_session,
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{

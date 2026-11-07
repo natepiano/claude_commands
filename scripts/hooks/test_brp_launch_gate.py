@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -131,9 +130,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         lint = self.root / "lint"
         hooks.mkdir()
         lint.mkdir()
-        library = self.root / "lib"
-        library.mkdir()
-        _ = shutil.copy2(HOOK.parent.parent / "lib" / "py", library / "py")
+        (self.root / "lib").symlink_to(HOOK.parent.parent / "lib", target_is_directory=True)
         self.hook = hooks / HOOK.name
         _ = self.hook.write_text(HOOK.read_text())
         _ = (lint / "memory_gate.sh").write_text(

@@ -7,6 +7,10 @@ kills a Claude process, or resumes `claude` with a CLAUDE_CONFIG_DIR of its own.
 and every call in any other session, passes. A broken hook never blocks a call.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import re

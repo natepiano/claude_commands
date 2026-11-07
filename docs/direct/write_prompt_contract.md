@@ -36,7 +36,7 @@ Codex review prompts also include section 3's command block.
    write_stdin poll, for any command, build or not. Anything longer runs
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
-   `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
@@ -221,7 +221,7 @@ The following routes apply only when the existing run's pin is `mesh`:
   Do not compose a name.
 - For `reach=SendMessage`, address the Claude member by its registered name.
   Use `ListAgents` to confirm its session.
-- For `reach=codex_mesh.py`, use `python3 ~/.claude/scripts/agents/codex_mesh.py send
+- For `reach=codex_mesh.py`, use `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py send
   --session-dir <concrete SESSION_DIR> --to <name> --message "<text>"`.
   Use `steer` only when the current work must stop.
   Use `list --session-dir <dir>` to read the registered workers.

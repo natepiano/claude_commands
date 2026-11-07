@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta
 from typing import cast
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 
 setUpModule = support.setUpModule
 

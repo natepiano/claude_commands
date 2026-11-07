@@ -413,7 +413,7 @@ class HanaShotTest(BuildLogIsolatedTest):
         self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -423,7 +423,7 @@ class HanaShotTest(BuildLogIsolatedTest):
 
     def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -1295,7 +1295,7 @@ class PortGuardTests(HanaShotTest):
         environment = self.script_environment()
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, "-B", "-E", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
             cwd=self.scratch, env=environment, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -1746,8 +1746,8 @@ class ShotTests(HanaShotTest):
 
     def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
         with (
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             brp = hana_shot.Brp(self.port)
             first = brp.diagnostics()
@@ -1769,7 +1769,7 @@ class ShotTests(HanaShotTest):
         with (
             mock.patch.object(time, "sleep", side_effect=tick),
             mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             hana_shot.wait_ready(brp, process, log)
         self.assertEqual(readings.call_count, 3)
@@ -1780,7 +1780,7 @@ class ShotTests(HanaShotTest):
             mock.patch.object(hana_shot.Brp, "call", return_value=None),
             mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
             mock.patch.object(time, "sleep"),
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
             redirect_stderr(io.StringIO()),
         ):
             hana_shot.shutdown(self.port)
@@ -2109,8 +2109,7 @@ class RemoteTests(HanaShotTest):
             "import os",
             "import signal",
             "import sys",
-            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
-            "import hana_shot",
+            "from scripts.hana_shot import hana_shot",
             "",
             setup,
             "",

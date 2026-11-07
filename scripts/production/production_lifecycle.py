@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Run the restartable git and document steps of a production lifecycle."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -23,21 +27,21 @@ from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_unt
 
 from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
-import showrunner_tree
-import tidy_wrapped
-import unit_lookup
+from scripts.production import showrunner_tree
+from scripts.production import tidy_wrapped
+from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
-from merge_checkpoint import (
+from scripts.production.merge_checkpoint import (
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               Stop,
                               git, good, merged_checkpoints, promote_local_checkout,
                               pull_mac_checkout, report)
 from scripts.production import production_doc
-from update_registration import QuestionStaff, RegistrationFailure, judgment_state
+from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from atomic_file import write_text_atomic
-from process_failure import failure_detail
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
 import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"

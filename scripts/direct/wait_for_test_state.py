@@ -1,6 +1,10 @@
 """Wait for disposable fixture state without a fixed polling delay."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -11,7 +15,6 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct.local_release_wait import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

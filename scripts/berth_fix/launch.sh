@@ -41,7 +41,7 @@ USAGE
 # restart unless something reads it back.
 live_fixer() {
     local candidates kind pid session name
-    candidates=$(timeout 60 claude agents --json 2>/dev/null | WORKTREE=$worktree "$HOME/.claude/scripts/lib/py" -c '
+    candidates=$(timeout 60 claude agents --json 2>/dev/null | WORKTREE=$worktree "${BASH_SOURCE[0]%/*}/../lib/py" -c '
 import json, os, sys
 
 wanted = os.environ["WORKTREE"]
@@ -66,7 +66,7 @@ for row in rows:
 
 recorded_session() {
     [ -f "$record" ] || return 1
-    "$HOME/.claude/scripts/lib/py" -c '
+    "${BASH_SOURCE[0]%/*}/../lib/py" -c '
 import json, sys
 try:
     recorded = json.load(open(sys.argv[1])).get("session_id", "")
@@ -79,7 +79,7 @@ print(recorded)
 }
 
 remember_session() {
-    RECORD=$record SESSION_ID=$1 KIND=$2 "$HOME/.claude/scripts/lib/py" -c '
+    RECORD=$record SESSION_ID=$1 KIND=$2 "${BASH_SOURCE[0]%/*}/../lib/py" -c '
 import json, os, subprocess
 
 with open(os.environ["RECORD"], "w") as handle:
@@ -98,7 +98,7 @@ with open(os.environ["RECORD"], "w") as handle:
 resume_flags=()
 project_history() {
     local projects=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects encoded
-    encoded=$("$HOME/.claude/scripts/lib/py" -c 'import re, sys; print(re.sub(r"[^a-zA-Z0-9]", "-", sys.argv[1]))' "$1") || return 1
+    encoded=$("${BASH_SOURCE[0]%/*}/../lib/py" -c 'import re, sys; print(re.sub(r"[^a-zA-Z0-9]", "-", sys.argv[1]))' "$1") || return 1
     printf '%s/%s\n' "$projects" "$encoded"
 }
 
@@ -113,7 +113,7 @@ set_resume_flags() {
         fi
         return 0
     fi
-    remembered=$("$HOME/.claude/scripts/lib/py" -c 'import uuid; print(uuid.uuid4())') || return 1
+    remembered=$("${BASH_SOURCE[0]%/*}/../lib/py" -c 'import uuid; print(uuid.uuid4())') || return 1
     resume_flags=(--session-id "$remembered")
     remember_session "$remembered" "$1"
 }

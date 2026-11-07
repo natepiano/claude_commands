@@ -8,16 +8,13 @@ from pathlib import Path
 from decimal import Decimal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
+from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger
-else:
-    from scripts.aws_target import ledger
+from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -302,6 +299,7 @@ source() {
     if [[ "$1" == */memory_gate.sh ]]; then
         export BUILDLOG_MEM_WAIT_SINCE=$fixture_wait_since
         export BUILDLOG_MEM_WAIT_FIRST_FILE=$fixture_wait_first_file
+        buildlog_memory_python() { "$HOME/.claude/scripts/lib/py" "$@"; }
         unset -f source
     fi
     return "$status"
@@ -362,7 +360,7 @@ source() {
         if library.is_symlink():
             library.unlink()
             library.mkdir()
-            launcher = 'exec "$TEST_REAL_PYTHON" "$@"\n'
+            launcher = f'exec "{REPOSITORY}/scripts/lib/py" "$@"\n'
         else:
             launcher = (library / "py").read_text().removeprefix("#!/bin/sh\n")
         for source in (REPOSITORY / "scripts/lib").iterdir():
@@ -370,7 +368,7 @@ source() {
                 (library / source.name).symlink_to(source)
         self.write_executable(library / "py", '#!/bin/sh\n'
             + 'case "${1:-}" in */admission_client.py)\n'
-            + f'  exec "$TEST_REAL_PYTHON" "{observer}" "$@" ;;\nesac\n' + launcher)
+            + f'  exec "{REPOSITORY}/scripts/lib/py" "{observer}" "$@" ;;\nesac\n' + launcher)
         os.mkfifo(self.runner_state / "memory-hook-ack")
 
     @override

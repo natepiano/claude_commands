@@ -19,6 +19,10 @@ score of its proposed stars, its prerequisite the first of its `depends_on`. The
 `--next` prints the one proposal /next shows and pins it until it leaves the waiting rows.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import math
@@ -35,18 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
-from issues import Issue
-from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
-from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
+from scripts.production.issues import Issue
+from scripts.production.proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
+from scripts.production.proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_table
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import unit_runs
-import urgency
-from user_zone import user_zone
+from scripts.lib import unit_runs
+from scripts.lib import urgency
+from scripts.lib.user_zone import user_zone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "prioritize"))
 from scripts.prioritize import renumber
