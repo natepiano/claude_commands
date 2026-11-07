@@ -11,9 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
-from pins import Pin, Pins
+from scripts.bevy_upgrade.pins import Pin, Pins
 from scripts.lib.atomic_file import write_text_atomic
-from upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
+from scripts.bevy_upgrade.upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
 
 if TYPE_CHECKING:
     from scripts.production.production_doc import Production

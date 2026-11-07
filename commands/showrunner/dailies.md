@@ -19,7 +19,7 @@ draws it with characters a code font has, for when you are remote, since the
 desktop app draws emoji wider than two columns. The mode lives in
 `~/.local/state/showrunner/dailies.conf`, which every showrunner's renderer
 reads, so no session remembers it. A mode argument sets it before the report:
-run `python3 ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
+run `~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
 So do your words: "ascii mode", "switch back to default". It holds until
 changed. User, 2026-10-03.
 
@@ -60,7 +60,7 @@ A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
 Read the current state, not memory, and check what you state the way
 `/showrunner:produce` checks a unit director's claims.
 
-1. **Time.** `TZ="$(python3 ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
+1. **Time.** `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
 3. **Each unit.** Use the saved status output for its latest activity. For a
    numbered open plan phase, the input builder takes its start and ETA from
@@ -121,12 +121,12 @@ When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
 carries the topic with that reason.
 
 ```sh
-python3 ~/.claude/scripts/production/dailies_input.py \
+~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_input.py \
   --production <showrunner name> --status <scratchpad>/unit_status.txt \
   --judgment <STATE_DIR>/dailies_judgment.json --state-dir <STATE_DIR>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
   --render-state <STATE_DIR>/dailies_state.json [--user-run] [--expand <child|all>]
-python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
+~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <STATE_DIR>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 

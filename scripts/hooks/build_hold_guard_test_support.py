@@ -19,7 +19,7 @@ from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 if TYPE_CHECKING:
     from ..build_hold import build_hold, hold_applies as hold_applies
 else:
-    import build_hold
+    from scripts.build_hold import build_hold
     import hold_applies as hold_applies
 
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")

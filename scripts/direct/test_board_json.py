@@ -29,7 +29,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from contextlib import redirect_stderr
 import io
 from scripts.herdr import worker_panes
-import herdr
+from scripts.herdr import herdr
 from scripts.shutdown import pane_record
 import display_cells
 

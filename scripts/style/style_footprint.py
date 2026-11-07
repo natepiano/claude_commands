@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Conservatively separate mechanical style diffs from findings needing review."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from bisect import bisect_left
@@ -22,7 +26,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
-from candidate_generators import boilerplate_allows, mask_source
+from scripts.style.candidate_generators import boilerplate_allows, mask_source
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9A-Fa-f_]+\}|\\x[0-9A-Fa-f]{2}|\\.|[^'\\\n])' ''',

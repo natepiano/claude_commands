@@ -162,7 +162,7 @@ class ShotReportTest(unittest.TestCase):
     def run_command(cls, *arguments: str) -> subprocess.CompletedProcess[str]:
         timing_args = ("--timings-path", str(cls.state_dir / "fixture-timings.jsonl")) if arguments[0] == "scan" else ()
         return subprocess.run(
-            [sys.executable, str(COMMAND), *arguments, *timing_args, "--state-dir", str(cls.state_dir)],
+            [str(HERE.parent / "lib/py"), str(COMMAND), *arguments, *timing_args, "--state-dir", str(cls.state_dir)],
             cwd=HERE,
             capture_output=True,
             text=True,
@@ -286,7 +286,7 @@ class ShotReportTest(unittest.TestCase):
             self.assertEqual(len(read_episodes(state_dir / "episodes.jsonl")), 5)
             self.assertIsInstance(read_episodes(state_dir / "episodes.jsonl")[0].attempt_count_evidence,
                                   ExactAttemptCountFromOrderedCaptures)
-            result = subprocess.run([sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir)],
+            result = subprocess.run([str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir)],
                                     cwd=HERE, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         header = next(line for line in result.stdout.splitlines() if line.startswith("split_s"))
@@ -358,7 +358,7 @@ class ShotReportTest(unittest.TestCase):
             state_dir = Path(directory)
             write_episodes(state_dir / "episodes.jsonl", by_hand)
             result = subprocess.run(
-                [sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir)],
+                [str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir)],
                 cwd=HERE, capture_output=True, text=True, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -388,7 +388,7 @@ class ShotReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             scan = subprocess.run([
-                sys.executable, str(COMMAND), "scan",
+                str(HERE.parent / "lib/py"), str(COMMAND), "scan",
                 "--claude-root", str(FIXTURES / "timeline" / "claude"),
                 "--codex-root", str(state_dir / "codex"),
                 "--timings-path", str(FIXTURES / "timeline" / "timings.jsonl"),
@@ -396,7 +396,7 @@ class ShotReportTest(unittest.TestCase):
             ], cwd=HERE, capture_output=True, text=True, check=False)
             self.assertEqual(scan.returncode, 0, scan.stderr)
             report = subprocess.run([
-                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+                str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir),
                 "--since", "2026-09-30", "--until", "2026-10-02",
             ], cwd=HERE, capture_output=True, text=True, check=False)
         self.assertEqual(report.returncode, 0, report.stderr)
@@ -433,7 +433,7 @@ class ShotReportTest(unittest.TestCase):
                     duration,
                 )
             scan = subprocess.run([
-                sys.executable, str(COMMAND), "scan",
+                str(HERE.parent / "lib/py"), str(COMMAND), "scan",
                 "--claude-root", str(claude_root), "--codex-root", str(state_dir / "codex"),
                 "--timings-path", str(state_dir / "missing-timings.jsonl"),
                 "--state-dir", str(state_dir),
@@ -449,7 +449,7 @@ class ShotReportTest(unittest.TestCase):
             status["mac_claude"] = "out"
             report_module._save_object(state_dir / "scan_status.json", status)  # pyright: ignore[reportPrivateUsage]
             report = subprocess.run([
-                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+                str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir),
             ], cwd=HERE, capture_output=True, text=True, check=False)
         self.assertEqual(report.returncode, 0, report.stderr)
         rows = _long_episode_rows(report.stdout)
@@ -523,7 +523,7 @@ class ShotReportTest(unittest.TestCase):
 
     def test_cli_has_no_rebuild_timelines_command_or_helper(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(COMMAND), "--help"], cwd=HERE,
+            [str(HERE.parent / "lib/py"), str(COMMAND), "--help"], cwd=HERE,
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -676,7 +676,7 @@ class ShotReportTest(unittest.TestCase):
             environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
             environment["USER_ZONE_CONF"] = str(configuration)
             result = subprocess.run([
-                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+                str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir),
                 "--since", "2026-01-10", "--until", "2026-01-11",
             ], cwd=HERE, env=environment, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -690,7 +690,7 @@ class ShotReportTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"USER_ZONE": "Asia/Kolkata"}), tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             result = subprocess.run([
-                sys.executable, str(COMMAND), "scan", "--state-dir", str(state_dir),
+                str(HERE.parent / "lib/py"), str(COMMAND), "scan", "--state-dir", str(state_dir),
                 "--claude-root", str(FIXTURES / "claude" / "projects"),
                 "--codex-root", str(FIXTURES / "codex" / "sessions"),
                 "--timings-path", str(state_dir / "missing-timings.jsonl"),

@@ -9,11 +9,10 @@ from uuid import uuid4
 
 from scripts.accounts import accounts, moves, refusal_watch
 from scripts.accounts.accounts import SessionMoveOutcome
-from scripts.herdr import worker_panes
-import herdr
+from scripts.herdr import herdr, worker_panes
 from scripts.direct import progress_history
 from scripts.lib import conf
-from scripts.lib.resume_message import AccountMove, BusyPass, PaneWorkerResume, ResumeWorkers, resume_message
+from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
 from scripts.production import session_staff, staff
 from scripts.shutdown import restart, stop_resume, stop_results
 from scripts.whoami import agent_accounts
@@ -88,8 +87,8 @@ def _request(move: WorkerMove, source: str, terminal: str) -> moves.MoveCommon:
 def _continue_pass(move: WorkerMove, opened: worker_panes.OpenWorker, source: str, target: str) -> None:
     passed = worker_panes.worker_pass(move.row, move.run)
     if passed.get("status") in ("active", "refused"):
-        workers = ResumeWorkers(panes=[PaneWorkerResume(move.row.id, BusyPass(str(passed["instance_id"])))])
-        move.client.prompt(opened.pane, resume_message(move.why, move=AccountMove(source, target), workers=workers),
+        move.client.prompt(opened.pane, resume_message(move.why, move=AccountMove(source, target),
+                           own_pass=BusyPass(str(passed["instance_id"]))),
                            target=str(move.row.current_session))
 
 

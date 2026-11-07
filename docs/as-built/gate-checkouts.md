@@ -113,12 +113,12 @@ Run a gate with the source worktree's uncommitted changes and a merge, in that
 order:
 
 ```sh
-python3 ~/.claude/scripts/copies/copies.py run \
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
   --owner verify --repo ~/worktrees/claude-build-followups-verify \
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  python3 ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
+  ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
 ```
 
 `run --owner O --repo R --commit C [--apply-uncommitted W] [--merge REF]
@@ -138,8 +138,8 @@ Failed application or a merge conflict exits 3,
 names the affected files, and releases the tree. The next use resets it clean.
 
 ```sh
-python3 ~/.claude/scripts/copies/copies.py list
-python3 ~/.claude/scripts/copies/copies.py remove \
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py list
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py remove \
   --owner verify --repo ~/worktrees/claude-build-followups-verify
 ```
 

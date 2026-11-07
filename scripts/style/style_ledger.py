@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Store style judgments and derive coverage at a repository's synced tip."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -28,33 +32,32 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-from issues import Issue, frontmatter
+from scripts.production.issues import Issue, frontmatter
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
 
-from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
+from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
                          LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
 
-import rules as rule_catalog
-import style_footprint
-import declarations
-import finding_sites
-from finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
+from scripts.style import rules as rule_catalog
+from scripts.style import style_footprint
+from scripts.style import declarations
+from scripts.style import finding_sites
+from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
                            RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
-import style_rules
-import approved_renames
-from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
+from scripts.style import style_rules
+from scripts.style import approved_renames
+from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from candidate_generators import enumerate_candidates
-from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+from scripts.style.candidate_generators import enumerate_candidates
+from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
-from rules import Family, InputScope, MemberReach, Rule, Tier
+from scripts.style.rules import Family, InputScope, MemberReach, Rule, Tier
 
 
 @dataclass(frozen=True)
@@ -2803,8 +2806,7 @@ class Ledger:
             texts: list[PinnedRuleText] = []
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                result = _git_bytes(self.repo, "hash-object", "--stdin", input=text)
-                hashed = result.stdout.decode().strip()
+                hashed = git_blob_id(text)
                 if hashed != definition.blob:
                     raise ChangedBeforeLock(f"{rule_id}: rule changed while pinning; rerun")
                 texts.append(PinnedRuleText(rule_id, hashed, text))

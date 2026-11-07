@@ -6,22 +6,16 @@ from contextlib import contextmanager
 from decimal import Decimal
 import os
 from pathlib import Path
-import sys
 import subprocess
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, git_only, instant
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-if TYPE_CHECKING:
-    from ..buildlog import store
-    from ..buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
-else:
-    import store
-    from test_index import COORDINATION_VARIABLES, call, encode, step
+from scripts.buildlog import store
+from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
 
 
 DAY = "2026-01-15"

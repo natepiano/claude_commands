@@ -25,8 +25,7 @@ else:
     from scripts.lib import process_start as process_identity
 
 
-import copy_watch
-import offload
+from scripts.mac_test import copy_watch, offload
 if TYPE_CHECKING:
     from ..direct import step_record
     from ..lint.memory_test_support import config_environment, write_config_fixture

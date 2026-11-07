@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
@@ -19,13 +18,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 from unittest.mock import Mock, patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
-import shutdown
-import inventory
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.agents import codex_mesh
 from scripts.whoami.account import UnreadableAccount
-from inventory import Inventory
+from scripts.shutdown.inventory import Inventory
 
 
 LOGIN = "owner@example.com"
@@ -85,6 +85,39 @@ def setUpModule() -> None:
 
 @final
 class ShutdownStatusTests(ShutdownTestCase):
+    def test_stop_reports_each_unresolved_worker_and_the_director_result(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("director-session"))
+        row = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId("worker-session"))
+        record = staff.StaffSnapshot((parent, row))
+        write_text_atomic(self.root / "run/worker_transport", "herdr\n")
+        def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            print("anomaly: impl: terminal changed", file=sys.stderr)
+            return [worker_panes.UncertainWorker(row, "terminal changed")]
+        for result, expected in ((stop_resume.StopFailed("director-session", "director stop failed"), "director stop failed"),
+                                 (stop_resume.NotRunning("director-session"), "unchanged")):
+            with (self.subTest(result=result), patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(worker_panes, "worker_run", return_value=self.root / "run"),
+                  patch.object(worker_panes, "observe", side_effect=observe),
+                  patch.object(stop_resume, "stop", return_value=result),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(shutdown.main(["stop", "director"]), 1)
+            text = output.getvalue() + errors.getvalue()
+            self.assertEqual(text.count("anomaly: impl: terminal changed"), 1, text)
+            self.assertIn(expected, text)
+
+    def test_record_precedes_worker_window(self) -> None:
+        row = staff.StaffRow(staff.StaffId("retained-worker"), "worker", "impl", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("native-worker"))
+        record = staff.StaffSnapshot((row,))
+        def window(selected: staff.StaffSnapshot) -> None:
+            self.assertIs(selected, record)
+            self.assertEqual(shutdown_record.read(), [row.id])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "live_rows", return_value=[row]), patch.object(shutdown, "wait_for_workers", side_effect=window)):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+
     def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
         row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", staff.StaffRoot(),
                              current_session=staff.StaffId("current-thread"))

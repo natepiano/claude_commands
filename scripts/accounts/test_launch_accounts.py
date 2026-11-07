@@ -453,7 +453,7 @@ def session_launch(identity: str):
 claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
 '''
-        self.assertEqual(shell_launch_account_violations(source, "direct/implement.sh"), [])
+        self.assertEqual(shell_launch_account_violations(source, "direct/assign_claude.py"), [])
 
     def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
         for arguments in ("--print prompt", "-p prompt", "prompt", ""):

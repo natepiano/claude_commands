@@ -10,7 +10,6 @@ import json
 import math
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,21 +18,20 @@ from pathlib import Path
 from typing import Callable, cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import add_showrunner
-import promote_showrunner
-from scripts.production import showrunners
-import showrunner_tree
-import unit_effort
-import unit_lookup
-import herdr
-import sessions
+from scripts.production import add_showrunner
+from scripts.production import promote_showrunner
+from scripts.production import showrunners, worker
+from scripts.shutdown import stop_resume
+from scripts.production import showrunner_tree
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
 from scripts.accounts import accounts
-from scripts.herdr import herdr as trust_reader
+from scripts.herdr import herdr as trust_reader, worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
@@ -81,6 +79,104 @@ def commit_all(path: Path) -> None:
 
 @final
 class PromoteShowrunnerTests(unittest.TestCase):
+    def test_promotion_closes_retained_shells_only_after_every_stop_proves_success(self) -> None:
+        unit = self.staff_unit()
+        retained = fixture_member("worker", name="impl", parent=unit.id)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        for stopped_director, unresolved, close_result in ((False, [], True), (True, [], True), (False, [], False),
+                (False, [], OSError("worker close failed")), (False, ["impl: not proved stopped"], True)):
+            world = PaneWorld()
+            world.add(unit, PANE, live=not stopped_director)
+            world.add(retained, "w7:p2", live=False)
+            before = staff.snapshot()
+            def stop(session: str, *, deadline: float) -> stop_resume.Stopped:
+                _ = world.foreground.pop(PANE, None)
+                return self.stop_member(session, deadline=deadline)
+            def close(pane: str, *, target: str = "", terminal: str = "") -> bool:
+                self.assertEqual((target, terminal), (SESSION, "") if pane == PANE else ("", "terminal-w7:p2"))
+                if pane != PANE:
+                    if isinstance(close_result, OSError):
+                        raise close_result
+                    if not close_result:
+                        return False
+                _ = world.locations.pop(pane)
+                _ = world.foreground.pop(pane, None)
+                return True
+            with (self.subTest(stopped_director=stopped_director, unresolved=unresolved, close_result=close_result),
+                  mock.patch.object(worker_panes, "_client", return_value=world),
+                  mock.patch.object(herdr.Herdr, "panes", side_effect=world.panes),
+                  mock.patch.object(herdr.Herdr, "pane_activity", side_effect=world.pane_activity),
+                  mock.patch.object(stop_resume, "stop", side_effect=stop),
+                  mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+                  mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants),
+                  mock.patch.object(stop_resume, "stop_unit_workers", return_value=unresolved),
+                  mock.patch.object(herdr.Herdr, "close_tab_confirmed", side_effect=close) as closed,
+                  redirect_stderr(io.StringIO()) as errors):
+                state = worker_panes.observe(unit.id, before)[0]
+                self.assertIsInstance(state, worker_panes.ClosedWorker if stopped_director else worker_panes.StoppedWorker)
+                self.assertTrue(promote_showrunner.stop(promotion))
+                if unresolved:
+                    closed.assert_not_called()
+                    self.assertEqual(set(world.locations), {PANE, "w7:p2"})
+                else:
+                    self.assertEqual(closed.call_count, 2)
+                    self.assertEqual(closed.call_args_list, [mock.call("w7:p2", terminal="terminal-w7:p2"),
+                                                           mock.call(PANE, target=SESSION)])
+                    self.assertIsInstance(worker_panes.observe(unit.id, staff.snapshot())[0], worker_panes.ClosedWorker)
+                self.assertEqual(staff.snapshot().rows, before.rows)
+                if not unresolved and close_result is not True:
+                    self.assertEqual(set(world.locations), {"w7:p2"})
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("anomaly: impl:", errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+
+    def test_promotion_keeps_a_worker_program_and_a_shell_in_another_tab(self) -> None:
+        unit = self.staff_unit()
+        retained = fixture_member("worker", name="impl", parent=unit.id)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        world = PaneWorld()
+        world.add(unit, PANE, live=False)
+        world.add(retained, "w7:p2")
+        world.add(retained, "w7:p3", live=False, tab="w1:t2")
+        before = staff.snapshot()
+        with (mock.patch.object(worker_panes, "_client", return_value=world),
+              mock.patch.object(herdr.Herdr, "panes", side_effect=world.panes),
+              mock.patch.object(herdr.Herdr, "pane_activity", side_effect=world.pane_activity),
+              mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        close.assert_called_once_with(PANE, target=SESSION)
+        self.assertEqual(staff.snapshot().rows, before.rows)
+        self.assertEqual(set(world.locations), {PANE, "w7:p2", "w7:p3"})
+
+    def test_promotion_continues_after_a_failed_confirmed_close(self) -> None:
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        with (mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=False),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+
+    def test_promotion_continues_after_a_failed_pane_read(self) -> None:
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
+              mock.patch.object(herdr.Herdr, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        close.assert_called_once_with(PANE, target=SESSION)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+
+    def test_promote_restores_retained_workers(self) -> None:
+        unit = self.staff_unit()
+        retained = fixture_member("worker", name="impl", parent=unit.id)
+        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
+            code, output, error = self.run_main()
+        self.assertEqual(code, 0, output + error)
+        restore.assert_called_once_with(unit.id)
+        self.assertEqual(staff.by_id(retained.id), retained)
+
     def test_remote_director_location_refuses_before_the_unit_stops(self) -> None:
         row = self.staff_unit()
         _ = staff.set_worktree(row.id, staff.PresentWorktree("mac", self.worktree), expected=row.worktree)
@@ -177,20 +273,25 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def pane_result(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del client, deadline
             if arguments[:2] == ("pane", "list"):
+                if "demo" not in self.marked:
+                    return {"panes": []}
                 place = self.marked["demo"].place
                 assert isinstance(place, herdr.HerdrPlace)
                 return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
-                                   "workspace_id": place.pane.split(":")[0]}]}
+                                   "workspace_id": place.pane.split(":")[0], "tab_id": "w7:t1"}]}
+            if arguments[:2] == ("agent", "list"):
+                return {"agents": []}
             if arguments[:2] == ("pane", "process-info"):
                 return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
                     "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}
             raise AssertionError(arguments)
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", pane_result))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True))
         for module, name, stand_in in (
                 (showrunners, "own_name", self.own_name), (unit_lookup, "labeled_session", self.labeled_session),
-                (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
-                (promote_showrunner, "POLL_S", 0), (add_showrunner, "checked", self.child_checked),
+                (stop_resume, "stop", self.stop_member), (stop_resume, "stop_unit_workers", mock.Mock(return_value=[])),
+                (worker, "restore", mock.Mock(return_value=worker.ExitCode.OK)), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
                 (unit_effort, "verdict", self.verdict)):
             _ = self.enterContext(mock.patch.object(module, name, stand_in))
@@ -217,16 +318,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def role_account(self, _role: str) -> accounts.ClaudeLaunchAccount:
         return self.unit_account
 
-    def stop_host(self, session: str) -> None:
-        self.events.append(f"stop herdr {session}")
+    def stop_member(self, session: str, *, deadline: float) -> stop_resume.Stopped:
+        del deadline
+        self.events.append(f"stop member {session}")
+        return stop_resume.Stopped(session, PID)
 
-    def type_pane(self, place: herdr.HerdrPlace, text: str, *, target: str) -> None:
-        herdr.Herdr(place.session).prompt(place.pane, text, target=target)
-        self.events.append(f"prompt herdr {place.session} {text}")
-
-    def is_alive(self, pid: int) -> bool:
-        self.assertEqual(pid, PID)
-        return self.alive.pop(0) if len(self.alive) > 1 else self.alive[0]
 
     def child_checked(self, _child: ProductionDocument, caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
@@ -246,7 +342,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def assert_nothing_stopped(self) -> None:
-        self.assertFalse(any(event.startswith(("prompt herdr ", "stop herdr ", "start")) for event in self.events))
+        self.assertFalse(any(event.startswith(("prompt herdr ", "stop member ", "start")) for event in self.events))
 
     def staff_unit(self) -> staff.StaffRow:
         parent = fixture_member("showrunner", name="parent")
@@ -264,13 +360,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual([row for row in staff.snapshot().rows if row.id == unit.id], [retained])
         self.assertEqual([row for row in staff.find(kind="showrunner") if row.name == "child"], [retained])
 
-    def test_promote_keeps_worker_rows_and_reports_each_one(self) -> None:
+    def test_promote_keeps_worker_rows_after_restore(self) -> None:
         unit = self.staff_unit()
         worker = fixture_member("worker", name="impl1", parent=unit.id)
         code, output, errors = self.run_main()
-        self.assertEqual(code, 1, output + errors)
-        self.assertIn(worker.id, output)
-        self.assertIn(worker.name, output)
+        self.assertEqual(code, 0, output + errors)
         self.assert_native_promotion(unit)
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertTrue(any(row.name == "child" for row in staff.find(kind="showrunner")))
@@ -498,12 +592,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_the_unit_is_gone_before_it_restarts(self) -> None:
         code, out, err = self.run_main()
         self.assertEqual(code, 0, err)
-        stop_at = self.events.index("prompt herdr demo /exit")
-        ended_at = self.events.index("stop herdr demo")
+        ended_at = self.events.index("stop member " + SESSION)
         started_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
-        self.assertLess(stop_at, ended_at)
         self.assertLess(ended_at, started_at)
-        self.assertEqual(self.alive, [False])
         self.assertIn(f"--resume {SESSION} --cwd {self.worktree}", self.events[started_at])
         self.assertIn("--model opus --effort high", self.events[started_at])
         self.assertIn("demo is now the showrunner of child", out)
@@ -574,7 +665,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn(str(directory), start)
         self.assertNotIn("--config-dir " + str(self.root / ".claude") + " ", start)
         self.assertLess(self.events.index("check showrunner account"),
-            next(index for index, event in enumerate(self.events) if event.startswith("stop herdr ")))
+            next(index for index, event in enumerate(self.events) if event.startswith("stop member ")))
 
     def test_promotion_resolves_showrunners_account_before_stopping_and_passes_it_to_resume(self) -> None:
         """F004: promotion uses group configuration before the stop begins."""
@@ -591,7 +682,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
             code, _, error = self.run_main()
         self.assertEqual((code, error), (0, ""))
-        kill_at = next(index for index, event in enumerate(self.events) if event.startswith("stop herdr "))
+        kill_at = next(index for index, event in enumerate(self.events) if event.startswith("stop member "))
         start_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
         self.assertLess(self.events.index("resolve showrunner"), kill_at)
         self.assertLess(kill_at, start_at)
@@ -621,12 +712,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
 
     def test_a_unit_still_running_after_exit_is_not_restarted(self) -> None:
-        self.alive = [True]
-        with mock.patch.object(promote_showrunner, "STOP_WAIT_S", 0):
+        with mock.patch.object(stop_resume, "stop", return_value=stop_resume.StopFailed(SESSION, "still runs")):
             code, out, _err = self.run_main()
         self.assertEqual(code, 1)
-        self.assertIn(f"Claude (pid {PID}) still runs", out)
-        self.assertNotIn("stop herdr demo", self.events)
+        self.assertIn("stop is not proved", out)
+        self.assertNotIn("stop member demo", self.events)
         self.assertFalse(any(event.startswith("start") for event in self.events))
 
     def native_unit(self) -> None:
@@ -649,7 +739,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         with mock.patch.object(herdr, "stop_session") as stopped:
             code, _out, err = self.run_main()
         self.assertEqual(code, 0, err)
-        stopped.assert_called_once_with("native")
+        stopped.assert_not_called()
         start = next(event for event in self.events if event.startswith("start"))
         self.assertIn(str(selected.dir), start)
 
@@ -664,25 +754,6 @@ class PromoteShowrunnerTests(unittest.TestCase):
         stopped.assert_not_called()
         self.assert_nothing_stopped()
 
-    def test_a_herdr_unit_exits_before_its_named_session_stops_and_restarts(self) -> None:
-        self.native_unit()
-
-        def stop_session(label: str) -> None:
-            self.assertEqual(self.alive, [False])
-            self.events.append(f"stop herdr {label}")
-
-        with mock.patch.object(herdr, "stop_session", side_effect=stop_session) as stopped:
-            code, _out, err = self.run_main()
-        self.assertEqual(code, 0, err)
-        stopped.assert_called_once_with("native")
-        calls = (self.root / "herdr.log").read_text().splitlines()
-        self.assertEqual(calls, [
-            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
-                        "--format", "ansi"]),
-            json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/exit"]),
-        ])
-        start_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
-        self.assertLess(self.events.index("stop herdr native"), start_at)
 
     def test_another_herdr_unit_does_not_exempt_the_childs_live_destination(self) -> None:
         self.marked["demo"] = unit_lookup.LabeledSession(
@@ -699,7 +770,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn("a tab named child is already open in herdr session agents", err)
         live.assert_called_once_with("child", add_showrunner.EndingUnitTab(PANE))
         self.assert_nothing_stopped()
-        self.assertFalse(any(event.startswith("stop herdr ") for event in self.events))
+        self.assertFalse(any(event.startswith("stop member ") for event in self.events))
 
     def test_promotion_check_exempts_its_own_tab_in_the_shared_session(self) -> None:
         self.marked["demo"] = unit_lookup.LabeledSession(
@@ -717,21 +788,6 @@ class PromoteShowrunnerTests(unittest.TestCase):
             code, out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
         self.assertIn("check: ok", out)
-        self.assert_nothing_stopped()
-
-    def test_a_blocked_herdr_unit_is_never_stopped_or_restarted(self) -> None:
-        self.native_unit()
-        refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked"}}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
-            "--session native agent prompt w1:p1 /exit": {
-                "code": 1, "stdout": json.dumps(refusal)},
-            "default": {"code": 0, "stdout": ""},
-        }))
-        with mock.patch.object(herdr, "stop_session") as stopped:
-            code, _out, err = self.run_main()
-        self.assertEqual(code, 2, err)
-        self.assertIn("agent_blocked", err)
-        stopped.assert_not_called()
         self.assert_nothing_stopped()
 
     def test_a_failed_restart_prints_the_way_back_and_leaves_the_row(self) -> None:

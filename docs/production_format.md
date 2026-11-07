@@ -106,8 +106,12 @@ The showrunner staff row gives its path. The row's `name` is the production name
   document file name (`change-review - natedev.md`); a child production names its root's
   list. `change_review.py` resolves the list from the root showrunner while it runs and
   falls back to this path when it does not, warning when the two differ.
-  `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
-  `/change_review` adds the rest; a missing file is created on its first row with
+  All merge callers use `change_review.list_ready` after the final promotion step succeeds, including the Mac pull.
+  It adds missing checkpoint changes only when they reach `origin/main` and become live.
+  A fourth field, `after <step>`, waits for `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
+  The session that completes the step runs `live`.
+  The command requires both arguments and releases only the named step.
+  `/change_review add` adds other ready changes. A missing file is created on its first row with
   frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
   list of production doc paths, `showrunner`), and every write moves `date_modified`
   and adds the writing production's doc to `productions`
@@ -151,14 +155,13 @@ every tool's arguments. A unit's session name can change, so find the unit at th
 prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
 session name now. `<showrunner name>` is the parent showrunner row's `name`.
 
-Run `/showrunner:rename_unit <old> <new>` from the showrunner session between phases.
-Never edit the staff row or `.unit.toml` by hand.
-The command repairs displays and completes any pending rename.
-Folder and branch targets use `unit_names.swap_stem` independently; each unmatched suffix prints one anomaly and stays unchanged.
-The move stops live members, moves the worktree and branch, and resumes those native conversations.
-Stopped members stay stopped; the output gives `shutdown.py restart --only <staff-id>` for manual restart.
-A completed rerun prints one `unchanged` line, exits 0, and sends no restart notice.
-See `commands/showrunner/rename_unit.md` for command results and timeout output.
+To rename a unit or showrunner, run `/showrunner:rename plan|apply <old> <new>`.
+Use a staff id, `showrunner/name`, or a unique name.
+A bare name first selects the calling showrunner or its units.
+The command searches all productions only when that scope has no match.
+A unit rename changes matching folder and branch suffixes and resumes its live sessions.
+The command keeps staff ids and creates no commit.
+Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 
 A showrunner rename with a document move preserves staged document bytes separately from working bytes.
 Recovery restores the staged destination entry before removing the source index entry.
@@ -429,4 +432,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
+    A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
+    Until then, add no row.
+    Merge callers share `list_ready`, which fetches `origin main` before it adds missing rows.
+    A fourth field, `after <step>`, holds the line until the session completes the step and runs `change_review.py live --merged <hash> --step <step>`.
 </ProductionUnit>

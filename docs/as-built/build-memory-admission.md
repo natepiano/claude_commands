@@ -1138,7 +1138,9 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
 The service applies each step's recorded headroom rule to the highest profile sample within its look-ahead window.
 `progress_lookahead_percent` is read at use; its initial value is 20.
-The window can cross a phase boundary. Each step has its own history key.
+The window crosses Cargo phase boundaries, including repeated build phases.
+The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
+Reruns without a measured window retain the full need. Each step has its own history key.
 Missing counters, profiles, or anonymous readings retain the full need.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
 CI keeps its configured margin until registered CI steps supply counters and profiles.

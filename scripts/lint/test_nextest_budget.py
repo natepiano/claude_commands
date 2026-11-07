@@ -1,24 +1,19 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Local nextest runs share the machine's test threads, in temporary directories only."""
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import override
 
-import nextest_budget as budget
+from scripts.lint import nextest_budget as budget
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_hold.override_guard import require_checkout
-else:
-    from scripts.build_hold.override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

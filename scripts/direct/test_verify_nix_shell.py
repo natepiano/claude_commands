@@ -23,7 +23,7 @@ PYTHON_SHIM = '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["VERIFY_PYTHON_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+os.execv(os.environ["VERIFY_REAL_PY"], [os.environ["VERIFY_REAL_PY"], *sys.argv[1:]])
 '''
 
 TOOL_SETUP = '''"$CLAUDE_PYTHON" - "$@" <<'PYTHON'
@@ -81,6 +81,7 @@ class VerifyNixShellTests(NixFixture):
         self.setup_log = self.root / "verification.json"
         self.python_log = self.root / "python.jsonl"
         self.env.update({"CLAUDE_PYTHON": sys.executable,
+                         "VERIFY_REAL_PY": str(SCRIPTS / "lib/py"),
                          "VERIFY_SETUP_LOG": str(self.setup_log),
                          "VERIFY_PYTHON_LOG": str(self.python_log),
                          "VERIFY_FIXTURE_EXIT": "37"})
