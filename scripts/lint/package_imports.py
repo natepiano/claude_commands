@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 import re
 import sys
+from typing import NamedTuple
 
 
 def add_bootstrap(file: Path) -> bool:
@@ -78,25 +79,27 @@ def module_name(root: Path, path: Path) -> str:
     return ".".join(path.relative_to(root).with_suffix("").parts).removesuffix(".__init__")
 
 
-def path_value(node: ast.AST, names: dict[str, Path], file: Path) -> Path:
-    """Read static path expressions without running repository code."""
+class FileRelativePath(NamedTuple):
+    path: Path
+
+
+def path_value(node: ast.AST, names: dict[str, FileRelativePath], file: Path) -> FileRelativePath:
+    """Read paths derived from __file__ without running repository code."""
     if isinstance(node, ast.Name):
-        return file if node.id == "__file__" else names[node.id]
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return Path(node.value)
+        return FileRelativePath(file) if node.id == "__file__" else names[node.id]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"Path", "str"} and node.args:
         return path_value(node.args[0], names, file)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr in {"resolve", "absolute", "expanduser"} and not node.args):
         return path_value(node.func.value, names, file)
     if isinstance(node, ast.Attribute) and node.attr == "parent":
-        return path_value(node.value, names, file).parent
+        return FileRelativePath(path_value(node.value, names, file).path.parent)
     if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "parents"
             and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)):
-        return path_value(node.value.value, names, file).parents[node.slice.value]
+        return FileRelativePath(path_value(node.value.value, names, file).path.parents[node.slice.value])
     if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
             and isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)):
-        return path_value(node.left, names, file) / node.right.value
+        return FileRelativePath(path_value(node.left, names, file).path / node.right.value)
     raise ValueError("dynamic path")
 
 
@@ -114,7 +117,7 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
     edits: list[tuple[int, int, bytes]] = []
     problems: list[str] = []
     converted: set[Path] = set()
-    names: dict[str, Path] = {}
+    names: dict[str, FileRelativePath] = {}
     folders = [file.parent]
     removed_names: set[str] = set()
     path_changes: list[ast.stmt] = []
@@ -136,24 +139,32 @@ def rewrite(root: Path, file: Path, modules: dict[str, list[Path]], selected: bo
             try:
                 names[node.targets[0].id] = path_value(node.value, names, file)
             except (ValueError, KeyError, TypeError, IndexError):
-                pass
+                _ = names.pop(node.targets[0].id, None)
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Expr, ast.Assign, ast.AugAssign)):
             continue
         value = node.value
-        change = (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+        change = (isinstance(node, ast.Expr) and isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
                   and value.func.attr in {"insert", "append", "extend"} and ast.unparse(value.func.value) == "sys.path")
         targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AugAssign) else []
-        change = change or any(ast.unparse(target).startswith("sys.path") for target in targets)
+        change = change or any(ast.unparse(target) == "sys.path"
+                               or isinstance(target, ast.Subscript) and ast.unparse(target.value) == "sys.path"
+                               for target in targets)
         if not change:
             continue
-        added = value.args[-1:] if isinstance(value, ast.Call) else value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+        if isinstance(node, ast.Expr) and isinstance(value, ast.Call):
+            added = value.args[-1:]
+            if isinstance(value.func, ast.Attribute) and value.func.attr == "extend" and added:
+                argument = added[0]
+                added = argument.elts if isinstance(argument, (ast.List, ast.Tuple)) else [argument]
+        else:
+            added = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
         for directory in added:
             try:
-                folders.append(path_value(directory, names, file))
+                folders.append(path_value(directory, names, file).path)
             except (ValueError, KeyError, TypeError, IndexError):
-                if selected:
-                    issue(node, "dynamic sys.path change")
+                issue(node, "dynamic sys.path change")
+                return original_source, set(), problems
         if selected:
             removed_names.update(child.id for child in ast.walk(node) if isinstance(child, ast.Name))
             path_changes.append(node)

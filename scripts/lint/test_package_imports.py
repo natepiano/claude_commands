@@ -15,6 +15,67 @@ from scripts.lint import package_imports
 
 
 class PackageImportTests(unittest.TestCase):
+    def assert_conversion_refuses_dynamic_path(self, path_change: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 'repository worker'\n")
+            caller = folder / "caller.py"
+            source = ('''#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+''' + path_change + '''
+import worker
+print(worker.VALUE)
+''').encode()
+            _ = caller.write_bytes(source)
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), source)
+            self.assertRegex(
+                report.getvalue(),
+                r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*: dynamic sys\.path change$",
+            )
+
+    def test_conversion_refuses_a_path_assignment_from_the_current_directory(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path[0] = os.getcwd()')
+
+    def test_conversion_refuses_an_unsupported_file_directory_call(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path.insert(0, os.path.dirname(__file__))')
+
+    def test_conversion_refuses_a_path_slice_with_a_vendor_directory(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path[:0] = [str(Path(__file__).parent), "/opt/vendor"]')
+
+    def test_conversion_refuses_to_select_a_repository_import_after_a_plugin_path(self) -> None:
+        self.assert_conversion_refuses_dynamic_path('sys.path.insert(0, os.environ["PLUGIN_DIR"])')
+
+    def test_conversion_removes_an_extend_list_of_file_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 'repository worker'\n")
+            caller = folder / "caller.py"
+            path_change = 'sys.path.extend([str(ROOT)])\n'
+            source = ('''import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+''' + path_change + '''import worker
+print(worker.VALUE, ROOT, sys.version_info.major)
+''')
+            _ = caller.write_bytes(source.encode())
+            report = io.StringIO()
+            with redirect_stdout(report):
+                package_imports.convert(root, [caller])
+            expected = source.replace(path_change, "", 1).replace("import worker\n", "from scripts.alpha import worker\n", 1)
+            self.assertEqual(caller.read_bytes(), expected.encode())
+            self.assertNotRegex(report.getvalue(), r"(?m)^scripts/alpha/caller\.py:[1-9][0-9]*:")
+
     def assert_conversion_refuses_source(self, source: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
