@@ -155,8 +155,7 @@ Records are written atomically under the busy lock. Git's `info/exclude` ignores
 
 ## Commands and Python API
 
-Run a gate with the source worktree's uncommitted changes and a merge, in that
-order:
+Run targeted tests with the source worktree's uncommitted changes and a merge, in that order:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
@@ -164,7 +163,7 @@ order:
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
+  ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF]

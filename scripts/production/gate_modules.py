@@ -15,6 +15,11 @@ def test_module_name(repo: Path, suite: str, path: Path) -> str:
     return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
 
 
+def is_test_module(path: str) -> bool:
+    name = Path(path).name
+    return name.startswith("test_") and name.endswith(".py")
+
+
 def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
     """Find modules in path order; each suite is the first folder under scripts."""
     scripts = repo / "scripts"
@@ -25,7 +30,7 @@ def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
         parent = Path(folder)
         parts = parent.relative_to(scripts).parts
         for name in filenames:
-            if name.startswith("test_") and name.endswith(".py") and (parent / name).is_file():
+            if is_test_module(name) and (parent / name).is_file():
                 modules.append((*parts, name))
     found: list[tuple[str, Path]] = []
     for parts in sorted(modules):

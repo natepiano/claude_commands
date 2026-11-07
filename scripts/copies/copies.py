@@ -588,7 +588,7 @@ def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> No
         raise CopyError(f"{tree}: refusing an unregistered existing directory")
     if (tree / ".git").is_dir() and not replace_git:
         try:
-            _ = git(tree, "rev-list", "--objects", "--all", "--quiet")
+            _ = git(tree, "show-ref", "--head")
         except CopyError:
             replace_git = True
     write_record(tree, owner, repo, source, base)
@@ -615,14 +615,33 @@ def resolved_remote_url(repo: Path, url: str) -> str:
 def refresh_remotes(tree: Path, source: Path) -> None:
     """Keep upstream refs and saved local branches in separate remotes."""
     url, refs = source_origin(source)
+    settings: dict[str, list[str]] = {}
+    for setting in git(tree, "config", "--local", "--null", "--list").decode().split("\0"):
+        if setting:
+            key, _, value = setting.partition("\n")
+            settings.setdefault(key, []).append(value)
+
+    def references(repo: Path, *prefixes: str) -> dict[str, str]:
+        listing = git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", *prefixes)
+        return dict(line.split(" ", 1) for line in listing.decode().splitlines())
+
+    source_references = references(source, refs, "refs/heads")
+    current_refs = references(tree, "refs/remotes/origin", "refs/remotes/source")
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
-        _ = git(tree, "config", "--replace-all", f"remote.{remote}.url", remote_url)
-        _ = git(tree, "config", "--replace-all", f"remote.{remote}.fetch",
-                f"+refs/heads/*:refs/remotes/{remote}/*")
-        # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
-        _ = git(tree, "update-ref", "--no-deref", "-d", f"refs/remotes/{remote}/HEAD")
-        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+        for key, value in ((f"remote.{remote}.url", remote_url),
+                           (f"remote.{remote}.fetch", f"+refs/heads/*:refs/remotes/{remote}/*")):
+            if settings.get(key) != [value]:
+                _ = git(tree, "config", "--replace-all", key, value)
+        prefix = f"refs/remotes/{remote}/"
+        expected = {name.removeprefix(source_refs + "/"): value.split()[0]
+                    for name, value in source_references.items() if name.startswith(source_refs + "/")}
+        current = {name.removeprefix(prefix): value.strip()
+                   for name, value in current_refs.items() if name.startswith(prefix)}
+        if current != expected:
+            # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
+            _ = git(tree, "update-ref", "--no-deref", "-d", prefix + "HEAD")
+            _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
 
 
 def final_object_store(store: Path) -> Path:

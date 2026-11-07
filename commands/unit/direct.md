@@ -126,11 +126,15 @@ Apply mesh instructions only when that existing pin is `mesh`.
 
 For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
+After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
+The close keeps the thread and staff row; the next assign resumes that thread.
+If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
 The worker command selects idle workers and reuses stopped workers.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
@@ -156,11 +160,12 @@ A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a lau
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
-Restore resumes the same conversations through `worker.py restore`.
+Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves keep the same conversation on the destination account.
-A stopped worker keeps its pane and terminal; a closed worker resumes in a new pane.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+A stopped worker with an active dispatch keeps its pane and terminal.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -724,8 +729,7 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-For `herdr`, retain worker rows and panes for the next phase.
-Use `worker.py end <name>` only when permanent removal is required.
+For `herdr`, apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
 
 For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
 `~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.

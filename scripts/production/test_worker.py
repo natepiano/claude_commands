@@ -254,6 +254,29 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
 
+    def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
+        idle = self.opened("review", "review")
+        _ = self.fixture.world.stop(idle.row, self.fixture.world)
+        self.assertIsInstance(worker_panes.close(self.fixture.parent.id, staff.WorkerName.parse(idle.row.name)),
+                              worker_panes.Closed)
+        busy = self.opened()
+        dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=busy.row.name, worker_id=busy.row.id, launcher_command=["assign.sh", "--to", "impl"],
+            prompt=self.prompt, kind="impl", lens="")
+        _ = self.fixture.world.stop(busy.row, self.fixture.world)
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
+            self.assertEqual(self.command("restore"), (0, "done\n", ""))
+        resume.assert_called_once_with(busy.row,
+            progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
+        self.assertEqual(self.fixture.staff_state(), before[0])
+        self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
+        states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
+        self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
+        self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
+        self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
+        self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
+
     def test_restore_rerun_after_agent_resume(self) -> None:
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
@@ -1249,11 +1272,13 @@ class WorkerCommandTests(unittest.TestCase):
         private_root.mkdir()
         self.run_dir = self.run_dir.rename(private_root / "held-run")
         _ = self.fixture.world.stop(row, self.fixture.world)
+        before = len(self.fixture.world.launches)
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(private_root)}):
             code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, "done\n", ""))
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
         self.assertEqual(staff.snapshot().by_id(row.id), row)
-        self.assertIn(row.current_session, self.fixture.world.requests[-1][1])
+        self.assertEqual(len(self.fixture.world.launches), before)
+        self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
 
     def test_herdr_list_shares_history_and_staff_reads_across_workers(self) -> None:
         expected: dict[str, str] = {}
@@ -1363,12 +1388,13 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl", completed=True)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
         before = self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()
+        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
         code, output, errors = self.command("restore")
         self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()), before)
-        self.assertEqual(self.fixture.world.native_session(opened.pane, self.fixture.world.foreground[opened.pane][1], 1), opened.row.current_session)
+        self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
+        self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
     def test_restore_reports_the_unavailable_role_and_continues_other_workers(self) -> None:
         missing = self.opened("impl")
@@ -1376,11 +1402,10 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.fixture.world.stop(missing.row, self.fixture.world)
         _ = self.fixture.world.stop(retained.row, self.fixture.world)
         self.fixture.dispatch(retained.row, "review", completed=True)
-        with redirect_stderr(io.StringIO()) as errors:
-            code = worker.restore(self.fixture.parent.id)
-        self.assertEqual(code, worker.ExitCode.REFUSED)
-        self.assertIn("dispatch role unavailable", errors.getvalue())
-        self.assertIn(retained.pane, self.fixture.world.foreground)
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
+        self.assertNotIn(retained.pane, self.fixture.world.foreground)
         self.assertNotIn(missing.pane, self.fixture.world.foreground)
 
     def test_end_keeps_a_busy_worker_and_reports_the_blocker(self) -> None:

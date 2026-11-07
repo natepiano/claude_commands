@@ -15,7 +15,7 @@ from contextlib import closing, redirect_stderr
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 
@@ -29,7 +29,7 @@ from scripts.style import style_ledger as ledger_api
 from scripts.style.approved_renames import BindingRename
 from scripts.style.ledger_test_support import machine_rename_fixture
 from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
-from scripts.style.style_child_test_support import install_refusal_tools
+from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
 from scripts.copies import copies
 from scripts.lib import copy_record, scratch
@@ -96,8 +96,41 @@ def available(_repo: Path, _path: str) -> None:
 
 
 class CrateRunTests(CargoProjectTests):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-"))) / "seed"
+        fixture = cls(methodName="runTest")
+        environment = os.environ.copy()
+        try:
+            fixture.prepare_fixture()
+            cls.fixture_root = fixture.root
+            cls.fixture_environment = {key: value for key, value in os.environ.items()
+                                       if environment.get(key) != value}
+            fixture.authority.close()
+            _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
+        finally:
+            fixture.doCleanups()
+
     @override
     def setUp(self) -> None:
+        self.root: Path = self.fixture_root
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.repo: Path = self.root / "project"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
+        _ = self.base
+        _ = self.authority
+
+    def prepare_fixture(self) -> None:
+        """Build the complete initial state through the real fixture writers."""
         super().setUp()
         # Finish Git maintenance before the fixture removes its repositories.
         _ = self.git("config", "maintenance.autoDetach", "false")
