@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import fcntl
 import json
@@ -636,7 +638,7 @@ class StopResumeTests(unittest.TestCase):
         atomic_file.write_text_atomic(doc, f"# Production\n\n- **Merge branch:** `merge`\n"
             + f"- **Showrunner checkout:** `{fixture.root}`\n- **Log:** `log.md`\n\n## Units\n")
         owner = fixture_member("showrunner", name="owner", runtime_id=self.entry["session_id"],
-                               doc=staff.LiveDoc("natedev", doc))
+                               doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="unit", parent=owner.id)
         foreign = fixture_worker("foreign", unit.id)
         codex = fixture_worker("codex-own", owner.id, backend=staff.CodexBackend(fixture.root / "codex"))
@@ -1456,7 +1458,7 @@ class StopResumeTests(unittest.TestCase):
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             folder = self.root / "staff-folder"
-            _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", folder), expected=owner.worktree)
+            _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), folder), expected=owner.worktree)
             self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
             pane_record.write("agents", self.entry)
             record = pane_record.record_path("agents")

@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -25,8 +24,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff, unit_lookup
 from scripts.production.production_doc import Production, Refusal, read_production
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from merge_checkpoint import Stop, git, report as merge_report
+from scripts.production.merge_checkpoint import Stop, git, report as merge_report
 from scripts.direct import progress_history
 from scripts.lib.user_zone import user_zone
 

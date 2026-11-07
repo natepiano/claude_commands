@@ -16,7 +16,6 @@ from collections.abc import Callable, Generator, Sequence, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
@@ -29,13 +28,13 @@ from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-import rename
+from scripts.production import rename
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
-import unit_names
+from scripts.production import unit_names
 from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -268,7 +267,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.folder_git(self.checkout, "worktree", "add", "-b", "unit-branch", str(self.old_folder))
         parent = fixture_member("showrunner", name="production")
         fixed = fixture_member("unit", name="kept-name", parent=parent.id,
-                               worktree=staff.PresentWorktree("natedev", self.old_folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), self.old_folder))
         self.owner = staff.update_current_session(fixed.current_session,
             staff.native_id(fixture_runtime_id("folder-move-current")))
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
@@ -538,7 +537,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.env.update(STAFF_FILE=str(self.staff_file), STAFF_TEST_OWNER_FILE=str(self.staff_file))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc("natedev", self.doc))
+        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc(remote.local_machine(), self.doc))
         with staff.operation(), unit_move.production_lock():
             pass
 

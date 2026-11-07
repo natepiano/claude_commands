@@ -13,7 +13,6 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
 
 from scripts.aws_target import aws_target, config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
@@ -82,6 +81,52 @@ class ControlTests(ControlFixture):
         self.assertEqual(self.aws.count("start-instances"), 1)
         decision = ledger.CostLedger(self.state).read_snapshot().decision
         self.assertEqual(decision["status"], "allowed")
+
+    def test_queue_repository_hold_controls_whether_a_stopped_box_starts(self) -> None:
+        self.replace("start_after_wait_s", "1")
+        self.snapshot(self.waiter(101, age=2), self.waiter(102, age=2))
+        self.check_decline_demand()
+
+    def test_pinned_repository_hold_controls_whether_a_stopped_box_starts(self) -> None:
+        self.pinned_step()
+        self.check_decline_demand()
+
+    def test_queue_subdirectory_uses_the_repository_hold(self) -> None:
+        folder = self.root / "src/subdirectory"
+        folder.mkdir(parents=True)
+        first, second = self.waiter(101), self.waiter(102)
+        first["folder"] = second["folder"] = str(folder)
+        self.snapshot(first, second)
+        self.check_decline_demand()
+
+    def test_pinned_poll_updates_keep_the_repository_hold(self) -> None:
+        self.pinned_step()
+        row = cast(dict[str, object], json.loads(step_record.record_path("pinned").read_text()))
+        step_record.write_fields("pinned", {**row, "updated": "2026-01-15T12:00:01Z"})
+        self.check_decline_demand()
+
+    def check_decline_demand(self) -> None:
+        self.replace("version_decline_hold_s", "60")
+        controller = self.controller()
+        path = offload.linux_version_decline_path("aws", "hana")
+        other = offload.linux_version_decline_path("aws", "other")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("No subprocess expected")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No subprocess expected")),
+            mock.patch.object(offload, "expected_linux_parity", side_effect=AssertionError("No tool comparison expected")),
+        ):
+            for content, starts in ((str(self.clock.now - 10), False), (str(self.clock.now - 59), False),
+                                    (str(self.clock.now - 60), True), (None, True), ("unreadable", True)):
+                with self.subTest(content=content):
+                    self.aws.state = "stopped"
+                    self.aws.calls.clear()
+                    path.unlink(missing_ok=True)
+                    _ = other.write_text(str(self.clock.now))
+                    if content is not None:
+                        _ = path.write_text(content)
+                    self.assertEqual(controller.tick().state, "starting" if starts else "stopped")
+                    self.assertEqual(self.aws.count("start-instances"), int(starts))
 
     def test_pinned_step_cannot_start_capacity_when_either_spending_cap_refuses(self) -> None:
         self.pinned_step()

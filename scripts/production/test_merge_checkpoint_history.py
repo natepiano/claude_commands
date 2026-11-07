@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.shutdown import remote
+
 import json
 import os
 import unittest
@@ -10,11 +11,10 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
 from scripts.production.production_doc import read_production
 
@@ -39,7 +39,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.env["STAFF_FILE"] = str(record_path)
         with mock.patch.dict(os.environ, self.env):
             row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.unit), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.unit), expected=row.worktree)
             found = merge_checkpoint.merged_checkpoints(read_production("example"))
         self.assertEqual(found, (merge_checkpoint.MergedCheckpoint("alpha", "2", checkpoint),))
 

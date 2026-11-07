@@ -1,6 +1,8 @@
 """Run the real CLI on a synthetic production with isolated state and external tools."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import subprocess
@@ -155,7 +157,7 @@ class CliFixture(unittest.TestCase):
         })
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = fixture_member("showrunner", name="demo", runtime_id=OWNER_ID,
-                                   doc=staff.LiveDoc("natedev", self.doc))
+                                   doc=staff.LiveDoc(remote.local_machine(), self.doc))
             _ = staff.update_current_session(owner.current_session, staff.native_id(CURRENT_ID))
         _ = (self.root / "environment.json").write_text(json.dumps({
             key: value for key, value in self.env.items() if value != os.environ.get(key)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for pushover.py: keys, request fields, and outcomes, with no network."""
 
 from __future__ import annotations
@@ -106,6 +106,12 @@ class PushoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        binary = folder / "bin"
+        binary.mkdir()
+        claude = binary / "claude"
+        _ = claude.write_text("#!/bin/sh\nexit 99\n")
+        claude.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
         self.keys = folder / "env"
         _ = self.keys.write_text("# comment\nPUSHOVER_USER=u123\nPUSHOVER_TOKEN='a456'\n")
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", folder / "log"))

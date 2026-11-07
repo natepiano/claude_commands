@@ -1,6 +1,8 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 import json
@@ -18,7 +20,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import broadcast
@@ -585,7 +586,7 @@ class MessageTests(unittest.TestCase):
         )
         runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
         _ = unit_membership("show", "trunk")
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
             labeled_host("trunk", "w1:p1", "trunk", production_name="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
@@ -692,7 +693,7 @@ class MessageTests(unittest.TestCase):
 
 class PaneCountTests(StaffTestCase):
     def test_five_states_count_only_working_codex_and_name_uncertainty(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id, backend=staff.CodexBackend(self.root / "codex"))
         cases: tuple[tuple[worker_panes.WorkerPane, int, str], ...] = (
             (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.WORKING), 1, ""),
@@ -717,7 +718,7 @@ class PaneCountTests(StaffTestCase):
                 self.assertIn(reason, error.getvalue())
 
     def test_mesh_counts_keep_process_ownership_without_a_pane_read(self) -> None:
-        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id)
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "codex", "codex exec task")}
         with mock.patch.object(unit_runs, "parent_transport", return_value="mesh"), mock.patch.object(
