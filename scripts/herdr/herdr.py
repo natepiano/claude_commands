@@ -1157,8 +1157,9 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float, *, exp
 def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
     """The indexes of `titles` in the order the workspace `space` shows them.
 
-    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
-    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
+    Saved tabs keep their saved order. A new tab goes after the last placed tab with an equal
+    or lower rule: showrunner first, then unit directors A-Z, then other tabs A-Z.
+    The first tab stays first. `sort-tabs` ignores saved order.
     """
     showrunner_title = space
     if titles and not saved and space not in titles:
@@ -1172,7 +1173,8 @@ def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_direct
     for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
         # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
         start = 0 if titles[index] == space or not order else 1
-        at = next((place for place in range(start, len(order)) if rule(titles[order[place]]) > rule(titles[index])), len(order))
+        at = next((place + 1 for place in range(len(order) - 1, start - 1, -1)
+                   if rule(titles[order[place]]) <= rule(titles[index])), start)
         order.insert(at, index)
     return order
 

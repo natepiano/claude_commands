@@ -12,7 +12,7 @@ On the Mac, `staff.py` asks natedev over SSH.
 
 ## Staff identity and backends
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, and `doc`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
@@ -35,7 +35,13 @@ The refusal names the value and the production. A unit of another production doe
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
+Rows, locations, and pause records keep fields that the reader does not know in `unknown_fields`.
+Writes preserve these fields unchanged. Row changes also preserve them.
+The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+Changes from the Mac use the same owner setters.
+A new pause record starts with no unknown fields because it replaces the old record.
 Staff storage uses schema 2.
+A change that old code cannot read safely requires a new schema number.
 `staff_sources.live` emits observations with schema 3.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
 

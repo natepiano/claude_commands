@@ -1164,8 +1164,8 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh list must not read panes")):
             code, output, errors = self.command("list")
             self.assertEqual(code, 0, errors)
-            self.assertIn(f"{running.name} fix running repairing the reader", output)
-            self.assertIn(f"{done.name} review idle", output)
+            self.assertIn(f"1 {running.name} fix running repairing the reader", output)
+            self.assertIn(f"2 {done.name} review idle", output)
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
         rows = cast(list[dict[str, object]], json.loads(output))
@@ -1287,6 +1287,21 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
 
+    def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
+        self.assertEqual(self.command("list"), (0, "", ""))
+        self.assertEqual(self.dispatch("impl01"), worker.ExitCode.OK)
+        self.assertEqual(self.command("list"), (0, "1 impl01 impl OpenWorker done\n", ""))
+        for number in range(2, 11):
+            self.assertEqual(self.dispatch(f"impl{number:02}"), worker.ExitCode.OK)
+
+        code, output, errors = self.command("list")
+
+        self.assertEqual(code, 0, errors)
+        members = staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)
+        numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
+        self.assertEqual(output.splitlines(), [
+            f"{number} {row.name} impl OpenWorker done" for number, row in zip(numbers, members, strict=True)])
+
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")
         self.fixture.dispatch(opened.row, "review", completed=True)
@@ -1297,6 +1312,27 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["role"], "review")
         self.assertEqual(listing[0]["state"], "OpenWorker")
         self.assertEqual(listing[0]["activity"], "done")
+
+    def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        rows = [self.fixture.worker(name) for name in ("impl", "review", "test")]
+        for index, row in enumerate(rows, 1):
+            self.fixture.world.add(row, f"w1:p{index}")
+        runs = self.fixture.root
+        for name in ("ownerless-a", "ownerless-b"):
+            run = runs / name
+            run.mkdir(parents=True)
+            atomic_file.write_text_atomic(run / unit_runs.STATE_FILE, '{}')
+        with patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans:
+            code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(scans.call_count, 1)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual({item["name"] for item in listing}, {row.name for row in rows})
+        self.assertEqual(errors.splitlines(), [
+            f"anomaly: {runs / name}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+            for name in ("ownerless-a", "ownerless-b")])
 
     def test_restore_retains_the_same_native_session_and_reruns_unchanged(self) -> None:
         opened = self.opened()

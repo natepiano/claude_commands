@@ -707,8 +707,9 @@ def main(arguments: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps(listing))
             else:
-                for fields in listing:
-                    print(f"{fields['name']} {fields['role']} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+                width = len(str(len(listing)))
+                for number, fields in enumerate(listing, 1):
+                    print(f"{number:>{width}} {fields['name']} {fields['role']} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
             return ExitCode.OK
         if args.command == "check":
             observed = _read_workers(owner, record)
