@@ -14,8 +14,8 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import models_registry
+from scripts.direct import claude_worker
 from scripts.lib.test_models_registry import write_registry
-from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.lib.process_group import send_process_group
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
@@ -84,6 +84,36 @@ print("SENT: fixture")
 '''
 
 
+OPEN_WORKER = """from pathlib import Path
+import os, signal, sys
+from scripts.direct import claude_worker
+
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+name, run, cwd, prompt, summary, log, model, role, workers, native_id = sys.argv[1:]
+turn = claude_worker.ClaudeTurn(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log),
+    model, os.environ.get("TEST_WORKER_EFFORT", ""), os.environ.get("TEST_WORKER_ROLE", role),
+    os.environ.get("TEST_WORKER_STAFF_ID", ""), workers == "1", dict(os.environ))
+result = claude_worker.follow_up(turn, native_id) if native_id else claude_worker.open_worker(turn)
+if isinstance(result, claude_worker.NotDelivered):
+    raise SystemExit(result.code)
+"""
+WAIT_FOR_TURN = """
+if isinstance(result, claude_worker.Delivered):
+    raise SystemExit(claude_worker.wait_for_turn(turn, result))
+"""
+
+
+def worker_command(name: str, run: Path, cwd: Path, prompt: Path, summary: Path, log: Path,
+                   model: str = "", role: str = "", workers: bool = False, native_id: str = "") -> list[str]:
+    """Call the worker functions in a child with the fixture environment."""
+    return [str(CHECKOUT / "scripts/lib/py"), "-c", OPEN_WORKER, name, str(run), str(cwd), str(prompt), str(summary),
+            str(log), model, role, "1" if workers else "0", native_id]
+
+
+
 @dataclass
 class ClaudeWorkerFixture:
     unit: staff.StaffRow
@@ -98,8 +128,6 @@ class ClaudeWorkerFixture:
 
 
 class NativeClaudeWorkerTests(StaffTestCase):
-    inspect_linux_processes: bool = sys.platform == "linux"
-
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": os.environ.get("PATH", os.defpath),
@@ -135,8 +163,8 @@ class NativeClaudeWorkerTests(StaffTestCase):
         models = write_registry(self.root / "models.conf")
         self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
-            "CONF_DIR": str(CHECKOUT / "config"),
-            "CLAUDE_BIN": str(backend), "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
+            "CONF_DIR": str(CHECKOUT / "config"), "UNIT_WORKER_POLL_SECS": "0",
+            "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),
             "FIXTURE_REGISTRY_PATH": str(registry), "FIXTURE_REGISTRY_RECORD": json.dumps(record)}
@@ -150,25 +178,57 @@ class NativeClaudeWorkerTests(StaffTestCase):
         (self.fixture.run_dir / "mesh_roster.json").unlink(missing_ok=True)
 
     def command(self) -> list[str]:
-        return ["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "--run", str(self.fixture.run_dir),
-                "fresh-impl", str(self.fixture.work), str(self.fixture.prompt), str(self.root / "summary"),
-                str(self.root / "log"), "", "0"]
+        return worker_command("fresh-impl", self.fixture.run_dir, self.fixture.work,
+                              self.fixture.prompt, self.root / "summary", self.root / "log")
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
         self.fixture.sent.unlink(missing_ok=True)
-        command, launch_environment = backend_fixture_command(
-            self.root / "assign-parent", self.command(),
-            {**self.fixture.environment, **environment})
-        return subprocess.run(command, cwd=self.fixture.work, env=launch_environment, capture_output=True, text=True,
+        return subprocess.run(self.command(), cwd=self.fixture.work,
+                              env={**self.fixture.environment, **environment}, capture_output=True, text=True,
                               check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def backend_calls(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in self.fixture.backend_log.read_text().splitlines()]
 
+    def test_a_log_directory_uses_the_fallback_summary(self) -> None:
+        log = self.root / "log-directory"
+        log.mkdir()
+        summary = self.root / "summary"
+        turn = claude_worker.ClaudeTurn("fresh-impl", self.fixture.run_dir, self.fixture.work,
+            self.fixture.prompt, summary, log, "", "", "", "", False, self.fixture.environment)
+        backend = self.root / "claude"
+        _ = backend.write_text(backend.read_text().replace(
+            'if sys.argv[1] == "agents":',
+            'if sys.argv[1] == "agents":\n    print("[]")\n    raise SystemExit'))
+        delivered = claude_worker.open_worker(turn)
+        self.assertIsInstance(delivered, claude_worker.Delivered)
+        assert isinstance(delivered, claude_worker.Delivered)
+        self.assertEqual(claude_worker.wait_for_turn(turn, delivered), 0)
+        self.assertEqual(summary.read_text(), "The background agent fresh-impl produced no summary.\n")
+
+    def test_transcript_counts_ignore_null_messages_and_json_lists(self) -> None:
+        turn = claude_worker.ClaudeTurn("fresh-impl", self.fixture.run_dir, self.fixture.work,
+            self.fixture.prompt, self.root / "summary", self.root / "log", "", "", "", "", False,
+            self.fixture.environment)
+        self.assertIsInstance(claude_worker.open_worker(turn), claude_worker.Delivered)
+        projects = Path.home() / ".claude/projects/fixture"
+        projects.mkdir(parents=True, exist_ok=True)
+        transcript = projects / f"{self.fixture.identity}.jsonl"
+        _ = transcript.write_text('\n'.join((
+            '{"type": "assistant", "message": null}',
+            '[]',
+            '{"type": "assistant", "message": {"stop_reason": "end_turn"}}',
+            '{"type": "assistant", "message": {"stop_reason": "stop_sequence"}}',
+        )) + '\n')
+        delivered = claude_worker.follow_up(turn, self.fixture.identity)
+        self.assertIsInstance(delivered, claude_worker.Delivered)
+        assert isinstance(delivered, claude_worker.Delivered)
+        self.assertEqual(delivered.turns_before, 2)
+
     def test_claude_dispatch_records_the_task_role_before_delivery(self) -> None:
         for switched in (False, True):
             with self.subTest(switched=switched):
-                environment = {"AGENT_BG_ROLE": "impl"}
+                environment = {"TEST_WORKER_ROLE": "impl"}
                 if switched:
                     backend = staff.CodexBackend(self.root / "source-codex")
                     source = fixture_worker("fresh-impl", self.fixture.unit.id, backend=backend)
@@ -188,7 +248,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 self.clear_worker(row)
 
     def test_claude_consultation_without_a_role_preserves_the_assignment_history(self) -> None:
-        result = self.launch(AGENT_BG_ROLE="")
+        result = self.launch(TEST_WORKER_ROLE="")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
         self.assertEqual(history.assignments, {})
@@ -202,7 +262,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
             self.assertFalse(str(path).startswith("/proc/"), str(path))
             return read_text(path, encoding=encoding, errors=errors)
 
-        with patch.object(self, "inspect_linux_processes", False), patch.object(Path, "read_text", portable_read):
+        with patch.object(Path, "read_text", portable_read):
             self.test_claude_admission_ends_at_dispatch_acceptance_or_cancellation()
 
     def test_claude_admission_ends_at_dispatch_acceptance_or_cancellation(self) -> None:
@@ -223,12 +283,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 address = gate.bind_socket()
                 gate.listen()
                 gate.settimeout(TEST_HANG_GUARD_SECS)
-                command, environment = backend_fixture_command(
-                    self.root / "assign-parent", self.command(),
-                    {**self.fixture.environment, "FIXTURE_GATE": str(address), "AGENT_BG_DETACH": "0",
-                             "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
-                             "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
-                             "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))})
+                command = self.command()
+                command[2] += WAIT_FOR_TURN
+                environment = {**self.fixture.environment, "FIXTURE_GATE": str(address),
+                    "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
+                    "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
+                    "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))}
                 with subprocess.Popen(command, cwd=self.fixture.work, text=True, env=environment,
                         start_new_session=True,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) as launcher:
@@ -236,25 +296,14 @@ class NativeClaudeWorkerTests(StaffTestCase):
                         with gate.accept()[0] as delivery:
                             delivery.settimeout(TEST_HANG_GUARD_SECS)
                             launcher_pid = int(delivery.recv(32))
-                            coordinator = 0
-                            pipes: set[str] = set()
-                            if self.inspect_linux_processes:
-                                children = Path(f"/proc/{launcher_pid}/task/{launcher_pid}/children").read_text().split()
-                                coordinator = next(int(pid) for pid in children
-                                    if b"coordinate-claude" in Path(f"/proc/{pid}/cmdline").read_bytes())
-                                pipes = {os.readlink(f"/proc/{coordinator}/fd/{fd}") for fd in (0, 1)}
                             if cancel:
                                 os.kill(launcher_pid, signal.SIGTERM)
                             delivery.sendall(b"1")
                         if not cancel:
-                            for status in (b"busy", b"idle", b"idle"):
+                            for status in (b"busy", b"idle"):
                                 with gate.accept()[0] as turn:
                                     turn.settimeout(TEST_HANG_GUARD_SECS)
                                     _ = turn.recv(512)
-                                    if self.inspect_linux_processes:
-                                        self.assertFalse(Path(f"/proc/{coordinator}").exists())
-                                        descriptors = {os.readlink(path) for path in Path(f"/proc/{launcher_pid}/fd").iterdir()}
-                                        self.assertTrue(pipes.isdisjoint(descriptors), descriptors)
                                     turn.sendall(status)
                         output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
@@ -264,8 +313,6 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     self.assertEqual(launcher.returncode, 143 if cancel else 0, output + errors)
                 record = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
                 self.assertEqual(record["fresh-impl"]["dispatch_state"], "sending" if cancel else "accepted")
-                if self.inspect_linux_processes:
-                    self.assertFalse(Path(f"/proc/{coordinator}").exists())
                 row = staff.by_current_session(self.fixture.identity)
                 assert row is not None
                 self.assertEqual(json.loads(stopped.read_text()), old.to_json())
@@ -318,7 +365,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
 from pathlib import Path
 from scripts.message import sessions
 
-if sys.argv[1:2] == ["coordinate-claude"]:
+if len(sys.argv) > 1 and sys.argv[0] == "-c":
     read_registry = sessions.read_registry
     read_count = 0
     def delayed_registry():

@@ -591,10 +591,7 @@ def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
     """Running director candidates, newest first, including sessions without sockets."""
     from scripts.message import sessions
 
-    return sorted(
-        (item.record for item in registry.entries if sessions.running_session(item.record)),
-        key=lambda session: session["updatedAt"], reverse=True,
-    )
+    return sessions.running_records(registry)
 
 
 def resolve_live_unit_director(

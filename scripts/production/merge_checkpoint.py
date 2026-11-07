@@ -781,8 +781,15 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
         _ = good(git(checkout, "fetch", "origin", "main"), "push")
         main = git(checkout, "rev-parse", "origin/main")
         if main.returncode == 0 and git(checkout, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
-            _ = good(git(checkout, "merge", "--no-ff", "-m",
-                         "Merge origin/main into " + production.merge_branch, "origin/main"), "push")
+            merged = git(checkout, "merge", "--no-ff", "-m",
+                         "Merge origin/main into " + production.merge_branch, "origin/main")
+            if merged.returncode:
+                conflicts = good(git(checkout, "diff", "--name-only", "--diff-filter=U"), "push")
+                _ = good(git(checkout, "merge", "--abort"), "push")
+                if conflicts:
+                    raise Stop("push", "held", "origin/main conflicts: " + ", ".join(conflicts.splitlines()),
+                               "merge origin/main into the merge branch, resolve the conflict, and run the push again")
+                _ = good(merged, "push")
         tip = good(git(checkout, "rev-parse", "HEAD"), "push")
         _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
     except Stop:
@@ -1723,10 +1730,10 @@ def main() -> int:
             with merge_lock(handoff.production.checkout, handoff.production.name):
                 return run_handoff(handoff)
         except Stop as error:
-            if error.state == "cancelled":
+            if error.state in ("cancelled", "held"):
                 report(error.step, error.state, error.detail.replace("\n", "; "))
                 print(error.message, flush=True)
-                return TREE_CHANGED_STATUS
+                return TREE_CHANGED_STATUS if error.state == "cancelled" else 1
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
         except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:

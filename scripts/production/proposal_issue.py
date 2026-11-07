@@ -288,9 +288,10 @@ def staff_name(identity: str) -> str:
 
 
 def proposal_unit(issue: Issue) -> str:
-    """Read the unit id from the proposal's stored staff id."""
+    """Read the current unit name from the proposal's stored staff id."""
     identity = issue.value("unit")
-    return staff_reference(identity, "unit").name if identity else ""
+    row = staff.snapshot().by_id(staff.StaffId(identity))
+    return row.name if row is not None else ""
 
 
 def calling_showrunner() -> str:
