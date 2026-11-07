@@ -45,7 +45,10 @@ from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.lib.conf import UseConfiguredValue
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.remote_test_support import local_remote_transport
 from scripts.lib import conf
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.agents import worker_lifecycle
 from scripts.direct import workers
 
@@ -119,9 +122,9 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retire_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
-        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
             pass
-        with copies.standing("other-unit", self.checkout, "HEAD") as other:
+        with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
             pass
         with copies.workspace(
             "alpha", self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
@@ -133,8 +136,24 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(workspace.exists())
         self.assertTrue(other.exists())
 
+    def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
+        _ = write_config_fixture(self.root / "scratch.conf")
+        _ = git(self.worktree, "rm", "Cargo.toml")
+        _ = git(self.worktree, "commit", "-qm", "remove the root build manifest")
+        _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
+        _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
+        with copies.standing("alpha", self.worktree, copies.CommittedSource("HEAD")) as tree:
+            self.assertTrue(tree.is_relative_to(Path(os.environ["SCRATCH_ROOT"])))
+            self.assertEqual(copies.owned_trees("alpha").standing, ())
+            self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
+        self.assertFalse(tree.exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(copies.owned_trees("alpha").standing, ())
+
     def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
-        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertIn("busy", output)
@@ -142,7 +161,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(self.worktree.exists())
 
     def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
-        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertIn("busy", output)
@@ -153,7 +172,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retirement_dry_run_lists_trees_and_workspaces_without_changes(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
-        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+        with copies.standing("alpha", self.checkout, copies.CommittedSource("HEAD")) as tree:
             pass
         with copies.workspace("alpha", self.checkout, "HEAD", name="worker", branch="worker") as workspace:
             pass
@@ -282,18 +301,13 @@ class RetireUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.limits()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root),
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
-        }))
+        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -302,6 +316,7 @@ class RetireUnitTests(unittest.TestCase):
                            capture_output=True)
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
+        _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n")
         self.worktree = self.root / "alpha-wt"
         self.doc = self.checkout / "alpha-production.md"
         _ = self.doc.write_text(
@@ -337,9 +352,9 @@ class RetireUnitTests(unittest.TestCase):
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         _ = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
-        production = read_production(self.doc)
+        production = read_production("alpha")
 
-        def production_of(_slug: str, *, record: staff.StaffSnapshot) -> Production:
+        def production_of(_production_name: str, *, record: staff.StaffSnapshot) -> Production:
             del record
             return production
 
@@ -356,7 +371,7 @@ class RetireUnitTests(unittest.TestCase):
             owner = next((item for item in self.claude if item["sessionId"] == session_id), None)
             if owner:
                 return sessions.LiveSessionProcess(owner["pid"])
-            marked = unit_lookup.labeled_session("alpha", "alpha-unit")
+            marked = unit_lookup.labeled_session("alpha", "alpha")
             if marked and isinstance(marked.claude, unit_lookup.LiveClaude) and marked.claude.session_id == session_id:
                 return sessions.LiveSessionProcess(marked.claude.pid)
             return sessions.SessionNotLive()
@@ -368,7 +383,7 @@ class RetireUnitTests(unittest.TestCase):
                                                        "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
         roster: dict[str, object] = {}
         home = self.root / "codex"
-        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha"))
         with store.locked() as ledger:
             for name, status in (("alpha-impl", "running"), ("alpha-old", "ended")):
                 row = fixture_worker(name, self.unit_staff_id, backend=staff.CodexBackend(home))
@@ -385,9 +400,9 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", session_liveness))
         self.marked = unit_lookup.LabeledSession(
-            "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
+            "alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
-        def labeled_session(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
+        def labeled_session(_production_name: str, _name: str) -> unit_lookup.LabeledSession | None:
             return self.marked
 
         self.config = self.root / "config"
@@ -395,7 +410,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(mock.patch.object(staff_pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude", "-n", "alpha"]))
+            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del deadline
             # Existing cases launch Claude with exec: it replaces the pane's shell.
@@ -578,7 +593,7 @@ class RetireUnitTests(unittest.TestCase):
             ["stop_resume.stop", SEAT],
             ["build_hold.py", "release", "--holder", DIRECTOR],
         ])
-        self.assertIn("alpha-unit retired", output)
+        self.assertIn("alpha retired", output)
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
         row = staff.by_id(self.unit_staff_id)
         assert row is not None
@@ -620,6 +635,44 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
+
+    def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
+        owner = copies.source_owner(self.worktree)
+        with copies.standing(owner, self.worktree, copies.CommittedSource("HEAD")) as checkout:
+            self.assertTrue(checkout.exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(checkout.exists())
+
+    def test_retirement_removes_only_its_remote_mirrors(self) -> None:
+        mine = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        other = copies.RemoteMirror("beta-unit", copies.SelectedRepository("hana"), "mac", "mirror/beta", "beta-session")
+        with fake_remote_removal((mine, other)) as remove:
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        remove.assert_called_once_with(mine)
+        self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
+
+    def test_retirement_refuses_a_busy_remote_mirror_before_worktree_removal(self) -> None:
+        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
+        copies.register_remote(mirror)
+        with copies.remote_lease(mirror):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("alpha-session", output)
+        self.assertIn("mirror/alpha", output)
+        self.assertTrue(self.worktree.exists())
+        self.assertTrue(copies.remote_record_path(mirror).exists())
+
+    def test_retirement_removes_an_idle_remote_mirror_through_the_remote_command(self) -> None:
+        mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac",
+                                     str(self.root / "mirrors/alpha"), "alpha-session")
+        with local_remote_transport(self.root):
+            self.assertEqual(publish_mirror(mirror), 0)
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(Path(mirror.path).exists())
+        self.assertFalse(copies.remote_record_path(mirror).exists())
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from scripts.lint import memory_admit as gate
 
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -115,8 +116,9 @@ class ObservedAdmissionServer(service.AdmissionServer):
 
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
-                 check_access: Callable[[str], None]) -> None:
+                 check_access: Callable[[str], None], before_admission: Callable[[], None]) -> None:
         self.check_access: Callable[[str], None] = check_access
+        self.before_admission: Callable[[], None] = before_admission
         super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path)
 
     @override
@@ -148,10 +150,24 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def handle_request(self, request: wire.Request,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
         self.check_access("handle_request")
-        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and isinstance(self.proc, TestProcesses):
-            self.proc.register(request.owner)
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
+            self.before_admission()
+            if isinstance(self.proc, TestProcesses):
+                self.proc.register(request.owner)
         return super().handle_request(request, connection)
 
+    def caller_live(self, scenery: set[str]) -> bool:
+        """Use the service lifetime rules for caller reservations, waiters, and slots."""
+        for record in self.reservations.values():
+            if (record.reservation_id not in scenery
+                    and not isinstance(self.proc.lifetime(service.reservation_row(record), self._live(record.owner)), gate.EndedStep)):
+                return True
+        if any(self._live(waiting.request.owner) for waiting in self.waiters.values()):
+            return True
+        return any(gate.between_steps(slot).reservation not in scenery
+                   and gate.slot_in_force(slot, self.clock.now())
+                   and self._run_alive(gate.between_steps(slot).run)
+                   for slot in self.slots.values())
 
     @contextmanager
     def silent_replies(self) -> Generator[None]:
@@ -294,7 +310,8 @@ class SocketPeer:
 
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
-    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None) -> None:
+    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
+                 skip_idle_spacing: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
@@ -310,6 +327,7 @@ class AdmissionFixture(ExitStack):
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"
         self.scenery_reservations: set[str] = set()
+        self.skip_idle_spacing: bool = skip_idle_spacing
         self.clock: FakeClock = FakeClock()
         self.fault: Faults = Faults()
         self.proc: TestProcesses = TestProcesses(self.root / "proc")
@@ -347,7 +365,8 @@ class AdmissionFixture(ExitStack):
 
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
-                                         fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn)
+                                         fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn,
+                                         before_admission=self.advance_idle_spacing)
         if start:
             server.start()
         return server
@@ -521,10 +540,47 @@ class AdmissionFixture(ExitStack):
         return wire.LaunchRequest(request.episode, request.owner, request.since,
                                   request.identity, request.profile, code_version=request.code_version)
 
+    def service_request(self, *, runner: str = "runner-a", job: str = "compile",
+                        owner: wire.Owner | None = None) -> wire.ServiceEstimateRequest:
+        """Request a service estimate without a client profile or history read."""
+        from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
+
+        owner = owner or self.proc.spawn()
+        sidecar = self.root / f"runner-{owner.pid}.cgroup"
+        _ = sidecar.write_text("")
+        return wire.ServiceEstimateRequest(f"uid:{os.getuid()}:ci-{owner.pid}", owner,
+            ("cargo", "build"), str(self.root), self.clock.now(), str(sidecar),
+            records.RepositoryIdentity("fixture-repository", "fixture"), str(self.root), runner, job,
+            code_version=LOADED_ADMISSION_CODE_VERSION)
+
+    def account_owner(self, uid: int) -> wire.Owner:
+        """Supply an account identity through the private process status reader."""
+        owner = self.proc.spawn()
+        status = self.proc.path / str(owner.pid) / "status"
+        _ = status.write_text(status.read_text() + f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        return owner
+
+    @contextmanager
+    def peer_account(self, uid: int) -> Generator[None]:
+        """Select credentials at the socket boundary without a real runner account."""
+        with mock.patch.object(service, "peer_uid", return_value=uid):
+            yield
+
     def connect(self, request: wire.Request | str) -> SocketPeer:
         peer = SocketPeer(self, request)
         _ = self.callback(peer.close)
         return peer
+
+    def completed_queue_change(self, request: wire.Request) -> list[wire.Reply]:
+        """Run the private loop until this change replies through its socket."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.connect(str(self.socket_path))
+            peer.sendall(wire.encode_request(request).encode())
+            with self.loop_turn():
+                while not select.select([peer], [], [], 0)[0]:
+                    self.server.run_once(float("inf"))
+            with peer.makefile("rb") as stream:
+                return [wire.parse_reply(stream.readline())]
 
     def occupy_host(self) -> wire.Admitted:
         """Keep one measured run active without another memory keep-aside."""
@@ -565,9 +621,15 @@ class AdmissionFixture(ExitStack):
 
     def allow_next_start(self) -> None:
         """Move the fake clock to the next permitted new start."""
-        spacing = self.server.spacing
-        if isinstance(spacing, gate.NextStartAt) and spacing.at > self.clock.now():
-            self.clock.advance(spacing.at - self.clock.now())
+        with self.loop_turn():
+            spacing = self.server.spacing
+            if isinstance(spacing, gate.NextStartAt) and spacing.at > self.clock.now():
+                self.clock.advance(spacing.at - self.clock.now())
+
+    def advance_idle_spacing(self) -> None:
+        """Skip start spacing without changing the clock when no caller remains live."""
+        if self.skip_idle_spacing and not self.server.caller_live(self.scenery_reservations):
+            self.server.spacing = gate.ReadyToStart()
 
     def free(self, available: int) -> None:
         _ = fake_memory_readings(self.root, available_kib=available // 1024,
@@ -768,13 +830,17 @@ def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "ne
 _caller_services: dict[str, AdmissionFixture] = {}
 
 
-def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str]) -> AdmissionFixture:
+def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str],
+                     *, skip_idle_spacing: bool = True) -> AdmissionFixture:
     """Use the one server for existing caller fixtures and their child processes."""
     existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
     if existing is not None and existing.root == root and not existing.server.closed:
+        if not skip_idle_spacing:
+            existing.skip_idle_spacing = False
         return existing
     _ = test.enterContext(LauncherHangGuard(test.id()).protect())
-    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
+    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"]),
+                                               skip_idle_spacing=skip_idle_spacing))
     _caller_services[str(fixture.socket_path)] = fixture
     test.addCleanup(_caller_services.pop, str(fixture.socket_path))
     fixture.clock.epoch = time.time()

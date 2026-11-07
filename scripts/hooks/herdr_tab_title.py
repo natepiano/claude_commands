@@ -86,7 +86,12 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
         print(f"herdr title: no staff row for current session {session_id}.", file=sys.stderr)
     if not name:
         return False
-    return herdr.Herdr(shared).retitle(pane, name)
+    client = herdr.Herdr(shared)
+    panes = client.panes()
+    tab = next((item.get("tab_id") for item in panes if item["pane_id"] == pane), None)
+    if any(item["pane_id"] != pane and item.get("tab_id") == tab for item in panes):
+        return False
+    return client.retitle(pane, name)
 
 
 def main() -> int:

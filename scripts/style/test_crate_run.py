@@ -101,6 +101,9 @@ class CrateRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Finish Git maintenance before the fixture removes its repositories.
+        _ = self.git("config", "maintenance.autoDetach", "false")
+        _ = self.git("config", "gc.autoDetach", "false")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="style-fixture")
         self.enterContext(mock.patch.dict(os.environ, {
@@ -155,7 +158,7 @@ class CrateRunTests(CargoProjectTests):
         _ = self.authority.ticket_base("1001")
         for index, path in enumerate(paths):
             proposal = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
-            _ = proposal.write_text("---\nunit: approved-unit\nplan: approved-plan\n---\nApproved rename\n")
+            _ = proposal.write_text("---\nunit: approved\nplan: approved-plan\n---\nApproved rename\n")
             source = (self.repo / path).read_text()
             finding = self.authority.hold(self.definition.rule_id, path, 2, source.splitlines()[1],
                                           "rename", "old", "number", self.definition.blob, "1001")

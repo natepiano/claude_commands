@@ -1,13 +1,14 @@
 """The compact queue view and the checks shared with one-step cards."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache, cached_property
-from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_evidence
+from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
+    eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
@@ -142,44 +143,10 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
     return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
 
 
-def eligible_head_position(waiting: Sequence[gate.WaitingStep]) -> int:
-    """Position of the first row eligible for the head rule; requires an eligible row."""
-    return next(place for place, step in enumerate(waiting, 1)
-                if not isinstance(step.reason, gate.TokenWaitingWaiter))
 
 
-def behind_place(reason: gate.BehindHead, waiting: Sequence[gate.WaitingStep]) -> int:
-    """Find the captured position of the step that holds this waiter."""
-    return next((place for place, step in enumerate(waiting, 1)
-                 if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
 
 
-def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
-    match reason:
-        case gate.TokenWaitingWaiter():
-            return "waiting for the cargo token"
-        case gate.EstimateExpired():
-            return "estimate expired"
-        case gate.ReadingUnavailable():
-            return reason.reason
-        case gate.MemoryPressure():
-            return "memory pressure"
-        case gate.PressureUnavailable():
-            return reason.reason
-        case gate.StartSpacingWait():
-            return "start spacing"
-        case gate.NeedsMemory():
-            return "free memory"
-        case gate.BehindHead():
-            place = behind_place(reason, waiting)
-            return f"behind #{place}" if place else "behind the first step"
-        case gate.ReadyForAdmission():
-            return "starts at the next check"
-        case gate.HeadAdmissionStatus():
-            return (f"#{eligible_head_position(waiting)}'s turn" if isinstance(reason.cause, gate.ReadyForAdmission)
-                    else reason_phrase(reason.cause, waiting))
-        case _:
-            assert_never(reason)
 
 
 def bar_eighths(gib: float, cap: float) -> int:
@@ -224,13 +191,14 @@ def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colo
     cells = max(1, min(width, (total + gate.GIB - 1) // gate.GIB))
     scale = total / cells
     cap_at = min(cells - 1, max(0, int(room.cap / scale)))
-    kept_end = min(room.cap, room.used + room.kept)
+    used = room.cap_use
+    kept_end = min(room.cap, used + room.kept)
     result: list[Span] = []
     for cell in range(cells):
         point = (cell + 0.5) * scale
         if cell == cap_at:
             result.append(Span("│", "error"))
-        elif point < min(room.used, room.cap):
+        elif point < min(used, room.cap):
             result.append(Span("█", "suggestion"))
         elif point < kept_end:
             result.append(Span("░", "warning"))
@@ -353,7 +321,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
-        show = field(identity.showrunner) or "—"
+        show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         unit = unit or "—"
         return show, unit, bool(bumped_unit and identity.unit == bumped_unit)

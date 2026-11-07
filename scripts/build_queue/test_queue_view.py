@@ -11,12 +11,13 @@ import unittest
 from typing import Self, cast, override
 from unittest import mock
 
-from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, NotServiceSlice
+from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
+    ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
 from scripts.build_queue.queue_lines import json_form, plain, wrap
@@ -43,6 +44,23 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
 
 
 class QueueViewTests(QueueFixtureTests):
+
+    def test_ci_reservation_label_comes_from_configuration_and_runner_identity(self) -> None:
+        with AdmissionFixture() as admission:
+            write_memory_config(admission.root / "build_admission.conf", ci_label="CI {runner} {job}")
+            request = admission.service_request(runner="a", job="job")
+            grant = only_admitted(admission.server.handle_request(request))
+            _ = admission.run_pass()
+            reply, = admission.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(reply, wire.ViewReply)
+            if isinstance(reply, wire.ViewReply):
+                row, = [row for row in reply.reading.view.running if row.pid == request.owner.pid]
+                self.assertEqual(row.session_name, "CI a job")
+                model = replace(self.fixture.model(), reading=reply.reading,
+                    facts=head_facts.read_head_facts(reply.reading))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn("CI a job", text)
+            admission.release(grant)
 
     @override
     def setUp(self) -> None:
@@ -227,7 +245,7 @@ class QueueViewTests(QueueFixtureTests):
                     self.assertEqual(len(rows), 1)
                     row, = rows
                     self.assertIn("idle", row)
-                    self.assertIn("0.1", row)
+                    self.assertIn("92 MiB RAM", row)
                     self.assertIn("swap", row)
                     self.assertIn("2.0", row)
                     self.assertNotIn("min", row)
@@ -477,9 +495,9 @@ class QueueViewTests(QueueFixtureTests):
             labels = {first.identity.session_id: UnitLabels("first", "builds", "other-unit"),
                       later.identity.session_id: UnitLabels("gate", "builds", "wrong-unit")}
             with mock.patch.object(gate, "priority_labels", return_value=labels):
-                refused, = fixture.server.handle_request(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
+                refused, = fixture.completed_queue_change(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
                 self.assertIsInstance(refused, wire.Refused)
-                replies = fixture.server.handle_request(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
+                replies = fixture.completed_queue_change(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
                 self.assertEqual(replies, [wire.Ok()])
                 model = self.service_model(fixture)
                 self.assertEqual([step.pid for step in model.reading.view.waiting], [later.owner.pid, first.owner.pid])
@@ -517,7 +535,7 @@ class QueueViewTests(QueueFixtureTests):
         with AdmissionFixture() as fixture:
             request = fixture.request(step="merge-gate")
             request = replace(request, identity=wire.Identity("gate-owner", "gate-worker", "", str(fixture.root)),
-                profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)),
+                profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(6 * gate.GIB, gate.FirstProgramPeak(6 * gate.GIB), 0.0)),
                 sidecar=str(fixture.scope(request.owner)))
             _ = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(7 * 60)
@@ -957,6 +975,27 @@ class CapViewTests(QueueFixtureTests):
             "Cap 22.0 GiB; anonymous use 5.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB")
         self.assertEqual(queue_evidence.keep_aside_text(room.runs[0]),
             "need 10.0 GiB; anonymous use 5.0 GiB; held slot 0.0 GiB; kept aside 5.0 GiB")
+
+    def test_view_and_cap_bar_include_ci_use_in_the_shared_cap(self) -> None:
+        model = self.fixture.cap_model()
+        policy = admission_policy_fixture()
+        inputs = self.fixture.inputs(policy=policy)
+        run = replace(inputs.running[0], promise=10 * gate.GIB,
+                      measured=gate.MeasuredMemory(5 * gate.GIB, anonymous=gate.AnonymousRunUse(5 * gate.GIB)))
+        ci = ci_step(4 * gate.GIB, RunningServiceJob(NOW - 60))
+        inputs = replace(inputs, running=(run, ci),
+            reservations=({**inputs.reservations[0], "need": 10 * gate.GIB},),
+            host=gate.HostMemory(20 * gate.GIB, 60 * gate.GIB))
+        reading = gate.queue_read_from(inputs, policy)
+        room = reading.explanation.room
+        assert isinstance(room, gate.MemoryRoom)
+        shown = plain(queue_view.render_view(replace(model, reading=reading), 140))
+        self.assertIn("cap 26.0", shown)
+        self.assertIn("Cap 26.0 GiB", queue_evidence.room_text(room))
+        bar = queue_view.cap_bar(room, 60, colour=True)
+        self.assertEqual(plain([bar[:9]]), "█" * 9)
+        self.assertEqual([span.tone for span in bar],
+            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)

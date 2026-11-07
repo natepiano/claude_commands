@@ -19,9 +19,7 @@ Workers keep their threads.
 `resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
 The executable is `scripts/shutdown/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
-The installation link belongs in `~/.local/bin` after merge.
 
-One `LaunchNames.read()` supplies the staff snapshot for lookup, labels, and restore.
 The lookup accepts a short name, a staff id, or a current session id.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
@@ -69,13 +67,58 @@ Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
 
-`move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
+`move_sessions` writes each session request before the stops, then records its confirmed or failed outcome in the accounts moves log.
+Each attempt has its own move ID and cause.
+Handed-off callers and sessions already on the target write nothing.
+
+`move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
 Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
 The watchdog does not read shutdown session records.
+
+## Worker resume results
+
+A session move selects only worker rows whose staff `parent` names the moved row.
+Owning a run does not select every worker in that run.
+The fixed staff ID identifies each child once, even when several runs name it.
+
+`inventory.worker_resumes` returns `WorkerResume` values from `resume_message.py`.
+Each child has one result:
+
+| Result | Evidence | Message |
+|---|---|---|
+| `Resumable` | The child's turn was live | The unchanged command from `resume_worker_command` |
+| `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
+| `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
+
+The reader takes one assignment-log snapshot and finds each child's newest run with a real worker record.
+A Codex roster record takes precedence over a slot record for the same worker in one run.
+A Claude worker uses its `impl_worker_<slot>.json` record and the matching status file.
+The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
+A readable non-live roster status, including `capacity_exhausted`, gives `Idle`.
+An unavailable child does not hide another child's result.
+
+`session_staff.worker_run_entries(snapshot, rows)` returns real `(run, entry)` pairs.
+`worker_run_index(snapshot)` also includes owner-marker runs without a worker record.
+Source release uses those marker runs to find loaded threads.
+Both readers share one scan and report unreadable evidence as anomalies.
+`unit_runs.run_folders` preserves root and name order, removes duplicate resolved paths, and skips each root's `active` marker folder.
+An unreadable root does not prevent reads of other roots.
+
+## Launch names
+
+`LaunchNames.read()` supplies one staff snapshot for lookup, labels, and restore.
+The Mac obtains that snapshot from the staff owner through one SSH read.
+The native session ID selects the staff row and its current name.
+An unavailable staff read preserves the saved launch name and prints a diagnostic.
+An empty name does not clear an existing title.
+Restore updates a stale tab title even when its pane title already matches.
+A resume resolves the saved staff reference to its current native session.
+Saved launch marks contain no copied `STAFF_ID`.
+The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
 

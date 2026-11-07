@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
@@ -172,7 +171,7 @@ class IsolatedHookTests(unittest.TestCase):
         })
 
     def run_python(self, arguments: list[str], payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, *arguments], input=json.dumps(payload),
+        return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), *arguments], input=json.dumps(payload),
                               text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                               env=self.environment, cwd=self.root)
 

@@ -18,7 +18,7 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         initial = self.cargo_calls()[0]
         checkout = Path(initial["cwd"])
-        self.assertTrue(checkout.is_relative_to(self.root / "target/verify-doc"))
+        self.assertTrue(checkout.is_relative_to(self.root / "home/worktrees/gates"))
         self.assertEqual(initial["target"], str(self.root / "target"))
         self.assertTrue((checkout / "deleted.txt").is_file())
         # Set a distinct old mtime: this proves preservation without a sleep or

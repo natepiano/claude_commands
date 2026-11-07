@@ -131,7 +131,7 @@ class RegistrationTests(RegistrationFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunner_tree, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
-            registration.open_items(read_production(self.doc))
+            registration.open_items(read_production("example"))
         self.assertIn(full, output.getvalue())
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())

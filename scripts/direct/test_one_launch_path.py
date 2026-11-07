@@ -8,6 +8,11 @@ import re
 import shlex
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from scripts.direct.progress_history import DispatchDetailNotRecorded, RecordedDispatch
+from scripts.lib import resume_message
+from scripts.lib.resume_message import PausedSeat
 
 from scripts.lib.code_kind import is_test_code
 
@@ -33,8 +38,23 @@ def starts_worker(words: list[str]) -> bool:
 
 def python_commands(source: str) -> list[tuple[int, list[str]]]:
     tree = ast.parse(source)
-    assignments = {target.id: node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                   for target in node.targets if isinstance(target, ast.Name)}
+    assignments: dict[str, ast.expr] = {}
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            assignments.update((target.id, node.value) for target in node.targets if isinstance(target, ast.Name))
+        elif isinstance(node, ast.Import):
+            imports.update((alias.asname or alias.name.split(".")[0],
+                            alias.name if alias.asname else alias.name.split(".")[0]) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            imports.update((alias.asname or alias.name, f"{node.module}.{alias.name}") for alias in node.names)
+
+    def called_name(node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return imports.get(node.id, "")
+        if isinstance(node, ast.Attribute) and (base := called_name(node.value)):
+            return f"{base}.{node.attr}"
+        return ""
 
     def word(node: ast.AST, seen: frozenset[str] = NO_REFERENCES) -> str:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -49,8 +69,17 @@ def python_commands(source: str) -> list[tuple[int, list[str]]]:
             return "".join(word(part, seen) for part in node.values)
         return ""
 
-    return [(node.lineno, [word(element) for element in node.elts])
-            for node in ast.walk(tree) if isinstance(node, (ast.List, ast.Tuple))]
+    commands: list[tuple[int, list[str]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            commands.append((node.lineno, [word(element) for element in node.elts]))
+        elif isinstance(node, ast.Call) and called_name(node.func) == "scripts.agents.codex_mesh.main":
+            arguments = node.args[0] if node.args else next((item.value for item in node.keywords if item.arg == "argv"), None)
+            if isinstance(arguments, ast.Name):
+                arguments = assignments.get(arguments.id, arguments)
+            if isinstance(arguments, (ast.List, ast.Tuple)):
+                commands.append((node.lineno, ["codex_mesh.py", *(word(element) for element in arguments.elts)]))
+    return commands
 
 
 def shell_commands(source: str) -> list[tuple[int, list[str]]]:
@@ -95,12 +124,17 @@ def forbidden_launches(root: Path) -> list[str]:
                  and Path(words[0]).name in {"py", "python", "python3"}
                  and Path(words[1]).name == "assign_gate.py"]
         if relative in GATED_HOPS and starts and gates and min(gates) < min(starts):
-            continue
+            starts = [line for line, words in commands if line in starts
+                      and any(Path(word).name == "codex_mesh.py" for word in words)]
         found.extend(f"{relative}:{line}" for line in starts)
     return sorted(set(found))
 
 
 class OneLaunchPathTests(unittest.TestCase):
+    def test_scan_reports_calls_and_sequences_in_traversal_order(self) -> None:
+        commands = python_commands('from scripts.agents import codex_mesh\ncodex_mesh.main(["start"])\nsend(["codex_mesh.py", "follow"])')
+        self.assertEqual([line for line, words in commands if starts_worker(words)], [2, 3])
+
     def test_only_assign_starts_or_follows_workers(self) -> None:
         found = forbidden_launches(ROOT)
         self.assertFalse(found, "Worker launch commands must use assign.sh:\n" + "\n".join(found))
@@ -120,6 +154,34 @@ class OneLaunchPathTests(unittest.TestCase):
                     _ = (root / "caller.sh").write_text(f'AGENT_BG_ROLE=impl bash "${{DIR}}/{launcher}" --to worker\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:1", "caller.sh:1"])
 
+    def test_scan_catches_in_process_worker_launches_and_keeps_nonlaunch_verbs_open(self) -> None:
+        forms = (
+            ('from scripts.agents import codex_mesh', 'codex_mesh.main(["{verb}"])'),
+            ('import scripts.agents.codex_mesh', 'scripts.agents.codex_mesh.main(["{verb}"])'),
+            ('import scripts.agents.codex_mesh', 'scripts.agents.codex_mesh.main(argv=["{verb}"])'),
+            ('from scripts.agents import codex_mesh', 'codex_mesh.main(argv=["{verb}"])'),
+            ('import scripts.agents.codex_mesh as mesh', 'mesh.main(argv=["{verb}"])'),
+            ('from scripts.agents.codex_mesh import main as launch', 'launch(argv=["{verb}"])'),
+            ('import scripts.agents.codex_mesh as mesh', 'mesh.main(["{verb}"])'),
+            ('from scripts.agents.codex_mesh import main as launch', 'launch(["{verb}"])'),
+            ('from scripts.agents import codex_mesh as mesh', 'arguments = ["{verb}"]\nmesh.main(arguments)'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for imports, call in forms:
+                for verb in (*sorted(MESH_STARTS), "end", "send", "list"):
+                    with self.subTest(call=call, verb=verb):
+                        source = imports + "\n" + call.format(verb=verb) + "\n"
+                        path = root / "caller.py"
+                        _ = path.write_text(source)
+                        self.assertEqual(forbidden_launches(root),
+                                         [f"caller.py:{len(source.splitlines())}"] if verb in MESH_STARTS else [])
+                        allowed = root / "scripts/direct/assign.py"
+                        allowed.parent.mkdir(parents=True, exist_ok=True)
+                        path.unlink()
+                        _ = allowed.write_text(source)
+                        self.assertEqual(forbidden_launches(root), [])
+
     def test_hops_require_the_gate_before_the_first_start(self) -> None:
         gate = '"/repo/scripts/lib/py" "/repo/scripts/direct/assign_gate.py"\n'
         for relative in (*sorted(GATED_HOPS), "other.sh"):
@@ -131,7 +193,8 @@ class OneLaunchPathTests(unittest.TestCase):
                     path = root / relative
                     path.parent.mkdir(parents=True, exist_ok=True)
                     _ = path.write_text(gate + start)
-                    self.assertEqual(forbidden_launches(root), [] if relative in GATED_HOPS else [f"{relative}:2"])
+                    allowed = relative in GATED_HOPS and "codex_mesh.py" not in start
+                    self.assertEqual(forbidden_launches(root), [] if allowed else [f"{relative}:2"])
                     _ = path.write_text(start)
                     self.assertEqual(forbidden_launches(root), [f"{relative}:1"])
                     _ = path.write_text(start + gate + start)
@@ -163,6 +226,53 @@ class OneLaunchPathTests(unittest.TestCase):
             _ = (root / "inspect.sh").write_text(
                 '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')
             self.assertEqual(forbidden_launches(root), [])
+
+
+class ResumeAssignmentTests(unittest.TestCase):
+    def test_saved_shell_commands_resume_through_assign_with_their_role_and_phase(self) -> None:
+        for launcher, role, arguments in (
+            ("implement.sh", "impl", ["impl", "the task", "impl", "writing", "0", "impl"]),
+            ("implement.sh", "fix", ["fix", "the repair", "fix", "repairing", "1", "impl"]),
+            ("review.sh", "review", ["review", "the review", "reviewing", "3"]),
+        ):
+            with self.subTest(launcher=launcher, role=role):
+                command = ["bash", str(ROOT / "scripts/direct" / launcher), "--phase", "3t"]
+                if role == "review":
+                    command.extend(("--lens", "contract"))
+                command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
+                seat = PausedSeat(run_dir="/run", seat="worker", role=role, staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(resume_message.resume_worker_command(seat, "/current/tree"))
+                self.assertEqual(rebuilt[:2], ["bash", str(ROOT / "scripts/direct/assign.sh")])
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--to"], "worker")
+                self.assertEqual(options["--role"], "implement" if role == "impl" else role)
+                self.assertEqual(options["--phase"], "3t")
+                self.assertEqual(options["--cwd"], "/current/tree")
+                self.assertEqual(options["--session-dir"], "/run")
+                self.assertEqual(options["--prompt"], "/run/worker.resume-prompt.md")
+                if role == "review":
+                    self.assertEqual(options["--lens"], "contract")
+                    self.assertEqual(options["--pass"], "3")
+                    self.assertNotIn("--paths", options)
+                else:
+                    self.assertEqual(options["--paths"], "/run/phases/3t/files")
+                if role == "fix":
+                    self.assertEqual(options["--fix-cause"], "resume after a move")
+                self.assertEqual(seat["launcher_command"], command)
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(resume_message.resume_worker_command(seat, "/current/tree")), rebuilt)
+
+    def test_worker_without_a_saved_launcher_uses_assign_and_the_recorded_phase(self) -> None:
+        seat = PausedSeat(run_dir="/run", seat="worker", role="test", staff_id="worker-id",
+                          turn_live=True, launcher_command=[])
+        with patch("scripts.lib.resume_message.progress_history.last_dispatch", return_value=RecordedDispatch(
+                "test", "3t", DispatchDetailNotRecorded.UNRECORDED, "/run/phases/3t/files")):
+            command = shlex.split(resume_message.resume_worker_command(seat, "/tree"))
+        self.assertEqual(command[:2], ["bash", str(ROOT / "scripts/direct/assign.sh")])
+        options = dict(zip(command[2::2], command[3::2]))
+        self.assertEqual(options["--role"], "test")
+        self.assertEqual(options["--paths"], "/run/phases/3t/files")
 
 
 if __name__ == "__main__":

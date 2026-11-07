@@ -9,7 +9,7 @@ import json
 import io
 import os
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -21,6 +21,11 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateLedgerTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
@@ -232,6 +237,36 @@ class MergeGateLedgerTests(MergeGateFixture):
             self.assertIsInstance(selected, CertifiedBase)
             assert isinstance(selected, CertifiedBase)
             self.assertEqual(selected.commit, head)
+
+    def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
+        from scripts.production import showrunners
+
+        _ = self.git(self.checkout, "rm", "Cargo.toml")
+        tip = self.commit(self.checkout, "repository without a build cache")
+        _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
+        self.write(self.state / "red-hooks", "red")
+        with mock.patch.object(showrunners, "tell", return_value="sent to quiet") as notice:
+            result = self.run_gate("--nightly")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [(suite, "test_first.py") for suite in self.suites]
+                              + ([("lib", "test_second.py")] if "lib" in self.suites else [])
+                              + [("hooks", "test_first.py")])
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        checkout = Path(type_call["cwd"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertFalse(checkout.exists())
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        record = cast(dict[str, object], json.loads(marker.read_text()))
+        tree = self.git(self.checkout, "rev-parse", f"{tip}^{{tree}}")
+        self.assertEqual(record["tree"], tree)
+        self.assertEqual(record["failed_modules"], ["hooks/test_first.py"])
+        notice.assert_called_once()
+        self.assertEqual(notice.call_args.args[:2], ("quiet", f"merge-gate-nightly:{tree}"))
+        message = cast(str, notice.call_args.args[2])
+        self.assertIn("hooks/test_first.py", message)
+        self.assertNotIn(str(checkout), message)
 
     def test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")

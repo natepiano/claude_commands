@@ -15,6 +15,7 @@ from unittest import mock
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue import snapshot_codec as codec
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture, write_pressure_reading
@@ -22,7 +23,7 @@ from scripts.message.unit_labels import UnitLabels
 from scripts.message import roster
 from scripts.build_queue import head_facts, queue_view
 from scripts.build_queue.queue_lines import Line, plain
-from scripts.build_queue.scope_activity import LiveBuildRun
+from scripts.build_queue.scope_activity import LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
 
 NOW = datetime(2026, 10, 30, 14, 46, 12, tzinfo=UTC).timestamp()
 ZONE = ZoneInfo("America/New_York")
@@ -154,6 +155,13 @@ def fixture_reservation(pid: int, need: int, *, step: str = "check", folder: str
     return {"pid": pid, "start_time": str(pid), "need": need, "repo": "fixture",
             "step": step, "worktree": folder, "admitted_at": "", "sidecar": "",
             "test_threads": gate.NoTestWidth(), "call_id": gate.NoCallRecord()}
+
+
+def ci_step(bytes: int, job_state: RunningServiceJob | IdleService | NotServiceSlice) -> gate.RunningStep:
+    """Build one CI service reading without an admission reservation."""
+    return gate.RunningStep("ci", "ci", "service", "/ci", 0,
+        gate.UnownedSliceMemory(bytes, owner="hana-ci.slice", job_state=job_state, pid=gate.PidNotRecorded()),
+        pid=gate.PidNotRecorded())
 
 
 def blocking_slot(now: float, held: int = 0) -> gate.BetweenStepsSlot:
@@ -296,7 +304,7 @@ class QueueFixture(ExitStack):
             bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
                       actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
         self.write_json(self.directory / "queue_priority.json", {"unit": "cables", "why": "captured priority",
-            "set_at": NOW - 12, "set_by": "user", "transition": gate.snapshot_value(gate.SettledPriority())})
+            "set_at": NOW - 12, "set_by": "user", "transition": codec.snapshot_value(gate.SettledPriority())})
         write_bumps(NOW, self.moves)
         self.write_pace([NOW - 3600 + index * 80 for index in range(44)])
 

@@ -14,9 +14,25 @@ if not __package__:
 from scripts.agents import worker_lifecycle
 
 
+ROSTER_LIVE = frozenset({"running", "starting"})
+
+
+def worker_status_paths(run: Path, pattern: str = "*_status*") -> list[Path]:
+    """Find status files only in the run and its phase folders."""
+    return [*run.glob(pattern), *run.glob(f"phases/*/{pattern}")]
+
+
+def worker_status_path(run: Path, slot: str) -> Path:
+    """Select the newest status for a slot, or its unwritten root path."""
+    return max(worker_status_paths(run, f"impl_status_{slot}"),
+               key=lambda path: path.stat().st_mtime, default=run / f"impl_status_{slot}")
+
+
 def worker_record_path(run: Path, name: str, slot: str) -> Path:
     """Find task settings through the fixed staff reference."""
-    reference = _worker_reference(run, name)
+    record = worker_lifecycle.read_worker_state(run / "mesh_roster.json")
+    entry = record.get(name)
+    reference = str(cast(dict[str, object], entry).get("staff_id", "")) if isinstance(entry, dict) else ""
     for path in sorted(run.glob("impl_worker_*.json")):
         try:
             value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -25,12 +41,6 @@ def worker_record_path(run: Path, name: str, slot: str) -> Path:
         if reference and isinstance(value, dict) and cast(dict[str, object], value).get("staff_id") == reference:
             return path
     return run / f"impl_worker_{slot}.json"
-
-
-def _worker_reference(run: Path, name: str) -> str:
-    record = worker_lifecycle.read_worker_state(run / "mesh_roster.json")
-    entry = record.get(name)
-    return str(cast(dict[str, object], entry).get("staff_id", "")) if isinstance(entry, dict) else ""
 
 
 def worker_slot(run: Path, name: str) -> str | None:

@@ -36,14 +36,16 @@ def gib(value: int) -> str:
     return f"{value / gate.GIB:.1f} GiB"
 
 
+def ci_amount(value: int) -> str:
+    """Show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB."""
+    return f"{value * 1024 / gate.GIB:.0f} MiB" if value < gate.GIB // 10 else gib(value)
+
+
 def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
               zone: ZoneInfo) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
-    if isinstance(basis, gate.ProgramMemoryCap):
-        program = "the merge gate" if basis.program == "merge-gate" else basis.program
-        return f"{program}'s memory cap"
     if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
         if isinstance(basis, gate.ShapeP90):
             text = f"same-shape p90 of {basis.runs} runs"
@@ -86,8 +88,6 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
         text = "fallback: fewer than 5 runs"
     elif source.source == "shape":
         text = "same-shape promise: basis not recorded"
-    elif source.source == "cap":
-        text = "memory cap: program not recorded"
     else:
         text = f"{source.source}: basis not recorded"
     text += f", last {source.history_days} days"
@@ -103,7 +103,8 @@ def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
     if isinstance(room, gate.ReadingUnavailable):
         return "Cap unavailable: " + room.reason
     if isinstance(room.cap, int):
-        calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)} + free {gib(room.available)}"
+        ci_use = f" + CI use {ci_amount(room.ci_use)}" if room.ci_use else ""
+        calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)}{ci_use} + free {gib(room.available)}"
     else:
         missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in room.cap.runs
                             if isinstance(run.use, gate.RunUseUnavailable))
@@ -203,8 +204,11 @@ def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, n
     if isinstance(memory, gate.UnownedSliceMemory) and memory.diagnostic:
         return f"{pid_text(memory.pid)} · {field(memory.owner)}: unavailable; {memory.diagnostic}"
     activity = service_activity_text(memory, now)
-    name = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service"
-    return f"{pid_text(memory.pid)} · {field(name)}: {activity}; {gib(memory.bytes)} RAM; {gib(memory.swap_bytes)} swapped"
+    if isinstance(memory, gate.UnownedSliceMemory):
+        name, amount = memory.owner, ci_amount(memory.bytes)
+    else:
+        name, amount = "sccache.service", gib(memory.bytes)
+    return f"{pid_text(memory.pid)} · {field(name)}: {activity}; {amount} RAM; {gib(memory.swap_bytes)} swapped"
 
 
 def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,

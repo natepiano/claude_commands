@@ -14,11 +14,14 @@ Print the script's output without changes.
 ## Execution
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <slug> <unit> [--dry-run]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <showrunner name> <unit> [--dry-run]
 ```
 
 Retire finds the unit by its staff name or id under the production.
 It stops the unit and its staff workers through `current_session`.
+Worker stops keep their rows, native conversations, and stopped panes for restore.
+Unknown evidence prints a named anomaly and supplies no stopped proof.
+A proved live target or structural fault prevents destructive worktree removal.
 Uncommitted work and commits outside the merge branch prevent removal.
 The recorder's only added `Project started` line does not count as uncommitted work.
 
@@ -29,5 +32,7 @@ The staff row stays with a `RemovedWorktree` location.
 Retire parks `.unit.toml` and its retirement facts under the staff id.
 
 Resume uses the staff name or id and restores the folder from the merge branch.
-It resumes the row's `current_session`.
-A completed retire rerun prints `unchanged`.
+It resumes the row's `current_session` and restores its retained workers.
+Only worker end or permanent unit removal deletes worker rows.
+An existing run pinned to `mesh` keeps its worker-end path.
+A completed retire rerun prints one `unchanged` line, exits 0, and sends no restart notice.

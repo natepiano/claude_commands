@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records as records
+
 from scripts.lint.memory_test_support import admission_policy_fixture
 
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -23,7 +25,7 @@ from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
 from scripts.build_queue.queue_lines import Line, plain
-from scripts.build_queue.queue_fixture import write_process, write_scope, fixture_queue_read
+from scripts.build_queue.queue_fixture import write_process, write_scope, fixture_queue_read, ci_step
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 
@@ -48,6 +50,41 @@ def gib(value: float) -> int:
 class FinishedTokenGapTimes(TypedDict):
     token_left_at: float
     token_back_at: float
+
+
+class RoomTextTests(unittest.TestCase):
+    def test_ci_amount_shows_mib_only_under_a_tenth_of_a_gib(self) -> None:
+        for value, text in ((47 * GIB // 1024, "47 MiB"), (GIB // 10 - 1, "102 MiB"),
+                            (GIB // 10, "0.1 GiB"), (22 * GIB, "22.0 GiB")):
+            with self.subTest(value=value):
+                self.assertEqual(queue_evidence.ci_amount(value), text)
+
+    def test_cap_text_shows_idle_ci_use_in_mib(self) -> None:
+        room = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB),
+            (gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB)),),
+            admission_policy_fixture(), ci_use=63 * GIB // 1024)
+        assert isinstance(room, gate.MemoryRoom)
+        self.assertIn("anonymous use 3.0 GiB + CI use 63 MiB + free 20.0 GiB", queue_evidence.room_text(room))
+
+    def test_idle_ci_slice_row_shows_mib_and_sccache_keeps_gib(self) -> None:
+        small = 47 * GIB // 1024
+        ci = gate.UnownedSliceMemory(small, owner="hana-ci.slice", job_state=IdleService(), pid=gate.PidNotRecorded())
+        compiler = gate.CompilerServiceMemory(small, swap_bytes=0, pid=gate.PidNotRecorded())
+        self.assertIn("hana-ci.slice: idle; 47 MiB RAM", queue_evidence.service_text(ci, 0.0))
+        self.assertIn("sccache.service: idle; 0.0 GiB RAM", queue_evidence.service_text(compiler, 0.0))
+
+    def test_cap_text_names_ci_use_and_its_printed_terms_sum_to_the_cap(self) -> None:
+        for ci_use, text in (
+            (0, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+            (4 * GIB, "Cap 24.0 GiB; anonymous use 3.0 GiB + CI use 4.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+        ):
+            with self.subTest(ci_use=ci_use):
+                room = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB),
+                    (gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB)),),
+                    admission_policy_fixture(), ci_use=ci_use)
+                assert isinstance(room, gate.MemoryRoom)
+                self.assertEqual(queue_evidence.room_text(room), text)
+
 
 
 class QueueEvidenceTests(unittest.TestCase):
@@ -111,7 +148,7 @@ class QueueEvidenceTests(unittest.TestCase):
             machine="test-machine", kind="codex", role="freestanding", name=f"{name}-session",
             status="running", reach=roster.CannotReceiveMessages("fixture"), cwd="/tmp/tree",
             showrunner=roster.UnderShowrunner("hana", "hana", "session:hana"),
-            director=roster.UnderDirector(f"{name}-unit", name, f"session:{name}"),
+            director=roster.UnderDirector(name, name, f"session:{name}"),
             assignment=roster.NotAWorker(), thread=roster.CodexThread(f"id-{name}"),
             session=roster.NoClaudeSession(),
         )
@@ -253,7 +290,7 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_full_package_estimates_keep_package_and_width_for_every_basis(self) -> None:
         for basis in (gate.BasisNotRecorded(), gate.ShapeP90(7), gate.ShapeLargest(2),
-                      gate.ShapeFallback(), gate.ProgramMemoryCap("merge-gate")):
+                      gate.ShapeFallback()):
             with self.subTest(basis=basis):
                 self.change_head(test_scope="full", package="hana_widget", filters=[],
                     test_threads=12, need_basis=gate.need_basis_record(basis))
@@ -434,8 +471,7 @@ class QueueEvidenceTests(unittest.TestCase):
         for job, expected in ((IdleService(), gate.HeadAdmitsAfterEnd),
                               (RunningServiceJob(NOW - 120), gate.HeadStillHeld)):
             with self.subTest(job=job):
-                ci = gate.RunningStep("ci", "ci", "service", "/ci", 0,
-                    gate.UnownedSliceMemory(4 * GIB, owner="hana-ci.slice", job_state=job, pid=gate.PidNotRecorded()), pid=gate.PidNotRecorded())
+                ci = ci_step(4 * GIB, job)
                 captured = replace(inputs, running=(*inputs.running, ci))
                 explanation = gate.queue_read_from(captured, config.policy).explanation
                 outcome = gate.head_after_steps_end(explanation, (ending,))
@@ -616,66 +652,25 @@ class QueueEvidenceTests(unittest.TestCase):
                 if isinstance(basis, gate.ShapeFallback):
                     self.assertEqual(text.split("; ")[-1], words[0])
 
-    def test_cap_need_text_uses_the_program_in_the_recorded_basis(self) -> None:
-        for program, words in (("merge-gate", "the merge gate's memory cap"),
-                               ("rust-analyzer", "rust-analyzer's memory cap")):
-            with self.subTest(program=program):
-                basis = gate.read_need_basis(gate.need_basis_record(gate.ProgramMemoryCap(program)))
-                source = gate.RecordedNeed("cap", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
-                self.assertEqual(queue_evidence.need_text(source, zone=user_zone()), words)
-
-    def test_gate_cap_need_and_charge_stay_the_same_after_head_seconds(self) -> None:
-        self.reset_running(available=40, need=20)
-        path = self.running(700, "gate", "merge-gate", 6, 1,
-                            int(121), peak=5)
-        row = cast(dict[str, object], json.loads(path.read_text()))
-        row["queue_waiter"] = {"need_source": "cap"}
-        _ = path.write_text(json.dumps(row))
-        self.change_head(step="merge-gate", need_source="cap", need_runs=0,
-                         need_basis=gate.need_basis_record(gate.ProgramMemoryCap("merge-gate")))
-        lines: list[tuple[str, int]] = []
-        for elapsed in (0, admission_policy_fixture().timing.estimate_refresh_seconds + 1):
-            with mock.patch.object(time, "time", return_value=NOW + elapsed):
-                reading = gate.queue_read()
-            assert isinstance(reading, gate.QueueRead)
-            head = reading.explanation.head
-            assert isinstance(head, gate.HeadExplanation)
-            self.assertEqual(len(reading.explanation.running), 2)
-            running, = (row for row in reading.explanation.running
-                        if gate.running_has_reservation(row.step))
-            lines.append((queue_evidence.need_text(head.need_source, zone=user_zone()), running.charged))
-            self.assertEqual(running.charged, 6 * GIB)
-        self.assertEqual(lines[0], lines[1])
-        self.assertEqual(lines[0], ("the merge gate's memory cap", 6 * GIB))
 
 
-    def test_aged_cap_waiter_has_no_refresh_text_but_history_waiter_does(self) -> None:
+    def test_aged_history_waiter_shows_refresh_text(self) -> None:
         expired_at = NOW - admission_policy_fixture().timing.estimate_refresh_seconds - 1
-        for sizing in (gate.FixedCapSizing(6 * GIB),
-                       gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), expired_at)):
-            with self.subTest(sizing=sizing):
-                profile = gate.ProgramProfile("merge-gate", "installed/.claude", "/tmp/gate", sizing)
-                self.change_head(step=profile.step, need=profile.peak.bytes,
-                                 need_source=profile.peak.source, need_runs=profile.peak.count,
-                                 need_basis=gate.need_basis_record(profile.peak.basis),
-                                 estimated_at=expired_at)
-                head = gate.explain_queue().head
-                assert isinstance(head, gate.HeadExplanation)
-                self.assertEqual(head.waiter.need, 6 * GIB)
-                text = self.output()
-                need_line = self.line(text, "Need source:")
-                self.assertIn("6.0 GiB", text)
-                if isinstance(sizing, gate.FixedCapSizing):
-                    self.assertNotIsInstance(head.cause, gate.EstimateExpired)
-                    self.assertIn("the merge gate's memory cap", need_line)
-                    self.assertNotIn("refresh", text)
-                    self.assertNotIn("estimate expired", text)
-                else:
-                    self.assertEqual(head.cause, gate.EstimateExpired(expired_at))
-                    self.assertIn("p90 of 10", need_line)
-                    self.assertIn("the estimate expired at", text)
-                    self.assertIn("the client refreshes it through the admission service", text)
-
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "/tmp/gate",
+            gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), expired_at))
+        self.change_head(step=profile.step, need=profile.peak.bytes,
+                         need_source=profile.peak.source, need_runs=profile.peak.count,
+                         need_basis=gate.need_basis_record(profile.peak.basis), estimated_at=expired_at)
+        head = gate.explain_queue().head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertEqual(head.waiter.need, 6 * GIB)
+        text = self.output()
+        need_line = self.line(text, "Need source:")
+        self.assertIn("6.0 GiB", text)
+        self.assertEqual(head.cause, gate.EstimateExpired(expired_at))
+        self.assertIn("p90 of 10", need_line)
+        self.assertIn("the estimate expired at", text)
+        self.assertIn("the client refreshes it through the admission service", text)
 
     def test_selected_page_warns_about_a_bad_config_key_once_per_process(self) -> None:
         config = self.root / "build_admission.conf"
@@ -687,7 +682,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(gate, "queue_read", side_effect=client.view), \
-                 mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+                 mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                  mock.patch("sys.argv", ["build_queue.py", "--columns", "400", "1"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)

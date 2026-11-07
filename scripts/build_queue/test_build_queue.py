@@ -4,7 +4,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import admission_policy_fixture
 
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, Exchange, ScriptedTransport, TimedChunk
-from scripts.build_queue import admission_client, admission_protocol as wire
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
 
 from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Callable, Mapping
@@ -146,7 +146,7 @@ class QueueTests(NotificationGuardedTestCase):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view), \
-                 mock.patch.object(memory_admit, "_warned_configuration_diagnostics", set[memory_admit.ConfigurationDiagnostic]()), \
+                 mock.patch.object(records, "_warned_configuration_diagnostics", set[memory_admit.ConfigurationDiagnostic]()), \
                  mock.patch("sys.argv", ["build_queue.py"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)

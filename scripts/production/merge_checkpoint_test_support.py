@@ -209,14 +209,14 @@ class BumpGateObservation(NamedTuple):
 
 
 def configure_test_environment() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them. The
-    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    """Use Pacific time and private scratch and registry folders for each module."""
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(Path(folder.name) / "config"),
         "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
         "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
+    _ = unittest.enterModuleContext(isolated_staff_file(Path(folder.name) / "staff.json", {}))
 
 
 class MergeResult(NamedTuple):
@@ -255,7 +255,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
         builder = cls()
         builder.bind_fixture(cls.fixture_root)
-        builder.build_fixture()
+        with isolated_staff_file(Path(builder.env["STAFF_FILE"]), builder.env):
+            builder.build_fixture()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
         shutil.rmtree(cls.fixture_root)
 
@@ -275,6 +276,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
         self.addCleanup(cleanup)
         self.bind_fixture(self.fixture_root)
+        _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -283,7 +285,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.unit = self.root / "alpha"
         self.other = self.root / "beta"
         self.promote = self.root / "installed"
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "tool-based-ui-production.md"
         self.log = self.checkout / "production.log"
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
@@ -314,6 +316,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
         self.write(self.checkout, "README.md", "base\n")
+        self.write(self.checkout, "Cargo.toml", "[workspace]\n")
         self.write(self.checkout, ".gitignore", "production.log\n.unit.toml\n")
         self.write(self.checkout, "src/alpha.txt", "alpha base\n")
         self.write(self.checkout, "src/beta.txt", "beta base\n")
@@ -336,6 +339,7 @@ class MergeCheckpointFixture(unittest.TestCase):
                      "style_sync.py", "style_ledger.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
+        (home / "rust/hanadocs/change-review").mkdir(parents=True)
         for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
@@ -422,7 +426,16 @@ class MergeCheckpointFixture(unittest.TestCase):
                        review: bool = True, trial: str = TRIAL,
                        delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
-        arguments = ["--production", str(self.doc), "alpha-unit", phase, sha,
+        runs = self.root / "history/runs"
+        fixture_records = runs / "fixture.jsonl"
+        if "--shrink" not in extra and "--as-built" not in extra and not any(
+                path != fixture_records for path in runs.glob("*.jsonl")):
+            runs.mkdir(parents=True, exist_ok=True)
+            with fixture_records.open("a") as output:
+                _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(self.unit), "checkpoint_commit": sha,
+                    "phase_id": phase, "timestamp_epoch": fixture_records.stat().st_size}) + "\n")
+        arguments = ["--production", "example", "alpha", phase, sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
@@ -448,10 +461,10 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.env["BUMP_TEST_ORIGIN"] = str(self.origin)
         self.env.update(fake_unit_host.environment(self.state))
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            production_membership("example", "alpha-unit")
+            production_membership("example", "alpha")
             runner = fixture_member("showrunner", name="example")
-            director = unit_membership("example", "alpha-unit")
-            fake_unit_host.write(self.env, [labeled_host("fixture-unit", "w1:p1", "alpha-unit", slug="example")])
+            director = unit_membership("example", "alpha")
+            fake_unit_host.write(self.env, [labeled_host("fixture", "w1:p1", "alpha", production_name="example")])
         records = self.root / "sessions"
         records.mkdir()
         self.env["NOTIFIER_SESSIONS_DIR"] = str(records)
@@ -468,10 +481,10 @@ class MergeCheckpointFixture(unittest.TestCase):
                 "messagingSocketPath": str(address), "updatedAt": 1,
                 "procStart": sessions.process_start(pid), "tmux": "",
             }))
-        timer = self.root / "notifier/showrunner-example"
+        timer = self.root / f"notifier/showrunner-{runner.id}"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:{runner.id}\nCHECK=zsh /fixture/production_check.sh {self.doc}\n"
+            f"TARGET=session:{runner.id}\nCHECK=zsh /fixture/production_check.sh {runner.id}\n"
         )
         self.addCleanup(self.stop_bump_gates)
 
@@ -502,7 +515,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             yield
 
     def move_bump_recipients(self) -> None:
-        timer = self.root / "notifier/showrunner-example/conf"
+        timer = next((self.root / "notifier").glob("showrunner-*/conf"))
         timer_text = timer.read_text()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             for path in (self.root / "sessions").glob("*.json"):
@@ -636,7 +649,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.events("review_regime.py"), [])
-        self.assertIn("send alpha-unit:", result.process.stdout)
+        self.assertIn("send alpha:", result.process.stdout)
 
     def receipts(self) -> list[dict[str, object]]:
         path = self.root / "history" / "merge_receipts.jsonl"
@@ -729,13 +742,17 @@ class MergeCheckpointFixture(unittest.TestCase):
             "else: raise SystemExit(2)", "",
         ]))
         self.executable(self.bin / "send.py", STUB)
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            relationship = fixture_member("showrunner", name=parent).id if parent else staff.StaffRoot()
+            _ = fixture_member("showrunner", name="example-style", parent=relationship,
+                               doc=staff.LiveDoc("natedev", doc))
         self.env["MERGE_CHECKPOINT_SHOWRUNNERS"] = str(registry)
         self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
         return doc
 
     def run_handoff(self, checkpoint: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return self.invoke(["--from-child", "example-style", "--checkpoint", checkpoint,
-                            "--production", str(self.doc), "--started", STARTED, *extra])
+                            "--production", "example", "--started", STARTED, *extra])
 
     def prepare_handoff_ledger(self, checkpoint: str, *, add_handoff: bool = True) -> None:
         ledger = Path(__file__).resolve().parents[1] / "style/style_ledger.py"

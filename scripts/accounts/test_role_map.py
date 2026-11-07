@@ -21,6 +21,7 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents import codex_mesh
+from scripts.direct import assign_gate
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.whoami import agent_accounts
@@ -761,6 +762,7 @@ class RoleMapTests(unittest.TestCase):
         with (isolated_staff_file(self.home / "staff.json", {}),
               patch.object(role_map, "ssh_role_map", side_effect=self.remote),
               patch.object(codex_mesh, "_start_server") as start,
+              patch.object(assign_gate, "called_by_assign", return_value=True),
               redirect_stdout(output), redirect_stderr(error)):
             owner = unit_membership("fixture", "scratch")
             _ = staff.set_worktree(owner.id, staff.PresentWorktree("mac", run), expected=owner.worktree)

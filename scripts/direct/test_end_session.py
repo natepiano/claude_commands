@@ -17,6 +17,7 @@ from scripts.direct import workers
 from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -40,6 +41,7 @@ class EndSessionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "run"
@@ -119,16 +121,16 @@ class EndSessionTests(unittest.TestCase):
 
     def seed(self) -> Path:
         return ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
-                                       "end@example.invalid", {"file": "content"}).checkout
+                                       "end@example.invalid", {"Cargo.toml": "[workspace]\n", "file": "content"}).checkout
 
     def test_end_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
         environment = self.environment()
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             source = self.seed()
-            with copies.standing("end-unit", source, "HEAD") as tree:
+            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
                 pass
-            with copies.standing("other-unit", source, "HEAD") as other:
+            with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
                 pass
             with copies.workspace("end-unit", source, "HEAD", name="worker", branch="worker") as workspace:
                 pass
@@ -139,12 +141,28 @@ class EndSessionTests(unittest.TestCase):
             self.assertTrue(other.exists())
             self.assertFalse(self.marker.exists())
 
+    def test_end_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
+        environment = self.environment()
+        environment["END_SESSION_REAL_COPIES"] = "1"
+        with patch.dict(os.environ, environment):
+            source = ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
+                                             "end@example.invalid", {"file": "content"}).checkout
+            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
+                self.assertTrue(tree.is_relative_to(Path(environment["SCRATCH_ROOT"])))
+                self.assertEqual(copies.owned_trees("end-unit").standing, ())
+                self.assertTrue((tree / ".git").is_dir())
+            self.assertFalse(tree.exists())
+            result = self.run_end(environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.marker.exists())
+            self.assertEqual(copies.owned_trees("end-unit").standing, ())
+
     def test_end_keeps_a_busy_tree_and_still_clears_the_marker(self) -> None:
         environment = self.environment()
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
             source = self.seed()
-            with copies.standing("end-unit", source, "HEAD") as tree:
+            with copies.standing("end-unit", source, copies.CommittedSource("HEAD")) as tree:
                 result = self.run_end(environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("busy", result.stderr)
@@ -186,7 +204,7 @@ class EndSessionTests(unittest.TestCase):
         parent = membership.by_current_session(director)
         if parent is None:
             owner = next(row for row in membership.find(kind="showrunner") if row.name == "end-owner")
-            parent = fixture_member("unit", name="other-unit", parent=owner.id,
+            parent = fixture_member("unit", name="other", parent=owner.id,
                                     runtime_id=fixture_runtime_id(director))
         _ = (run / "progress_history_state.json").write_text(
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")

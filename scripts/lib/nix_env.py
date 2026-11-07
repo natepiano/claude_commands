@@ -131,9 +131,10 @@ def registered_copy(envrc: Path) -> bool:
             sys.path.insert(0, repository_root)
         from scripts.lib import copy_record
 
-        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
+        record_path = copy_record.record_path(folder)
+        if envrc.name != ".envrc" or record_path is None:
             return False
-        record = copy_record.read_record(folder / copy_record.RECORD)
+        record = copy_record.read_record(record_path)
         if not isinstance(record, copy_record.Registered):
             return False
         source_path = record.fields.get("source_path")
@@ -241,6 +242,10 @@ def main(arguments: list[str]) -> int:
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
+        if not __package__:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from scripts.lib.models_registry import agent_environment
+
         program = arguments[1]
         if not Path(program).is_absolute():
             print("nix_env: exec requires an absolute program path", file=sys.stderr)
@@ -254,7 +259,7 @@ def main(arguments: list[str]) -> int:
         else:
             _ = outcome.env.pop("NIX_ENV_ENVRC", None)
         try:
-            os.execvpe(program, arguments[1:], outcome.env)
+            os.execvpe(program, arguments[1:], agent_environment(outcome.env))
         except OSError as error:
             print("nix_env: " + last_line(str(error), type(error).__name__), file=sys.stderr)
             return 1

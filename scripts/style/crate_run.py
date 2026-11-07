@@ -848,7 +848,7 @@ class CrateRun:
 
     @contextmanager
     def frozen_checkout(self, manifest: Manifest) -> Generator[Path]:
-        with copies.standing(self.owner, self.repo, manifest["base"]) as checkout:
+        with copies.standing(self.owner, self.repo, copies.CommittedSource(manifest["base"])) as checkout:
             yield checkout
 
     def definition(self, manifest: Manifest) -> rules.Rule:
@@ -1355,7 +1355,7 @@ class CrateRun:
                          actual.stdout.strip() if actual.code == 0 else "0" * 40)
         assert "integration" in record
         if IntegrationStage(record["integration"]["stage"]) == IntegrationStage.PREPARED:
-            with copies.standing(self.owner, self.repo, candidate) as checkout:
+            with copies.standing(self.owner, self.repo, copies.CommittedSource(candidate)) as checkout:
                 tree = run.git(checkout, "rev-parse", "HEAD^{tree}")
                 run.require_test_tree(checkout, tree)
                 if run.git(checkout, "rev-parse", "HEAD") != candidate:

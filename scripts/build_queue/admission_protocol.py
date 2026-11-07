@@ -1,17 +1,18 @@
-"""Versioned admission envelopes; domain values use memory_admit's one codec."""
+"""Versioned admission envelopes; domain values use the shared snapshot codec."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 from typing import TypeVar, cast
 
+from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_code import (
     ADMISSION_CODE_PATHS as ADMISSION_CODE_PATHS,
     admission_code_version as admission_code_version,
 )
-from scripts.lint import memory_admit as gate
+from scripts.build_queue import admission_records as records
 
 VERSION = 1
 
@@ -54,6 +55,7 @@ class RunPlace:
     run: RunIdentity
     since: float
     first_owner: Owner
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,7 @@ class Identity:
     unit: str = ""
 
 
-Profile = gate.StepProfile | gate.ProgramProfile
+Profile = records.StepProfile | records.ProgramProfile
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -82,12 +84,28 @@ class AdmitRequest(CallerCode):
     since: float
     sidecar: str
     identity: Identity
-    call: gate.Call
-    test_width: gate.TestWidth
+    call: records.Call
+    test_width: records.TestWidth
     profile: Profile
     fresh_test: bool
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
+
+
+@dataclass(frozen=True)
+class ServiceEstimateRequest(CallerCode):
+    """Ask the service to estimate a cargo call from its own history."""
+    episode: str
+    owner: Owner
+    argv: tuple[str, ...]
+    cwd: str
+    since: float
+    sidecar: str
+    repository: records.Repository
+    worktree: str
+    runner: str
+    job: str
+    test_width: records.TestWidth = records.NoTestWidth()
 
 
 @dataclass(frozen=True)
@@ -160,17 +178,29 @@ class TokenWaitRequest(CallerCode):
     reservation: str
 
 
-Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest)
 
 
 @dataclass(frozen=True)
 class Wait:
-    reason: gate.WaitReason
+    reason: records.WaitReason
     position: int
     head: str
     text: str
-    snapshot: gate.AdmissionWaitSnapshot
+    snapshot: records.AdmissionWaitSnapshot
+
+
+@dataclass(frozen=True)
+class AcquisitionTiming:
+    """Bound acquisition without reading the client account's configuration."""
+    silence_seconds: float
+    reconnect_seconds: float
+    unreachable_limit_seconds: float
+    wait_reply_seconds: float = 60.0
+
+
+PROTOCOL_ACQUISITION_TIMING = AcquisitionTiming(120.0, 2.0, 300.0)
 
 
 @dataclass(frozen=True)
@@ -198,6 +228,18 @@ class Admitted:
 
 
 @dataclass(frozen=True)
+class RunnerExecutionTiming:
+    program_sample_seconds: float
+    program_stop_seconds: float
+    peak_wave_seconds: float
+
+
+@dataclass(frozen=True)
+class RunnerAdmitted(Admitted):
+    execution: RunnerExecutionTiming = field(kw_only=True)
+
+
+@dataclass(frozen=True)
 class LaunchAdmitted:
     need: int
     source: str
@@ -220,30 +262,30 @@ class BuildHistoryReply:
 
 @dataclass(frozen=True)
 class ViewReply:
-    reading: gate.QueueRead
+    reading: records.QueueRead
 
 
 @dataclass(frozen=True)
 class ExplainReply:
-    explanation: gate.QueueExplanation
-    diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
+    explanation: records.QueueExplanation
+    diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
 class MineReply:
-    reading: gate.QueueRead
+    reading: records.QueueRead
 
 
-Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
+Reply = Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
 
 _REQUESTS: dict[str, type] = {
-    "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
+    "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
 }
 _REPLIES: dict[str, type] = {
-    "wait": Wait, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
 }
 T = TypeVar("T")
@@ -257,19 +299,19 @@ def admission_socket_path() -> Path:
 
 def encode_record(value: object) -> str:
     """State and message payloads have exactly the domain codec's representation."""
-    return json.dumps(gate.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return json.dumps(codec.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def parse_record(text: str, schema: type[T]) -> T:
     value = cast(object, json.loads(text))
-    return cast(T, gate.parse_snapshot_value(value, schema))
+    return cast(T, codec.parse_snapshot_value(value, schema))
 
 
 def _encode(value: object, variants: dict[str, type]) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    data = gate.snapshot_value(value)
+    data = codec.snapshot_value(value)
     return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
@@ -285,7 +327,7 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         data = envelope["data"]
-        return gate.parse_snapshot_value(data, variants[name])
+        return codec.parse_snapshot_value(data, variants[name])
     except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
@@ -343,7 +385,7 @@ def encode_reply(reply: Reply) -> str:
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
     reply = cast(Reply, _parse(line, _REPLIES))
     if (isinstance(request, LaunchRequest) and isinstance(reply, Admitted)
-            or isinstance(request, AdmitRequest) and isinstance(reply, LaunchAdmitted)):
+            or isinstance(request, (AdmitRequest, ServiceEstimateRequest)) and isinstance(reply, LaunchAdmitted)):
         raise ValueError("admission outcome does not match request")
     return reply
 

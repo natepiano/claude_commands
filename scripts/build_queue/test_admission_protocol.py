@@ -1,11 +1,16 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import snapshot_codec as codec
+
 from scripts.lint.memory_test_support import admission_policy_fixture
 
+from contextlib import redirect_stderr
 from dataclasses import replace
+import io
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import unittest
@@ -14,14 +19,63 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_protocol as wire, queue_evidence
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
 
+    def test_service_estimate_request_carries_identity_without_a_client_estimate(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            encoded = wire.encode_request(request)
+            decoded = wire.parse_request(encoded)
+            self.assertEqual(decoded, request)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            fields = cast(dict[str, object], envelope["data"])
+            self.assertNotIn("profile", fields)
+            self.assertNotIn("history", fields)
+            self.assertEqual(wire.parse_reply(wire.encode_reply(admitted_reply()), request), admitted_reply())
+            grant = admitted_reply()
+            runner = wire.RunnerAdmitted(grant.reservation, grant.need, grant.source,
+                grant.max_path, grant.wave_path, grant.sampling_context, grant.cleanup_timing,
+                execution=wire.RunnerExecutionTiming(0.1, 0.2, 1.0))
+            self.assertEqual(wire.parse_reply(wire.encode_reply(runner), request), runner)
+            with self.assertRaises(ValueError):
+                _ = wire.parse_reply(wire.encode_reply(wire.LaunchAdmitted(GIB, "wrong outcome")), request)
+
+
+    def test_wait_holder_identity_survives_the_wire_for_each_holder_kind(self) -> None:
+        for holder in (records.SessionHolder("session-id", "worker"), records.UnitHolder("compiler"), records.NoHolder()):
+            with self.subTest(holder=holder):
+                reply = wait_reply(records.NeedsMemory())
+                reply = replace(reply, snapshot=replace(reply.snapshot, holder=holder))
+                parsed = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(parsed, reply)
+                assert isinstance(parsed, wire.Wait)
+                self.assertEqual(parsed.snapshot.holder, holder)
+
+    def test_an_unknown_snapshot_field_keeps_the_reply_and_the_client_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            reply = wait_reply(records.NeedsMemory())
+            encoded = cast(dict[str, object], json.loads(wire.encode_reply(reply)))
+            data = cast(dict[str, object], encoded["data"])
+            snapshot = cast(dict[str, object], data["snapshot"])
+            snapshot["future_wait_evidence"] = {"kind": "UnknownFutureEvidence", "value": 17}
+            line = json.dumps(encoded) + "\n"
+            self.assertEqual(wire.parse_reply(line), reply)
+            granted = admitted_reply()
+            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            waits: list[wire.Wait] = []
+            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
+                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
+                result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(waits, [reply])
+            self.assertEqual(result, granted)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
         from scripts.build_queue.queue_fixture import QueueFixture
@@ -55,7 +109,7 @@ class ProtocolTests(unittest.TestCase):
 
         activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
         current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=gate.PidNotRecorded())
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(current), gate.UnownedSliceMemory), current)
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(current), gate.UnownedSliceMemory), current)
 
     def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
         from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
@@ -83,14 +137,14 @@ class ProtocolTests(unittest.TestCase):
 
         view = gate.QueueView((), (), 0, 0, 0, NOW)
         reading = queue_read_fixture(view, policy=admission_policy_fixture())
-        current = cast(dict[str, object], gate.snapshot_value(reading))
+        current = cast(dict[str, object], codec.snapshot_value(reading))
         del current["diagnostics"]
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
-        parsed = gate.parse_snapshot_value(current, gate.QueueRead)
+        parsed = codec.parse_snapshot_value(current, gate.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
         step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(step), gate.RunningStep), step)
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), gate.RunningStep), step)
 
     def test_unit_override_round_trips(self) -> None:
         with AdmissionFixture() as fixture:
@@ -137,7 +191,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             run_request = replace(request, run=run)
             self.assertEqual(wire.parse_request(wire.encode_request(run_request)), run_request)
             run_encoded = cast(dict[str, object], json.loads(wire.encode_request(run_request)))
-            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], gate.snapshot_value(run))
+            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
         conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
@@ -155,7 +209,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(3 * GIB))),
+                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(3 * GIB, gate.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
                     gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
@@ -191,10 +245,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
             for reply in replies:
                 with self.subTest(reply=type(reply).__name__):
-                    with mock.patch.object(gate, "snapshot_value", wraps=gate.snapshot_value) as encode:
+                    with mock.patch.object(codec, "snapshot_value", wraps=codec.snapshot_value) as encode:
                         line = wire.encode_reply(reply)
                     self.assertGreater(encode.call_count, 0)
-                    with mock.patch.object(gate, "parse_snapshot_value", wraps=gate.parse_snapshot_value) as parse:
+                    with mock.patch.object(codec, "parse_snapshot_value", wraps=codec.parse_snapshot_value) as parse:
                         self.assertEqual(wire.parse_reply(line), reply)
                     self.assertGreater(parse.call_count, 0)
 

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Own the phase process: measure how a `/unit:direct` phase runs from start to end and how design and documentation docs are made before a plan exists, find where time and tokens go, propose changes, then build and measure one approved change at a time.
 
-> **Production: sdlc** — unit `phases-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
