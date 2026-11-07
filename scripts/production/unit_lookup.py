@@ -5,6 +5,10 @@ Current names, places and messaging sockets come from herdr and live session
 records. Run state comes from /unit:direct records.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -480,6 +484,10 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
         if process.place.session not in running:
             continue
         native = holders[process.pid][1]
+        problem = unread.places.get(process.place, unread.unplaced.reason
+                                    if isinstance(unread.unplaced, RecordsPartlyUnread) else "")
+        if problem and process.pid not in claudes:
+            _ = session_staff.collect_anomaly(f"pid {process.pid} in {place_text(process.place)}: {problem}", pid=process.pid)
         if not native:
             if process.place in unread.places or process.command in ("claude", "codex"):
                 yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
@@ -488,10 +496,8 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
         claude: Claude
         if process.pid in claudes:
             claude = claudes[process.pid]
-        elif process.place in unread.places:
-            claude = ClaudeUnknown(unread.places[process.place])
-        elif isinstance(unread.unplaced, RecordsPartlyUnread):
-            claude = ClaudeUnknown(unread.unplaced.reason)
+        elif problem:
+            claude = ClaudeUnknown(problem)
         elif (process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh") and process_counts[process.place] == 1
               and process.marks.get("CLAUDE_CODE_SESSION_ID") == native
               and not process.marks.get("CODEX_THREAD_ID")):

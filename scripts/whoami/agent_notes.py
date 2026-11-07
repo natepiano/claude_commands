@@ -17,6 +17,10 @@ as the timer left them and hands them to quota_alert.blocked().
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import asyncio
@@ -34,7 +38,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import codex_pacer
 from scripts.whoami import five_hour
@@ -346,7 +349,6 @@ def apply(
 
 @role_map_command
 def update(*, include_warnings: bool = True) -> list[str]:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     workers_home = resolve_workers_home()
@@ -669,10 +671,8 @@ def main() -> None:
         return
     if sys.argv[1:] not in ([], ["refresh"]):
         sys.exit("usage: agent_notes.py [refresh|usage-only|renew-logins|blocked]")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
     from scripts.herdr import herdr
 
     from scripts.accounts import refusal_watch

@@ -30,6 +30,37 @@ from scripts.production.merge_gate_test_support import gate_suites, wait_for_fil
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
+class GateProgressHistoryTests(unittest.TestCase):
+    def test_gate_tail_uses_first_pass_memory_when_history_contains_reruns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = progress.ProfileHistory(root)
+            for episode, rerun in (("first-pass", False), ("old-rerun", True)):
+                for index in range(20):
+                    history.observe(episode, "gate", progress.ProgressCounter("suites:1", index * 5, 100),
+                        (20 - index) * memory_admit.GIB // 10, 100)
+                if rerun:
+                    history.observe(episode, "gate", progress.ProgressCounter("suites:2", 0, 100),
+                        9 * memory_admit.GIB, 100)
+                history.finish(episode, 101, 90)
+            profile = progress.ProfileHistory(root).matching("gate", 90)
+            row = fixture_reservation(123, 4 * memory_admit.GIB, step="merge-gate")
+            reading = memory_admit.MeasuredMemory(memory_admit.GIB // 20,
+                anonymous=memory_admit.AnonymousRunUse(memory_admit.GIB // 20))
+            for done, expected in ((86, 3 * memory_admit.GIB // 10), (99, memory_admit.GIB // 10)):
+                with self.subTest(done=done):
+                    adjusted = memory_admit.progress_memory(row, reading,
+                        memory_admit.AttributedStepUse(reading.anonymous, True),
+                        progress.ProgressCounter("suites:1", done, 100), profile, admission_policy_fixture())
+                    self.assertEqual(adjusted.remaining_need, expected)
+                    self.assertNotIn("full need", memory_admit.progress_text(adjusted))
+            rerun = memory_admit.progress_memory(row, reading,
+                memory_admit.AttributedStepUse(reading.anonymous, True),
+                progress.ProgressCounter("suites:2", 0, 100), profile, admission_policy_fixture())
+            self.assertEqual(rerun.remaining_need, row["need"])
+            self.assertIn("full need", memory_admit.progress_text(rerun))
+
+
 class ServiceGateFixture(GateSuitesFixture):
     def reservation(self) -> tuple[Path, memory_admit.Reservation]:
         record, = self.admission.server.reservations.values()

@@ -15,6 +15,10 @@ through `push_texts.user_send_argv()` with its registered template. Holding a KE
 may hold on every check and `close` once the news stops being true.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -36,12 +40,8 @@ from scripts.production import staff
 from scripts.message import send_budget, session_send
 from scripts.notify import push_texts
 from scripts.notify import push_reference
-if TYPE_CHECKING:
-    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                        codex_account, workers_home)
-else:
-    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                codex_account, workers_home)
+from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+                                    codex_account, workers_home)
 from scripts.notify.user_action import ActionRequired, NoActionRequired, UserAction
 
 if TYPE_CHECKING:

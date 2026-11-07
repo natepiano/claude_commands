@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Quietly enable Remote Control for one proven restarted process."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -13,10 +17,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
-
-SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production", "notify", "herdr", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
 
 from scripts.lib import detached
 from scripts.shutdown.stop_results import shutdown_state_root

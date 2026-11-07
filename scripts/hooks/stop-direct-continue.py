@@ -10,14 +10,17 @@ Exceptions permit the stop without output.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import re
 import sys
-from pathlib import Path
 from typing import cast
 
-from context_usage import (
+from scripts.hooks.context_usage import (
     HookInput,
     auto_compact_window,
     handoff_threshold,
@@ -25,7 +28,7 @@ from context_usage import (
     pending_background_tasks,
     trigger_tokens,
 )
-from direct_run import active_run
+from scripts.hooks.direct_run import active_run
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
@@ -60,7 +63,6 @@ def main() -> None:
     # A declared wait is a real stop, including a restated decision after a
     # compaction block. Record before the compaction and background-work guards.
     final_message = payload.get("last_assistant_message", "")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.direct.progress_history import record_turn_wait
 
     if record_turn_wait(session_dir, session_id, final_message):

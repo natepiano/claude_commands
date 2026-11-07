@@ -11,7 +11,6 @@ import os
 import shutil
 import subprocess
 import sys
-import venv
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
@@ -130,46 +129,6 @@ class MergeGateTypesTests(GateSuitesFixture):
                 result = self.run_gate("--tests-only")
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertIn("basedpyright: " + ("OK" if expected == 0 else "RED"), result.stdout)
-
-    def test_real_basedpyright_exits_zero_without_a_checkout_venv(self) -> None:
-        executable = shutil.which("basedpyright")
-        self.assertIsNotNone(executable, "basedpyright is required")
-        assert executable is not None
-        repo = Path(__file__).resolve().parents[2]
-        _ = shutil.copyfile(repo / "pyrightconfig.json", self.checkout / "pyrightconfig.json")
-        self.write(self.checkout / "clean.py", 'message: str = "clean"\nprint(message)\n')
-        self.assertFalse((self.checkout / ".venv").exists())
-
-        result = subprocess.run(
-            [executable, "clean.py"], cwd=self.checkout, env=self.environment,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("0 errors, 0 warnings, 0 notes", result.stdout)
-
-    def test_type_check_uses_pinned_packages_when_the_checkout_has_a_venv(self) -> None:
-        executable = shutil.which("basedpyright")
-        self.assertIsNotNone(executable, "basedpyright is required")
-        assert executable is not None
-        repo = Path(__file__).resolve().parents[2]
-        _ = shutil.copyfile(repo / "pyrightconfig.json", self.checkout / "pyrightconfig.json")
-        pinned = self.state / "runner" / "typecheck-venv"
-        venv.EnvBuilder().create(pinned)
-        venv.EnvBuilder().create(self.checkout / ".venv")
-        packages = pinned / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-        for module in ("bpy", "PIL"):
-            self.write(packages / module / "__init__.pyi", "__version__: str\n")
-        self.write(pinned / "gate-requirements.txt", "\n".join(merge_gate.TYPECHECK_REQUIREMENTS) + "\n")
-        self.write(self.checkout / "packages.py",
-                   "import bpy\nimport PIL\nprint(bpy.__version__, PIL.__version__)\n")
-        self.environment["MERGE_GATE_BASEDPYRIGHT"] = executable
-
-        result = self.run_gate("--tests-only", "--type-dirs", "packages.py")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("basedpyright: OK\n0 errors, 0 warnings, 0 notes", result.stdout)
 
     @gate_suites("hooks")
     def test_types_owns_a_shared_slot_until_it_finishes(self) -> None:

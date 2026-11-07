@@ -124,8 +124,12 @@ Each local Promote checkout must exist before the command pushes.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
   6. *test*: each package owning a changed file (nearest `Cargo.toml`, named by its directory) through `verify.sh test`, each changed `crates/<pkg>/examples/<name>` through `verify.sh example`, then each Merge tests command, into `<scratch>/merge_<short>_test.log` with `<name>_EXIT=<rc>` lines. A command that cannot start is exit 127. `parse_merge_tests(lines, checkout)` reads the commands at input: each backticked entry before the first unbackticked `(` is split with `shlex`, each word passes `expanduser` then `expandvars` (the commands run with no shell), and an entry is refused by name when a `$VAR` is still left, or when its first word is neither on PATH nor an executable file in the checkout (a package name or a directory, as cargo-liner wrote, 2026-10-17). A shrink runs none.
-  7. *red*: each red command reruns once alone. When every test in its nextest `FAIL` rows is listed in Known flaky tests, only those tests rerun (`verify.sh --filter <name>` per test, else `-E test(=<name>)`). Green alone continues with a LOG note when that held, or when the command is a package listed in Known flakes; otherwise `reset --keep HEAD~1` after confirming `HEAD` is this merge and is not on origin.
-  8. *push and promote*. `GitPush`: merge `origin/main` with `--no-ff` when it has diverged, push the merge branch (on failure, abort the merge and reset to the old origin tip if origin did not move). `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
+  7. *red*: run each failed command once alone.
+     If every nextest `FAIL` row names a Known flaky test, run only those tests again.
+     Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
+     A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
+     Otherwise, confirm that `HEAD` is this merge and is not on origin, then use `reset --keep HEAD~1`.
+  8. *push and promote*. `GitPush` merges `origin/main` with `--no-ff` when it has diverged, then pushes the merge branch. A failed merge always runs `git merge --abort`, including during a repeated promotion. Conflicts produce `push: held` with the conflicting paths, separated by commas. A repeated promotion keeps HEAD and the work tree as they were before the push step. When rollback is allowed and origin did not move, the push step also resets the checkpoint merge. The message asks the unit to merge `origin/main` into the merge branch, resolve the conflict, and run the push again. A merge failure without conflicting paths stays failed. Other push failures use the same rollback rule. `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
   9. *record*: for a code checkpoint, `review_regime.py add --unit --plan <the unit's Plan cell> --phase --regime --started --merged <merge commit time> --holds --merge-defects` plus the five review numbers and any `--excluded`. The ledger names a row by unit, plan and phase (2026-10-12), because a unit that runs a second plan starts again at phase 1; then the LOG line `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <tests> green; pushed[; promoted]`. A LOG that already has this line skips the step.
 - **Merge report.** Step 8 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
@@ -210,8 +214,10 @@ Each local Promote checkout must exist before the command pushes.
   A failed main push or Mac pull adds no rows.
   The next successful call adds the rows from earlier promoted merges.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
+- **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
+  It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
-  The gate runs test modules under a memory cap.
+  The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
@@ -351,9 +357,19 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
-    The command prints unplaced processes below the table on stdout.
-    The process scanner also supplies processes outside the pane lookup.
-    `CodexProcessThreads.thread` reads native identity, terminal metadata and a unique loaded daemon thread name.
+    The command prints read failures below the table on stdout when they make the table wrong or incomplete.
+    Staff name conflicts also produce lines. Each process has at most one line.
+    The command does not scan other processes.
+    A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
+    A process without an identity reports an unreadable thread when its pane holds staff.
+    One staff candidate retains its pane placement with unknown status.
+    `CodexProcessThreads.thread` reads the open rollout first.
+    With no open rollout, it reads the thread environment and resume arguments.
+    It then reads the native pane session and the terminal title with daemon names, only when this process is the pane's one foreground process.
+    A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
+    Other rollout read failures stop identity recovery.
+    The worker scanner uses this reader before it joins the current thread to its staff row.
+    A missing pane launch record does not make a resolved staff worker unknown.
     `send.morty_stamp` matches Morty's thread against `MORTY_NATIVE_ID` from `config/send.conf`.
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).

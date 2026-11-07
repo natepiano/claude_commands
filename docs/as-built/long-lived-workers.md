@@ -13,7 +13,11 @@ Codex code review uses the unit's read-only `review` workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
-Phase cleanup ends turns and keeps threads. Unit pause, move, and end use staff membership and the worker ledger. Usage reports compare checkpointed phases through the usage store.
+After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
+Unit pause, move, and end use staff membership and the worker ledger.
+Usage reports compare checkpointed phases through the usage store.
 
 ## Unit code reviewers
 
@@ -85,10 +89,11 @@ The source release result is `SourceReleased`, `SourceUnresolved(reason)`, or `S
 For Codex, the release path resolves that result through server evidence.
 Codex release checks the fixed id and current session against staff.
 It parks queued submissions before interruption and checks every recorded source server.
-A matching roster entry with no remaining server can prove release.
+A missing server record or a stopped server permits release without a diagnostic.
 A record with only `previous_servers` names no current server.
-A current server without a valid pid gives `SourceReleaseUnknown`.
-Uncertain release keeps source evidence and prevents destination creation.
+An invalid record or an unavailable server prints an anomaly and permits release.
+A changed staff identity prints an anomaly and permits release without signaling a process.
+Only an answering server with a loaded target thread and an unknown stop state prevents Codex release.
 
 The default switch request is `sha256(f"{staff id}:{destination family}")`.
 Assignment delivery uses `assignment_id(prompt)`, which hashes the resolved path, modification time, and contents.
@@ -127,12 +132,16 @@ Its follow path does not restore a saved extract.
 
 ### Claude coordinator and friends
 
-`agent_bg.sh` keeps Bash as the parent and runs `worker_fill.py coordinate-claude` as a Python coprocess.
-The coordinator reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
+`scripts/direct/claude_worker.py` runs the Claude launch steps in the assign process.
+`assign_claude._run` calls its functions directly.
+The module has no command line or shell protocol.
+It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
 It verifies the destination against the running Claude registry before staff publication.
-The protocol reports `launch`, `attach`, or `unchanged`.
-`published <native id>` carries the destination id after publication.
-A failure prints its complete diagnostic before it reports `failed`.
+It records the role before delivery.
+Delivery starts one Python child through `scripts/lib/py`: `send.py --to session:<id> --from launcher --file <prompt>`.
+`CLAUDE_WORKER_SEND_SCRIPT` selects the delivery script.
+`assign_claude.py` records the worker after publication.
+The heartbeat watch follows the assign process during the wait.
 
 A retry that finds its original user prompt in the transcript records acceptance without another send.
 A complete transcript without that prompt permits delivery.
@@ -141,6 +150,7 @@ The refusal says `Claude prompt delivery is unknown: transcript has a torn JSON 
 
 `worker_fill.py end-friend` stops a friend in process.
 For Codex, a failed `command_end` still reaches the server stop.
+A failed staff retirement also reaches the server stop before the command returns 1.
 A failed server stop keeps the retry eligible to stop that server again.
 The command writes `ended` only after a confirmed stop or confirmed absence.
 Claude friends use the same completion rule through their stop result.
@@ -159,6 +169,9 @@ The lifecycle and held-role rules below still apply during a move.
 Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
 
 **Protocol.** Initialize with `capabilities.experimentalApi=true` for queue calls. Pass a `SandboxMode` string in `thread/start.sandbox`. Worker threads remain non-ephemeral because ephemeral threads reject queued submissions.
+
+Every `turn/start` request sets `approvalPolicy` to `never` and names its `sandboxPolicy`.
+The server keeps the thread's last turn policy, so resumed workers also need both fields.
 
 **Launch retry.** A nonresident launch can retry once after a fast failure from an inherited server. Eligible outcomes are `FailedBeforeThread` and `FailedWithThread` containing `STALE_SIGN_IN`. The failure must occur within 120 seconds.
 
@@ -191,9 +204,9 @@ The verbs:
 
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, and `previous_status`. It records the task role and lens in `agents.jsonl`. |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores the previous status and records the restored task role in `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
-| `end` | `--session-dir --to` | Clears the worker's pending queue, writes its end marker and sets the worker's roster `status` to `"ended"`. |
+| `end` | `--session-dir --to` | Clears the pending queue, writes the end marker and sets roster `status` to `"ended"`. Keeps the staff row and thread id. A second `end` retries cleanup. Permanent removal retires the staff row. |
 | `stop` | `--session-dir [--pause]` | Sets every roster worker to `"ended"` and stops the current server and every retired one. With `--pause` (a shutdown stop, `docs/as-built/shutdown-and-restart.md`) it instead sets every non-ended worker to the followable `"paused"`, with `paused_from` and `paused_turn`, after dropping its queued messages and interrupting a live turn. |
-| `reopen` | `--session-dir --to` | Returns an `ended` worker, or an abandoned `running`/`starting` worker, to `"paused"` on its recorded thread. With a live recorded server it requires a positive idle read and no live launcher, clears the stale turn id, and stores `not_measured_since_compaction`. Its one-line result names that same thread; no replacement thread is opened. A live turn, unreadable thread, missing thread id or live launcher refuses recovery with exit 2. |
+| `reopen` | `--session-dir --to` | Returns an `ended`, `running`, `starting` or `waiting_capacity` worker to `"paused"` on its recorded thread when its launcher is dead. Requires positive idle evidence when recovering a live status or recorded server. Clears the stale turn id and stores `not_measured_since_compaction`. Prints the same thread id. A live turn, unreadable thread, missing thread id or live launcher refuses recovery with exit 2. `assign.sh --to` calls it before dispatch. |
 | `sweep` | `[--root] [--stop]` | Gives a verdict on every app-server listening on `ws://` (see Cleanup). |
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
@@ -254,7 +267,7 @@ For Claude implementation, test, and repair work, it calls `assign_claude.py` in
 - The Claude path checks admission before it records the pass.
 - A claim protects a continued worker until the dispatch ends.
 - Each slot keeps its `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log`, and `impl_agent_<slot>` files.
-- `UNIT_WORKER_WAIT_ATTEMPTS` and `UNIT_WORKER_POLL_SECS` control the worker record probes.
+- `UNIT_WORKER_POLL_SECS` overrides the worker poll interval from `CLAUDE_WORKER_POLL_SECS`, which defaults to 15 seconds.
 - `assign_claude.py` releases the claim and stops the heartbeat watch when the dispatch ends.
 
 **Codex code review dispatch.** Use `assign.sh --role review --session-dir <run>
@@ -317,10 +330,20 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore retains launcher recovery and shares dispatch reads across pane workers.
+Restore reopens only workers with active dispatches and retains launcher recovery.
+It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Account moves must preserve closed idle workers.
 
 ### Cleanup
 
+- **Worker end.** `codex_mesh.py end` stops the recorded servers when every roster worker has status `ended`.
+  `_reap_validated_servers` and `_release_held_server_locked` use the same identity step, `_reap_recorded_server`.
+  This step signals only a process whose pid and `app-server --listen` port match the record.
+  A failed process scan prints an anomaly and sends no signal.
+  It reports another live process and forgets its record without a signal.
+  It stops them before staff retirement, including when retirement refuses.
+  Another open worker keeps the servers.
+  Held design roles keep their existing lifecycle.
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. It leaves Codex threads open and preserves Claude workers held by the unit ledger or a live unit director. It does not launch server reclamation.
 - **Run end.** `scripts/direct/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. The scan uses `unit_runs.run_folders`, which excludes each root's `active` marker folder. The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
   1. `design_roles.py unbind-run <run>` for each held run, which unbinds every held design role bound to it and leaves its thread, prompts and replies (`docs/as-built/long-lived-workers.md#lasting-roles`); a failure stops the script before any other step
@@ -338,7 +361,7 @@ Restore retains launcher recovery and shares dispatch reads across pane workers.
   - Current run servers and held design servers share the 30-minute quiet window (`SERVER_IDLE_SECS`): a live worker launcher, a server under 30 minutes old, a mesh folder changed in the last 30 minutes, or a conversation mid-turn means in use.
 
   It reads `thread/queue/list` for loaded threads; queued submissions or unreadable queue state keep the server. It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Ordinary idle-stop and retired-server reclamation can free an unused server while the director lives; the next dispatch resumes the same worker name and thread. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
-- **Sign-in change.** `signin-changed` retires servers that hold the old sign-in. Running workers are interrupted and resumed on a new server. Idle workers move at their next turn.
+- **Sign-in change.** `signin-changed` retires servers that hold the old sign-in. Running workers are interrupted and resumed on a new server. The move selects a recorded server whose loaded threads include the worker's thread. Unreadable server evidence refuses the move. Proven absence permits a marker with the roster's last `turn_id`, without queue transfer or interruption. `assign.sh --operation resume-account-move` resumes that thread on a new server, even when its launcher died. Idle workers move at their next turn.
 
 `scripts/direct/workers.py` stores each unit ledger at `~/.local/state/unit-workers/<staff id>.json`.
 `UNIT_WORKERS_STATE` selects a private root.
@@ -395,7 +418,7 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |
 | `scripts/whoami/agent_notes.py` | `credits` on Codex readings |
-| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. A Codex pane worker takes the same value as `model_auto_compact_token_limit` at launch. |
+| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. `assign.py` compacts an idle mesh worker above it before new work. A pane worker has no in-turn compaction option. Codex keeps its own full-window limit. |
 | `commands/unit/direct.md` | `<LongLivedWorkers/>`, referenced from `<LaunchImplementation/>`, `<FixDispatch/>`, `<PhaseCleanup/>` and `<CompactionContract/>`; early review worker (`EARLY_REVIEW_SLOT`) |
 | `docs/direct/launch_implementation.md` | `codex_mesh.py list`, then `--to` for every slot with an open worker |
 | `docs/direct/dual_review.md`, `docs/direct/run_phase_review.md`, `commands/plan/phase_review.md` | Review worker selection and `--to`/`--slot` calls |
@@ -609,15 +632,16 @@ connection, initialization, queue draining, readback and interruption. A
 released lifecycle lock is not proof that the turn stopped: follow still
 requires positive idle evidence.
 
-An abandoned running worker recovers through `follow` or `reopen`. The current
-server may not know a thread on a retired server: recovery checks the old
-writer, resumes the exact thread on the current server and proves idle before
-publishing recovery or submitting work. Live or unknown state preserves pending
-work and names the cause. Reopen probes without a roster flock, then rechecks
-revision and launcher under the roster flock. Compact does not recover a dead
-launcher; its refusal directs the caller to follow or reopen.
-When no server is live, follow refuses before claiming an abandoned worker;
-reopen can restart the server and recover only after proving that same thread idle.
+`assign.sh --to` calls `reopen` for an ended worker or a live status with a dead launcher.
+Recovery checks the old server, resumes the recorded thread and proves it idle before dispatch.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+Live or unknown state preserves pending work and names the cause.
+Reopen probes without a roster flock, then rechecks the revision and launcher under that flock.
+Compact does not recover a dead launcher; its refusal directs the caller to follow or reopen.
+Without a live server, reopen starts a server and proves the recorded thread idle.
+`end` keeps the staff row and thread id for recovery. Permanent removal retires the row.
+`assign.py` ends an Astra reviewer, releases its role, and retires its staff row after the review.
+The unit ledger keeps ended workers so unit retirement can find and retire their rows.
 
 
 ## Whole worker-state publication

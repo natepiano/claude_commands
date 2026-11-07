@@ -5,6 +5,10 @@ repeats.py [--here] [--day YYYY-MM-DD] [--replay] [--log PATH]
 The default report joins local and peer summaries, not their private message bodies.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -19,9 +23,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.message import repeat_guard
 from scripts.shutdown import remote
 from scripts.lib.user_zone import user_zone  # noqa: E402

@@ -1,6 +1,10 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Start a Bevy upgrade watch and record the user's crate-specific answers."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -64,7 +68,7 @@ def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Produc
         name = cast(str | None, args.production)
         if name is not None:
             return read_production(name, record)
-        runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        runtime = staff.caller_identity()
         row = record.by_current_session(runtime)
         if row is None or row.kind != "showrunner":
             raise Refusal("this session runs no production; pass --production <name>")

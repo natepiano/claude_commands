@@ -2,6 +2,10 @@
 """Coordinate build-step use of the Mac: one claim per repository, and the Mac block."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator
@@ -2201,12 +2205,12 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     return ClaimFinished(0)
 
 
-def command_claim_wait(args: CliArguments, paths: StatePaths) -> int:
+def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "") -> int:
     """Reserve a slot for a live local wait without starting remote work."""
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = offload.read_config(settings)
     if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package,
-                                             args.verb, args.target), offload.IneligibleMacStep):
+                                             args.verb, args.target, kind=kind), offload.IneligibleMacStep):
         return 1
     args.worktree = args.repo_root
     args.what = f"{args.verb} {args.package or 'workspace'}"

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Claude gets one phone reminder when a low account lacks an account-move entry.
 
 Codex refusal reruns reach only the stopped command's director; other notices are logged.
@@ -7,6 +7,10 @@ its episode silently; /quota_refresh still refreshes readings.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import asyncio
@@ -31,6 +35,7 @@ from scripts.lib import process_group
 
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
+from scripts.shutdown import remote
 from scripts.whoami import note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402
@@ -608,8 +613,19 @@ def showrunners_now() -> list[Showrunner]:
 
 def recipients(config: Config, here: str | None = None) -> list[str]:
     """Recipients for five-hour, Claude no-room and blocked next-head notices."""
+    from scripts.message import sessions
+
+    aliases: dict[str, str] = {}
+    for observation in sessions.read_registry().entries:
+        record = observation.record
+        address = "session:" + record["sessionId"]
+        for name in (record["sessionId"], address, record["name"], *record["formerNames"]):
+            if name:
+                aliases[name] = address
     names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
-    return list(dict.fromkeys(name for name in names if name != here))
+    excluded = aliases.get(here or "", here)
+    return list(dict.fromkeys(aliases.get(name, name) for name in names
+                             if aliases.get(name, name) != excluded))
 
 
 def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
@@ -1756,7 +1772,7 @@ def _paid_credits_notice(label: str, report: Report,
     except ValueError:
         credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
     return ZeroEpisodeNotice(id="quota.paid_credits", values={
-        "sender": "quota_alert", "account": label, "machine": os.uname().nodename, "credits": credits_left,
+        "sender": "quota_alert", "account": label, "machine": remote.local_machine(), "credits": credits_left,
         "refill": reset_display(refusals.KnownReset(reset)),
         "next_reset": reset_display(refusals.KnownReset(next_reset)),
     })

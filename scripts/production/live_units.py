@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """List a showrunner's recorded units, each with its session now."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
 from collections.abc import Callable
@@ -28,7 +32,7 @@ class UnitListing(NamedTuple):
     anomalies: tuple[str, ...]
 
 
-def read_units(production_name: str, *scans: Callable[[staff.StaffSnapshot, unit_lookup.MemberSources], None],
+def read_units(production_name: str, *,
                check: Callable[[int, str], session_staff.ReportProcessIdentity] | None = None) -> UnitListing:
     """Return staff units and every anomaly from this observation."""
     record = staff.snapshot()
@@ -38,8 +42,6 @@ def read_units(production_name: str, *scans: Callable[[staff.StaffSnapshot, unit
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
     with session_staff.anomalies(check) as lines:
         every = unit_lookup.every_labeled_session(record=record, sources=sources)
-        for scan in scans:
-            scan(record, sources)
     units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()))
     return UnitListing(units, tuple(lines))
 

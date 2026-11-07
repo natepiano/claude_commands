@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import sys
 import fcntl
 import json
 import os
 import subprocess
 import unittest
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.production import showrunners
@@ -248,6 +245,22 @@ always=always-there
                              ["natedev", "boss of bosses", "new director"])
             self.assertEqual(quota_alert.recipients(quota_alert.load_config(), "natedev"),
                              ["boss of bosses", "new director"])
+
+    def test_recipient_identity_merges_ids_names_and_the_here_exclusion(self) -> None:
+        from scripts.message import sessions
+
+        record: sessions.SessionRecord = {"pid": 998001, "sessionId": "fixture-director", "name": "natedev",
+            "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": ["old director"]}
+        registry = sessions.RegistryRead((sessions.RegistryObservation(record, {}),), ())
+        config = quota_alert.load_config()
+        config["always"] = ["fixture-director", "session:fixture-director", "old director"]
+        with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
+              mock.patch.object(sessions, "read_registry", return_value=registry),
+              mock.patch.object(quota_alert, "registered_showrunners", return_value=running("natedev"))):
+            self.assertEqual(quota_alert.recipients(config), ["session:fixture-director"])
+            for here in ("fixture-director", "session:fixture-director", "natedev", "old director"):
+                with self.subTest(here=here):
+                    self.assertEqual(quota_alert.recipients(config, here), [])
 
     def test_low_recovery_closes_the_episode_without_telling_sessions(self) -> None:
         _ = self.alert([self.note("codex1.md", "active", "1")], self.now)

@@ -24,6 +24,8 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
 
 @final
@@ -39,11 +41,23 @@ class RemoteCopiesTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
-                                             {"source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
+                                             {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
 
     def remote(self, owner: str = "alpha", path: str = "mirror/repository") -> copies.RemoteMirror:
         return copies.RemoteMirror(owner, copies.SelectedRepository(self.source.name), "host", path, "holder-session")
+
+    def test_a_remote_mirror_keeps_its_staff_owner_after_a_rename(self) -> None:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        parent = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="alpha", parent=parent.id)
+        mirror = self.remote(str(unit.id))
+        with fake_remote_removal((mirror,)) as remove:
+            _ = staff.rename(unit.id, "renamed")
+            self.assertEqual(copies.owned_remote_mirrors(str(unit.id)), [mirror])
+            copies.remove_trees(str(unit.id))
+        remove.assert_called_once_with(mirror)
+        self.assertEqual(copies.owned_remote_mirrors(str(unit.id)), [])
 
     def test_staged_source_keeps_only_index_content_without_source_changes(self) -> None:
         original = self.source / "source.txt"
@@ -92,6 +106,14 @@ class RemoteCopiesTests(unittest.TestCase):
             with self.assertRaisesRegex(copies.CopyError, "mirror/repository.*holder-session"):
                 copies.remove_trees("alpha")
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
+
+    def test_busy_mirror_stays_and_the_other_mirror_goes(self) -> None:
+        busy, idle = self.remote(), self.remote("alpha", "mirror/idle")
+        with fake_remote_removal((busy, idle)) as remove, copies.remote_lease(busy):
+            with self.assertRaisesRegex(copies.CopyError, "mirror/repository.*holder-session"):
+                copies.remove_trees("alpha")
+        remove.assert_called_once_with(idle)
+        self.assertEqual(copies.owned_remote_mirrors("alpha"), [busy])
 
     def test_cancelled_copy_releases_lease_and_keeps_metadata(self) -> None:
         mirror = self.remote()

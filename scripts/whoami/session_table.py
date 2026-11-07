@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import re
 import sys
-from pathlib import Path
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import canonical_label
 

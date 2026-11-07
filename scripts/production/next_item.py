@@ -23,6 +23,10 @@ docs; a production with none has no efficiency items. A list that cannot be read
 one line on stderr.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sys
@@ -35,7 +39,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 from scripts.production import change_review
 from scripts.production import proposals_folder
 from scripts.production import proposals_table
-from footer_counts import efficiency_ledger
+from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production

@@ -16,6 +16,10 @@ but the showrunner did not appear or attach (the session is left running); 2 on 
 3 (SESSION_NOT_READY) when the session is open but its opening prompt was not proven submitted.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 
 import argparse

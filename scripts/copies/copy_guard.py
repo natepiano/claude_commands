@@ -1,5 +1,9 @@
 """Keep repository checkout creation in copies.py and the named original/mirror paths."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import ast
 from collections import deque
@@ -32,7 +36,7 @@ SHELL = cast(ShellCommands, cast(object, load_file_module(
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner verify "
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
     + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
 )

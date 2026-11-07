@@ -9,6 +9,10 @@ Action counters include zeroes. Read-only children run normally; only their firs
 two command words appear in the report. Pass messages and child output stay private.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import builtins
@@ -35,7 +39,6 @@ from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class DiscardedTextWrite(io.StringIO):
@@ -132,8 +135,6 @@ class NotesPass:
 
 
 def load_pass() -> NotesPass:
-    # Keep the timer modules on their existing sibling import names.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     notes = import_module('scripts.whoami.agent_notes')
     watch = import_module("scripts.accounts.refusal_watch")
     watchdog = import_module("scripts.accounts.unit_watchdog")

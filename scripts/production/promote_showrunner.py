@@ -8,6 +8,10 @@ The completion receipt follows worker restore.
 Use --check to inspect the promotion without stopping sessions.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 
 import argparse

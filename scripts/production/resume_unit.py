@@ -7,6 +7,10 @@ A preview changes no files. A repeated command preserves completed steps.
 Exit 0 on success, 1 on refusal or failure, and 2 on invalid arguments.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import subprocess
@@ -15,17 +19,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote
 from scripts.lib import conf
 from scripts.message import sessions
 
 from scripts.production import add_unit
-import retire_unit
-import unit_lookup
-import unit_names
-import pane_record
+from scripts.production import retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_names
+from scripts.shutdown import pane_record
 from scripts.production.production_doc import Production, Refusal
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"

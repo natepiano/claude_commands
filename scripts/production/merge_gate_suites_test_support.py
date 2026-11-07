@@ -15,13 +15,13 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 # Keep the shared fixture unchanged for its other subjects. These jobs still run
 # in separate processes, but need no Python stub which only execs Python again.
 CONCURRENCY_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-            while not (state / (str(os.getpid()) + ".released")).exists():
+            while not (state / (str(os.getpgrp()) + ".released")).exists():
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)'''
 CONCURRENCY_EVENT = '''            sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
             from scripts.direct.wait_for_test_state import wait_until
-            wait_until((state / (str(os.getpid()) + ".released")).exists,
+            wait_until((state / (str(os.getpgrp()) + ".released")).exists,
                        state, timeout=TEST_HANG_GUARD_SECS)'''
 OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while True:

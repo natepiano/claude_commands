@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build and inspect Claude and Codex account directories; select Claude roles."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import asyncio
@@ -2687,7 +2691,8 @@ class PaneMoves(Protocol):
 
 
 class SessionBatchMove(Protocol):
-    def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause) -> list[stop_results.MoveResult]: ...
+    def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
+                 source_accounts: Mapping[str, str]) -> list[stop_results.MoveResult]: ...
 
 
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
@@ -2714,7 +2719,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
             eligible.append(identity)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
-    results = batch(eligible, checked.destination.label, why=why, cause=cause)
+    sources = {item.session_id: claude_config_label(item.config_dir) for item in live if item.session_id in eligible}
+    results = batch(eligible, checked.destination.label, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
             account_anomaly(f"{identity}: no saved session was found")

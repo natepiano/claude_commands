@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, override
 
 from scripts.lib import process_start as process_identity
+from scripts.copies.copies_test_support import copies_environment
 
 
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
@@ -292,6 +293,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.environment = {
             **os.environ,
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),

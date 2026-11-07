@@ -2,6 +2,10 @@
 """Find a live Claude session's socket, `SendMessage` address, session ID or transcript."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -9,7 +13,7 @@ import stat
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module
@@ -333,12 +337,19 @@ def _readable_records() -> Iterator[SessionRecord]:
     yield from (item.record for item in read_registry().entries)
 
 
+def _running(records: Iterable[SessionRecord]) -> list[SessionRecord]:
+    return sorted((record for record in records if running_session(record)),
+                  key=lambda record: record["updatedAt"], reverse=True)
+
+
+def running_records(registry: RegistryRead) -> list[SessionRecord]:
+    """Every running record of one registry read, newest first, including processes without sockets."""
+    return _running(item.record for item in registry.entries)
+
+
 def running_sessions() -> list[SessionRecord]:
     """Every running record, newest first, including processes without sockets."""
-    return sorted(
-        (record for record in _readable_records() if running_session(record)),
-        key=lambda record: record["updatedAt"], reverse=True,
-    )
+    return _running(_readable_records())
 
 
 def live_sessions() -> list[SessionRecord]:

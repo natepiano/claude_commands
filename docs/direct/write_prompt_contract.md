@@ -22,8 +22,9 @@ Codex review prompts also include section 3's command block.
    "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
    Review prompts use
    <ReviewPromptContract/>'s style assignment instead.
-3. Narration: require this command when the activity changes, with the concrete path and assigned slot:
-   `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
+3. Narration: require this command when a herdr pane worker's activity changes:
+   `bash ~/.claude/scripts/direct/board.sh post <slot> status "<activity>"`.
+   For an existing `mesh` pin, insert the concrete run folder after `post`.
    For a read-only pane reviewer, require short output lines instead of board posts.
    Assign its required suites to the director or a writer.
    Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
@@ -56,10 +57,12 @@ Codex review prompts also include section 3's command block.
    ```
 
    Claude workers use `run_in_background: true` and end the turn until the result arrives.
-   Before a role change, require this command from writers and existing mesh-pinned reviewers:
-   `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`.
+   Before a role change, require this command from herdr pane writers:
+   `bash ~/.claude/scripts/direct/board.sh role <slot> <impl|fix|test|review> "<why>"`.
+   For existing mesh-pinned writers and reviewers, insert the concrete run folder after `role`.
    The director records a pane reviewer's role change.
-   Use the concrete path and the prompt's slot. Check that different prompts name different slots.
+   Use the prompt's slot. Check that different prompts name different slots.
+   Omit the run folder from pane worker board commands. They read `UNIT_RUN_DIR`.
 4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
    Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
    Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
@@ -106,7 +109,7 @@ Codex review prompts also include section 3's command block.
     3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
     ```
 
-    Run the phase and merge gates in full. Require each worker's listed tests before its checkpoint.
+    Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <PhaseTeam>
@@ -168,37 +171,23 @@ Completion ends the turns and retains the worker conversations.
 </PhaseTeam>
 
 <CoordinationBoard>
-The team coordinates through `${SESSION_DIR}/board.log`, written only with
-`bash ~/.claude/scripts/direct/board.sh`.
+The team uses the run's `board.log`. Write it only through `bash ~/.claude/scripts/direct/board.sh`.
+The board keeps decisions and activity across stops and restarts. Send questions by message under <PhaseMesh/>.
 
-The board keeps decisions and activity across stops and restarts.
-Messages carry questions to one recipient. The board keeps the shared record.
+Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
+Directors and workers with an existing `mesh` pin insert `<session_dir>` after the verb.
 
-- `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
-  Kinds are a closed set: `register`, `claim`, `release`, `status`, `blocked`,
-  `handoff`, `done`. There is no `ask` and no `answer`, and the command rejects
-  both: a question to a peer is a message, per <PhaseMesh/>.
-- `board.sh read <session_dir> --since <cursor>` — everything new. Each line is
-  numbered; keep the last number as the cursor. Read after acquiring a token,
-  and whenever you need what a peer has recorded rather than what it would say
-  if asked — the role it holds now, whether it has posted `done`.
-- `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call this
-  the moment your slot starts doing something other than what it is named
-  for.** A slot is a fixed identity and its role is not: a writer that takes a
-  slice of the remaining test work is doing `test`. The launcher stamps the opening role, so
-  the table is never blank;
-  after that only this command keeps it true, and saying it in a `status`
-  sentence does not count — the table reads the field, not prose. **Every call
-  adds a row**, so a change you do not post is a shape the run never shows, and
-  the row above it silently claims your old role held the whole time.
-- **One way to do each thing.** A question goes by message; a decision goes on
-  the board. A decision that is not on the board did not happen, however plainly
-  it was settled in messages — the board is what a peer resuming later, and the
-  unit director at its next tick, actually read.
+- `board.sh post <slot> <kind> <message>` adds one board line.
+  Kinds are `register`, `claim`, `release`, `status`, `blocked`, `handoff`, and `done`.
+  The command rejects `ask` and `answer`.
+- `board.sh read --since <cursor>` reads new lines.
+  Keep the last line number as the cursor. Read after acquiring a token or when you need a peer's record.
+- `board.sh role <slot> <impl|fix|test|review> [note]` records a role change.
+  Record each role change when it starts. A writer that starts test work takes the `test` role.
+  The launcher records the opening role. Every role call adds a row.
+  A `status` post does not change the role field.
 
-Narration goes through the board too: `board.sh post` takes the slot as a
-required argument, so attribution cannot be dropped, where a name an agent is
-merely asked to prefix onto a heartbeat line reliably goes missing.
+Record decisions on the board. Keep the slot argument in every post.
 </CoordinationBoard>
 
 <PhaseMesh>

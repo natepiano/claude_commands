@@ -34,6 +34,10 @@ usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent afte
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -46,17 +50,13 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from . import decision_priority
-else:
-    from scripts.notify import decision_priority
+from scripts.notify import decision_priority
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -526,10 +526,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
             elif opening.since != reference["since"]:
                 reason = "question reopened"
     elif reference["kind"] == "review_watch":
-        if TYPE_CHECKING:
-            from ..production import review_regime
-        else:
-            from scripts.production import review_regime
+        from scripts.production import review_regime
         if review_regime.acknowledged():
             reason = "report acknowledged"
     if reason:

@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """resume_unit.py in process. Git runs in temporary repositories; add_unit.py is a recording stand-in
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
+
+from scripts.production.staff_test_support import foreign_hostname
+
+from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
@@ -21,17 +25,16 @@ from multiprocessing.connection import Connection
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import resume_unit
+from scripts.production import resume_unit
 from scripts.production import add_unit
-import retire_unit
+from scripts.production import retire_unit
 from scripts.message import sessions as retirement_sessions
-import unit_lookup
-import unit_move
-import test_retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_move
+from scripts.production import test_retire_unit
 from scripts.production.production_doc import Production, read_production
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.herdr.herdr import HerdrPlace
 
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
@@ -47,6 +50,7 @@ DIRECTOR = "11111111-1111-1111-1111-111111111111"
 
 
 def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 
@@ -105,7 +109,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertTrue((self.worktree / ".git").is_file())
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         row = unit_membership("alpha", "alpha")
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.worktree))
+        self.assertEqual(row.worktree, staff.PresentWorktree(remote.local_machine(), self.worktree))
         self.assertIsInstance(resume_unit.find_unit("alpha", "alpha"), resume_unit.NoRecoveryRequired)
 
 
@@ -148,7 +152,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         unit_config.discard_parked(row.id)
         before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
         for flags in ((), ("--dry-run",)):
@@ -221,7 +225,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         self.retained_config()
 
     def retained_config(self, *, plan: str = "docs/plans/alpha.md") -> None:
@@ -264,7 +268,7 @@ class ResumeUnitTests(unittest.TestCase):
     def test_resume_unit_rerun(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
             unit_config.AppPort(1), ("scripts",),
             unit_config.RetiredSession("2026-10-20", DIRECTOR, unit_config.Branch("alpha")))
@@ -306,7 +310,7 @@ class ResumeUnitTests(unittest.TestCase):
         tip = git(retirement.checkout, "rev-parse", "main")
         code, output = retirement.retire()
         self.assertEqual(code, 0, output)
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", retirement.worktree)))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(remote.local_machine(), retirement.worktree)))
         restore = self.enterContext(mock.patch.object(
             worker, "restore", return_value=worker.ExitCode.OK))
         launched_ids: list[staff.StaffId] = []
@@ -409,7 +413,7 @@ class ResumeUnitTests(unittest.TestCase):
         source.symlink_to(self.doc)
         _ = self.staff.record_production("alpha", source)
         row = unit_membership("alpha", "alpha")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
         wrapper = self.root / "resume-launch.py"
         # The inner launcher boundary supplies no live pane. Its public main and
         # staff step are real, including the inherited operation lock.
@@ -652,7 +656,7 @@ class ResumeUnitTests(unittest.TestCase):
         parked = unit_config.parked_path(row.id)
         before = parked.read_bytes(), parked.stat().st_mtime_ns
         destination = self.root / "changed-staff-folder"
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), destination), expected=row.worktree)
         unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         command = resume_unit.launch_command(unit)

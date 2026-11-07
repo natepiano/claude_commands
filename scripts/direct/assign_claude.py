@@ -7,14 +7,14 @@ import re
 import signal
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
-from scripts.direct import phase_reservation, worker_state
+from scripts.direct import claude_worker, phase_reservation, worker_state
 from scripts.lib import models_registry
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import session_staff, staff, worker_admission
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -100,16 +100,11 @@ def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
             _ = path.write_text(json.dumps(expected))
         status = worker_state.worker_status_path(launch.run, launch.slot)
         claim = launch.run / f"impl_claim_{launch.slot}.json"
-        pid = _read(claim).get("pid", 0)
-        stale = False
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                stale = True
-                claim.unlink(missing_ok=True)
-            else:
-                _fail(f"{name} is claimed by launcher {pid}")
+        owner = worker_state.read_worker_claim(claim)
+        if isinstance(owner, worker_state.HeldWorkerClaim):
+            _fail(f"{name} is claimed by launcher {owner.pid}")
+        stale = isinstance(owner, worker_state.EndedWorkerClaim)
+        claim.unlink(missing_ok=True)
         if stale or (status.exists() and status.read_text().strip() == "implementing"):
             _ = status.write_text("error\n")
         claude = env.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
@@ -122,7 +117,7 @@ def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
         row = next((row for row in rows if row.get("sessionId") == session), missing)
         if row.get("status") != "idle":
             _fail(f"{name} is busy or gone")
-        _ = claim.write_text(json.dumps({"pid": os.getpid(), "worker": name}))
+        worker_state.publish_worker_claim(claim, name)
 
 
 def _release(launch: ClaudeLaunch) -> None:
@@ -157,6 +152,24 @@ def run(launch: ClaudeLaunch) -> int:
             _release(launch)
         for sig, handler in handlers.items():
             _ = signal.signal(sig, handler)
+
+
+def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
+                slot: str, env: dict[str, str]) -> bool:
+    """Claim the phase files before the worker opens."""
+    if phase:
+        with log.open("a") as output:
+            reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
+                "--session-dir", str(run), "--phase", phase, "--repo", str(cwd)],
+                env=env, stdout=output, stderr=subprocess.STDOUT)
+        if reserved.returncode:
+            print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
+            write_text_atomic(status, "error\n")
+            _ = subprocess.run(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
+                f"launcher: phase {phase} could not claim its files; its worker did not open"],
+                env=env, text=True, check=False)
+            return False
+    return True
 
 
 def _run(launch: ClaudeLaunch) -> int:
@@ -208,16 +221,8 @@ def _run(launch: ClaudeLaunch) -> int:
         worker = NewClaudeWorker()
     if isinstance(worker, ClaudeFollowUp):
         _claim(launch, name, env)
-    if launch.phase:
-        with log.open("a") as output:
-            reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
-                "--session-dir", str(launch.run), "--phase", launch.phase, "--repo", str(launch.cwd)],
-                env=env, stdout=output, stderr=subprocess.STDOUT)
-        if reserved.returncode:
-            print(f"ERROR: phase {launch.phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
-            _ = status.write_text("error\n")
-            board("blocked", f"launcher: phase {launch.phase} could not claim its files; its worker did not open")
-            return 1
+    if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
+        return 1
     _ = summary.write_text("")
     _ = status.write_text("implementing\n")
     _ = (directory / f"impl_agent_{launch.slot}").write_text(
@@ -247,45 +252,40 @@ def _run(launch: ClaudeLaunch) -> int:
     if not Path(env["TMPDIR"]).is_dir():
         _ = child([PYTHON, build_folders, "stable", "--run-temp", str(launch.run)], capture=True)
     message = directory / f"impl_follow_message_{launch.slot}.{os.getpid()}.txt"
-    command = ["bash", str(SCRIPTS / "../agents/agent_bg.sh")]
-    env["AGENT_BG_ROLE"] = launch.role
     if isinstance(worker, ClaudeFollowUp):
         _ = message.write_bytes(launch.prompt.read_bytes() +
             f"\n\nAs your last act, write impl_summary_{launch.slot}.txt, then post done on the board.\n".encode())
-        command += ["--attach"]
-    else:
-        env.update(AGENT_BG_WORKERS="1", AGENT_BG_EFFORT=launch.effort)
-    command += ["--run", str(launch.run), name, str(launch.cwd),
-                str(message if isinstance(worker, ClaudeFollowUp) else launch.prompt),
-                str(summary), str(log), launch.model]
-    agent = subprocess.Popen(command, env=env)
-
-    def terminate_agent(signum: int, frame: FrameType | None) -> None:
-        del signum, frame
-        agent.terminate()
-
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        _ = signal.signal(sig, terminate_agent)
-    if isinstance(worker, NewClaudeWorker):
-        attempts = int(env.get("UNIT_WORKER_WAIT_ATTEMPTS") or "30")
-        while attempts > 0:
-            attempts -= 1
-            if _record(launch, name) or agent.poll() is not None:
-                break
-            time.sleep(float(env.get("UNIT_WORKER_POLL_SECS") or "1"))
-    watch = subprocess.Popen(["bash", str(SCRIPTS / "../agents/heartbeat_watch.sh"),
-        str(launch.run / "heartbeat.log"), tag, str(agent.pid), str(log), "60"], env=env)
+    turn = claude_worker.ClaudeTurn(name, launch.run, launch.cwd,
+        message if isinstance(worker, ClaudeFollowUp) else launch.prompt, summary, log,
+        launch.model, launch.effort, launch.role, env.get("WORKER_STAFF_ID", ""), True, env)
     try:
-        code = agent.wait()
-        code = code if code >= 0 else 128 - code
+        try:
+            if isinstance(worker, ClaudeFollowUp):
+                member = worker_admission.member(launch.run, name, staff.local_snapshot())
+                delivered = claude_worker.follow_up(turn, member.current_session if member else "")
+            else:
+                delivered = claude_worker.open_worker(turn)
+        finally:
+            _ = _record(launch, name)
+        if isinstance(delivered, claude_worker.Delivered):
+            watch = subprocess.Popen(["bash", str(SCRIPTS / "../agents/heartbeat_watch.sh"),
+                str(launch.run / "heartbeat.log"), tag, str(os.getpid()), str(log), "60"], env=env)
+            try:
+                code = claude_worker.wait_for_turn(turn, delivered)
+            finally:
+                if watch.poll() is None:
+                    watch.terminate()
+                _ = watch.wait()
+        else:
+            code = delivered.code if isinstance(delivered, claude_worker.NotDelivered) else 0
+    except SystemExit as error:
+        code = error.code if isinstance(error.code, int) else 1
+    except Exception as error:
+        print(f"claude_worker: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        code = 1
+    finally:
         if isinstance(worker, ClaudeFollowUp):
             message.unlink(missing_ok=True)
-        else:
-            _ = _record(launch, name)
-    finally:
-        if watch.poll() is None:
-            watch.terminate()
-        _ = watch.wait()
     findings = launch.run / "findings_state.json"
     resolves = env.get("UNIT_RESOLVES_ROUND", "1" if launch.role == "fix" and launch.slot == "impl" else "0") == "1"
     repair_options = ["--phase", launch.phase] if launch.phase else []

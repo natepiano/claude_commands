@@ -383,7 +383,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
                      for space in herdr.saved_layout(client.session)["workspaces"]
                      for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
-        for row, pane in row_panes(selected, client):
+        visible = row_panes(list(record.rows) if stop_all else selected, client)
+        for row, pane in visible:
+            if row not in selected:
+                continue
             try:
                 workspace, index, tab = client.pane_tab(pane)
                 positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
@@ -391,6 +394,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _anomaly(row, error)
         for row in selected:
             print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
+        for row in {row.id: row for row, _pane in visible if row not in selected}.values():
+            print(f"{row.name}: left alone; no proved local restart target")
         return 0
     errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []

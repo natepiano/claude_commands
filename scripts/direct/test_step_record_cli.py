@@ -47,7 +47,7 @@ else:
         records.mkdir()
         path = records / "call.json"
         _ = path.write_text(json.dumps(dict(v=1, call_id="call", pid=42, proc_start="123", repo=str(root),
-            kind="test", package=None, runs_on={"kind": "mac_allowed"}, state="waiting_hold", updated="now")))
+            kind="test", package=None, eligible_targets=["mac", "natedev"], runs_on={"kind": "any_target", "mac_targets": ["mac"]}, state="waiting_hold", updated="now")))
         return path
 
     def test_each_record_verb_avoids_heavy_imports_in_a_fresh_process(self) -> None:
@@ -58,7 +58,7 @@ else:
                 arguments = [verb, "--call-id", "call"]
                 if verb == "write":
                     path.unlink()
-                    arguments += ["--pid", "42", "--kind", "lint", "--runs-on", "ssh_allowed",
+                    arguments += ["--pid", "42", "--kind", "lint", "--runs-on", "any_target",
                                   "--eligible-targets", "studio,natedev", "--mac-targets", "studio",
                                   "--pinned-target", "studio", "--state", "waiting_ssh"]
                 elif verb == "stopped":
@@ -98,7 +98,7 @@ else:
                 path = self.fixture(root)
                 before = path.read_bytes()
                 arguments = ["write", "--call-id", "call", "--pid", "42", "--kind", "lint",
-                             "--runs-on", "mac_allowed", "--state", "waiting_hold", flag, value]
+                             "--runs-on", "any_target", "--state", "waiting_hold", flag, value]
                 result = self.invoke(root, arguments)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("step refused", result.stderr)

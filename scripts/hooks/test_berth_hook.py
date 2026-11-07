@@ -17,8 +17,7 @@ from collections.abc import Callable
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
-import phase_reservation  # noqa: E402
+from scripts.direct import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402

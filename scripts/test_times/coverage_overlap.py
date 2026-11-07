@@ -5,6 +5,10 @@ Candidates can check different results. Review their assertions before removal.
 Collector times describe this run. Measure speed with the collector disabled.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Sequence
 from collections import defaultdict

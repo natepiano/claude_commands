@@ -7,6 +7,10 @@ Without `--production`, the caller's staff row names the production.
 The phase and task come from the unit's run records.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
@@ -141,7 +145,7 @@ def main(arguments: list[str]) -> int:
             doc = read_production(name).doc
             style = is_style_production(doc)
             with ThreadPoolExecutor(max_workers=2) as reads:
-                sessions = reads.submit(live_units.read_units, name, staff_sources.unplaced_processes,
+                sessions = reads.submit(live_units.read_units, name,
                                         check=staff_sources.CodexProcessThreads().check)
                 records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                 listing = sessions.result()

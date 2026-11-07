@@ -45,6 +45,10 @@ on berth's board, and a released one takes the phase's live reservation. Every o
 left as it is: the checkpoint's own states belong to <CheckpointCommit/>.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json

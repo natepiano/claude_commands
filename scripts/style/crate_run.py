@@ -5,6 +5,10 @@ Canonical Git and the ledger own claims and publication. Private checkouts own e
 validation. The existing workspace validation and exact-tree test proof are unchanged.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -813,6 +817,7 @@ class CrateRun:
                 if isinstance(skipped, run.OpenTicketRefusal):
                     directory = style_proposals.crate_for(directories, skipped.path)
                     held_by_crate[directory][skipped.finding_id] = list(skipped.ticket_ids)
+            checkout_parent = copies.workspace_path(self.owner, self.repo, f"crate-{self.run_id}.selected").parent
             for member in members:
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", member.package_name):
                     raise bulk.BulkRenameError("unsafe package name")
@@ -829,8 +834,7 @@ class CrateRun:
                     frozen.append({"id": finding.finding_id, "path": finding.path, "proposal": proposal,
                                    "rule_blob": finding.rule_blob, "evidence": evidence(finding),
                                    "proposal_sha256": hashlib.sha256(Path(proposal).read_bytes()).hexdigest()})
-                checkout = copies.workspace_path(self.owner, self.repo,
-                                                 f"crate-{self.run_id}.{member.package_name}")
+                checkout = checkout_parent / f"crate-{self.run_id}.{member.package_name}"
                 records[member.package_name] = {
                     "directory": member.directory, "checkout": str(checkout),
                     "branch": f"refs/heads/style-crate/{self.run_id}/workers/{member.package_name}",

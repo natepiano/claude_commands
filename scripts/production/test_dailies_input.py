@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import sqlite3
@@ -62,7 +64,7 @@ class DailiesInputTests(DailiesInputFixture):
         if doc != self.doc:
             write_text_atomic(doc, self.doc.read_text())
         row = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == name)
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(row.id, staff.LiveDoc(remote.local_machine(), doc))
         conf = self.root / "notifier-state" / f"showrunner-{row.id}" / "conf"
         write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {row.id}\n")
 

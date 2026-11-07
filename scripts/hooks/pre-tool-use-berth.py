@@ -33,6 +33,10 @@ edit can collide with a foreign reservation, where a refused one only costs the 
 Codex accepts only a refusal from a PreToolUse hook: an allow is an exit 0 with no output.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -40,11 +44,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_reservation  # noqa: E402
-import unit_runs  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct import phase_reservation  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 
 

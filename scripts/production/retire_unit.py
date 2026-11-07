@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Retire a staff unit without deleting uncommitted or unmerged work."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -457,6 +461,9 @@ def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
         print(f"refused: {reason}")
     for row in members(unit, staff.snapshot()):
         print(f"would stop: session {row.current_session}")
+    trees = copies.owned_trees(str(unit.staff_member.id))
+    for tree in (*trees.standing, *(entry[0] for entry in trees.workspaces)):
+        print(f"would remove: checkout {tree}")
     print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")
     return int(bool(refused))
@@ -493,6 +500,10 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
+        try:
+            copies.remove_trees(str(row.id))
+        except copies.CopyError as error:
+            print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
         return 0
     refused = refusals(unit, settings=settings)
@@ -546,10 +557,12 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for item in remaining):
         return 1
     try:
-        copies.remove_trees(copies.unit_owner(row.name))
-    except (copies.CopyError, OSError) as error:
+        copies.remove_trees(str(row.id))
+    except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
         return 1
+    except copies.CopyError as error:
+        print(f"anomaly: {error}".replace("\n", " "))
     failed = remove(unit, settings=settings)
     if failed:
         print("\n".join(f"anomaly: {reason}" for reason in failed))
@@ -571,7 +584,7 @@ def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
         if cast(bool, options.dry_run):
             return dry_run(unit, settings=settings)
         return retire(unit, settings=settings, record=record)
-    except (Refused, Refusal, ValueError, OSError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
+    except (Refused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"retire: {error}")
         return 1
 

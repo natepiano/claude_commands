@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for report.py: a section per kind split by caller, then one summary row per kind."""
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 
@@ -31,12 +31,9 @@ from scripts.buildlog import store
 from scripts.buildlog.record import TARGET_DIR_UNSET
 from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_mac_block
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 from scripts.buildlog.test_record_rerun import refresh_machine_health
-from scripts.buildlog.test_memory_window import isolated_journal
+from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
 
 HISTORY_STAMP = "2026-09-30T12:00:00Z"
 
@@ -114,7 +111,7 @@ def probe_cli() -> None:
 def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
     # Importing test_index installs its own paths; restore this fixture afterwards.
     result = subprocess.run(
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
         env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
         capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
@@ -158,7 +155,7 @@ class ReportSpeedTests(unittest.TestCase):
                 )))
                 _ = index.update()
                 result = subprocess.run(
-                    [str(Path(__file__).resolve().parents[1] / "lib/py"), "scripts/buildlog/cli.py", "report"],
+                    configured_host_cli(Path("scripts/buildlog/cli.py"), "report"),
                     cwd=Path(__file__).resolve().parents[2],
                     env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
                          "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
@@ -262,6 +259,7 @@ class ReportTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)

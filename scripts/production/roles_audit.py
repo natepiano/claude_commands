@@ -6,6 +6,10 @@ static: Python string literals (excluding docstrings, keys, paths and machine
 tokens), quoted shell output and cat heredocs. Scripts and strings are not expanded.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import ast

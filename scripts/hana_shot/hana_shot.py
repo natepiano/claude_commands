@@ -2,6 +2,10 @@
 """Frame Hana's camera on a known view over BRP and save a timed screenshot."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from functools import partial
 
@@ -2206,9 +2210,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             current = staff.runtime_id()
             if current:
                 record = staff.local_snapshot()
-                row = record.by_current_session(current)
-                if row is not None and row.kind == "worker":
-                    row = record.parent_of(row)
+                row = record.owner_of(current)
                 if row is not None:
                     owner = row.name
         except staff.StaffUnreadable:

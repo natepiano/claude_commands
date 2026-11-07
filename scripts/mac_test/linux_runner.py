@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Execute trusted source in a cached Linux development shell."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator, Mapping
@@ -27,14 +31,13 @@ from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 from types import FrameType
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..copies import copies
-    from ..lib import build_folders
-    from ..lib.boot_identity import boot_identity as boot_identity
-    from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from ..aws_target import ledger
-    from ..build_targets.target_config import SshTarget, is_aws_target
+    from scripts.copies import copies
+    from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.aws_target import ledger
+    from scripts.build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.copies import copies
     from scripts.lib import build_folders
@@ -161,6 +164,15 @@ def positive_setting(values: dict[str, str], key: str) -> float:
     return value
 
 
+def shell_environment_script(shell: ShellEnvironment) -> str:
+    """Keep the caller's tools after the development shell's tools."""
+    return ('linux_runner_path=$PATH\n'
+            + f'source {shlex.quote(str(shell.exports))} || exit 75\n'
+            + 'export PATH="$PATH:$linux_runner_path"\n'
+            + 'unset linux_runner_path\n'
+            + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n')
+
+
 def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
     return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
 
@@ -188,29 +200,16 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
         copies.mirror_probe_setup(mirror),
         f'checkout="$HOME"/{shlex.quote(mirror)}',
-        'if [[ -f "$checkout/Cargo.toml" ]]; then',
-        "  capacity_code=" + shlex.quote("\n".join((
-            "import sys",
-            "from pathlib import Path",
-            "sys.path.insert(0, str(Path.home() / '.claude'))",
-            "from scripts.mac_test.linux_runner import output_free_bytes",
-            "print(f'{output_free_bytes(Path(sys.argv[1])) / 1024 ** 3:.6f}')",
-        ))),
-        '  free_gib=$(python3 -c "$capacity_code" "$checkout") || { printf \'disk capacity unavailable\\n\' >&2; exit 1; }',
-        'else',
-        '  disk_usage=$(df -Pk "$checkout") || exit 1',
-        '  free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
-        'fi',
+        'disk_usage=$(df -Pk "$checkout") || exit 1',
+        'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
-        'rustc_version=$(rustc -V) || exit 1',
-        'nextest_version=$(cargo nextest --version) || exit 1',
-        'mend_version=$(cargo mend --version) || exit 1',
-        f'rustc_version=$(printf \'%s\' "$rustc_version" | {tool_version_filter()}) || exit 1',
+        'nextest_version=$(cargo-nextest nextest --version) || exit 1',
+        'mend_version=$(cargo-mend mend --version) || exit 1',
         f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
         f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
-        'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
-        + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
+        'printf \'nextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
+        + '"$nextest_version" "$mend_version" "$scripts_commit"',
     ))
 
 
@@ -492,12 +491,18 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
+                   test_environment: tuple[tuple[str, str], ...] = (),
+                   clear_environment: str = '') -> str:
     arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
         arguments.extend(['--repo-identity', repo_identity])
+    for name, value in test_environment:
+        arguments.extend(['--env', name + '=' + value])
+    if clear_environment:
+        arguments.extend(['--clear-environment', clear_environment])
     arguments.extend(['--', *words])
     return shlex.join(arguments)
 
@@ -555,10 +560,7 @@ def permission_refused(values: dict[str, str]) -> bool:
         context = aws_execution_context(values)
         if isinstance(context, IndependentLinuxExecution):
             return False
-        if TYPE_CHECKING:
-            from ..aws_target import ledger
-        else:
-            from scripts.aws_target import ledger
+        from scripts.aws_target import ledger
         remote = aws_execution_evidence()
         permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
                                                  boot_id=boot_identity())
@@ -609,8 +611,7 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
                                   positive_setting(values, 'shell_timeout_s'))
             if permission_refused(values):
                 return 75
-            command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-                       + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
+            command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
             return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
@@ -621,20 +622,22 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     if permission_refused(values):
         return 75
     try:
         with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
 
 
-def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
+def output_filesystem_paths(checkout: Path, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Resolve the checkout and its Cargo output filesystems."""
-    outputs = read_cargo_output_roots(checkout)
+    outputs = read_cargo_output_roots(checkout, environment=environment)
     if isinstance(outputs, CargoOutputUnavailable):
         if not (checkout / "Cargo.toml").exists():
             return (checkout,)
@@ -642,9 +645,9 @@ def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
     return (checkout, outputs.target_directory, outputs.build_directory)
 
 
-def output_free_bytes(checkout: Path) -> int:
+def output_free_bytes(checkout: Path, environment: Mapping[str, str] | None = None) -> int:
     readings: list[int] = []
-    for path in output_filesystem_paths(checkout):
+    for path in output_filesystem_paths(checkout, environment):
         while True:
             try:
                 readings.append(shutil.disk_usage(path)[2])
@@ -688,13 +691,56 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
     return f'{target} version mismatch: ' + '; '.join(differences) + hint
 
 
+def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
+    """Install the tree's toolchain under one lock for its channel."""
+    version = re.fullmatch(r'rustc (\d+\.\d+\.\d+)(?: .*)?', expected_rustc)
+    fallback = (f'export RUSTUP_TOOLCHAIN={shlex.quote(version[1])}' if version else ':')
+    name_code = '\n'.join((
+        'import hashlib, os, tomllib',
+        'from pathlib import Path',
+        'path = next((p for p in (Path("rust-toolchain"), Path("rust-toolchain.toml")) if p.is_file()), None)',
+        'if os.environ.get("RUSTUP_TOOLCHAIN"):',
+        '    print(os.environ["RUSTUP_TOOLCHAIN"])',
+        'elif path is None:',
+        '    print("")',
+        'else:',
+        '    text = path.read_text()',
+        '    try:',
+        '        toolchain = tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest()',
+        '    except tomllib.TOMLDecodeError:',
+        '        toolchain = text.strip()',
+        '    print(toolchain)',
+    ))
+    return '\n'.join((
+        'if [[ -z ${RUSTUP_TOOLCHAIN-} && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then',
+        f'  {fallback}',
+        'fi',
+        f'toolchain=$(python3 -c {shlex.quote(name_code)}) || exit 75',
+        'if [[ -n "$toolchain" ]]; then',
+        '  mkdir -p -- "${RUSTUP_HOME:-$HOME/.rustup}" || exit 75',
+        '  (',
+        '    flock -x 9 || exit 75',
+        '    if install_output=$(rustup toolchain install --no-self-update --no-update 2>&1); then',
+        '      if [[ -n "$install_output" ]]; then printf \'%s\\n\' "$install_output"; fi',
+        '    else',
+        '      install_output=${install_output//$\'\\n\'/ }',
+        f'      printf \'%s version mismatch: toolchain install failed: %s\\n\' {shlex.quote(target)} "$install_output" >&2',
+        '      exit 75',
+        '    fi',
+        '  ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/$toolchain.lock" || exit 75',
+        'fi',
+    ))
+
+
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
-    if verb not in ('nextest', 'check', 'doc'):
-        raise ValueError('Linux targets accept only test, check and doc')
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
+    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
+        raise ValueError('unsupported remote verb')
     if verb == 'nextest':
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = 'test' if verb == 'nextest' else verb
+    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)
@@ -727,6 +773,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),
     }
+    if verb == 'nextest':
+        environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
     if repo_identity:
@@ -757,23 +805,30 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
-    command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-               + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
-               + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-               + '\n'.join(parity) + '\n'
-               + f'export {assignments}\n')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
-        command += (f': > {shlex.quote(str(started))} || exit 75\n'
+        toolchain_environment = step_directory / 'toolchain'
+        _ = toolchain_environment.write_text('')
+        command = (shell_environment_script(shell)
+                    + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
+                    + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
+                    + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
+                    + '\n'.join(parity) + '\n'
+                    + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
+                    + f'export {assignments}\n'
+                    + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
         completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
                                    pass_fds=copies.inherited_mirror_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
+        toolchain = toolchain_environment.read_text()
+        if toolchain:
+            environment['RUSTUP_TOOLCHAIN'] = toolchain
     try:
-        free = output_free_bytes(mirror) / (1024 ** 3)
+        free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)
@@ -800,6 +855,8 @@ class RunnerArguments(argparse.Namespace):
         self.call_id: str = ''
         self.tree_key: str = ''
         self.repo_identity: str = ''
+        self.environment: list[str] = []
+        self.clear_environment: str = ''
         self.words: list[str] = []
 
 
@@ -816,6 +873,8 @@ def main() -> int:
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
     _ = runner.add_argument('--repo-identity', default='')
+    _ = runner.add_argument('--clear-environment', default='')
+    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -827,7 +886,10 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key, arguments.repo_identity)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity,
+               tuple((name, value) for entry in arguments.environment
+                     for name, _, value in (entry.partition('='),)),
+               arguments.clear_environment)
 
 
 if __name__ == '__main__':

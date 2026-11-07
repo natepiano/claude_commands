@@ -7,6 +7,10 @@ Retire the alert when the prompt ends. Staff ids identify files and alert keys.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -28,9 +32,6 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
 from scripts.lib import conf as tunables
 from scripts.lib.atomic_file import write_text_atomic
@@ -38,15 +39,12 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
 from scripts.production import showrunners, staff, session_staff
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-import context_usage  # noqa: E402
+from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
-import rca  # noqa: E402
+from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
 from scripts.herdr import herdr  # noqa: E402

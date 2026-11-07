@@ -2,6 +2,10 @@
 """Expected process-memory peaks and atomic build admission."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import errno
 from contextlib import closing
@@ -2211,6 +2215,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                            identity["folder"], row["since"], row["need"], admission.reason, row.get("unit", ""),
+                           project=step_project(row.get("repository_name", "")),
                            run=row.get("build_run", NoLiveBuildRun()))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and waiter_owner(row) == waiter_owner(candidate.waiter):
@@ -2497,6 +2502,12 @@ if __name__ == "__main__":
     main()
 
 
+def step_project(repository_name: str, repo: str = "") -> str:
+    """Use a recorded project name without showing an absolute repository path."""
+    name = repository_name or repo
+    return "" if Path(name).is_absolute() else name
+
+
 def reservation_identity(row: Reservation) -> WaiterIdentity:
     """Keep recorded holder names when a legacy row has no queue waiter."""
     identity = RecordedQueueIdentities().identity(row["pid"],
@@ -2524,7 +2535,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
         running.append(RunningStep(identity["session_id"], identity["session_name"],
                                    identity["step"], identity["folder"], row["need"], memory,
                                    run=row.get("build_run", NoLiveBuildRun()), started_at=epoch(row["admitted_at"]),
-                                   unit=identity.get("unit", ""), pid=row["pid"]))
+                                   unit=identity.get("unit", ""), pid=row["pid"],
+                                   project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"])))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value,
                    pid=value.pid if isinstance(value, CompilerServiceMemory) else PidNotRecorded())

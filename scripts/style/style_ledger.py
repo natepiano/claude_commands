@@ -2,6 +2,10 @@
 """Store style judgments and derive coverage at a repository's synced tip."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -30,10 +34,12 @@ from typing import Concatenate, Literal, TypedDict, cast
 
 from scripts.production.issues import Issue, frontmatter
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
 
 from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
-                         LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
+                         LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git,
+                         TreeEntry as TreeEntry, parse_tree_listing, blob_contents as blob_contents)
 
 from scripts.style import rules as rule_catalog
 from scripts.style import style_footprint
@@ -1760,15 +1766,6 @@ class LintCoverage:
     rule_blobs: dict[str, str]
 
 
-@dataclass(frozen=True)
-class TreeEntry:
-    """One `git ls-tree -r` entry: a blob, or a submodule's `commit`."""
-
-    mode: str
-    kind: str
-    object: str
-
-
 # A symlink is a blob too, but its content is a path, not Rust.
 REGULAR_FILE_MODES = ("100644", "100755")
 
@@ -1859,15 +1856,7 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
 
 def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
     """Read the complete inventory of a commit or bare tree, retaining modes and object kinds."""
-    listing = _git(repo, "ls-tree", "-rz", "--full-tree", revision)
-    entries: dict[str, TreeEntry] = {}
-    for entry in listing.split("\0"):
-        if not entry:
-            continue
-        metadata, path = entry.split("\t", 1)
-        mode, kind, name = metadata.split()
-        entries[path] = TreeEntry(mode, kind, name)
-    return entries
+    return parse_tree_listing(_git(repo, "ls-tree", "-rz", "--full-tree", revision))
 
 
 def _tip(repo: Path, commit: str) -> RepositoryTip:
@@ -1886,23 +1875,6 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
             ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
-
-
-def blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
-    """Each path of blobs with the bytes of its blob, read by one `git cat-file --batch`."""
-    with tempfile.TemporaryFile() as contents:
-        command = ("git", "-C", str(repo), "cat-file", "--batch")
-        _ = run_git(command, input="".join(f"{blob}\n" for blob in blobs.values()).encode(), output=contents)
-        _ = contents.seek(0)
-        for path, blob in blobs.items():
-            header = contents.readline().split()
-            if len(header) != 3 or header[:2] != [blob.encode(), b"blob"]:
-                raise GitReadFailed(command, 0, f"{path}: invalid Git blob response")
-            size = int(header[2])
-            content = contents.read(size)
-            if len(content) != size or contents.read(1) != b"\n":
-                raise GitReadFailed(command, 0, f"{path}: incomplete Git blob response")
-            yield path, content
 
 
 def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
@@ -2801,8 +2773,7 @@ class Ledger:
             texts: list[PinnedRuleText] = []
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                result = _git_bytes(self.repo, "hash-object", "--stdin", input=text)
-                hashed = result.stdout.decode().strip()
+                hashed = git_blob_id(text)
                 if hashed != definition.blob:
                     raise ChangedBeforeLock(f"{rule_id}: rule changed while pinning; rerun")
                 texts.append(PinnedRuleText(rule_id, hashed, text))

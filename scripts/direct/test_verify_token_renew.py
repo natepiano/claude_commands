@@ -234,8 +234,10 @@ release_token
         lock = self.root / "board" / "locks" / "cargo.d"
         self.wait_for_running(self.root / "memory-wait", process)
         original_expiry = int((self.root / "original-expiry").read_text())
+        wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry,
+                   lock, processes=(process,))
         # Try another acquisition after the initial lease expires, during admission.
-        _ = Event().wait(max(0, original_expiry + 2 - time.time()))
+        _ = Event().wait(max(0, original_expiry + 1 - time.time()))
         rival = self.board(self.root / "board", "acquire", "second", "cargo", "--pid", str(os.getpid()))
         try:
             self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
@@ -262,16 +264,21 @@ release_token
         lock = board / "locks" / "cargo.d"
         original_expiry = int((self.root / "original-expiry").read_text())
         trace = self.root / "board.trace"
-        with (board / "locks" / "cargo.guard").open("a") as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            # Observe a real guard conflict before release.
-            wait_until(lambda: "+ status=75" in trace.read_text(), trace, processes=(process,))
-            _ = Event().wait(0.3)
+        config = self.root / "direct.conf"
+        original_config = config.read_text()
+        _ = write_config_fixture(config, "TOKEN_GUARD_ATTEMPTS=2\nTOKEN_GUARD_DELAY_MS=1")
+        try:
+            with (board / "locks" / "cargo.guard").open("a") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                # The trace closes after both failed retries return status 2.
+                wait_until(lambda: "+ status=75" in trace.read_text(), trace, processes=(process,))
+        finally:
+            _ = config.write_text(original_config)
         # Observe renewed expiry before another sender tries to acquire the token.
         wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry,
-                   lock, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
+                   lock, processes=(process,))
         # Try another acquisition after the initial lease expires.
-        _ = Event().wait(max(0, original_expiry + 3 - time.time()))
+        _ = Event().wait(max(0, original_expiry + 1 - time.time()))
         rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
         try:
             self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
@@ -381,7 +388,7 @@ class LintInputIdentityTests(VerifyLintCacheFixture):
         judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
         expected = [judgment]
         if fixes:
-            fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+            fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
             expected = [judgment, *([fix] * fixes), judgment]
         self.assertEqual(self.calls("clippy"), expected)
 

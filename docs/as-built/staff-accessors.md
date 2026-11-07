@@ -12,7 +12,7 @@ On the Mac, `staff.py` asks natedev over SSH.
 
 ## Staff identity and backends
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, and `doc`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
@@ -22,16 +22,26 @@ The fixed `id` identifies a member across session changes.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
+A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
+
 `StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
 JSON stores `paused: {since, by, why}` only for a paused row.
 `pause(reference, why)` records the time in the user zone and the caller's staff name.
 `resume(reference)` removes the field.
 The commands accept a unit or `--production <showrunner name>`.
 Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
+An unmatched `--except` value refuses the whole command before any write.
+The refusal names the value and the production. A unit of another production does not match.
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
+Rows, locations, and pause records keep fields that the reader does not know in `unknown_fields`.
+Writes preserve these fields unchanged. Row changes also preserve them.
+The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+Changes from the Mac use the same owner setters.
+A new pause record starts with no unknown fields because it replaces the old record.
 Staff storage uses schema 2.
+A change that old code cannot read safely requires a new schema number.
 `staff_sources.live` emits observations with schema 3.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
 
@@ -63,7 +73,6 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
-| `scripts/agents/agent_bg.sh` | read | runtime_id |
 | `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
 | `scripts/agents/mesh_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
@@ -76,12 +85,15 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
-| `scripts/copies/copies.py` | read | local_snapshot |
+| `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
+| `scripts/build_queue/build_queue.py` | read | caller_identity |
+| `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
+| `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
@@ -90,6 +102,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
@@ -105,16 +118,18 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
+| `scripts/message/morty_identity.py` | read | native_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
-| `scripts/message/send.py` | read | native_id, snapshot |
+| `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
@@ -136,7 +151,11 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
-| `scripts/production/merge_gate.py` | read | staff.json path |
+| `scripts/production/bump_gate.py` | read | read_production.owner.id |
+| `scripts/production/ci_points.py` | read | Production.owner.id |
+| `scripts/production/fast_track.py` | read | copies.source_owner |
+| `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
@@ -206,6 +225,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
 | `scripts/style/style_proposals.py` | read | snapshot |
+| `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, record_path |
 | `scripts/usage/outcomes.py` | read | snapshot |
@@ -213,7 +233,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-155 accessors: 31 write, 123 read, 1 owner.
+165 accessors: 32 write, 132 read, 1 owner.
 
 ## Approved copies
 

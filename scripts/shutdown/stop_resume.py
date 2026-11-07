@@ -1,6 +1,10 @@
 """Stop a session, or resume it on its account in its herdr tab."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import math
 import os
@@ -14,13 +18,15 @@ import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable
-from contextlib import ExitStack, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Generator, Mapping
+from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextvars import ContextVar
 from io import StringIO
 from importlib import import_module
 from threading import Event
 from time import monotonic
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Never, Protocol, cast
 from uuid import uuid4
 
@@ -67,6 +73,19 @@ class RowStarter(Protocol):
 
 
 _UNREAD_NAMES = LaunchNamesNotRead()
+_NO_SOURCE_ACCOUNTS: Mapping[str, str] = MappingProxyType({})
+_detached_moves: ContextVar[bool] = ContextVar("detached_moves", default=False)
+_move_resume: ContextVar[bool] = ContextVar("move_resume", default=False)
+
+
+@contextmanager
+def detached_moves() -> Generator[None]:
+    """Keep move batches outside the maintenance part's kill boundary."""
+    token = _detached_moves.set(True)
+    try:
+        yield
+    finally:
+        _detached_moves.reset(token)
 
 
 def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES) -> herdr.TabSession | SessionNotFound:
@@ -391,11 +410,15 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
+    kind = pane_launch.agent_kind(entry)
+    program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
+    if kind == "codex":
+        environment["CODEX_HOME"] = entry["config_dir"]
+        program = ["codex"]
     return ["env", *(argument for key in unset for argument in ("-u", key)),
             *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
-            sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
+            *program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
@@ -403,7 +426,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     """Replace the foreground command with the saved account launch."""
     command = _pane_command(tab, entry, account)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, *([message] if message else [])])
+    os.execvp(command[0], [*command, *([message] if message and pane_launch.agent_kind(entry) == "claude" else [])])
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
@@ -681,9 +704,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["environment"] = names.environment(entry)
         from scripts.whoami.account import named_account_environment
 
-        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
+        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
@@ -774,23 +797,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: launch record anomaly: {error}", file=sys.stderr)
         attempt_pane = ""
-        try:
-            if isinstance(started, herdr.AgentLaunched):
-                observed = running_on_account(identity, tab.pane_id, kind="codex")
-                if not isinstance(observed, ClaudeUp) or not isinstance(observed.pid, int):
-                    raise OSError(observed.reason if isinstance(observed, ResumeFailed) else "process id is unavailable")
-                pid = observed.pid
-            else:
-                pid = started.pid
-            generation = sessions.process_start(pid)
-            if generation:
-                _detach(["stay", "--session", identity, "--pane", tab.pane_id,
-                         "--account", label, "--pid", str(pid), "--generation", generation, "--why", why,
-                         *(["--requester", requester] if requester else [])], "stay")
-            else:
-                print(f"{identity}: observer anomaly: process generation is unavailable", file=sys.stderr)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"{identity}: observer anomaly: {error}", file=sys.stderr)
+        if not _move_resume.get():
+            _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
     except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         if original is not None and attempt_pane:
@@ -801,6 +809,27 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as cleanup:
                 return ResumeFailed(identity, f"{error}; cleanup failed: {cleanup}")
         return ResumeFailed(identity, str(error))
+
+
+def _watch_resume(identity: str, pane: str, account: str,
+                  started: herdr.AgentLaunched | sessions.LiveSessionProcess, requester: str, why: str) -> None:
+    try:
+        if isinstance(started, herdr.AgentLaunched):
+            observed = running_on_account(identity, pane, kind="codex")
+            if not isinstance(observed, ClaudeUp) or not isinstance(observed.pid, int):
+                raise OSError(observed.reason if isinstance(observed, ResumeFailed) else "process id is unavailable")
+            pid = observed.pid
+        else:
+            pid = started.pid
+        generation = sessions.process_start(pid)
+        if generation:
+            _detach(["stay", "--session", identity, "--pane", pane,
+                     "--account", account, "--pid", str(pid), "--generation", generation, "--why", why,
+                     *(["--requester", requester] if requester else [])], "stay")
+        else:
+            print(f"{identity}: observer anomaly: process generation is unavailable", file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"{identity}: observer anomaly: {error}", file=sys.stderr)
 
 
 def _detach(arguments: list[str], task: str) -> None:
@@ -829,9 +858,11 @@ def _detach(arguments: list[str], task: str) -> None:
                            text=True, check=True, timeout=15)
 
 
-def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int, cause: moves.MoveCause) -> None:
+def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int, cause: moves.MoveCause,
+                   source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> None:
     # Options precede the positional list so session names cannot become options.
     _detach(["batch", "--target", target, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
+             *(arg for identity, label in source_accounts.items() for arg in ("--source-account", f"{identity}={label}")),
              "--", *selected], "move")
 
 
@@ -850,7 +881,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
 
 
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
-                why: str = "") -> str:
+                why: str = "", failure: str = "") -> str:
     """Build one actionable outcome for the showrunner, user push and stay log."""
     from scripts.production import showrunners, staff, staff_sources
     from scripts.accounts import unit_watchdog
@@ -889,7 +920,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         command = shlex.join(["python3", "scripts/shutdown/shutdown.py", "resume", name,
                               "--to", account, "--why", why or "retry after early exit"])
         next_step = f"resume it: cd ~/.claude && {command}"
-    cause = f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}"
+    cause = (f"{name}: resume on {account} failed: {failure}; {next_step}" if failure else
+             f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}")
     try:
         name = staff_sources.unit_parent(unit, identity).name if unit else requester
         if name:
@@ -950,7 +982,7 @@ def _request_moves(selected: list[str], target: str, why: str, cause: moves.Move
     for session in selected:
         identity = identities.get(session, session)
         try:
-            requests[session] = _request_move(session, identity, target, why, cause, sources.get(session, ""), names)
+            requests[identity] = _request_move(session, identity, target, why, cause, sources.get(session, ""), names)
         except Exception as error:
             print(f"{identity}: move log anomaly: {error}", file=sys.stderr)
     return requests
@@ -976,16 +1008,48 @@ def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFa
         print(f"{identity}: move log anomaly: {error}", file=sys.stderr)
 
 
+def _confirm_move_start(result: ClaudeUp, requester: str, why: str) -> ClaudeUp | ResumeFailed:
+    """Keep the existing stay observation inside the move's outcome."""
+    identity = result.session_id
+    live = sessions.session_liveness(identity)
+    failure = (_check_stay(identity, result.pane_id, result.account, live.pid,
+                           sessions.process_start(live.pid) or "", requester, why)
+               if isinstance(live, sessions.LiveSessionProcess) else
+               _early_exit(identity, result.pane_id, result.account, 0.0, requester=requester, why=why))
+    return ResumeFailed(identity, failure) if failure else result
+
+
+def _resume_move(identity: str, target: str, requester: str, why: str, began: float) -> ResumeResult:
+    token = _move_resume.set(True)
+    try:
+        try:
+            result = (resume(identity, why=why, to=target, requester=requester) if requester else
+                      resume(identity, why=why, to=target))
+        except Exception as error:
+            result = ResumeFailed(identity, str(error))
+        if isinstance(result, ClaudeUp):
+            return _confirm_move_start(replace(result, elapsed_seconds=monotonic() - began), requester, why)
+        reason = "session has no tab after stop" if isinstance(result, SessionNotFound) else result.reason
+        _ = _early_exit(identity, "", target, 0.0, requester=requester, why=why, failure=reason)
+        return result
+    finally:
+        _move_resume.reset(token)
+
+
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,
-                  requester: str = "", cause: moves.MoveCause = "by hand") -> list[MoveResult]:
+                  requester: str = "", cause: moves.MoveCause = "by hand",
+                  source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> list[MoveResult]:
     """Interrupt all selected sessions before resuming any; isolate each failure."""
     warn_seconds = max(0, warn_seconds)
     selected = list(dict.fromkeys(sessions))
     if not selected:
         return []
+    if _detached_moves.get():
+        _handoff_batch(selected, target, why, warn_seconds, cause, source_accounts)
+        return [MoveHandedOff(identity) for identity in selected]
     began = monotonic()
     already_up: dict[str, ClaudeUp] = {}
-    sources: dict[str, str] = {}
+    sources: dict[str, str] = dict(source_accounts)
     identities: dict[str, str] = {}
     for session in selected:
         try:
@@ -994,7 +1058,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 identities[session] = tab.session_id or session
                 running = running_on_account(tab.session_id or "", tab.pane_id)
                 if isinstance(running, ClaudeUp):
-                    sources[session] = running.account
+                    _ = sources.setdefault(session, running.account)
                 if isinstance(running, ClaudeUp) and running.account == target:
                     already_up[session] = running
         except (OSError, ValueError, herdr.HerdrFailure):
@@ -1007,7 +1071,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             tabs = [_tab_of(session) for session in selected]
             if any(session not in already_up and isinstance(tab, herdr.TabSession) and tab.session_id == caller
                    for session, tab in zip(selected, tabs)):
-                _handoff_batch(selected, target, why, warn_seconds, cause)
+                _handoff_batch(selected, target, why, warn_seconds, cause, sources)
                 return [MoveHandedOff(tab.session_id) if isinstance(tab, herdr.TabSession) and tab.session_id
                         else SessionNotFound(session) for session, tab in zip(selected, tabs)]
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
@@ -1045,33 +1109,31 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                     stopped.append(result)
                 except Exception as error:
                     stopped.append(StopFailed(session, str(error)))
-            def resume_moved(identity: str) -> ResumeResult:
-                result = (resume(identity, why=why, to=target, requester=requester) if requester else
-                          resume(identity, why=why, to=target))
-                return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
-
-            resumes = {index: pool.submit(resume_moved, result.session_id)
+            resumes = {pool.submit(_resume_move, result.session_id, target, requester, why, began): (index, result.session_id)
                        for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
-            outcomes: list[ClaudeUp | StopFailed | SessionNotFound | ResumePending] = []
+            outcomes: dict[int, ClaudeUp | StopFailed | SessionNotFound | ResumePending] = {}
             for index, result in enumerate(stopped):
                 if isinstance(result, (StopFailed, ClaudeUp, SessionNotFound)):
-                    outcomes.append(result)
-                    continue
-                identity = result.session_id
+                    outcomes[index] = result
+                    identity = result.name if isinstance(result, SessionNotFound) else result.session_id
+                    if identity in requests:
+                        _record_move_outcome(requests[identity], result)
+            for future in as_completed(resumes):
+                index, identity = resumes[future]
                 try:
-                    resumed = resumes[index].result()
+                    resumed = future.result()
                     if isinstance(resumed, ClaudeUp):
-                        outcomes.append(resumed)
+                        outcome = resumed
                     elif isinstance(resumed, SessionNotFound):
-                        outcomes.append(ResumePending(identity, target, "session has no tab after stop"))
+                        outcome = ResumePending(identity, target, "session has no tab after stop")
                     else:
-                        outcomes.append(ResumePending(identity, target, resumed.reason))
+                        outcome = ResumePending(identity, target, resumed.reason)
                 except Exception as error:
-                    outcomes.append(ResumePending(identity, target, str(error)))
-            for session, outcome in zip(selected, outcomes):
-                if session in requests:
-                    _record_move_outcome(requests[session], outcome)
-            return list(outcomes)
+                    outcome = ResumePending(identity, target, str(error))
+                outcomes[index] = outcome
+                if identity in requests:
+                    _record_move_outcome(requests[identity], outcome)
+            return [outcomes[index] for index in range(len(selected))]
 
 
 def move(session: str, target: str, *, why: str) -> MoveResult:
@@ -1087,6 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--why", default="account move")
     _ = batch.add_argument("--cause", choices=("by hand", "refusal", "auto", "credits off"), default="by hand")
     _ = batch.add_argument("--warn-seconds", type=int, default=0)
+    _ = batch.add_argument("--source-account", action="append", default=[])
     _ = batch.add_argument("--log", type=Path, default=shutdown_state_root() / "move.log")
     _ = batch.add_argument("sessions", nargs="+")
     stay = commands.add_parser("stay")
@@ -1109,7 +1172,9 @@ def main(argv: list[str] | None = None) -> int:
     with log.open("a", encoding="utf-8") as output:
         results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
                                 why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
-                                requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause))
+                                requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
+                                source_accounts={identity: label for item in cast(list[str], args.source_account)
+                                                 for identity, _, label in (item.partition("="),)})
         for result in results:
             _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
     return int(any(not isinstance(result, ClaudeUp) for result in results))
