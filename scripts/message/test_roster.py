@@ -566,13 +566,15 @@ class RosterTests(unittest.TestCase):
     def test_keyed_send_reuses_roster_registry_before_delivery(self) -> None:
         state = self.root / "message"
         state.mkdir()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        _ = fixture_worker("impl2", unit.id)
         identity = "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"
         registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
         assert registered is not None
         started = send.now()
         targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
-        no_backends: dict[staff.StaffId, staff.ClaudeBackend | staff.CodexBackend] = {}
         for target in targets:
+            registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
@@ -580,9 +582,7 @@ class RosterTests(unittest.TestCase):
                 with (mock.patch.object(send, "STATE", state),
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
-                      # The staff backend lookup has its own registry read. This test counts send and roster.
-                      mock.patch.object(staff.StaffSnapshot, "backends", no_backends),
-                      mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry,
+                      mock.patch.object(sessions, "read_registry", registry),
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 registry.assert_called_once_with()
@@ -1108,6 +1108,27 @@ class RosterTests(unittest.TestCase):
             self._entries()["alpha-impl"].assignment,
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
+
+    def test_a_roster_takes_folder_and_status_from_the_registry_read_it_receives(self) -> None:
+        registry = sessions.read_registry()
+        solo = next(item.record for item in registry.entries if item.record["name"] == "solo-director")
+        (self.sessions / "solo.json").unlink()
+
+        found = roster.roster(os.environ, roster.ThisMachine(), registry=registry)
+
+        entry = next(entry for entry in found.entries if entry.name == "solo-director")
+        self.assertEqual((entry.cwd, entry.status), (solo.get("cwd"), "waiting"))
+
+    def test_a_send_by_name_stops_when_the_session_folder_cannot_be_listed(self) -> None:
+        missing = self.root / "no-session-folder"
+        membership = staff.snapshot()
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(missing)}):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertIn(f"Claude session records: cannot list {missing}", result.problems)
+        with mock.patch.object(roster, "peer_roster") as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.LocalRosterIncomplete)
+        peer.assert_not_called()
 
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
@@ -2604,11 +2625,11 @@ class PaneRosterTests(StaffTestCase):
     def test_roster_names_owner_and_record_failures(self) -> None:
         _ = self.row_production()
         _ = self.write_document({"schema": 2, "rows": ["invalid member"]})
-        result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+        result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
         self.assertTrue(any("staff membership" in problem for problem in result.problems), result.problems)
         self.assertTrue(any("staff" in problem for problem in result.problems), result.problems)
         with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
-            result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+            result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
         self.assertTrue(any("not reached" in problem for problem in result.problems), result.problems)
 
 

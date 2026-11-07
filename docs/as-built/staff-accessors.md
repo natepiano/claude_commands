@@ -22,6 +22,8 @@ The fixed `id` identifies a member across session changes.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
+A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
+
 `StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
 JSON stores `paused: {since, by, why}` only for a paused row.
 `pause(reference, why)` records the time in the user zone and the caller's staff name.
