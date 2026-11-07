@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build-moment comparisons over fixture logs and fixture progress history."""
 
 from __future__ import annotations

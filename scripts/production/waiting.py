@@ -26,7 +26,7 @@ from scripts.production import session_staff, staff, unit_lookup
 from scripts.production.production_doc import Production, Refusal, read_production
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from merge_checkpoint import Stop, git, report as merge_report
+from scripts.production.merge_checkpoint import Stop, git, report as merge_report
 from scripts.direct import progress_history
 from scripts.lib.user_zone import user_zone
 

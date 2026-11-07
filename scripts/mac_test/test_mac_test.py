@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise Mac test commands and their real process coordination boundaries."""
 
 from __future__ import annotations
@@ -23,33 +23,21 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
-else:
-    from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.mac_test import mac_test
 from scripts.lib import conf
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase
-    from ..production.cli_fixture import invoke_cli
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+    from scripts.production.cli_fixture import invoke_cli
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
     from scripts.production.cli_fixture import invoke_cli
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 

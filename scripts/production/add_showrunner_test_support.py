@@ -18,7 +18,6 @@ from types import ModuleType, SimpleNamespace
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_claude_account

@@ -13,7 +13,6 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
 
 from scripts.aws_target import aws_target, config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture

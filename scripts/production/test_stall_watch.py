@@ -39,9 +39,9 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
-import fake_unit_host
-from fake_unit_host import HostedUnit
-import fake_herdr
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
 import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
@@ -49,7 +49,7 @@ import context_usage
 import rca
 from scripts.production.cli_fixture import invoke_cli
 from test_showrunners import stalled_session_reader
-import unit_lookup
+from scripts.production import unit_lookup
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -522,7 +522,7 @@ always=natedev
     def stop_unit(self) -> Path:
         """Stop the fixture's unit through the real cancellation boundary; return its isolated launch file."""
         from scripts.shutdown import stop_resume
-        import pane_record
+        from scripts.shutdown import pane_record
         with (mock.patch.object(pane_record, "RECORD_DIR", self.root / "launches"),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
@@ -761,7 +761,7 @@ always=natedev
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
         import stall_watch
         from scripts.production import showrunners
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         marked: dict[str, dict[str, lookup.LabeledSession]] = {}
         for production_name in ("first", "second"):
@@ -1234,7 +1234,7 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
-        import pane_record
+        from scripts.shutdown import pane_record
         from scripts.shutdown import pane_record as staff_launches
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})

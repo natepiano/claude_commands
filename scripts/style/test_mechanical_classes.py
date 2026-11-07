@@ -5,14 +5,12 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.style import mechanical_classes
 from scripts.style import style_footprint

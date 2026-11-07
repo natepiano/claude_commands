@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
 

@@ -26,8 +26,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import promote, request_from
-import merge_checkpoint
+from scripts.production.merge_checkpoint import promote, request_from
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production.production_doc import Production
 
@@ -703,7 +703,7 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("merge_checkpoint.datetime", wraps=datetime, now=now):
+        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)

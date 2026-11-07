@@ -28,22 +28,21 @@ from typing import TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit
 from scripts.production import dailies_render
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
-from fake_showrunner import write_timer
+from scripts.production.fake_showrunner import write_timer
 from scripts.production import update_registration
-import waiting
+from scripts.production import waiting
 from scripts.production.cli_fixture import invoke_cli, production_paths
-from fake_herdr import CommandResponse
-import fake_unit_host
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production import fake_unit_host
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -850,7 +849,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.write(self.log, "\n".join((*lines, "")))
 
     def test_arbitrary_merge_subjects_preserve_merged_work_and_phase_start(self) -> None:
-        from merge_checkpoint import MergedCheckpoint, merged_checkpoints
+        from scripts.production.merge_checkpoint import MergedCheckpoint, merged_checkpoints
         from scripts.production.production_doc import read_production
 
         start = datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0) - timedelta(hours=9)

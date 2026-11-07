@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
 from scripts.production.production_doc import read_new_production
 
@@ -188,7 +188,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         original_notify = merge_checkpoint.notify_style
 
         def malformed_notification(checkout: Path, branch: str, tip: str) -> bool:
-            with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
+            with mock.patch("scripts.production.merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
                 return original_notify(checkout, branch, tip)
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,

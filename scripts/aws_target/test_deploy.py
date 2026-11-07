@@ -24,7 +24,6 @@ from typing import ClassVar, cast, override
 from unittest import mock
 from urllib.request import Request
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 
 from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings

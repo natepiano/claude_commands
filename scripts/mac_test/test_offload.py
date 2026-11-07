@@ -20,17 +20,13 @@ import io
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import offload
 if TYPE_CHECKING:
-    from ..lib import copy_record, nix_env, scratch
-    from ..build_targets import target_config
-    from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
+    from scripts.lib import copy_record, nix_env, scratch
+    from scripts.build_targets import target_config
+    from scripts.buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config

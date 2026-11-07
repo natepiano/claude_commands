@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
 from __future__ import annotations
 

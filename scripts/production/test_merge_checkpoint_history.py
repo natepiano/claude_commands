@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from scripts.shutdown import remote
 
-import sys
 import json
 import os
 import unittest
@@ -12,11 +11,10 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
 from scripts.production.production_doc import read_production
 

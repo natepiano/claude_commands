@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """dailies_render.py's footer, report, and timeline through this worktree's CLI."""
 
 from __future__ import annotations

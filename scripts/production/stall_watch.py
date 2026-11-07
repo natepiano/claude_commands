@@ -42,7 +42,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
 from scripts.production import showrunners, staff, session_staff
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))

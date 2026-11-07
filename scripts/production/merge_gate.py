@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
 The queue reservation and the test runner governor use separate configuration keys.

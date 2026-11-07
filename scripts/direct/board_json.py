@@ -27,7 +27,7 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-import display_cells
+from scripts.production import display_cells
 
 from scripts.agents import worker_lifecycle
 from scripts.direct import phase_table, plan_history

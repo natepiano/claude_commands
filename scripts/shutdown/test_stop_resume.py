@@ -1128,7 +1128,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
         _ = self.enterContext(patch.object(stop_resume, "_confirm_move_start", self.confirm))
-        import quota_alert
+        from scripts.whoami import quota_alert
         _ = self.enterContext(patch.object(quota_alert, "tell_user"))
         _ = self.enterContext(patch.object(showrunners, "tell", return_value="fixture report"))
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Load and prove a worktree's nix environment before starting a process.
 
 Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
@@ -153,9 +153,6 @@ def generated_source(root: Path) -> bool:
     """Accept a scratch record that marks files written by our code."""
     try:
         folder = root.resolve(strict=True)
-        repository_root = str(Path(__file__).resolve().parents[2])
-        if repository_root not in sys.path:
-            sys.path.insert(0, repository_root)
         from scripts.lib import copy_record
 
         if folder.parent != copy_record.root().resolve():
@@ -251,8 +248,6 @@ def main(arguments: list[str]) -> int:
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
-        if not __package__:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from scripts.lib.models_registry import agent_environment
 
         program = arguments[1]

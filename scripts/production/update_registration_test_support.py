@@ -16,12 +16,10 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
@@ -35,11 +33,7 @@ from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
-if TYPE_CHECKING:
-    from scripts.notify import review as review
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    from scripts.notify import review as review
+from scripts.notify import review as review
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 

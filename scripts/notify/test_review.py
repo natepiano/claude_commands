@@ -18,7 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -32,22 +32,13 @@ from scripts.notify.user_action import ActionRequired, NoActionRequired, Session
 
 REAL_REVIEW = review.review
 
-if TYPE_CHECKING:
-    from ..accounts import accounts
-    from ..production import staff
-    from ..production.update_registration_test_support import RegistrationFixture
-    from ..production.cli_fixture import production_paths
-    from ..production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
-else:
-    from scripts.accounts import accounts
-    from scripts.production import staff
-    from scripts.production.update_registration_test_support import RegistrationFixture
-    from scripts.production.cli_fixture import production_paths
-    from scripts.production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
+from scripts.accounts import accounts
+from scripts.production import staff
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+)
 
 
 class VerdictJSON(TypedDict):

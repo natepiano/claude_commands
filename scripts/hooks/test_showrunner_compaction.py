@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Check the showrunner resume text and the absence of PreCompact writes."""
 
 from __future__ import annotations

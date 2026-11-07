@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Name temporary build folders and preserve their caller's lifetime."""
 from __future__ import annotations
 try:
@@ -16,7 +16,6 @@ import signal
 import stat
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Literal, cast, override
@@ -450,5 +449,4 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     raise SystemExit(main(sys.argv[1:]))

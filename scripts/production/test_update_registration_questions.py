@@ -157,7 +157,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(staff_file.read_bytes(), before)
 
     def test_footer_sources_reports_ambiguous_document_ownership_without_a_traceback(self) -> None:
-        import footer_counts
+        from scripts.production import footer_counts
 
         document, first, second = self.ambiguous_question_document()
         staff_file = self.state / "staff/staff.json"

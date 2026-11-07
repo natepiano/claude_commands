@@ -9,7 +9,6 @@ import io
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -19,9 +18,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import change_review
 from scripts.lib import copy_record
 from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run retire_unit.py in process against temporary repositories.
 Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
@@ -24,12 +24,11 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
-import retire_unit
-import unit_lookup
-import unit_move
+from scripts.production import retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_move
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Production, read_production
 
@@ -42,7 +41,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume, restart
 from scripts.herdr import worker_panes
 from scripts.shutdown import pane_record as staff_pane_record
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.lib.conf import UseConfiguredValue

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """resume_unit.py in process. Git runs in temporary repositories; add_unit.py is a recording stand-in
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
@@ -23,17 +23,16 @@ from multiprocessing.connection import Connection
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import resume_unit
+from scripts.production import resume_unit
 from scripts.production import add_unit
-import retire_unit
+from scripts.production import retire_unit
 from scripts.message import sessions as retirement_sessions
-import unit_lookup
-import unit_move
-import test_retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_move
+from scripts.production import test_retire_unit
 from scripts.production.production_doc import Production, read_production
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.herdr.herdr import HerdrPlace
 
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase

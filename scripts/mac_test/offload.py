@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run one read-only Cargo judgment on an idle Mac mirror when it is available."""
 
 from __future__ import annotations

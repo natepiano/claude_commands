@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Prepare local evidence and deploy resources only through an explicit user command."""
 from __future__ import annotations
 try:
@@ -26,7 +26,6 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise mac_run.sh coordination with disposable state and command stand-ins."""
 
 from __future__ import annotations

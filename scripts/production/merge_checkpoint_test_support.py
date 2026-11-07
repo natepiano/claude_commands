@@ -26,11 +26,9 @@ from unittest import mock
 from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder

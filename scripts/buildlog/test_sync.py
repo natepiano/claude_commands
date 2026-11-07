@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Sync pauses and Mac command status stay within a temporary state root."""
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import ExitStack, redirect_stdout
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import ci, cli
@@ -27,12 +27,8 @@ from scripts.buildlog import rust_release
 from scripts.buildlog import store
 from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
 
 def setUpModule() -> None:

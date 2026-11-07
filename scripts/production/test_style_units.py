@@ -6,7 +6,6 @@ from scripts.shutdown import remote
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -16,13 +15,12 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import live_units
 from scripts.production import proposal_issue
-import style_units
+from scripts.production import style_units
 from scripts.style import style_ledger
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff

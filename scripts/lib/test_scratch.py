@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for scratch.py: folders that belong to a task and go when it ends."""
 from __future__ import annotations
 

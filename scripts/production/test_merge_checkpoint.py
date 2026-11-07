@@ -17,11 +17,10 @@ from pathlib import Path
 from typing import cast, final
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
-from merge_checkpoint import check_parallel
+from scripts.production.merge_checkpoint import check_parallel
 
 from scripts.lib import scratch
 

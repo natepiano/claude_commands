@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for report.py: a section per kind split by caller, then one summary row per kind."""
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 
@@ -31,10 +31,7 @@ from scripts.buildlog import store
 from scripts.buildlog.record import TARGET_DIR_UNSET
 from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_mac_block
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 from scripts.buildlog.test_record_rerun import refresh_machine_health
 from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
 

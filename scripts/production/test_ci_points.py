@@ -19,7 +19,7 @@ from typing import TypedDict, cast, final, override
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_points
 from scripts.production.cli_fixture import invoke_cli
-from merge_checkpoint import merge_lock
+from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 

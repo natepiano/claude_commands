@@ -20,7 +20,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import broadcast

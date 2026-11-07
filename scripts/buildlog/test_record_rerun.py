@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """An interrupted recorder keeps its original step until publication finishes."""
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, chdir, closing, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import index
@@ -32,10 +32,7 @@ from scripts.buildlog.test_index import point_root_at, step as indexed_step
 from scripts.buildlog.test_launches import CLI
 from scripts.buildlog.test_memory_window import configured_host_cli, configured_local_host
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
 
 
 class RecorderStopped(BaseException):

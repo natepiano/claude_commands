@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 if TYPE_CHECKING:
     from scripts.lib import process_group
 else:
-    import process_group
+    from scripts.lib import process_group
 
 
 STARTUP_SIGNAL_ENV = "DETACHED_STARTUP_SIGNAL"

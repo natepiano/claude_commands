@@ -31,7 +31,7 @@ from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
-from merge_checkpoint import (
+from scripts.production.merge_checkpoint import (
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               Stop,
                               git, good, merged_checkpoints, promote_local_checkout,

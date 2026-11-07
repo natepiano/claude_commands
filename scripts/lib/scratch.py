@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Scratch folders that belong to a task, and go when the task ends.
 
 Agents made loose folders in /tmp and ~/rust (repo copies, repros, test trees) and nothing removed
@@ -76,7 +76,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 

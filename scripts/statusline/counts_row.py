@@ -54,7 +54,7 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
         sources.append(doc)
     if production is None:
         return "", "", sources
-    import footer_counts
+    from scripts.production import footer_counts
     from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities = QuestionStaff.read() if identities is None else identities

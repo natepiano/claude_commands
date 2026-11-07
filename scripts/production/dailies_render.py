@@ -1600,7 +1600,7 @@ def footer(
 
 def doc_counts(doc: Path | None) -> str | None:
     """The counts line for a production doc; the status line carries the question count."""
-    import footer_counts
+    from scripts.production import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 

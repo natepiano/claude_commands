@@ -16,26 +16,25 @@ from collections.abc import Callable, Generator, Sequence, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
-import fake_herdr
+from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-import rename
+from scripts.production import rename
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
-import unit_names
+from scripts.production import unit_names
 from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -259,7 +258,7 @@ class FolderMoveFixture(StaffTestCase):
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
-        _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
+        _ = self.enterContext(mock.patch("scripts.direct.progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -450,7 +449,7 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     roots = tuple(Path(root) for root in environment.get(
         "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
     _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
-    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
+    _ = case.enterContext(mock.patch("scripts.direct.progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),

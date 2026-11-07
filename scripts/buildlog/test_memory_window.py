@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Snapshot and instant-window CLI contracts against fixtures, never host state."""
 
 from __future__ import annotations

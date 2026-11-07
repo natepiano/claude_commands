@@ -23,15 +23,9 @@ from scripts.buildlog import store
 from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots
-    from ..lint.memory_test_support import config_environment
-    from ..mac_test import linux_runner
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots
-    from scripts.lint.memory_test_support import config_environment
-    from scripts.mac_test import linux_runner
+from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lint.memory_test_support import config_environment
+from scripts.mac_test import linux_runner
 
 
 def setUpModule() -> None:

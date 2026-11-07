@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Control one AWS target through confirmed lifecycle and spending evidence."""
 from __future__ import annotations
 try:
@@ -21,8 +21,6 @@ import sys
 import time
 from typing import Literal, Protocol, cast, final, get_args
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 from scripts.aws_target import ledger, measurement, remote
 from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings, service_loop
 from scripts.build_queue import queue_snapshot

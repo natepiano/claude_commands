@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Execute trusted source in a cached Linux development shell."""
 
 from __future__ import annotations
@@ -31,14 +31,13 @@ from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 from types import FrameType
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..copies import copies
-    from ..lib import build_folders
-    from ..lib.boot_identity import boot_identity as boot_identity
-    from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from ..aws_target import ledger
-    from ..build_targets.target_config import SshTarget, is_aws_target
+    from scripts.copies import copies
+    from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.aws_target import ledger
+    from scripts.build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.copies import copies
     from scripts.lib import build_folders
@@ -555,10 +554,7 @@ def permission_refused(values: dict[str, str]) -> bool:
         context = aws_execution_context(values)
         if isinstance(context, IndependentLinuxExecution):
             return False
-        if TYPE_CHECKING:
-            from ..aws_target import ledger
-        else:
-            from scripts.aws_target import ledger
+        from scripts.aws_target import ledger
         remote = aws_execution_evidence()
         permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
                                                  boot_id=boot_identity())
