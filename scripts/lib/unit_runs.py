@@ -13,6 +13,10 @@ A test points a reader at its own folder with an override, which replaces both n
 Staff supplies each run's current owner. Run records keep task history.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl

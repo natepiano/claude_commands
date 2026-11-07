@@ -522,6 +522,44 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(hook.returncode, 0, hook.stderr)
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
+    def test_codex_publication_and_label_repair_keep_kind_without_claude_settings(self) -> None:
+        from scripts.production import session_staff
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        environment = {**self.env, "CODEX_HOME": str(self.root / ".codex2")}
+        with (mock.patch.dict(os.environ, environment),
+              isolated_staff_file(self.root / "staff.json", environment)):
+            owner = unit_membership("demo", "alpha")
+            launch = pane_record.launch("w1:p2", owner.current_session, str(self.root), environment,
+                                       ["codex"], kind="codex")
+            history = launch.copy()
+            history["environment"] = {
+                "CODEX_HOME": environment["CODEX_HOME"], "CODEX_THREAD_ID": owner.current_session,
+                "STAFF_ID": owner.id,
+            }
+            self.records.mkdir(parents=True)
+            path = self.records / "agents.json"
+            _ = path.write_text(json.dumps({"w1:p2": history}))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources((history,)))
+            with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
+                  mock.patch.object(sessions, "running_sessions", return_value=[])):
+                pane_record.write("agents", session_staff.record_membership(launch))
+                published = pane_record.read_strict("agents")["w1:p2"]
+                self.assertEqual(published.get("kind"), "codex")
+                self.assertEqual(published["config_dir"], environment["CODEX_HOME"])
+                self.assertEqual(published["environment"], {
+                    "CODEX_HOME": environment["CODEX_HOME"], "CODEX_THREAD_ID": owner.current_session,
+                    "ENABLE_TOOL_SEARCH": "true",
+                })
+                _ = path.write_text(json.dumps({"w1:p2": {**published, "environment": history["environment"]}}))
+                repaired = session_staff.repair_marks()
+            self.assertEqual(len(repaired), 1)
+            self.assertEqual(pane_record.read_strict("agents")["w1:p2"], {
+                **published, "environment": {
+                    "CODEX_HOME": environment["CODEX_HOME"], "CODEX_THREAD_ID": owner.current_session,
+                },
+            })
+
     def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
         from scripts.production import staff, session_staff
 

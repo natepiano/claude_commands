@@ -8,6 +8,10 @@ span (10min, 1h30min); --at is a time in the user's zone (user_zone.py), which t
 in UTC, so it holds whatever zone natedev's clock is in.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import platform
