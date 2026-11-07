@@ -703,6 +703,14 @@ class NoPane:
 
 
 @dataclass(frozen=True)
+class PaneNotRead:
+    """The caller has not read the pane row."""
+
+
+PANE_NOT_READ = PaneNotRead()
+
+
+@dataclass(frozen=True)
 class SeveralPanes:
     label: str
     count: int
@@ -2036,28 +2044,29 @@ class Herdr:
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(shell), activity)
 
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> str:
         """Prove the backend identity from the exact foreground process."""
         try:
-            return self.native_pane_process(pane, kind, timeout).current_identity
+            return self.native_pane_process(pane, kind, timeout, pane_row=pane_row).current_identity
         except ValueError as error:
             raise HerdrFailure(str(error)) from error
 
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        pane_row: Mapping[str, object] = {}
-        if kind == "codex" and codex_without_session(info):
+        if isinstance(pane_row, PaneNotRead) and kind == "codex" and codex_without_session(info):
             try:
                 row = self.pane_row(pane)
                 if not isinstance(row, NoPane):
                     pane_row = row
             except HerdrFailure:
                 pass
-        return pane_native_process(info, kind, pane_row)
+        return pane_native_process(info, kind, {} if isinstance(pane_row, PaneNotRead) else pane_row)
 
     def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
         """Read the foreground agent identity, then confirm its terminal."""
@@ -3301,6 +3310,18 @@ def codex_rollout_thread(pid: int) -> str:
     if len(identities) != 1:
         raise ValueError(f"pid {pid}: current Codex rollout is unavailable or ambiguous")
     return next(iter(identities))
+
+
+
+def codex_transcript(pid: int) -> Path:
+    """Find the open transcript of one proved Codex process."""
+    started = _process_birth(pid)
+    files = _open_codex_rollouts(pid)
+    identity = codex_rollout_thread(pid)
+    paths = {Path(target) for target in files.values() if target.endswith(f"-{identity}.jsonl")}
+    if _process_birth(pid) != started or _open_codex_rollouts(pid) != files or len(paths) != 1:
+        raise ValueError(f"pid {pid}: current Codex transcript is unavailable or ambiguous")
+    return next(iter(paths))
 
 
 def _codex_resume_thread(pid: int) -> str:

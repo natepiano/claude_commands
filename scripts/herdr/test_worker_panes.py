@@ -10,18 +10,21 @@ import sys
 import time
 import subprocess
 from copy import deepcopy
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal, cast, final, override
 from unittest.mock import patch
+from weakref import finalize
 
 from scripts.production import staff, worker_admission
 from scripts.shutdown import restart
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import unit_runs
+from scripts.lib import process_start, unit_runs
+from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import accounts
@@ -36,16 +39,21 @@ class PaneWorld(herdr.Herdr):
 
     def __init__(self) -> None:
         super().__init__("agents")
+        self.process_directory = TemporaryDirectory(prefix="pane-world-proc-")
+        self.process_cleanup = finalize(self, self.process_directory.cleanup)
         self.locations: dict[str, dict[str, object]] = {}
         self.processes: dict[int, herdr.NativeAgentProcess] = {}
         self.foreground: dict[str, tuple[int, str, list[str]]] = {}
         self.shells: dict[str, int] = {}
         self.unknown: dict[str, str] = {}
         self.commands: list[tuple[str, ...]] = []
+        self.reads: list[tuple[str, ...]] = []
         self.process_reads: list[str] = []
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
+        self.launch_directories: list[Path] = []
         self.launch_timeouts: list[int] = []
         self.stops: list[str] = []
+        self.signals: list[tuple[int, int]] = []
         self.stop_deadlines: list[float] = []
         self.closed: list[tuple[str, str]] = []
         self.requests: list[tuple[str, list[str], dict[str, str]]] = []
@@ -60,6 +68,35 @@ class PaneWorld(herdr.Herdr):
         self.report_reads_before_publish = 0
         self.report_reads_at_wait: list[int] = []
         self.disappear_after_launch = False
+
+    def setup(self, test: StaffTestCase, *, compact_above_tokens: int = 43000) -> None:
+        """Install shared accounts, configuration, and process facts."""
+        config = test.root / "conf"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+                          + f"# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS={compact_above_tokens}\n"
+                          + "# whole: 1..\nASTRA_REVIEW_COMPACT_ABOVE_TOKENS=200000\n"
+                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
+                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
+                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n")
+        registry = write_registry(config / "models.conf")
+        _ = cast(object, test.enterContext(patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
+            "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
+            "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
+            "AGENTS_CALLER_FAMILY": "", "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
+            "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
+        })))
+        _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = test.enterContext(patch.object(herdr, "Herdr", return_value=self))
+        _ = test.enterContext(patch.object(herdr, "native_process", side_effect=self.native_process))
+        _ = test.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.descendants))
+        _ = test.enterContext(patch.object(sessions, "process_start", side_effect=self.process_start))
+        _ = test.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", test.root / "codex")))
+        _ = test.enterContext(patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()))
 
     def add(self, row: staff.StaffRow, pane: str, *, live: bool = True,
             family: Literal["claude", "codex"] = "claude", terminal: str = "",
@@ -125,6 +162,30 @@ class PaneWorld(herdr.Herdr):
         self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", environment)
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
 
+    @property
+    def process_root(self) -> Path:
+        """Use the configured process directory or this fixture's private directory."""
+        return Path(os.environ.get("HERDR_PROC", self.process_directory.name))
+
+    def process_start(self, pid: int) -> str | None:
+        """Read the process generation from the private stat file."""
+        if pid in self.processes:
+            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
+                observed = process_start.process_start(pid)
+        else:
+            observed = process_start.process_start(pid)
+        return observed.start if isinstance(observed, process_start.Started) else None
+
+    def signal(self, pid: int, number: int) -> None:
+        """Stop only an agent that belongs to this fixture."""
+        if pid not in self.processes:
+            raise AssertionError(f"signal target is outside the fixture: {pid}")
+        self.signals.append((pid, number))
+        for pane, (agent_pid, _, _) in tuple(self.foreground.items()):
+            if pid == agent_pid:
+                self.stops.append(self.processes[pid].identity.id)
+                del self.foreground[pane]
+
     def native_process(self, pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
         if self.foreground and kind not in ("claude", "codex"):
             raise AssertionError(f"unexpected family {kind}")
@@ -149,8 +210,9 @@ class PaneWorld(herdr.Herdr):
         return herdr.PaneRunning((process[1],))
 
     @override
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> herdr.NativeAgentProcess:
-        del timeout
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+        del timeout, pane_row
         if pane in self.foreground and self.foreground[pane][0] in self.unreadable_environment:
             raise herdr.HerdrFailure("process environment is unreadable")
         if self.report_reads_before_publish and any(
@@ -173,6 +235,7 @@ class PaneWorld(herdr.Herdr):
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
         self.launches.append(destination)
+        self.launch_directories.append(prepared.directory)
         self.launch_timeouts.append(timeout_ms)
         self.requests.append((kind, agent_arguments.copy(), prepared.env.copy()))
         if isinstance(destination, herdr.SplitPane):
@@ -195,12 +258,27 @@ class PaneWorld(herdr.Herdr):
         self.activate(identity, pane, cast(Literal["claude", "codex"], kind))
         pid, family, _ = self.foreground[pane]
         self.processes[pid].environment.update(prepared.env)
+        process_root = self.process_root / str(pid)
+        process_root.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
             self.processes[pid] = herdr.NativeAgentProcess(herdr.LaunchArgument(process.identity.id), process.started, process.environment)
         fixture_session(identity, staff.ClaudeBackend() if kind == "claude" else
                         staff.CodexBackend(Path(prepared.env["CODEX_HOME"])))
+        if kind == "codex":
+            source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
+            if not source.read_text():
+                write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+            rollout = source.with_name(f"rollout-fixture-{identity}.jsonl")
+            rollout.unlink(missing_ok=True)
+            rollout.symlink_to(source)
+            descriptors = process_root / "fd"
+            descriptors.mkdir(exist_ok=True)
+            descriptor = descriptors / "3"
+            descriptor.unlink(missing_ok=True)
+            descriptor.symlink_to(rollout)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
@@ -240,6 +318,7 @@ class PaneWorld(herdr.Herdr):
 
     @override
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.reads.append(arguments)
         del deadline
         if arguments[:2] == ("pane", "list"):
             if self.unreadable:
@@ -319,31 +398,13 @@ class WorkerPaneTests(StaffTestCase):
         showrunner = fixture_member("showrunner", name="showrunner")
         self.parent_id = fixture_member("unit", name="unit", parent=showrunner.id,
                                         worktree=staff.PresentWorktree("natedev", self.root)).id
-        config = self.root / "conf"
-        config.mkdir()
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
-                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
-                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        registry = write_registry(config / "models.conf")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
-            "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(self.root),
-            "UNIT_RUN_DIR": str(self.root / "run"), "ROSTER_RUN_ROOT": str(self.root),
-        })))
         self.world = PaneWorld()
+        self.world.setup(self)
         self.world.add(self.parent, "w1:p0")
-        _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit-runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
-        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.world.native_process))
-        _ = self.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.world.descendants))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch))
         _ = self.enterContext(patch.object(restart, "stop_row", side_effect=self.world.stop))
-        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / "codex")))
-        _ = self.enterContext(patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()))
 
     def worker(self, name: str = "impl2", *, family: Literal["claude", "codex"] = "claude") -> staff.StaffRow:
         backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / "codex")
@@ -746,6 +807,24 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.locations, locations)
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
+
+    def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
+        first = self.start()
+        assert isinstance(first, worker_panes.OpenWorker)
+        self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
+        before = self.staff_state()
+        commands = self.world.commands.copy()
+        with patch.object(staff, "runtime_id", return_value=self.parent.current_session):
+            code, output, diagnostic = self.command("start-or-resume", first.row.name, "--role", "impl")
+        self.assertEqual(code, worker_panes.ExitCode.UNCERTAIN)
+        self.assertEqual(output, "")
+        self.assertEqual(len(diagnostic.splitlines()), 1)
+        self.assertIn("launch environment is unproved", diagnostic)
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(self.world.commands, commands)
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
 
     def test_current_dispatch_reuses_a_worker_with_an_unreadable_launch_environment(self) -> None:
         first = self.start()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import fcntl
 import json
+import math
 import os
 import socket
 from pathlib import Path
@@ -14,14 +15,16 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
-from typing import Literal, cast, final, override
+from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
-from scripts.direct import progress_history
+from scripts.direct import assign, progress_history
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member
 from scripts.lib import atomic_file, unit_runs
@@ -40,6 +43,7 @@ class DispatchAgent:
     def __init__(self, fixture: pane_fixtures.WorkerPaneTests) -> None:
         self.fixture = fixture
         self.submitted: list[tuple[str, str]] = []
+        self.replies: list[str] = []
         self.waited: list[str] = []
         self.finish_after = 0
         self.wait_count = 0
@@ -49,6 +53,7 @@ class DispatchAgent:
         self.during_prompt: Callable[[], None] = lambda: None
         self.without_done = False
         self.after_complete: Callable[[str], None] = lambda pane: None
+        self.consultation_delivery: Literal["prompt", "second wait", "never"] = "prompt"
         self.run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
     def row(self, pane: str) -> staff.StaffRow:
@@ -59,10 +64,18 @@ class DispatchAgent:
         return row
 
     def append(self, pane: str, role: str, text: str) -> None:
-        row = self.row(pane)
-        backend = staff.backend(row)
-        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
-        path = worker_admission.transcript_source(row, backend)
+        pid, family, _ = self.fixture.world.foreground[pane]
+        process = self.fixture.world.processes[pid]
+        row = staff.snapshot().by_current_session(process.current_identity)
+        if row is None:
+            backend = staff.CodexBackend(Path(process.environment["CODEX_HOME"])) if family == "codex" else staff.ClaudeBackend()
+            paths = (list((backend.codex_home / "sessions").rglob(f"*{process.current_identity}.jsonl"))
+                     if isinstance(backend, staff.CodexBackend) else sessions.transcript_locations(process.current_identity))
+            path = max(paths, key=lambda source: source.stat().st_mtime)
+        else:
+            backend = staff.backend(row)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            path = worker_admission.transcript_source(row, backend)
         record = ({"type": "event_msg", "payload": {"type": "user_message" if role == "user" else "agent_message", "message": text}}
                   if isinstance(backend, staff.CodexBackend) else
                   {"type": role, "message": {"role": role, "content": [{"type": "text", "text": text}]}})
@@ -72,9 +85,46 @@ class DispatchAgent:
     def complete(self, pane: str) -> None:
         line = next(text for target, text in reversed(self.submitted) if target == pane)
         dispatch_id = line.split("DONE ")[-1].split(".")[0].strip()
-        self.append(pane, "assistant", self.final if self.without_done else self.final + "\nDONE " + dispatch_id)
+        response = self.final if self.without_done else self.final + "\nDONE " + dispatch_id
+        self.replies.append(response)
+        self.append(pane, "assistant", response)
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
+
+    def consultations(self, case: unittest.TestCase) -> None:
+        run = self.fixture.world.run
+        wait_turn_end = self.fixture.world.wait_turn_end
+
+        def submit(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:2] == ("agent", "prompt"):
+                pane, line = arguments[2:4]
+                pid = self.fixture.world.foreground[pane][0]
+                if staff.snapshot().by_current_session(self.fixture.world.processes[pid].current_identity) is None:
+                    self.submitted.append((pane, line))
+                    self.during_prompt()
+                    if self.error:
+                        raise herdr.HerdrFailure(self.error)
+                    if self.consultation_delivery == "prompt":
+                        self.append(pane, "user", line)
+                        self.complete(pane)
+            return result
+
+        def wait(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+            self.waited.append(pane)
+            self.wait_count += 1
+            if self.consultation_delivery != "prompt":
+                self.fixture.world.turn_end_status = herdr.AgentStatus.IDLE
+                if self.consultation_delivery == "second wait" and self.wait_count == 2:
+                    line = next(text for target, text in reversed(self.submitted) if target == pane)
+                    self.append(pane, "user", line)
+                    self.complete(pane)
+                    self.fixture.world.turn_end_status = herdr.AgentStatus.DONE
+            return wait_turn_end(pane, timeout_ms)
+
+        _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=submit))
+        _ = case.enterContext(patch.object(self.fixture.world, "wait_turn_end", side_effect=wait))
+        _ = case.enterContext(patch.object(os, "kill", side_effect=self.fixture.world.signal))
 
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if args[0] != "/nonexistent/herdr":
@@ -107,6 +157,47 @@ class DispatchAgent:
 
 
 @final
+class PaneCommandRouter:
+    """Run private pane commands through their real parsers and handlers."""
+
+    def __init__(self) -> None:
+        self.cwd = Path()
+        self.commands: list[list[str]] = []
+        self.worker_commands: list[list[str]] = []
+        self.run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+    def setup(self, case: unittest.TestCase, cwd: Path) -> None:
+        self.cwd = cwd
+        self.run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        _ = case.enterContext(patch.object(subprocess, "run", side_effect=self.run))
+        _ = case.enterContext(patch.object(assign, "require_live_director"))
+
+    def run(self, command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        path = Path(command[1]).resolve() if len(command) > 1 else Path()
+        root = Path(__file__).resolve().parents[2]
+        arguments = command[2:]
+        environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+        cwd = Path(cast(str | Path, options.get("cwd", self.cwd)))
+        if path == root / "scripts/direct/assign.sh":
+            self.commands.append(arguments.copy())
+            result = invoke_cli(assign, assign.main, arguments, environment, cwd)
+        elif path == root / "scripts/production/worker.py":
+            self.worker_commands.append(arguments.copy())
+            result = invoke_cli(worker, lambda: worker.main(arguments), arguments, environment, cwd)
+        elif path == root / "scripts/direct/progress_history.py":
+            result = invoke_recorder(arguments, environment, cwd)
+        else:
+            return self.run_process(command, **options)
+        output = options.get("stdout")
+        if output is not None:
+            _ = cast(TextIO, output).write(result.stdout + result.stderr)
+        elif not options.get("capture_output"):
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+        return result
+
+
+@final
 class WorkerCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -128,6 +219,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent = DispatchAgent(self.fixture)
         self.run_dir = self.fixture.root / "run"
         self.run_dir.mkdir(exist_ok=True)
+        atomic_file.write_text_atomic(Path.home() / ".codex/sessions" / f"{self.fixture.parent.current_session}.jsonl",
+                                      json.dumps({"type": "turn_context", "payload": {
+                                          "model": "fixture", "effort": "high"}}) + "\n")
         atomic_file.write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
         self.prompt = self.run_dir / "prompt.md"
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")

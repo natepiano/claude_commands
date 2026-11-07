@@ -2830,7 +2830,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Ruled out:** the dispatch record as the only evidence of the run, because it lags an in-place restart.
 
-### Phase 17 — Pane launch paths for held roles and friends  · status: todo
+### Phase 17 — Pane launch paths for held roles and friends  · status: done
 
 **Depends on:** Phase 16 (`scripts/herdr/worker_panes.py`).
 
@@ -2860,6 +2860,10 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 - `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — Spec items 3, 6, 7 and 9.
 - `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec item 8; preserve the report and resume proof.
 - `scripts/production/worker.py`, `scripts/production/test_worker.py` — Spec item 2.
+- `scripts/direct/test_assign_launcher_review.py` — the mesh `MeshWorker` hold test.
+- `commands/unit/direct.md`, `commands/astra_review.md` — the consultation pane text.
+- `config/direct.conf` — `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS` for the ad hoc review.
+- `scripts/production/test_rename_unit_sessions.py` — the native pane read fake takes `pane_row`.
 
 **Workers:** `1 writer + 1 tester` — `impl`: the shared launch, its targets and policy, the routing, the pane APIs and the `PaneWorld` fixture; `test`: family permissions, reports, recovery, session-report order and the launch consumer tests. `impl` owns `scripts/herdr/worker_panes.py` and `scripts/herdr/test_worker_panes.py`; `test` sends its changes to these two files through `impl`.
 
