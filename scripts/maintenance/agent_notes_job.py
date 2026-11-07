@@ -1,6 +1,10 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run independent, bounded maintenance parts; never collect recovery snapshots."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import re
@@ -138,8 +142,11 @@ def _perform(part: Part) -> int:
                 agent_accounts.observe_workers_home(), agent_notes.claude_note_logins(note_file.read_notes()))
             for line in refreshed.messages:
                 print(line)
-        for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
-            print(line)
+        from scripts.shutdown import stop_resume
+
+        with stop_resume.detached_moves():
+            for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
+                print(line)
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
