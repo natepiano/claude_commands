@@ -1590,7 +1590,7 @@ No code change. Both causes are named from evidence, and neither cause is in a t
 
 **Gotchas:** the cached scan is valid only while no test writes into the scanned tree. A test that edits repository files must scan again.
 
-### Phase 75 — `production/test_add_unit.py` uses half its CPU  · status: todo
+### Phase 75 — `production/test_add_unit.py` uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
