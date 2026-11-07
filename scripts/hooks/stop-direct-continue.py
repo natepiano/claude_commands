@@ -18,7 +18,6 @@ except FileNotFoundError:
 import json
 import re
 import sys
-from pathlib import Path
 from typing import cast
 
 from scripts.hooks.context_usage import (
@@ -29,7 +28,7 @@ from scripts.hooks.context_usage import (
     pending_background_tasks,
     trigger_tokens,
 )
-from direct_run import active_run
+from scripts.hooks.direct_run import active_run
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
@@ -64,7 +63,6 @@ def main() -> None:
     # A declared wait is a real stop, including a restated decision after a
     # compaction block. Record before the compaction and background-work guards.
     final_message = payload.get("last_assistant_message", "")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.direct.progress_history import record_turn_wait
 
     if record_turn_wait(session_dir, session_id, final_message):

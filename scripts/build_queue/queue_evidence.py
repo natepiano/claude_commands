@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from scripts.build_queue import head_facts, queue_lines
 from scripts.build_queue.queue_lines import age, field
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
+from scripts.lib.build_steps import StepNames
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -156,14 +157,14 @@ def estimate_refresh_text(reason: gate.EstimateExpired, zone: ZoneInfo) -> str:
 
 
 def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
-                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo) -> str:
+                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     if isinstance(release, gate.HeadRelease):
         if not release.ended:
             text = "no running step needs to end"
         else:
-            names = [step_labels(explanation.running[index].step, labels).session
-                     + " " + queue_lines.step_text(explanation.running[index].step) for index in release.ended]
-            text = (f"{' + '.join(names)} end (keep-aside drops {gib(release.growth_drop)}; "
+            ended_steps = [step_labels(explanation.running[index].step, labels).session
+                           + " " + queue_lines.step_prose(explanation.running[index].step, names) for index in release.ended]
+            text = (f"{' + '.join(ended_steps)} end (keep-aside drops {gib(release.growth_drop)}; "
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
@@ -212,7 +213,7 @@ def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, n
 
 
 def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,
-                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo) -> str:
+                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
     if isinstance(memory, gate.CompilerServiceMemory) or (
             isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
@@ -234,7 +235,7 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
         observed = memory.peak_history
         phase = (f"; tests started: need {gib(gate.test_phase_charge(observed))} "
                  f"(test peak {gib(observed.peak_so_far)}, history {gib(observed.need.bytes)} x {observed.need.margin:g})")
-    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {queue_lines.step_text(running.step)}: {started}; "
+    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {queue_lines.step_prose(running.step, names)}: {started}; "
             + evidence + phase + swap)
 
 

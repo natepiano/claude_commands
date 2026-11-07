@@ -12,10 +12,8 @@ import re
 import sys
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
 REASON = "Compaction runs by itself mid-work; do the work now."

@@ -50,7 +50,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
   - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/direct.md` — the role contracts
   - `~/.claude/docs/decision_criteria.md` — what reaches the user
 - **Test lanes:** `scripts/hierarchies/` — `test_*.py` beside the script.
-- **Test:** `python3 -m unittest discover -s scripts/hierarchies -p 'test_*.py'`, from the worktree root. Gate: `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` from the worktree root (memory `shared-module-full-gate`).
+- **Test:** `python3 -m unittest discover -s scripts/hierarchies -p 'test_*.py'`, from the worktree root.
+  Targeted test: `~/.claude/scripts/lib/py scripts/production/targeted_test.py` from the worktree root.
+  Memory: `shared-module-full-gate`.
 - **Lint:** `basedpyright scripts/hierarchies` passes when its output ends `0 errors, 0 warnings, 0 notes`; it exits 3 in every checkout, so the exit status says nothing.
 - **Invariants:**
   - Measuring reads every source read-only. It sends no message, push or alert, and starts no session (plan author: a measure must not add traffic).

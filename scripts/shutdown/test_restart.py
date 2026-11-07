@@ -1493,9 +1493,11 @@ class RestartTests(RestartTestCase):
 
 class RetainedSplitRestartTests(RestartTestCase):
     def test_interrupted_restart_keeps_every_original_pane_and_terminal(self) -> None:
+        from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import PaneWorld
-        from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
         from scripts.lib.test_models_registry import registry_text
+        from scripts.production import worker
+        from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 
         fixture = StaffTestCase()
         fixture.setUp()
@@ -1523,10 +1525,19 @@ class RetainedSplitRestartTests(RestartTestCase):
             "model": "", "remote_control": False, "environment": {}, "flags_read": True,
             "written_at": "2026-11-06T00:00:00+00:00"}
         pane_record.write("agents", entry)
-        write_text_atomic(root / "run/progress_history_state.json", json.dumps({"main_agent": {"session_id": str(holder.current_session)}, "pass": {
-            row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
-                       "team_slot": row.name, "kind": "impl", "status": "completed"} for row in children}}))
-        write_text_atomic(root / "run/worker_transport", "herdr\n")
+        run = root / "run"
+        write_text_atomic(run / "progress_history_state.json", json.dumps({
+            "main_agent": {"session_id": str(holder.current_session)},
+            "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
+                      "started_at": 1, "status": "active"},
+            "pass": {}, "history_file": str(run / "history.jsonl")}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        for row in children:
+            _ = progress_history.begin_dispatch(run, slot=row.name, phase="earlier", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["bash", "assign.sh", "impl", str(prompt)],
+                prompt=prompt, kind="impl", lens="")
         shutdown_record.save([str(row.id) for row in (holder, *children)])
         world.interrupt = "agent"
 
@@ -1559,6 +1570,7 @@ class RetainedSplitRestartTests(RestartTestCase):
               patch.object(accounts, "role_account", side_effect=role_account),
               patch.object(accounts, "account_dir", return_value=Path(os.environ["CLAUDE_CONFIG_DIR"])),
               patch.object(restart.stop_resume, "heal_account_trust"),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(len(shutdown_record.read()), 3)

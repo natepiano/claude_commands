@@ -5,15 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import unittest
 from typing import cast
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.production import session_pane
 from scripts.production import staff
@@ -107,7 +104,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         blocked.chmod(0o755)
         lookup = self.root / "lookup.py"
         _ = lookup.write_text(
-            "import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
+            "from scripts.hooks import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
         )
         with (
             patch.object(conversation_pause, "sessions_command", return_value=[str(blocked)]),

@@ -11,6 +11,7 @@ import os
 import stat
 from pathlib import Path
 import resource
+import select
 import signal
 import sys
 import time
@@ -51,6 +52,7 @@ if __name__ == "__main__":
 '''
 from scripts.lint import memory_admit
 from scripts.lib import copy_record, scratch
+from scripts.message.process_test_support import OwnedTestProcesses
 
 
 @final
@@ -403,6 +405,66 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertTrue(cpu_path.is_file())
         self.assertEqual(merge_gate.read_measures(cpu_path), {"hooks/test_first.py": 12.0})
         self.assertGreater(result.jobs[0].cpu_seconds, 0.0)
+
+    def test_module_time_limit_kills_and_reaps_a_detached_orphan(self) -> None:
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        self.environment = processes.environment(self.environment)
+        self.write(self.checkout / "scripts/hooks/test_first.py", '''import os
+from pathlib import Path
+import signal
+import unittest
+
+class HeldModule(unittest.TestCase):
+    def test_detached_orphan(self):
+        reader, writer = os.pipe()
+        intermediate = os.fork()
+        if intermediate == 0:
+            os.close(reader)
+            if os.fork() != 0:
+                os._exit(0)
+            os.setsid()
+            os.write(writer, str(os.getpid()).encode())
+            os.close(writer)
+            while True:
+                signal.pause()
+        os.close(writer)
+        pid = int(os.read(reader, 32))
+        os.close(reader)
+        os.waitpid(intermediate, 0)
+        state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+        temporary = state / "detached-pid.tmp"
+        temporary.write_text(str(pid))
+        temporary.replace(state / "detached-pid")
+        signal.pause()
+''')
+        output = io.StringIO()
+        monotonic = time.monotonic
+        deadline = monotonic() + TEST_HANG_GUARD_SECS
+        handles: dict[int, int] = {}
+
+        def module_clock() -> float:
+            if monotonic() >= deadline:
+                raise TimeoutError("The gate did not stop the held module")
+            ready = self.state / "detached-pid"
+            if not ready.exists():
+                return monotonic()
+            pid = int(ready.read_text())
+            if pid not in handles:
+                descriptor = os.pidfd_open(pid)
+                handles[pid] = descriptor
+                self.addCleanup(os.close, descriptor)
+            return monotonic() + 2000
+
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(time, "monotonic", side_effect=module_clock), redirect_stdout(output):
+            result = merge_gate.run_suites(self.checkout)
+        self.assertFalse(result.passed, output.getvalue())
+        self.assertIn("hooks/test_first.py killed: still running after 1800 s, the module time limit", output.getvalue())
+        observer = select.poll()
+        for descriptor in handles.values():
+            observer.register(descriptor, select.POLLHUP)
+        self.assertTrue(observer.poll(0), "The module time limit left the detached orphan alive or unreaped")
 
     def test_nonpositive_module_time_limit_refuses_without_running_modules(self) -> None:
         result = self.run_gate("--tests-only", "--module-time-limit-s", "0")

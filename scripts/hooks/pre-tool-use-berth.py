@@ -44,11 +44,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_reservation  # noqa: E402
+from scripts.direct import phase_reservation  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import design_roles  # noqa: E402
 
 

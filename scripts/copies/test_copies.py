@@ -550,6 +550,57 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
             self.assertEqual(self.git(tree, "rev-parse", "source/builds"), self.head)
 
+    def test_warm_copies_refresh_moved_and_deleted_refs_without_a_new_head(self) -> None:
+        _ = self.git(self.source, "branch", "retired", self.head)
+        _ = self.git(self.source, "update-ref", "refs/remotes/origin/retired", self.published)
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as standing:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head, name="refs", branch="worker") as workspace:
+            pass
+        _ = self.git(self.source, "branch", "-D", "retired")
+        _ = self.git(self.source, "update-ref", "-d", "refs/remotes/origin/retired")
+        _ = self.git(self.source, "update-ref", "refs/remotes/origin/main", self.head)
+        with ExitStack() as stack:
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
+                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                                                         name="refs", branch="worker"))]
+            self.assertEqual(trees, [standing, workspace])
+            for tree in trees:
+                with self.subTest(tree=tree):
+                    self.assertEqual(self.git(tree, "rev-parse", "origin/main"), self.head)
+                    self.assertEqual(self.git(tree, "for-each-ref", "--format=%(refname)",
+                                              "refs/remotes/source/retired", "refs/remotes/origin/retired"), "")
+                    self.assertEqual((tree / "tracked.txt").read_text(), "source HEAD\n")
+
+    def test_warm_copies_remove_tracking_refs_after_source_objects_are_pruned(self) -> None:
+        retired = self.incoming()
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as standing:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head, name="pruned", branch="worker") as workspace:
+            pass
+        _ = self.git(self.source, "branch", "-D", "incoming")
+        _ = self.git(self.source, "reflog", "expire", "--expire=now", "--all")
+        _ = self.git(self.source, "gc", "--prune=now")
+        with ExitStack() as stack:
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
+                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                                                         name="pruned", branch="worker"))]
+            self.assertEqual(trees, [standing, workspace])
+            for tree in trees:
+                with self.subTest(tree=tree):
+                    fetched = subprocess.run(["git", "-C", str(tree), "fetch", "--quiet", "source"],
+                                             capture_output=True, text=True, timeout=10)
+                    self.assertEqual(fetched.returncode, 0, fetched.stderr)
+                    listed = subprocess.run(["git", "-C", str(tree), "for-each-ref",
+                                             "--format=%(refname) %(objectname)"],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(listed.returncode, 0, listed.stderr)
+                    self.assertEqual(listed.stderr, "")
+                    self.assertNotIn("refs/remotes/source/incoming", listed.stdout)
+                    self.assertNotIn(retired, listed.stdout)
+                    self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+                    self.assertEqual((tree / "tracked.txt").read_text(), "source HEAD\n")
+
     def test_new_commit_reuses_tree_keeps_unchanged_mtime_and_target(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             stable = tree / "stable.txt"

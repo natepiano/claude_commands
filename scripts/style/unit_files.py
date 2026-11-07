@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.style.git_process import GitExitAnswers, run_git
+from scripts.style.git_process import GitExitAnswers, parse_status_z, run_git
 
 from scripts.style import style_ledger
 from scripts.production import session_staff, staff, unit_lookup
@@ -140,12 +140,4 @@ def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_un
 
 
 def changed_files(repo: Path) -> frozenset[str]:
-    entries = iter(git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0"))
-    paths: set[str] = set()
-    for entry in entries:
-        if not entry:
-            continue
-        paths.add(entry[3:])
-        if "R" in entry[:2] or "C" in entry[:2]:
-            paths.add(next(entries))
-    return frozenset(paths)
+    return frozenset(parse_status_z(git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")))

@@ -14,10 +14,8 @@ except FileNotFoundError:
 import json
 import os
 import sys
-from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 from scripts.shutdown import pane_record  # noqa: E402
 
 

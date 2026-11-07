@@ -15,14 +15,12 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from contextlib import redirect_stderr
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import nightly_review
+from scripts.nightly_review import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
 from scripts.production import showrunners, staff, fake_showrunner, session_staff, unit_config
@@ -32,15 +30,8 @@ from scripts.production.staff_test_support import (isolated_staff_file, isolated
                                                     fixture_runtime_id)
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-# `messages` reads the message review from its own folder, as the timer does.
-
-sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
-if TYPE_CHECKING:
-    from scripts.notify import review
-    from scripts.production.unit_lookup import LiveClaude
-else:
-    from scripts.notify import review
-    from unit_lookup import LiveClaude
+from scripts.notify import review
+from scripts.production.unit_lookup import LiveClaude
 
 NIGHT = date(2026, 9, 29)
 SESSION = "nightly-review"
@@ -112,6 +103,8 @@ class NightlyReviewTests(unittest.TestCase):
         library.mkdir()
         _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/process_failure.py",
                             library / "process_failure.py")
+        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/package_root.py",
+                            library / "package_root.py")
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
