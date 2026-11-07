@@ -20,7 +20,7 @@ The move stops the live unit and its live workers.
 It moves the Git worktree and changes the branch while the sessions are stopped.
 It writes the staff location and resumes the same current sessions in their panes.
 A stopped session stays stopped.
-A restart failure prints `shutdown.py restart --only <staff-id>`.
+A restart failure prints `agents restart --only <staff-id>`.
 A retry reports stopped rows and keeps them stopped.
 The move limits come from `config/production.conf` at use.
 
