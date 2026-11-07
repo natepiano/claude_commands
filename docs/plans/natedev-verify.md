@@ -1337,8 +1337,8 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Spec:**
 
 1. In `scripts/direct/tree_watch.py`, for the `test` command, the verdict key and the tree content key also hold each set variable named by two new keys in `config/direct.conf`, read at use:
-   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, `LC_ALL`, `LC_CTYPE`.
-   - `VERIFY_RESULT_ENV_PREFIXES`: `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
+   - `VERIFY_RESULT_ENV_NAMES`: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`.
+   - `VERIFY_RESULT_ENV_PREFIXES`: `LC_`, `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, `TRACE_`.
    - `RUST_LOG` and the other `RUST` names already reach the key.
    - The build key does not change: a changed value reruns tests and rebuilds nothing. Each other command's key does not change.
    - An unset name and an empty name differ.
