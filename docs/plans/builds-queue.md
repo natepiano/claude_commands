@@ -287,36 +287,21 @@ only I can bump
 
 ### Phase 20b — A clippy fix step leaves the machine-wide build tokens to other builds  · status: done
 
-**Depends on:** nothing. Source: builds showrunner, 2026-11-06 10:22 EST, on the user's words "how to share cpu slots between compiles and gates".
+#### As-built
 
-#### Work Order
+- A `cargo clippy --fix` step runs with `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` removed and with `--jobs` from `clippy_fix_jobs=8` in `config/lint.conf`. The `fixing` branch of `invoke_clippy` in `scripts/lint/invoke.sh` holds the call; a plain clippy step keeps the pool, on natedev and on the Mac alike.
+- `lint_config_clippy_fix_jobs` in `scripts/lint/lint_config.sh` reads the key with builtins only.
+- One real hana `clippy --fix`: installed 323 s wall, 0 s wait; new 394 s wall, 192 s wait. The load differed, so there is no speed claim. The real cargo process had no pool variables.
+- A waiting rustc holds its token: 86 of 105 samples had 20 or more shims with no compiler child, mean 27.4 idle holders, with 0 free tokens.
 
-**Goal:** A `cargo clippy --fix` step runs in its own small pool of jobs. It stops taking tokens from `/dev/steve` that it does not use.
+**Files:** `config/lint.conf`, `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `docs/as-built/phase-checks.md`, `scripts/direct/test_verify_lint_output.py`, `scripts/direct/test_verify_lint_judgment.py`, `scripts/direct/verify_lint_scope_test_support.py`, `scripts/direct/test_verify_token_renew.py`.
 
-**Spec:**
+**Binds later work:** a change to the fix call updates the four test files above that assert it.
 
-1. **Key.** `clippy_fix_jobs=8` in `config/lint.conf` `[clippy]`, with a comment that says who reads it and the valid range. `scripts/lint/lint_config.sh` reads it with builtins only, as `lint_config_build_oom_score_adj` does: missing uses 8; invalid prints one warning and uses 8.
-2. **Call.** `invoke_clippy_fix` in `scripts/lint/invoke.sh` runs cargo with `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` removed and with `--jobs <clippy_fix_jobs>`, on natedev and on the Mac alike. A plain `invoke_clippy` stays in the pool. The memory queue step, the lint gating and the build log record do not change: the recorded argv still holds `--fix`.
-3. **Comment.** The pool comment near `scripts/lint/invoke.sh:53` names this one exception and why.
-4. **Proof by test.** A fake cargo on PATH behind the real `invoke_clippy_fix` and `invoke_clippy` records argv and environment. The fix call has no pool variables and has `--jobs` from the config. The plain call keeps the pool. A changed config value changes `--jobs`. An invalid value warns and uses 8.
-5. **Proof on hana.** One real `invoke_clippy_fix` on a scratch hana clone with warm build output, before (the installed copy) and after (this tree), with the argv of the live step. Report the wall time of each. The real cargo process has no pool variable in its environment.
+**Gotchas:** a proof on the shared pool holds tokens for every other build. A proof runs at a quiet time or in a small pool.
 
-**Files:**
-- `config/lint.conf`
-- `scripts/lint/lint_config.sh`
-- `scripts/lint/invoke.sh`
-- `scripts/lint/test_invoke_scope.py`
-- `scripts/direct/test_verify_lint_output.py` (approved fix argv assertion)
-- `scripts/direct/test_verify_lint_judgment.py` (approved fix argv assertion)
-- `docs/as-built/phase-checks.md`
+**Ruled out:** a speed claim from the hana runs.
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` — `config/lint.conf`, `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh`, `docs/as-built/phase-checks.md`.
-- `test2` — `scripts/lint/test_invoke_scope.py` and the hana proof.
-
-**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, and the wall time and token answer in the notice.
-
-**Change-Review:** a hana clippy fix step no longer holds the build tokens.
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
 #### As-built
