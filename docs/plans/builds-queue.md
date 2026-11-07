@@ -1178,68 +1178,17 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 25 — A queue view answers inside its limit  · status: done
 
-**Depends on:** none. Source: the user, 2026-11-06: "pretty frequently the html page blanks out and says 'the queue did not answer' - what is going on". Builds ruling, 2026-11-06 22:57: fix the cause in the service; keep `query_timeout_seconds` at 0.5.
+#### As-built
 
-#### Work Order
+- One `OperatingSystemReader` thread reads the process table, the unowned slices, the scope activity files and the memory readings at the pass cadence (`waiting_pass_seconds` while steps wait, `running_pass_seconds` else). It returns raw evidence only and wakes the loop through an eventfd. The loop applies the current configuration and reservation records (need, width, peak hold) at each pass, so a pending configuration or a width change takes effect at once. The loop thread still owns all service state and makes no `/proc` or cgroup read.
+- `update()` wakes the reader when the cadence changes from running to waiting. A read that raises does not end the reader; the loop raises it as the pass did before.
+- Each reading carries `started_monotonic`. An Admit, Launch or estimate request for an owner whose pid and start time the reading lacks waits as a `DeferredOwnerRequest` and asks for an early read. It runs on the first reading that started after it arrived. A finished, refused or closed connection drops its deferred requests.
+- Each reply tree is encoded once (`snapshot_codec.py` returns scalars directly and caches dataclass field names). View and Explain bytes are encoded on the first request after a pass and kept until the next pass ends. Mine keeps its full content. `persist` encodes only the changed records; file bytes, fsync order and wire bytes do not change.
+- `query_timeout_seconds` stays 0.5; no configuration key changed.
+- Replay with no profiler (`measure_25.py --reuse`, 20 samples per group): a pass takes 16 ms median, 33 ms worst (372 ms median before). A View queued behind a pass, a Release, a TokenWait and a pending configuration waits 255 ms median, 406 ms worst; most of it is disk sync. The live probe after deploy is the proof.
 
-**Goal:** Every queue view answers well inside the client's 0.5 s limit at the live load.
+**Files:** `scripts/build_queue/admission_service.py`, `admission_protocol.py`, `snapshot_codec.py`; `test_admission_service.py`, `test_admission_protocol.py`; `docs/as-built/build-memory-admission.md`.
 
-**Spec:**
+**Binds later work:** a durable write still syncs the state file on the loop thread, so a View waits behind each Release and TokenWait sync. The next item "Durable writes leave the admission service loop" waits on the live probe.
 
-1. **Measured cause (2026-11-06 22:44-22:50, load about 80).** Of 180 live view reads with a 10 s limit, the median took 0.05 s and 4 (2%) took over 0.5 s, the worst 0.87 s. Connect took under 5 ms; all delay came before the first reply byte. In 60 s the service used 6.8 s of CPU and waited 0.05 s for a CPU. Each view reply was 130 to 320 KB. The service answers on one thread (`admission_service.py` `run_once`), so a view waits while a pass or another request runs. A view also runs a full pass first when a configuration change is pending (`handle_request`, the `pending_configuration` branch).
-2. **Measure first.** Copy the live service state into a `tempfile.TemporaryDirectory`. Never open the live state for writing and never call the live service. Replay it in a private service instance. Time with `cProfile`: one `run_pass`, one view reply (`queue_read_from_pass` and the reply encoding), and each other request kind. Report the top five costs of each, with their share of the time. Send the result in the summary, then stop. The director rules on the fix before any code change.
-3. **Fix.** Change only what the ruling names. The target: on the replayed state, no single pass or request holds the service thread for more than 0.1 s, and a view reply takes under 0.05 s.
-4. **Fixed values.** `query_timeout_seconds` stays 0.5. No config key changes name or meaning.
-5. **Proof.** A test proves each structural change by behavior, never by machine speed. The summary gives the replay times before and after the fix, from the same state copy. After the merge, the director repeats the live probe (180 view reads, one each 2 s) and reports it.
-
-**Files:**
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_queue/test_admission_service.py`
-- `scripts/build_queue/admission_protocol.py`
-- `scripts/build_queue/test_admission_protocol.py`
-- `scripts/build_queue/snapshot_codec.py`
-- `docs/as-built/build-memory-admission.md`
-
-**Workers:** `1 writer` — `impl3` owns the measurement, the code, the tests and the doc.
-
-**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed file, adversary and contract reviews.
-
-**Change-Review:** The memory page stays live | On natedev, open http://100.103.14.30:8765/h7uj5c/memory_live.html and keep it open for 10 minutes | The status reads Live the whole time, and the page never shows "The queue did not answer"
-
-#### Rulings
-
-**Ruling 1 (director, 2026-11-06 23:25).**
-
-Measured cause (impl3 replay): a pass holds the service thread 372 ms median (772 ms worst). Operating-system reads take 58% of it and a full state encode takes 28%. A view reply takes 107 ms, and 96 ms of that encodes the 330 KB reply twice. Release and token-wait take 724 to 742 ms: five full state encodes each. A view waits behind all of these.
-
-Fix, in this order:
-
-1. **Encode once.** `admission_protocol.py` (and `snapshot_codec.py` if the double walk lives there) walks each reply tree one time. The wire bytes do not change.
-2. **Reply bytes per pass.** After each completed pass, the service keeps the encoded View and Explain reply bytes. View and Explain answer those bytes. Mine encodes only the caller's rows.
-3. **Operating-system reads off the loop.** One reader thread reads the process table, the unowned slices, the scope activity files and the memory readings. It publishes one immutable reading with its read time, and wakes the loop. The loop joins the newest reading with service state; the loop itself makes no /proc or cgroup read. The thread reads at the cadence the passes use today (waiting_pass_seconds while steps wait, running_pass_seconds else), so CPU use does not grow. My call: a pass uses a reading up to one cadence old. Risk: an admission decision sees memory up to 1 s old; today it sees memory read at that pass, which is at most 1 s apart as well.
-4. **Persist changed records only.** `persist` keeps the encoded form of each durable record and encodes again only the records that changed. The file bytes, the lifecycle commit order and every write it does today stay the same.
-5. **Pending configuration keeps Phase 10c behavior.** A view that arrives with a pending configuration still runs a pass first, so it shows the new values. After items 3 and 4 that pass stays under 0.1 s.
-6. **query_timeout_seconds stays 0.5.** Add no configuration key.
-
-Proof (no machine-speed assertion in any test):
-
-1. Behavior tests: the View bytes after a pass equal `encode_reply` of that pass's reading; a View with a pending configuration shows the new values; a pass with a fake reader uses the reader's reading and calls no /proc read; a Mine reply holds only the caller's rows; after each kind of change, `persist` writes the same bytes as a full encode.
-2. Replay before and after, with `measure_25.py --reuse` on the saved inputs: the same 17 groups, 20 samples each.
-3. Ordered replay (architect review finding 8): queue a pass, a release, a token-wait and a pending configuration ahead of a View, then measure the View's complete wait to its reply bytes. Report it before and after.
-4. Replay isolation (architect review finding 7): confirm in the summary that the replay's clock is fixed, that alert operations (`_check_reading_alert` and outage claims) are replaced by private stubs, and that every input comes from the private copy.
-
-Target: no pass or request holds the loop over 0.1 s in the replay, and a View reply takes under 0.05 s.
-
-**Ruling 2 (director, 2026-11-06 23:27).** Mine keeps its current reply content, `decided_from` included. Ruling 1 item 2 no longer filters Mine rows; Mine gets only the encode-once gain. No assertion changes.
-
-**Ruling 3 (director, 2026-11-06 23:34).** `snapshot_codec.py` returns scalar values directly, caches dataclass field names and reuses converted objects within one encode; wire bytes do not change. View and Explain bytes are encoded on the first request after a pass, not inside the pass, and kept until the next pass ends.
-
-**Ruling 4 (director, 2026-11-06 23:38).** The reader starts when the configuration becomes usable. A read that raises does not end the reader; the loop handles the exception as the pass did before. An Admit or Launch for an owner absent from the reading asks the reader for one early read.
-
-**Ruling 5 (director, 2026-11-06 23:44).** Acceptance uses a replay with no profiler: the ordered View wait is under 250 ms worst, and the pass is under 100 ms worst. A mutation alone may take over 100 ms; each fsync and the lifecycle write order stay.
-
-**Ruling 6 (director, 2026-11-06 23:50).** Accepted with no more code change. With no profiler, the pass takes 16 ms median (63 ms worst), a View 0.003 ms median (6 ms worst). The ordered View wait is 375 ms median (696 ms worst), and at most 113 ms of it is CPU: the rest is disk sync and scheduling wait under load. The live probe after the deploy is the proof (Spec 5). A View that waits on disk syncs is a next item: durable writes leave the service loop.
-
-**Ruling 7 (director, 2026-11-07 00:12).** after review fix 1 the unprofiled pass is 26 ms worst and the ordered View 406 ms worst (696 ms before). Ruling 6 already accepts the ordered View wait as disk sync time. The writer's blocked post on that number is not a defect. The live probe after deploy stays the proof.
-
-**Ruling 8 (director, 2026-11-07 00:26).** Review found six defects, all fixed with a test that failed first. The reader returns raw operating-system evidence; the loop applies the current configuration and reservation records each pass. A reading carries its read-start time, and a deferred request retries only on a reading that started after it arrived. A deferred request drops when its connection finishes, is refused or closes. The deferral check compares the pid and the process start time. The waiting cadence wakes the reader at once.
+**Ruled out:** a larger `query_timeout_seconds`; a lock on service state; a second state-owning thread.
