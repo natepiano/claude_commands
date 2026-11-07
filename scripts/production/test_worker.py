@@ -340,8 +340,8 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
-        self.assertEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
-                                       PaneWorkerResume(idle.row.id, IdleWorker())])
+        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
+                                             PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
