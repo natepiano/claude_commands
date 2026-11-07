@@ -1041,7 +1041,16 @@ class Deployment:
                                  service='cloudformation')
                     executed = True
                     print('cloud-gate: applying the change (several minutes)', flush=True)
-                    _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+                    try:
+                        _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+                    except AwsUnavailable:
+                        events = ledger.rows(api.call('describe-stack-events', '--stack-name', stack_id,
+                                                      '--max-items', '60', service='cloudformation'), 'StackEvents')
+                        for event in reversed(events):
+                            if str(event.get('ResourceStatus', '')).endswith('_FAILED'):
+                                failure = event.get('ResourceStatusReason', 'no reason given')
+                                print(f"cloud-gate: {event.get('LogicalResourceId')} {event.get('ResourceStatus')}: {failure}", flush=True)
+                        raise
             finally:
                 if not executed:
                     _ = self._discard_change_set(api, stack_id, name)
