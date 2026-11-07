@@ -14,20 +14,38 @@ def snapshot_fields(schema: type) -> dict[str, object]:
     return cast(dict[str, object], get_type_hints(schema, include_extras=True))
 
 
+@lru_cache(maxsize=None)
+def record_field_names(schema: type) -> tuple[str, ...]:
+    return tuple(member.name for member in fields(schema))
+
+
 def snapshot_value(value: object) -> object:
-    """The cache's tagged records retain domain variants, including nested memory evidence."""
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return {"kind": type(value).__name__, **{field.name: snapshot_value(cast(object, getattr(value, field.name)))
-                                                for field in fields(value)}}
-    if isinstance(value, Mapping):
-        return {key: snapshot_value(item) for key, item in cast(Mapping[str, object], value).items()}
-    if isinstance(value, frozenset):
-        return [snapshot_value(item) for item in sorted(cast(frozenset[str], value))]
-    if isinstance(value, (tuple, list)):
-        return [snapshot_value(item) for item in cast(tuple[object, ...] | list[object], value)]
-    return value
+    """Convert each shared record once within this encoding."""
+    converted: dict[int, object] = {}
+
+    def convert(item: object) -> object:
+        if type(item) in (str, int, float, bool, type(None)):
+            return item
+        identity = id(item)
+        if identity in converted:
+            return converted[identity]
+        if isinstance(item, Path):
+            result: object = str(item)
+        elif is_dataclass(item) and not isinstance(item, type):
+            result = {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
+                for name in record_field_names(type(item))}}
+        elif isinstance(item, Mapping):
+            result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
+        elif isinstance(item, frozenset):
+            result = [convert(value) for value in sorted(cast(frozenset[str], item))]
+        elif isinstance(item, (tuple, list)):
+            result = [convert(value) for value in cast(tuple[object, ...] | list[object], item)]
+        else:
+            return item
+        converted[identity] = result
+        return result
+
+    return convert(value)
 
 
 def parse_snapshot_value(value: object, schema: object) -> object:
