@@ -93,3 +93,13 @@
    - An eligibility consumer from `initialize_step_record`. It accepts real eligibility output and starts no heavy target command.
    - A result consumer from `try_mac_test`. It accepts the actual result, status and output, and gives the next step decision of `route_test`. This one decides the most: a stop after a busy result and the queue-age handoff have no narrow function now.
    - The reservation and retry orchestration around `command_reserve`, claim recovery and target selection. It keeps the real admission result and queue sequence.
+
+## A stopped verify call waits for every process of its step
+
+**Source:** natest-unit, 2026-11-06, forced evidence on 5f56b92c4. Builds placed it here, 2026-11-07.
+
+**Today:** `verify.sh` signals the step's process group, then waits only for `RUN_STEP_PID`. The cargo token releases and `verify.sh` exits while a step member (rustc, cargo) can still run. Evidence: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/73/profile/impl3/cargo-survivor-evidence.jsonl`, a forced SIGSTOP case only.
+
+**Needed:**
+1. Measure a live stopped call. Record whether a step member outlives the token release.
+2. Only if one does: wait for the whole step process group before the token releases, with a test that fails on the old code.
