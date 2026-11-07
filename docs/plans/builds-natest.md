@@ -938,34 +938,21 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 ### Phase 44 — `copies.py` does less Git work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** each `copies.py` use does less Git work, with the same copies. Phase 40 measured 803 `refresh_remotes` calls, 1,606 fetches, 3,212 config writes and 1,606 update-refs, about 100 s of a 325 s profiled `style/test_crate_run.py` run. The showrunner assigned this on 2026-11-05 and moved queue's item to it.
+Each `copies.py` use does less Git work, with the same trees, remote refs and exit status. Three same-time pairs: warm `copies.py run` CPU 0.503 to 0.361 s (28.3%), processes 60 to 30, execs 67 to 33, wall 0.515 to 0.359 s. `style/test_crate_run.py` CPU 71.98 to 63.80 s (11.4%), processes 34,460 to 29,883, execs 36,289 to 31,010, wall 170.56 to 148.40 s. The Git work is a small part of that module now, so it misses the half target; no floor is established.
 
-**Spec:**
-1. Measure before any edit: `style/test_crate_run.py` (CPU s and process count first, then wall s; same-load pairs) and one real `copies.py run`. The module's median is now 89 s, so the 325 s profile above does not give its current cost. Profile the current `standing` and `workspace` costs, then state the gain.
-2. `refresh_remotes` (`scripts/copies/copies.py:372`) does only the work a changed source needs.
-3. Remove the full object scan from `copies.py` initialization (0.39 s per `verify.sh doc` run; item from queue-unit).
-4. Queue-unit keeps the `copies.py` list labels item. On `copies.py`, the second lander resolves.
-5. Behavior does not change: same trees, same remote refs, same exit status. Add no guard, refusal or check (user rule, 2026-11-05).
+- `initialize` checks ref tips with `git show-ref --head` in place of `rev-list --objects --all --quiet`: 0.0012 CPU s against 0.307 s. A missing ref tip still exits 128 and sets `replace_git` through `CopyError`.
+- `refresh_remotes` reads `git config --local --null --list` and `for-each-ref`, in the source and the tree. It writes config only if the settings differ, and runs `update-ref -d HEAD` and `fetch --prune` only if the refs differ.
+- Recovery from missing borrowed objects stays (`test_deleted_borrowed_objects_are_recovered_from_replacement_source`).
 
 **Files:**
 - `scripts/copies/copies.py` — the cuts
-- `scripts/copies/test_copies.py` — tests for the changed paths
+- `scripts/copies/test_copies.py` — `test_warm_copies_refresh_moved_and_deleted_refs_without_a_new_head`, `test_warm_copies_remove_tracking_refs_after_source_objects_are_pruned`
 
-**Workers:** 1 writer on slot `impl` (one module and its tests; the file does not split)
-- `impl` — all files above, role impl
+**Gotchas:** damage below a valid ref tip is no longer scanned at `initialize`. A later Git step reports it through `CopyError`. The showrunner accepted this limit.
 
-**Constraints from prior phases:**
-- Phase 40 measured the cost; the module itself is at a floor.
-- Verify Phase 35 replaces the `None` source and merge policies of `copies.standing` with named types. Build on those types.
-- Recovery from missing borrowed objects stays (`copies.py:349`, `test_copies.py:980`). If the refresh error path changes, replace `PostUseError.caller_error: BaseException | None` (`copies.py:110`) with named caller outcomes.
-
-**Acceptance gate:**
-- caller suites for `copies.py` green, `style/test_bulk_run.py` included (`bulk_run.test_tree` calls `copies.standing`)
-- measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a half-CPU claim for `style/test_crate_run.py` from this cut alone.
 
 ### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: done
 **Depends on:** none
@@ -1496,7 +1483,8 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 **Constraints from prior phases:**
 - Phase 55: `implement_launcher_test_support.py` repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in `assign_launcher_test_support.py` in this phase. Keep each fixture's own restoration: `first_assignment` restores server observations, and `first_worker_launch` restores `staff_parent`.
 - Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Phase 47's `/dev/shm` pairs do not reach this fixture through `TMPDIR`: `MeshCommandFixture.setUp` uses `dir="/tmp"` (`test_codex_mesh.py:1033`), the module setup patches `tempfile.tempdir` to `/tmp` (`:566`), and `AssignLauncherFixture.setUp` sets the child `TMPDIR` to `/tmp` (`assign_launcher_test_support.py:138`). Run each pair on `/tmp` at the same time, and state that in the result. Make no fixture-root option for the measure alone.
+- `assign.Dispatch` uses `None` for an absent worker claim and for a dispatch with no backend switch. The boundary belongs to the coordinator owner. New fixture helpers do not repeat those raw optional states.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**

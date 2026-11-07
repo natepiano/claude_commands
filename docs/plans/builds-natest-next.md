@@ -7,15 +7,15 @@ The phase backlog of natest-unit. At each phase end, rank modules by median CPU 
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
 1. Phases 65, 64, 66, 55, 63, 70 and 71 are complete, and they form one tip.
-2. Phase 69 and Phase 44: `copies/test_review_remote_copies.py`, 215.4 CPU s, and `copies.py` Git work with `style/test_crate_run.py`, 68.5 CPU s. Both are reviewed. They share one targeted test after Phase 71's checkpoint.
+2. Phases 69 and 44 are complete. Their paired after measurements are 120.2 CPU s for `copies/test_review_remote_copies.py` and 63.80 CPU s for `style/test_crate_run.py`. These are not refreshed gate medians. Confirm the merged gate rank before another dispatch.
 3. Phase 67, after verify's two function moves: lint judgment and the parser cases, 231 CPU s. The four SSH target files, 146.1 CPU s, wait for verify's cold import cut and functions (Phase 66 floor).
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
-5. Phase 72, now: `direct/test_findings_simplify.py` staff file, `production/test_production_lifecycle.py` teardown and `production/test_merge_gate_suites_admission.py` hang. Phase 73, now: `direct/test_verify_token_memory_history.py` and `direct/test_verify_mac_copy_ownership.py`.
+5. Phase 72 has passed review. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.
 6. Further `test_verify*` batches follow CPU rank. Measure with `module_cost.py --tests 10 --commands 10` before direct moves. Hold cases dominated by real `build_targets.py` commands for verify's import change. Hold routing decisions without a narrow function for verify's function change. These include Mac retry, fallback, queue-age and handoff cases. Profile doc, lint-scope and existing token-renewal function cases now. Their fixtures and function boundaries differ from the SSH fixtures. Include admission, setup and cleanup CPU. Give each shared fixture one owner. Each batch has one phase and one bumped checkpoint. Use `docs/plans/natedev-verify-test-cost.md` for the file list.
    - The next batch names these files, with ownership by support file (`verify_mac_offload_test_support.py`, `verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`), not by importer: `test_verify_mac_lifecycle`, `mac_retry_hold`, `mac_retry_clock` (memory and token cases; its routing-hook case already uses a direct call), `mac_results`, `mac_holder_history`, `mac_fallback_announcements`, `mac_fallback_diagnostics`, `mac_wait_records`, `mac_local_release`, `mac_release`, `mac_routing`, `mac_routing_changes`, `mac_memory_handoff`, `mac_pacing`, `mac_withdrawal`, `token_memory_history`, `token_wait`, `token_reservation`, `token_handoff`, `token_queue`, `hold_wait`.
 7. Phase 68, after devtools' coordinator change reaches builds: the assign launcher group, 300.9 CPU s. Measure the remaining CPU before selecting direct calls.
-8. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
-9. New phases by rank: `copies/test_copy_guard.py` 64.0, `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
+8. Phase 59: `style/test_style_proposals.py`, reviewed, 53.75 to 28.51 CPU s in pairs.
+9. Phases 74 and 75 hold `copies/test_copy_guard.py` and `production/test_add_unit.py`. Unassigned candidates: `style/test_crate_run.py`, `production/test_fast_track.py`, `production/test_staff.py`, `style/test_add_style.py`. Confirm their merged gate medians before selecting the next target.
 
 Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/basedpyright`, 238.4 CPU s; `agents/test_codex_mesh.py`, 232.6 CPU s, retires.
 
@@ -115,7 +115,7 @@ These are wall floors from before 2026-11-06, not CPU floors. A wall floor does 
 | --- | --- | --- | --- |
 | `production/test_fast_track.py` | 97.9 | production Git, CLI children, blocked-hook deadlines and promotion retries | 33 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
-| `style/test_crate_run.py` | Current floor not measured; historical baseline 257.2 | current gate median 88.6 s; Phase 44 measures current copy costs before it states a gain | 40, 44 |
+| `style/test_crate_run.py` | No floor established; Phase 44 paired wall median 148.40 s | After: 63.80 CPU s and 29,883 process starts; measure remaining cost before another cut | 40, 44 |
 | `direct/test_verify_mac_only.py` | 185.8 (load 52-70) | `build_targets.py` process starts through the `build_hold` chain; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41, 42 |
 | `direct/test_verify_lint_cache_versions.py` | 135.9 (clean rounds, no pairs) | `verify.sh lint` route: `step_record.py` 486 starts and 23.1 of 94.0 CPU s | 45 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
