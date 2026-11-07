@@ -2880,7 +2880,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 ### Phase 19 — Delete the mesh and rename the detached runs  · status: todo
 
-**Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, Phase 22, Phase 23, Phase 24, and the drain gate below.
+**Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, and the drain gate below.
 Require the devtools-unit 3t checkpoint, with the `implement.sh` and `review.sh` Codex branches deleted, merged to sdlc.
 Unrelated staff stores and deletions can follow panes without the whole-4g barrier.
 
@@ -3146,15 +3146,17 @@ Claude Code 2.1.319 has a prompt stash: `ctrl+s` (`chat:stash`) moves a non-empt
 
 sdlc ordered it (2026-11-07), a defect from builds: herdr cuts an agent name to 32 characters. `_agent_name` (`scripts/herdr/herdr.py:4745`) maps the name and returns `mapped[:32]`. The verify unit's workers `claude-build-followups-verify-review4`, `-review5` and `-review6` all become `claude-build-followups-verify-re`. With review5 live, review4 and review6 exit 8 (`agent_name_taken`). `Herdr.start_agent` (`:1903`) turns the failure into `PromptNotSubmitted`, and `launch_prepared_agent` (`:4859`) keeps the pane it opened, so each failed start leaves a pane.
 
-A new worker has no staff id before its first start, so the short name comes from the full name. Recovery finds a worker pane by its label, which keeps the full name, so the agent name has no other reader.
+sdlc added a second case (2026-11-07): herdr agent names are global across the server, not per unit. The devtools unit's `assign.sh --to review` and `--to review2` exited 8, because other panes (`w16:p1R`, `w16:p22`) held the short names `review` and `review2`. Each refusal left an empty pane (`w16:p27`, `w16:p28`).
+
+sdlc ruled (2026-11-07): names of 32 characters or fewer stay as they are, because a change to every name in herdr's agent list is a change to shown names and needs the user's approval. So this phase does not fix two short names that collide across units; the failed-start close removes the pane that such a refusal leaves. A new worker has no staff id before its first start, so the short form comes from the full name. Recovery finds a worker pane by its label, which keeps the full name.
 
 #### Work Order
 
-**Goal:** two different worker names always give two different herdr agent names of 32 characters or fewer. A start that fails before the agent runs closes the pane that this launch opened.
+**Goal:** two different worker names longer than 32 characters give two different herdr agent names of 32 characters or fewer. A start that fails before the agent runs closes the pane that this launch opened.
 
 **Spec:**
 
-1. `_agent_name`: a mapped name of 32 characters or fewer does not change. A longer one becomes its first 23 characters, `-`, and the first 8 hex digits of the SHA-256 of the mapped name. Add no refusal.
+1. `_agent_name`: a mapped name of 32 characters or fewer does not change. A longer one becomes its first 23 characters, `-`, and the first 8 hex digits of the SHA-256 of the mapped name. This is the one place for every caller. Add no refusal.
 2. Add `AgentNotStarted(PromptNotSubmitted)` beside `PromptNotSubmitted` (`:313`): the `agent start` command failed, and no agent runs in the pane. The `except HerdrFailure` branch of `Herdr.start_agent` returns it in place of `PromptNotSubmitted`. Callers that match `PromptNotSubmitted` keep their behavior.
 3. `launch_prepared_agent`: when the outcome is `AgentNotStarted` and the destination is `NewTab` or `SplitPane`, close the pane as the `AgentExited` branch does (`close_agent` for `NewTab`, `client.close_retained_pane` for `SplitPane`). Print `herdr <name>:<pane>: agent start failed: <reason>; pane closed`. An `ExistingPane` stays open: this launch did not open it.
 4. Add no check, refusal, validation, retry or new wait.
@@ -3162,7 +3164,7 @@ A new worker has no staff id before its first start, so the short name comes fro
 **Files:**
 - `scripts/herdr/herdr.py` — Spec items 1-3.
 - `scripts/herdr/test_herdr.py`:
-  - Repin `test_agent_names_are_valid_for_method_and_module_launches` (`:4207`): the `"X" * 40` case gives the 23-character prefix, `-` and the hash digits.
+  - Repin `test_agent_names_are_valid_for_method_and_module_launches` (`:4207`): the `"X" * 40` case gives 23 `x` characters, `-` and the hash digits; the other cases do not change.
   - Add a test: the three verify names give three different agent names, each of 32 characters or fewer.
   - Add a test: an `agent_name_taken` start into a `SplitPane` closes the pane and returns `AgentNotStarted`; the same failure into an `ExistingPane` keeps the pane.
   - Keep every other test in the module.
@@ -3177,6 +3179,38 @@ A new worker has no staff id before its first start, so the short name comes fro
 - `python3 -m unittest discover -s scripts/herdr -p 'test_herdr.py'` and `-p 'test_worker_panes.py'` pass.
 - `-s scripts/shutdown -p 'test_stop_resume.py'`, `-p 'test_pane_restore.py'`, and `-s scripts/production -p 'test_add_unit_rerun.py'`, `-p 'test_worker.py'` pass.
 - basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
+
+### Phase 25 — A herdr launch claims its phase files before the worker opens  · status: todo
+
+**Depends on:** none (other files than Phases 23 and 24). Phase 19 waits for this phase.
+
+sdlc ordered it (2026-11-07), a defect from the cargo-liner handler unit, phase 34: the herdr launch path wrote no `phases/<id>/phase_baseline`, so the checkpoint backstop `record-active` refused. The handler unit wrote the baseline by hand with `phase_reservation.py claim`. The old Codex launcher (`implement.sh`, from 1fb33e8fb) and the Claude launcher (`assign_claude._run`, `scripts/direct/assign_claude.py:207`) run `phase_reservation.py claim --session-dir <run> --phase <id> --repo <cwd>` before the worker opens. The claim writes `phase_baseline`, `phase_baseline_status` and the reservation state. `assign.execute_herdr` (`scripts/direct/assign.py:693`) does not run it.
+
+#### Work Order
+
+**Goal:** a herdr launch with a phase runs the same claim as the Claude launch, before `worker.py assign`, so the phase baseline exists for the checkpoint.
+
+**Spec:**
+
+1. Move the claim block of `assign_claude._run` into one function, and call it from `assign_claude._run` and `assign.execute_herdr`. Keep its command, its log, its error line `ERROR: phase <id> could not claim its files before its worker opens; see <log>.`, its `error` status, its board line and exit 1. There is one copy of the claim call.
+2. `execute_herdr` calls it for every role except `review`, as the Claude path does, after the prompt files are written and before `worker.py assign` runs. A refused claim opens no worker.
+3. Do not change `phase_reservation.py`. Add no check, refusal, validation, retry or new wait.
+
+**Files:**
+- `scripts/direct/assign_claude.py`, `scripts/direct/assign.py` — Spec items 1 and 2.
+- `scripts/direct/test_assign_launcher.py` — beside `test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend` (`:632`), add: (a) a herdr implement launch with `--phase` runs the claim before `worker.py assign`, and `phases/<id>/phase_baseline` holds the HEAD commit; (b) a refused claim exits 1 with the error line and runs no `worker.py assign`; (c) a herdr review launch runs no claim. Use the claim fixture that `test_assign_claude.py` uses (`test_phase_claim_precedes_the_claude_worker_open`, `:257`); do not copy it.
+- Keep `test_assign_claude.py` claim tests passing with no change.
+
+**Workers:** `1 writer` — `impl`: the three files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 22 changed `scripts/production/worker.py`; this phase does not touch it.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher*.py'`, `-p 'test_assign_claude*.py'` and `-p 'test_phase_reservation.py'` pass.
+- basedpyright on the three files reads `0 errors, 0 warnings, 0 notes`.
 - The full gate passes.
 
 ## Reference
