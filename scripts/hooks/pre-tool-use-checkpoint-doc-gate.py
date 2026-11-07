@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Check the documentation record for the selected checkpoint tree."""
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 import json
 import re
 import sys

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff_sources
 import io
@@ -19,12 +17,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
-import inventory
-import sessions
+from scripts.shutdown import inventory
+from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production.staff_test_support import recorded_showrunner
 from scripts.whoami import account
@@ -33,8 +30,8 @@ from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from test_restart import showrunner, top_level, unit
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_restart import showrunner, top_level, unit
+from scripts.shutdown.test_support import ShutdownTestCase
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300
@@ -219,7 +216,7 @@ class AccountMoveTests(ShutdownTestCase):
         }
         before = self.disk_state()
         result = subprocess.run(
-            [sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
+            [str(accounts.SCRIPTS / "lib" / "py"), str(accounts.SCRIPTS / "accounts" / "accounts.py"),
              "move", "showrunners", "claude3", "--dry-run"],
             env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_SECONDS,
         )

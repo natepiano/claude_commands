@@ -7,20 +7,18 @@ Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--sess
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sys
 from pathlib import Path
 from typing import cast
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-for dependency in ("whoami", "message", "herdr", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import herdr  # noqa: E402
-import pane_record  # noqa: E402
-import pane_launch
+from scripts.herdr import herdr, pane_launch
+from scripts.shutdown import pane_record
 from scripts.lib import conf
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.whoami import agent_accounts

@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, cast, override
 import unittest
 from unittest import mock
 
-import index
-import report
-from test_index import Record, STAMP, call, encode, local_day, point_root_at, step
+from scripts.buildlog import index
+from scripts.buildlog import report
+from scripts.buildlog.test_index import Record, STAMP, call, encode, local_day, point_root_at, step
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture

@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Freeze backfill evidence and track each source record's review outcome."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fnmatch
@@ -15,7 +19,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
-from feature_log import PROJECTS, locked, state_dir, vault_dir
+from scripts.feature_log.feature_log import PROJECTS, locked, state_dir, vault_dir
 
 
 RecordKind = Literal["phase", "asbuilt", "changelog", "tag", "merge", "commit"]

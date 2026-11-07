@@ -6,14 +6,12 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import fake_herdr
 from scripts.production import showrunners
@@ -22,7 +20,7 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import transfer_unit
+from scripts.production import transfer_unit
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 

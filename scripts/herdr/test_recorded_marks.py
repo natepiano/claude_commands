@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.shutdown import pane_record
 
 @final

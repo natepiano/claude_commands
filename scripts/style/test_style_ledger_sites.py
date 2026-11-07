@@ -2,28 +2,27 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import os
 import sqlite3
 import subprocess
-import sys
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from contextlib import closing
 from typing import cast, final
 from unittest import mock
-import style_ledger
-import rules
-from approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
-import declarations
-import style_footprint
-import style_proposals
-import bulk_run
-import bulk_rename
+from scripts.style import style_ledger
+from scripts.style import rules
+from scripts.style.approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
+from scripts.style import declarations
+from scripts.style import style_footprint
+from scripts.style import style_proposals
+from scripts.style import bulk_run
+from scripts.style import bulk_rename
 
-from ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, TWIN, TRAIT_METHOD)
+from scripts.style.ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, TWIN, TRAIT_METHOD)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -1540,14 +1539,14 @@ class StyleLedgerSitesTests(LedgerTestCase):
         before = self.held_rows(ledger.database)
         # Guard against nontermination if alias expansion keeps growing its path.
         program = (
-            "from pathlib import Path; import style_ledger; import sys; "
+            "from pathlib import Path; from scripts.style import style_ledger; import sys; "
             "ledger = style_ledger.Ledger(Path(sys.argv[1]), Path(sys.argv[2])); "
             "outcome, = ledger.follow_declarations([sys.argv[3]], ledger.synced_commit(), approved=lambda path: True).outcomes; "
             "print(type(outcome).__name__); ledger.close()"
         )
-        result = subprocess.run([sys.executable, "-c", program, str(self.repo), str(ledger.database), finding_id],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(self.repo), str(ledger.database), finding_id],
                                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
-                                env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
+                                env=os.environ.copy())
         self.assertEqual(result.stdout.strip(), "TraitIdentityUncertain")
         self.assertEqual(self.held_rows(ledger.database), before)
 

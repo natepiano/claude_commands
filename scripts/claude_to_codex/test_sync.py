@@ -3,11 +3,9 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
-from pathlib import Path
 import sys
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.claude_to_codex import sync
 from scripts.lib.rerun_test_support import SCRIPTS, ScriptRepositoryTestCase
 

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from ..lib import conf
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import conf
+    from scripts.lib import conf
 
 
 @dataclass(frozen=True)
