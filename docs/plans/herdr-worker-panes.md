@@ -2979,6 +2979,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 25: a herdr launch with a phase runs `assign_claude.claim_phase` before `worker.py assign` (not for `review`). Keep the one claim call when the launch path changes.
 - Phase 26: every unfinished run pins herdr; a finished run can still hold a `mesh` pin file. Phase 19 removes the reader, so no pin file is read after it.
 - Phase 30: herdr adds no draft restore step after a submit; Claude keeps the draft itself. A draft lost in a stop and resume is the agents unit's fix.
+- Phase 27: only a worker with an active dispatch reopens on restore, restart or a move; an idle worker stays closed until its next assign. Keep this rule when the mesh branch goes.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3171,31 +3172,23 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 
 **Ruled out:** a code-only switch of the pin under a live run (`mesh_runs.deliver` reads the pin when a detached run delivers).
 
-### Phase 27 — Only working workers hold a pane  · status: todo
+### Phase 27 — Only working workers hold a pane  · status: done
 
-**Depends on:** Phase 24 and Phase 25 (they edit `scripts/herdr` and `scripts/direct` files that this phase reads). Its order against Phase 19 is sdlc's call.
+#### As-built
 
-The user (2026-11-07): "given we can stop and resume workers, there isn't much point to keeping idle ones open in panes - we should just resume workers so we get their context back - when we need them and not just keep them in open panes. actual work should be what is open in panes - unit directors should coordinate this and it should be part of their unit direct instructions to do this". This replaces the rule that a unit's named workers stay open (user, 2026-10-10 and 2026-10-28): a worker still lasts as long as its unit, but as a saved conversation, not as an open pane. The tools exist: `worker_panes.py close <name>` stops the agent and closes its pane, and keeps the staff row and its thread (`worker_panes.close`, `scripts/herdr/worker_panes.py:899`; it refuses a busy worker). The next `assign.sh --to <name>` runs `codex resume <thread>` in a new pane (`_start_locked`).
+A pane holds a worker only while it works. After a director accepts a pass and starts no fix round or next dispatch at once, it closes the pane with `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`. The close keeps the staff row and the thread; the next `assign.sh --to <name>` resumes that thread in a new pane on the current role account. A busy worker or a live detached run keeps its pane until that work ends.
 
-#### Work Order
+- `worker.restore` (`scripts/production/worker.py`) reopens only a worker with an `ActiveDispatch` from `progress_history.active_dispatch`, through `_resume_launcher`; an idle worker stays closed. `ActiveDispatchUnavailable` prints an anomaly and makes the result `UNCERTAIN`. The shutdown restart and `pane_restore` reach this same function.
+- `pane_moves._move_locked` (`scripts/accounts/pane_moves.py`) moves only a worker with an active dispatch. It closes an idle worker's open or stopped pane and returns `nothing to move`.
 
-**Goal:** a pane holds a worker only while it works. When a worker's pass ends and the director has no next dispatch for it now, the director closes its pane. The next assign resumes its same conversation.
+**Files:**
+- `scripts/production/worker.py` — `restore` with the active-dispatch rule.
+- `scripts/accounts/pane_moves.py` — the move rule for idle workers.
+- `commands/unit/direct.md`, `commands/unit/worker.md` — the close-after-accept rule.
+- `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md` — the same rule.
+- `scripts/production/test_worker.py`, `scripts/accounts/test_accounts.py`, `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_restart.py` — busy and idle restore and move cases.
 
-**Spec:**
-
-1. `commands/unit/direct.md` <LongLivedWorkers/>: when a worker's pass is accepted and the director sends it no next dispatch now (no fix round, no next phase work), close its pane with `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`. The thread and the staff row stay. A refusal (a busy worker or a live detached run) keeps the pane; close it after that work ends. Replace each text that tells the director to keep idle workers open.
-2. Restore, resume and account moves reopen only a worker with an active dispatch (`BusyPass`). An idle worker stays closed and resumes at its next assign. Find each path that reopens idle pane workers (`worker.py restore`, the shutdown restart, the account move) and change it in its one shared place.
-3. `docs/as-built/herdr-adoption.md` and `docs/as-built/long-lived-workers.md` say the same.
-4. Add no check, refusal or validation that this list does not name.
-
-**Files:** `commands/unit/direct.md`, `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md`, and the one shared reopen place of Spec item 2 with its tests. The writer names the reopen file in the summary before editing it. When that file belongs to the shutdown unit or the accounts unit, sdlc settles who edits it.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- The tests of the reopen place pass. They show that a restore of a unit with one busy and one idle worker reopens the busy one only.
-- The full gate passes.
-- Director proof: in a test run, a worker closed after its pass resumes its same thread at the next assign.
+**Gotchas:** a test that expects a worker to reopen needs an active dispatch with a `launcher_command` (`progress_history.begin_dispatch`) and a patched `worker._resume_launcher`; without a live director session, `_resume_launcher` prints "director session is unavailable".
 
 ### Phase 28 — A director answers a worker's question in its pane  · status: todo
 
@@ -3283,7 +3276,26 @@ sdlc reported a finding from the agents unit's live proof (2026-11-07): `herdr.l
 
 The agents unit's evidence (2026-11-07, `/tmp/claude/unit/fac3cc89-6c14-4c9a-9d7d-1c7c22403037/phases/morty-workers/proof/`): `live_proof_3.log` (12:15:49 EST) and `live_proof_4.log` (12:20:23-12:23:45 EST) called `herdr.launch_agent(..., {'CODEX_HOME': '/home/natepiano/.codex2'}, 'codex', [...], NoOpeningPrompt(), ...)` into a `NewTab`. The Codex process read `CODEX_HOME=/home/natepiano/.codex1` from its environment at launch. `live_proof_7.log` started on codex2 because it ran `env CODEX_HOME=~/.codex2 codex ...` in a plain pane with `run_in_pane`, not through `launch_agent`.
 
-The Work Order is written at the phase start. Step 1 measures `CODEX_HOME` in the pane shell and in the Codex process of a throwaway zz-proof pane; the fix goes where the value is lost.
+Likely cause, from the code: the pane shell is an interactive zsh with `alias codex='~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec workers'`, and `accounts.exec_account` sets `CODEX_HOME` to the workers account (`scripts/accounts/accounts.py:1514`). The `ExistingPane` route of `launch_prepared_agent` runs `unalias {kind}` before the start (`scripts/herdr/herdr.py:4922`); the `NewTab` and `SplitPane` routes do not. `live_proof_7.log` ran `~/.local/bin/codex` by path, so no alias applied.
+
+#### Work Order
+
+**Goal:** a Codex or Claude agent that herdr starts in a pane runs with the caller's account environment, for every destination.
+
+**Spec:**
+
+1. Prove the cause live before any edit (Acceptance gate). Launch Codex through `herdr.launch_agent` into a `NewTab` with `CODEX_HOME=~/.codex2`. Name the account folder the Codex process uses from its open files (`/proc/<pid>/fd`), not from its environment. Record the cause in the summary.
+2. Fix in one shared place that every destination passes through: the shell alias of the agent kind no longer replaces the canonical executable. Use the `unalias` step that the `ExistingPane` route has; do not keep a second copy of it.
+3. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: a `NewTab` launch and a `SplitPane` launch remove the kind's alias before `agent start`, through the same step as `ExistingPane`.
+- A live proof, before and after the fix, in a tab named `zz-proof-codexhome` in the agents herdr session, with its working directory under `/home/natepiano/scratch/herdrcheck/`: the Codex process opens files only under `~/.codex2`. Close only the ids that the proof opened.
+- `HerdrTests` and `PromptSubmissionTests` pass; basedpyright on both files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
 
 ## Reference
 
