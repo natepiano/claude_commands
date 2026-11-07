@@ -304,6 +304,18 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 
 `scripts/direct/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
 
+### Resume messages
+
+`resume_message` builds one prompt for resumed conversations.
+`ResumeWorkers(results, cwd, panes)` combines `Resumable`, `Idle`, and `Unavailable` results with pane worker states.
+`PausedSeat` retains the saved launcher arguments and fixed staff reference.
+`worker_resumes` reads direct worker children across Claude and Codex.
+`AccountMove` names the source and destination accounts.
+A busy recipient gets only its `own_pass` continuation.
+An idle worker row receives no prompt.
+A director can receive the list of busy and idle worker children.
+Restore retains launcher recovery and shares dispatch reads across pane workers.
+
 ### Cleanup
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. It leaves Codex threads open and preserves Claude workers held by the unit ledger or a live unit director. It does not launch server reclamation.
@@ -330,6 +342,8 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 The ledger stores fixed staff references, access policy, ownership, and events.
 Staff supplies current names, parents, worktrees, and backend identities.
 A rename or transfer preserves those fixed references.
+`rename.py` changes the unit row and repairs its session and display names.
+An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
 See [unit rename](unit-rename.md) for explicit worktree moves.
 
 ### Measurement: `scripts/whoami/worker_usage.py`

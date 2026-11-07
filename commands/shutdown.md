@@ -1,6 +1,6 @@
 ---
 description: Stop, resume, or restore a session.
-argument-hint: 'stop SESSION | resume NAME [--why TEXT] [--to claudeN] | status | restart [--all] [--dry-run]'
+argument-hint: 'stop SESSION | resume NAME [--why TEXT] [--to ACCOUNT] | status | restart [--all] [--dry-run]'
 ---
 
 Run `agents stop SESSION` to stop the session and its worker agents.
@@ -10,11 +10,20 @@ Unknown workers retain their reasons and remain not proved stopped.
 Unproved targets stay unchanged; unrelated proved work continues.
 Stop uses the limits from `config/shutdown.conf`.
 
-Run `resume NAME [--why "reason"] [--to claudeN]` from another pane and any directory.
+Run `resume NAME [--why "reason"] [--to ACCOUNT]` from another pane and any directory.
 Use a short name, a staff id, or a session id.
+An exact Codex thread name resolves through the shared `session_index.jsonl`.
+A raw session id takes priority over a thread name.
 The default reason is `resumed by name`.
-The command restores the account, environment, and folder.
+The command restores the saved environment and folder.
+A Codex resume uses the configured `workers` account.
+A Claude unit or showrunner uses its configured role account.
+Other Claude sessions keep their saved account.
+`--to ACCOUNT` overrides the account for either family.
 A closed tab uses the existing restore path.
+A herdr server restore keeps the saved account for both families and sends no generated prompt.
+Resume from its own empty pane executes the saved launch in that pane.
+A running session prints `unchanged` with its current account and returns status 0.
 Restore resumes the director and its retained workers with their native conversations.
 A stopped worker reuses its pane and terminal; a proved closed worker can use a new split.
 Restore reads each worker's role and busy dispatch from the saved pass.
