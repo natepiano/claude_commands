@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import models_registry
+from scripts.lib import models_registry, unit_runs
 from scripts.usage import agents_log
 
 ROSTER = "mesh_roster.json"
@@ -591,10 +591,7 @@ def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
     """Running director candidates, newest first, including sessions without sockets."""
     from scripts.message import sessions
 
-    return sorted(
-        (item.record for item in registry.entries if sessions.running_session(item.record)),
-        key=lambda session: session["updatedAt"], reverse=True,
-    )
+    return sessions.running_records(registry)
 
 
 def resolve_live_unit_director(
@@ -603,7 +600,7 @@ def resolve_live_unit_director(
     use_live_marks: bool = True,
 ) -> LiveUnitDirector | NoLiveUnitDirector:
     """Resolve the current director from worker membership or the unit staff row."""
-    from scripts.production import session_staff, unit_lookup
+    from scripts.production import unit_lookup
 
     dependencies(run / ROSTER)
     rosters = worker_lifecycle.read_json_object(run / ROSTER)
@@ -623,20 +620,20 @@ def resolve_live_unit_director(
             parents[parent.id] = parent
     dependencies(run / STATE)
     context = worker_lifecycle.read_json_object(run / STATE)
-    production, unit = context.get("production"), context.get("unit")
-    if not parents and isinstance(production, str) and isinstance(unit, str) and production and unit:
-        found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
-        if isinstance(found, session_staff.MemberFound):
-            parents[found.row.id] = found.row
+    if not parents:
+        owner = unit_runs.run_owner(context, record)
+        if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
+            parents[owner.id] = owner
     if len(parents) != 1:
         return NoLiveUnitDirector()
     parent = next(iter(parents.values()))
     for session in running:
         if session["sessionId"] == parent.current_session:
             return LiveUnitDirector(session["sessionId"], session["pid"])
-    if use_live_marks and isinstance(production, str) and isinstance(unit, str) and production and unit:
+    production = record.parent_of(parent)
+    if use_live_marks and production is not None:
         try:
-            marked = unit_lookup.labeled_session(production, unit, record=record, sources=sources, running=running)
+            marked = unit_lookup.labeled_session(production.name, parent.name, record=record, sources=sources, running=running)
         except OSError:
             return NoLiveUnitDirector()
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):

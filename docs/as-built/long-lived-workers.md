@@ -85,10 +85,11 @@ The source release result is `SourceReleased`, `SourceUnresolved(reason)`, or `S
 For Codex, the release path resolves that result through server evidence.
 Codex release checks the fixed id and current session against staff.
 It parks queued submissions before interruption and checks every recorded source server.
-A matching roster entry with no remaining server can prove release.
+A missing server record or a stopped server permits release without a diagnostic.
 A record with only `previous_servers` names no current server.
-A current server without a valid pid gives `SourceReleaseUnknown`.
-Uncertain release keeps source evidence and prevents destination creation.
+An invalid record or an unavailable server prints an anomaly and permits release.
+A changed staff identity prints an anomaly and permits release without signaling a process.
+Only an answering server with a loaded target thread and an unknown stop state prevents Codex release.
 
 The default switch request is `sha256(f"{staff id}:{destination family}")`.
 Assignment delivery uses `assignment_id(prompt)`, which hashes the resolved path, modification time, and contents.
@@ -160,6 +161,9 @@ The lifecycle and held-role rules below still apply during a move.
 Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
 
 **Protocol.** Initialize with `capabilities.experimentalApi=true` for queue calls. Pass a `SandboxMode` string in `thread/start.sandbox`. Worker threads remain non-ephemeral because ephemeral threads reject queued submissions.
+
+Every `turn/start` request sets `approvalPolicy` to `never` and names its `sandboxPolicy`.
+The server keeps the thread's last turn policy, so resumed workers also need both fields.
 
 **Launch retry.** A nonresident launch can retry once after a fast failure from an inherited server. Eligible outcomes are `FailedBeforeThread` and `FailedWithThread` containing `STALE_SIGN_IN`. The failure must occur within 120 seconds.
 
@@ -322,6 +326,14 @@ Restore retains launcher recovery and shares dispatch reads across pane workers.
 
 ### Cleanup
 
+- **Worker end.** `codex_mesh.py end` stops the recorded servers when every roster worker has status `ended`.
+  `_reap_validated_servers` and `_release_held_server_locked` use the same identity step, `_reap_recorded_server`.
+  This step signals only a process whose pid and `app-server --listen` port match the record.
+  A failed process scan prints an anomaly and sends no signal.
+  It reports another live process and forgets its record without a signal.
+  It stops them before staff retirement, including when retirement refuses.
+  Another open worker keeps the servers.
+  Held design roles keep their existing lifecycle.
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. It leaves Codex threads open and preserves Claude workers held by the unit ledger or a live unit director. It does not launch server reclamation.
 - **Run end.** `scripts/direct/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. The scan uses `unit_runs.run_folders`, which excludes each root's `active` marker folder. The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
   1. `design_roles.py unbind-run <run>` for each held run, which unbinds every held design role bound to it and leaves its thread, prompts and replies (`docs/as-built/long-lived-workers.md#lasting-roles`); a failure stops the script before any other step

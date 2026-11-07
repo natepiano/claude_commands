@@ -140,6 +140,9 @@ class WorkerFillTests(StaffTestCase):
         parent = unit_membership("demo", "models")
         _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
         run = self.worker_run("demo", "models", "director")
+        self.write_json(run / "progress_history_state.json", {
+            "owner_staff_id": parent.id, "main_agent": {"family": "claude", "session_id": "director"},
+        })
         with redirect_stderr(io.StringIO()) as errors:
             allowed = worker_admission.admit("impl", run)
         self.assertEqual(allowed.parent, parent.id)
