@@ -314,3 +314,13 @@ From the sdlc showrunner, 2026-11-06, rca 261106-1. Separate hash, on branch `sd
 From the sdlc showrunner, 2026-11-06: "merge_checkpoint.py at push merged origin/main into sdlc, hit a conflict in 3 files, and left the showrunner checkout mid-merge. It must abort the merge on a conflict, leave the checkout as it was, and print a held line that names the files."
 
 Cause: `push_git` aborts its origin/main merge only when `may_undo` is true. `refresh_pushed_tip` calls it with false, so a conflict leaves the merge in place. The merge is `push_git`'s own step, so `push_git` aborts it on every failure, then holds with the conflicted paths.
+
+The `--from-child` handler in `main` reports a held Stop as it reports a cancelled one: the held line, the files and the recovery message. Held returns 1; cancelled keeps 77.
+
+### Phase 9y — The review trial line counts the findings in the ledger  · status: in progress
+
+From the sdlc showrunner, 2026-11-06: "unit-board's review trial recorder printed code 4 findings, but its ledger holds 1 (F001)... The count must come from the findings ledger." In this unit the recorder printed code 4 for 9x, whose ledger holds 2, and code 5 for 9w, whose ledger holds 6. Count the code findings from the phase's findings ledger. Add no new check.
+
+### Phase 9z — The launcher sees the end of a worker that read a passed run  · status: todo
+
+From the sdlc showrunner, 2026-11-06. Codex worker merge16 (verify-unit) stopped with no event after it read a passed run, twice (14:59 and 16:35 EST). Its launcher stayed attached for 62 and 19 minutes. An interrupt ended the wait in seconds. Find why the launcher does not see the worker's end, and fix the cause where it lives. Add no new check.

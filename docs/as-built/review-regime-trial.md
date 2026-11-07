@@ -11,16 +11,15 @@ The review records connect each merged phase to its findings, review time, merge
 A named phase selects its open instance or its latest completed instance.
 Without `--phase-id`, the command selects the current phase, including a completed phase.
 
-Completed review records supply code finding counts through `_raised_findings`.
-The records live under `history_root()/review_turns/<run>/`.
-`CodeReviewEvidence` is `NoRecordedCodeReview | RecordedCodeFindings`.
-`RecordedCodeFindings(0)` records a completed review with no findings.
-`NoRecordedCodeReview` makes the count use `finding_opened` events instead.
+The phase's `finding_opened` events supply the finding counts.
+`findings.py open` writes one event for each ledger entry with its phase instance, finding id, and lens.
+The recorder counts each code finding id once, including routed and closed findings.
+Review records and closure replies do not change the counts.
 
 | Field | Source |
 | --- | --- |
 | UX findings | `finding_opened` events that name `ux`. |
-| Code findings | Completed review records, excluding `ux`; otherwise matching ledger events. |
+| Code findings | `finding_opened` events with no lens or any lens other than `ux`. |
 | Review-worker minutes | Finished review passes and UX review activities. |
 | UX check minutes | Finished `UX review` activities. |
 | UX repair minutes | Finished fix passes whose dispatched batch includes a UX finding. |
@@ -54,7 +53,7 @@ The tracked `review-regime-trial.jsonl` contains a fixed data sample.
 The live ledger remains outside Git.
 Rows without a plan field do not identify the same key as rows that supply a plan.
 Missing metric fields do not mean zero.
-Older code counts can describe only the `craft` reviewer; current counts cover code reviews excluding UX.
+Older code counts can describe one reviewer or totals from review records; current counts use ledger opening events.
 Compare records with the same count definition.
 
 `watch` waits for 12 eligible `after` phases, then returns 3 until `ack` records the user's acknowledgment.
@@ -63,5 +62,5 @@ An acknowledged watch returns 0.
 ## Why
 
 Phase-instance selection keeps reopened phases separate.
-A recorded zero preserves evidence that a review completed.
+Ledger opening events preserve findings after routing and closure.
 The row key lets one unit run several plans without merging their phase numbers.

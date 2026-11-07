@@ -6424,17 +6424,6 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
     return {part.strip() for part in lens.split(",") if part.strip()}
 
 
-@dataclass(frozen=True)
-class NoRecordedCodeReview:
-    """No finished code review records this phase's raised count."""
-
-
-@dataclass(frozen=True)
-class RecordedCodeFindings:
-    count: int
-
-
-CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
 SEPARATE_TRIAL_LENSES = ("ux",)
 
 
@@ -6464,44 +6453,13 @@ def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
         return
 
 
-def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:
-    """Read the durable review records for one phase instance."""
-    root = plan_history.history_root() / "review_turns" / session_dir.name
-    for path in sorted(root.glob("*.json")):
-        try:
-            record = _object_dict(cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        except (OSError, ValueError):
-            continue
-        if record is not None and _string(record.get("phase_instance_id")) == instance_id:
-            yield record
-
-
-def _is_code_review(record: dict[str, object]) -> bool:
-    return (
-        _string(record.get("kind")) not in SEPARATE_TRIAL_LENSES
-        and _string(record.get("lens")) not in SEPARATE_TRIAL_LENSES
-    )
-
-
-def _raised_findings(records: Iterable[dict[str, object]]) -> CodeReviewEvidence:
-    """Count findings from completed reviews."""
-    evidence: CodeReviewEvidence = NoRecordedCodeReview()
-    for record in records:
-        if _string(record.get("status")) != "reviewed":
-            continue
-        count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
-        evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
-    return evidence
-
-
 def _review_trial(args: argparse.Namespace) -> None:
     """Print the phase's findings and review minutes for the checkpoint notice.
 
     A named phase selects its open instance or its latest completed instance.
     An unnamed command selects the current phase, including a completed phase.
-    Only events and review records for that instance count.
-    Completed reviews supply the code count.
-    Without completed reviews, the count uses the findings that the director opened.
+    Only events for that instance count.
+    Ledger opening events supply the finding counts, including routed and closed findings.
     Review-worker minutes count finished review passes and UX review activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
@@ -6533,7 +6491,7 @@ def _review_trial(args: argparse.Namespace) -> None:
             + "the phase start-phase opened, and this run has not opened one"
         )
     ux_findings = 0
-    code_findings = 0
+    code_finding_ids: set[str] = set()
     review_seconds = 0
     ux_check_seconds = 0
     ux_finding_ids: set[str] = set()
@@ -6549,7 +6507,7 @@ def _review_trial(args: argparse.Namespace) -> None:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
             if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
-                code_findings += 1
+                code_finding_ids.add(_string(event.get("finding_id")))
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
@@ -6575,12 +6533,8 @@ def _review_trial(args: argparse.Namespace) -> None:
         for event in fix_passes
         if _integer(event.get("fix_pass")) in ux_rounds
     )
-    records = list(_phase_review_records(session_dir, instance_id))
-    raised = _raised_findings(filter(_is_code_review, records))
-    if isinstance(raised, RecordedCodeFindings):
-        code_findings = raised.count
     print(
-        f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
+        f"review trial: ux {ux_findings} findings, code {len(code_finding_ids)} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
         + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
