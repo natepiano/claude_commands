@@ -78,12 +78,26 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - "finish the current step" on either command lets workers finish their current task first, then hold or exit.
 - Deletes the `staff.py` pause and resume commands and the pause and resume text in `/showrunner:units`.
 - No draft keep: a move does not save or type back unsent composer text (user 2026-11-07, via sdlc: "this is overkill").
+- `agents stop --all` stops every live row and saves them for `agents restart`. Its dry run lists every live row and is fast.
+
+### Phase 11a: `agents restart ACCOUNT` selects only that account
+
+- Today `restart` reads ACCOUNT and does not use it. It restarts only the rows of that account.
+- Its own hash, so it merges alone. Tell accounts when it is on main.
+
+### Phase 11b: a unit rename takes `--to-branch`
+
+- `rename.py apply OLD NEW --to-branch BRANCH` works for a unit. NEW may equal the current name, so only the branch moves.
+- It uses the unit rename steps: stop, branch move, origin push and resume. The branch checks are one function for units and showrunners.
+- Request from cargo-liner, from the user 2026-11-07: "give the branch for the handler unit a better name".
 
 ### Phase 12: retire, and resume of a retired unit
 
 - `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record. The board does not show it.
 - `agents resume NAME` of a retired unit refuses and names `--retired`. The showrunner asks the user yes or no before it runs `--retired`.
 - Replaces `retire_unit.py` and `resume_unit.py`. Deletes `/showrunner:retire_unit` and `/showrunner:resume_unit`.
+- A restart that cuts a worker off in the middle of a turn leaves a resume step that works. Today the resume note offers the saved assign command. That command exits 3 when the dispatch is already in the transcript and the worker is idle. The resume sends a continue prompt instead (sdlc 2026-11-07).
+- No resume note for a dispatch that is already closed. On 2026-11-07 a note named a fix dispatch that landed five hours before.
 
 ### Phase 13: rename
 
