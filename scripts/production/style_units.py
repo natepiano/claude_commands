@@ -299,21 +299,21 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
             if path not in snapshots:
                 snapshots[path] = read_snapshot(path, now, decision_folder, decisions)
         open_steps = steps.result()
-    lines = ["| Unit | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
-             "| --- | --- | --- | --- | ---: | ---: | ---: |"]
+    lines = ["| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
+             "| --- | --- | --- | --- | --- | ---: | ---: | ---: |"]
     for unit in units:
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
         holder = holders.get(unit.unit)
         if holder is None:
-            print(f"anomaly: {unit.unit}: staff ticket ownership is unavailable under {doc}", file=sys.stderr)
+            session_staff.report_anomaly(f"{unit.unit}: staff ticket ownership is unavailable under {doc}")
         ticket = snapshot.tickets.get(str(holder.id), NoTicket()) if holder is not None else NoTicket()
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"
         left = left_cell(counts.left, counts.filed, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
-        cells = (display_cells.session_cell(unit), ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
+        cells = (holder.name if holder is not None else unit.unit, unit.status, ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
                  format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
                  f"{counts.built:,}", f"{counts.recent:,}", left)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")

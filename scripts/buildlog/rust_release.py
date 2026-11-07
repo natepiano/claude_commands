@@ -378,7 +378,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         step = "checkout"
         if held():
             raise TrialDeferred("build hold active")
-        with copies.standing("toolchain-trial", HANA, revision.stdout.strip()) as checkout:
+        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip())) as checkout:
             _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {
                 "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),

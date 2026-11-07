@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, cast, final, override
+from typing import BinaryIO, Literal, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -298,6 +298,85 @@ class NativePaneSessionTests(StaffTestCase):
             observed = herdr.native_process(998072, "codex")
         self.assertEqual(observed, herdr.NativeAgentProcess(herdr.RolloutThread(current), "same-process", environment))
         self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
+
+    def assert_target_survives_closed_descriptor(self, stage: Literal[
+            "listing", "read", "final listing", "new descriptor"]) -> None:
+        identity = fixture_runtime_id("descriptor-current-thread")
+        other = fixture_runtime_id("descriptor-other-thread")
+        proc = self.root / "descriptor-proc"
+        descriptors = proc / "998081" / "fd"
+        descriptors.mkdir(parents=True)
+        rollout = self.root / "rollout-descriptor.jsonl"
+        write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        closing, stable = descriptors / "7", descriptors / "8"
+        closing.symlink_to(rollout)
+        stable.symlink_to(rollout)
+        readlink = os.readlink
+        open_file = cast(Callable[..., TextIO], Path.open)
+
+        def read_descriptor(path: Path) -> str:
+            if path == closing and stage == "listing":
+                path.unlink()
+            return readlink(path)
+
+        def read_rollout(path: Path, *args: object, **kwargs: object) -> TextIO:
+            if path == closing and stage == "read":
+                path.unlink()
+            return open_file(path, *args, **kwargs)
+
+        stat = Path.stat
+        reads = 0
+
+        def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            nonlocal reads
+            value = stat(path, follow_symlinks=follow_symlinks)
+            if path == closing and stage in ("final listing", "new descriptor"):
+                reads += 1
+                if reads == 2:
+                    if stage == "final listing":
+                        path.unlink()
+                    else:
+                        (descriptors / "9").symlink_to(rollout)
+            return value
+
+        client = herdr.Herdr("fixture")
+        pane: herdr.PaneIdentity = {"pane_id": "w1:p1", "workspace_id": "w1",
+                                    "terminal_id": "private-terminal", "session_id": other}
+        info = {"process_info": {"shell_pid": 998080, "foreground_process_group_id": 998081,
+                "foreground_processes": [{"pid": 998081, "argv": ["codex"]}]}}
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="same-process"),
+              patch.object(herdr, "process_environment", return_value={}),
+              patch.object(client, "result", return_value=info),
+              patch.object(client, "composer", return_value=herdr.ComposerInput("")),
+              patch.object(os, "readlink", side_effect=read_descriptor),
+              patch.object(Path, "open", read_rollout),
+              patch.object(Path, "stat", read_metadata)):
+            with redirect_stderr(io.StringIO()) as output:
+                allowed = herdr.check_target(identity, action="keys", client=client,
+                    pane_info=pane, place=herdr.HerdrPlace("fixture", "w1:p1"))
+            if stage == "new descriptor":
+                self.assertFalse(allowed)
+                self.assertIn("current Codex rollout or process changed", output.getvalue())
+            else:
+                self.assertTrue(allowed)
+            with self.assertRaisesRegex(herdr.HerdrFailure, f"does not run session {other}") as refused:
+                self.assertTrue(herdr.check_target(other, action="keys", client=client,
+                    pane_info=pane, place=herdr.HerdrPlace("fixture", "w1:p1")))
+            self.assertEqual(refused.exception.code, "wrong_target")
+
+    def test_target_proof_survives_a_descriptor_closing_during_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("listing")
+
+    def test_target_proof_survives_a_descriptor_closing_during_read(self) -> None:
+        self.assert_target_survives_closed_descriptor("read")
+
+    def test_target_proof_survives_a_descriptor_closing_before_the_final_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("final listing")
+
+    def test_target_proof_refuses_a_new_descriptor_before_the_final_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("new descriptor")
 
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
@@ -969,7 +1048,33 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
+    def test_idle_pane_without_interactive_ready_or_remote_control_receives_prompt(self) -> None:
+        self.submit_on_type = True
+        _ = self.path.write_text("")
+        result = self.client.result
+
+        def observe(*arguments: str) -> dict[str, object]:
+            if arguments == ("agent", "get", "destination:p1"):
+                return {"agent": {"agent_status": "idle"}}
+            return result(*arguments)
+
+        def readiness(pane: str) -> herdr.WorkerReadiness:
+            return type(self.client).readiness(self.client, pane)
+
+        with (patch.object(self.client, "result", side_effect=observe),
+              patch.object(self.client, "readiness", side_effect=readiness)):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
     def test_ready_session_still_requires_a_visible_empty_composer(self) -> None:
+        self.screen = "Restoring conversation"
+        self.events.append((2, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertGreaterEqual(self.typed[0][2], 2)
+
+    def test_idle_pane_waits_for_a_visible_empty_composer(self) -> None:
         self.screen = "Restoring conversation"
         self.events.append((2, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
         self.submit_on_type = True
@@ -1302,6 +1407,15 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIn("recipient changed", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
+
+
+    def test_done_recipient_can_retype_a_lost_prompt(self) -> None:
+        self.drop_before = 7
+        self.submit_on_type = True
+        with patch.object(self.client, "readiness", return_value={"agent_status": herdr.AgentStatus.DONE, "interactive_ready": True}):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 2)
+        self.assertGreaterEqual(self.typed[1][2], herdr.PROMPT_SETTLE_SECONDS)
 
     def test_remote_control_turn_does_not_make_a_loading_destination_ready(self) -> None:
         self.ready_at = 60
@@ -2090,12 +2204,16 @@ class HerdrTests(unittest.TestCase):
                 self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [
                     {"pane_id": "worker", "agent": "codex", "agent_status": raw}]}}))
                 self.configure_herdr(["agent", "get", "worker"], json.dumps({"result": {"agent": {
-                    "agent_status": raw, "interactive_ready": True}}}))
+                    "agent_status": raw}}}))
                 self.assertIs(self.herdr.agents()[0]["agent_status"], state)
                 self.assertIs(self.herdr.readiness("worker")["agent_status"], state)
-                if state == herdr.AgentStatus.UNKNOWN:
-                    observation = self.herdr.prompt_input_state("worker")
-                    self.assertIsInstance(observation, herdr.PromptInputNotReady)
+                self.configure_herdr(["pane", "read", "worker", "--source", "visible", "--format", "ansi"],
+                                     "────────\n❯ \n────────")
+                observation = self.herdr.prompt_input_state("worker")
+                self.assertEqual(isinstance(observation, herdr.PromptInputReady),
+                                 state in {herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
+                if isinstance(observation, herdr.PromptInputReady):
+                    self.assertEqual(observation.idle, state in {herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
 
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
@@ -4144,7 +4262,7 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual(output.getvalue(), "herdr fixture:pane-1: readiness is unknown\n")
 
     def test_readiness_and_wait_states(self) -> None:
-        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         self.assertEqual(self.herdr.readiness("pane-1"), {"agent_status": "idle", "interactive_ready": True})
         arguments = ["agent", "wait", "pane-1", "--until", "done", "--timeout", "20"]
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "done"}}}))
@@ -5809,7 +5927,7 @@ class RowTabTests(StaffTestCase):
             saved = herdr.layout_path("fixture").read_bytes()
             self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
             self.assertEqual(herdr.layout_path("fixture").read_bytes(), saved)
-        self.assertEqual(self.client.saved_row_tab(self.rows["stopped"].id, self.rows["stopped"].name),
+        self.assertEqual(self.client.saved_row_tab(self.rows["stopped"].id, self.rows["stopped"].name, "fallback"),
                          herdr.NewTab(self.rows["parent"].name, self.rows["stopped"].name))
 
     def test_retitle_row_uses_native_sessions_despite_stale_marks_and_duplicate_titles(self) -> None:
@@ -5825,6 +5943,15 @@ class RowTabTests(StaffTestCase):
         self.client.commands.clear()
         self.assertFalse(self.client.retitle_row(self.rows["unit"].id))
         self.assertEqual(self.client.commands, [])
+
+    def test_sort_preserves_worker_columns(self) -> None:
+        before = [(pane["pane_id"], pane["tab_id"], pane["terminal_id"]) for pane in self.client.tabs]
+        _ = self.client.sort_tabs()
+        self.assertCountEqual(before, [(pane["pane_id"], pane["tab_id"], pane["terminal_id"])
+                                      for pane in self.client.tabs])
+        self.client.commands.clear()
+        _ = self.client.sort_tabs()
+        self.assertFalse(any(command[0] == "tab.move" for command in self.client.commands))
 
     def test_ordering_retry_keeps_split_tabs_and_closes_only_the_placeholder(self) -> None:
         self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
@@ -5985,6 +6112,11 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
+        client = LayoutHerdr()
+        self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
+                         herdr.NewTab("production", "unit"))
+
     def test_remember_row_tab_moves_its_saved_binding_to_the_new_workspace(self) -> None:
         client = LayoutHerdr()
         client.spaces = [("w-a", "workspace-a"), ("w-b", "workspace-b")]
@@ -6001,7 +6133,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual([(space["name"], tab["name"])
                           for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]],
                          [("workspace-b", row_id)])
-        self.assertEqual(client.saved_row_tab(row_id, "moving-row"),
+        self.assertEqual(client.saved_row_tab(row_id, "moving-row", "fallback"),
                          herdr.ExistingPane("pane-b", "terminal-p2"))
 
     def test_remember_row_tab_keeps_a_pending_row_before_the_restarted_row(self) -> None:

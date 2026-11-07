@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.herdr import side_pane
+from scripts.herdr import side_pane, worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -18,7 +18,6 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.accounts import accounts
-from scripts.shutdown import stop_resume
 
 import herdr
 import pane_launch
@@ -45,7 +44,10 @@ class SidePaneTests(StaffTestCase):
         self.caller_id = fixture_runtime_id("ad-hoc-caller")
         config = self.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n"
+                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=53000\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
@@ -116,6 +118,63 @@ class SidePaneTests(StaffTestCase):
         self.assertIsInstance(result, side_pane.OpenSidePane)
         assert isinstance(result, side_pane.OpenSidePane)
         return result
+
+    def test_codex_side_pane_uses_the_compaction_limit_after_a_restart(self) -> None:
+        self.caller("codex")
+        first = self.start()
+        arguments = self.world.requests[-1][1]
+        self.assertIn(["-c", "model_auto_compact_token_limit=53000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=71000"))
+        del self.world.foreground[first.pane]
+        self.assertEqual(self.start(), first)
+        arguments = self.world.requests[-1][1]
+        self.assertIn(["-c", "model_auto_compact_token_limit=71000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertEqual(len(self.world.launches), 2)
+
+    def test_a_friend_launches_with_the_worker_permissions_for_both_families(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                self.caller(family)
+                opened = side_pane.open("worker-policy-" + family, cwd=self.root)
+                self.assertIsInstance(opened, side_pane.OpenSidePane)
+                self.assertEqual(self.world.requests[-1][0], family)
+                arguments = self.world.requests[-1][1]
+                if family == "codex":
+                    self.assertEqual(arguments[arguments.index("--sandbox") + 1], "danger-full-access")
+                    self.assertEqual(arguments[arguments.index("--ask-for-approval") + 1], "never")
+                else:
+                    self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "bypassPermissions")
+                self.assertNotIn("read-only", arguments)
+                self.assertNotIn("plan", arguments)
+
+    def test_claude_side_pane_ignores_the_codex_compaction_limit(self) -> None:
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        _ = self.start()
+        family, arguments, _ = self.world.requests[-1]
+        self.assertEqual(family, "claude")
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+
+    def test_unusable_codex_compaction_limit_refuses_the_side_pane(self) -> None:
+        self.caller("codex")
+        config = self.root / "conf/direct.conf"
+        original = config.read_text()
+        before = staff.snapshot().rows
+        for value in ("", "invalid", "0", "-1", "1.5"):
+            with self.subTest(value=value):
+                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                code, output, errors = self.command("open", "friend", "--cwd", str(self.root))
+                self.assertEqual(code, worker_panes.ExitCode.REFUSED)
+                self.assertEqual(output, "")
+                self.assertIn("UNIT_COMPACT_ABOVE_TOKENS", errors)
+                self.assertEqual(self.world.launches, [])
+                self.assertEqual(staff.snapshot().rows, before)
 
     def test_friend_question_and_followup_keep_the_caller_family_without_staff(self) -> None:
         before = staff.snapshot().rows
@@ -330,7 +389,8 @@ class SidePaneTests(StaffTestCase):
             send_signal(agent_pid, number)
             self.world.activate(fixture_runtime_id("other-work"), result.pane, "claude")
 
-        with patch.object(os, "kill", side_effect=busy), patch.object(stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=busy):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)
@@ -426,8 +486,8 @@ class SidePaneTests(StaffTestCase):
         def retained(agent_pid: int, number: int) -> None:
             self.signals.append((agent_pid, number))
 
-        with patch.object(os, "kill", side_effect=retained), patch.object(
-                stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=retained):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)
