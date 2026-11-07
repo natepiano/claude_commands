@@ -108,7 +108,8 @@ class InventoryImportTests(unittest.TestCase):
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-sys.path.insert(0, str(root))
+with open(root / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 assert str(root / "scripts/shutdown") not in sys.path
 from scripts.shutdown import inventory
 from scripts.production import staff

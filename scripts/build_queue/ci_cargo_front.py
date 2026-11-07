@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Hold admission while a CI cargo call and its descendants run."""
 from __future__ import annotations
 try:
@@ -18,8 +18,6 @@ import sys
 import tempfile
 import threading
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client
 from scripts.build_queue import admission_protocol as wire
@@ -28,6 +26,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
+from scripts.lib.descendants import adopt_descendants
 
 
 BUILDING = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
@@ -36,7 +35,6 @@ GLOBAL_VALUES = frozenset({"-C", "--config", "-Z", "--color", "--manifest-path",
                           "--target-dir", "--target", "-j", "--jobs", "-p", "--package", "--exclude",
                           "-F", "--features", "--profile", "--message-format", "--artifact-dir", "--out-dir"})
 PR_SET_PDEATHSIG = 1
-PR_SET_CHILD_SUBREAPER = 36
 LIBC = ctypes.CDLL(None, use_errno=True)
 
 
@@ -124,8 +122,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str) -> int:
         status = 1
         cleanup = ExitStack()
         try:
-            if LIBC.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-                raise OSError(ctypes.get_errno(), "cannot adopt cargo descendants")
+            _ = adopt_descendants()
             # The main thread forks because the death signal follows the thread that forks.
             process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
                                   preexec_fn=partial(end_with_front, pid))

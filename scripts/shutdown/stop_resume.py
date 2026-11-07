@@ -706,8 +706,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
 
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
-        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or (
-            accounts.CodexWorkersAccount(source_label, source) if kind == "codex" and original is not None else ""))
+        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label

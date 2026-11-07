@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 import unittest
 from unittest import mock
 from scripts.production import staff
+from scripts.shutdown import remote
 
 if TYPE_CHECKING:
     from scripts.message.sessions import SessionRecord
@@ -71,11 +72,11 @@ class FileOnlyLabelTests(unittest.TestCase):
             _ = doc.write_text("# Healthy production\n")
             identity = staff.StaffId(fixture_runtime_id("healthy-owner"))
             healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", staff.StaffRoot(),
-                                           current_session=identity, doc=staff.LiveDoc("natedev", doc))
+                                           current_session=identity, doc=staff.LiveDoc(remote.local_machine(), doc))
             missing_id = staff.StaffId(fixture_runtime_id("missing-owner"))
             missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", staff.StaffRoot(),
                                      current_session=missing_id,
-                                     doc=staff.LiveDoc("natedev", root / "missing-production.md"))
+                                     doc=staff.LiveDoc(remote.local_machine(), root / "missing-production.md"))
             timer_path = root / f"showrunner-{identity}"
             timer_path.mkdir()
             _ = (timer_path / "conf").write_text(
@@ -90,7 +91,7 @@ class FileOnlyLabelTests(unittest.TestCase):
             problems: list[str] = []
             with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root),
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 rows = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems),
                                                          known_sessions={identity: record}, resolver=resolver)
             self.assertEqual(rows, [healthy])
@@ -112,10 +113,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
-                                          current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
+                                          current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
             def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.TimerRegistration:
@@ -125,7 +126,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                 return showrunners.TimerRegistration("healthy-alias", f"session:{row.current_session}", "UTC")
 
             with (mock.patch.object(showrunners, "timer_for", side_effect=timer),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 for reader in ("registrations", "places"):
                     with self.subTest(reader=reader):
                         problems: list[str] = []
@@ -149,7 +150,7 @@ class FileOnlyLabelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
             doc = Path(directory) / "production.md"
             _ = doc.write_text("# Production\n")
-            parents = [fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            parents = [fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
                        for name in ("healthy", "broken")]
             for parent in parents:
                 for number in range(3):
@@ -180,10 +181,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
-                                          current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
+                                          current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
                 timer_path = timers / f"showrunner-{owner_id}"
                 timer_path.mkdir(parents=True)
                 _ = (timer_path / "conf").write_text(
@@ -194,7 +195,7 @@ class FileOnlyLabelTests(unittest.TestCase):
             snapshot = staff.StaffSnapshot(tuple(rows))
             with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers),
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 for reader in ("registrations", "places"):
                     with self.subTest(reader=reader):
                         problems: list[str] = []
@@ -223,17 +224,17 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                document_state = (staff.WrappedDoc("natedev", document) if name == "wrapped"
-                                  else staff.LiveDoc("natedev", document))
+                document_state = (staff.WrappedDoc(remote.local_machine(), document) if name == "wrapped"
+                                  else staff.LiveDoc(remote.local_machine(), document))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name, staff.StaffRoot(),
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("private fixture")),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot,
                                                        resolver=session_staff.RowResolver(snapshot))
             self.assertEqual(set(places), {rows[3].current_session})
@@ -252,6 +253,7 @@ import sys
 from unittest import mock
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.shutdown import remote
 from scripts.production import session_staff
 
 record = json.loads(sys.stdin.read())

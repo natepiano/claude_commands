@@ -1147,6 +1147,20 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(problems, [f"{run}: run owner missing-unit: unit staff row is unavailable"])
 
+    def test_a_stopped_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
+        run = self.runs / "lost-owner-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: "missing-unit", "status": "active"}))
+        self._write_mesh(run, {"lost-worker": {"thread_id": fixture_runtime_id("lost-worker"), "status": "done", "role": "impl"}})
+        _ = (run / unit_runs.HEARTBEAT).write_text("live\n", encoding="utf-8")
+
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertIn(f"{run}: run owner missing-unit: unit staff row is unavailable", found.problems)
+        self.assertNotIn("lost-worker", {entry.name for entry in found.entries})
+        self.assertTrue(found.entries, found.problems)
+
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
             entries = self._entries()

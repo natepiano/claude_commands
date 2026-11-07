@@ -22,19 +22,16 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
-    from ..lib import script_prompts, unit_runs
-    from ..message.relay_identity import message_sender_name
+    from scripts.lib import script_prompts, unit_runs
+    from scripts.message.relay_identity import message_sender_name
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import script_prompts
-    import unit_runs
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    from relay_identity import message_sender_name
+    from scripts.lib import script_prompts
+    from scripts.lib import unit_runs
+    from scripts.message.relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -1010,7 +1007,7 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     scheduled_root = state_root() / "scheduled-prompts"
     try:

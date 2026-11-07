@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import fcntl
@@ -168,7 +170,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         working.mkdir()
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", working), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), working), expected=owner.worktree)
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "USAGE_STATE_DIR": str(self.session_dir.parent / "usage-state"),
@@ -490,7 +492,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         state = json_object(self.session_dir / workers.STATE)
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", nested), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), nested), expected=owner.worktree)
         del state["working_dir"]
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
@@ -531,7 +533,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         (self.session_dir / "working_dir").unlink()
         owner = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.RemovedWorktree("natedev", self.session_dir.parent / "repository"),
+        _ = staff.set_worktree(owner.id, staff.RemovedWorktree(remote.local_machine(), self.session_dir.parent / "repository"),
                               expected=owner.worktree)
         with self.assertRaisesRegex(workers.WorkerUnavailable, "^invalid worker state: missing working_dir$"):
             _ = workers.resolve(self.session_dir, "review")
@@ -597,7 +599,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         assert worker is not None
         owner = membership.parent_of(worker)
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", checkout), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), checkout), expected=owner.worktree)
         _ = record.write_text(json.dumps({"staff_id": worker.id, "worker": "w7", "status": "running", "pid": child.pid}))
         self.assertEqual([path for path, _ in workers.live_detached_runs(self.session_dir.resolve())], [record])
         self.assertEqual(workers.protected_working_directories(self.session_dir.resolve()), (checkout.resolve(),))

@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """dailies_render.py's footer, report, and timeline through this worktree's CLI."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import json
 import sys
@@ -170,7 +172,7 @@ def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Gener
         folder.mkdir(exist_ok=True)
         doc = root / "reader-production.md"
         _ = doc.write_text(f"# Production — reader\n- **Proposals:** {folder}\n")
-        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
         timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-reader"
         timer.mkdir(parents=True, exist_ok=True)
         _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")

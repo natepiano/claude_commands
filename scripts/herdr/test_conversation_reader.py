@@ -4,15 +4,12 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 import time
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
 from scripts.agents import codex_mesh

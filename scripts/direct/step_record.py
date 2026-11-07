@@ -16,13 +16,9 @@ import socket
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 from scripts.lib.boot_identity import boot_identity
 
@@ -35,7 +31,7 @@ COMMAND_ARGUMENTS: dict[str, tuple[tuple[str, bool, str, tuple[str, ...]], ...]]
     "write": tuple(("--" + name, True, "", ()) for name in ("call-id", "pid", "kind", "runs-on", "state"))
         + (("--repo", False, os.getcwd(), ()),)
         + tuple(("--" + name, False, "", ()) for name in
-                ("package", "reason", "eligible-targets", "mac-targets", "pinned-target")),
+                ("package", "reason", "eligible-targets", "mac-targets", "mac-disk-exclusions", "pinned-target")),
     "stopped": (("--call-id", True, "", ()), ("--consumed", True, "", ())),
 }
 
@@ -94,15 +90,15 @@ def execute_cli(args: dict[str, str]) -> int:
             return 0 if consume_stopped_build(call_id, Path(args["consumed"])) else 1
         else:
             pid, kind, location = int(args["pid"]), args["kind"], args["runs_on"]
-            if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
+            if kind not in KINDS or location not in ("any_target", "natedev_only"):
                 raise ValueError("invalid step kind or run location")
             if location == "natedev_only" and not args["reason"]:
                 raise ValueError("natedev-only step needs a reason")
             if args["state"] not in STATES:
                 raise ValueError("invalid step state")
             runs_on: dict[str, object] = {"kind": location}
-            eligible = ["mac", "natedev"] if location == "mac_allowed" else ["natedev"]
-            if location == "ssh_allowed":
+            eligible = ["natedev"]
+            if location == "any_target":
                 eligible = list(filter(None, args["eligible_targets"].split(",")))
                 runs_on["mac_targets"] = list(filter(None, args["mac_targets"].split(",")))
             elif location == "natedev_only":
@@ -110,6 +106,7 @@ def execute_cli(args: dict[str, str]) -> int:
             row: dict[str, object] = dict(v=1, call_id=call_id, pid=pid, proc_start=process_start(pid),
                 repo=str(Path(args["repo"]).resolve()), kind=kind, package=args["package"] or None,
                 eligible_targets=eligible, selected_target="", runs_on=runs_on, state=args["state"],
+                mac_disk_exclusions=list(filter(None, args["mac_disk_exclusions"].split(","))),
                 updated=datetime.now(timezone.utc).isoformat())
             if args["pinned_target"]:
                 row["pinned_target"] = args["pinned_target"]
@@ -171,9 +168,7 @@ def validated_fields(value: object, call_id: str) -> dict[str, object]:
     if not isinstance(target, dict):
         raise ValueError("invalid run location")
     location = cast(dict[str, object], target)
-    if location.get("kind") == "mac_allowed":
-        eligible = ["mac", "natedev"]
-    elif location.get("kind") == "ssh_allowed":
+    if location.get("kind") == "any_target":
         targets, macs = row.get("eligible_targets"), location.get("mac_targets", [])
         if (not isinstance(targets, list) or not isinstance(macs, list)
                 or not all(isinstance(item, str) and item for item in cast(list[object], targets))
@@ -190,7 +185,7 @@ def validated_fields(value: object, call_id: str) -> dict[str, object]:
         raise ValueError("invalid selected target")
     if not isinstance(pinned, str):
         raise ValueError("invalid pinned target")
-    if pinned and pinned not in (eligible if location["kind"] == "ssh_allowed" else ["mac"]):
+    if pinned and pinned not in eligible:
         raise ValueError("pinned target is not eligible")
     for field in ("proc_start", "repo", "updated"):
         _ = _text(row.get(field))
@@ -261,22 +256,17 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class MacAllowed:
-    pass
-
-
-@dataclass(frozen=True)
 class NatedevOnly:
     reason: str
 
 
 @dataclass(frozen=True)
-class SshAllowed:
+class AnyTarget:
     targets: tuple[str, ...]
     mac_targets: tuple[str, ...] = ()
 
 
-RunsOn = MacAllowed | NatedevOnly | SshAllowed
+RunsOn = NatedevOnly | AnyTarget
 
 
 @dataclass(frozen=True)
@@ -306,8 +296,8 @@ class NamedPackage:
 PackageSelection = WorkspacePackages | NamedPackage
 
 
-def package_selection(value: PackageSelection | str | None) -> PackageSelection:
-    return value if isinstance(value, (WorkspacePackages, NamedPackage)) else NamedPackage(value) if value else WorkspacePackages()
+def package_selection(value: str | None) -> PackageSelection:
+    return NamedPackage(value) if value else WorkspacePackages()
 
 
 def package_name(value: PackageSelection) -> str:
@@ -315,8 +305,7 @@ def package_name(value: PackageSelection) -> str:
 
 
 def mac_eligible(record: StepRecord) -> bool:
-    return isinstance(record.runs_on, MacAllowed) or (
-        isinstance(record.runs_on, SshAllowed) and bool(record.runs_on.mac_targets))
+    return isinstance(record.runs_on, AnyTarget) and bool(record.runs_on.mac_targets)
 
 
 class StepState(str, Enum):
@@ -329,7 +318,7 @@ class StepState(str, Enum):
     LOCAL_NONCOMPILING = "local_noncompiling"
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class StepRecord:
     call_id: str
     pid: int
@@ -343,22 +332,13 @@ class StepRecord:
     v: int = 1
     selected_target: str = ""
     selection: TargetSelection = ROUTED
-
-    def __init__(self, call_id: str, pid: int, proc_start: str, repo: Path, kind: str,
-                 package: PackageSelection | str | None, runs_on: RunsOn, state: StepState,
-                 updated: str, v: int = 1, selected_target: str = "",
-                 selection: TargetSelection = ROUTED) -> None:
-        for name, value in (("call_id", call_id), ("pid", pid), ("proc_start", proc_start),
-                            ("repo", repo), ("kind", kind), ("package", package_selection(package)),
-                            ("runs_on", runs_on), ("state", state), ("updated", updated),
-                            ("v", v), ("selected_target", selected_target), ("selection", selection)):
-            object.__setattr__(self, name, value)
+    mac_disk_exclusions: tuple[str, ...] = ()
 
     @property
     def eligible_targets(self) -> tuple[str, ...]:
-        if isinstance(self.runs_on, SshAllowed):
+        if isinstance(self.runs_on, AnyTarget):
             return self.runs_on.targets
-        return ("mac", "natedev") if isinstance(self.runs_on, MacAllowed) else ("natedev",)
+        return ("natedev",)
 
 
 @dataclass(frozen=True)
@@ -383,18 +363,18 @@ ReadResult = StepRecord | MissingRecord | StaleRecord | UnreadableRecord
 def _decode(value: object, call_id: str) -> StepRecord:
     row = validated_fields(value, call_id)
     location = cast(dict[str, object], row["runs_on"])
-    if location["kind"] == "mac_allowed":
-        runs_on: RunsOn = MacAllowed()
-    elif location["kind"] == "ssh_allowed":
-        runs_on = SshAllowed(tuple(cast(list[str], row["eligible_targets"])),
+    runs_on: RunsOn
+    if location["kind"] == "any_target":
+        runs_on = AnyTarget(tuple(cast(list[str], row["eligible_targets"])),
                             tuple(cast(list[str], location.get("mac_targets", []))))
     else:
         runs_on = NatedevOnly(_text(location["reason"]))
     pinned = cast(str, row.get("pinned_target", ""))
     return StepRecord(call_id, cast(int, row["pid"]), _text(row["proc_start"]), Path(_text(row["repo"])),
-                      _text(row["kind"]), cast(str | None, row["package"]), runs_on,
+                      _text(row["kind"]), package_selection(cast(str | None, row["package"])), runs_on,
                       StepState(_text(row["state"])), _text(row["updated"]),
-                      selected_target=cast(str, row["selected_target"]), selection=Pinned(pinned) if pinned else ROUTED)
+                      selected_target=cast(str, row["selected_target"]), selection=Pinned(pinned) if pinned else ROUTED,
+                      mac_disk_exclusions=tuple(cast(list[str], row.get("mac_disk_exclusions", []))))
 
 
 def read(call_id: str) -> ReadResult:
@@ -421,6 +401,8 @@ def read(call_id: str) -> ReadResult:
                 value = row
                 if words and words[0] == "writes_tree":
                     row["runs_on"] = {"kind": "natedev_only", "reason": "step writes the tree"}
+                    if row.get("pinned_target"):
+                        row["pinned_target"] = "natedev"
                     words = words[1:]
                 word = words[0] if words else ""
                 selected = words[1] if len(words) > 1 else "mac" if word == "on_mac" else "natedev" if word == "on_natedev" else ""
@@ -446,13 +428,13 @@ def live_records() -> list[StepRecord]:
 
 
 def write(record: StepRecord) -> None:
-    location = ({"kind": "mac_allowed"} if isinstance(record.runs_on, MacAllowed)
-                else {"kind": "ssh_allowed", "mac_targets": list(record.runs_on.mac_targets)}
-                if isinstance(record.runs_on, SshAllowed)
+    location = ({"kind": "any_target", "mac_targets": list(record.runs_on.mac_targets)}
+                if isinstance(record.runs_on, AnyTarget)
                 else {"kind": "natedev_only", "reason": record.runs_on.reason})
     row = dict(v=record.v, call_id=record.call_id, pid=record.pid, proc_start=record.proc_start,
                repo=str(record.repo), kind=record.kind, package=package_name(record.package) or None,
                eligible_targets=list(record.eligible_targets), selected_target=record.selected_target,
+               mac_disk_exclusions=list(record.mac_disk_exclusions),
                runs_on=location, state=record.state.value, updated=record.updated)
     if isinstance(record.selection, Pinned):
         row["pinned_target"] = record.selection.target

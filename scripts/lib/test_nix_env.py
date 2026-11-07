@@ -10,10 +10,36 @@ import sys
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import copy_record, nix_env, scratch
 from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class GeneratedSourceTests(NixFixture):
+    def test_generated_source_requires_a_readable_registered_record_with_true_field(self) -> None:
+        with patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.root / 'scratch')}):
+            folder = scratch.new('gate:generated-source', 'proof')
+            self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue(nix_env.generated_source(folder))
+            outside = self.root / 'outside'
+            outside.mkdir()
+            _ = (outside / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(outside))
+            nested = folder / 'nested'
+            nested.mkdir()
+            _ = (nested / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(nested))
+            with patch.object(copy_record, 'read_record', return_value=copy_record.UnreadableRecord('unreadable')):
+                self.assertFalse(nix_env.generated_source(folder))
+            with patch.object(copy_record, 'read_record', side_effect=OSError('read failed')):
+                self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': 1})
+            self.assertFalse(nix_env.generated_source(folder))
+            (folder / copy_record.RECORD).unlink()
+            self.assertFalse(nix_env.generated_source(folder))
 
 
 class EnsureTests(NixFixture):
@@ -458,6 +484,16 @@ class RegisteredCloneTests(GitNixFixture):
         self.assertEqual(self.direnv_calls(), [
             {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
             {"args": ["export", "json"], "cwd": str(checkout)}])
+
+    def test_task_clone_parent_with_matching_envrc_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        parent = checkout.parent
+        _ = (parent / ".envrc").write_bytes((checkout / ".envrc").read_bytes())
+        self.assertIsNone(copy_record.record_path(parent))
+        self.assertFalse(nix_env.registered_copy(parent / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(parent / ".envrc"))
+        self.assert_explicit_approval_required(parent)
 
     def test_registered_clone_with_edited_envrc_requires_explicit_approval(self) -> None:
         checkout = self.clone(self.repository(self.home / "rust/repo"))

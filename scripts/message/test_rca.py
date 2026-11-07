@@ -9,7 +9,6 @@ import os
 import socket
 import signal
 import subprocess
-import sys
 import tempfile
 import unittest
 from threading import Thread
@@ -18,13 +17,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import IO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.notify import push_texts  # noqa: E402
@@ -264,9 +259,8 @@ pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
 # A separate service manager can end the test's caller group without signalling its own group.
 subprocess.run([sys.executable, '-c',
-    "import pathlib, signal, sys; "
-    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
-    "import process_group; "
+    "import signal, sys; "
+    "from scripts.lib import process_group; "
     "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
     str(os.getpgrp())], start_new_session=True, check=True)
 """
@@ -337,7 +331,6 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
 
     def test_native_identity_uses_the_shared_member_resolver(self) -> None:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
         from scripts.production import unit_lookup
         self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 

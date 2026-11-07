@@ -15,7 +15,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import patch

@@ -23,10 +23,6 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
-    if str(_directory) not in sys.path:
-        sys.path.insert(0, str(_directory))
 
 from scripts.production import showrunners  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
@@ -40,7 +36,7 @@ from scripts.usage import agents_log
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
-    from ..accounts.role_map import role_map_command
+    from scripts.accounts.role_map import role_map_command
     from scripts.whoami import account, agent_accounts, note_file
 else:
     import importlib.util
@@ -1269,7 +1265,11 @@ def _unit_workers(
         except (OSError, ValueError) as error:
             _problem(problems, f"worker transport {run.path}", error)
         server_homes = _run_server_homes(run)
-        place = _run_place(run, claude_entries, production_places, membership)
+        try:
+            place = _run_place(run, claude_entries, production_places, membership)
+        except staff.StaffUnreadable as error:
+            _problem(problems, str(run.path), error)
+            continue
         for name, record in sorted(_mesh_records(run, problems).items()):
             if not _listed_mesh_worker(record):
                 continue

@@ -10,14 +10,8 @@ import argparse
 import json
 import sys
 import time
-from pathlib import Path
 from contextlib import closing
 from typing import Literal, TypedDict, cast
-
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
@@ -184,9 +178,22 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         time.sleep(1)
 
 
+USAGE = """usage: agents COMMAND
+  agents help
+  agents status [ACCOUNT] [--json] [--here]
+  agents resume NAME [--why TEXT] [--to ACCOUNT]
+  agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
+  agents stop SESSION
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
+    arguments = sys.argv[1:] if argv is None else argv
+    if not arguments or arguments in (["help"], ["--help"], ["-h"]):
+        print(USAGE, end="")
+        return 0
+    parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     for verb in ("stop", "resume"):
         command = commands.add_parser(verb)
         _ = command.add_argument("session")
@@ -213,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--proc-start", required=True)
     _ = command.add_argument("--who", required=True)
     _ = command.add_argument("--session", dest="account", required=True)
-    options = cast(CommandLine, parser.parse_args(argv))
+    options = cast(CommandLine, parser.parse_args(arguments))
     try:
         if options.command == "restart":
             return restart.restart(stop_all=options.all, dry_run=options.dry_run,

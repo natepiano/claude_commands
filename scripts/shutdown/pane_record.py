@@ -35,11 +35,6 @@ from typing import TYPE_CHECKING, Literal, cast
 if TYPE_CHECKING:
     from scripts.production import staff
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "herdr"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.herdr import herdr, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity

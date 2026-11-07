@@ -11,11 +11,9 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import os
-from pathlib import Path
 import sys
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.message import sessions
 from scripts.shutdown import pane_record

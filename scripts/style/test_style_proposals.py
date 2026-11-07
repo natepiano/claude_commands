@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import errno
@@ -85,6 +87,8 @@ class StyleProposalsTests(unittest.TestCase):
 
     template_repo: Path = Path()
     template_tip: str = ""
+    fixture_seed: Path = Path()
+    seed_root: Path = Path()
 
     @classmethod
     @override
@@ -107,19 +111,29 @@ class StyleProposalsTests(unittest.TestCase):
             _ = fixture.git("commit", "-qm", "Workspace")
             cls.template_tip = fixture.git("rev-parse", "HEAD")
 
+        cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "seed"
+        try:
+            fixture.prepare_fixture()
+            cls.seed_root = fixture.root
+            _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
+        finally:
+            fixture.doCleanups()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True, dirs_exist_ok=True)
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_text(staff_file.read_text().replace(str(self.seed_root), str(self.root)))
+        self.use_fixture()
+
+    def use_fixture(self) -> None:
+        """Bind the independent fixture copy to this test."""
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.catalog = self.root / "nate_style/rust"
         self.proposals = self.root / "vault/issues"
         self.template = self.root / "issue.yaml"
-        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
-        self.catalog.mkdir(parents=True)
-        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
-        _ = self.template.write_text(TEMPLATE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
@@ -127,6 +141,19 @@ class StyleProposalsTests(unittest.TestCase):
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent))
         self.tip = self.template_tip
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.calls = []
+        _ = self.enterContext(mock.patch.object(style_proposals, "proposal_command", side_effect=self.issue_command))
+        _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
+
+    def prepare_fixture(self) -> None:
+        """Build the complete initial state once through the real writers."""
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.use_fixture()
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
+        self.catalog.mkdir(parents=True)
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+        _ = self.template.write_text(TEMPLATE)
         _ = self.git("branch", "style/main")
         for name, metadata in (("names", "tier: C\nfamily: names\ninput_scope: file\n"),
                                ("modules", "tier: D\nfamily: modules\ninput_scope: crate\n"),
@@ -147,15 +174,11 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.git_at(root, "update-ref", "refs/remotes/origin/main", self.git_at(root, "rev-parse", "HEAD"))
             # All refs are local; no test contacts the fake origin.
             _ = self.git_at(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         for name in ("parent", "sample-style"):
             owner = fixture_member("showrunner", name=name)
             if name == "sample-style":
                 for unit in ("names", "types", "modules"):
                     _ = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
-        self.calls = []
-        _ = self.enterContext(mock.patch.object(style_proposals, "proposal_command", side_effect=self.issue_command))
-        _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
 
     def ledger(self) -> style_ledger.Ledger:
         return style_ledger.open_ledger(self.repo)
@@ -802,7 +825,7 @@ class StyleProposalsTests(unittest.TestCase):
         doc = self.repo / ".git/decision-review.md"
         _ = doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** main\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
         owner = proposal_issue.staff_reference("sample-style", "showrunner")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         with self.ledger() as ledger:
             _ = self.hold(ledger)
             issue, = self.file(ledger)
