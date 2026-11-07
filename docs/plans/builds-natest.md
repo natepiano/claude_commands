@@ -1429,6 +1429,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 **Constraints from prior phases:**
 - Phase 61: `test_verify_lint_cache_versions.py` holds the harness form for lint functions. `test_verify_mac_only.py`'s `mac_result()` holds the form for result functions.
 - Verify's functions: `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` (7ea9b08ef), and `parse_routing_arguments` (0c855e894). Call them through `shell_functions`. The parser's arguments and globals are in `scripts/direct/test_verify_argument_parser.py`. After verify's 41g, new tests use the new forms: `final --saved`, `lint` with no package, `example --name` and `test --test`.
+- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root, or `verify.sh:1272` reads the live `/tmp/claude/unit` through `progress_history.last_dispatch`, `unit_runs.held` and `_supplier_address`. `verify_lint_scope_test_support.py:276` and `verify_mac_offload_test_support.py:752` do not set all three. Set them in the owned test files; a shared support change needs its own owner.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
@@ -1609,35 +1610,115 @@ No code change. Both causes are named from evidence, and neither cause is in a t
 ### Phase 76 — Verify hold fixtures read their own run root  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the verify hold test fixtures read unit runs only under their own tempdir, never the live `/tmp/claude/unit`, with every checked behavior kept.
+The verify hold and token wait fixtures keep every run root inside the test root. Live `/tmp/claude/unit` opens per module go from 289-867 to zero. All 36 importer modules (123 tests) pass, and CPU does not change (59.19 to 58.99 s for the four hold modules).
 
-**Spec:**
-1. User rule (via the showrunner, 2026-11-06): tests never touch live units.
-2. Cause: `scripts/direct/verify_hold_wait_test_support.py` sets no run root. `unit_runs.held_by_session` and `unit_runs.director` then read the real `/tmp/claude/unit`. `session_staff.py:150`, `worker.py:371` and `worker.py:427` pass `ROSTER_RUN_ROOT`. `progress_history.py:5786` reads `UNIT_RUN_ROOT`. herdr found the read from "no unit staff row" lines in red gate output.
-3. Trace each read from the fixture's `verify.sh` call to `unit_runs.run_roots`. Name each environment variable that selects a run root on that path.
-4. Set each such variable in the fixture environment to a folder under the fixture root. Make the folder once in the class seed when a reader needs it to exist.
-5. Check the other `scripts/direct/verify_*_test_support.py` fixtures for the same read. Apply the same fix where a fixture reaches the read.
-6. Change only test support files. verify-unit changes `verify.sh` and `record.py` in its next tip.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+- `VerifyHoldTools.setUpClass` sets `ROSTER_RUN_ROOT` and `UNIT_RUN_ROOT` to `<root>/unit` and `SCRATCH_ROOT` to `<root>/scratch`.
+- The token wait fixture makes a `unit` folder and sets the same three keys under each test root.
+- The seven other `verify_*_test_support.py` families make no live read and do not change.
 
 **Files:**
-- `scripts/direct/verify_hold_wait_test_support.py` — the hold fixture environment
-- `scripts/direct/verify_*_test_support.py` — only those that reach the same read
+- `scripts/direct/verify_hold_wait_test_support.py` — hold fixture class seed and environment
+- `scripts/direct/verify_token_wait_test_support.py` — token wait fixture environment
 
-**Workers:** 1 writer on slot `impl` (one fixture change; the files do not split)
+**Binds later work:** a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root.
+
+**Gotchas:** `verify.sh:1272` reaches `progress_history.last_dispatch` (`ROSTER_RUN_ROOT`), and `unit_runs.held` and `progress_history._supplier_address` (`UNIT_RUN_ROOT`). `SCRATCH_ROOT` sets the `unit_runs` defaults at import, and `copy_record.py` reads it.
+
+### Phase 77 — `style/test_crate_run.py` uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/style/test_crate_run.py` (70.7 CPU s per gate, 97 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Phase 40 measured the floor parts: `style/bulk_run.py` and `style/git_process.py` make 10,444 Git calls (60.9 s), and durable publications make 5,777 fsync calls (44.4 s). Phase 44 cut the `copies.py` part (71.98 to 63.80 CPU s). Measure each remaining part again, and send each production cut with its measured gain.
+2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/style/test_crate_run.py` — the module
+
+**Workers:** 1 writer on slot `impl` (one module; the file does not split)
 - `impl` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 72: `direct/test_findings_simplify.py` stopped a live staff read with `isolated_staff_file`. Reuse that helper where a fixture also reads `STAFF_FILE`.
-- `VerifyHoldTools.setUp` copies one class seed into each test's root. A path set in the seed must point inside that root.
+- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
+- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
+- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Phase 40: a per-class seed gave no gain (128 s to 126 s).
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 78 — `production/test_staff.py` uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_staff.py` (56.8 CPU s per gate, 122 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. About 160 other test modules import `staff_test_support.py`, so keep each cut inside the module.
+2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/production/test_staff.py` — the module
+
+**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
+- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
+- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `scripts/direct/test_verify_hold_signals.py`, `_wait`, `_history` and `_workers` pass under `scripts/test_times/module_run.py`
-- every other importer of each changed support file passes
-- a proof on a tempdir copy shows no open of a path under the live `/tmp/claude/unit` during the four modules
+- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 79 — `style/test_add_style.py` uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/style/test_add_style.py` (49.2 CPU s per gate, 31 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of each real `add_style.py` launch and each Git repository a test makes.
+2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/style/test_add_style.py` — the module
+
+**Workers:** 1 writer on slot `impl3` (one module; the file does not split)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
+- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
+- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
