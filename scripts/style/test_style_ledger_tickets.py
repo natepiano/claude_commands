@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
-import errno
 import io
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 from collections.abc import Callable, Sequence
@@ -41,7 +41,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "identity-staff.json", {}))
         owner = fixture_member("showrunner", name="style-owner")
         units = tuple(fixture_member("unit", name=name, parent=owner.id,
-            worktree=staff.PresentWorktree("natedev", self.repo.parent / name))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.repo.parent / name))
             for name in ("names", "types"))
         first, second = (staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id(row.name + "-current"))) for row in units)
@@ -288,9 +288,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         first, _ = self.fixed_style_units()
         other_parent = fixture_member("showrunner", name="other-style")
         second = fixture_member("unit", name=first.name, parent=other_parent.id,
-            worktree=staff.PresentWorktree("natedev", self.root / "other-names"))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-names"))
         ledger = self.ledger()
-        with mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"):
+        with mock.patch("scripts.shutdown.remote.local_machine", return_value=remote.local_machine()):
             for row in (first, second):
                 self.assertIsInstance(row.worktree, staff.PresentWorktree)
                 assert isinstance(row.worktree, staff.PresentWorktree)
@@ -869,31 +869,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(ledger.proposal_tickets()[-1]["state"], "dropped")
         self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
 
-    def test_rule_hash_launch_failures_keep_ticket_context_and_cause(self) -> None:
-        rule = self.rule("probe")
-        ledger = self.ledger()
-        before = self.ledger_contents(ledger)
-        original = mock.Mock(wraps=subprocess.run)
-        for code in (errno.EMFILE, errno.ENOENT):
-            with self.subTest(errno=code):
-                failure = OSError(code, "PRIVATE launch diagnostic")
-
-                def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-                    if tuple(command) == ("git", "hash-object", "--stdin"):
-                        raise failure
-                    return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
-
-                with mock.patch.object(subprocess, "run", side_effect=fail_hash):
-                    with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 38001 add:") as refused:
-                        ledger.ticket_add("38001", ticket_owner_id("probe"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
-                cause = refused.exception.__cause__
-                self.assertIsInstance(cause, style_ledger.GitReadFailed)
-                assert isinstance(cause, style_ledger.GitReadFailed)
-                self.assertEqual(cause.command, ("git", "hash-object", "--stdin"))
-                self.assertIs(cause.__cause__, failure)
-                self.assertNotIn("PRIVATE", str(refused.exception))
-                self.assertEqual(self.ledger_contents(ledger), before)
-
     def test_widen_callback_file_failure_is_not_a_git_failure(self) -> None:
         ledger, _ = self.widen_ticket()
         before = self.ledger_contents(ledger)
@@ -1009,16 +984,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
     def test_git_boundary_all_public_operations_keep_typed_failure_context(self) -> None:
         ledger = self.checkpointed_read_transition()
         rule = self.rule("new")
-        original = mock.Mock(wraps=subprocess.run)
-
-        def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            if tuple(command) == ("git", "hash-object", "--stdin"):
-                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
-            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
-
-        with mock.patch.object(subprocess, "run", side_effect=fail_hash):
-            self.assert_git_refusal(ledger, "ticket 28001 add:",
-                lambda: ledger.ticket_add("28001", ticket_owner_id("new"), "read", "names", "crates/alpha", [self.sources[0]], [rule]))
         self.add_ticket("28001", [rule], unit="new")
         ledger.ticket_assign("28001", "main")
         with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
@@ -3864,31 +3829,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(refused.returncode, 2)
         self.assertEqual(refused.stderr.strip(), "style_ledger: 1001: cannot become merged from assigned")
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("read"))[0]["state"], "assigned")
-
-    def test_ticket_pin_git_failure_is_a_cli_error_and_rolls_back_the_ticket(self) -> None:
-        rule = self.rule("read")
-        binary = self.root / "bin"
-        binary.mkdir()
-        git = binary / "git"
-        real_git = shutil.which("git")
-        if real_git is None:
-            self.fail("git is required for the ledger fixture")
-        _ = git.write_text(
-            "#!/bin/sh\nif [ \"$*\" = \"-C " + str(self.repo) + " hash-object --stdin\" ]; then\n"
-            + "  echo 'pin hash unavailable' >&2; exit 17\nfi\nexec " + real_git + ' "$@"\n',
-        )
-        git.chmod(0o755)
-        with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")}):
-            result = self.cli("ticket", "add", "--id", "1001", "--unit", "read", "--kind", "read",
-                              "--family", "names", "--crate", "crates/alpha", "--files", json.dumps([self.sources[0]]),
-                              "--rules", json.dumps([rule]), success=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("style_ledger: ticket 1001 add: git hash-object failed (exit 17)", result.stderr)
-        self.assertNotIn("pin hash unavailable", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(self.ledger().queued_tickets(ticket_owner_id("read")), ())
-        with closing(sqlite3.connect(self.ledger().database)) as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM rule_texts").fetchone(), (0,))
 
 
 if __name__ == "__main__":

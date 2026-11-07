@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Control one AWS target through confirmed lifecycle and spending evidence."""
 from __future__ import annotations
 try:
@@ -21,8 +21,6 @@ import sys
 import time
 from typing import Literal, Protocol, cast, final, get_args
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 from scripts.aws_target import ledger, measurement, remote
 from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings, service_loop
 from scripts.build_queue import queue_snapshot
@@ -189,17 +187,21 @@ class Controller:
         values = configuration.values()
         return sum(1 for _, row in snapshot.inputs.ordered
                    if offload.linux_kind_permitted(values, str(row.get('step', ''))) and row.get('repo_identity')
-                   and row.get('repository_name') and 'token_left_at' not in row
-                   and now - row['since'] >= settings.start_after_wait_s)
+                   and (repository_name := row.get('repository_name')) and 'token_left_at' not in row
+                   and now - row['since'] >= settings.start_after_wait_s
+                   and not offload.linux_version_declined_recently(
+                       self.target, repository_name, settings.version_decline_hold_s, now))
 
-    def _pinned_work(self, configuration: conf.ConfigRead) -> bool:
+    def _pinned_work(self, settings: ControlSettings, now: int, configuration: conf.ConfigRead) -> bool:
         values = configuration.values()
         return any(isinstance(record.selection, step_record.Pinned)
                    and record.selection.target == self.target
                    and record.state in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_SSH)
                    and self.target in record.eligible_targets
                    and offload.linux_kind_permitted(values, record.kind)
-                   and isinstance(offload.repository_identity(record.repo), offload.KnownRepository)
+                   and isinstance(repository := offload.repository_identity(record.repo), offload.KnownRepository)
+                   and not offload.linux_version_declined_recently(
+                       self.target, repository.name, settings.version_decline_hold_s, now)
                    for record in step_record.live_records())
 
     def _prices(self, api: AwsCli, settings: ControlSettings, now: int) -> None:
@@ -361,7 +363,7 @@ class Controller:
                 if evidence.state != 'stopped':
                     return self._save(state, ControlResult('starting' if evidence.state == 'pending' else evidence.state,
                                                            '' if published else 'permission_unpublished', now, evidence.generation))
-                if (action == 'tick' and not self._pinned_work(configuration)
+                if (action == 'tick' and not self._pinned_work(settings, now, configuration)
                         and self._queued(settings, now, configuration) < settings.start_min_waiting):
                     return self._save(state, ControlResult('stopped', 'no_eligible_work', now, evidence.generation))
                 backoff = state.get('capacity_retry_after', 0)

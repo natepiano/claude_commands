@@ -43,6 +43,11 @@ The [worker design](long-lived-workers.md#roster-fields) defines stored run fiel
 
 The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
 
+`codex_mesh.py end` keeps the staff row and its thread id.
+`assign.sh --to` reopens an ended worker or a worker whose launcher died, using the recorded thread.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+The unit ledger keeps ended workers until permanent removal retires their staff rows.
+
 ### How each row's role is derived
 
 A live run is a run directory with a marker whose director session is running, or a heartbeat younger than 600 s (then it has no running director).
@@ -460,7 +465,8 @@ Release recalculates the priority of a kept decision.
 
 **Roster records**
 
-- A Claude worker ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
+- A Claude worker ledger id is the background id that `scripts/direct/claude_worker.py` reads from the start banner.
+  The id is a prefix of the `sessionId`.
 
 - Session records are one file per pid, indexed by `(sessionId, pid)`; the newest `updatedAt` wins. A pid-to-name map therefore cannot hold a stale name.
 

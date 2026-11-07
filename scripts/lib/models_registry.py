@@ -113,8 +113,9 @@ def _sync_catalog(path: Path) -> None:
 
 
 def agent_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Remove configuration state before an agent or server starts."""
-    return {key: value for key, value in environment.items() if key not in OPERATION_ENVIRONMENT}
+    """Remove operation state before an agent or server starts."""
+    return {key: value for key, value in environment.items()
+            if key not in (*OPERATION_ENVIRONMENT, "STAFF_OPERATION_FD")}
 
 
 def _decoded(encoded: str) -> tuple[Path, str]:

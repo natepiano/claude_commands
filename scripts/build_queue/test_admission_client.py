@@ -27,11 +27,8 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from scripts.lint import memory_admit as gate
-from typing import TYPE_CHECKING, cast
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    from scripts.lib import conf
+from typing import cast
+from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply

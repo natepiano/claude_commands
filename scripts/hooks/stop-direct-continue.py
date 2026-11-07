@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
-from context_usage import (
+from scripts.hooks.context_usage import (
     HookInput,
     auto_compact_window,
     handoff_threshold,

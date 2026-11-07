@@ -22,7 +22,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 from scripts.shutdown import pane_record
-import herdr  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 import herdr_tab_title  # noqa: E402
 from herdr_tab_title import StopPayload  # noqa: E402

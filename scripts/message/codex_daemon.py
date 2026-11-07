@@ -12,7 +12,6 @@ import json
 import os
 import socket
 import struct
-import sys
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +20,6 @@ from enum import Enum
 from pathlib import Path
 from typing import cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
 _clock = time.monotonic

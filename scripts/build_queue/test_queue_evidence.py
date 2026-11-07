@@ -20,7 +20,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import TYPE_CHECKING, TypedDict, Unpack, cast, override
+from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
@@ -29,10 +29,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope, fixtur
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    from scripts.buildlog import store
+from scripts.buildlog import store
 
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture

@@ -101,18 +101,16 @@ class PublishedWorker:
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the recorded run owner or run unit before the roster and caller."""
+    """Resolve the recorded run owner before the roster and caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
         except (OSError, ValueError) as error:
-            print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
+            unit_runs.report_anomaly(f"anomaly: {error}".replace("\n", " "))
             state = {}
         owner = unit_runs.run_owner(state, record)
         if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
             return owner
-        production = value if isinstance(value := state.get("production"), str) else ""
-        unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:
         found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
         if isinstance(found, session_staff.MemberFound):
@@ -134,11 +132,15 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
     row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
-    sources = sources if sources is not None else session_staff.member_sources()
-    found = sources.member(session_staff.ShowrunnerMember(production), record)
-    if isinstance(found, session_staff.NoSuchMember):
+    if production:
+        sources = sources if sources is not None else session_staff.member_sources()
+        found = sources.member(session_staff.ShowrunnerMember(production), record)
+        if isinstance(found, session_staff.MemberFound):
+            return found.row
+    if unit or production:
         raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
-    return found.row
+    raise ValueError(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+                     if run is not None else "the caller has no staff row and names no unit or production")
 
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:

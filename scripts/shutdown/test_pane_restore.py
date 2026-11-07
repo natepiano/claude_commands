@@ -153,8 +153,9 @@ class FakeClient(herdr.Herdr):
         _ = pane, command, terminal
 
     @override
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
-        del kind, timeout
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
+        del kind, timeout, pane_row
         if self.start_error is not None:
             raise self.start_error
         if pane not in self.native_ids:

@@ -44,6 +44,26 @@ class RuleTests(unittest.TestCase):
         _ = (member / "Cargo.toml").write_text('[package]\nname = "public-member"\nversion = "0.1.0"\n')
         return repo
 
+    def test_rule_blob_matches_git_for_empty_unicode_crlf_and_edited_bytes(self) -> None:
+        path = self.global_dir / "blob.md"
+        for content in (b"", "# Café 日本語\n".encode(), b"# Rule\r\nText.\r\n"):
+            with self.subTest(content=content):
+                _ = path.write_bytes(content)
+                rule = rules._load_rule(path, "global", self.global_dir.parent, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                expected = subprocess.run(
+                    ["git", "hash-object", "--stdin"], input=content, capture_output=True, check=True,
+                ).stdout.decode().strip()
+                self.assertEqual(rule.blob, expected)
+
+                edited = content + b"# Edited\n"
+                _ = path.write_bytes(edited)
+                reloaded = rules._load_rule(path, "global", self.global_dir.parent, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                expected_edited = subprocess.run(
+                    ["git", "hash-object", "--stdin"], input=edited, capture_output=True, check=True,
+                ).stdout.decode().strip()
+                self.assertEqual(reloaded.blob, expected_edited)
+                self.assertNotEqual(rule.blob, reloaded.blob)
+
     def test_manifest_read_failure_remains_the_original_file_error(self) -> None:
         repo = self.member_repo()
         path = repo / "docs/member/style/rule.md"

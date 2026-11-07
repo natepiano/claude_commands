@@ -59,15 +59,10 @@ from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import review  # noqa: E402
 from scripts.message import sessions  # noqa: E402

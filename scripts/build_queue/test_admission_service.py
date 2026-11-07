@@ -25,24 +25,17 @@ import threading
 import time
 import subprocess
 import unittest
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
 from scripts.accounts import outage_alerts
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
-else:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
+from scripts.buildlog import store
+from scripts.buildlog import record as buildlog_record
 
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    from scripts.lib import conf
+from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic

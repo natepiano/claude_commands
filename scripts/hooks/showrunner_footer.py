@@ -82,7 +82,7 @@ def targeted_instances(session_id: str) -> list[Path]:
             try:
                 if f"TARGET=session:{reference}" in (instance / "conf").read_text().splitlines():
                     matches.append(instance)
-            except OSError:
+            except (OSError, UnicodeError):
                 continue
     except OSError:
         pass

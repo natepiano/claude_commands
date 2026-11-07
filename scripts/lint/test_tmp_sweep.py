@@ -4,6 +4,8 @@ of the clock, so every file a test writes is old, ctime included, unless the tes
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import fcntl
 import json
@@ -915,7 +917,7 @@ class OwnerTests(TmpSweepCase):
         owner = fixture_member("showrunner", name="sweep")
         for run, session in ((live, LIVE_SESSION), (ended, ENDED_SESSION)):
             unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
-            _ = write(run / "progress_history_state.json", json.dumps({"unit": unit.name}))
+            _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
         unowned = write(self.unit / "unowned" / "board.log").parent
         result = self.sweep()
         self.assertTrue(live.is_dir())
@@ -944,7 +946,7 @@ class OwnerTests(TmpSweepCase):
             unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
             log = write(history / f"{run.name}.jsonl", json.dumps(
                 {"event_type": "run_started", "main_agent": {"session_id": session}}) + "\n")
-            _ = write(run / "progress_history_state.json", json.dumps({"unit": unit.name, "history_file": str(log)}))
+            _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id, "history_file": str(log)}))
         result = self.sweep()
         self.assertTrue(runs[LIVE_SESSION].is_dir())
         self.assertFalse(runs[ENDED_SESSION].exists())
@@ -1670,7 +1672,7 @@ class PaneRunTests(TmpSweepCase):
         self.assertEqual(snapshot.call_count, 1)
 
     def test_five_states_keep_only_open_or_unproved_runs(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.tmp.parent))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
         worker = fixture_worker("reader", parent.id)
         run = self.unit / "pane-run"
         self.now = self.now + 8 * DAY
@@ -1699,7 +1701,7 @@ class PaneRunTests(TmpSweepCase):
                 self.assertIn(str(run), result.kept[tmp_sweep.RunKeepReason.UNENDED_WORKER.value])
 
     def test_pane_worker_thread_keeps_its_session_folder(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.tmp.parent))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
         worker = fixture_worker("reader", parent.id)
         run = self.unit / "pane-run"
         write_text_atomic(run / "payload", "payload")

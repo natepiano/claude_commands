@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run one read-only Cargo judgment on an idle Mac mirror when it is available."""
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
 import fcntl
+import json
 import math
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import record, repository, store
 from scripts.build_targets import target_config
+from scripts.lib import build_folders
 
 
 # Version the mirrored repository's development shell exports on the Mac.
@@ -1128,7 +1130,9 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
         return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
-    return f"{linux_mirror_root()}/{repository.path_key}/{slot}"
+    name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
+    return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
+        kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1243,7 +1247,7 @@ def trusted_linux_source(root: Path) -> bool:
         if nix_env.trusted_envrc(envrc):
             return True
         return isinstance(nix_env.ensure(root), nix_env.Loaded)
-    return nix_env.trusted_root(root) or nix_env.registered_worktree(root)
+    return nix_env.trusted_root(root) or nix_env.registered_worktree(root) or nix_env.generated_source(root)
 
 
 class PublicToolParity(TypedDict):
@@ -1276,6 +1280,44 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
         expected[key] = normalize_tool_version(value)
     return {"rustc": expected["rustc"], "nextest": expected["nextest"],
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
+
+
+def recorded_linux_version_mismatch(controller: ProcessController, config: OffloadConfig,
+                                    target: str) -> str:
+    """Compare the tree with the tools recorded by deployment without contacting the box."""
+    from scripts.mac_test import linux_runner
+    try:
+        raw = cast(object, json.loads((target_config.ssh_target_state_directory(target) / "box-tools.json").read_text()))
+        if not isinstance(raw, dict):
+            return ""
+        versions = cast(dict[str, object], raw).get("versions")
+        if not isinstance(versions, dict):
+            return ""
+        entries = cast(dict[str, object], versions)
+        if any(not isinstance(value, str) for value in entries.values()):
+            return ""
+        actual = {key: linux_runner.normalize_tool_version(cast(str, value)) for key, value in entries.items()}
+        expected = expected_linux_parity(controller, config)
+        if isinstance(expected, UnavailableToolParity):
+            return ""
+        selected = {key: linux_runner.normalize_tool_version(value) for key, value in (
+            ("rustc", expected["rustc"]), ("nextest", expected["nextest"]), ("mend", expected["mend"])) if key in actual}
+        return linux_runner.version_mismatch(target, actual, selected, config.values.get("version_pin_file", ""))
+    except (OSError, ValueError, UnicodeError):
+        return ""
+
+
+def linux_version_decline_path(target: str, repository_name: str) -> Path:
+    """Use one decline record for each repository name."""
+    return state_directory(target) / f"version-decline-{repository_name}"
+
+
+def linux_version_declined_recently(target: str, repository_name: str, hold_s: float, now: float) -> bool:
+    """Read whether this repository has a decline within the hold duration."""
+    try:
+        return 0 <= now - float(linux_version_decline_path(target, repository_name).read_text()) < hold_s
+    except (OSError, ValueError, UnicodeError):
+        return False
 
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
@@ -1369,11 +1411,11 @@ def probe_mac(
                 return probe
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == value for key, value in expected.items()):
+            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
                 return probe
             from scripts.mac_test import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
-                      {"rustc": expected["rustc"], "nextest": expected["nextest"], "mend": expected["mend"]},
+                      {"nextest": expected["nextest"], "mend": expected["mend"]},
                       config.values.get("version_pin_file", ""))
                       if not isinstance(expected, UnavailableToolParity) else "")
             if detail:
@@ -2159,6 +2201,14 @@ def run_offload(
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
+    if linux:
+        detail = recorded_linux_version_mismatch(controller, config, request.target)
+        decline_path = linux_version_decline_path(request.target, repository.name)
+        if detail:
+            decline_path.parent.mkdir(parents=True, exist_ok=True)
+            _ = decline_path.write_text(str(time.time()))
+            return DeclinedMacRun("state", elapsed_seconds(started), detail)
+        decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
             if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):

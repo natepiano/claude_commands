@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 from scripts.lint.memory_test_support import config_environment
@@ -24,11 +26,9 @@ from unittest import mock
 from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
@@ -354,10 +354,10 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = fixture_member("showrunner", name="example")
         self.production_doc()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(remote.local_machine(), self.doc))
             for name, folder in (("alpha", self.unit), ("beta", self.other)):
                 _ = fixture_member("unit", name=name, parent=owner.id,
-                                   worktree=staff.PresentWorktree("natedev", folder))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), folder))
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -749,7 +749,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             relationship = fixture_member("showrunner", name=parent).id if parent else staff.StaffRoot()
             _ = fixture_member("showrunner", name="example-style", parent=relationship,
-                               doc=staff.LiveDoc("natedev", doc))
+                               doc=staff.LiveDoc(remote.local_machine(), doc))
         self.env["MERGE_CHECKPOINT_SHOWRUNNERS"] = str(registry)
         self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
         return doc

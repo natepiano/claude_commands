@@ -10,14 +10,8 @@ import argparse
 import json
 import sys
 import time
-from pathlib import Path
 from contextlib import closing
 from typing import Literal, TypedDict, cast
-
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff

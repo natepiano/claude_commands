@@ -19,6 +19,7 @@ from scripts.message import process_table
 from scripts.production import staff
 from scripts.production.staff_test_support import OWNER_CLI, StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
 from scripts.agents import worker_lifecycle
+from scripts.lib.atomic_file import write_text_atomic
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
 
@@ -81,11 +82,12 @@ class RemoveWorkersTest(unittest.TestCase):
         selected = root or self.root
         run = selected / name
         run.mkdir()
+        write_text_atomic(run / "worker_transport", "mesh\n")
         parent = unit_membership("cleanup", name)
         if orchestrator is not None:
             parent = staff.update_current_session(parent.current_session, staff.native_id(orchestrator))
             _ = (selected / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": name}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         roster: dict[str, object] = {}
         for worker in workers:
             member = fixture_worker("worker-" + worker, parent.id, runtime_id=fixture_runtime_id(worker + "-full"))
@@ -197,11 +199,11 @@ class RemoveWorkersTest(unittest.TestCase):
         pane_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-pane")
         mesh_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-mesh")
         mesh_worker = staff.move(mesh_worker.id, staff.ReportsTo(parent.id))
-        _ = (mesh_run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": "pane-run"}))
+        _ = (mesh_run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = (pane_run / "worker_transport").write_text("herdr\n")
         _ = (mesh_run / "worker_transport").write_text("mesh\n")
         _ = (pane_run / "progress_history_state.json").write_text(json.dumps({
-            "production": "cleanup", "unit": "pane-run", "pass": {"impl": {
+            "owner_staff_id": parent.id, "pass": {"impl": {
                 "instance_id": "pane-dispatch", "worker_name": pane_worker.name,
             }},
         }))
@@ -291,6 +293,22 @@ class RemoveWorkersTest(unittest.TestCase):
         own = self.run_dir("own", ["own1", "own2"], orchestrator=ORCHESTRATOR)
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
         self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
+
+    def test_own_run_removal_reports_phase_completion_with_a_live_director(self) -> None:
+        own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
+        self.list_rows([row("own1", "p-impl")])
+        result, removed = self.run_remove_workers(own)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(removed, ["own1"])
+        self.assertEqual(result.stdout, "removed worker p-impl (own1): its run finished this phase\n")
+
+    def test_sweep_removal_reports_a_dead_director(self) -> None:
+        _ = self.run_dir("orphaned", ["orph1"], orchestrator=GONE_ORCHESTRATOR)
+        self.list_rows([row("orph1", "p-impl")])
+        result, removed = self.run_remove_workers()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(removed, ["orph1"])
+        self.assertEqual(result.stdout, "removed worker p-impl (orph1): unit director is not live\n")
 
     def test_unreadable_run_owner_does_not_stop_other_worker_removal(self) -> None:
         for transport in ("mesh", "herdr"):
@@ -395,7 +413,7 @@ class RemoveWorkersTest(unittest.TestCase):
         self.assertEqual(self.remove_workers(), (1, []))
 
     def test_failed_session_listing_never_runs_the_destructive_server_sweep(self) -> None:
-        own = self.root / "own"
+        own = self.run_dir("own", [])
         arguments = [
             os.fspath(SCRIPT),
             "--session-dir",

@@ -9,7 +9,6 @@ import io
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -19,9 +18,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import change_review
 from scripts.lib import copy_record
 from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
@@ -83,7 +80,7 @@ def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str]
     """Give the selected fixture rows Producer ids and staff records."""
     runners: dict[str, staff.StaffRow] = {}
     for name, doc in documents.items():
-        runners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        runners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
         text = doc.read_text() if doc.exists() else f"# {name}\n"
         if "**Showrunner checkout:**" not in text:
             text += f"\n- **Showrunner checkout:** `{root}`\n"
@@ -101,7 +98,7 @@ def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str]
                 continue
             name = "fixture-" + owner + "-" + path.stem.replace(" ", "-") + "-" + row["#"]
             member = fixture_member("unit", name=name, parent=runners[owner].id,
-                                    worktree=staff.PresentWorktree("natedev", root / name))
+                                    worktree=staff.PresentWorktree(remote.local_machine(), root / name))
             if "| Producer |" not in text:
                 lines = text.splitlines()
                 header = next(i for i, line in enumerate(lines) if line.startswith("| # |"))
@@ -751,6 +748,93 @@ class ReadyListTests(ProducerFixture):
         self.assertNotIn("change review: no staff row", output)
         self.assertEqual(self.listing.read_bytes(), written)
 
+    def test_an_edited_change_row_covers_its_merge_on_the_next_scan(self) -> None:
+        _ = self.merge_change("Change-Review: Original words | Read | Result")
+        self.promote()
+        self.assertEqual(self.ready()[0], 0)
+        _ = change_review.edit_row(self.listing, "C1", Visible("Edited words", "Read", "Result"),
+                                   date(2026, 11, 7), self.doc)
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited words"])
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_text_matching_reserves_its_row_before_an_edited_row_covers_another_change(self) -> None:
+        _ = self.merge_change("Change-Review: First | Read | First result\n"
+                              + "Change-Review: Second | Read | Second result")
+        self.promote()
+        self.assertEqual(self.ready()[0], 0)
+        _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
+                                   date(2026, 11, 7), self.doc)
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited first", "Second"])
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_one_edited_row_leaves_the_second_change_of_its_merge_uncovered(self) -> None:
+        merged = self.merge_change("Change-Review: First | Read | First result\n"
+                                   + "Change-Review: Second | Read | Second result")
+        self.promote()
+        _ = change_review.append_rows(self.listing, [Visible("First", "Read", "First result")],
+                                      date(2026, 11, 7), merged[:8], self.doc, record=staff.snapshot())
+        _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
+                                   date(2026, 11, 7), self.doc)
+        code, output, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["#"], row["Change"]) for row in change_review.pending(self.listing)],
+                         [("C1", "Edited first"), ("C2", "Second")])
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_an_edited_ready_row_does_not_cover_an_earlier_held_change_during_live(self) -> None:
+        merged = self.merge_change("Change-Review: Restarted | Open | New service | after restart\n"
+                                   + "Change-Review: Plain | Read | Ready")
+        self.promote()
+        self.assertEqual(self.ready()[0], 0)
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
+        _ = change_review.edit_row(self.listing, "C1", Visible("Edited plain", "Read", "Ready"),
+                                   date(2026, 11, 7), self.doc)
+        code, output, error = self.live(merged)
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["#"], row["Change"]) for row in change_review.pending(self.listing)],
+                         [("C1", "Edited plain"), ("C2", "Restarted")])
+        _ = change_review.edit_row(self.listing, "C2", Visible("Edited restart", "Open", "New service"),
+                                   date(2026, 11, 7), self.doc)
+        written = self.listing.read_bytes()
+        self.assertEqual(self.live(merged), (0, "", ""))
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_an_edited_second_step_row_does_not_hide_the_first_step_change(self) -> None:
+        merged = self.merge_change("Change-Review: Restarted | Open | New service | after restart\n"
+                                   + "Change-Review: Deployed | Open | New build | after deploy")
+        self.promote()
+        self.assertEqual(self.live(merged, "deploy")[0], 0)
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Deployed"])
+        _ = change_review.edit_row(self.listing, "C1", Visible("Edited deploy", "Open", "New build"),
+                                   date(2026, 11, 7), self.doc)
+        code, output, error = self.live(merged, "restart")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["#"], row["Change"]) for row in change_review.pending(self.listing)],
+                         [("C1", "Edited deploy"), ("C2", "Restarted")])
+
+    def test_a_row_without_this_merge_hash_does_not_cover_different_words(self) -> None:
+        earlier = self.git("rev-parse", "HEAD")
+        _ = self.merge_change("Change-Review: New change | Read | New result")
+        self.promote()
+        for merged in ("", earlier[:8]):
+            with self.subTest(merged=merged):
+                self.listing.unlink(missing_ok=True)
+                _ = change_review.append_rows(self.listing, [Visible("Unrelated words", "Read", "Old result")],
+                                              date(2026, 11, 7), merged, self.doc, record=staff.snapshot())
+                self.assertEqual(self.ready()[0], 0)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 ["Unrelated words", "New change"])
+
     def test_live_adds_only_the_held_line_once_after_main_promotion(self) -> None:
         merged = self.merge_change("Change-Review: Plain | Read | Ready\n"
                                    + "Change-Review: Restarted | Open | New service | after restart")
@@ -1078,9 +1162,9 @@ class ActionTest(unittest.TestCase):
         _ = parent.write_text("- **Merge branch:** main\n", encoding="utf-8")
         style = self.path.parent / "parent-style-production.md"
         _ = style.write_text("- **Kind:** style\n- **Parent production:** /stale/parent-production.md\n", encoding="utf-8")
-        owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", parent))
+        owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc(remote.local_machine(), parent))
         _ = fixture_member("showrunner", name="parent-style", parent=owner.id,
-                           doc=staff.LiveDoc("natedev", style))
+                           doc=staff.LiveDoc(remote.local_machine(), style))
         record = staff.snapshot()
         self.assertEqual(change_review.credited(style, record), parent)
         self.assertEqual(change_review.credited(parent, record), parent)
@@ -1938,9 +2022,9 @@ class RepositoryTest(unittest.TestCase):
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
         _ = recorded_unit("kid", "u", self.repo / "u", kid, plan="docs/u-plan.md")
-        top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
+        top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
         tree = change_review.Tree([top, kid])
-        kid_owner = staff.snapshot().by_doc("natedev", kid)
+        kid_owner = staff.snapshot().by_doc(remote.local_machine(), kid)
         assert kid_owner is not None
         expected = ({"C1": kid_owner.id, "C2": top_owner.id}, {"C3": "no merge hash"})
         self.assertEqual(change_review.backfill(path, tree, write=False), expected)
@@ -1962,8 +2046,8 @@ class RepositoryTest(unittest.TestCase):
         _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
                              + f"- **Parent production:** {top}\n", encoding="utf-8")
         _ = recorded_unit("top-style", "u", self.repo / "u", style, plan="docs/u-plan.md")
-        owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
-        child = staff.snapshot().by_doc("natedev", style)
+        owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
+        child = staff.snapshot().by_doc(remote.local_machine(), style)
         assert child is not None
         _ = staff.move(child.id, staff.ReportsTo(owner.id))
         path = folder / "change-review - top.md"

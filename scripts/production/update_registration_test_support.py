@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 from types import ModuleType
 import json
@@ -14,12 +16,10 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
@@ -33,11 +33,7 @@ from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
-if TYPE_CHECKING:
-    from scripts.notify import review as review
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    from scripts.notify import review as review
+from scripts.notify import review as review
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 
@@ -67,6 +63,10 @@ if args[0] == "status":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "new":
     instance.touch()
+    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / args[1]
+    timer.mkdir(parents=True, exist_ok=True)
+    target = args[args.index("--to") + 1] if "--to" in args else ""
+    (timer / "conf").write_text(f"TARGET={target}\\n", encoding="utf-8")
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
@@ -180,7 +180,7 @@ class RegistrationFixture(unittest.TestCase):
         runner = recorded_showrunner("example", self.doc)
         self.owner_id = runner.id
         _ = fixture_member("unit", name="alpha", parent=runner.id,
-                           worktree=staff.PresentWorktree("natedev", alpha))
+                           worktree=staff.PresentWorktree(remote.local_machine(), alpha))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
 
@@ -231,6 +231,7 @@ class RegistrationFixture(unittest.TestCase):
         return path
 
     def build_command_copy(self, tree: Path) -> None:
+        _ = self.question_instance()
         _ = shutil.copytree(SCRIPT.parent.parent, tree / "scripts",
                             ignore=shutil.ignore_patterns("__pycache__"))
         hooks = tree / "scripts/hooks"
@@ -268,9 +269,9 @@ class RegistrationFixture(unittest.TestCase):
         return output.getvalue()
 
     def question_instance(self) -> Path:
-        instance = self.state / "notifier/showrunner-example"
+        instance = self.state / "notifier" / f"showrunner-{self.owner_id}"
         instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text("TARGET=session:current-session-id\n")
+        _ = (instance / "conf").write_text(f"TARGET=session:{self.owner_id}\n")
         return instance
 
     def timer(self, name: str) -> None:
@@ -303,11 +304,11 @@ class RegistrationFixture(unittest.TestCase):
             return fixed.id
         matches = [row for row in record.find(kind="showrunner") if row.name == name]
         owner = matches[0] if matches else fixture_member("showrunner", name=name)
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.document_for(name)))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), self.document_for(name)))
         if not reference or reference == "showrunner":
             return owner.id
         return fixture_member("unit", name=unit_names.name(reference), parent=owner.id,
-                              worktree=staff.PresentWorktree("natedev", self.root / unit_names.name(reference))).id
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root / unit_names.name(reference))).id
 
     def write_open_for(self, name: str, *items: dict[str, str]) -> None:
         owner = self.fixture_staff_id(name=name)

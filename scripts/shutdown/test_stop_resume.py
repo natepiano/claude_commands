@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import fcntl
 import json
@@ -636,7 +638,7 @@ class StopResumeTests(unittest.TestCase):
         atomic_file.write_text_atomic(doc, f"# Production\n\n- **Merge branch:** `merge`\n"
             + f"- **Showrunner checkout:** `{fixture.root}`\n- **Log:** `log.md`\n\n## Units\n")
         owner = fixture_member("showrunner", name="owner", runtime_id=self.entry["session_id"],
-                               doc=staff.LiveDoc("natedev", doc))
+                               doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="unit", parent=owner.id)
         foreign = fixture_worker("foreign", unit.id)
         codex = fixture_worker("codex-own", owner.id, backend=staff.CodexBackend(fixture.root / "codex"))
@@ -849,6 +851,43 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, stop_resume.ResumeFailed("accounts", "session is on other-machine"))
         self.start.assert_not_called()
         self.kill.assert_not_called()
+
+    def test_codex_record_keeps_its_home_without_claude_trust(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        home = self.root / ".codex2"
+        self.entry.update(kind="codex", config_dir=str(home), model="")
+        self.entry["environment"] = {"CLAUDE_CONFIG_DIR": str(home)}
+        pane_record.write("agents", self.entry)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / ".codex1")),
+              patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(stop_resume, "heal_account_trust") as trust,
+              patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
+              patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                _ = stop_resume.resume("alpha")
+        trust.assert_not_called()
+        entry = cast(pane_record.PaneLaunch, execute.call_args.args[1])
+        self.assertEqual(entry["config_dir"], str(home))
+        self.assertEqual(entry["environment"]["CODEX_HOME"], str(home))
+
+    def test_codex_own_pane_exec_has_no_prompt_and_uses_the_saved_home(self) -> None:
+        home = self.root / ".codex2"
+        self.entry.update(kind="codex", config_dir=str(home), model="")
+        self.entry["environment"] = {"CLAUDE_CONFIG_DIR": str(home)}
+        tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])
+        with (patch.object(os, "chdir"), patch.object(os, "execvp", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                stop_resume._exec_in_own_pane(tab, self.entry, "codex2", "Continue this conversation.")  # pyright: ignore[reportPrivateUsage]
+        arguments = cast(list[str], execute.call_args.args[1])
+        self.assertEqual(arguments[-2:], ["resume", self.entry["session_id"]])
+        self.assertIn("codex", arguments)
+        self.assertIn("CODEX_HOME=" + str(home), arguments)
+        self.assertNotIn("Continue this conversation.", arguments)
+        self.assertNotIn(str(stop_resume.SCRIPTS / "accounts/accounts.py"), arguments)
 
     def test_own_empty_pane_executes_the_saved_launch(self) -> None:
         self.entry["ended"] = True
@@ -1089,7 +1128,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
         _ = self.enterContext(patch.object(stop_resume, "_confirm_move_start", self.confirm))
-        import quota_alert
+        from scripts.whoami import quota_alert
         _ = self.enterContext(patch.object(quota_alert, "tell_user"))
         _ = self.enterContext(patch.object(showrunners, "tell", return_value="fixture report"))
 
@@ -1419,7 +1458,7 @@ class StopResumeTests(unittest.TestCase):
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             folder = self.root / "staff-folder"
-            _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", folder), expected=owner.worktree)
+            _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), folder), expected=owner.worktree)
             self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
             pane_record.write("agents", self.entry)
             record = pane_record.record_path("agents")

@@ -25,7 +25,7 @@ from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, offload_enabled, read_settings,
 )
 
-InstanceState = Literal["pending", "running", "stopping", "stopped", "terminated", "unknown"]
+InstanceState = Literal["pending", "running", "stopping", "stopped", "shutting-down", "terminated", "unknown"]
 SpendingPurpose = Literal["deployment", "start", "admission"]
 ChargeKind = Literal["instance", "fixed", "explorer", "reconciliation"]
 
@@ -280,7 +280,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
     observations: list[InstanceObservation] = []
     for record in rows(row, "observations"):
         state = text(record, "state")
-        if state not in ("pending", "running", "stopping", "stopped", "terminated", "unknown"):
+        if state not in ("pending", "running", "stopping", "stopped", "shutting-down", "terminated", "unknown"):
             raise LedgerUnavailable("unknown instance state")
         observations.append(InstanceObservation(instant(record, "at"), state, text(record, "source")))
     evidence = LedgerEvidence(
