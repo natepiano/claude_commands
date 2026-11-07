@@ -1273,6 +1273,40 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_verify_build_key.py`: `NO_COLOR` changes the verdict key and not the build key. A `check` key does not change with `NO_COLOR`.
 - The modules that read the key pass. One assertion change, which item 3 calls for: `test_verify_mac_only.py` expected the forwarded map to hold only the user's `--env` name. It now holds that name and the automatic values, and the comparison stays a whole-map comparison. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
+### Phase 41j — A stop leaves no Mac log file  · status: todo
+
+**Depends on:** Phase 41i.
+
+#### Work Order
+
+**Source:** fix16's check run in phase 41i, 2026-11-06. Builds placed it after the 41i tip and before 41h, 21:35 EST.
+
+**Goal:** a signal during a Mac or SSH step leaves no temp log file, under any load.
+
+**Defect:** `verify.sh` starts `tee "$MAC_LOG_FILE"` and `tee -a "$MAC_LOG_FILE"` as process substitutions. Under load a tee can open the file after `forward_mac_runner_signal` removes it, so the name comes back and one temp file stays. Forced proof on 8b5df1f3f: a one-second delay before tee fails `test_signal_before_runner_start_removes_result_without_local_work` 3 of 3. Seen once without force; a rerun passes.
+
+**Spec:**
+
+1. The parent shell opens the Mac log file once, on a file descriptor, before it starts the runner. Both tee processes write through `/dev/fd/<N>` of that descriptor, so a late tee creates no name.
+2. Each place that removes `MAC_LOG_FILE` also closes the descriptor. The pass record reads the same file as today.
+3. A regression test delays tee start (the forced form of the proof) and shows that a stop leaves no temp file. It fails on the old code.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/direct/test_verify_mac_signal_boundaries.py`
+
+**Workers:** 1 writer, in its own tree from the builds tip that holds 41i.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time.
+- A move of a `verify.sh` function reaches each test whose DEBUG trap watches its commands. Search `trap .* DEBUG` and `BASH_COMMAND`, and run those modules.
+- Phase 41h edits `verify.sh` in another tree. Merge whichever lands second.
+
+**Acceptance gate:**
+- The new test fails on the old code and passes on the new code.
+- `test_verify_mac_signal_boundaries.py` and the other Mac step modules pass. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
 **Depends on:** Phase 41g.
