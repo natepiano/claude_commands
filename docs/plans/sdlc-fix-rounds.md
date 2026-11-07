@@ -317,9 +317,11 @@ Cause: `push_git` aborts its origin/main merge only when `may_undo` is true. `re
 
 The `--from-child` handler in `main` reports a held Stop as it reports a cancelled one: the held line, the files and the recovery message. Held returns 1; cancelled keeps 77.
 
-### Phase 9y — The review trial line counts the findings in the ledger  · status: in progress
+### Phase 9y — The review trial line counts the findings in the ledger  · status: done
 
 From the sdlc showrunner, 2026-11-06: "unit-board's review trial recorder printed code 4 findings, but its ledger holds 1 (F001)... The count must come from the findings ledger." In this unit the recorder printed code 4 for 9x, whose ledger holds 2, and code 5 for 9w, whose ledger holds 6. Count the code findings from the phase's findings ledger. Add no new check.
+
+`review-trial` reads the selected instance's ledger file through `findings.read_phase_ledger`. The UX and code counts and the UX repair rounds come from that ledger, so a routed or closed finding counts, and a closure reply adds none.
 
 ### Phase 9z — The launcher sees the end of a worker that read a passed run  · status: todo
 
