@@ -275,7 +275,7 @@ Design from the sdlc showrunner:
 
 **Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
 
-### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: in progress
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: done
 
 From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
 
@@ -284,6 +284,8 @@ From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-
 - One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
 - `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
 - After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+Landed on main in 9aa3b5526 (2fc784207), folded into the fix-rounds branch. devtools 8l keeps the staff row at `codex_mesh end`, so end stops the last worker's server and does not call `staff.retire`. The sweep on 2026-11-07 retired all 24 astra-reviewer rows through `staff.py retire`; none had a live process.
 
 ### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
 
