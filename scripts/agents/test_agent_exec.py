@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.direct import test_claude_worker
 
 import json
 import os
@@ -323,22 +324,18 @@ class ClaudeLauncherTests(unittest.TestCase):
                   patch.dict(os.environ, private_env)):
                 owner = unit_membership("fixture", "account-selection")
                 registry = Path(private_env["NOTIFIER_SESSIONS_DIR"])
-                environment = {**self.environment, **private_env, "AGENT_BG_DETACH": "1", "BACKGROUND_LAUNCH_FILE": str(captured),
+                environment = {**self.environment, **private_env, "BACKGROUND_LAUNCH_FILE": str(captured),
                                "CODEX_THREAD_ID": owner.id, "NOTIFIER_SESSIONS_DIR": str(registry),
                                "FIXTURE_REGISTRY_PATH": str(registry / f"{os.getpid()}.json"),
                                "FIXTURE_REGISTRY_RECORD": json.dumps(record), "FIXTURE_NATIVE_ID": native,
-                               "AGENT_BG_SEND_SCRIPT": str(sender)}
+                               "CLAUDE_WORKER_SEND_SCRIPT": str(sender)}
                 _ = environment.pop("CLAUDE_CONFIG_DIR", None)
                 if caller:
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-                command, environment = backend_fixture_command(
-                    private / "assign-parent",
-                    ["bash", str(SCRIPTS / "agents/agent_bg.sh"), "--run", str(private / "run"),
-                     "fixture-worker", str(self.home), str(prompt), str(self.home / "summary"), str(self.home / "log")],
-                    environment)
-                result = subprocess.run(command, capture_output=True, text=True, check=True,
-                                        env=environment, cwd=self.home)
-                self.assertIn("launched fixture-worker", result.stdout)
+                command = test_claude_worker.worker_command("fixture-worker", private / "run", self.home, prompt,
+                                         self.home / "summary", self.home / "log")
+                _ = subprocess.run(command, capture_output=True, text=True, check=True,
+                                   env=environment, cwd=self.home)
                 self.assertEqual(json.loads(captured.read_text()), {
                     "CLAUDE_CONFIG_DIR": str(accounts.account_dir(expected)),
                     "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.home / ".claude")})

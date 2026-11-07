@@ -31,8 +31,6 @@ def starts_worker(words: list[str]) -> bool:
             return True
         if name == "codex_mesh.py" and index + 1 < len(words) and words[index + 1] in MESH_STARTS:
             return True
-        if name == "agent_bg.sh" and (index + 1 == len(words) or words[index + 1] not in {"stop", "status", "--stop", "--status"}):
-            return True
     return False
 
 
@@ -148,10 +146,10 @@ class OneLaunchPathTests(unittest.TestCase):
                         f'MESH = ROOT / "scripts/agents/codex_mesh.py"\ncommand = [python, str(MESH), "{verb}"]\n')
                     _ = (root / "caller.sh").write_text(f'MESH="${{DIR}}/codex_mesh.py"\n"$PY" "$MESH" {verb}\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:2", "caller.sh:2"])
-            for launcher in ("review.sh", "agent_bg.sh"):
+            for launcher in ("review.sh",):
                 with self.subTest(launcher=launcher):
                     _ = (root / "caller.py").write_text(f'command = ["bash", str(ROOT / "{launcher}")]\n')
-                    _ = (root / "caller.sh").write_text(f'AGENT_BG_ROLE=impl bash "${{DIR}}/{launcher}" --to worker\n')
+                    _ = (root / "caller.sh").write_text(f'bash "${{DIR}}/{launcher}" --to worker\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:1", "caller.sh:1"])
 
     def test_scan_catches_in_process_worker_launches_and_keeps_nonlaunch_verbs_open(self) -> None:
@@ -186,8 +184,7 @@ class OneLaunchPathTests(unittest.TestCase):
         gate = '"/repo/scripts/lib/py" "/repo/scripts/direct/assign_gate.py"\n'
         for relative in (*sorted(GATED_HOPS), "other.sh"):
             for start in ('"$PY" "/repo/scripts/agents/codex_mesh.py" start\n',
-                          'AGENT_BG_ROLE=impl bash "/repo/scripts/agents/agent_bg.sh" worker\n',
-                          'AGENT_BG_ROLE=impl bash "/repo/scripts/agents/agent_bg.sh" --attach worker\n'):
+                          'bash "/repo/scripts/direct/review.sh" worker\n'):
                 with self.subTest(path=relative, start=start), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     path = root / relative
@@ -204,14 +201,6 @@ class OneLaunchPathTests(unittest.TestCase):
                     _ = path.write_text('echo "assign_gate.py"\n' + start)
                     self.assertEqual(forbidden_launches(root), [f"{relative}:2"])
 
-    def test_claude_stop_and_status_do_not_start_workers(self) -> None:
-        for verb in ("stop", "status", "--stop", "--status"):
-            with self.subTest(verb=verb), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _ = (root / "caller.py").write_text(f'command = ["bash", "scripts/agents/agent_bg.sh", "{verb}", "worker"]\n')
-                _ = (root / "caller.sh").write_text(f'BG="scripts/agents/agent_bg.sh"\nbash "$BG" {verb} worker\n')
-                self.assertEqual(forbidden_launches(root), [])
-
     def test_scan_excludes_tests_launcher_and_nonlaunch_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -219,9 +208,9 @@ class OneLaunchPathTests(unittest.TestCase):
                              "scripts/launch_test_support.py", "scripts/recorder_fixture.py"):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text('command = ["agent_bg.sh"]\n')
+                _ = path.write_text('command = ["review.sh"]\n')
             _ = (root / "inspect.py").write_text(
-                '# codex_mesh.py start\ntext = "agent_bg.sh --attach worker"\n' +
+                '# codex_mesh.py start\ntext = "review.sh worker"\n' +
                 'command = ["codex_mesh.py", "end"]\n')
             _ = (root / "inspect.sh").write_text(
                 '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')

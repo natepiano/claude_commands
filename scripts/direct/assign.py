@@ -29,7 +29,7 @@ from scripts.astra import astra_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers
+from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers, worker_state
 from scripts.direct.worker_state import ROSTER_LIVE, worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, models_registry, unit_runs
@@ -436,17 +436,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if not identity:
             worker_lifecycle.WorkerStateFile(identity_path).publish(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
-        previous_claim = read_object(claim_path)
-        pid = previous_claim.get("pid")
-        stale_claim = False
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                stale_claim = True
-                claim_path.unlink(missing_ok=True)
-            else:
-                refuse(f"{dispatch.worker} is claimed by launcher {pid}")
+        owner = worker_state.read_worker_claim(claim_path)
+        if isinstance(owner, worker_state.HeldWorkerClaim):
+            refuse(f"{dispatch.worker} is claimed by launcher {owner.pid}")
+        stale_claim = isinstance(owner, worker_state.EndedWorkerClaim)
+        claim_path.unlink(missing_ok=True)
         status_path = worker_status_path(dispatch.run, slot)
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
@@ -485,7 +479,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 and not codex_mesh.worker_launcher_attached(record)):
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
-        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker}))
+        worker_state.publish_worker_claim(claim_path, dispatch.worker)
         # Each turn runs at the caller's model:effort (models.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 

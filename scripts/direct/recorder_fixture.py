@@ -160,7 +160,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
     for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py", "codex_mesh.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
-    for name in ("assign.sh", "assign.py", "assign_claude.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
+    for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
@@ -181,7 +181,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
     environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
     environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
-                       UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
+                       UNIT_WORKER_POLL_SECS="0.01", UNIT_SYNC_WRITES="0",
                        TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")

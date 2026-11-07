@@ -387,8 +387,8 @@ class UnitPhasesTests(unittest.TestCase):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", folder))
         decision = self.root / "decision.md"
-        _ = decision.write_text("---\nstatus: open\nunit: names\nplan: approved\n---\n")
         names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
+        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\n---\n")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:

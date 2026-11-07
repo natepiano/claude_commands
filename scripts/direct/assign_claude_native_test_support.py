@@ -66,14 +66,6 @@ class ClaudeLauncherFixture(support.AssignClaudeLauncherFixture):
         for status in ("busy", "idle", "gone"):
             rows = [] if status == "gone" else [{"id": "abc12345", "sessionId": "abc12345-2222-4333-8444-555555555555", "name": "fixture-impl", "status": status}]
             _ = (builder.root / f"listing-{status}.json").write_text(json.dumps(rows))
-        agent_bg = builder.root / "scripts/agents/agent_bg.sh"
-        # Both fake transitions happen before their CLI returns. Consume their
-        # event instead of waiting 0.05 seconds for state that is already ready.
-        _ = agent_bg.write_text(agent_bg.read_text().replace(
-            'sleep "${POLL_SECS}"',
-            '[[ -f "$STUB_CLAUDE_ROOT/poll-ready" ]] || { echo "missing fake poll event" >&2; exit 1; }; '
-            + 'rm "$STUB_CLAUDE_ROOT/poll-ready"',
-        ))
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
         shutil.rmtree(cls.fixture_root)
 

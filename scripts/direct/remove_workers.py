@@ -29,6 +29,8 @@ from scripts.production import session_staff, staff, worker_admission
 from scripts.lib import unit_runs
 
 CLAUDE_TIMEOUT_SECS = 30
+OWN_RUN_FINISHED = "its run finished this phase"
+DIRECTOR_NOT_LIVE = "unit director is not live"
 
 
 
@@ -124,6 +126,7 @@ def removal_targets(own_runs: set[Path], rows: list[AgentRow], *,
                     pane_workers.update(run_workers(pin.parent, record))
     listed = {row.get("sessionId", "") for row in rows}
     targets: dict[str, str] = {}
+    reason = OWN_RUN_FINISHED if own_runs else DIRECTOR_NOT_LIVE
     for member in record.find(kind="worker"):
         if not isinstance(record.backends.get(member.id), staff.ClaudeBackend):
             continue
@@ -135,7 +138,7 @@ def removal_targets(own_runs: set[Path], rows: list[AgentRow], *,
                 print(f"anomaly: {member.name}: pane worker retained; use worker.py end from its parent", file=sys.stderr)
                 continue
             agent = next((row for row in rows if row.get("sessionId") == member.current_session), None)
-            targets[agent.get("id", member.current_session) if agent is not None else member.current_session] = "unit director is not live"
+            targets[agent.get("id", member.current_session) if agent is not None else member.current_session] = reason
     return targets
 
 

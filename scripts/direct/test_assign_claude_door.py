@@ -54,7 +54,6 @@ class AssignClaudeDoorTests(AssignLauncherFixture):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
             "CLAUDE_BIN": str(backend),
-            "UNIT_WORKER_WAIT_ATTEMPTS": "1",
             "UNIT_WORKER_POLL_SECS": "0",
         })))
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)

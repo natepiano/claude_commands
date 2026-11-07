@@ -19,6 +19,7 @@ from scripts.direct import assign, workers
 from scripts.production import session_staff, staff, worker
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import process_start
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
@@ -118,17 +119,27 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         name = next(iter(self.assignment_records()))
         original = self.server.respond
         claims: list[dict[str, object]] = []
+        starts: list[str] = []
 
         @self.hang_guard.callback
         def read_claim(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
-                claims.extend(read_object(path) for path in self.session_dir.glob("impl_claim_*.json"))
+                for path in self.session_dir.glob("impl_claim_*.json"):
+                    claim = read_object(path)
+                    claims.append(claim)
+                    pid = claim["pid"]
+                    assert isinstance(pid, int)
+                    started = process_start.process_start(pid)
+                    assert isinstance(started, process_start.Started)
+                    starts.append(started.start)
             return original(request)
 
         self.server.respond = read_claim
         self.review_launcher("--to", name, "2")
         claim, = claims
-        self.assertEqual(set(claim), {"pid", "worker"})
+        self.assertEqual(set(claim), {"pid", "started", "worker"})
+        started, = starts
+        self.assertEqual(claim["started"], started)
         self.assertEqual(claim["worker"], name)
         self.assertIsInstance(claim["pid"], int)
 

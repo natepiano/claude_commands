@@ -5,14 +5,12 @@ import fcntl
 import json
 import math
 import os
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf
 from scripts.whoami import usage_store  # noqa: E402
