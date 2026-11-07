@@ -33,6 +33,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
@@ -274,6 +275,7 @@ class ReservationRecord:
     finalization: gate.FinalizationIntent | NoFinalizationIntent = NoFinalizationIntent()
     charge_use: gate.TestPhaseChargeUse | gate.NoTestPhaseChargeUse = gate.NoTestPhaseChargeUse()
     run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
+    place: wire.LocalPlace | wire.CloudPlace = wire.LocalPlace()
 
 
 def reservation_row(record: ReservationRecord) -> gate.Reservation:
@@ -284,7 +286,7 @@ def reservation_row(record: ReservationRecord) -> gate.Reservation:
         "admitted_at": record.admitted_at, "sidecar": record.sidecar,
         "test_threads": record.test_width, "call_id": record.call,
         "reservation_id": record.reservation_id, "queue_waiter": record.queue_waiter,
-        "scoped": bool(record.sidecar), "test_scope": record.test_scope,
+        "scoped": bool(record.sidecar) and isinstance(record.place, wire.LocalPlace), "test_scope": record.test_scope,
         "package": record.package, "filters": list(record.filters),
     }
     if isinstance(record.run, wire.RunIdentity):
@@ -735,6 +737,7 @@ class Connection:
     sending: bytes = b""
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
+    version: int = 1
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1119,8 @@ class AdmissionServer:
     def _ordered_waiters(self) -> list[tuple[Path, gate.RankedWaiter]]:
         rows: list[tuple[Path, gate.RankedWaiter]] = []
         for waiting in self.waiters.values():
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
+                continue
             row = gate.rank_waiter(waiting.row, gate.NormalOrder())
             row["order_since"] = row.get("order_since", row["since"])
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.run, wire.RunIdentity):
@@ -1171,6 +1176,8 @@ class AdmissionServer:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, gate.ContinuationSlot)}
         for waiting in sorted(self.waiters.values(), key=lambda item: gate.waiter_order(item.row)):
             request = waiting.request
+            if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
+                continue
             if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
                 continue
             owner = gate.waiter_owner(waiting.row)
@@ -1186,6 +1193,8 @@ class AdmissionServer:
             claimed.add(owner)
 
     def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> None:
+        if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
+            return
         if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
             return
         run = request.run
@@ -1219,7 +1228,8 @@ class AdmissionServer:
         since = request.since if isinstance(place, gate.NoWaiter) else place.since
         row: gate.Waiter = {
             "pid": request.owner.pid, "start_time": request.owner.start_time,
-            "need": profile.peak.bytes, "since": since,
+            "need": (0 if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+                     else profile.peak.bytes), "since": since,
             "order_since": (place.order_since if isinstance(place, WaiterPlace)
                             and not isinstance(place.order_since, OrderNotStarted) else since),
             "session_id": identity.session_id, "session_name": identity.name,
@@ -1265,9 +1275,15 @@ class AdmissionServer:
 
     def _reading_plan(self, config: gate.MemoryConfig) -> SystemReadingPlan:
         return SystemReadingPlan(config, tuple(replace(record, queue_waiter=record.queue_waiter.copy())
-            for record in self.reservations.values()), tuple(self.run_places.values()), bool(self.waiters))
+            for record in self.reservations.values() if isinstance(record.place, wire.LocalPlace)),
+            tuple(self.run_places.values()), bool(self._ordered_waiters()))
 
     def _lifetime(self, record: ReservationRecord) -> gate.StepLifetime:
+        if isinstance(record.place, wire.CloudPlace):
+            live = self._live(record.owner)
+            if isinstance(record.run, wire.RunIdentity):
+                live = live and self._run_alive(record.run)
+            return gate.LiveOwnerProcess() if live else gate.EndedStep()
         if not isinstance(self.system_reader, NoSystemReader):
             return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
@@ -1289,6 +1305,9 @@ class AdmissionServer:
         self.system_evidence = evidence
         memories: list[tuple[gate.Reservation, gate.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
+            if isinstance(record.place, wire.CloudPlace):
+                _ = self._end_if_finished(episode, record)
+                continue
             if isinstance(record.finalization, dict) or not isinstance(record.ending, NotEnding):
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending)
@@ -1313,6 +1332,8 @@ class AdmissionServer:
             memories.append((row, memory))
             self._watch_scope(evidence.lifetimes.get(episode, gate.LiveOwnerProcess()), episode)
         for waiting in self.waiters.values():
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
+                continue
             waiting.row["build_history_current"] = not self._build_estimate_expired(waiting.request)
             request = waiting.request
             if "build_run" not in waiting.row:
@@ -1341,6 +1362,13 @@ class AdmissionServer:
         owned: set[str] = set()
         scopes: dict[str, str] = {}
         for record in self.reservations.values():
+            if isinstance(record.place, wire.CloudPlace) and record.sidecar:
+                try:
+                    scope = Path(record.sidecar).read_text().strip()
+                except (OSError, UnicodeError):
+                    scope = ""
+                if scope:
+                    owned.add(scope)
             captured = evidence.reservations.get(record.episode)
             if captured is not None and captured.scope:
                 owned.add(captured.scope)
@@ -1530,6 +1558,7 @@ class AdmissionServer:
         result = gate.admission_pass(inputs, inputs.now, policy)
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
+        cloud_started = self._cloud_pass(inputs, self.configuration)
         by_owner = {gate.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
@@ -1560,7 +1589,7 @@ class AdmissionServer:
         self.next_pass = self.clock.monotonic() + interval
         if isinstance(self.override_reconnect_until, ReconnectDeadline):
             self.next_pass = min(self.next_pass, self.override_reconnect_until.at)
-        if starts:
+        if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
         try:
             ordered, priority = self._queue_order()
@@ -1576,18 +1605,81 @@ class AdmissionServer:
             self.system_reader.update(self._reading_plan(config))
         return result
 
+    def _cloud_waiters(self) -> list[WaitingAdmission]:
+        return sorted((waiting for waiting in self.waiters.values()
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace)),
+            key=lambda waiting: waiting.row["since"])
+
+    def _cloud_pass(self, inputs: gate.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
+        waiting_cloud = self._cloud_waiters()
+        if not waiting_cloud:
+            return False
+        config = configuration.config
+        slots = configuration.cloud_gate_slots
+        used = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+        started = False
+        position = 0
+        for waiting in waiting_cloud:
+            if used < slots:
+                self._admit(waiting, config)
+                used += 1
+                started = True
+                continue
+            position += 1
+            reason = wire.CloudSlotWait(used, slots)
+            snapshot = AdmissionWaitSnapshot(gate.AdmissionDecision("hold", 0, 0, 0, 0),
+                replace(waiting.request.profile.peak, bytes=0), (), 0,
+                waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics)
+            reply = wire.Wait(reason, position, "", reason.text, snapshot)
+            if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
+                self._deliver(waiting, reply)
+                waiting.last_reply, waiting.last_sent = reply, inputs.now
+        return started
+
+    def _cloud_reading(self, reading: gate.QueueRead, configuration: gate.UsableAdmissionConfiguration
+                       ) -> gate.QueueRead | wire.CloudQueueRead:
+        rows: list[wire.CloudRow] = []
+        for record in self.reservations.values():
+            if not isinstance(record.place, wire.CloudPlace):
+                continue
+            waiter = record.queue_waiter
+            identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
+                record.step, record.worktree, waiter.get("unit", ""))
+            sidecar = Path(record.sidecar)
+            rows.append(wire.CloudRow(record.owner, identity, record.place, waiter["since"],
+                gate.epoch(record.admitted_at), cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress(),
+                progress.read_counter(sidecar) if record.sidecar else progress.NoCounter(), gate.ReadyForAdmission()))
+        used = len(rows)
+        waiting_cloud = self._cloud_waiters()
+        if not rows and not waiting_cloud:
+            return reading
+        slots = configuration.cloud_gate_slots
+        for waiting in waiting_cloud:
+            request = waiting.request
+            assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+            sidecar = Path(request.sidecar)
+            rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
+                cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
+                progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
+        return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
+            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
+
     def _publish_replies(self) -> None:
-        if (not isinstance(self.last_inputs, gate.QueueInputs)
+        if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
+                or not isinstance(self.last_inputs, gate.QueueInputs)
                 or not isinstance(self.last_policy, gate.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         self.published = PublishedReplies(view, explain)
 
-    def reply_bytes(self, reply: wire.Reply) -> bytes:
+    def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
+        if version != wire.VERSION:
+            return wire.encode_reply(reply, version=version).encode()
         published = self.published
         if isinstance(published, PublishedReplies):
             if reply is published.view:
@@ -1622,6 +1714,8 @@ class AdmissionServer:
 
     def _save_place(self, waiting: WaitingAdmission) -> None:
         row, request = waiting.row, waiting.request
+        if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
+            return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
         place = waiter_place(row, request.episode)
@@ -1692,13 +1786,15 @@ class AdmissionServer:
                 shape = gate.merge_gate_shape(request.argv)
             else:
                 shape = ""
-            record = ReservationRecord(request.episode, str(stem), request.owner, profile.peak.bytes,
+            cloud = isinstance(request.place, wire.CloudPlace)
+            record = ReservationRecord(request.episode, str(stem), request.owner, 0 if cloud else profile.peak.bytes,
                 profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
                 request.test_width, request.call, stem.name, gate.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, gate.RepositoryIdentity) else "",
                 profile.scope, gate.test_package(list(request.argv)), tuple(gate.test_filters(list(request.argv))),
-                shape, run=request.run)
-            record = self._freeze_test_phase_need(record, config)
+                shape, run=request.run, place=request.place)
+            if not cloud:
+                record = self._freeze_test_phase_need(record, config)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
             self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, profile.peak.source,
@@ -1710,7 +1806,7 @@ class AdmissionServer:
                 if isinstance(slot, gate.ContinuationSlot) and slot.owner == gate.waiter_owner(waiting.row):
                     del self.slots[key]
             reply = wire.Admitted(stem.name, record.need, profile.peak.source, str(stem.with_suffix(".max")),
-                                  str(stem.with_suffix(".wave")), gate.sampling_context(reservation_row(record)),
+                                  str(stem.with_suffix(".wave")), {} if cloud else gate.sampling_context(reservation_row(record)),
                                   wire.CleanupTiming(config.silence_seconds, config.reconnect_seconds))
             self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
             self._watch_owner(request.owner)
@@ -1747,7 +1843,7 @@ class AdmissionServer:
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault, self.places),
             end_kind=end_kind)
-        if (isinstance(record.run, wire.RunIdentity)
+        if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, gate.MemoryConfig)):
             slot = gate.ended_step_slot(row, ended_at, self.last_usable_configuration.policy)
@@ -1891,7 +1987,8 @@ class AdmissionServer:
                 if record.reservation_id == request.reservation:
                     updated = replace(record, test_width=gate.RequestedTestWidth(request.width),
                                       test_phase_need=gate.NoTestPhaseNeed("not_recorded"))
-                    if isinstance(configuration, gate.UsableAdmissionConfiguration):
+                    if (isinstance(record.place, wire.LocalPlace)
+                            and isinstance(configuration, gate.UsableAdmissionConfiguration)):
                         updated = self._freeze_test_phase_need(updated, configuration.config)
                     self.reservations[episode] = updated
             live = any(record.reservation_id == request.reservation for record in self.reservations.values())
@@ -2039,7 +2136,7 @@ class AdmissionServer:
     def _send(self, connection: Connection, reply: wire.Reply) -> None:
         if connection.finished:
             return
-        connection.sending += self.reply_bytes(reply)
+        connection.sending += self.reply_bytes(reply, version=connection.version)
         connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
         if connection.finished:
             self._drop_deferred_requests(connection)
@@ -2157,7 +2254,7 @@ class AdmissionServer:
                 line, _, tail = connection.received.partition(b"\n")
                 if tail:
                     raise ValueError("one request per connection")
-                request = wire.parse_request(line)
+                connection.version, request = wire.parse_request_envelope(line)
                 cleanup = isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
                     raise ValueError(reason)

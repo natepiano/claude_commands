@@ -25,6 +25,7 @@ import threading
 import time
 import subprocess
 import unittest
+from types import ModuleType
 from typing import cast, override
 from unittest import mock
 
@@ -1346,6 +1347,249 @@ class ReadingAlertTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIsInstance(fixture.server.reading_hold, service.NoReadingHold)
                 self.assertIsInstance(fixture.server.reading_alert_delivery, service.NoReadingAlertDelivery)
+
+
+class CloudAdmissionTests(unittest.TestCase):
+    def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes", "safety_gib"):
+            with self.subTest(key=key), AdmissionFixture() as fixture:
+                config_path = fixture.root / "build_admission.conf"
+                write_memory_config(config_path, cloud_gate_slots="1", cloud_gate_stale_pushes="3")
+                sidecar = fixture.root / "cloud.cgroup"
+                _ = sidecar.write_text("")
+                request = replace(self.cloud_request(fixture), sidecar=str(sidecar))
+                grant = only_admitted(fixture.server.handle_request(request))
+                cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 0, fixture.clock.now() - 15))
+                waiting = self.cloud_request(fixture)
+                self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+                read_configuration = gate.read_admission_configuration
+
+                def change_after_check() -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
+                    configuration = read_configuration()
+                    write_memory_config(config_path, **{key: "invalid"})
+                    return configuration
+
+                with mock.patch.object(gate, "read_admission_configuration", side_effect=change_after_check):
+                    fixture.server.next_pass = fixture.clock.monotonic()
+                    fixture.server.run_once(0)
+                self.assertIsInstance(fixture.server.configuration, gate.UsableAdmissionConfiguration)
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply) and isinstance(reply.reading, wire.CloudQueueRead)
+                self.assertEqual(reply.reading.cloud_slots, 1)
+                self.assertEqual(reply.reading.cloud_gate_stale_pushes, 3)
+                self.assertIn(waiting.episode, fixture.server.waiters)
+                model = queue_view.QueueModel(reply.reading, {}, gate.NoWaiter(), head_facts.PaceUnavailable(),
+                    ZoneInfo("UTC"), queue_view.HostLoadUnavailable(), gate.NoWaiter())
+                with mock.patch.object(queue_view, "cloud_push_interval", return_value=queue_view.CloudPushInterval(5)):
+                    text = plain(queue_view.render_view(model, 140))
+                self.assertIn("no update for", text)
+                fixture.server.next_pass = fixture.clock.monotonic()
+                fixture.server.run_once(0)
+                self.assertIsInstance(fixture.server.configuration, gate.UnusableAdmissionConfiguration)
+                refused, = fixture.connect(wire.ViewRequest()).replies()
+                self.assertIsInstance(refused, wire.Refused)
+                assert isinstance(refused, wire.Refused)
+                self.assertIn(key, refused.reason)
+                self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
+                fixture.release(grant)
+                self.assertFalse(fixture.server.reservations)
+
+    def test_view_and_mine_keep_version_one_readings_plain_with_a_cloud_gate(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            sent: list[str] = []
+
+            def capture(line: str) -> str:
+                sent.append(line)
+                return line
+
+            with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                for version in (2, 1, 2, 1):
+                    for kind, request in (("view", wire.ViewRequest()), ("mine", wire.MineRequest("cloud-session"))):
+                        with self.subTest(version=version, kind=kind):
+                            line = wire.encode_record({"v": version, "type": kind, "data": request}) + "\n"
+                            reply, = fixture.connect(line).replies()
+                            assert isinstance(reply, (wire.ViewReply, wire.MineReply))
+                            message = cast(dict[str, object], json.loads(sent[-1]))
+                            self.assertEqual(message["v"], version)
+                            if version == 1:
+                                self.assertIs(type(reply.reading), records.QueueRead)
+                                data = cast(dict[str, object], message["data"])
+                                old_reading = wire.parse_record(json.dumps(data["reading"]), records.QueueRead)
+                                self.assertEqual(old_reading, reply.reading)
+                            else:
+                                self.assertIsInstance(reply.reading, wire.CloudQueueRead)
+                                assert isinstance(reply.reading, wire.CloudQueueRead)
+                                self.assertEqual(len(reply.reading.cloud), 1)
+
+    def test_bad_cloud_settings_hold_admission_and_keep_the_service_available(self) -> None:
+        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes"):
+            for value in ("bad", "0"):
+                with self.subTest(key=key, value=value), AdmissionFixture() as fixture:
+                    grant = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+                    config = fixture.root / "build_admission.conf"
+                    write_memory_config(config, **{key: value})
+                    fixture.server.next_pass = fixture.clock.monotonic()
+                    fixture.server.run_once(0)
+                    self.assertIsInstance(fixture.server.configuration, gate.UnusableAdmissionConfiguration)
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    assert isinstance(reply, wire.Refused)
+                    self.assertIn(key, reply.reason)
+                    fixture.release(grant)
+                    self.assertFalse(fixture.server.reservations)
+                    write_memory_config(config, **{key: "9" if key == "cloud_gate_slots" else "3"})
+                    fixture.server.run_once(0)
+                    self.assertIsInstance(fixture.server.configuration, gate.UsableAdmissionConfiguration)
+                    self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+
+    def reading(self, fixture: AdmissionFixture) -> gate.QueueRead:
+        reply, = fixture.server.handle_request(wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        return reply.reading
+
+    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "merge-gate",
+                      run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
+        return replace(fixture.request(need=40 * GIB, step=step, run=run), place=wire.CloudPlace("aws"))
+
+    def test_cloud_starts_with_full_local_memory_and_charges_zero(self) -> None:
+        for step in ("merge-gate", "targeted-test"):
+            with self.subTest(step=step), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                _ = fixture.run_pass()
+                before = self.reading(fixture)
+                request = self.cloud_request(fixture, step=step)
+                grant = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(grant.need, 0)
+                self.assertEqual(fixture.server.reservations[request.episode].need, 0)
+                after = self.reading(fixture)
+                self.assertEqual(after.view.promised, before.view.promised)
+                self.assertEqual(after.explanation.room, before.explanation.room)
+
+    def test_cloud_module_progress_updates_without_a_memory_charge(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        with AdmissionFixture() as fixture:
+            request = self.cloud_request(fixture)
+            sidecar = fixture.root / "cloud.cgroup"
+            _ = sidecar.write_text("")
+            request = replace(request, sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            before = self.reading(fixture)
+            for done, state in ((3, "running"), (12, "uploading")):
+                current = cloud_progress.CloudProgress(
+                    cast(cloud_progress.CloudState, state), 32, 1, fixture.clock.now())
+                cloud_progress.publish(sidecar, current)
+                counter = progress.ProgressCounter("modules", done, 12)
+                progress.publish_counter(sidecar, counter)
+                _ = fixture.run_pass()
+                reading = self.reading(fixture)
+                assert isinstance(reading, wire.CloudQueueRead)
+                row, = reading.cloud
+                self.assertEqual(row.progress, current)
+                self.assertEqual(row.counter, counter)
+                self.assertEqual(reading.explanation.room, before.explanation.room)
+                self.assertEqual(fixture.server.reservations[request.episode].need, 0)
+            fixture.release(grant)
+
+    def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            requests = [self.cloud_request(fixture) for _ in range(11)]
+            grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
+            for request in requests[9:]:
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.Wait)
+                self.assertIn("cloud slot", reply.text)
+                self.assertIn("9 of 9", reply.text)
+            self.assertEqual(len(fixture.server.reservations), 9)
+            fixture.release(grants[0])
+            _ = fixture.run_pass()
+            self.assertIn(requests[9].episode, fixture.server.reservations)
+            self.assertNotIn(requests[10].episode, fixture.server.reservations)
+            self.assertEqual(len(fixture.server.reservations), 9)
+            fixture.release(grants[1])
+            _ = fixture.run_pass()
+            self.assertIn(requests[10].episode, fixture.server.reservations)
+
+    def test_cloud_slot_limit_reads_configuration_at_use(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, cloud_gate_slots="1")
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            waiting = self.cloud_request(fixture)
+            reply, = fixture.server.handle_request(waiting)
+            assert isinstance(reply, wire.Wait)
+            self.assertIn("1 of 1", reply.text)
+            write_memory_config(config, cloud_gate_slots="2")
+            _ = fixture.run_pass()
+            self.assertIn(waiting.episode, fixture.server.reservations)
+            self.assertEqual(len(fixture.server.reservations), 2)
+
+    def test_dead_route_releases_the_cloud_slot_while_its_child_lives(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            route = fixture.run_owner()
+            running = self.cloud_request(fixture, run=route)
+            _ = only_admitted(fixture.server.handle_request(running))
+            waiting = self.cloud_request(fixture)
+            reply, = fixture.server.handle_request(waiting)
+            self.assertIsInstance(reply, wire.Wait)
+            fixture.end_run(route)
+            _ = fixture.run_pass()
+            self.assertNotIn(running.episode, fixture.server.reservations)
+            self.assertIn(waiting.episode, fixture.server.reservations)
+            self.assertEqual(fixture.proc.owner_start(running.owner.pid), service.LiveOwnerIdentity(running.owner.start_time))
+
+    def test_dead_cloud_owner_releases_its_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            running = self.cloud_request(fixture)
+            _ = only_admitted(fixture.server.handle_request(running))
+            waiting = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            fixture.end_owner(running.owner)
+            _ = fixture.run_pass()
+            self.assertNotIn(running.episode, fixture.server.reservations)
+            self.assertIn(waiting.episode, fixture.server.reservations)
+
+    def test_waiting_cloud_gate_does_not_block_a_local_step(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            cloud_waiter = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(cloud_waiter)[0], wire.Wait)
+            local = fixture.request(need=GIB)
+            grant = only_admitted(fixture.server.handle_request(local))
+            self.assertEqual(grant.need, GIB)
+            self.assertIn(cloud_waiter.episode, fixture.server.waiters)
+
+    def test_local_memory_wait_does_not_block_a_cloud_gate(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            local = fixture.request(need=GIB)
+            self.assertIsInstance(fixture.server.handle_request(local)[0], wire.Wait)
+            cloud = self.cloud_request(fixture)
+            grant = only_admitted(fixture.server.handle_request(cloud))
+            self.assertEqual(grant.need, 0)
+            self.assertIn(local.episode, fixture.server.waiters)
+
+    def test_fallback_releases_cloud_and_waits_for_local_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            cloud = self.cloud_request(fixture)
+            grant = only_admitted(fixture.server.handle_request(cloud))
+            fixture.release(grant)
+            local = fixture.request(need=4 * GIB, step="merge-gate")
+            reply, = fixture.server.handle_request(local)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertFalse(fixture.server.reservations)
+            self.assertIn(local.episode, fixture.server.waiters)
 
 
 class RoomAndSlotTests(unittest.TestCase):
@@ -3168,10 +3412,46 @@ class ServiceTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertEqual(len(fixture.server.reservations), 1)
 
-    def test_version_two_client_gets_explicit_refusal_and_socket_is_private(self) -> None:
+    def test_unparsed_request_refusals_decode_with_both_protocol_versions(self) -> None:
+        source = subprocess.run(["git", "show", "7ab78b74e:scripts/build_queue/admission_protocol.py"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
+        legacy = ModuleType("admission_protocol_version_one")
+        with mock.patch.dict(sys.modules, {legacy.__name__: legacy}):
+            exec(compile(source, "admission_protocol_version_one.py", "exec"), legacy.__dict__)
+            decode_legacy = cast(Callable[[str], object], getattr(legacy, "parse_reply"))
+            for version in (1, 2):
+                for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
+                    with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
+                        fixture.configure(request_max_bytes=512)
+                        _ = fixture.run_pass()
+                        prefix = f'{{"v":{version},'
+                        if kind.startswith("oversize"):
+                            line = prefix + '"data":"'
+                            tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
+                            limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
+                            line += "x" * (limit + 1 - len(line) - len(tail)) + tail
+                        else:
+                            line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
+                        sent: list[str] = []
+
+                        def capture(line: str) -> str:
+                            sent.append(line)
+                            return line
+
+                        with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                            peer = fixture.connect(line)
+                            if kind == "fragmented":
+                                self.assertEqual(peer.replies(), [])
+                                peer.socket.sendall(b'"type":"view","data": }\n')
+                            reply, = peer.replies()
+                        self.assertIsInstance(reply, wire.Refused)
+                        self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
+                        self.assertEqual(wire.parse_reply(sent[-1]), reply)
+
+    def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
-            peer = fixture.connect('{"v":2,"type":"view","data":{}}\n')
-            self.assertEqual(peer.replies(), [wire.Refused("client version 2, service supports 1..1")])
+            peer = fixture.connect('{"v":3,"type":"view","data":{}}\n')
+            self.assertEqual(peer.replies(), [wire.Refused("client version 3, service supports 1..2")])
             self.assertEqual(stat.S_IMODE(fixture.socket_path.stat().st_mode), 0o600)
 
     def test_aged_launch_alone_does_not_create_a_reservation(self) -> None:
@@ -5138,14 +5418,14 @@ class AdmissionConfigurationTests(unittest.TestCase):
             self.assertEqual(grant.need, request.profile.peak.bytes)
             self.assertEqual(len(fixture.server.reservations), 1)
 
-    def test_one_config_read_supplies_a_complete_service_pass(self) -> None:
+    def test_memory_and_cloud_config_reads_supply_a_complete_service_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
             _ = fixture.server.handle_request(fixture.request())
             with mock.patch.object(conf, "read", wraps=conf.read) as reader:
                 _ = fixture.server.run_pass()
-            reader.assert_called_once_with("build_admission")
+            self.assertEqual(reader.call_args_list, [mock.call("build_admission"), mock.call("build_admission")])
 
     def test_unusable_config_restart_replays_one_existing_reservation(self) -> None:
         with AdmissionFixture() as fixture:

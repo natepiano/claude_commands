@@ -5,14 +5,106 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 
 from dataclasses import replace
 import unittest
+from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
-from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, with_waiting
+from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, with_waiting, write_memory_config
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+
+
+class CloudQueueCardTests(unittest.TestCase):
+    def test_cloud_card_reads_progress_from_a_private_service(self) -> None:
+        with AdmissionFixture() as fixture:
+            sidecar = fixture.root / "cloud.cgroup"
+            _ = sidecar.write_text("")
+            request = fixture.request(step="merge-gate")
+            request = replace(request, place=wire.CloudPlace("aws"), sidecar=str(sidecar),
+                identity=replace(request.identity, session_id="private-cloud", unit="private-unit"))
+            grant = only_admitted(fixture.connect(request).replies())
+            progress_profile.publish_counter(sidecar, progress_profile.ProgressCounter("modules", 7, 12))
+            cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 1, fixture.clock.now()))
+            _ = fixture.run_pass()
+            reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            model = queue_view.QueueModel(reply.reading, {}, gate.NoWaiter(), head_facts.PaceUnavailable(),
+                ZoneInfo("UTC"), queue_view.HostLoadUnavailable(), gate.NoWaiter())
+            text = plain(queue_card.render_selection(model, "private-cloud", 140))
+            for value in ("Cloud", "1 of 9 slots", "private-unit", "merge-gate", "running", "7 of 12 modules", "32 vCPUs"):
+                self.assertIn(value, text)
+            self.assertEqual(grant.need, 0)
+            fixture.release(grant)
+
+    def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
+        fixture = self.enterContext(QueueFixture(captured=False))
+        write_memory_config(fixture.root / "build_admission.conf",
+            cloud_gate_slots="1", cloud_gate_stale_pushes="3")
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        model = fixture.model()
+        rows = (
+            wire.CloudRow(wire.Owner(700001, "100"),
+                wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+                wire.CloudPlace("aws"), NOW - 245, NOW - 240,
+                cloud_progress.CloudProgress("running", 32, 1, NOW - 120),
+                progress_profile.ProgressCounter("modules", 7, 12), gate.ReadyForAdmission()),
+            wire.CloudRow(wire.Owner(700002, "200"),
+                wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+                wire.CloudPlace("aws"), NOW - 60, 0,
+                cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
+        )
+        reading = model.reading
+        return replace(model, reading=wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
+            reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)), fixture
+
+    def test_cloud_card_shows_slots_progress_size_elapsed_and_age(self) -> None:
+        model, _fixture = self.cloud_model()
+        text = plain(queue_card.render_selection(model, "cloud-session", 140))
+        for value in ("Cloud", "1 of 1 slots", "cloud-unit", "merge-gate", "running", "32", "vCPUs", "4 min"):
+            self.assertIn(value, text)
+        self.assertRegex(text, r"7(?: of |/)12")
+        self.assertIn("no update for 2 min", text)
+        self.assertEqual(text + "\n", (GOLDEN / "cloud_card.txt").read_text())
+
+    def test_waiting_cloud_card_names_the_full_slots(self) -> None:
+        model, _fixture = self.cloud_model()
+        text = plain(queue_card.render_selection(model, "cloud-waiter", 140))
+        self.assertIn("Cloud", text)
+        self.assertIn("waiting-unit", text)
+        self.assertIn("targeted-test", text)
+        self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
+        self.assertEqual(text + "\n", (GOLDEN / "cloud_wait_card.txt").read_text())
+
+    def test_missing_cloud_progress_has_a_named_card_state(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        for reason in ("missing", "unreadable"):
+            with self.subTest(reason=reason):
+                row = replace(reading.cloud[0], progress=cloud_progress.NoCloudProgress(reason))
+                model = replace(model, reading=replace(reading, cloud=(row,)))
+                text = plain(queue_card.render_selection(model, "cloud-session", 140))
+                self.assertIn(reason, text)
+                self.assertNotIn("no update for", text)
+
+    def test_missing_push_file_or_key_omits_the_card_stale_age(self) -> None:
+        model, fixture = self.cloud_model()
+        config = fixture.root / "cloud_gate.conf"
+        for missing in ("key", "file"):
+            with self.subTest(missing=missing):
+                if missing == "key":
+                    _ = config.write_text("[cloud_gate]\n")
+                else:
+                    config.unlink()
+                text = plain(queue_card.render_selection(model, "cloud-session", 140))
+                self.assertIn("running", text)
+                self.assertRegex(text, r"7(?: of |/)12")
+                self.assertNotIn("no update for", text)
 
 
 class QueueCardTests(QueueFixtureTests):

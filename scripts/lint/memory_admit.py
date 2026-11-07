@@ -684,6 +684,8 @@ def blocker_fields(blocker: Blocker) -> dict[str, str]:
 @dataclass(frozen=True)
 class UsableAdmissionConfiguration:
     config: MemoryConfig
+    cloud_gate_slots: int
+    cloud_gate_stale_pushes: int
 
 
 @dataclass(frozen=True)
@@ -694,7 +696,14 @@ class UnusableAdmissionConfiguration:
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
     """Resolve one pass without preventing cleanup when a setting is unavailable."""
     try:
-        return UsableAdmissionConfiguration(read_memory_config(report=False))
+        with conf.diagnostics(report=False) as messages:
+            settings = conf.read("build_admission")
+            cloud_gate_slots = settings.whole("cloud_gate_slots")
+            cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
+        config = read_memory_config(report=False)
+        return UsableAdmissionConfiguration(replace(config,
+            diagnostics=(*config.diagnostics, *configuration_diagnostics(messages))),
+            cloud_gate_slots, cloud_gate_stale_pushes)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -2478,7 +2487,8 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
         sidecar = Path(row["sidecar"])
-        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"), sidecar):
+        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
+                       Path(str(sidecar) + ".cloud.json"), sidecar):
             try:
                 sample.unlink(missing_ok=True)
             except PermissionError:

@@ -6,6 +6,58 @@ Every build on natedev, CI's and the sessions', is admitted so that it fits in m
 
 ## How it works
 
+### Cloud gates
+
+`AdmitRequest.place` defaults to `LocalPlace()`.
+This tree supplies the queue API and the cloud progress file.
+The aws route integration belongs to a separate tree.
+That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+The route process owns the reservation.
+The service releases the cloud slot when that process ends.
+An explicit release also ends the reservation.
+A route that returns to natedev releases its cloud reservation before it requests local admission.
+
+Cloud reservations need zero local memory.
+They do not consume memory room, CI room, head protection, start spacing, or progress memory.
+Local waits and cloud waits have separate admission orders.
+Cloud gates wait in arrival order when all cloud slots are in use.
+The wait text includes the used slots and the slot limit.
+`cloud_gate_slots=9` sets the limit in `config/build_admission.conf`.
+The service reads the limit through its configuration check before each pass.
+The pass uses the checked values if the file changes during that pass.
+The next check handles an unusable cloud setting like other unusable settings.
+
+`cloud_progress.publish(sidecar, progress)` writes `<sidecar>.cloud.json` with the shared atomic writer.
+`CloudProgress(state, size_vcpus, failed_modules, updated_at)` stores the cloud state.
+`CloudState` names `requesting`, `setup`, `running`, and `uploading`.
+`cloud_progress.read(sidecar)` returns `CloudProgress` or `NoCloudProgress`.
+`NoCloudProgress.reason` distinguishes missing data from unreadable data.
+The API supplies `progress_profile.publish_counter` for the route to write module counts.
+The service removes the progress files when the reservation ends.
+
+The queue view and card show cloud rows under `Cloud`, with used slots and total slots.
+Each row shows the unit, step, state, module counts, vCPUs, and elapsed time.
+Missing progress and module counts have explicit display states.
+Waiting rows show their cloud slot wait.
+`cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
+The queue reading carries the checked threshold to the display.
+The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
+An older update shows `no update for <age>`.
+`CloudPushIntervalUnavailable` names an unavailable push interval.
+The display omits the stale age when the push interval is unavailable.
+
+The wire envelope uses protocol version 2 and keeps the existing admission code version rule.
+The service accepts client versions 1 and 2.
+The service sends a version 1 refusal when it cannot determine the request version.
+Both client versions can decode that refusal.
+Version 1 view and mine replies carry plain `QueueRead` records without cloud rows.
+Version 2 replies can carry `CloudQueueRead` records.
+The shared codec encodes the new place field and its frozen dataclasses.
+Old requests default to local admission when they omit the place field.
+`CloudSlotWait` carries the used slots and slot limit in wait replies.
+`CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
+Local queue readings keep their existing wire form when no cloud row exists.
+
 Linux target steps set `BUILDLOG_CALLER=verify-linux`.
 `memory_gate.sh` grants these steps without a local admission socket or a natedev hold check.
 Target slots and the target build budget provide admission there.
