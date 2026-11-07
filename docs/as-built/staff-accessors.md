@@ -12,7 +12,7 @@ On the Mac, `staff.py` asks natedev over SSH.
 
 ## Staff identity and backends
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, and `doc`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
@@ -22,6 +22,8 @@ The fixed `id` identifies a member across session changes.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
+A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
+
 `StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
 JSON stores `paused: {since, by, why}` only for a paused row.
 `pause(reference, why)` records the time in the user zone and the caller's staff name.
@@ -33,7 +35,13 @@ The refusal names the value and the production. A unit of another production doe
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
+Rows, locations, and pause records keep fields that the reader does not know in `unknown_fields`.
+Writes preserve these fields unchanged. Row changes also preserve them.
+The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+Changes from the Mac use the same owner setters.
+A new pause record starts with no unknown fields because it replaces the old record.
 Staff storage uses schema 2.
+A change that old code cannot read safely requires a new schema number.
 `staff_sources.live` emits observations with schema 3.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
 
@@ -65,7 +73,6 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
-| `scripts/agents/agent_bg.sh` | read | runtime_id |
 | `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
 | `scripts/agents/mesh_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
@@ -84,6 +91,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
+| `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
@@ -107,6 +115,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |

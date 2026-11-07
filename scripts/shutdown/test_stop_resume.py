@@ -850,6 +850,43 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_not_called()
         self.kill.assert_not_called()
 
+    def test_codex_record_keeps_its_home_without_claude_trust(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        home = self.root / ".codex2"
+        self.entry.update(kind="codex", config_dir=str(home), model="")
+        self.entry["environment"] = {"CLAUDE_CONFIG_DIR": str(home)}
+        pane_record.write("agents", self.entry)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / ".codex1")),
+              patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(stop_resume, "heal_account_trust") as trust,
+              patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
+              patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                _ = stop_resume.resume("alpha")
+        trust.assert_not_called()
+        entry = cast(pane_record.PaneLaunch, execute.call_args.args[1])
+        self.assertEqual(entry["config_dir"], str(home))
+        self.assertEqual(entry["environment"]["CODEX_HOME"], str(home))
+
+    def test_codex_own_pane_exec_has_no_prompt_and_uses_the_saved_home(self) -> None:
+        home = self.root / ".codex2"
+        self.entry.update(kind="codex", config_dir=str(home), model="")
+        self.entry["environment"] = {"CLAUDE_CONFIG_DIR": str(home)}
+        tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])
+        with (patch.object(os, "chdir"), patch.object(os, "execvp", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                stop_resume._exec_in_own_pane(tab, self.entry, "codex2", "Continue this conversation.")  # pyright: ignore[reportPrivateUsage]
+        arguments = cast(list[str], execute.call_args.args[1])
+        self.assertEqual(arguments[-2:], ["resume", self.entry["session_id"]])
+        self.assertIn("codex", arguments)
+        self.assertIn("CODEX_HOME=" + str(home), arguments)
+        self.assertNotIn("Continue this conversation.", arguments)
+        self.assertNotIn(str(stop_resume.SCRIPTS / "accounts/accounts.py"), arguments)
+
     def test_own_empty_pane_executes_the_saved_launch(self) -> None:
         self.entry["ended"] = True
         pane_record.write("agents", self.entry)

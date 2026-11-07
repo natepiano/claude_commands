@@ -1060,6 +1060,7 @@ class MeshCommandFixture(unittest.TestCase):
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
         self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
+        atomic_file.write_text_atomic(self.session_dir / "worker_transport", "mesh\n")
         from scripts.production import fake_unit_host
         host = fake_unit_host.environment(self.session_dir)
         fake_unit_host.write(host, [])
@@ -1075,8 +1076,7 @@ class MeshCommandFixture(unittest.TestCase):
         parent = unit_membership("natedev", "models")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
-        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
-            "production": "natedev", "unit": parent.name}))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = (self.session_dir / "prompt.txt").write_text("Original worker task", encoding="utf-8")
         self.outcomes = []
         self.turn_starts = 0
@@ -2032,6 +2032,7 @@ class MeshCommandFixture(unittest.TestCase):
         parent = unit_membership("sdlc", "roles")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         yield
 
 
@@ -14231,6 +14232,7 @@ class WorkerPauseTests(MeshCommandFixture):
         parent = unit_membership("demo", "builders")
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir), expected=parent.worktree)
         session_staff.inbox_path(parent.id).parent.mkdir(parents=True, exist_ok=True)
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session})))
         respond = self.server.respond
         @bounded_fixture
@@ -15134,6 +15136,7 @@ class DetachedRunWatchTests(StaffTestCase):
             _ = (session / codex_mesh.ROSTER_FILE).write_text(json.dumps(fixture_roster(cast(dict[str, object], {"worker": {
                 "thread_id": THREAD_ID, "status": "running", "launcher_pid": os.getpid(),
             }}), staff.native_id(os.environ["CODEX_THREAD_ID"]), Path(os.environ["CODEX_HOME"]))))
+            atomic_file.write_text_atomic(session / "worker_transport", "mesh\n")
             supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                                           stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             record = runs / "orphan.json"

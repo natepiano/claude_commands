@@ -177,6 +177,10 @@ class WorkerName:
         raise StaffRefused(f"invalid worker name: {name!r}; expected launcher name characters")
 
 
+def _unknown_fields(value: dict[str, object], known: set[str]) -> dict[str, object]:
+    return {key: item for key, item in value.items() if key not in known}
+
+
 def _location(machine: str, path: Path) -> None:
     if not machine or machine != machine.strip() or not path.is_absolute():
         raise StaffRefused("a staff location requires a machine name and an absolute path")
@@ -186,6 +190,7 @@ def _location(machine: str, path: Path) -> None:
 class PresentWorktree:
     machine: str
     path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         _location(self.machine, self.path)
@@ -195,6 +200,7 @@ class PresentWorktree:
 class RemovedWorktree:
     machine: str
     path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         _location(self.machine, self.path)
@@ -209,6 +215,7 @@ class WorktreeUnfilled:
 class LiveDoc:
     machine: str
     path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         _location(self.machine, self.path)
@@ -218,6 +225,7 @@ class LiveDoc:
 class WrappedDoc:
     machine: str
     path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         _location(self.machine, self.path)
@@ -226,6 +234,15 @@ class WrappedDoc:
 @dataclass(frozen=True)
 class DocUnfilled:
     """The transitional record has no production document fact yet."""
+
+
+def _keep_location_fields[Location: PresentWorktree | RemovedWorktree | LiveDoc | WrappedDoc](
+    new: Location,
+    current: PresentWorktree | RemovedWorktree | LiveDoc | WrappedDoc | WorktreeUnfilled | DocUnfilled,
+) -> Location:
+    if isinstance(current, (WorktreeUnfilled, DocUnfilled)):
+        return new
+    return replace(new, unknown_fields=current.unknown_fields)
 
 
 WORKTREE_UNFILLED = WorktreeUnfilled()
@@ -242,18 +259,21 @@ class Paused:
     since: str
     by: str
     why: str
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
-    def to_json(self) -> dict[str, str]:
-        return {"since": self.since, "by": self.by, "why": self.why}
+    def to_json(self) -> dict[str, object]:
+        return {**self.unknown_fields, "since": self.since, "by": self.by, "why": self.why}
 
     @classmethod
     def from_json(cls, value: object) -> Paused:
         if not isinstance(value, dict):
             raise StaffUnreadable("paused must contain since, by and why")
         fields = cast(dict[str, object], value)
-        if set(fields) != {"since", "by", "why"} or not all(isinstance(item, str) for item in fields.values()):
+        required = {"since", "by", "why"}
+        if not required <= fields.keys() or not all(isinstance(fields[key], str) for key in required):
             raise StaffUnreadable("paused must contain since, by and why as strings")
-        return cls(cast(str, fields["since"]), cast(str, fields["by"]), cast(str, fields["why"]))
+        return cls(cast(str, fields["since"]), cast(str, fields["by"]), cast(str, fields["why"]),
+                   unknown_fields=_unknown_fields(fields, required))
 
 
 @dataclass(frozen=True)
@@ -268,17 +288,18 @@ class StaffRow:
     doc: LiveDoc | WrappedDoc | DocUnfilled = field(default_factory=DocUnfilled)
 
     paused: Paused | Active = field(default_factory=Active)
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
         return self.parent == ReportsTo(identity)
 
     def to_json(self) -> dict[str, object]:
-        value: dict[str, object] = {"id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
+        value: dict[str, object] = {**self.unknown_fields, "id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
         if not isinstance(self.worktree, WorktreeUnfilled):
-            value["worktree"] = {"machine": self.worktree.machine, "path": str(self.worktree.path),
+            value["worktree"] = {**self.worktree.unknown_fields, "machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
         if not isinstance(self.doc, DocUnfilled):
-            value["doc"] = {"machine": self.doc.machine, "path": str(self.doc.path),
+            value["doc"] = {**self.doc.unknown_fields, "machine": self.doc.machine, "path": str(self.doc.path),
                             "state": "live" if isinstance(self.doc, LiveDoc) else "wrapped"}
         if isinstance(self.paused, Paused):
             value["paused"] = self.paused.to_json()
@@ -289,7 +310,7 @@ class StaffRow:
         if not isinstance(value, dict):
             raise StaffUnreadable("staff row must be an object")
         fields = cast(dict[str, object], value)
-        if not {"id", "kind", "name", "parent"} <= set(fields) or set(fields) - {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused"}:
+        if not {"id", "kind", "name", "parent"} <= set(fields):
             raise StaffUnreadable("staff row must contain id, kind, name and parent")
         staff_id, kind, name, parent = (fields[key] for key in ("id", "kind", "name", "parent"))
         if not isinstance(staff_id, str) or not _valid_id(staff_id):
@@ -306,7 +327,8 @@ class StaffRow:
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
-                   paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active())
+                   paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
+                   unknown_fields=_unknown_fields(fields, {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused"}))
 
 
 def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
@@ -321,16 +343,18 @@ def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktre
         if not isinstance(raw, dict):
             raise StaffUnreadable(f"{key} must be an object")
         location = cast(dict[str, object], raw)
-        if set(location) != {"machine", "path", "state"}:
+        required = {"machine", "path", "state"}
+        if not required <= location.keys():
             raise StaffUnreadable(f"{key} requires machine, path and state")
         machine, path, state = (location.get(item) for item in ("machine", "path", "state"))
         if not isinstance(machine, str) or not isinstance(path, str):
             raise StaffUnreadable(f"invalid {key} location")
+        unknown_fields = _unknown_fields(location, required)
         try:
             if key == "worktree" and state in ("present", "removed"):
-                worktree = PresentWorktree(machine, Path(path)) if state == "present" else RemovedWorktree(machine, Path(path))
+                worktree = PresentWorktree(machine, Path(path), unknown_fields=unknown_fields) if state == "present" else RemovedWorktree(machine, Path(path), unknown_fields=unknown_fields)
             elif key == "doc" and state in ("live", "wrapped"):
-                doc = LiveDoc(machine, Path(path)) if state == "live" else WrappedDoc(machine, Path(path))
+                doc = LiveDoc(machine, Path(path), unknown_fields=unknown_fields) if state == "live" else WrappedDoc(machine, Path(path), unknown_fields=unknown_fields)
             else:
                 raise StaffUnreadable(f"invalid {key} state: {state!r}")
         except StaffRefused as error:
@@ -417,10 +441,12 @@ class StaffSnapshot:
     current_sessions_recorded: bool = field(default=True, compare=False)
     # True only when snapshot() reads the production record.
     production: bool = field(default=False, compare=False)
+    # The session ids a caller already read. None reads the session registry at use.
+    running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
     @cached_property
     def backends(self) -> Mapping[StaffId, ClaudeBackend | CodexBackend]:
-        return _found_backends(self.rows)
+        return _found_backends(self.rows, self.running_sessions)
 
     @cached_property
     def rows_by_id(self) -> dict[StaffId, StaffRow]:
@@ -908,7 +934,8 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
     return _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE)
 
 
-def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | CodexBackend]:
+def _found_backends(rows: Sequence[StaffRow],
+                    running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each home."""
     from scripts.message import sessions
 
@@ -929,8 +956,9 @@ def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | C
                         _ = found.setdefault(identity, CodexBackend(home))
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
-    running = ({record["sessionId"] for record in sessions.running_sessions()}
-               if any(identity not in found for identity in wanted.values()) else set[str]())
+    if running is None:
+        running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
+                   if any(identity not in found for identity in wanted.values()) else frozenset())
     for current, identity in wanted.items():
         if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
@@ -1379,7 +1407,7 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
         if (existing.worktree.machine, existing.worktree.path) != (worktree.machine, worktree.path):
             raise StaffRefused(f"{existing.name}: restore worktree conflicts with retained location")
         pending.discard(staff_id)
-        restored = replace(existing, worktree=worktree)
+        restored = replace(existing, worktree=_keep_location_fields(worktree, existing.worktree))
         rows[rows.index(existing)] = restored
         return restored
 
@@ -1501,7 +1529,7 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
             return row
         if row.worktree != expected:
             raise StaffRefused(f"{unit}: worktree differs from the expected value {expected!r}; found {row.worktree!r}")
-        changed = replace(row, worktree=worktree)
+        changed = replace(row, worktree=_keep_location_fields(worktree, row.worktree))
         rows[rows.index(row)] = changed
         return changed
 
@@ -1518,7 +1546,7 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
         row = _required(rows, showrunner)
         if row.kind not in ("showrunner", "agent"):
             raise StaffRefused("set-doc requires a showrunner or agent")
-        changed = replace(row, doc=doc)
+        changed = replace(row, doc=_keep_location_fields(doc, row.doc))
         rows[rows.index(row)] = changed
         return changed
 
@@ -1618,7 +1646,8 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
         if isinstance(row.worktree, WorktreeUnfilled):
             print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
             return False
-        changed = replace(row, worktree=RemovedWorktree(row.worktree.machine, row.worktree.path))
+        changed = replace(row, worktree=_keep_location_fields(
+            RemovedWorktree(row.worktree.machine, row.worktree.path), row.worktree))
     elif row.kind == "showrunner":
         if any(child.kind == "unit" and child.parent == ReportsTo(row.id)
                and not isinstance(child.worktree, RemovedWorktree) for child in rows):
@@ -1626,7 +1655,7 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
         if isinstance(row.doc, DocUnfilled):
             print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
             return False
-        changed = replace(row, doc=WrappedDoc(row.doc.machine, row.doc.path))
+        changed = replace(row, doc=_keep_location_fields(WrappedDoc(row.doc.machine, row.doc.path), row.doc))
     else:
         raise StaffRefused("pending retirement is for units and showrunners")
     rows[rows.index(row)] = changed

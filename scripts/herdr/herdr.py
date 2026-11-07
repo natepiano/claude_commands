@@ -707,6 +707,14 @@ class NoPane:
 
 
 @dataclass(frozen=True)
+class PaneNotRead:
+    """The caller has not read the pane row."""
+
+
+PANE_NOT_READ = PaneNotRead()
+
+
+@dataclass(frozen=True)
 class SeveralPanes:
     label: str
     count: int
@@ -1149,8 +1157,9 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float, *, exp
 def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
     """The indexes of `titles` in the order the workspace `space` shows them.
 
-    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
-    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
+    Saved tabs keep their saved order. A new tab goes after the last placed tab with an equal
+    or lower rule: showrunner first, then unit directors A-Z, then other tabs A-Z.
+    The first tab stays first. `sort-tabs` ignores saved order.
     """
     showrunner_title = space
     if titles and not saved and space not in titles:
@@ -1164,7 +1173,8 @@ def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_direct
     for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
         # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
         start = 0 if titles[index] == space or not order else 1
-        at = next((place for place in range(start, len(order)) if rule(titles[order[place]]) > rule(titles[index])), len(order))
+        at = next((place + 1 for place in range(len(order) - 1, start - 1, -1)
+                   if rule(titles[order[place]]) <= rule(titles[index])), start)
         order.insert(at, index)
     return order
 
@@ -1192,6 +1202,19 @@ class _LayoutLock:
     def __exit__(self, *_: object) -> None:
         if self.handle >= 0:
             os.close(self.handle)
+
+
+@dataclass(frozen=True)
+class SubmitUnproved:
+    """Submit without waiting for a turn state."""
+
+
+@dataclass(frozen=True)
+class SubmitStarts:
+    timeout_ms: int
+
+
+SUBMIT_UNPROVED = SubmitUnproved()
 
 
 class Herdr:
@@ -2040,10 +2063,11 @@ class Herdr:
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(shell), activity)
 
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> str:
         """Prove the backend identity from the exact foreground process."""
         try:
-            return self.native_pane_process(pane, kind, timeout).current_identity
+            return self.native_pane_process(pane, kind, timeout, pane_row=pane_row).current_identity
         except ValueError as error:
             raise HerdrFailure(str(error)) from error
 
@@ -2059,21 +2083,21 @@ class Herdr:
             raise HerdrFailure("native process pid is unavailable")
         return pid
 
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        pane_row: Mapping[str, object] = {}
-        if kind == "codex" and codex_without_session(info):
+        if isinstance(pane_row, PaneNotRead) and kind == "codex" and codex_without_session(info):
             try:
                 row = self.pane_row(pane)
                 if not isinstance(row, NoPane):
                     pane_row = row
             except HerdrFailure:
                 pass
-        return pane_native_process(info, kind, pane_row)
+        return pane_native_process(info, kind, {} if isinstance(pane_row, PaneNotRead) else pane_row)
 
     def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
         """Read the foreground agent identity, then confirm its terminal."""
@@ -2331,7 +2355,8 @@ class Herdr:
         except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
             return failure(str(error))
 
-    def prompt(self, pane: str, text: str, *, target: str) -> None:
+    def prompt(self, pane: str, text: str, *, target: str,
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2339,7 +2364,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-        self._prompt(pane, text)
+        self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
@@ -2348,18 +2373,22 @@ class Herdr:
             raise HerdrFailure(f"{pane}: terminal changed before prompt")
         self._prompt(pane, text)
 
-    def _prompt(self, pane: str, text: str) -> None:
+    def _prompt(self, pane: str, text: str, *,
+                proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        _ = self.run("agent", "prompt", pane, text)
+        arguments = ["agent", "prompt", pane, text]
+        if isinstance(proof, SubmitStarts):
+            arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
+        _ = self.run(*arguments)
 
-    def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
+    def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
         try:
-            result = run_program(self.argv("agent", "wait", pane, "--until", state,
+            result = run_program(self.argv("agent", "wait", pane, "--until", "done", "--until", "idle",
                                            "--timeout", str(timeout_ms)), timeout=timeout_ms / 1000 + 10)
         except subprocess.TimeoutExpired:
             return WaitTimedOut()
@@ -3318,6 +3347,17 @@ def codex_rollout_thread(pid: int) -> str:
     if len(identities) != 1:
         raise ValueError(f"pid {pid}: current Codex rollout is unavailable or ambiguous")
     return next(iter(identities))
+
+
+def codex_transcript(pid: int) -> Path:
+    """Find the open transcript of one proved Codex process."""
+    started = _process_birth(pid)
+    files = _open_codex_rollouts(pid)
+    identity = codex_rollout_thread(pid)
+    paths = {Path(target) for target in files.values() if target.endswith(f"-{identity}.jsonl")}
+    if _process_birth(pid) != started or _open_codex_rollouts(pid) != files or len(paths) != 1:
+        raise ValueError(f"pid {pid}: current Codex transcript is unavailable or ambiguous")
+    return next(iter(paths))
 
 
 def codex_resume_thread(pid: int) -> str:

@@ -2997,7 +2997,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
             try:
-                herdr.Herdr(herdr.shared_session()).prompt(state.pane, text, target=str(worker.current_session))
+                herdr.Herdr(herdr.shared_session()).prompt(
+                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr.HerdrFailure, OSError) as error:
                 reason = str(error)
@@ -3034,9 +3035,13 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    running = (sessions.running_sessions() if needs_recipient_roster or needs_sender_roster
-               or (options.to != USER and isinstance(options.selection, RosterLookup)) else [])
-    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, records=running) if needs_recipient_roster or needs_sender_roster
+    reads_registry = (needs_recipient_roster or needs_sender_roster
+                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+    registry = sessions.read_registry() if reads_registry else sessions.RegistryRead((), ())
+    running = sessions.running_records(registry)
+    if reads_registry:
+        membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
     if isinstance(options.selection, MeshWorker):

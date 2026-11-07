@@ -20,7 +20,10 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 - `append(agent_id, role, lens, at, approximate=False)` writes under an exclusive `fcntl.flock` and starts a new line after a truncated tail.
 - `register_default(agent_id, role, at) -> bool` reads the log and appends under the same lock, only when no line already names the agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id`. Concurrent deliveries write one line.
 - `assignments(path) -> RoleLog(assignments, problems)` reads the file as bytes and decodes each line inside its own handler. A malformed or undecodable line is a counted `problems` entry; the reader never raises.
-- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`. For a full id it merges the history recorded under `agent_id[:8]` when that prefix is a recorded 8-hex id, so an old worker line under the prefix still counts. A worker reads `interactive` until `agent_bg.sh` records its dispatch role under the full id.
+- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`.
+  For a full id, it merges history under `agent_id[:8]` when that prefix is a recorded 8-hex id.
+  Old worker lines under that prefix still count.
+  A worker reads `interactive` until `scripts/direct/claude_worker.py` records its dispatch role under the full id.
 - CLI: `append`, `register --id --role`, `backfill [--archive] [--live]`, `show [--id]`. A write failure prints one `agents_log: <reason>` stderr line and exits 0.
 
 **Writers.**
@@ -29,7 +32,7 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | --- | --- |
 | `scripts/direct/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
-| `scripts/agents/agent_bg.sh` | the `AGENT_BG_ROLE` dispatch role, under the full destination id, before delivery. A call with no role, such as a resident consultation, records nothing, so that session stays `interactive` |
+| `scripts/direct/claude_worker.py` | Records the dispatch role under the full destination id before delivery. A call without a role records nothing, so the session stays `interactive`. |
 | `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
 | `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
@@ -71,7 +74,7 @@ Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/
 
 **Request activity** (`scripts/usage/activity.py`, standard library only, shipped to the Mac). Each request is `Working() | Waiting(action) | PostingStatus()`, decided from atoms of the request's items: a final answer or any work atom makes it work; else any wait atom makes it wait, named by the first; else any status atom makes it a status post; else work. A Codex request's items are the `response_item` lines before its `token_count` record (`CodexContext.evidence`, also in the replayed prefix); a Claude request's are the lines of one message key, so a multi-line message takes the merged result and the merge `UPDATE` replaces `activity` and `wait_action`. A re-read Codex row that conflicts sets them with an `UPDATE` and does not count as added.
 
-- Shell commands (Claude `Bash`, Codex `exec_command` `cmd`): heredoc bodies dropped, quoted text kept with its separators turned to `_`, `/dev/null` and fd-dup redirections dropped, then one atom per statement (`&&`, `||`, `;`, newline, `&`). A pipe into anything but a filter (`grep head tail wc awk sed sort uniq cut tr jq rg cat`), or a filter with `>`, is work. `sleep`, `wait`, `board.sh read`, `tail` without `>`, `cat`/`grep`/`rg`/`wc`/`stat`/`head` of a status file (`.log .out .output .status .exit .rc .done .pid .code`, `/proc/loadavg`, `sentinel`, `marker`, `exit_code`), `test`/`[`/`[[`, `ps`, `pgrep`, `kill -0` wait; `board.sh post <dir> <who> status` is a status post; `echo`, `cd`, `done` and the other neutral words add nothing; anything else is work.
+- Shell commands come from Claude `Bash` and Codex `exec_command` `cmd`. The parser removes heredoc bodies and replaces separators in quoted text with `_`. It removes `/dev/null` redirections and file descriptor duplication. It makes one atom per statement, split at `&&`, `||`, `;`, newline, or `&`. A pipe into a command outside the filter list counts as work. The filters are `grep head tail wc awk sed sort uniq cut tr jq rg cat`. A filter with `>` also counts as work. The commands `sleep`, `wait`, `board.sh read`, and `tail` without `>` count as wait. The commands `cat`, `grep`, `rg`, `wc`, `stat`, and `head` count as wait when they read a status file. Status files include `.log .out .output .status .exit .rc .done .pid .code`, `/proc/loadavg`, `sentinel`, `marker`, and `exit_code`. The commands `test`, `[`, `[[`, `ps`, `pgrep`, and `kill -0` also count as wait. Both `board.sh post <dir> <who> status` and `board.sh post <who> status` count as status posts. An explicit `<dir>` starts with `/`; the form without a folder uses `UNIT_RUN_DIR`. The commands `echo`, `cd`, `done`, and the other neutral words add nothing. All other commands count as work.
 - Codex: an `exec` custom tool call with `setTimeout(` waits; one calling any tool but `exec_command`/`write_stdin` works; an empty `chars` (or a `write_stdin` with none) waits as `empty write_stdin`; each `cmd` is classified as shell. `function_call` `sleep` and `wait` wait (`sleep tool`, `wait tool`); every other item type except messages, reasoning and outputs works.
 - Claude: `Read` of a status file waits (`Read *.output`); every other tool use works; a text-only message is work.
 - The Mac wire carries `activity` and `wait_action`; `remote_measurement` decodes them strictly (`decode_activity`) and a missing or invalid pair is a failed read.
@@ -258,7 +261,7 @@ These writes do not enter the usage store.
 | `scripts/whoami/worker_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
 | `scripts/agents/codex_mesh.py` | Worker role and lens recording; roster revision and guarded writes |
-| `scripts/direct/prepare_session.sh`, `scripts/agents/agent_bg.sh`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
+| `scripts/direct/prepare_session.sh`, `scripts/direct/claude_worker.py`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
 | `/etc/nixos/modules/linux/usage-collect.nix` | Hourly timer |
 | `scripts/usage/test_*.py`, `scripts/whoami/test_worker_usage.py`, `scripts/usage/fixtures/` | Tests over invented logs; expected reports compared whole |
 
@@ -290,7 +293,10 @@ These writes do not enter the usage store.
 - **Token counts** outside 0..`MAX_SQLITE_INTEGER` (2**63-1) are never measurements: locally the line is skipped and its cursor advances; on the wire one ends the pass as a failed read.
 - **Listing** uses `os.scandir`, because Python 3.13 `Path.glob` hides listing errors. A nested folder that cannot be listed makes the source `partial`.
 - **Codex key collisions**: the key holds the file's last path component only, so a moved file keeps its keys, and two files of one thread with the same name would share them. Codex names files `rollout-<date-time>-<id>.jsonl`.
-- **Hook order**: for a worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes the dispatch role under the same id; the latest line wins in `role_at`. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
+- **Hook order**: the hook writes `interactive` under the full worker UUID before `scripts/direct/claude_worker.py` writes the dispatch role under that id.
+  The latest line wins in `role_at`.
+  `register_default` reads the whole log at every session start.
+  Sessions that started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
 - **Backfill limits**: the worker archive keeps no `mesh_roster.json` or `workers` ledger, so archived runs backfill nothing; older review logs do not name the worker, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
 - **Role coverage is thin for old history.** At first import most Codex requests were `unassigned` (460,601 of about 496,500); Claude about half (191,755 of about 400,000).
 - **Checkpoints** are read on natedev only, so a commit made on the Mac counts once natedev's repository has it. A candidate repository path that no longer exists (a removed worktree; 4 of 18 at first read) is skipped. 6 of 637 real phase ids contain spaces.

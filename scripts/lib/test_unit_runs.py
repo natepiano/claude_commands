@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -24,6 +25,36 @@ else:
 
 
 class UnitRunsTest(StaffTestCase):
+    def test_anomaly_prints_once_across_both_import_names(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repository / "scripts/lib"), str(repository)))}
+        for names in (("unit_runs", "scripts.lib.unit_runs"), ("scripts.lib.unit_runs", "unit_runs")):
+            with self.subTest(names=names):
+                command = f"import importlib; [importlib.import_module(name).report_anomaly('anomaly: import test') for name in {names!r}]"
+                result = subprocess.run([sys.executable, "-c", command], cwd=self.root, env=environment,
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["anomaly: import test"])
+
+    def test_director_prints_each_anomaly_once_but_keeps_changed_causes(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        _ = fixture_member("showrunner", name="anomaly-fixture")
+        first, second = self.root / "first", self.root / "second"
+        for run in (first, second):
+            run.mkdir()
+            write_text_atomic(run / unit_runs.STATE_FILE, "{}")
+        record = staff.snapshot()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            for run in (first, second, first, second):
+                self.assertEqual(unit_runs.director(run, record=record), "")
+            write_text_atomic(first / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: "gone"}))
+            self.assertEqual(unit_runs.director(first, record=record), "")
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
+            f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
+            f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
+
     def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
         runs, config = self.root / "runs", self.root / "config"
         config.mkdir()
@@ -101,6 +132,8 @@ class UnitRunsTest(StaffTestCase):
             config = root / "config"
             config.mkdir()
             run = root / "first"
+            run.mkdir()
+            write_text_atomic(run / "worker_transport", "mesh\n")
             with patch.dict(os.environ, {"CONF_DIR": str(config)}):
                 write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
                 self.assertEqual(unit_runs.worker_transport(run), "mesh")
@@ -111,7 +144,27 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(pin.read_text(), "mesh\n")
                 self.assertEqual(pin.stat().st_mtime_ns, unchanged)
                 self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
-                self.assertEqual((root / "second/worker_transport").read_text(), "herdr\n")
+                second_pin = root / "second/worker_transport"
+                self.assertEqual(second_pin.read_text(), "herdr\n")
+                second_before = second_pin.read_bytes(), second_pin.stat().st_mtime_ns
+                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
+                self.assertEqual((second_pin.read_bytes(), second_pin.stat().st_mtime_ns), second_before)
+
+    def test_new_mesh_run_exits_two_with_one_error_line_and_no_pin(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        run = self.root / "new-mesh"
+        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            with self.assertRaises(SystemExit) as failure:
+                _ = unit_runs.main(["worker-transport", str(run)])
+        self.assertEqual(failure.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("mesh", errors.getvalue())
+        self.assertFalse((run / "worker_transport").exists())
 
     def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
