@@ -1122,6 +1122,11 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
+Running rows show a `machine` column after `min` and before `pid`.
+The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
+A narrow view omits the machine column before it reduces name space.
+Waiting rows have no machine value. Services lines do not change.
+The admission service admits each running step on its own machine. No per-row protocol field is added.
 `keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
 `RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
 `admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import cache, cached_property
 from zoneinfo import ZoneInfo
 
+from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
@@ -364,7 +365,14 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             show_width -= 1
         if show_width + unit_width > name_room and unit_width > 3:
             unit_width -= 1
-    bar_column = fixed + show_width + unit_width + pid_width + 1
+    machine = field(store.host_name()) if running else ""
+    machine_width = max(len("machine"), terminal_width(machine)) if machine else 0
+    names_fit = all(terminal_width(show) <= show_width and terminal_width(unit) <= unit_width
+                    for show, unit, _ in all_names)
+    if not names_fit or show_width + unit_width + machine_width + 1 > name_room:
+        machine_width = 0
+    machine_cells = machine_width + 1 if machine_width else 0
+    bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells
     running_text = [
         (f" {row.kept / gate.GIB:.1f} / {row.used / gate.GIB:.1f}" if row.measured
          else f" {row.kept / gate.GIB:.1f} / —")
@@ -392,7 +400,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         place, memory = "#", "GiB: kept/use; need"
         return (Span(pad_left(place, place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
                      + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", step_width) + " "
-                     + pad_left("min", minutes_width) + " " + pad_right("pid", pid_width) + " " + memory, "inactive"),)
+                     + pad_left("min", minutes_width) + " "
+                     + (pad_right("machine", machine_width) + " " if machine_width else "") + pad_right("pid", pid_width) + " " + memory, "inactive"),)
 
     @cache
     def column(text: str, width: int) -> str:
@@ -429,11 +438,13 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         append_row((*identity_columns("run", row.step.step, pair, minutes,
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
+                      *((Span(column(machine, machine_width), "inactive"),) if machine_width else ()),
                       Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
     for index, (step, pair, bar, suffix) in enumerate(zip(waiting, waiting_names, bars, waiting_status)):
         row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
+               *((Span(" " * machine_cells),) if machine_width else ()),
                Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
         append_row((*row, *suffix))
     if isinstance(head, gate.TokenWaitersOnly):

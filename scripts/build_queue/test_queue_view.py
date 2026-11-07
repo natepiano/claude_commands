@@ -12,6 +12,7 @@ from typing import Self, cast, override
 from unittest import mock
 
 from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
+from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -44,6 +45,41 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
 
 
 class QueueViewTests(QueueFixtureTests):
+
+    def test_running_machine_column_uses_the_private_host_and_preserves_names(self) -> None:
+        model = self.fixture.cap_model()
+        for columns in (60, 80, 100, 140):
+            with self.subTest(columns=columns):
+                text = plain(queue_view.render_view(model, columns))
+                header, = [row for row in text.splitlines() if row.lstrip().startswith("# ")]
+                rows = [row for row in text.splitlines() if row.startswith("run")]
+                self.assertTrue(rows)
+                if columns >= 100:
+                    self.assertLess(header.index("min"), header.index("machine"))
+                    self.assertLess(header.index("machine"), header.index("pid"))
+                    for row in rows:
+                        self.assertEqual(row.index("fixture-host"), header.index("machine"))
+                        self.assertEqual(row.index("pid "), header.index("pid"))
+                    for row in waiting_rows(queue_view.render_view(model, columns)):
+                        self.assertEqual(row[header.index("machine"):header.index("pid")].strip(), "")
+                else:
+                    self.assertNotIn("machine", header)
+                    self.assertNotIn("fixture-host", text)
+                self.assertTrue(all(terminal_width(row) <= columns for row in text.splitlines()))
+
+    def test_long_machine_name_drops_before_the_view_cuts_names(self) -> None:
+        model = self.fixture.cap_model()
+        baseline = plain(queue_view.render_view(model, 100))
+        with mock.patch.object(store, "host_name", return_value="private-machine-with-a-long-name"):
+            text = plain(queue_view.render_view(model, 100))
+        header, = [row for row in text.splitlines() if row.lstrip().startswith("# ")]
+        self.assertNotIn("machine", header)
+        before_rows = [row for row in baseline.splitlines() if "pid " in row]
+        after_rows = [row for row in text.splitlines() if "pid " in row]
+        self.assertEqual([row.split()[:5] for row in before_rows],
+                         [row.split()[:5] for row in after_rows])
+        self.assertIn("metrics-gathering", text)
+        self.assertIn("metrics-gathering", baseline)
 
     def test_ci_reservation_label_comes_from_configuration_and_runner_identity(self) -> None:
         with AdmissionFixture() as admission:

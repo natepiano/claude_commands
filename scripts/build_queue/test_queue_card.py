@@ -17,6 +17,19 @@ from scripts.message.unit_labels import UnitLabels
 
 class QueueCardTests(QueueFixtureTests):
 
+    def test_running_card_names_the_private_machine_after_pid(self) -> None:
+        model = self.fixture.model()
+        for columns in (60, 80, 100, 140):
+            with self.subTest(columns=columns):
+                lines = queue_card.render_selection(model, "1", columns)
+                text = plain(lines)
+                record = " ".join(text.split())
+                self.assertIn("pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, nextest:", record)
+                self.assertEqual(record.count("pid 900"), 1)
+                self.assertEqual(record.count("0 min ago"), 1)
+                self.assertNotIn("min machine", text)
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):
@@ -313,7 +326,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_running_selector_prints_one_complete_running_evidence_record(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "id-widget", 400))
-        expected = ("Selected running step: pid 900 · tool-based-ui / widget / widget-enhancements-title, nextest: "
+        expected = ("Selected running step: pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, nextest: "
                     "admitted 10:45 (0 min ago); need 11.1 GiB; anonymous use 5.1 GiB; "
                     "held slot 0.0 GiB; kept aside 6.0 GiB")
         self.assertEqual(text.count(expected), 1)

@@ -520,6 +520,21 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Ruled out:** a separate `type_gate.py`, a promotion hook or a new timer; a client that sends the gate shape.
 
+### Phase 24 — Each running row names its machine  · status: done
+
+#### As-built
+
+- The run rows of `build_queue.py view` show a `machine` column after `min` and before `pid`. The value is `scripts.buildlog.store.host_name()`, read once per view: the admission service admits work only on the machine where it runs.
+- A narrow view (60, 80) leaves the column out before it cuts a name, so `view_60.txt` and `view_80.txt` did not change.
+- The one-step card names the machine after the pid in its running line. The card has no second table.
+- `queue_fixture.py` sets a private host name, so no test reads the live host.
+
+**Files:** `scripts/build_queue/queue_view.py`, `queue_card.py`, `queue_fixture.py`; `test_queue_view.py`, `test_queue_card.py`; goldens `view_100.txt`, `view_140.txt`, `card_1.txt`, `card_4.txt`, `no_bump_100.txt`, `unit_override_view.txt`; `docs/as-built/build-memory-admission.md`; `commands/build/queue.md`.
+
+**Binds later work:** Phase 10g places steps on other hosts; its rows need a host per row from the service, because the view reads one `host_name()` for all rows.
+
+**Ruled out:** a new host name function; a per-row protocol field before 10g.
+
 ### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: done
 
 #### As-built
