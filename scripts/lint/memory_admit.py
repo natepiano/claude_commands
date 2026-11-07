@@ -40,6 +40,7 @@ from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCrates
 from atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
+from scripts.production import staff
 
 from test_phase import (
     CallRecord as CallRecord,
@@ -3422,7 +3423,7 @@ BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session = staff.caller_identity()
     identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
                                 "step": step, "folder": os.getcwd() if worktree else ""}
     if unit := os.environ.get(BUILDLOG_UNIT):

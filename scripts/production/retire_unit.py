@@ -25,6 +25,7 @@ from scripts.message import sessions
 from scripts.lib import process_group, conf
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
+from scripts.copies import copies
 import berth_board
 import progress_history
 import unit_lookup
@@ -461,6 +462,9 @@ def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
         print(f"refused: {reason}")
     for row in members(unit, staff.snapshot()):
         print(f"would stop: session {row.current_session}")
+    trees = copies.owned_trees(unit.staff_member.name)
+    for tree in (*trees.standing, *(entry[0] for entry in trees.workspaces)):
+        print(f"would remove: checkout {tree}")
     print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")
     return int(bool(refused))
@@ -492,11 +496,20 @@ def release_reservations(unit: Unit, *, settings: conf.ConfigRead) -> None:
             print(f"anomaly: {failure(result)}")
 
 
+def remove_unit_trees(owner: str) -> None:
+    """Report a cleanup failure without stopping retirement."""
+    try:
+        copies.remove_trees(owner)
+    except copies.CopyError as error:
+        print(f"anomaly: {error}".replace("\n", " "))
+
+
 def retire(unit: Unit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
     if unit.retired and not unit.worktree.exists():
+        remove_unit_trees(row.name)
         print("unchanged")
         return 0
     refused = refusals(unit, settings=settings)
@@ -542,6 +555,7 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    remove_unit_trees(row.name)
     failed = remove(unit, settings=settings)
     if failed:
         print("\n".join(f"anomaly: {reason}" for reason in failed))
@@ -563,7 +577,7 @@ def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
         if cast(bool, options.dry_run):
             return dry_run(unit, settings=settings)
         return retire(unit, settings=settings, record=record)
-    except (Refused, Refusal, ValueError, OSError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
+    except (Refused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"retire: {error}")
         return 1
 

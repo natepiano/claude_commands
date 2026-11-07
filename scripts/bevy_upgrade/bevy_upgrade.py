@@ -68,7 +68,7 @@ def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Produc
         return read_production(document.path)
     doc = cast(Path | None, args.production)
     if doc is None:
-        runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        runtime = staff.caller_identity()
         row = record.by_current_session(runtime)
         if row is not None and row.kind == "showrunner":
             document = session_staff.RowResolver(record).production_doc(row)

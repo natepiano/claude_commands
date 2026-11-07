@@ -20,6 +20,7 @@ import sys
 import time
 from threading import Event, Thread
 from typing import NoReturn, cast, override
+from urllib.parse import unquote, urlsplit
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -51,7 +52,7 @@ class AllRepositories:
 
 @dataclass(frozen=True)
 class SelectedRepository:
-    """Remove copies from one canonical repository name."""
+    """Remove copies from one repository identity."""
 
     name: str
 
@@ -216,15 +217,55 @@ def commit_at(repo: Path, revision: str) -> str:
     return git(repo, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}").decode().strip()
 
 
+def caller_owner() -> str:
+    """Read the calling session's owner from the local staff record."""
+    from scripts.production import staff
+
+    try:
+        record = staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        raise CopyError(f"calling session has no readable staff row: {error}".replace("\n", " ")) from error
+    row = record.owner_of(staff.caller_identity())
+    if row is None:
+        raise CopyError("calling session has no staff row or unit owner")
+    return row.name
+
+
+def origin_url(source: Path) -> str | None:
+    """Read the origin URL when the repository has one."""
+    if "origin" in git(source, "remote").decode().splitlines():
+        return git(source, "remote", "get-url", "origin").decode().strip()
+    return None
+
+
+def main_checkout(source: Path) -> Path:
+    """Read the main checkout, including repositories with separate Git metadata."""
+    common, current = git(source, "rev-parse", "--path-format=absolute",
+                          "--git-common-dir", "--git-dir").decode().splitlines()
+    if common == current and git(source, "rev-parse", "--is-bare-repository").strip() == b"false":
+        return Path(git(source, "rev-parse", "--show-toplevel").decode().strip())
+    first = git(source, "worktree", "list", "--porcelain").decode().splitlines()[0]
+    checkout = Path(first.removeprefix("worktree "))
+    configured = git(source, "config", "--default", str(checkout), "--get", "core.worktree").decode().strip()
+    return (Path(common) / configured).resolve()
+
+
 def repository_name(source: Path) -> str:
-    record = scratch.task_of(source)
-    if isinstance(record, copy_record.Registered):
-        original = record.fields.get("source_path")
-        if isinstance(original, str) and Path(original) != source:
-            source = Path(original)
-    common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
-    # Linked unit worktrees share the main repository's name, including .claude.
-    return common.parent.name if common.name == ".git" else source.name
+    """Follow local origins to the repository's upstream identity."""
+    seen: set[Path] = set()
+    while True:
+        origin = origin_url(source)
+        if (origin is not None and not origin.startswith("file://")
+                and not Path(resolved_remote_url(source, origin)).is_absolute()):
+            return origin.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+        checkout = main_checkout(source)
+        if checkout in seen:
+            raise CopyError(f"{source}: local origins form a cycle")
+        seen.add(checkout)
+        if origin is None:
+            return checkout.name
+        source = (Path(unquote(urlsplit(origin).path)) if origin.startswith("file://")
+                  else Path(resolved_remote_url(checkout, origin)))
 
 
 def checked_owner(owner: str) -> str:
@@ -357,8 +398,9 @@ def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> No
 
 def source_origin(source: Path) -> tuple[str, str]:
     """Return the upstream URL and the source refs that represent it."""
-    if "origin" in git(source, "remote").decode().splitlines():
-        return git(source, "remote", "get-url", "origin").decode().strip(), "refs/remotes/origin"
+    origin = origin_url(source)
+    if origin is not None:
+        return origin, "refs/remotes/origin"
     return str(source), "refs/heads"
 
 
@@ -544,6 +586,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
     branch = branch.removeprefix("refs/heads/")
     _ = git(source, "check-ref-format", f"refs/heads/{branch}")
     common = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip()
+    identity = repository_name(source)
     descriptors: list[int] = []
     with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
         if state is not ClaimState.ACQUIRED:
@@ -563,7 +606,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     _ = scratch.hold(tree, task, LEGACY_WORKER_HOLD_REASON)
                     fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),
                         source_commit=base, copy_commit=copy_commit, target_mode="none",
-                        seed_source="", borrows_from=common)
+                        seed_source="", borrows_from=common, repository_identity=identity)
                     if manifest_path:
                         fields["crate_run"] = manifest_path
                     _ = scratch.update_record(tree, lambda _: scratch.fields_for_task(fields, task))
@@ -571,7 +614,8 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                 else:
                     scratch.register_copy(tree, task=task, owner_unit=owner, source_path=str(source),
                                           source_commit=base, copy_commit=copy_commit, target_mode="none",
-                                          seed_source="", borrows_from=common, crate_run=manifest_path)
+                                          seed_source="", borrows_from=common, crate_run=manifest_path,
+                                          repository_identity=identity)
 
             if isinstance(record, copy_record.Registered):
                 expected = {"owner_unit": owner, "source_path": str(source), "source_commit": base}
@@ -730,22 +774,11 @@ def removing_path(tree: Path) -> Path:
 
 
 def workspace_repository(record: copy_record.Registered) -> str:
-    """Read repository provenance without requiring the source checkout to exist."""
-    seen: set[str] = set()
-    while True:
-        common = record.fields.get("borrows_from")
-        if not isinstance(common, str) or common in seen:
-            source = record.fields.get("source_path")
-            return Path(source).name if isinstance(source, str) else ""
-        seen.add(common)
-        git_dir = Path(common)
-        if git_dir.name != ".git":
-            source = record.fields.get("source_path")
-            return Path(source).name if isinstance(source, str) else ""
-        parent = scratch.task_of(git_dir.parent)
-        if not isinstance(parent, copy_record.Registered):
-            return git_dir.parent.name
-        record = parent
+    """Read the repository identity saved when the workspace was registered."""
+    identity = record.fields["repository_identity"]
+    if not isinstance(identity, str):
+        raise CopyError("workspace repository_identity must be a string")
+    return identity
 
 
 def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[tuple[Path, copy_record.Registered]]:
@@ -855,8 +888,16 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
         raise CopyError(f"{tree}: repair crate run {path}: {error}") from error
 
 
-def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
-    """Remove an owner's idle trees within the selected repository scope."""
+@dataclass(frozen=True)
+class OwnedTrees:
+    """The standing trees and workspaces selected for one owner."""
+
+    standing: tuple[Path, ...]
+    workspaces: tuple[tuple[Path, copy_record.Registered], ...]
+
+
+def owned_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> OwnedTrees:
+    """Read the owner's trees without acquiring locks or changing files."""
     pool = load_config()
     scope = repository_scope(repo)
     directories = ([pool.root / scope.name] if isinstance(scope, SelectedRepository) else
@@ -864,26 +905,30 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                    if pool.root.exists() else [])
     if not OWNER.fullmatch(owner):
         directories = []
-    workspaces = owned_workspaces(owner, scope)
-    with ExitStack() as locks:
-        present: list[Path] = []
-        for directory in directories:
-            for candidate in tree_paths(owner, directory.name, pool):
-                for tree in (removing_path(candidate), candidate):
-                    if not tree.exists():
-                        continue
-                    state = locks.enter_context(claim_tree(tree, create=False))
-                    if state is ClaimState.REPLACED:
-                        continue
-                    if state is not ClaimState.ACQUIRED:
-                        raise BusyCopy(tree)
-                    if (tree / GATE_RECORD).exists():
-                        record = read_record(tree)
-                        if record.owner != owner or record.repo != directory.name:
-                            raise CopyError(f"{tree}: gate record belongs to another owner or repository")
-                    present.append(tree)
-        for tree, record in workspaces:
-            try:
+    standing = tuple(tree for directory in directories
+                     for candidate in tree_paths(owner, directory.name, pool)
+                     for tree in (removing_path(candidate), candidate) if tree.exists())
+    return OwnedTrees(standing, tuple(owned_workspaces(owner, scope)))
+
+
+def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
+    """Remove the caller's idle trees within the selected repository scope."""
+    try:
+        selected = owned_trees(owner, repo)
+        with ExitStack() as locks:
+            present: list[Path] = []
+            for tree in selected.standing:
+                state = locks.enter_context(claim_tree(tree, create=False))
+                if state is ClaimState.REPLACED:
+                    continue
+                if state is not ClaimState.ACQUIRED:
+                    raise BusyCopy(tree)
+                if (tree / GATE_RECORD).exists():
+                    record = read_record(tree)
+                    if record.owner != owner or record.repo != tree.parent.name:
+                        raise CopyError(f"{tree}: gate record belongs to another owner or repository")
+                present.append(tree)
+            for tree, record in selected.workspaces:
                 with workspace_removal_guard(tree, record) as validate:
                     if not scratch.end_selected_copy(tree, record, time.time(), validate=validate):
                         with scratch.judgment_lock(tree) as idle:
@@ -891,16 +936,16 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                                 raise BusyCopy(tree)
                         reason = scratch.unsaved_work(tree) or str(scratch.lifetime(tree))
                         raise CopyError(f"{tree}: kept: {reason}")
-            except scratch.ScratchError as error:
-                raise CopyError(str(error)) from error
-            _ = scratch.release(tree)
-            print(f"removed {tree}")
-        for tree in present:
-            tombstone = tree if tree.name.endswith(".removing") else removing_path(tree)
-            if tombstone != tree:
-                _ = tree.rename(tombstone)
-            shutil.rmtree(tombstone)
-            print(f"removed {tree}")
+                _ = scratch.release(tree)
+                print(f"removed {tree}")
+            for tree in present:
+                tombstone = tree if tree.name.endswith(".removing") else removing_path(tree)
+                if tombstone != tree:
+                    _ = tree.rename(tombstone)
+                shutil.rmtree(tombstone)
+                print(f"removed {tree}")
+    except (OSError, scratch.ScratchError) as error:
+        raise CopyError(str(error)) from error
 
 
 class CopyParser(argparse.ArgumentParser):
@@ -911,7 +956,6 @@ class CopyParser(argparse.ArgumentParser):
 
 class CopyArguments(argparse.Namespace):
     action: str = ""
-    owner: str = ""
     repo: str | None = None
     commit: str = ""
     apply_uncommitted: str | None = None
@@ -933,9 +977,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = ends.add_argument("--until", default="")
     _ = clone_command.add_argument("--name", default="hana")
     run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
-    remove = commands.add_parser("remove", help="remove an owner's idle standing trees")
-    for command in (run, remove):
-        _ = command.add_argument("--owner", required=True)
+    remove = commands.add_parser("remove", help="remove the caller's idle standing trees")
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
     _ = run.add_argument("--commit", required=True)
@@ -953,7 +995,7 @@ def main(argv: list[str] | None = None) -> int:
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
                 raise CopyError("run requires a command after --")
-            with standing(args.owner, args.repo or "", args.commit,
+            with standing(caller_owner(), args.repo or "", args.commit,
                           apply_uncommitted=args.apply_uncommitted, merge=args.merge) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
@@ -963,7 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             scope = (ALL_REPOSITORIES if args.repo is None else
                      SelectedRepository(repository_name(Path(args.repo).expanduser().resolve())))
-            remove_trees(args.owner, scope)
+            remove_trees(caller_owner(), scope)
     except (CopyError, OSError, scratch.ScratchError) as error:
         print(f"copies: {error}", file=sys.stderr)
         return error.exit_code if isinstance(error, CopyError) else 2

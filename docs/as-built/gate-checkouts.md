@@ -29,14 +29,18 @@ paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
 Trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
-`<repo>` is the repository folder name: `hana`, `.claude`,
-or `cargo-liner`. Linked worktrees use the main repository's name, so a unit
-worktree of `.claude` uses `.claude/verify-unit-gate`. The root under
-`~/worktrees` belongs to the existing trusted direnv root.
+`<repo>` is the last part of the upstream `origin` URL, without `.git`.
+Local origins lead to their source repository.
+Main checkouts, linked worktrees, and clones use the same identity.
+A relative local origin resolves from the main checkout.
+A repository without an origin uses its main checkout folder name, including when Git metadata is stored separately.
+Each workspace record stores its repository identity. Removal reads that identity without starting Git.
+The root under `~/worktrees` belongs to the existing trusted direnv root.
 
-Owners are unit or production names, such as `verify-unit` or `builds`, and must
-match `[a-z0-9][a-z0-9-]*`. Use no phase, run, or session ids. The caller supplies
-the owner from its existing context; the helper does not consult a roster.
+The CLI reads the calling session's local staff row.
+A worker uses its parent unit's name.
+A caller without a staff row receives an error.
+Owners for new trees must match `[a-z0-9][a-z0-9-]*`.
 
 ## Reset and build output
 
@@ -113,14 +117,14 @@ order:
 
 ```sh
 python3 ~/.claude/scripts/copies/copies.py run \
-  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify \
+  --repo ~/worktrees/claude-build-followups-verify \
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
   python3 ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
 ```
 
-`run --owner O --repo R --commit C [--apply-uncommitted W] [--merge REF]
+`run --repo R --commit C [--apply-uncommitted W] [--merge REF]
 -- <cmd> ...` executes the command with the checkout as its working directory.
 Every `{tree}` occurrence in an argument becomes the checkout's absolute path.
 The command's exit status is returned, and its output passes through.
@@ -139,15 +143,15 @@ names the affected files, and releases the tree. The next use resets it clean.
 ```sh
 python3 ~/.claude/scripts/copies/copies.py list
 python3 ~/.claude/scripts/copies/copies.py remove \
-  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify
+  --repo ~/worktrees/claude-build-followups-verify
 ```
 
 `list` prints one row per tree: path, owner, repo, commit, busy or idle, last
-holder pid, and target size. `remove --owner O` removes the owner's trees
+holder pid, and target size. `remove` removes the caller's trees
 across all repositories. An optional `--repo R` limits removal to that repository.
 The Python API accepts only a `RepositoryScope` value for `repo`.
 `copies.remove_trees(owner)` uses `AllRepositories()` by default.
-`copies.remove_trees(owner, SelectedRepository(name))` limits removal to one canonical repository name.
+`copies.remove_trees(owner, SelectedRepository(name))` limits removal to one repository identity.
 The API refuses raw strings and paths, including an empty string.
 Removal includes standing checkouts, registered editable copies, and adopted
 legacy workers. Editable copies retain scratch's checks for unsaved work and
@@ -155,9 +159,9 @@ active tasks. A busy tree refuses with exit 2. A retry completes interrupted
 removal, including a standing tree's `.removing` directory. Repeated removal
 succeeds when the trees are gone.
 
-`retire_unit.py` removes the unit's checkouts after its processes stop and before
-it writes the retired note. A busy checkout refuses retirement. The refusal
-names the session when available and otherwise gives the recorded pid.
+Unit retirement and run end remove the unit's idle standing trees and workspaces.
+A busy tree prints one line and does not stop retirement or run end.
+A retirement retry repeats cleanup. The existing cleanup also removes idle trees.
 `tidy_wrapped.py` removes the production's checkouts and its units' checkouts
 before it deletes production state. A refusal keeps the state for a retry.
 

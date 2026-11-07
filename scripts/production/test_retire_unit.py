@@ -5,6 +5,7 @@ sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_worker
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -115,6 +116,54 @@ class RetireUnitTests(unittest.TestCase):
                             + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
         return path
 
+
+    def test_retire_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
+        _ = write_config_fixture(self.root / "scratch.conf")
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            pass
+        with copies.standing("other-unit", self.checkout, "HEAD") as other:
+            pass
+        with copies.workspace(
+            "alpha", self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
+        ) as workspace:
+            pass
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(tree.exists())
+        self.assertFalse(workspace.exists())
+        self.assertTrue(other.exists())
+
+    def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn("busy", output)
+            self.assertTrue(tree.exists())
+        self.assertFalse(self.worktree.exists())
+
+    def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assertIn("busy", output)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn("unchanged", output)
+        self.assertFalse(tree.exists())
+
+    def test_retirement_dry_run_lists_trees_and_workspaces_without_changes(self) -> None:
+        _ = write_config_fixture(self.root / "scratch.conf")
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            pass
+        with copies.workspace("alpha", self.checkout, "HEAD", name="worker", branch="worker") as workspace:
+            pass
+        before = {path: path.read_bytes() for folder in (tree, workspace)
+                  for path in folder.rglob("*") if path.is_file()}
+        code, output = self.retire("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would remove: checkout {tree}", output.splitlines())
+        self.assertIn(f"would remove: checkout {workspace}", output.splitlines())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_one_retirement_shares_settings_through_validation_and_cleanup(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as reads:

@@ -80,9 +80,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
     identity = fields.get("main_agent")
     agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
     reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
     return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 

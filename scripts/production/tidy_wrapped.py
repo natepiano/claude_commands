@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_lookup  # noqa: E402
 from scripts.production.store_owner import document_id, showrunner_id  # noqa: E402
 from scripts.copies import copies  # noqa: E402
-from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from proposals_folder import issues_folder  # noqa: E402
 
@@ -94,7 +93,7 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
     try:
         for owner in sorted(owners):
             copies.remove_trees(owner)
-    except (copies.CopyError, OSError, scratch.ScratchError) as error:
+    except copies.CopyError as error:
         raise TidyRefused(str(error)) from error
     removed: list[Path] = []
     for path in paths:

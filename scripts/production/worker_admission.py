@@ -131,9 +131,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             owner = record.parent_of(child) if child is not None else None
             if owner is not None:
                 return owner
-    row = record.by_current_session(staff_id) if staff_id else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
     sources = sources if sources is not None else session_staff.member_sources()

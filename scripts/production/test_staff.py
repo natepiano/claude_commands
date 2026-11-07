@@ -508,6 +508,23 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
+        showrunner, unit, worker = self.tree()
+        record = staff.local_snapshot()
+        for reference in (worker.id, worker.current_session, unit.id, unit.current_session):
+            with self.subTest(reference=reference):
+                self.assertEqual(record.owner_of(reference), unit)
+        self.assertEqual(record.owner_of(showrunner.id), showrunner)
+        self.assertIsNone(record.owner_of("absent"))
+
+    def test_caller_identity_uses_codex_before_claude_and_allows_no_identity(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "codex", "CLAUDE_CODE_SESSION_ID": "claude"}):
+            self.assertEqual(staff.caller_identity(), "codex")
+            del os.environ["CODEX_THREAD_ID"]
+            self.assertEqual(staff.caller_identity(), "claude")
+            del os.environ["CLAUDE_CODE_SESSION_ID"]
+            self.assertEqual(staff.caller_identity(), "")
+
     def test_snapshots_keep_their_production_record_source(self) -> None:
         value: dict[str, object] = {"schema": 2, "rows": []}
         _ = self.write_document(value)

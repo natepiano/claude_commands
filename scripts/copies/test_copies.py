@@ -23,6 +23,8 @@ from scripts.copies import copies
 from scripts.lib import copy_record, scratch
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
 
 class WaitNotice(io.StringIO):
@@ -72,12 +74,18 @@ class StandingTests(unittest.TestCase):
             "COPIES_CONFIG": str(self.configuration),
         })
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        self.enterContext(isolated_staff_file(self.base / "staff.json", {}))
+        parent = fixture_member("showrunner", name="builds")
+        owner = fixture_member("unit", name="verify-unit", parent=parent.id)
+        os.environ["CODEX_THREAD_ID"] = ""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
         seed = ImmutableGitSeed.create(
             self.base, "main", "Gate Tests", "gate-tests@example.invalid",
             {"tracked.txt": "published\n", "stable.txt": "unchanged\n",
              ".gitignore": "target/\nignored.txt\n"},
         )
         self.source = seed.checkout
+        _ = self.git(seed.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
         self.gates = Path(self.settings["root"]) / self.source.name
         self.published = self.git(self.source, "rev-parse", "HEAD")
         _ = (self.source / "tracked.txt").write_text("source HEAD\n")
@@ -96,8 +104,41 @@ class StandingTests(unittest.TestCase):
                           dict(os.environ), self.base)
 
     def run_cli(self, *options: str, command: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
-        return self.cli("run", "--owner", "verify-unit", "--repo", str(self.source),
+        return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or (sys.executable, "-c", "pass")))
+
+    def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
+        unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")
+        worker = fixture_worker("builds-impl", unit.id)
+        for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            with self.subTest(variable=variable), mock.patch.dict(os.environ, {
+                "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", variable: worker.current_session,
+            }):
+                if variable == "CODEX_THREAD_ID":
+                    self.assertEqual(copies.caller_owner(), "verify-unit")
+                    continue
+                location = self.base / "command-location"
+                result = self.run_cli(command=(
+                    sys.executable, "-c",
+                    "import sys; from pathlib import Path; Path(sys.argv[1]).write_text(str(Path.cwd()))",
+                    str(location),
+                ))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                tree = Path(location.read_text())
+                self.assertEqual(tree, self.gates / "verify-unit-gate")
+                self.assertEqual(self.record(tree)["owner"], "verify-unit")
+                removed = self.cli("remove")
+                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertFalse(tree.exists())
+
+    def test_missing_staff_row_refuses_run_and_remove_in_one_line(self) -> None:
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "absent", "CODEX_THREAD_ID": ""}):
+            for arguments in (("run", "--repo", str(self.source), "--commit", "HEAD", "--", "true"), ("remove",)):
+                with self.subTest(arguments=arguments):
+                    result = self.cli(*arguments)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stderr, "copies: calling session has no staff row or unit owner\n")
+                    self.assertFalse(self.gates.exists())
 
     def record(self, tree: Path) -> dict[str, object]:
         return cast(dict[str, object], json.loads((tree / ".gate.json").read_text()))
@@ -404,6 +445,77 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertTrue((tree / ".git").is_dir())
 
+    def test_main_worktree_and_local_clones_share_the_upstream_identity(self) -> None:
+        linked = self.base / "worktree"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        checkout = self.base / "clone/checkout"
+        reload = self.base / "clone/reload"
+        for path, origin in ((checkout, self.source), (reload, checkout)):
+            _ = self.git(self.base, "clone", "-q", str(origin), str(path))
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/project.git")
+        for source in (self.source, linked, checkout, reload):
+            with self.subTest(source=source):
+                self.assertEqual(copies.repository_name(source), "project")
+        _ = self.git(reload, "remote", "set-url", "origin", checkout.as_uri())
+        self.assertEqual(copies.repository_name(reload), "project")
+
+    def test_repository_without_origin_uses_main_checkout_name(self) -> None:
+        _ = self.git(self.source, "remote", "remove", "origin")
+        linked = self.base / "worktree"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        self.assertEqual(copies.repository_name(linked), self.source.name)
+
+    def test_relative_origin_uses_the_main_checkout_from_each_worktree(self) -> None:
+        _ = self.git(self.source, "remote", "set-url", "origin", "../origin.git")
+        upstream = self.source.parent / "origin.git"
+        _ = self.git(upstream, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        linked = self.base / "worktrees" / "unit"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        for source in (self.source, linked):
+            with self.subTest(source=source), copies.standing("verify-unit", source, "HEAD") as tree:
+                self.assertEqual(tree.parent.name, "widget")
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_separate_git_directory_uses_the_main_checkout_without_origin(self) -> None:
+        main = self.base / "widget"
+        metadata = self.base / "state" / "widget-index"
+        metadata.parent.mkdir()
+        _ = self.git(self.base, "clone", "-q", "--separate-git-dir", str(metadata), str(self.source), str(main))
+        _ = self.git(main, "remote", "remove", "origin")
+        self.assertEqual(copies.repository_name(main), "widget")
+        # Linked worktrees need the main path recorded when Git metadata lives elsewhere.
+        _ = self.git(main, "config", "core.worktree", str(main))
+        linked = self.base / "separate-worktree"
+        _ = self.git(main, "worktree", "add", "--detach", str(linked), "HEAD")
+        for source in (main, linked):
+            with self.subTest(source=source), copies.standing("verify-unit", source, "HEAD") as tree:
+                self.assertEqual(tree.parent.name, "widget")
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_repository_removal_keeps_workspace_identity_after_source_deletion(self) -> None:
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        selector = self.base / "selector"
+        _ = self.git(self.base, "clone", "-q", str(self.source), str(selector))
+        _ = self.git(selector, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        with copies.workspace("verify-unit", self.source, "HEAD", name="worker", branch="worker") as tree:
+            pass
+        _ = self.git(tree, "repack", "-a", "-d")
+        (tree / ".git/objects/info/alternates").unlink()
+        shutil.rmtree(self.source)
+        result = self.cli("remove", "--repo", str(selector))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(tree.exists())
+
+    def test_remove_reports_a_filesystem_failure_as_a_copy_error(self) -> None:
+        with copies.standing("verify-unit", self.source, "HEAD") as tree:
+            pass
+        with mock.patch.object(shutil, "rmtree", side_effect=OSError("removal interrupted")):
+            with self.assertRaisesRegex(copies.CopyError, "removal interrupted"):
+                copies.remove_trees("verify-unit")
+        self.assertTrue(copies.removing_path(tree).exists())
+        copies.remove_trees("verify-unit")
+        self.assertFalse(copies.removing_path(tree).exists())
+
     def test_workspace_records_ownership_and_preserves_edits_on_resume(self) -> None:
         name = "crate-run-package"
         branch = "style-crate/run/package"
@@ -639,16 +751,16 @@ class StandingTests(unittest.TestCase):
     def test_remove_refuses_busy_tree_then_deletes_both_idle_trees_and_repeats(self) -> None:
         with copies.standing("verify-unit", self.source, self.head) as first:
             with copies.standing("verify-unit", self.source, self.head) as second:
-                result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+                result = self.cli("remove", "--repo", str(self.source))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("busy", result.stderr)
                 self.assertTrue(first.is_dir())
                 self.assertTrue(second.is_dir())
-        result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+        result = self.cli("remove", "--repo", str(self.source))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
-        self.assertEqual(self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source)).returncode, 0)
+        self.assertEqual(self.cli("remove", "--repo", str(self.source)).returncode, 0)
 
     def test_owner_removal_covers_repositories_and_editable_copies(self) -> None:
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
@@ -670,11 +782,11 @@ class StandingTests(unittest.TestCase):
             pass
         with copies.standing("other-unit", self.source, self.head) as kept:
             pass
-        narrowed = self.cli("remove", "--owner", "verify-unit", "--repo", str(other))
+        narrowed = self.cli("remove", "--repo", str(other))
         self.assertEqual(narrowed.returncode, 0, narrowed.stderr)
         self.assertFalse(second.exists())
         self.assertTrue(first.exists())
-        result = self.cli("remove", "--owner", "verify-unit")
+        result = self.cli("remove")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(first.exists())
         self.assertFalse(worker.exists())
@@ -685,7 +797,7 @@ class StandingTests(unittest.TestCase):
 
     def test_owner_removal_retries_busy_and_interrupted_trees_without_a_source(self) -> None:
         with copies.standing("verify-unit", self.source, self.head) as tree:
-            result = self.cli("remove", "--owner", "verify-unit")
+            result = self.cli("remove")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("busy", result.stderr)
             self.assertTrue(tree.exists())
@@ -694,14 +806,14 @@ class StandingTests(unittest.TestCase):
             raise OSError("interrupted owner removal")
 
         with mock.patch.object(shutil, "rmtree", side_effect=interrupt):
-            result = self.cli("remove", "--owner", "verify-unit")
+            result = self.cli("remove")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertTrue(copies.removing_path(tree).exists())
         shutil.rmtree(self.source)
-        result = self.cli("remove", "--owner", "verify-unit")
+        result = self.cli("remove")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(copies.removing_path(tree).exists())
-        self.assertEqual(self.cli("remove", "--owner", "verify-unit").returncode, 0)
+        self.assertEqual(self.cli("remove").returncode, 0)
 
     def test_owner_removal_finishes_a_deleted_editable_copy(self) -> None:
         with copies.workspace("verify-unit", self.source, self.head,
@@ -717,28 +829,21 @@ class StandingTests(unittest.TestCase):
             raise OSError("interrupted after folder deletion")
 
         with mock.patch.object(scratch, "remove", side_effect=interrupt):
-            result = self.cli("remove", "--owner", "verify-unit")
+            result = self.cli("remove")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(tree.exists())
         self.assertTrue(scratch.removal_mark(tree).exists())
-        result = self.cli("remove", "--owner", "verify-unit")
+        result = self.cli("remove")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(scratch.removal_mark(tree).exists())
         self.assertNotIn(str(tree), scratch.holds())
-        self.assertEqual(self.cli("remove", "--owner", "verify-unit").returncode, 0)
-
-    def test_owner_removal_accepts_names_that_cannot_create_copies(self) -> None:
-        for owner in ("Verify", "unit_name"):
-            with self.subTest(owner=owner):
-                result = self.cli("remove", "--owner", owner)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse(self.gates.exists())
+        self.assertEqual(self.cli("remove").returncode, 0)
 
     def test_busy_editable_copy_identifies_its_holder(self) -> None:
         with copies.workspace("verify-unit", self.source, self.head,
                               name="busy-worker", branch="worker") as tree:
             with mock.patch.object(sessions, "running_sessions", return_value=[]):
-                result = self.cli("remove", "--owner", "verify-unit")
+                result = self.cli("remove")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn(str(tree), result.stderr)
             self.assertIn(f"pid {os.getpid()}", result.stderr)
@@ -752,7 +857,7 @@ class StandingTests(unittest.TestCase):
         with copies.standing("verify-unit", self.source, self.head) as tree:
             pass
         shutil.rmtree(other)
-        result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+        result = self.cli("remove", "--repo", str(self.source))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(tree.exists())
         self.assertTrue(kept.exists())
@@ -895,8 +1000,8 @@ class StandingTests(unittest.TestCase):
     def test_invalid_owner_refuses_without_creating_a_tree(self) -> None:
         for owner in ("../escape", "Verify", "unit/name", "-unit", "unit_name", ""):
             with self.subTest(owner=owner):
-                result = self.run_cli("--owner", owner)
-                self.assertEqual(result.returncode, 2, result.stderr)
+                with self.assertRaises(copies.CopyError), copies.standing(owner, self.source, "HEAD"):
+                    self.fail("invalid owner started a tree")
                 self.assertFalse(self.gates.exists())
 
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
@@ -952,10 +1057,10 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
             raise OSError("interrupted directory removal")
 
         with mock.patch.object(shutil, "rmtree", side_effect=interrupt):
-            result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+            result = self.cli("remove", "--repo", str(self.source))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertTrue(tree.with_name(tree.name + ".removing").exists())
-        result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+        result = self.cli("remove", "--repo", str(self.source))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(self.gates.iterdir()), [])
         with copies.standing("verify-unit", self.source, self.head) as recovered:
@@ -1112,7 +1217,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
 
         result = self.python_run(
             "import sys; from scripts.copies import copies; sys.exit(copies.main(sys.argv[1:]))",
-            "run", "--owner", "verify-unit", "--repo", str(self.source), "--commit", "HEAD",
+            "run", "--repo", str(self.source), "--commit", "HEAD",
             "--merge", "origin/main", "--", "git", "rev-parse", "HEAD^2")
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1125,7 +1230,7 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
     def test_command_keeps_busy_lock_after_wrapper_is_killed(self) -> None:
         command = "import os,sys; print(os.getpid(), flush=True); sys.stdin.read(1)"
         process = subprocess.Popen(
-            [sys.executable, str(Path(copies.__file__)), "run", "--owner", "verify-unit",
+            [sys.executable, str(Path(copies.__file__)), "run",
              "--repo", str(self.source), "--commit", "HEAD", "--", sys.executable, "-c", command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:

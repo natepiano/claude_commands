@@ -469,9 +469,7 @@ def unit_worktree(session_id: str) -> staff.PresentWorktree | staff.RemovedWorkt
         record = staff.snapshot()
     except staff.StaffUnreadable:
         return staff.WORKTREE_UNFILLED
-    row = record.by_member_reference(session_id)
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(session_id)
     if row is None or row.kind != "unit":
         return staff.WORKTREE_UNFILLED
     return row.worktree

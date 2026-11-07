@@ -33,7 +33,7 @@ SHELL = cast(ShellCommands, cast(object, importlib.import_module("pre-tool-use-s
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit "
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover"
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})

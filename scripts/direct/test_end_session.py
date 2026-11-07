@@ -14,6 +14,8 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.direct import workers
+from scripts.copies import copies
+from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
@@ -60,6 +62,8 @@ class EndSessionTests(unittest.TestCase):
         direct_dir.mkdir(parents=True)
         agents.mkdir()
         (scripts / "lib").mkdir()
+        (scripts / "copies").mkdir()
+        (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
@@ -71,11 +75,12 @@ class EndSessionTests(unittest.TestCase):
         python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
         python_shim.parent.mkdir(parents=True)
         _ = python_shim.write_text(
-            # The run scan and the scratch removal are real; every other script only records its call.
+            # The run scan and scratch cleanup use private paths.
             "#!/usr/bin/env bash\ncase \"$1\" in */remove_run_scratch.py)"
             + " printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
             + f" exec {sys.executable} \"$@\";; */unit_runs.py)"
-            + f" exec {sys.executable} \"$@\";; esac\n"
+            + f" exec {sys.executable} \"$@\";; */copies.py)"
+            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
             encoding="utf-8",
         )
@@ -93,6 +98,9 @@ class EndSessionTests(unittest.TestCase):
             "HOME": str(self.root),
             "PYTHONPATH": str(END_SESSION.resolve().parents[2]),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
+            "CODEX_THREAD_ID": "",
+            "COPIES_CONFIG": str(END_SESSION.resolve().parents[2] / "config/copies.conf"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "END_SESSION_CALLS": str(self.calls),
             "UNIT_ACTIVE_DIR": str(self.marker.parent),
             "UNIT_RUN_ROOT": str(self.runs),
@@ -105,6 +113,44 @@ class EndSessionTests(unittest.TestCase):
         })
         return environment
 
+    def run_end(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(self.script)], capture_output=True, text=True,
+                              env=environment, timeout=TEST_HANG_GUARD_SECS)
+
+    def seed(self) -> Path:
+        return ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
+                                       "end@example.invalid", {"file": "content"}).checkout
+
+    def test_end_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
+        environment = self.environment()
+        environment["END_SESSION_REAL_COPIES"] = "1"
+        with patch.dict(os.environ, environment):
+            source = self.seed()
+            with copies.standing("end-unit", source, "HEAD") as tree:
+                pass
+            with copies.standing("other-unit", source, "HEAD") as other:
+                pass
+            with copies.workspace("end-unit", source, "HEAD", name="worker", branch="worker") as workspace:
+                pass
+            result = self.run_end(environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(tree.exists())
+            self.assertFalse(workspace.exists())
+            self.assertTrue(other.exists())
+            self.assertFalse(self.marker.exists())
+
+    def test_end_keeps_a_busy_tree_and_still_clears_the_marker(self) -> None:
+        environment = self.environment()
+        environment["END_SESSION_REAL_COPIES"] = "1"
+        with patch.dict(os.environ, environment):
+            source = self.seed()
+            with copies.standing("end-unit", source, "HEAD") as tree:
+                result = self.run_end(environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("busy", result.stderr)
+                self.assertTrue(tree.exists())
+            self.assertFalse(self.marker.exists())
+
     def test_roster_without_server_record_still_runs_mesh_stop(self) -> None:
         parent = staff.local_snapshot().by_current_session(self.session_id)
         assert parent is not None
@@ -112,17 +158,11 @@ class EndSessionTests(unittest.TestCase):
         _ = (self.session_dir / "mesh_roster.json").write_text(json.dumps({
             "project-impl": {"staff_id": worker.id, "status": "done"},
         }), encoding="utf-8")
-        result = subprocess.run(
-            ["bash", str(self.script)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-        )
+        result = self.run_end(self.environment())
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertTrue(calls[0].endswith(f"astra/design_roles.py unbind-run {self.session_dir}"))
         self.assertIn("remove_workers.py --session-dir", calls[1])
         self.assertIn("codex_mesh.py stop", calls[2])
@@ -131,6 +171,7 @@ class EndSessionTests(unittest.TestCase):
         self.assertIn(str(self.session_dir), calls[2])
         self.assertFalse(any("codex_mesh.py sweep" in call for call in calls))
         self.assertTrue(calls[3].endswith(f"remove_run_scratch.py --tracked {self.session_dir}"))
+        self.assertTrue(calls[4].endswith("copies/copies.py remove"))
         self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:
@@ -159,8 +200,7 @@ class EndSessionTests(unittest.TestCase):
         other = self.make_run("run-other", "another-director")
         _ = self.marker.write_text(f"{marked}\n", encoding="utf-8")
 
-        result = subprocess.run(
-            ["bash", str(self.script)], check=False, capture_output=True, text=True, env=self.environment())
+        result = self.run_end(self.environment())
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
@@ -193,8 +233,7 @@ class EndSessionTests(unittest.TestCase):
         other = self.make_run("run-other", "another-director")
         self.marker.unlink()
 
-        result = subprocess.run(
-            ["bash", str(self.script)], check=False, capture_output=True, text=True, env=self.environment())
+        result = self.run_end(self.environment())
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No active unit run marker", result.stdout)
@@ -241,8 +280,7 @@ class EndSessionTests(unittest.TestCase):
                 ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
                     workers.CodexThread(member.current_session, str(self.root / "codex")), workers.Paused(),
                     [workers.WorkerEvent("opened", "fixture", str(run), 1.0)], staff_id=member.id)
-        result = subprocess.run(["bash", str(self.script)], env=environment,
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(command_cwd.is_dir(), result.stdout + result.stderr)
         self.assertFalse(unused.exists(), result.stdout + result.stderr)
