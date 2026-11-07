@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Report named usage metrics from the ledger without reading logs or changing it."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sqlite3
@@ -16,8 +20,6 @@ from pathlib import Path
 from typing import NoReturn, cast, override
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import session_staff, staff
 from scripts.usage import collect, outcomes, weights

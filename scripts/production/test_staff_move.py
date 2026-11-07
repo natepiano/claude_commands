@@ -11,7 +11,7 @@ from unittest import mock
 
 from scripts.production import staff, staff_move, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-import herdr
+from scripts.herdr import herdr
 
 
 class StaffMoveTests(StaffTestCase):

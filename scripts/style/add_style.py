@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Create or attach one standing style production per repository."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import os
@@ -11,22 +15,20 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
 
 from scripts.production import showrunners, staff
 from scripts.lib.git_exclude import ensure_excluded
-import showrunner_tree
-from add_showrunner import NoEndingTab, herdr_tab_open
-import herdr
+from scripts.production import showrunner_tree
+from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
+from scripts.herdr import herdr
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
 
-import rules
-import style_ledger
-from atomic_file import write_text_atomic
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.lib.atomic_file import write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")

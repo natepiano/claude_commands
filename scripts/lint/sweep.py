@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Keep a cargo project's target directory under a size budget.
 
 invoke.sh's run() starts `lint sweep` in the background after every build
@@ -152,6 +152,10 @@ test binaries. A running app counts too, so its target waits for it to exit.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -178,47 +182,42 @@ from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-import conf
-from cargo_target_config import (
+from scripts.lib import conf
+from scripts.lib.cargo_target_config import (
     CargoFolderSetting,
     cargo_folder_settings,
     cargo_home_folder,
     cargo_workspace_manifest,
 )
-from process_failure import failure_detail
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
-    from . import tmp_sweep
-    from ..copies import copies
-    from ..lib import scratch
-    from ..lib.atomic_file import write_text_atomic
-    from ..buildlog import index as build_index, record, store
-    from ..notify.push_texts import RenderedPush
-    from ..notify import review
+    from scripts.lint import tmp_sweep
+    from scripts.copies import copies
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import index as build_index, record, store
+    from scripts.notify.push_texts import RenderedPush
+    from scripts.notify import review
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.copies import copies
     from scripts.lint import tmp_sweep
-    import scratch
-    from atomic_file import write_text_atomic
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-    import record
-    import store
-    import index as build_index
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.buildlog import index as build_index
 
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
 from scripts.mac_test.mirror_root import MacMirrorRoot
-from build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
+from scripts.lint.build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -1247,13 +1246,8 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     """The live Claude session each pid runs under: the nearest ancestor a session record names."""
     if not pids:
         return {}
-    if TYPE_CHECKING:
-        from ..message import process_table
-        from ..message.sessions import live_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import process_table
-        from sessions import live_sessions
+    from scripts.message import process_table
+    from scripts.message.sessions import live_sessions
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
@@ -3146,11 +3140,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     scripts = Path(__file__).resolve().parents[1]
     command: list[str] = []
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        if TYPE_CHECKING:
-            from ..notify.push_texts import RenderedPush, user_send_argv
-        else:
-            sys.path.insert(0, str(scripts / "notify"))
-            from push_texts import RenderedPush, user_send_argv
+        from scripts.notify.push_texts import RenderedPush, user_send_argv
 
         if not isinstance(phone, RenderedPush):
             raise ValueError("phone channel requires a rendered disk alert")
@@ -3163,7 +3153,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     if not command:
         return FloorAlertDelivery(natedev, FloorChannelOutcome.NOT_ATTEMPTED)
     if not TYPE_CHECKING:
-        import review
+        from scripts.notify import review
     try:
         result = subprocess.run(command, input=None, text=True, capture_output=True,
                                 timeout=send_budget.user_seconds(review.user_send_seconds()))
@@ -3177,13 +3167,8 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
 
 
-if TYPE_CHECKING:
-    from ..build_hold import build_hold
-    from ..message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    import build_hold
-    import sessions
+from scripts.build_hold import build_hold
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)

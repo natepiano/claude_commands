@@ -24,11 +24,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import herdr
+from scripts.herdr import herdr
 import retire_unit
 import unit_lookup
 import unit_move
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Production, read_production
 
 from scripts.message import sessions

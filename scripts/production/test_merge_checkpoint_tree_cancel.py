@@ -12,8 +12,8 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-import merge_checkpoint
-import test_merge_checkpoint as checkpoint_fixture
+from scripts.production import merge_checkpoint
+from scripts.production import test_merge_checkpoint as checkpoint_fixture
 from scripts.production.production_doc import ProductionDocument
 from scripts.production.merge_checkpoint_test_support import configure_test_environment
 

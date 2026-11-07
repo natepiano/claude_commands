@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Deterministically score and rank the Hanadocs issue backlog.
 
 The command-line interface is deliberately fixed to the Hanadocs vault.  The
@@ -7,6 +7,10 @@ live notes.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -24,7 +28,7 @@ from collections.abc import Sequence
 from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
-import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import writer_lock
 
 
 VAULT_PATH = Path.home() / "rust/hanadocs"

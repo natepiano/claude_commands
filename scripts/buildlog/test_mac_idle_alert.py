@@ -21,9 +21,9 @@ if TYPE_CHECKING:
     from .mac_idle_test_support import write_idle_config
     from ..lint.memory_test_support import commit_config_fixture
 else:
-    import conf
+    from scripts.lib import conf
     from scripts.buildlog import mac_idle_alert
-    from test_index import use_test_log
+    from scripts.buildlog.test_index import use_test_log
     from scripts.buildlog.mac_idle_test_support import write_idle_config
     from scripts.lint.memory_test_support import commit_config_fixture
 

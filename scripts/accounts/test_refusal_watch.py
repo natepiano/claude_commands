@@ -4,7 +4,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
@@ -37,7 +36,7 @@ from scripts.whoami import run_out
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
-import quota_alert
+from scripts.whoami import quota_alert
 
 local_staff_snapshot = staff.local_snapshot
 
@@ -49,12 +48,12 @@ if TYPE_CHECKING:
     from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("inventory")
-    shutdown_record = import_module("shutdown_record")
-    restart_support = import_module("restart_support")
-    sessions = import_module("sessions")
-    pane_record = import_module("pane_record")
+    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.shutdown.inventory")
+    shutdown_record = import_module("scripts.shutdown.shutdown_record")
+    restart_support = import_module("scripts.shutdown.restart_support")
+    sessions = import_module('scripts.message.sessions')
+    pane_record = import_module("scripts.shutdown.pane_record")
 
 
 def setUpModule() -> None:
@@ -1056,7 +1055,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups()
         _ = self.owner("new-unit", host="unit")
@@ -1080,7 +1079,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude3")
         processes: list[herdr.HerdrProcess] = []
@@ -1105,7 +1104,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
@@ -1129,7 +1128,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
         def observed() -> list[sessions.SessionRecord]:
@@ -1153,7 +1152,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         path = self.groups()
         owner = self.owner("new-unit", host="unit")
@@ -1304,6 +1303,24 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.head_deliveries, [])
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.moves.calls, [])
+
+    def test_blocked_notice_rechecks_the_current_head_before_delivery(self) -> None:
+        entry = self.low_rule(target="claude3")
+        rule = refusal_watch.AutoMoveRule(entry.id, "units", entry.to, refusal_watch.LeftAtMost(1))
+        reason = refusal_watch.TargetAtOrBelowThreshold(0, 1)
+        for current in ((), (self.low_rule("replacement", target="claude2"),),
+                        (self.low_rule(entry.id, target="claude2"),)):
+            with (self.subTest(current=current),
+                  patch.object(next_moves, "read_next_moves", return_value=current),
+                  patch.object(refusal_watch, "_notify_blocked_head") as notify):
+                state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                _ = refusal_watch._record_blocked_head(state, rule, reason, NOW, False)  # pyright: ignore[reportPrivateUsage]
+                notify.assert_not_called()
+        with (patch.object(next_moves, "read_next_moves", return_value=(entry,)),
+              patch.object(refusal_watch, "_notify_blocked_head", return_value=True) as notify):
+            state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+            _ = refusal_watch._record_blocked_head(state, rule, reason, NOW, False)  # pyright: ignore[reportPrivateUsage]
+            notify.assert_called_once_with(rule, reason, NOW)
 
     def test_removing_a_blocked_entry_clears_its_notice_deduplication(self) -> None:
         _ = self.groups()
@@ -3377,6 +3394,17 @@ class RefusalWatchTests(unittest.TestCase):
             _ = self.cli()
         move.assert_called_once()
         self.assertEqual(move.call_args.kwargs["cause"], "auto")
+
+    def test_auto_move_keeps_each_members_live_source_and_the_selected_destination(self) -> None:
+        _ = self.groups(units="claude1")
+        owner = self.owner("off-group-unit", host="unit", label="claude3")
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        self.assertEqual(len(self.moves.calls), 1)
+        self.assertEqual((self.moves.calls[0].session_id, self.moves.calls[0].target),
+                         (owner["session_id"], "claude2"))
+        self.assertEqual(self.moves.sources, [{owner["session_id"]: "claude3"}])
 
     def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
         _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))

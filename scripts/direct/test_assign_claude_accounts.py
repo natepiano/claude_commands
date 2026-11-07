@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import unittest
 import json
-from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
+from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
 from scripts.accounts import accounts
 import os
 from unittest.mock import patch
 
 
-class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
     def test_copied_claude_launcher_keeps_legacy_home_then_uses_showrunners_after_cutover(self) -> None:
         with patch.dict(os.environ, self.environment(), clear=True):
             self.assertEqual(accounts.setup("claude2"), [])

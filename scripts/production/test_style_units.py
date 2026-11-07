@@ -16,12 +16,12 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import live_units
-import proposal_issue
+from scripts.production import live_units
+from scripts.production import proposal_issue
 import style_units
-import style_ledger
+from scripts.style import style_ledger
 import unit_lookup
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership

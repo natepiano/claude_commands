@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 import base64
 import json
@@ -17,7 +16,6 @@ from typing import cast, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.note_file import note_name
 from scripts.accounts import accounts, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -26,7 +24,7 @@ from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,

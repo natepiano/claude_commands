@@ -469,7 +469,7 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path[0] = os.path.dirname(os.path.abspath(filename))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module
@@ -524,9 +524,9 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
 if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
-    export VERIFY_TRACE_REAL_PY="${HOME}/.claude/scripts/lib/py"
+    export VERIFY_TRACE_REAL_PY="$VERIFY_START_DIR/../lib/py"
 else
-    PY="${HOME}/.claude/scripts/lib/py"
+    PY="$VERIFY_START_DIR/../lib/py"
 fi
 
 hash_stream() {
@@ -1876,7 +1876,7 @@ with open(3, "rb") as handoff:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
 sys.argv = sys.argv[1:]
-sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (

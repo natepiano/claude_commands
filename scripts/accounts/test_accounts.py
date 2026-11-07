@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.whoami.note_file import note_name
@@ -31,7 +30,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from collections.abc import Callable, Generator, Iterator
-from typing import TYPE_CHECKING, Literal, Self, TextIO, TypedDict, cast, final, override
+from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -44,16 +43,13 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 from scripts.shutdown import stop_resume
 from scripts.shutdown import remote, stop_results
 from scripts.message import sessions
-if TYPE_CHECKING:
-    from scripts.herdr import herdr
-else:
-    herdr = import_module("herdr")
+from scripts.herdr import herdr
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import run_out
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -341,7 +337,7 @@ class AccountsTests(unittest.TestCase):
                 accounts.KnownReset(now + timedelta(days=1)))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
               patch.object(sessions, "running_sessions", return_value=[owner]),
-              patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
+              patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
               patch.object(accounts, "pick", side_effect=chosen),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1")),
@@ -473,7 +469,7 @@ class AccountsTests(unittest.TestCase):
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
               patch.object(sessions, "running_sessions", return_value=[owner]),
-              patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
+              patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
             summary = self.run_cli()
             detail = self.run_cli("--detail")
@@ -1028,7 +1024,7 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=text, stderr="")) as fetch:
             self.assertEqual(role_map.ssh_role_map(("session-counts-read",), machine=peer), text)
         fetch.assert_called_once_with(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", peer,
-            "python3 ~/.claude/scripts/accounts/accounts.py session-counts-read"),
+            "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py session-counts-read"),
             capture_output=True, text=True, timeout=20)
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
@@ -1205,8 +1201,8 @@ class AccountsTests(unittest.TestCase):
                 program, argv, environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
                 claude = str(self.home / ".local/bin/claude")
                 if tty:
-                    self.assertEqual(program, sys.executable)
-                    self.assertEqual(argv, [sys.executable, str(accounts.SCRIPTS / "lib/relaunch.py"),
+                    self.assertEqual(program, str(accounts.SCRIPTS / "lib/py"))
+                    self.assertEqual(argv, [str(accounts.SCRIPTS / "lib/py"), str(accounts.SCRIPTS / "lib/relaunch.py"),
                                            "run", "--", claude, *arguments])
                 else:
                     self.assertEqual((program, argv), (claude, [claude, *arguments]))
@@ -1654,8 +1650,8 @@ class AccountsTests(unittest.TestCase):
                     _ = accounts.exec_account("claude3", ["--resume", "conversation-id"])
                 executable, argv, child_environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
                 if tty and not supervised:
-                    self.assertEqual(executable, sys.executable)
-                    self.assertEqual(argv, [sys.executable,
+                    self.assertEqual(executable, str(accounts.SCRIPTS / "lib/py"))
+                    self.assertEqual(argv, [str(accounts.SCRIPTS / "lib/py"),
                         str(accounts.SCRIPTS / "lib" / "relaunch.py"), "run", "--",
                         str(self.home / ".local/bin/claude"), "--resume", "conversation-id"])
                 else:
@@ -2020,7 +2016,7 @@ class AccountsTests(unittest.TestCase):
     def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
         from scripts.shutdown.inventory import ListedSession
 
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
         owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
                               self.home / ".claude1", "", "", "")
         target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
@@ -2033,15 +2029,15 @@ class AccountsTests(unittest.TestCase):
                 result = accounts.move(owner.session_id, "claude2", why="fixture move")
             self.assertIsInstance(result, accounts.MoveStarted)
             listing.assert_called_once_with()
-            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand")
+            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
+                                          source_accounts={owner.session_id: "claude1"} if live else {})
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
         stale = showrunners.Showrunner(session="", socket="", name="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
@@ -2065,8 +2061,7 @@ class AccountsTests(unittest.TestCase):
 
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
         stale = [showrunners.Showrunner(session="", socket="", name=name, zone="America/New_York",
                                        doc=f"/w/doc-{name}-production.md") for name in ("first", "second")]
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
@@ -5976,7 +5971,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             quotas=[agent_accounts.Quota("Weekly", 10, datetime.now(timezone.utc) + timedelta(days=1))])
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"private", b"private")) as probe:
             self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewed())
-        probe.assert_called_once_with([sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
+        probe.assert_called_once_with([str(accounts.SCRIPTS / "lib/py"), str(accounts.SCRIPTS / "accounts" / "accounts.py"),
             "exec", "--probe", "claude2", "-p", "hello"], cwd="/tmp", stdin=subprocess.DEVNULL,
             timeout=120, capture_output=True)
         self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
@@ -6819,7 +6814,7 @@ _ = sys.stdin.read()
         server.chmod(0o700)
         environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.defpath}",
             "PYTHONDONTWRITEBYTECODE": "1", "TEST_SERVER_READY": str(ready), "TEST_SERVER_RELEASE": str(release)}
-        process = subprocess.Popen([sys.executable, str(Path(accounts.__file__)), "setup", "codex1"],
+        process = subprocess.Popen([str(accounts.SCRIPTS / "lib" / "py"), str(Path(accounts.__file__)), "setup", "codex1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
         try:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
@@ -7048,7 +7043,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         _ = self.enterContext(patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, [])))
         _ = self.enterContext(patch.object(agent_accounts, "codex_home_role_label", side_effect=self.account_label))
         self.target_check = cast(MagicMock, self.enterContext(patch.object(herdr, "check_target", return_value=True)))
-        _ = self.enterContext(patch("sessions.session_liveness", side_effect=self.claude_live))
+        _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.claude_live))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.claude_process_home))
         _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=self.codex_process_home))
         _ = self.enterContext(patch.object(herdr, "read_conversation", side_effect=self.conversation))
@@ -7083,14 +7078,9 @@ class PaneWorkerMoveTests(unittest.TestCase):
         return Path(request[2][key]) if request is not None else self.root / default
 
     def claude_live(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-        if TYPE_CHECKING:
-            from scripts.message import sessions as runtime_sessions
-        else:
-            runtime_sessions = import_module("sessions")
-
         pid = next((pid for pid, kind, _ in self.world.foreground.values()
                     if kind == "claude" and self.world.processes[pid].current_identity == identity), None)
-        return runtime_sessions.LiveSessionProcess(pid) if pid is not None else runtime_sessions.SessionNotLive()
+        return sessions.LiveSessionProcess(pid) if pid is not None else sessions.SessionNotLive()
 
     def conversation(self, identity: str, kind: str = "") -> herdr.LiveConversation | herdr.StoppedConversation:
         candidates = [(pid, family) for pid, family, _ in self.world.foreground.values()

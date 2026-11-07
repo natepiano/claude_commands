@@ -291,7 +291,7 @@ existing rules; hand cleanup still requires end evidence. Folder audit also uses
 the shared tree change-time check (mtime and ctime) and waits 7 days without a
 change, so a recent copy with preserved mtimes stays.
 
-Run `python3 scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
+Run `scripts/lib/py scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
 compile-hours by clone kind and cause: `floor take`, `budget take`, `tmp sweep`
 or `none`. The command reads steps and trims from natedev's monthly build-log JSON lines, the
 journal and legacy `~/.local/state/lint-sweep/removals.jsonl`. It writes no report, index or sweep state. `BUILDLOG_DIR` selects a

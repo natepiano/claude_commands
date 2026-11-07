@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.lib import test_hang_guard
-from scripts.production import staff
+from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.test_models_registry import registry_text, write_registry
@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
@@ -134,16 +135,16 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-class ImplementLauncherFixture(LauncherFixture):
+class AssignClaudeLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
-    implement_script: Path = Path()
+    assign_script: Path = Path()
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.prompt_file: Path = self.root / "implementation_prompt.md"
-        self.implement_script = self.root / "scripts" / "direct" / "implement.sh"
+        self.assign_script = self.root / "scripts" / "direct" / "assign.sh"
         _ = self.staff_parent
 
     @cached_property
@@ -171,6 +172,10 @@ class ImplementLauncherFixture(LauncherFixture):
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
+        _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
+        (self.root / "codex").symlink_to(sys.executable)
+        _ = (self.root / "paths").write_text("src/\n")
         # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
         _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
@@ -181,7 +186,7 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = (self.root / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "worker@example.invalid"},
         }))
-        self.implement_script = self.build_script_tree()
+        self.assign_script = self.build_script_tree()
 
     @override
     def start_phase(self, name: str) -> Path:
@@ -195,12 +200,20 @@ class ImplementLauncherFixture(LauncherFixture):
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
-        # These tests cover the launcher after admission. Assign tests cover admission.
-        _ = (direct_dir / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
+        _ = (self.root / "scripts/__init__.py").write_text(
+            "from pkgutil import extend_path\n__path__ = extend_path(__path__, __name__)\n")
+        # Keep each copied module in the fixture checkout.
+        for relative in ("astra/astra_roles.py", "astra/astra_work.py", "astra/design_roles.py",
+                     "direct/simplify_daily.py", "lib/nix_env.py", "lib/scratch.py",
+                     "message/relay_identity.py", "message/repeat_guard.py",
+                     "production/showrunners.py", "production/staff.py", "whoami/account.py"):
+            destination = self.root / "scripts" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(DIRECT_DIR.parent / relative, destination)
         for name in ("conf.py", "conf.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
-        configure_launcher_fixture(direct_dir / "implement.sh")
+        configure_launcher_fixture(direct_dir / "assign.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         claude = self.root / "claude-bin"
         _ = claude.write_text(STUB_CLAUDE, encoding="utf-8")
@@ -223,7 +236,7 @@ class ImplementLauncherFixture(LauncherFixture):
                 'POLL_SECS="${7:-15}"', 'POLL_SECS="${7:-0.05}"'
             ), encoding="utf-8",
         )
-        return direct_dir / "implement.sh"
+        return direct_dir / "assign.sh"
 
     @override
     def environment(self) -> dict[str, str]:
@@ -246,13 +259,27 @@ class ImplementLauncherFixture(LauncherFixture):
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
+        environment["UNIT_ACTIVE_DIR"] = str(self.root / "active")
+        environment["UNIT_RUN_ROOT"] = str(self.root / "runs")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment
 
-    def implement_command(self, session: Path, *options: str, kind: str = "impl",
-                          slot: str = "impl", subtask: str = "impl") -> list[str]:
-        return ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
-                str(self.prompt_file), subtask, "the retry path", kind, "writing the retry path", "0", slot]
+    def assign_command(self, session: Path, *options: str, kind: str = "impl",
+                          slot: str = "impl") -> list[str]:
+        if "--phase" not in options:
+            directory = session / "phases"
+            directory.mkdir(exist_ok=True)
+            phase = directory / "3"
+            if not phase.exists():
+                phase.symlink_to("..", target_is_directory=True)
+        command = ["bash", str(self.assign_script), "--role", "implement" if kind == "impl" else kind,
+                   "--session-dir", str(session), "--cwd", str(self.working_dir),
+                   "--prompt", str(self.prompt_file), "--paths", str(self.root / "paths")]
+        if "--to" not in options:
+            command += ["--new-worker", slot]
+        command += list(options)
+        return [str(self.root / "codex"), "-c",
+                "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))", *command]
 
     def launch_environment(self, session: Path, slot: str = "impl") -> dict[str, str]:
         environment = self.environment()
@@ -260,7 +287,7 @@ class ImplementLauncherFixture(LauncherFixture):
         return environment
 
     def launch(self, session_dir: Path, kind: str, slot: str) -> subprocess.CompletedProcess[str]:
-        return self.worker_launch(session_dir, kind=kind, slot=slot, subtask=kind)
+        return self.worker_launch(session_dir, kind=kind, slot=slot)
 
     def checked_launch(
         self, session: Path, *options: str, kind: str = "impl",
@@ -270,7 +297,7 @@ class ImplementLauncherFixture(LauncherFixture):
         environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
         environment["STUB_SUMMARY"] = str(session / "phases" / "3" / "impl_summary_impl.txt")
         return subprocess.run(
-            self.implement_command(session, *options, kind=kind, subtask=kind),
+            self.assign_command(session, *options, kind=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -307,14 +334,14 @@ printf '%s\\n' '{answer}'
     def worker_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
         kind: str = "impl", behavior: str = "complete", resolves_round: bool = False,
-        fix_cause: str = "", subtask: str = "impl",
+        fix_cause: str = "",
     ) -> subprocess.CompletedProcess[str]:
         options: list[str] = []
         if to:
             options.extend(("--to", to))
         if fix_cause:
             options.extend(("--fix-cause", fix_cause))
-        environment = self.launch_environment(session_dir, slot)
+        environment = self.launch_environment(session_dir, to or slot)
         if to:
             records = [cast(dict[str, object], json.loads(path.read_text()))
                        for path in (self.root / "sessions").glob("*.json")]
@@ -327,7 +354,7 @@ printf '%s\\n' '{answer}'
                                     "STUB_SEND_BEHAVIOR": behavior})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
-        return subprocess.run(self.implement_command(session_dir, *options, kind=kind, slot=slot, subtask=subtask),
+        return subprocess.run(self.assign_command(session_dir, *options, kind=kind, slot=slot),
                               check=False, capture_output=True, text=True,
                               env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
@@ -353,7 +380,7 @@ printf '%s\\n' '{answer}'
         rounds = cast("list[dict[str, object]]", state["rounds"])
         return cast("str", rounds[-1]["outcome"])
 
-    def observe_status_at_records(self, *, fail_landed: bool = False) -> None:
+    def observe_status_at_records(self, *, slot: str, fail_landed: bool = False) -> None:
         """Record the status each copied helper sees before it updates its ledger."""
         direct_dir = self.root / "scripts" / "direct"
         for name, commands in (
@@ -367,7 +394,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     _probe_session = _probe_pathlib.Path(
         _probe_sys.argv[_probe_sys.argv.index('--session-dir') + 1]
     )
-    _probe_status = (_probe_session / 'impl_status_impl').read_text(encoding='utf-8')
+    _probe_status = (_probe_session / {'impl_status_' + slot!r}).read_text(encoding='utf-8')
     (_probe_session / ('observed_' + _probe_sys.argv[1] + '.txt')).write_text(
         _probe_status, encoding='utf-8'
     )
@@ -433,7 +460,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         else:
             _ = environment.pop("AGENT_BG_EFFORT", None)
         return subprocess.run(
-            self.implement_command(session_dir, kind=kind),
+            self.assign_command(session_dir, kind=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 

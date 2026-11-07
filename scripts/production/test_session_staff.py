@@ -14,11 +14,26 @@ from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
-import herdr
-from pane_launch import PaneLaunch
+from scripts.herdr import herdr
+from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
+        from scripts.shutdown import pane_record
+
+        fixture = self.row_production()
+        launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
+                                   {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
+        launch["environment"] = {"CODEX_HOME": launch["config_dir"],
+                                 "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
+        membership = labels.LaunchMembership(staff.snapshot(), labels.MemberSources(()))
+        before = self.staff_state()
+        self.assertEqual(membership.environment(launch), {
+            "CODEX_HOME": launch["config_dir"], "CODEX_THREAD_ID": fixture.unit.current_session,
+        })
+        self.assertEqual(self.staff_state(), before)
+
     def test_pane_parents_selects_only_local_pane_workers_from_the_record(self) -> None:
         config, runs = self.root / "config", self.root / "runs"
         config.mkdir()
@@ -52,7 +67,7 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(self.staff_state(), before)
 
     def test_unknown_process_identity_preserves_healthy_unit_status(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
 
         broken = unit_membership("show", "broken")
         healthy = unit_membership("show", "healthy")

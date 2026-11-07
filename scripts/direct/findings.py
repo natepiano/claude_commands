@@ -48,6 +48,10 @@ the run's durable event stream when `progress_history.py` has started a run.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -187,10 +191,8 @@ def _state_path(session_dir: Path) -> Path:
 def _parked_path(session_dir: Path, instance_id: str) -> Path:
     """Where a phase's ledger waits while another open phase is current.
 
-    Phases can be open together, and the current one owns `findings_state.json`
-    (implement.sh reads it there). The ledger it displaces is kept here rather
-    than discarded, so the older phase finds its findings when it is current
-    again.
+    The current phase owns `findings_state.json`, which assign_claude.py reads.
+    Keep the previous ledger here until its phase becomes current again.
     """
     return session_dir / f"findings_state-{instance_id}.json"
 
@@ -206,9 +208,8 @@ def _ledger_instance(path: Path) -> str:
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     """Write a phase's ledger where its readers look for it.
 
-    The newest open phase owns `findings_state.json`. An older open phase named
-    with `--phase` writes its parked file instead, so its repair never displaces
-    the newest phase's ledger from the file implement.sh checks.
+    The newest open phase owns `findings_state.json`, which assign_claude.py checks.
+    An older open phase named with `--phase` writes its parked file.
     """
     session_dir.mkdir(parents=True, exist_ok=True)
     live = _state_path(session_dir)
