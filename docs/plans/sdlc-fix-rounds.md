@@ -350,7 +350,7 @@ Cause: neither test failure came from this branch. `test_restart` read the live 
 
 The phase also folds retire-servers `7c0e6596f` (Phase 9r) into this branch. devtools 8l keeps the staff row at `codex_mesh end`, so the merge keeps the last-worker server reap and drops the retire call. The reap now also runs when an end of the last worker fails after it publishes `ended`. `scripts/message/morty_identity.py` holds the `MORTY_NATIVE_ID` rule for `send` and `session_staff`, which breaks the send → roster → session_staff → send import cycle.
 
-### Phase 10b — Git proves that a shrink's code checkpoint merged  · status: in progress
+### Phase 10b — Git proves that a shrink's code checkpoint merged  · status: done
 
 From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink unless `merged_checkpoints` finds a `progress_history` checkpoint event for the phase. Today it held two shrinks whose code checkpoint was on sdlc:
 
@@ -358,3 +358,5 @@ From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink
 2. herdr 21: the code checkpoint is the top hash, and it has no event.
 
 Git proves the merge. A shrink passes when its parent commit is an ancestor of the merge branch. This path no longer reads events. Add no new check. Add one test for each case.
+
+As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.
