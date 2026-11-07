@@ -1659,7 +1659,7 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 78 — `production/test_staff.py` uses half its CPU  · status: todo
+### Phase 78 — `production/test_staff.py` uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1722,3 +1722,36 @@ The verify hold and token wait fixtures keep every run root inside the test root
 - CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 80 — Claim tests catch a reply with no mirrors and a server with no admission lock  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/copies/test_review_remote_copies.py` fails when a claim reply leaves out the mirrors, and when the claim server runs with no admission lock. The six claim mutations that fail now still fail.
+
+**Spec:** The verify unit sent this item through the showrunner on 2026-11-07. Both gaps are older than Phase 69.
+1. Gap 1: a claim reply that leaves out the mirrors still passes `test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling` (`test_review_remote_copies.py:72`). Find where the claim server builds its reply. Make the test, or one new test named for the behavior, read the mirrors the reply carries.
+2. Gap 2: a claim server with no admission lock still passes `test_cancelled_sweep_releases_real_locks_for_admission_and_owner_removal` (`test_review_remote_copies.py:670`). Find where the server takes the admission lock. Make a test show that a second admission waits while the lock is held.
+3. Prove each check on a tempdir copy: make the mutation, run the module, and show that the named test fails. Run the six existing claim mutations again, and show each still fails.
+4. Use the warm claim servers (`scripts/copies/remote_test_support.py`) and the class seed from Phase 69. Add no new process start that the check does not need. Report the module CPU s before and after.
+5. Edit only the test file. queue-unit owns `copies.py` and the claim server code. Add no guard, refusal or check in production code (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/copies/test_review_remote_copies.py` — the module
+
+**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 69: each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`, and `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source. The threaded cancellation test keeps fresh subprocesses.
+- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
+- Phase 47: runs use `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes under `scripts/test_times/module_run.py`
+- each of the two mutations fails a named test on a tempdir copy, and the six existing claim mutations still fail
+- module CPU s before and after, from `module_cost.py`
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
