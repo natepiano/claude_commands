@@ -161,6 +161,20 @@ class CloudQueueViewTests(unittest.TestCase):
 
 class QueueViewTests(QueueFixtureTests):
 
+    def test_targeted_test_step_uses_its_shown_name(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        running = model.reading.view.running
+        view = replace(model.reading.view,
+            waiting=(replace(waiting[0], step="targeted-test"), *waiting[1:]),
+            running=(replace(running[0], step="targeted-test"), *running[1:]))
+        model = replace(model, reading=queue_read_fixture(view, policy=model.reading.explanation.policy))
+        text = plain(queue_view.render_view(model, 140))
+        rows = [row for row in text.splitlines() if "targeted test" in row]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any(row.startswith("run") for row in rows))
+        self.assertNotIn("targeted-test", text)
+
     def test_running_machine_column_uses_the_private_host_and_preserves_names(self) -> None:
         model = self.fixture.cap_model()
         for columns in (60, 80, 100, 140):

@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.build_steps import read_step_names
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
@@ -2011,7 +2012,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertEqual(running.promise, hold.memory.need)
                 assert isinstance(running.step.measured, gate.MeasuredMemory)
                 self.assertIsInstance(running.step.measured.peak_history, gate.TestPhaseStarted)
-                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"))
+                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn(f"tests started: need {expected:.1f} GiB", text)
                 self.assertIn(f"test peak {peak / GIB:.1f} GiB, history 3.0 GiB x 1.2", text)
                 self.assertIn(queue_evidence.keep_aside_text(hold), text)

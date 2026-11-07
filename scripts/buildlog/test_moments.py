@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
 import sqlite3
@@ -25,6 +27,10 @@ from scripts.buildlog.test_memory_window import write_lint_config
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
 END = START + timedelta(days=2)
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 def build(record_id: str, seconds: float, **fields: object) -> Record:
@@ -567,7 +573,8 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-from scripts.buildlog import index, memory, moments, report
+from scripts.buildlog import index, memory, moments, report, record, store
+store.host_name = lambda: record.local_step_identity().hosts[0]
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)

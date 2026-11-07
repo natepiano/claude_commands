@@ -58,8 +58,8 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A failed start preserves the pane. A failed restore returns exit status 1.
 - Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
   herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
-- `shutdown.py restart --all` stops and starts the local live Claude and Codex staff rows.
-- `shutdown.py restart` starts the missing rows from the saved row ID list.
+- `agents restart --all` stops and starts the local live Claude and Codex staff rows.
+- `agents restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.
 - A restore takes focus only when that launch created a window

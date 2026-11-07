@@ -448,9 +448,13 @@ def _passes(run: Path) -> list[dict[str, object]]:
 
 
 def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+    def started_at(item: dict[str, object]) -> float:
+        value = item.get("started_at")
+        return value if isinstance(value, (int, float)) else float("-inf")
+
     no_pass: dict[str, object] = {}
-    return next((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                 or item.get("team_slot") == row.name), no_pass)
+    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
+                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:

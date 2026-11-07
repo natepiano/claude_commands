@@ -1,12 +1,13 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
 import signal
 import tempfile
 import sqlite3
-import socket
 import subprocess
 import unittest
 from io import StringIO
@@ -17,6 +18,7 @@ from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from types import SimpleNamespace
 
 
 from scripts.style import bulk_run as run
@@ -32,6 +34,10 @@ from scripts.style.ledger_test_support import machine_rename_fixture, MACHINE_RE
 from scripts.style import style_ledger as ledger_api
 from scripts.style.approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
 from scripts.style.test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeRunner:
@@ -366,7 +372,7 @@ class WorkspaceRunTests(CargoProjectTests):
                    base_tree: str, destination: str, authority: ledger_api.Ledger) -> int:
             return owned_run(repo, packages, run_id, rule, base_tree, destination, authority,
                              self.server, self.runner, self.available)
-        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+        with mock.patch.object(run, "socket", SimpleNamespace(gethostname=lambda: "natedev")), mock.patch.object(
                 ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
                 run, "run_crates", side_effect=crates), redirect_stdout(StringIO()):
             return run.main(["--repo", str(self.repo), *arguments])
@@ -422,7 +428,7 @@ class WorkspaceRunTests(CargoProjectTests):
         owned_run = run.run_rule
         def workspace(repo: Path, rule: str, base_tree: str, authority: ledger_api.Ledger) -> Path:
             return owned_run(repo, rule, base_tree, authority, self.server, self.runner, self.available)
-        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+        with mock.patch.object(run, "socket", SimpleNamespace(gethostname=lambda: "natedev")), mock.patch.object(
                 ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
                 run, "run_rule", side_effect=workspace) as invoked, mock.patch.object(
                 run, "run_crates", side_effect=AssertionError("workspace does not enter crate lifecycle")), redirect_stdout(StringIO()):

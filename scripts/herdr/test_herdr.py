@@ -788,6 +788,32 @@ class PromptSubmissionTests(unittest.TestCase):
                          [("destination:p1", script_prompt("resume the saved work"))])
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
 
+    def test_proved_submission_returns_without_waiting_for_the_turn_or_restoring_the_stash(self) -> None:
+        text = "Resume the saved work.\nKeep the user's draft."
+        for draft_text in ("keep this draft", "[Pasted text #9 +2 lines]"):
+            draft = f"────────\n❯ {draft_text}\n────────"
+            for composer_text in ("", draft_text, script_prompt(text), "[Pasted text #1 +4 lines]"):
+                with self.subTest(draft=draft_text, composer=composer_text):
+                    self.elapsed = 0
+                    self.screen = draft
+                    self.stashed_drafts.clear()
+                    self.path.unlink(missing_ok=True)
+                    self.submit_on_type = True
+                    self.working_until = 60
+                    submitted_screen = f"────────\n❯ {composer_text}\n────────"
+
+                    def submit_with_composer(pane: str, prompt: str) -> None:
+                        self.type_prompt(pane, prompt)
+                        self.screen = submitted_screen
+
+                    with patch.object(self.client, "_prompt", side_effect=submit_with_composer):
+                        outcome = self.submit(text=text)
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
+                    self.assertEqual(self.enters, [])
+                    self.assertEqual(self.elapsed, 0.1)
+                    self.assertEqual(self.screen, submitted_screen)
+
     def test_a_second_draft_waits_until_the_deadline_without_a_second_stash(self) -> None:
         draft = "────────\n❯ keep this draft\n────────"
         second_draft = "────────\n❯ keep this second draft\n────────"

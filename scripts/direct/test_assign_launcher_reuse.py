@@ -17,7 +17,7 @@ setUpModule = mesh_fixture.setUpModule
 
 
 @final
-class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
+class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
     def use_fixture_server_start(self) -> None:
         directory = self.session_dir.parent / "restart-server"
         directory.mkdir()
@@ -106,7 +106,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assert_reopened_dispatch_keeps_a_thread_when_resume_fails("ended")
 
     def test_named_dispatch_reuses_a_thread_and_advances_the_manifest_number(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         _ = self.successful("test", "--to", name)
         self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
@@ -115,7 +115,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(read_object(self.session_dir / "phases/7/dispatch_2_paths.json")["worker"], name)
 
     def test_explicit_turn_settings_reuse_the_named_worker_without_rewriting_its_identity(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         identity_path = self.identity_path(name)
         identity = identity_path.read_bytes()
@@ -133,7 +133,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_turn_display_fields_never_choose_the_next_named_dispatch_model_or_effort(self) -> None:
-        _ = self.successful("implement")
+        self.first_assignment("implement")
         roster = self.assignment_records()
         name = next(iter(roster))
         roster[name].update({"turn_model": "gpt-other-sol", "turn_effort": "max"})
@@ -143,7 +143,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual((turn["model"], turn["effort"]), ("gpt-kept-sol", "high"))
 
     def test_a_model_override_reuses_an_idle_worker_and_updates_only_its_turn_display(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, before = next(iter(self.assignment_records().items()))
         _ = self.successful("implement", "--model", "gpt-other-sol:high")
         roster = self.assignment_records()
@@ -155,7 +155,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_a_saved_identity_model_is_history_while_the_turn_uses_the_registry(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name = next(iter(self.assignment_records()))
         identity_path = self.identity_path(name)
         identity = read_object(identity_path)
@@ -168,7 +168,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(self.turn_starts, 2)
 
     def test_a_legacy_roster_without_a_model_uses_registry_changes_on_the_same_thread(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, record = next(iter(self.assignment_records().items()))
         original_thread = record["thread_id"]
         _ = record.pop("model", None)
@@ -185,7 +185,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(self.turn_starts, 3)
 
     def test_a_large_named_worker_is_compacted_before_its_next_assignment(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, record = next(iter(self.assignment_records().items()))
         record["context_tokens"] = 200_000
         self.write_pool_roster({name: record})
@@ -201,7 +201,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         config = self.session_dir.parent / "direct.conf"
         _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
         with patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
-            _ = self.successful()
+            self.first_assignment()
             name, record = next(iter(self.assignment_records().items()))
             thread = record["thread_id"]
             record["context_tokens"] = 200_000
@@ -217,7 +217,7 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(self.turn_starts, 3)
 
     def test_a_compaction_roster_conflict_refuses_assignment_before_claim_or_follow(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, record = next(iter(self.assignment_records().items()))
         record["context_tokens"] = 126299
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE

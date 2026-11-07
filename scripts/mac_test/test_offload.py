@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,8 @@ from scripts.lib import conf
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
@@ -147,6 +150,74 @@ class LintVerbTests(unittest.TestCase):
                                             env=environment, cwd=root, capture_output=True, text=True, check=False)
                     self.assertEqual(answer.returncode, 0, answer.stderr)
                     self.assertEqual(answer.stdout.splitlines(), expected)
+
+    def check_scope_start(self, *, symlink: bool) -> None:
+        scripts = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lint_dir = root / ".claude/scripts/lint"
+            lint_dir.mkdir(parents=True)
+            for name in ("lint", "scope.py"):
+                _ = shutil.copy2(scripts / "lint" / name, lint_dir / name)
+            library = lint_dir.parent / "lib"
+            library.mkdir()
+            _ = shutil.copy2(scripts / "lib/py", library / "py")
+            _ = (lint_dir / "invoke.sh").write_text(
+                'run() { printf "%s\\n" "$@"; }\n'
+                + 'invoke_clippy() { printf "%s\\n" cargo clippy "$@"; }\n'
+                + 'invoke_mend() { printf "%s\\n" cargo mend "$@"; }\n')
+            workspace = root / "workspace"
+            workspace.mkdir()
+            _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers=["one", "two"]\n')
+            for name in ("one", "two"):
+                member = workspace / name
+                (member / "src").mkdir(parents=True)
+                _ = (member / "Cargo.toml").write_text(
+                    f'[package]\nname="{name}"\nversion="0.1.0"\n')
+                _ = (member / "src/lib.rs").write_text("")
+            front = root / "bin"
+            front.mkdir()
+            metadata = {
+                "packages": [{"name": name, "id": name,
+                              "manifest_path": str(workspace / name / "Cargo.toml")}
+                             for name in ("one", "two")],
+                "workspace_members": ["one", "two"],
+            }
+            cargo = front / "cargo"
+            _ = cargo.write_text(
+                '#!/bin/sh\n[ "$1" = metadata ] || exit 99\n'
+                + "printf '%s\\n' " + shlex.quote(json.dumps(metadata)) + "\n")
+            cargo.chmod(0o755)
+            seed_interpreter_cache(root / "cache")
+            environment = {**os.environ, "HOME": str(root), "XDG_CACHE_HOME": str(root / "cache"),
+                           "PATH": str(front) + os.pathsep + os.environ["PATH"]}
+            _ = environment.pop("CLAUDE_PYTHON", None)
+            if symlink:
+                command = front / "lint"
+                command.symlink_to(lint_dir / "lint")
+                cwd = workspace
+            else:
+                command = Path("lint")
+                cwd = lint_dir
+            for verb, expected in (
+                ("check", ["cargo", "check", "--workspace"]),
+                ("clippy", ["cargo", "clippy", "--workspace", "--all-targets"]),
+                ("mend", ["cargo", "mend", "--workspace"]),
+            ):
+                with self.subTest(verb=verb):
+                    manifest = ["--manifest-path", str(workspace / "Cargo.toml")]
+                    answer = subprocess.run(
+                        ["bash", str(command), verb, *manifest], env=environment, cwd=cwd,
+                        capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(answer.returncode, 0, answer.stderr)
+                    self.assertEqual(answer.stdout.splitlines(), [*expected, *manifest])
+
+    def test_lint_symlink_in_another_folder_keeps_workspace_scope(self) -> None:
+        self.check_scope_start(symlink=True)
+
+    def test_lint_filename_in_its_folder_keeps_workspace_scope(self) -> None:
+        self.check_scope_start(symlink=False)
 
 
 class RunnerCompletionTests(unittest.TestCase):

@@ -18,6 +18,7 @@ from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.build_steps import read_step_names
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
@@ -197,7 +198,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
                 shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"))
+                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
                 self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
 
@@ -372,9 +373,11 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), gate.EstimateExpired)
             zone = ZoneInfo("UTC")
-            self.assertEqual(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone),
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone))
-            self.assertTrue(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone).startswith("the estimate expired at"))
+            names = read_step_names()
+            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
+            self.assertEqual(shown,
+                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
+            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, gate.HeadExplanation)
             assert isinstance(local.head.cause, gate.EstimateExpired)
             assert isinstance(parsed.explanation.head, gate.HeadExplanation)

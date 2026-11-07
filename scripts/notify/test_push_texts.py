@@ -294,7 +294,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
                 self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
-                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/agents restart"), 1)
                 self.assertIn("natedev", cast(ActionRequired, push.action).text)
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
@@ -308,7 +308,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(example.values["stopped"], push.body)
             action = cast(ActionRequired, push.action).text
             self.assertEqual(action.count("accounts.py trust"), 1)
-            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertEqual(action.count("/agents restart"), 1)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         unlisted = entries["shutdown.restart_untrusted_unlisted"]
@@ -320,7 +320,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                           cast(ActionRequired, push.action).text)
             self.assertNotIn("accounts.py trust", push.message)
-            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("/agents restart", push.message)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         self.assertNotIn("shutdown.move_untrusted", entries)
@@ -334,7 +334,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn(example.values["stopped"], push.body)
                 self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                               cast(ActionRequired, push.action).text)
-                self.assertNotIn("/shutdown restart", push.message)
+                self.assertNotIn("/agents restart", push.message)
                 self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:

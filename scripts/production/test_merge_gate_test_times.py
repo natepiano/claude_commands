@@ -9,13 +9,12 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import cast, final, override
+from typing import final, override
 import unittest
 from unittest import mock
 
 from scripts.buildlog import store
 from scripts.build_hold import build_hold
-from scripts.lint import sweep
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
@@ -65,13 +64,8 @@ class MergeGateTestTimesTests(MergeGateFixture):
         _ = write_config_fixture(config / "lint.conf")
         _ = write_config_fixture(config / "test_times.conf", "SLOW_TEST_S=1.0")
 
-    def records(self) -> list[gate_record.GateRunRecord]:
-        paths = sorted(Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl"))
-        return [cast(gate_record.GateRunRecord, cast(object, row))
-                for row in sweep.build_log_rows(paths) if row.get("kind") == "gate_run"]
-
     def only_record(self) -> gate_record.GateRunRecord:
-        records = self.records()
+        records = self.gate_run_records()
         self.assertEqual(len(records), 1, records)
         return records[0]
 
@@ -183,7 +177,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.clear_gate_events()
         second = self.run_gate("--tests-only")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        records = self.records()
+        records = self.gate_run_records()
         self.assertEqual(len(records), 2)
         reused = records[1]
         self.assertEqual((reused["selection"], reused["reason"], reused["source"], reused["status"]),
@@ -229,7 +223,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
                     remaining = "".join(line + "\n" for line in result.stderr.splitlines()
                                         if not line.startswith(("gate run not written:", "warning:")))
                     self.assertEqual(remaining, baseline.stderr)
-        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(len(self.gate_run_records()), 1)
         self.assertEqual(blocked_log.read_text(), "This file cannot hold a build log.\n")
 
     @gate_suites("hooks", "notify", "direct")
