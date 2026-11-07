@@ -454,6 +454,30 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         dispatched = [event for event in self.events() if event["event_type"] == "finding_batch_dispatched"][-1]
         self.assertEqual(dispatched["repair_round"], 2)
 
+    def test_overlap_with_a_refunded_batch_counts_only_the_landed_batch(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        self.record_repair_pass(status="error")
+        _ = self.run_command("abandon", "--reason", "the launcher failed")
+        self.close_round(["F001"], verdict="still_open")
+        records = self.events()
+        for record in records:
+            if record["event_type"] in {"pass_started", "pass_finished"}:
+                launch = cast(dict[str, object], record.pop("launch_check"))
+                cause = cast(dict[str, object], launch["fix_cause"])
+                record["fix_pass"] = cause["round"]
+        gate: dict[str, object] = {
+            "event_type": "pass_started", "phase_instance_id": "instance-a",
+            "pass_instance_id": "overlapping-gate", "pass_kind": "fix", "fix_pass": 99,
+            "pass_activity": "run the merge gate", "pass_started_at": 1_110, "timestamp_epoch": 1_110,
+        }
+        records.extend([gate, {**gate, "event_type": "pass_finished", "status": "completed",
+                               "timestamp_epoch": 1_240, "pass_elapsed_seconds": 130}])
+        _ = self.history_file.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        self.assertEqual(self.gate(at=1_500)["repair_round"], 2)
+
     def test_started_batches_without_dispatch_events_count_repair_rounds(self) -> None:
         self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
