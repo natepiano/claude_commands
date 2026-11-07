@@ -9,6 +9,7 @@ from scripts.lib.terminal_cells import terminal_width
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import RunningStep, WaitingStep
+    from scripts.lib.build_steps import StepNames
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -41,9 +42,14 @@ def field(text: str) -> str:
     return " ".join(text.split())
 
 
-def step_text(step: WaitingStep | RunningStep) -> str:
-    """Show the project with the step when the project is known."""
-    return field(f"{step.project} {step.step}")
+def step_text(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's shown name when the project is known."""
+    return field(f"{step.project} {names.shown(step.step)}")
+
+
+def step_prose(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's sentence name when the project is known."""
+    return field(f"{step.project} {names.prose(step.step)}")
 
 
 def age(since: float, now: float) -> int:

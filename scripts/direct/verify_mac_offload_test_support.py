@@ -31,7 +31,8 @@ from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -1163,13 +1164,8 @@ exit 99
                     descriptors.append(os.pidfd_open(process.pid))
                 except ProcessLookupError:
                     pass
-            with local_release_waiter(directory or self.root, self.root / "tmp") as events:
-                if isinstance(events, LocalReleaseEvents):
-                    add_watch = events.add_watch
-                    def watch_modifications(fd: int, path: bytes, mask: int) -> int:
-                        return add_watch(fd, path, mask | 0x2)
-
-                    events.add_watch = watch_modifications
+            with local_release_waiter(directory or self.root, self.root / "tmp",
+                                      RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 while True:
                     events.arm()
                     if condition():

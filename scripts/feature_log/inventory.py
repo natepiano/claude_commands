@@ -19,6 +19,8 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
+from scripts.style.git_process import GitBlob, MissingBlob, TruncatedBlobReply, read_batch_blob
+
 from scripts.feature_log.feature_log import PROJECTS, locked, state_dir, vault_dir
 
 
@@ -302,18 +304,15 @@ def _read_frozen_files(repo: str, ref: str, paths: list[str]) -> dict[str, str]:
     replies = BytesIO(result.stdout)
     files: dict[str, str] = {}
     for path in paths:
-        header = replies.readline().removesuffix(b"\n")
-        if header.endswith(b" missing"):
+        reply = read_batch_blob(replies)
+        if isinstance(reply, MissingBlob):
             raise InventoryError(f"{repo}: missing frozen source {path} at {ref}")
-        fields = header.split(b" ")
-        if len(fields) != 3 or fields[1] != b"blob" or not fields[2].isdigit():
-            raise InventoryError(f"{repo}: invalid blob reply for {path} at {ref}")
-        size = int(fields[2])
-        contents = replies.read(size)
-        if len(contents) != size or replies.read(1) != b"\n":
+        if isinstance(reply, TruncatedBlobReply):
             raise InventoryError(f"{repo}: truncated blob reply for {path} at {ref}")
+        if not isinstance(reply, GitBlob):
+            raise InventoryError(f"{repo}: invalid blob reply for {path} at {ref}")
         try:
-            files[path] = contents.decode("utf-8")
+            files[path] = reply.content.decode("utf-8")
         except UnicodeDecodeError as error:
             raise InventoryError(f"{repo}: {path} at {ref} is not UTF-8") from error
     if replies.read(1):

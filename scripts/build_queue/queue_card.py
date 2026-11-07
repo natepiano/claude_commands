@@ -47,7 +47,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         if card:
             add()
         add((Span(f"#{position} of {len(waiting)} · {queue_evidence.step_pid_text(step)} · ", bold=True), *name_spans(step, model.labels),
-             Span(f" · {queue_lines.step_text(step)} · {step.need / gate.GIB:.1f} GiB", bold=True)))
+             Span(f" · {queue_lines.step_text(step, model.names)} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
         add()
@@ -87,7 +87,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} {queue_evidence.step_pid_text(ahead)} · "), Span("↑  " if is_moved(model, place) else "   "),
-                     *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead)}  {detail}")), 6)
+                     *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead, model.names)}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
             joined = 1 + sum(other.since < step.since for other in waiting)
@@ -147,7 +147,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
-        text = queue_evidence.running_text(running, explanation, model.labels, model.zone)
+        text = queue_evidence.running_text(running, explanation, model.labels, model.zone, names=model.names)
         if not isinstance(running.step.measured, (gate.CompilerServiceMemory, gate.UnownedSliceMemory)):
             pid, separator, detail = text.partition(" · ")
             text = pid + separator + machine + separator + detail
@@ -161,11 +161,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     if isinstance(head, gate.TokenWaitersOnly):
         add("All waiting steps are waiting for the cargo token.")
-        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
         return lines
     add()
     if not head_card:
-        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {queue_lines.step_text(head.waiter)}; "
+        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {queue_lines.step_text(head.waiter, model.names)}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
@@ -173,11 +173,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     add(queue_evidence.need_details(head.need_source))
     if isinstance(model.facts, head_facts.HeadFacts):
         facts = model.facts
-        add(head_facts.bump_text(facts, model.zone))
-        for text in head_facts.bump_lines(facts, model.zone, model.labels):
+        add(head_facts.bump_text(facts, model.zone, names=model.names))
+        for text in head_facts.bump_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
         add("Order rule: " + head_facts.order_rule(facts))
-        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels):
+        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
     else:
         add("Order history: unavailable")
@@ -194,7 +194,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             + f"oldest waiting {age(followers.oldest_since, explanation.now)} min")
     else:
         add("Followers: none")
-    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
     return lines
 
 

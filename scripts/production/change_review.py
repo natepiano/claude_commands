@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read checkpoint trailers and write change review rows.
 
 A visible trailer has three fields and an optional fourth field: after <step>.
@@ -922,6 +922,9 @@ class UnknownProducer:
     """The change has no known staff producer."""
 
 
+UNKNOWN_PRODUCER = UnknownProducer()
+
+
 @dataclass(frozen=True)
 class UnitSource:
     """The production document and branch worktree of a unit."""
@@ -949,37 +952,65 @@ def _branch_snapshot() -> staff.StaffSnapshot:
 
 def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
     """Resolve branch names and aliases from the unit staff rows of each document."""
-    found: dict[str, UnitSource] = {}
-    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
-    resolver = session_staff.RowResolver(record)
-    machine = remote.local_machine()
+    return _branches_from_units(_document_units(docs, record), record)
+
+
+def _document_units(docs: Iterable[Path], record: staff.StaffSnapshot) -> list[tuple[Path, staff.StaffRow]]:
+    """Collect each document's units and report unreadable staff records."""
+    pairs: list[tuple[Path, staff.StaffRow]] = []
     for doc in docs:
         try:
             rows = unit_lookup.doc_units(doc, record)
         except staff.StaffUnreadable as error:
             print(f"change review: {error}", file=sys.stderr)
             continue
-        for row in rows:
-            tree = row.worktree
-            worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
-                        else MissingUnitWorktree())
-            source = UnitSource(doc, worktree, row.name, row.id)
-            branch = resolver.unit_branch(row)
-            if isinstance(branch, session_staff.Branch):
-                _ = found.setdefault(branch.name, source)
-            try:
-                config = resolver.unit_config(row)
-            except unit_config.ConfigRefused as error:
-                print(f"change review: {source.name}: {error}", file=sys.stderr)
-                config = unit_config.ConfigMissing(str(error))
-            plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
-                    and isinstance(config.plan, unit_config.PlanFile) else "")
-            aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
+        pairs.extend((doc, row) for row in rows)
+    return pairs
+
+
+def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
+                         record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve exact branches before aliases, in the supplied unit order."""
+    found: dict[str, UnitSource] = {}
+    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
+    resolver = session_staff.RowResolver(record)
+    machine = remote.local_machine()
+    for doc, row in pairs:
+        tree = row.worktree
+        worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                    else MissingUnitWorktree())
+        source = UnitSource(doc, worktree, row.name, row.id)
+        branch = resolver.unit_branch(row)
+        if isinstance(branch, session_staff.Branch):
+            _ = found.setdefault(branch.name, source)
+        try:
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            print(f"change review: {source.name}: {error}", file=sys.stderr)
+            config = unit_config.ConfigMissing(str(error))
+        plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
+                and isinstance(config.plan, unit_config.PlanFile) else "")
+        aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
     for source, names in aliases:
         for name in names:
             if name:
                 _ = found.setdefault(name, source)
     return found
+
+
+def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve live units before retired units, with scoped units first in each group."""
+    pairs = _document_units(_publication_docs(production, record), record)
+    scoped = {pair[1].id for pair in pairs}
+    machine = remote.local_machine()
+    resolver = session_staff.RowResolver(record)
+    for row in record.find(kind="unit"):
+        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
+            continue
+        doc = resolver.production_doc(row)
+        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
+    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
+    return _branches_from_units(pairs, record)
 
 
 def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
@@ -1022,23 +1053,33 @@ def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId |
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
 
 
+def unit_producer(unit: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer of one unit across the staff record."""
+    try:
+        return unit_lookup.unit_row(unit, staff.snapshot()).id
+    except staff.StaffUnreadable:
+        return UNKNOWN_PRODUCER
+
+
 def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
     """Resolve child production documents with the held staff snapshot."""
     return scope_docs(production, below=True, record=record)
 
 
 def publication_changes(commits: list[Commit], production: Path, *,
-                        record: staff.StaffSnapshot | None = None
-                        ) -> list[PublicationChange]:
+                        record: staff.StaffSnapshot | None = None,
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
     record = staff.snapshot() if record is None else record
-    branches = _unit_branches(_publication_docs(production, record), record)
+    branches = _publication_branches(production, record)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     for commit, item in _checkpoint_entries(commits):
         match = _CHECKPOINT.match(commit.subject)
         source = branches.get(match["branch"]) if match is not None else None
-        producer = producer_for(source, record, machine) if source is not None else UnknownProducer()
+        producer = known_producer
+        if isinstance(producer, UnknownProducer) and source is not None:
+            producer = producer_for(source, record, machine)
         name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
         changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
     return changes
@@ -1468,6 +1509,14 @@ def _words(name: str, value: str) -> str:
 
 
 @dataclass(frozen=True)
+class KnownMergeProducer:
+    """The unit identity supplied by the checkpoint request for one merge."""
+
+    merge: str
+    producer: staff.StaffId
+
+
+@dataclass(frozen=True)
 class ReadinessScan:
     """Scan published merges for changes that need no further step."""
 
@@ -1483,7 +1532,8 @@ _READINESS_SCAN = ReadinessScan()
 
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
-               selection: ReadinessScan | CompletedStep = _READINESS_SCAN) -> list[str]:
+               selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+               known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -1527,7 +1577,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             print(f"{short}: after {readiness.step}; run {command}")
             noted.add(readiness.step)
 
-        for change in publication_changes(commits, production, record=record):
+        producer = (known_producer.producer
+                    if isinstance(known_producer, KnownMergeProducer) and known_producer.merge == merge
+                    else UNKNOWN_PRODUCER)
+        for change in publication_changes(commits, production, record=record, known_producer=producer):
             readiness = change.item.readiness
             if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
                 matched_step = True

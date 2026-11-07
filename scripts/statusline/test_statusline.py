@@ -17,6 +17,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, staff
 from scripts.shutdown import remote
 from scripts.statusline import adhoc_items, assignment, rebuild_row
@@ -65,6 +66,7 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
 
 def seed_rebuild_cache(home: Path) -> None:
     """Keep shell tests on temporary answers without calling Nix or SSH."""
+    seed_interpreter_cache(home / ".cache")
     cache = home / ".local/state/showrunner/rebuilds"
     cache.parent.mkdir(parents=True, exist_ok=True)
     _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")

@@ -41,7 +41,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Measured facts (2026-10-20, `history.py phases --since 60d --sort fix_passes --status all`):** 2,896 fix passes over 839 phases, but only 1,621 ledger rounds (`finding_batch_dispatched`). Fix time is 41% of all agent time; 188 phases (11%) with ≥4 fix passes hold 75% of fix time. The top record, run `189487ea` phase `6` ("Palette rows highlight the matched letters", rich-text-plan), shows 70 fix passes and 2 ledger rounds over 8 days. Its pass activities name Phases 7 and 14 and merge work, so the record holds work from several phases. A fix-pass count is therefore not a repair-round count, and a `(run, phase)` record is not always one phase.
 - **Test lanes:** `scripts/history/` — `test_*.py` beside the module (none yet; Phase 1 adds `test_rounds.py`); markdown files — none.
 - **Build:** none (Python and markdown).
-- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root. Then the merge gate from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`.
+- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root.
+  Then run the targeted test from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`.
 - **Lint:** `basedpyright scripts/history` from the worktree root; pass is its `0 errors, 0 warnings` line (exit status says nothing).
 - **Invariants:**
   - `/history` reads only; it never writes a run record (`commands/history.md`, repository rule).

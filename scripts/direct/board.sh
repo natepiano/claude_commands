@@ -53,13 +53,16 @@
 # exactly one of N racing acquirers creates the directory and the rest fail.
 
 set -euo pipefail
-UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+BOARD_SCRIPT=${BASH_SOURCE[0]}
+[[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
+BOARD_DIR=${BOARD_SCRIPT%/*}
+UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
 # shellcheck source=/dev/null
-source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
+source "$BOARD_DIR/../lib/conf.sh"
 
 die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 
@@ -88,7 +91,7 @@ now_epoch() {
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
 flatten() {
-  "${BASH_SOURCE[0]%/*}/../lib/py" -c '
+  "$BOARD_DIR/../lib/py" -c '
 import sys
 text = sys.argv[2].translate(str.maketrans({"\n": " ", "\r": " ", "\t": " "}))
 print("".join(character for character in text if character.isprintable())[:int(sys.argv[1])], end="")
@@ -229,7 +232,7 @@ pid_is_gone() {
 owned_group_matches() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 1
-  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" <<'PYTHON'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PYTHON'
 import json
 from pathlib import Path
 import sys
@@ -285,7 +288,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
 from __future__ import annotations
 
 import json

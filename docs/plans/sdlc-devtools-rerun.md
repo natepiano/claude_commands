@@ -79,7 +79,9 @@ Q1 stop-and-rerun finishes · Q2 live check, not stored status · Q3 failure kee
   - `scripts/lib/rerun_test_support.py` — the one rerun test harness: disposable HOME and repo, one-shot `git` and command stops (`fail_git`, `stop_command`)
   - `scripts/lib/scratch.py` — scratch folders and the safe worktree removal
   - `docs/plans/sdlc-rerun-sweep.md` — the per-site rows and their owners
-- **Test:** each module's own suite, `python3 -m unittest discover -s scripts/<folder> -p '<test file>'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only --full`, from the worktree root, after `build_hold.py status` shows no natedev hold that is not ours.
+- **Test:** each module's own suite, `python3 -m unittest discover -s scripts/<folder> -p '<test file>'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo . --full`.
+  Run it from the worktree root after `build_hold.py status` shows no natedev hold that is not ours.
 - **Lint:** `basedpyright <changed Python files and every caller module>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - One place for each thing (user, 2026-10-30). A phase moves every copy of its cause onto the shared place, deletes the copy, and adds a check that refuses a new one. Where the check cannot see a copy (shell writers, Python in a string, a caller's own notice mark), the phase says so and names the sites. No forwarding wrapper that only calls the shared place.
