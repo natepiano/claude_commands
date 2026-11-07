@@ -1317,6 +1317,42 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The new test fails on the old code and passes on the new code.
 - `test_linux_runner.py` passes 10 of 10 runs. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
+### Phase 41l — The Mac idle watch alerts only on a waiter that waited past the limit  · status: todo
+
+**Depends on:** Phase 41k.
+
+#### Work Order
+
+**Source:** builds, 2026-11-06 23:35 EST: "the idle watch alerts only when the waiter itself has waited past the limit, not on Mac idle time alone. Put it after 41k. A false alert reaches every showrunner, so it has a cost."
+
+**Goal:** The Mac idle watch sends its outage message, its push and its `idle_with_waiter` message only for a waiting call whose own wait is longer than `alert_seconds`. Mac idle time alone sends nothing.
+
+**Defect:** `watch_once` in `scripts/buildlog/mac_idle.py` (near line 503) alerts when the Mac idle time passes `alert_seconds` and any call waits. It does not read how long the call has waited. Call `v20261107T043436-3692814-29883` entered `waiting_hold` at 04:34:36Z. The alert fired at 04:34:40Z, 4 seconds into the wait. The call left for the Mac at 04:34:42Z. Routing had no gap; the alert was false.
+
+**Spec:**
+
+1. A waiting call's wait time is `now` minus its step record's `updated` time. The record writes `updated` when its state changes, so a move from `waiting_hold` to `waiting_mac` starts a new wait.
+2. Apply one filter in `watch_once`, right after `waiting_calls`: keep only calls whose wait time is at least `alert_seconds`. Every later step reads only the kept calls: the `waiting` count, the disk exclusion detail, the outage message, the push and the per-call causes.
+3. An `updated` time that does not parse counts as past the limit, so a bad record still alerts.
+4. Take the limit from `mac_idle_alert.read_idle_config()`. Add no new setting.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py`
+- `scripts/buildlog/test_mac_idle.py`
+
+**Workers:** 1 writer, the check worker, in the verify-env tree.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test makes its project in a tempdir at run time.
+- Phase 41h also edits `test_mac_idle.py` in the verify-plain tree. The second to land merges.
+
+**Acceptance gate:**
+- A call 4 seconds into `waiting_hold`, with the Mac idle for longer than `alert_seconds`, sends no outage message, no push and no `idle_with_waiter` message. This test fails on the old code.
+- The same call at `alert_seconds` plus 1 second sends the outage message.
+- One fresh call and one call past the limit give a message that counts 1 waiting call.
+- `test_mac_idle.py` passes. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
 ### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
 
 **Depends on:** Phase 41g, Phase 41j and Phase 41k.
