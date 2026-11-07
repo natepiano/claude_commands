@@ -1024,12 +1024,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("resources-current", "transport")
         self.staff_member("resources-current", "resources")
         record = staff.StaffSnapshot(tuple(self.staff_rows.values()))
-        records = sessions.running_sessions()
+        registry = sessions.read_registry()
         with mock.patch.object(staff, "snapshot", return_value=record) as snapshots, \
                 mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as transport:
             self.assertEqual(send.send(local_options(["--to", "resources", "--text", "hello"])).outcome, "sent")
         snapshots.assert_called_once_with()
-        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, records=records)
+        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, registry=registry)
 
     def daemon_owner(self) -> codex_daemon.CodexDaemon:
         home = self.root / ".codex2"
@@ -4936,8 +4936,8 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
 
     def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
-                   records: list[sessions.SessionRecord]) -> roster.Roster:
-        del records
+                   registry: sessions.RegistryRead) -> roster.Roster:
+        del registry
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
         return self.local
@@ -5474,7 +5474,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_TRANSPORT=herdr\nWORKER_SPLIT_RATIO=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
-        _ = self.enterContext(mock.patch.object(sessions, "running_sessions", return_value=[]))
+        _ = self.enterContext(mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CODEX_THREAD_ID": str(self.fixture.parent.current_session), "CLAUDE_CODE_SESSION_ID": "",
@@ -5621,7 +5621,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
                                                    membership=staff.snapshot(), records=[record])
                     if transport == "herdr":
                         self.assertEqual(route, send.PaneWorkerRecipient(self.row))
-                        with mock.patch.object(sessions, "running_sessions", return_value=[record]):
+                        with mock.patch.object(sessions, "running_records", return_value=[record]):
                             result = self.deliver(address, "Continue through the worker pane.")
                         self.assertIsInstance(result, send.PaneTextDelivered)
                     else:

@@ -155,6 +155,48 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((self.state / "notified-tip").read_text(), merge)
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertLess(retried.stdout.index("push: ok"), retried.stdout.index("hand-off "))
+    def assert_child_push_conflict_is_held(self, *, already_pushed: bool) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        _ = self.child_production()
+        _ = self.checkpoint(content="child alpha\n")
+        checkpoint = self.checkpoint("src/beta.txt", "child beta\n")
+        if already_pushed:
+            _ = self.git("merge", "--no-ff", "-m", "Merge child handoff", checkpoint)
+            _ = self.git("push", "origin", "production")
+        before = self.git("rev-parse", "HEAD")
+        remote_before = self.git("rev-parse", "production", cwd=self.origin)
+        for path in ("src/alpha.txt", "src/beta.txt"):
+            self.write(self.promote, path, "main side\n")
+        _ = self.git("add", "src", cwd=self.promote)
+        _ = self.git("commit", "-m", "Conflicting main edits", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        main_before = self.git("rev-parse", "HEAD", cwd=self.promote)
+
+        result = self.run_handoff(checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("push: held", result.stdout)
+        self.assertIn("src/alpha.txt, src/beta.txt", result.stdout)
+        self.assertIn("merge origin/main into the merge branch, resolve the conflict, and run the push again",
+                      result.stdout)
+        merge_head = self.checkout / self.git("rev-parse", "--git-path", "MERGE_HEAD")
+        self.assertFalse(merge_head.exists())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), remote_before)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main_before)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main_before)
+        self.assertFalse(self.log.exists(), "a held push must not record completion")
+        self.assertEqual(self.events("style_ledger.py"), [])
+        self.assertEqual(self.events("send.py"), [])
+
+    def test_fresh_child_push_conflict_reports_held_without_completion(self) -> None:
+        self.assert_child_push_conflict_is_held(already_pushed=False)
+
+    def test_pushed_child_awaiting_promotion_reports_main_conflict_as_held(self) -> None:
+        self.assert_child_push_conflict_is_held(already_pushed=True)
+
     def test_locally_merged_handoff_is_pushed_before_acknowledgment_without_merging_again(self) -> None:
         self.promotions = str(self.promote)
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
