@@ -483,7 +483,7 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
         problem = unread.places.get(process.place, unread.unplaced.reason
                                     if isinstance(unread.unplaced, RecordsPartlyUnread) else "")
         if problem and process.pid not in claudes:
-            session_staff.report_anomaly(f"pid {process.pid} in {place_text(process.place)}: {problem}", pid=process.pid)
+            _ = session_staff.collect_anomaly(f"pid {process.pid} in {place_text(process.place)}: {problem}", pid=process.pid)
         if not native:
             if process.place in unread.places or process.command in ("claude", "codex"):
                 yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
