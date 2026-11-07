@@ -1536,7 +1536,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 70 — The token order test stops hanging  · status: todo
+### Phase 70 — The token order test stops hanging  · status: done
 **Depends on:** none
 
 #### Work Order
