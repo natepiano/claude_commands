@@ -194,7 +194,7 @@ Do not remove coverage or disable the memory scope to qualify Fargate.
 The remaining EC2-specific sections describe the fresh-Spot candidate, not a selected production method.
 Their production launch method waits for Steps A and B, then the concurrency trial.
 Shared requirements remain: exact tree, equal coverage, dedicated gate capacity, bounded cost, result integrity, and confirmed cleanup.
-The ready-image candidate contains NixOS, required store paths, Python, Node, basedpyright, uv, Git, and shells.
+The ready-image candidate contains NixOS, required store paths, Python, basedpyright, uv, Git, and shells.
 It contains no job tree, host credential, session state, or Rust build output.
 A launch template stores settings; it does not contain installed tools.
 Containers require the same tool manifest with separately qualified host integration.
@@ -292,8 +292,7 @@ Step A measures this allowance within running-to-gate-start time.
 
 Use a non-root Linux user with a real passwd home, a user systemd manager, and cgroup v2.
 Give it an empty private home and the public configuration from the tested tree.
-Keep the same Python and basedpyright versions as natedev.
-Use the same pinned Nix packages for the remaining tools.
+Use the same pinned Nix packages as natedev for Python, basedpyright, and the remaining tools.
 Do not copy natedev's private home configuration.
 
 | Requirement found in code | File and line | Instance treatment or local work |
@@ -303,8 +302,8 @@ Do not copy natedev's private home configuration.
 | Linux process memory and process groups | `scripts/production/merge_gate.py:484`, `:590`, `:1146` | Provide `/proc`, cgroup v2, and normal process permissions. Keep sampling and group cleanup. |
 | Writable tmpfs | `scripts/production/merge_gate.py:1013` | Provide writable `/dev/shm` with space for the gate's temporary files. |
 | Optional shared CPU device | `scripts/production/merge_gate.py:312` | Use the existing absent-device path. One instance has one gate, so it needs no shared `/dev/steve` pool. |
-| Pinned type packages and uv | `scripts/production/merge_gate.py:98`, `:526` | Include the type environment in the image. Keep its existing pin validation. |
-| A real basedpyright executable | `scripts/production/test_merge_gate_suites_types.py:36` | Install the same version as natedev. A fake executable cannot satisfy this test. |
+| Pinned type packages and uv | `scripts/production/merge_gate.py:98`, `:526` | The nightly run needs the full type environment. The cloud tests-only run does not prepare it. Keep uv for tests. |
+| A real basedpyright executable | `scripts/production/test_merge_gate_suites_types.py:36` | Use the Nix basedpyright package for the two tests that run the real tool. |
 | Nix launch environment and trusted home paths | `scripts/lib/nix_env.py:76`; `scripts/lib/test_nix_env_launches.py:54` | Install Nix and the public trusted-root configuration. Existing tests supply their fake launch programs. |
 | bash, zsh, Git, jq, and core tools | `scripts/production/test_smoke_launch.py:35`; `scripts/statusline/test_statusline.py:30`; `scripts/hana_instances/test_hana_instances.py:445` | Install them. Missing zsh must not remove tests from the remote gate. |
 | Fixture homes and public target settings | `scripts/direct/verify_mac_offload_test_support.py:675`, `:722` | Keep fixture creation unchanged. Copy the complete public configuration tree. |
@@ -581,7 +580,7 @@ It requires no per-instance Tailscale login, SSH setup, console action, or packa
 An absent AWS account or unavailable administrator access remains outside a command's ability to create its own authority.
 
 Build the image from the selected Nix system and a public tool manifest.
-Include the gate's Python, basedpyright, Node, shell tools, and pinned type packages in that manifest.
+Include the gate's Python, basedpyright, uv, and shell tools in that manifest.
 A changed manifest causes `up` to build and qualify a new image.
 Publish a new template version after qualification. Let existing attempts finish on their recorded image.
 The queue sends work to natedev when no image matches the required tool manifest.
@@ -652,22 +651,21 @@ Start with one small run:
 3. Upload the bundle to a temporary private bucket.
 4. Launch one Spot instance from the configured official NixOS image.
 5. Prepare tools through `nix shell`.
-6. Run all discovered test modules and the script type check through `run_suites` with `WholeMachine`.
+6. Run all discovered test modules through `run_suites` with `WholeMachine` and no `type_dirs`.
 7. Terminate each instance when its attempt ends.
 
 The host reads the root `nixpkgs` input revision from `/etc/nixos/flake.lock` before it creates trial resources.
 The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
 The guest links `google-chrome` to Chromium for headless chart tests.
-The host reads and prints its basedpyright version at trial start.
-The guest installs that version through `uv tool install basedpyright==<version>` and adds the installation directory to PATH.
-The guest replaces the wheel's Node executable with a link to Nix Node from the tool shell.
+The guest uses Nix basedpyright for the two tests that run the real tool.
+The cloud gate matches natedev's `--tests-only` run and prepares no full type environment.
 The tool shell also includes `taplo`, `zsh`, `bash`, `gh`, and Git.
 Root prepares `/bin/bash`, `/bin/zsh`, and Python at `/run/current-system/sw/bin/python3` through a temporary bind mount.
 Before the bind mount, `cp -a` copies the system profile links and preserves their targets in `/nix/store`.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
 Its shell reads `/etc/profile` before tests start, then restores the tool PATH.
 The exported NixOS environment marker prevents child zsh shells from replacing fixture paths.
-Tool preparation time includes the Nix packages, the basedpyright installation, and the environment setup.
+Tool preparation time includes the Nix packages and the environment setup.
 The change in preparation time remains to be measured.
 
 The bundle excludes uncommitted changes.
@@ -682,7 +680,7 @@ It limits each module to `gate_trial_module_limit_s` seconds, with a default of 
 The JSON report retains each module's status, time, and stopped flag.
 The log prints the module name, exit status, and time as each job ends.
 Both machine modes use one runner loop with the same module command, test environment, and process cleanup.
-It runs basedpyright on `scripts` as one more job.
+The cloud gate runs tests only. The nightly run does the full type check.
 A failed suite remains a measured result.
 
 The command calls `DescribeSubnets` for the configured VPC.

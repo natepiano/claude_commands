@@ -190,10 +190,10 @@ The gate trial sends the host's module times as a separate S3 object.
 The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
 The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
 The guest links `google-chrome` to Chromium before the system profile bind mount for headless chart tests.
-The host reads and prints its basedpyright version at trial start.
-The guest installs that version through uv and adds `$HOME/.local/bin` to PATH before the gate starts.
-The guest replaces the wheel's Node executable with a link to Nix Node from the tool shell.
-The installation time counts in running to tools ready.
+The cloud gate runs tests only, like natedev's `--tests-only` run.
+It supplies no `type_dirs` and prepares no full type environment.
+The nightly run does the full type check.
+The guest keeps Nix basedpyright for the two tests that run the real tool.
 Root prepares the shell links and a temporary system profile bind mount with Python at `/run/current-system/sw/bin/python3`.
 Before the bind mount, `cp -a` copies the system profile links and preserves their targets in `/nix/store`.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.

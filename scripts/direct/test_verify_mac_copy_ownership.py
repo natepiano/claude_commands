@@ -7,7 +7,7 @@ from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim
+from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim, wait_for_marker_exit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.admission_test_support import caller_admission
 
@@ -26,6 +26,7 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
         self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
         self.stop_verify(process)
+        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
         self.assertEqual(processes_carrying(self.child_marker()), set())
 
     def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:

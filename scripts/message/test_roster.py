@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -70,6 +72,10 @@ ENTRY_FIELDS = {
 WORKER_SESSION_ID = "12345678-1234-5678-9abc-def012345678"
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class RosterTests(unittest.TestCase):
@@ -632,7 +638,7 @@ class RosterTests(unittest.TestCase):
         _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
         _ = doc.write_text("# Receiving\n")
-        _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(receiving.id, staff.LiveDoc(roster.remote.local_machine(), doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
         _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {receiving.id}\n")
@@ -700,7 +706,7 @@ class RosterTests(unittest.TestCase):
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
         owner = showrunner_relationship("alpha")
-        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
+        owner = staff.set_doc(owner.id, staff.LiveDoc(roster.remote.local_machine(), self.production_doc))
         showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
         _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
@@ -1309,7 +1315,7 @@ class RosterTests(unittest.TestCase):
         local = staff.local_snapshot()
         membership = staff.StaffSnapshot((*local.rows, staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
             'natedev', staff.StaffRoot(), current_session=staff.StaffId('peer-session'),
-            doc=staff.LiveDoc('natedev', doc))))
+            doc=staff.LiveDoc(roster.remote.local_machine(), doc))))
         with mock.patch.object(staff, 'snapshot', return_value=membership), \
                 mock.patch.object(send, 'STATE', self.root / 'send-state'), \
                 mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
@@ -2870,7 +2876,7 @@ class UnitLabelsTests(unittest.TestCase):
         assert isinstance(unit.parent, staff.ReportsTo)
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
-        _ = staff.set_doc(unit.parent.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(unit.parent.id, staff.LiveDoc(roster.remote.local_machine(), doc))
         _ = doc.write_text("# cargo-liner\n")
         records: list[sessions.SessionRecord] = [
             {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",

@@ -4,6 +4,8 @@ Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import fixture_member, fixture_worker
@@ -60,6 +62,7 @@ STOP_SESSION = stop_resume.stop
 
 
 def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 

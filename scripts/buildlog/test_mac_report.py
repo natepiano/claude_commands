@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import os
 import json
 import subprocess
@@ -29,6 +31,7 @@ else:
 from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
 from scripts.buildlog.test_report import MeasuredCliRun, measure_cli_work
+from scripts.buildlog.test_memory_window import configured_local_host
 from scripts.lib.user_zone import user_zone
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -39,6 +42,10 @@ CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
 START = "2026-10-11T15:09:00.000Z"
 END = "2026-10-12T15:09:00.000Z"
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class MacCallFields(TypedDict, total=False):
@@ -686,7 +693,8 @@ class MacReportTests(unittest.TestCase):
                     caller="verify-mac" if 100 <= number < 200 else "verify",
                     tree_key=f"tree-{number % 100}", status=1 if 100 <= number < 200 else 0,
                 )))
-            hold_rows = timed_hold_events(began, now)
+            with patch.object(store, "host_name", side_effect=configured_local_host):
+                hold_rows = timed_hold_events(began, now)
             for hold_row in hold_rows:
                 _ = handle.write(encode(hold_row))
         self.assertEqual(index.update(), 65_600 + len(hold_rows))
