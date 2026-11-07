@@ -5621,7 +5621,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
                                                    membership=staff.snapshot(), records=[record])
                     if transport == "herdr":
                         self.assertEqual(route, send.PaneWorkerRecipient(self.row))
-                        with mock.patch.object(sessions, "running_sessions", return_value=[record]):
+                        with mock.patch.object(sessions, "running_records", return_value=[record]):
                             result = self.deliver(address, "Continue through the worker pane.")
                         self.assertIsInstance(result, send.PaneTextDelivered)
                     else:
