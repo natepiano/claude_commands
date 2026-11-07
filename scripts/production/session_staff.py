@@ -27,7 +27,7 @@ from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
-from scripts.message import process_table
+from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch, agent_kind
@@ -109,9 +109,7 @@ def report_anomaly(message: str, *, pid: int = 0) -> None:
 
 
 def morty_thread(identity: str) -> bool:
-    from scripts.message import send
-
-    return bool(identity) and send.morty_stamp(send.CodexSender(identity))
+    return bool(identity) and morty_identity.matches(f"codex:{identity}")
 
 
 WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
