@@ -48,12 +48,12 @@ class UnitRunsTest(StaffTestCase):
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             for run in (first, second, first, second):
                 self.assertEqual(unit_runs.director(run, record=record), "")
-            write_text_atomic(first / unit_runs.STATE_FILE, '{"production":"absent","unit":"gone"}')
+            write_text_atomic(first / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: "gone"}))
             self.assertEqual(unit_runs.director(first, record=record), "")
         self.assertEqual(errors.getvalue().splitlines(), [
             f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
             f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
-            f"anomaly: {first}: no unit staff row for gone"])
+            f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
 
     def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
         runs, config = self.root / "runs", self.root / "config"
