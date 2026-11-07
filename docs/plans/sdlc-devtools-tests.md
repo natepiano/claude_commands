@@ -1441,3 +1441,30 @@ Every entry script under `scripts/` runs under bare `python3 <path>` from any wo
 **Gotchas:** `__file__.rpartition("/")[0]` is empty for a `__file__` with no folder part and gives `/../lib/...`; the block uses `rfind`. A `runpy` or `pathlib` form costs about 15 ms for each start; `open` + `exec` costs under 1 ms.
 
 **Ruled out:** hand-written blocks after the converter goes — they drift.
+
+### Phase 8o — Screen recording finds a window with no client list  · status: done
+
+Source: sdlc [10933f69] 2026-11-07, from the hana showrunner. At 03:3x EST on natedev, `scripts/screen_record/screen_record.py` found no Hana window: KWin Xwayland on `:0` published no `_NET_CLIENT_LIST`. demo-unit found the window with `xwininfo` and recorded it with ffmpeg x11grab. Run after the 3z accounts hash, with its own hash.
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `screen_record.py` finds a window by title when the root window has no `_NET_CLIENT_LIST`.
+
+**Spec:**
+1. `find_window` reads `xprop -root _NET_CLIENT_LIST` as now. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes the window ids and titles from that output.
+2. The fallback keeps every current rule: the 10 s lookup limit, the poll, one match records, two or more matches stop before ffmpeg, and no match reports the titles seen.
+3. `xwininfo` is a required tool only on the fallback path. A missing `xwininfo` there gives one error line that names it.
+
+**Files:**
+- `scripts/screen_record/screen_record.py` — the fallback.
+- `scripts/screen_record/test_screen_record.py` — tests.
+
+**Workers:** `1 writer + 1 tester`. `impl` owns `screen_record.py`; `test` owns `test_screen_record.py`.
+
+**Acceptance gate:**
+1. A test with a fake `xprop` that prints `_NET_CLIENT_LIST:  not found.` and a fake `xwininfo` tree finds and records the matching window.
+2. A test with an empty client list does the same.
+3. The existing `test_screen_record.py` tests pass with no assertion changed.
+4. basedpyright `0 errors, 0 warnings, 0 notes` on both files; the full gate passes.
