@@ -5,19 +5,17 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import fake_showrunner
-import fake_unit_host
-from fake_unit_host import HostedUnit, labeled as marked
+from scripts.production import fake_showrunner
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
 
@@ -29,7 +27,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         import io
         from contextlib import redirect_stderr
         from scripts.production import live_units, session_staff
-        import unit_lookup
+        from scripts.production import unit_lookup
 
         fixture = self.row_production()
         sources = unit_lookup.member_sources()
@@ -69,7 +67,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                     (fixture.worktree / ".unit.toml").unlink()
                 errors = io.StringIO()
                 with (redirect_stderr(errors),
-                      mock.patch("unit_lookup.every_labeled_session", return_value=every)):
+                      mock.patch("scripts.production.unit_lookup.every_labeled_session", return_value=every)):
                     units = live_units.units_of(fixture.runner.name)
                 self.assertEqual([item.unit for item in units], ["member"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -166,7 +164,7 @@ class LiveUnitsTests(unittest.TestCase):
             "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", "show"))],
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *(arguments or ("--production", "show"))],
                               env=self.environment, capture_output=True, text=True, check=False)
 
     def test_offline_staff_unit_is_listed_without_a_worktree(self) -> None:
@@ -217,7 +215,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.members("alpha")
         self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha")})
         listed = self.run_script()
-        target = subprocess.run([sys.executable, str(SCRIPT.with_name("unit_lookup.py")),
+        target = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT.with_name("unit_lookup.py")),
                                  "pane", "show", "alpha"], env=self.environment,
                                 capture_output=True, text=True, check=False)
         self.assertEqual((listed.returncode, target.returncode), (0, 0), listed.stderr + target.stderr)

@@ -64,7 +64,7 @@ The stages pass data through files in the state directory, so each command can r
 
 ### Commands
 
-`python3 scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
+`scripts/lib/py scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
@@ -122,9 +122,9 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 
 ## How to re-run
 
-- `python3 scripts/model_study/model_study.py results` extracts the live transcripts, compares, joins the phase table, adds a history line, and replaces `docs/as-built/director-model-study-results.md` and `.json` plus `~/.local/state/model-study/report.md`. Add `--message` for the short message, `--no-extract` to reuse extracted rows, `--now 2026-10-07T10:30` to pin the clock, `--no-history` to skip the history line.
-- `python3 scripts/model_study/model_study.py report --interim` writes only `report.md` and a history line; `ready` prints the gate state and exits 0 or 3.
-- `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'` from the repository root runs the tests (`test_turns`, `test_stats`, `test_compare`, `test_phases`, `test_report`, `test_rerun`); it prints a pass count and touches no real transcript or state.
+- `scripts/lib/py scripts/model_study/model_study.py results` extracts the live transcripts, compares, joins the phase table, adds a history line, and replaces `docs/as-built/director-model-study-results.md` and `.json` plus `~/.local/state/model-study/report.md`. Add `--message` for the short message, `--no-extract` to reuse extracted rows, `--now 2026-10-07T10:30` to pin the clock, `--no-history` to skip the history line.
+- `scripts/lib/py scripts/model_study/model_study.py report --interim` writes only `report.md` and a history line; `ready` prints the gate state and exits 0 or 3.
+- `~/.claude/scripts/lib/py -m unittest discover -s scripts/model_study -p 'test_*.py'` from the repository root runs the tests (`test_turns`, `test_stats`, `test_compare`, `test_phases`, `test_report`, `test_rerun`); it prints a pass count and touches no real transcript or state.
 - `basedpyright scripts/model_study` type-checks the tool; read its closing counts, not its exit status.
 
 ## Result at the time of writing

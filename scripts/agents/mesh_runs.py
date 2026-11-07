@@ -43,6 +43,10 @@ held for the worker's next dispatch, so it is never lost.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import contextlib
@@ -415,7 +419,7 @@ def command_start(args: argparse.Namespace) -> int:
         _write_record(record_path, record)
         with log_path.open("ab") as log:
             supervisor = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, cwd=cwd,
             )

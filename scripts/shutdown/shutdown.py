@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Stop a session or restart staff rows on this machine."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -19,10 +23,10 @@ from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 from scripts.agents import codex_mesh
-import herdr
-from inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
-from remote import other_machine, run_remote as run_remote
-import remote_control
+from scripts.herdr import herdr
+from scripts.shutdown.inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
+from scripts.shutdown.remote import other_machine, run_remote as run_remote
+from scripts.shutdown import remote_control
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount, named_claude_account, own_claude_account
 
 

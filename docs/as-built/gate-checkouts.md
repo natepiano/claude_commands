@@ -159,12 +159,12 @@ Run a gate with the source worktree's uncommitted changes and a merge, in that
 order:
 
 ```sh
-python3 ~/.claude/scripts/copies/copies.py run \
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
   --repo ~/worktrees/claude-build-followups-verify \
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  python3 ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
+  ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF]
@@ -186,8 +186,8 @@ A fresh copy is deleted.
 The next standing use resets its tree.
 
 ```sh
-python3 ~/.claude/scripts/copies/copies.py list
-python3 ~/.claude/scripts/copies/copies.py remove \
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py list
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py remove \
   --repo ~/worktrees/claude-build-followups-verify
 ```
 

@@ -74,8 +74,7 @@ class EndSessionTests(unittest.TestCase):
         _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         (agents / "codex_mesh.py").symlink_to(END_SESSION.parents[1] / "agents" / "codex_mesh.py")
 
-        python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
-        python_shim.parent.mkdir(parents=True)
+        python_shim = scripts / "lib" / "py"
         _ = python_shim.write_text(
             # The run scan and scratch cleanup use private paths.
             "#!/usr/bin/env bash\ncase \"$1\" in */remove_run_scratch.py)"

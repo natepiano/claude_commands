@@ -16,6 +16,10 @@ there, so the job's next run commits it. Called by agent-notes and the Nix confi
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import os
@@ -24,9 +28,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import cast
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.maintenance.settings import settings
 def git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     # Literal pathspecs: note names hold spaces and could hold glob characters.

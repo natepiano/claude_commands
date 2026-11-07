@@ -8,22 +8,17 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
-from typing import TYPE_CHECKING, TextIO, cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import offload
-import conf
-import sweep
-from offload_test_support import OffloadCommandFixture
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import offload
+from scripts.lib import conf
+from scripts.lint import sweep
+from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class FloorSweepTests(unittest.TestCase):

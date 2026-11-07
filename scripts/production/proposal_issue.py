@@ -5,6 +5,10 @@ Store staff ids in unit, proposed_by and approved_in.
 Read current names from staff. Keep proposal numbers unique across issues and archives.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -25,9 +29,9 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 from scripts.production import staff, unit_names
 
 FENCE = "---"

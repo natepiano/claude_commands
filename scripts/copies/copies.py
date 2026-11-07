@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Run gates in fresh copies or reusable copies with build output."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -26,8 +30,6 @@ from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
 from scripts.lib.conf import UseConfiguredValue

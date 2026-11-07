@@ -10,9 +10,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, TypedDict, cast
 
-import rules
-from approved_renames import AppliedInCode, BindingRename, binding_rename_check
-from style_footprint import FileChange, FileStatus, RevisionTree, lint_removal_files, moved_files
+from scripts.style import rules
+from scripts.style.approved_renames import AppliedInCode, BindingRename, binding_rename_check
+from scripts.style.style_footprint import FileChange, FileStatus, RevisionTree, lint_removal_files, moved_files
 
 CLASSES = Path(__file__).with_name("mechanical_classes.toml")
 NO_BINDING_RENAMES: Mapping[str, tuple[BindingRename, ...]] = MappingProxyType({})

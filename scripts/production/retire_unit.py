@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Retire a staff unit without deleting uncommitted or unmerged work."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -14,9 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-for folder in ("production", "lib", "message", "shutdown", "direct"):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / folder))
 
 from scripts.production import staff, staff_sources, unit_config
 from scripts.copies import copies
@@ -27,12 +28,12 @@ from scripts.lib import process_group, conf
 from scripts.herdr import worker_panes
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
-import berth_board
-import progress_history
-import herdr
-import unit_lookup
-import unit_move
-import unit_runs
+from scripts.lib import berth_board
+from scripts.direct import progress_history
+from scripts.herdr import herdr
+from scripts.production import unit_lookup
+from scripts.production import unit_move
+from scripts.lib import unit_runs
 from scripts.production.production_doc import Production, Refusal, read_production
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -310,7 +311,6 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
 
 def live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
     return tuple(claim for claim in claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start)
-
 
 
 class MeshRun(NamedTuple):

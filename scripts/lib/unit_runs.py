@@ -13,6 +13,10 @@ A test points a reader at its own folder with an override, which replaces both n
 Staff supplies each run's current owner. Run records keep task history.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -213,7 +217,7 @@ def marker_must_stay(path: Path) -> bool:
         from ..message import sessions
     else:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
+        from scripts.message import sessions
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
@@ -467,7 +471,7 @@ def main(argv: list[str]) -> int:
         from ..message.sessions import running_sessions
     else:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from sessions import running_sessions
+        from scripts.message.sessions import running_sessions
 
     return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
 

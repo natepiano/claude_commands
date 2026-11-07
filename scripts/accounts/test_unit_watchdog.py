@@ -17,14 +17,12 @@ from dataclasses import replace
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from pathlib import Path
-from importlib import import_module
-from typing import TYPE_CHECKING, Literal, cast, final, override
+from typing import Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 GIT: str = shutil.which("git") or "git"
 
@@ -38,18 +36,11 @@ from scripts.shutdown import stop_resume
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown import pane_record as hook_pane_record
 
-if TYPE_CHECKING:
-    from scripts.shutdown import inventory, pane_record
-    from scripts.herdr import herdr
-    from scripts.message import sessions
-    from scripts.production import unit_lookup
-else:
-    pane_record = import_module("pane_record")
-    herdr = import_module("herdr")
-    inventory = import_module("inventory")
-    sessions = import_module("sessions")
-    unit_lookup = import_module("unit_lookup")
-import quota_alert
+from scripts.shutdown import inventory, pane_record
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production import unit_lookup
+from scripts.whoami import quota_alert
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
@@ -59,8 +50,8 @@ class RecoveryChildImportTests(unittest.TestCase):
     def test_recovery_child_imports_with_only_home_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             child = subprocess.run(
-                [sys.executable, "-m", "scripts.accounts.unit_watchdog", "--recover"],
-                cwd=Path(__file__).resolve().parents[2],
+                [str(Path(unit_watchdog.__file__).resolve().parents[1] / "lib/py"), "-m", "scripts.accounts.unit_watchdog", "--recover"],
+                cwd="/",
                 env={"HOME": home, "PATH": os.environ["PATH"]},
                 capture_output=True, text=True, timeout=10, check=False,
             )

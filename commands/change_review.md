@@ -22,9 +22,8 @@ The actions below remain for unit directors and showrunners.
 Each top-level showrunner keeps one list of changes waiting for the user's
 check, named for it: `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
 such as `change-review - natedev.md`. A child production's rows go to its
-root's list. Merges add a row for each
-`Change-Review:` line in a checkpoint. This skill adds the rest, shows the list
-when the user asks, and records verdicts. Unit directors and showrunners use it.
+root's list. `list_ready` adds checkpoint changes only after they reach `origin/main` and become live.
+This command adds other ready changes, shows the list, and records verdicts.
 
 Every action runs:
 
@@ -62,6 +61,10 @@ half a second and can drop a row; the vault owner sets Excluded folders →
 
 ## add
 
+A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
+Until then, add no row.
+`add --merged` refuses a hash that is not on `origin/main`.
+
 For a change the user should check that no checkpoint `Change-Review:` line
 carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
@@ -83,6 +86,35 @@ shows each unit's phase" --check "In a showrunner session on natedev, type
 /showrunner:unit_board" --see "Each row has a Phase column"`. The row's How to
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. It prints the new row's id, such as `C12`.
+
+## list-ready and live
+
+All merge callers use `list_ready` after the final promotion step succeeds, including the Mac pull.
+It fetches `origin main` and scans merge commits from 2026-11-06.
+It adds each uncovered checkpoint line, including after an interrupted call.
+A row covers the same change when its merge contains that checkpoint.
+A row without a known merge also covers that change.
+A later fix can add a new row with the same words.
+A failed fetch prints one error line and adds nothing.
+The `append` and `drift` actions are removed.
+
+```sh
+… list-ready --repo <checkout> --production <showrunner>
+```
+
+A checkpoint line can end with ` | after <step>` when it needs a rebuild, restart or deploy.
+The scan prints the merge, the step and the exact `live` command only for uncovered lines.
+The session that completes the step runs that command:
+
+```sh
+… live --merged <hash> --step <step> --repo <checkout> --production <showrunner>
+```
+
+`live` requires both `--merged` and `--step`.
+It adds only that merge's lines that wait for the named step, after the merge reaches `origin/main`.
+A step with no matching line gives an error.
+A repeated call adds nothing.
+A hash outside `origin/main` takes the same refusal as `add --merged`.
 
 ## edit
 
@@ -235,11 +267,3 @@ Producer retains the unit's fixed staff id for verdict delivery.
 Unknown units leave Producer empty and print one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
 A showrunner directory or an unowned directory records a production-owned change.
-
-## Migrate owner cells
-
-Run `migrate-owners [--list <list>]` to list conversions and unknown names.
-Add `--write` to replace known names with fixed staff ids.
-Without `--list`, the command reads all change review lists.
-Unknown names and reviewed rows remain unchanged.
-A retry completes interrupted work; a finished retry writes nothing.
