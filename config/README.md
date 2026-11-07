@@ -113,6 +113,11 @@ next run, so a change is immediate:
 - `scripts/lint/invoke.sh` — the lint CLI and
   `scripts/direct/verify.sh`'s `lint` and `fmt` arms
 
+Use `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]`.
+Without a package, lint covers the workspace. `--check` prevents repairs with
+or without a package. See `<VerificationContract/>` in `commands/unit/direct.md`
+for all command forms.
+
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
 `validate_ci.sh`. Those are correctness gates rather than lints, and a release
@@ -270,7 +275,9 @@ The user completes deployment before target activation.
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
-`kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds.
+A build or final uses AWS only when a flag pins the command.
+An empty `ci_repo` disables GitHub calls.
 
 `monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
@@ -503,6 +510,25 @@ or invalid value warns and uses the newest valid committed value; without a
 usable revision, `findings.py` lists the problems and exits 2 before running
 the command. `CONF_DIR` selects the fixture folder in tests.
 
+The test environment policy has three keys:
+
+- `VERIFY_RESULT_ENV_NAMES` names exported values that change test results.
+  The default names are `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, and `LANG`.
+  The locale names are `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`.
+  The list also includes `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, and `LC_TELEPHONE`.
+- `VERIFY_RESULT_ENV_PREFIXES` selects exported values by prefix.
+  The default prefixes are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
+  `LC_TERMINAL` and `LC_TERMINAL_VERSION` do not enter the key.
+- `VERIFY_TEST_FIXED_ENV` sets terminal values for each test, including the test step of `final`.
+  The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+
+`scripts/direct/result_environment.py` reads these keys through `conf.read` at use.
+The existing feature reader supplies the policy to Bash without another Python start.
+Test verdict keys include selected values and configured fixed values.
+Unset values differ from empty values.
+The new inputs do not change build keys or other command keys.
+Mac and SSH nextest runs receive the same values, including copy runs.
+
 ## dailies.conf
 
 The counts each production's dailies show on one line above the chart, in
@@ -574,7 +600,7 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 
 Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
 The source directory name still selects the legacy Mac mirror and claim.
-`kinds=test,check,doc` selects Linux commands without Mac `linux_only.*` keys.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
 
 `devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
 `shell_cache` gives the cache path relative to the remote home.

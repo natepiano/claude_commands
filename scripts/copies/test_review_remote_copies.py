@@ -50,7 +50,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.enterContext(local_remote_transport(self.root))
         _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
-                                             {"source.txt": "content\n"}).checkout
+                                             {"Cargo.toml": "[workspace]\n", "source.txt": "content\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
 
     def mirror_record(self, owner: str = "alpha", path: Path | None = None) -> copies.RemoteMirror:

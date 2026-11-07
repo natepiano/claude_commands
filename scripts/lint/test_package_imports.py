@@ -15,6 +15,49 @@ from scripts.lint import package_imports
 
 
 class PackageImportTests(unittest.TestCase):
+    def test_conversion_keeps_an_elif_with_originally_equal_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "records.py").write_text("class CallRecord: pass\nclass NoCallRecord: pass\n")
+            caller = folder / "caller.py"
+            path_change = "sys.path.append(__file__)\n"
+            source = ('''import sys
+from scripts.alpha.records import CallRecord, NoCallRecord
+''' + path_change + '''VERSION = sys.version_info.major
+def record(call, fields):
+    if call.get("kind") == CallRecord.__name__ and isinstance(call.get("call_id"), str):
+        fields["call_id"] = call["call_id"]
+    elif call.get("kind") == NoCallRecord.__name__:
+        fields["call_id"] = None
+    else:
+        fields["call_id"] = None
+''')
+            _ = caller.write_bytes(source.encode())
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_bytes(), source.replace(path_change, "", 1).encode())
+
+    def test_conversion_collapses_branches_made_equal_by_import_rewrites(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts/alpha"
+            folder.mkdir(parents=True)
+            _ = (folder / "worker.py").write_text("VALUE = 1\n")
+            caller = folder / "caller.py"
+            _ = caller.write_text('''import sys
+sys.path.append(__file__)
+if sys.version_info.major == 3:
+    import worker
+else:
+    from scripts.alpha import worker
+print(worker.VALUE)
+''')
+            with redirect_stdout(io.StringIO()):
+                package_imports.convert(root, [caller])
+            self.assertEqual(caller.read_text(), "from scripts.alpha import worker\nprint(worker.VALUE)\n")
+
     def assert_conversion_refuses_dynamic_path(self, path_change: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

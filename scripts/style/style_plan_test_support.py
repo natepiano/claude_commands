@@ -265,7 +265,7 @@ class StylePlanFixture(unittest.TestCase):
         return "\n".join([
             "# Standing names",
             "> **Standing:** style_plan.py", "", "## Delegation Context", "",
-            "- **Project:** sample", "- **Test:** verify.sh test <package>", "", "## Phases", "",
+            "- **Project:** sample", "- **Test:** verify.sh test [<package>]", "", "## Phases", "",
         ])
 
     def board(self, *blocked: str) -> berth_board.Board:

@@ -4,13 +4,41 @@
 
 `verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold they keep their local path. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path, platform) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
+`test`, `check`, `doc`, `example`, and lint judgments use the first eligible target from their first step.
+The default target order is Mac, natedev, AWS.
+`step_routing_rule` selects the policy before target admission.
+Tree-writing steps always run on natedev.
+`build` and `final` run on natedev unless a flag pins them.
+Every command accepts `--target <name>`, `--mac "<reason>"`, and `--local "<reason>"`.
+A pin applies to movable steps and waits for that target.
+A pinned final runs both steps on the target and keeps the clean-tree check.
+It saves no pass because a saved pass describes this machine.
+An unpinned final keeps its local compiler identity and saved-pass checks.
+A remote build uses the `build` verb and prints `binary: <target>:<path>`.
+A lint can leave its first mend memory wait for a free Mac.
+`build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
+Its first line is `any_target` or `natedev_only <reason>`.
+Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
+A named test package uses its package rule.
+A workspace test refuses Mac offload when any member is `linux_only`.
+Check, lint, and doc require every workspace member to permit macOS.
+This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
+An unreadable member keeps the step on natedev.
+Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
+Unpinned build keeps `makes natedev artifacts`; unpinned final keeps `full gate runs on natedev`.
+Calls without `--kind` keep the test-target table.
+The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the call's route state.
+The call guard, hold enforcer, and idle watch read that record.
 
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
 
-Mac-allowed lint, check, and doc use the same availability checks and target reservations as tests during a natedev Cargo token wait. A free eligible Mac permits immediate routing. An idle alert marker does not control admission. Blocks, live repository claims, and retry delays still apply. Tree repair steps remain local.
+Lint judgments, check, and doc use the same availability checks and target reservations as tests.
+A free eligible target permits immediate routing, including during a natedev Cargo token wait.
+An idle alert marker does not control admission.
+Blocks, live repository claims, and retry delays still apply.
+Tree repair steps remain local.
 
-Lint during a hold keeps local `cargo fmt` and `taplo fmt`, then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. Compile rewrite loops do not run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac or a `linux_only.<repo>` exclusion keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## How it works
 
@@ -52,7 +80,7 @@ The views read the saved file and local configuration.
 They make no SSH or recipient lookup calls.
 
 The check counts live steps that can use a Mac.
-It accepts `MacAllowed` and `SshAllowed` records with Mac targets.
+It accepts `AnyTarget` records with Mac targets.
 The step must have state `waiting_hold` or `waiting_mac`.
 The check validates the owner PID and process start time.
 It preserves P10 admission reads and excludes permanent local declines.
@@ -212,20 +240,33 @@ An interruption marker reports the instance generation.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 
-`test <package> --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
+`test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 
 `--env NAME` and `--fetch <folder>` require `--mac`. These flags can appear anywhere after the verb.
-Verify removes them before constructing Cargo arguments, cache keys and call records.
+Verify removes these flags before constructing Cargo arguments and call records.
+Test verdict keys include each `--env` value. Build keys exclude these values.
 Variable names must be valid and exported by the caller. Empty values are allowed.
 Verify saves the caller's values before assigning its own variables. A pipe transfers the values to Python without placing them on argv.
 The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `RUSTDOCFLAGS` at the verify interface.
 It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
 The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
 One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
+Each test uses the terminal values from `VERIFY_TEST_FIXED_ENV` in `config/direct.conf`.
+The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+The rule includes local tests and the test step of `final`.
+Test keys hold configured fixed values, instead of the caller's terminal values.
+
+`VERIFY_RESULT_ENV_NAMES` and `VERIFY_RESULT_ENV_PREFIXES` select other exported values for test verdict and tree content keys.
+Unset and empty values differ. These new inputs leave build keys and other command keys unchanged.
+A remote nextest run clears each selected name the call did not set, then applies the call's values.
+Mac and SSH nextest runs receive these values and `RUST_LOG`, `RUST_BACKTRACE`, and `RUST_LIB_BACKTRACE`.
+The same rule applies to unpinned runs, `--mac`, `--target`, and copy runs.
+Other remote verbs receive no new values.
+
 A Mac-only call reuses only a Mac pass. Forwarding or fetch disables cache reads and writes.
 If tests pass but fetch fails, the call exits 2 and retains the Mac pass evidence.
 A test failure retains the runner's status. No forwarded name, value or folder is added to the build log.

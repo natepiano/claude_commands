@@ -20,6 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
@@ -84,7 +85,7 @@ if tool == "df":
     if "-g" in arguments:
         raise SystemExit("Linux must not use df -g")
     free = int(os.environ.get("FAKE_FREE_GIB", "100"))
-    if any("G" in argument for argument in arguments):
+    if any("G" in argument for argument in arguments if argument.startswith("-")):
         available = str(free) + "G"
     elif "-B1" in arguments:
         available = str(free * 1024 ** 3)
@@ -305,6 +306,29 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(evaluations[0]["inputs"], ["flake.lock", "flake.nix", "nix/shell.nix"])
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
+
+    def test_forwarded_test_environment_survives_the_development_shell(self) -> None:
+        _ = write_config_fixture(self.root / "direct.conf")
+        values = {"NO_COLOR": "1", "TERM": "xterm-256color", "COLORTERM": "truecolor",
+                  "TERM_PROGRAM": "verify", "COLUMNS": "80", "LINES": "24"}
+        self.environment.update(copies_environment(self.root))
+        self.environment["FAKE_NIX_EXPORTS"] = "\n".join(
+            "export " + name + "=shell-value"
+            for name in (*values, "CLICOLOR", "HANA_TARGET_ONLY", "LC_TERMINAL"))
+        capture = self.mirror / "received-environment.json"
+        lint = self.root / ".claude/scripts/lint/lint"
+        original = lint.read_text()
+        _ = lint.write_text(original.replace("tool = Path(sys.argv[0]).name",
+            "Path(" + repr(str(capture)) + ").write_text(json.dumps(dict(os.environ)))\n"
+            + "tool = Path(sys.argv[0]).name"))
+        request = replace(self.request(), environment=tuple(values.items()))
+        result = self.execute(request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads(capture.read_text()))
+        self.assertEqual({name: observed[name] for name in values}, values)
+        self.assertNotIn("CLICOLOR", observed)
+        self.assertNotIn("HANA_TARGET_ONLY", observed)
+        self.assertEqual(observed["LC_TERMINAL"], "shell-value")
 
     def test_pinned_selection_reaches_the_remote_step_environment(self) -> None:
         with mock.patch.dict(os.environ, {"BUILDLOG_PINNED_TARGET": "aws"}):
@@ -828,6 +852,23 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(values["scripts_commit"], "fixture-commit")
         self.assertNotIn("-g", self.events("df")[-1]["args"])
 
+    def test_probe_disk_units_do_not_depend_on_the_mirror_path(self) -> None:
+        identity = offload.KnownRepository("phase-copy", "https://example.com/team/GiB")
+        mirror = self.root / offload.remote_mirror(identity, "aws", 2)
+        mirror.mkdir(parents=True)
+        for tool in ("rustc", "cargo", "hostname"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
+
+        result = subprocess.run(
+            ["bash", "-c", offload.probe_script(identity, "aws", 2)], cwd=self.root,
+            env=self.environment, text=True, capture_output=True, check=False, timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(float(values["free_gib"]), 100.0)
+
     def test_matching_shell_tools_run_when_the_base_environment_versions_differ(self) -> None:
         for tool in ("rustc", "cargo"):
             self.write_tool(self.root / "bin" / tool)
@@ -941,6 +982,20 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "builder version mismatch: rustc box=rustc fixture "
                          + "natedev=rustc required; move the box pins in nixos hosts/builder.nix\n")
         self.assertFalse(self.events("lint"))
+
+    def test_remote_build_and_judgments_receive_their_verbs_and_kinds(self) -> None:
+        _ = self.settings.write_text(self.settings.read_text().replace(
+            "kinds=test,check,doc", "kinds=test,check,doc,lint,example,build"))
+        cases: tuple[tuple[offload.MacVerb, str, tuple[str, ...]], ...] = (
+            ("build", "build", ("--workspace", "--bins")),
+            ("clippy", "lint", ("--workspace", "--all-features")),
+            ("mend-check", "lint", ("--workspace",)),
+            ("clippy", "example", ("--workspace", "--example", "demo")),
+        )
+        for verb, kind, words in cases:
+            with self.subTest(verb=verb, kind=kind):
+                event = self.assert_ran(replace(self.request(verb, words), kind=kind))
+                self.assertEqual(event["args"], [verb, *words])
 
     def test_check_and_staged_doc_keep_their_arguments_and_document_policy(self) -> None:
         check = self.assert_ran(self.request("check", ("--workspace", "--all-features")))
