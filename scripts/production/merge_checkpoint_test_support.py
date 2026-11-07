@@ -316,6 +316,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
         self.write(self.checkout, "README.md", "base\n")
+        self.write(self.checkout, "Cargo.toml", "[workspace]\n")
         self.write(self.checkout, ".gitignore", "production.log\n.unit.toml\n")
         self.write(self.checkout, "src/alpha.txt", "alpha base\n")
         self.write(self.checkout, "src/beta.txt", "beta base\n")

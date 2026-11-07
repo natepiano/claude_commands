@@ -15,6 +15,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import copy_record
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
@@ -39,6 +40,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"

@@ -62,6 +62,26 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         self.wait_bump_gate_exit(run)
         self.assertTrue((run.checkout / ".git").is_dir(), "the gate must retain its standing checkout")
 
+    def test_bump_without_a_build_cache_delivers_the_result_and_removes_its_copy(self) -> None:
+        self.prepare_bump_gate()
+        _ = self.git("rm", "Cargo.toml", cwd=self.unit)
+        checkpoint = self.checkpoint()
+        result = self.run_checkpoint(checkpoint, "--bump")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        tip = self.assert_pushed(checkpoint)
+        run, = self.wait_bump_gate_runs(1)
+        self.assertNotEqual(run.checkout, self.checkout)
+        self.assertTrue((run.checkout / ".git").is_dir())
+        self.assertEqual(run.head, tip)
+        self.release_bump_gate()
+        self.wait_bump_gate_exit(run)
+        self.assertFalse(run.checkout.exists())
+        self.assertEqual(self.bump_gate_record(tip)["result"], "green")
+        notice, = self.bump_notices()
+        self.assertEqual(self.notice_recipient(notice), "showrunner")
+        self.assertIn(tip, self.notice_text(notice))
+        self.assertNotIn(str(run.checkout), self.notice_text(notice))
+
     def test_red_gate_reports_both_recipients_after_the_merge_is_pushed(self) -> None:
         self.prepare_bump_gate(red=True)
         self.promotions = str(self.promote)

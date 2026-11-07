@@ -21,6 +21,7 @@ from unittest import mock
 
 from scripts.copies import copies
 from scripts.lib import copy_record, scratch
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
@@ -51,6 +52,7 @@ class StandingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         home = self.base / "home"
         home.mkdir()
