@@ -10,6 +10,7 @@ import json
 from unittest import mock
 
 from scripts.lib import unit_runs
+from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
@@ -19,6 +20,15 @@ from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
+        path = self.root / "missing/run/mesh_roster.json"
+        self.assertEqual(labels.read_worker_roster(path), {})
+        self.assertFalse(path.parent.parent.exists())
+        with worker_lifecycle.locked_state(path) as handle:
+            handle.publish('{}')
+        self.assertEqual(path.read_text(), '{}')
+        self.assertEqual(labels.read_worker_roster(path), {})
+
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
         from scripts.shutdown import pane_record
 
