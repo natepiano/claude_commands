@@ -438,6 +438,17 @@ class FindingsLedgerTests(FindingsLedgerFixture):
             self.assertIsNone(payload["advisory"])
             self.assertIsNone(payload["consecutive_same_kind"])
 
+    def test_started_batches_without_dispatch_events_count_repair_rounds(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        for number in range(1, 4):
+            _ = self.open_finding("blocker", f"defect {number}")
+            self.close_round([f"F{number:03d}"])
+            retained = [event for event in self.events() if event["event_type"] != "finding_batch_dispatched"]
+            _ = self.history_file.write_text("".join(json.dumps(event) + "\n" for event in retained), encoding="utf-8")
+        self.assertEqual(self.status()["rounds_completed"], 3)
+        self.assertEqual(self.gate()["repair_round"], 4)
+
     def test_gate_fix_and_unledgered_relaunch_add_no_repair_round(self) -> None:
         self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")

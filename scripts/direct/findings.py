@@ -446,7 +446,7 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     instance = _string(state.get("phase_instance_id"))
     events = [event for line in lines if (event := _json_object(line)) is not None
               and _string(event.get("phase_instance_id")) == instance]
-    return sum(repair["cause"] in ("review-code", "review-ux") for repair in phase_rounds(events)) + 1
+    return sum(repair["ledger_group"] for repair in phase_rounds(events)) + 1
 
 
 def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:

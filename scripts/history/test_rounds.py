@@ -203,6 +203,19 @@ class RepairRoundTests(unittest.TestCase):
         repairs = rounds.phase_rounds(events)
         self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
 
+    def test_missing_dispatch_keeps_ledger_identity_and_refund_rules(self) -> None:
+        events = pass_events(BASE, BASE + 10, name="batch", ledger_round=1)
+        events += pass_events(BASE + 20, BASE + 30, name="retry", ledger_round=1)
+        events += pass_events(BASE + 40, BASE + 50, name="gate", activity="run tests")
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_group"] for repair in repairs], [True, False])
+        self.assertEqual([repair["cause"] for repair in repairs], ["other", "gate"])
+        self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
+        events.append(dict(event("finding_batch_abandoned", BASE + 60), round=1, edits_landed=False))
+        self.assertEqual([repair["ledger_group"] for repair in rounds.phase_rounds(events)], [False])
+        events.append(dict(event("finding_batch_landed", BASE + 70), round=1))
+        self.assertEqual([repair["ledger_group"] for repair in rounds.phase_rounds(events)], [True, False])
+
     def test_refunded_batch_adds_no_round_unless_it_later_lands(self) -> None:
         events = ledger_events() + pass_events(BASE + 10, BASE + 13, ledger_round=1, status="error")
         abandoned = dict(event("finding_batch_abandoned", BASE + 20), round=1, edits_landed=False)
