@@ -335,7 +335,7 @@ From the sdlc showrunner, 2026-11-06. In cargo-liner, a worker relaunch after a 
 
 Cause: `findings._repair_round` counted every group from `history/rounds.phase_rounds`. A fix pass with no ledger batch (a gate run sent as a fix, a relaunch with no ledger number, a follow-up) makes its own group, so it added a round. It now counts the distinct ledger batch numbers that the groups hold, less the refunded batches that never land. One batch split across two groups counts once. `phase_rounds` and `history.py rounds` keep the other groups.
 
-### Phase 10a — Branch tests stay green on the merge with sdlc  · status: in progress
+### Phase 10a — Branch tests stay green on the merge with sdlc  · status: done
 
 From the sdlc merge gate, 2026-11-07. Hash 2b1b216e7 merged into sdlc a8123acd4 turned two tests red, in the batch and alone. Both pass on a8123acd4 without this branch.
 
@@ -343,3 +343,7 @@ From the sdlc merge gate, 2026-11-07. Hash 2b1b216e7 merged into sdlc a8123acd4 
 2. `ask_a_friend/test_end_friend.py` `test_a_staff_retirement_refusal_still_stops_the_consultation_server`: the consultation server survives the retirement refusal.
 
 The branch changes neither folder. The cause is a shared path the branch changes: the Codex process scan in `staff_sources.py` or the retire path. Tests must not read live units.
+
+Cause: neither test failure came from this branch. `test_restart` read the live Astra root, because its fixture patched `unit_runs.run_roots` but not `unit_runs.ASTRA_RUN_ROOT`. Under load, `codex_mesh._reap` returned success while a zombie child app-server was not yet waitable, so end-friend left the consultation server alive. The fixture now patches the Astra root, and only `waitpid` confirms a child exit.
+
+The phase also folds retire-servers `7c0e6596f` (Phase 9r) into this branch. devtools 8l keeps the staff row at `codex_mesh end`, so the merge keeps the last-worker server reap and drops the retire call. The reap now also runs when an end of the last worker fails after it publishes `ended`. `scripts/message/morty_identity.py` holds the `MORTY_NATIVE_ID` rule for `send` and `session_staff`, which breaks the send → roster → session_staff → send import cycle.
