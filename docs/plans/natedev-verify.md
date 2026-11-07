@@ -1284,38 +1284,22 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The new test fails on the old code and passes on the new code.
 - `test_verify_mac_signal_boundaries.py` and the other Mac step modules pass. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
 
-### Phase 41k — The Linux disk probe test passes on every run  · status: todo
+### Phase 41k — The Linux disk probe test passes on every run  · status: done
 
 **Depends on:** Phase 41i.
 
-#### Work Order
+#### As-built
 
-**Source:** queue, through builds, 2026-11-06 23:00 EST. Builds asked for the repair in the next verify-env hash.
-
-**Goal:** `test_probe_uses_linux_disk_units_and_reports_all_parity_fields` passes on every run, and the probe reports free disk in GiB on every run.
-
-**Defect:** `scripts/mac_test/test_linux_runner.py::test_probe_uses_linux_disk_units_and_reports_all_parity_fields` failed 2 of 7 runs on trees based on builds 6793e84a0, with `free_gib=9.5e-05`, expected `100.0`. It passed 5 of 5 on 24e1c2630. No commit between them touches `linux_runner.py` or its test. Logs: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/18c/`. The value is 100 divided by 1024 squared, so one unit step is lost.
-
-**Spec:**
-
-1. Find the cause from the logs and the code. Quote the failing log line and the source line that causes it.
-2. Repair the cause where it lives. If the cause is in the probe, the probe reports GiB on every run. If the cause is only in the test, the test controls the input it reads.
-3. A regression test forces the failing condition and fails on the old code.
+- The fake `df` in `scripts/mac_test/test_linux_runner.py` picks its output unit from option arguments only (arguments that start with `-`). A `G` in a path, such as the mirror path, no longer makes it print GiB.
+- `test_probe_disk_units_do_not_depend_on_the_mirror_path` puts a `G` in the mirror path and requires `free_gib` = 100.0.
+- The probe in `scripts/mac_test/linux_runner.py` is unchanged.
 
 **Files:**
-- `scripts/mac_test/linux_runner.py`
-- `scripts/mac_test/test_linux_runner.py`
+- `scripts/mac_test/test_linux_runner.py` — the fake `df` and the regression test.
 
-**Workers:** 1 writer, in the verify-env tree, beside the phase 41j writer.
+**Gotchas:** LinuxShellTests reach the real `rustc` through rustup. A copy with no default rustup toolchain fails 9 of them when the module runs alone; the merge gate run passes.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test makes its project in a tempdir at run time.
-- aws tip 46329bd70 also edits `linux_runner.py`. The second to land resolves.
-
-**Acceptance gate:**
-- The new test fails on the old code and passes on the new code.
-- `test_linux_runner.py` passes 10 of 10 runs. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Ruled out:** a change to the probe in `linux_runner.py` — its `-BG` call was already correct.
 
 ### Phase 41l — The Mac idle watch alerts only on a waiter that waited past the limit  · status: todo
 
