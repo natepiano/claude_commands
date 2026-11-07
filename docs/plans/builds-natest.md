@@ -1553,43 +1553,20 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 ### Phase 72 — Three gate tests stop failing from load and live staff  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner and two targeted test runs, 2026-11-06. Each item has its own cause and proof.
-
-**Goal:** `direct/test_findings_simplify.py` uses its own staff file, and the lifecycle teardown and the admission hang each have a named cause from evidence, with a fix or a named owner, with every checked behavior kept.
-
-**Spec:**
-1. `direct/test_findings_simplify.py`, `test_held_finding_survives_a_repair_round_and_phase_end`: `progress_history` start-run reads the live staff file through `staff.initial_snapshot`. On a tree with an older `staff.py` it fails with `StaffUnreadable`. `FindingsLedgerFixture.environment()` at `findings_test_support.py:101` copies `os.environ`, so it inherits `STAFF_FILE`. Use `isolated_staff_file` from `scripts/production/staff_test_support.py` around the recorder sequence. Prove it: run the test with `STAFF_FILE` set to an unreadable file, and show that it fails before the fix and passes after.
-2. `production/test_production_lifecycle.py`: the first failure is `OSError: [Errno 39] Directory not empty: '.../lifecycle-test-cz0_xeap/case/origin.git/objects'` in the `shutil.rmtree` cleanup. The next 16 tests then fail with `FileExistsError` at `production_lifecycle_test_support.py:119`, because `LifecycleFixture` reuses one directory. Find the process that writes to `origin.git/objects` after its test ends, before you select a teardown fix. A retry in `rmtree` hides that process, so do not use one unless the evidence shows the writer ends by itself. Keep one failure from turning into 17.
-3. `production/test_merge_gate_suites_admission.py`: the hang is in `admission_client._line` at load 140, and the module passes alone on the base in 12.7 s. No cause is proved. Capture the blocked stack, the admission state and the child processes under forced load or a forced delay, before you select a fix. Forced case, 2026-11-06: `AdmissionFixture.loop_turn` waits 3 s for the loop lock, its error stops the server thread, and the client then waits for a reply that never comes. `scripts/build_queue/admission_test_support.py` is a test file, so this phase changes it. A cause in a production file goes to queue-unit, with the failing line, the source line and a reproduction.
-4. Quote the failing line and the source line before any fix. Reproduce with a forced delay or at gate load. State what is proved and what is not.
-5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time. A cut in a production file goes to the director first.
+- `direct/test_findings_simplify.py` runs its recorder sequence inside `isolated_staff_file`. An unreadable `STAFF_FILE` gave `StaffUnreadable` before and passes now.
+- `LifecycleFixture.remove_fixture` renames the fixture root to a new `finished-` folder before `shutil.rmtree`. One failed removal stays one error, and the next test gets its path.
+- `AdmissionFixture.loop_turn` and the fixture shutdown wait `TEST_HANG_GUARD_SECS` (600 s) in place of 3 s. A forced 4 s delay fails on the old form and passes now.
 
 **Files:**
-- `scripts/direct/test_findings_simplify.py`
-- `scripts/direct/findings_test_support.py`
-- `scripts/production/test_production_lifecycle.py`
-- `scripts/production/production_lifecycle_test_support.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-- `scripts/production/merge_gate_suites_test_support.py`
-- `scripts/build_queue/admission_test_support.py`
+- `scripts/direct/test_findings_simplify.py` — staff isolation
+- `scripts/production/production_lifecycle_test_support.py` — fixture cleanup
+- `scripts/build_queue/admission_test_support.py` — fixture waits; queue-unit owns this file
 
-**Workers:** 2 writers; the admission fixture has no shared file with the other two
-- `impl3` — `test_findings_simplify.py`, `findings_test_support.py`, `test_production_lifecycle.py`, `production_lifecycle_test_support.py`, role impl
-- `impl4` — `test_merge_gate_suites_admission.py`, `merge_gate_suites_test_support.py`, `admission_test_support.py`, role impl
+**Gotchas:** two causes stay unproved. The process that wrote to `origin.git/objects` did not show in 66 delayed cleanups under strace, with zero live writers. No stack exists from the first admission hang at load 140. A real hang can report at up to 1200 s, below the 1800 s module limit.
 
-**Constraints from prior phases:**
-- Phase 63: a flake fix publishes a file atomically and waits on events. A forced case fails before the fix and passes after it.
-- Phase 70: a hang that does not reproduce gets a report that names the wait, and the cause stays open.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- for each item, the quoted failing line, the source line and the named cause are in the summary, or the summary states that the cause stays open, with the evidence and the owner
-- a forced case fails before each fix and passes after it, on a tempdir copy
-- each changed module passes 5 runs under `module_run.py`, and every importer of a changed support file passes
-- the targeted test green on the phase commit merged with `origin/builds`, after the reviews converge
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a retry in `rmtree`, because it hides the writer; one shared deadline for the two waits, because it could fail a slow passing test.
 
 ### Phase 73 — Two stopped-call tests stop failing at random  · status: todo
 **Depends on:** none
