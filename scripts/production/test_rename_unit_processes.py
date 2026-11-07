@@ -3,17 +3,15 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, final, override
+from typing import NamedTuple, cast, final, override
 from unittest import mock
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import retire_unit
+from scripts.production import retire_unit
 from scripts.production import unit_lookup
 from scripts.production import unit_move
 from scripts.production import staff_sources
@@ -23,10 +21,7 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
-if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
-else:
-    from unit_staff_test_support import PARENTS, isolated_parents
+from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'

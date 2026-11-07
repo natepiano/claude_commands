@@ -85,7 +85,9 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
-| `scripts/copies/copies.py` | read | local_snapshot |
+| `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
+| `scripts/build_queue/build_queue.py` | read | caller_identity |
+| `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
@@ -100,6 +102,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
@@ -148,7 +151,11 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
-| `scripts/production/merge_gate.py` | read | staff.json path |
+| `scripts/production/bump_gate.py` | read | read_production.owner.id |
+| `scripts/production/ci_points.py` | read | Production.owner.id |
+| `scripts/production/fast_track.py` | read | copies.source_owner |
+| `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
@@ -218,6 +225,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
 | `scripts/style/style_proposals.py` | read | snapshot |
+| `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, record_path |
 | `scripts/usage/outcomes.py` | read | snapshot |
@@ -225,7 +233,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-155 accessors: 31 write, 123 read, 1 owner.
+165 accessors: 32 write, 132 read, 1 owner.
 
 ## Approved copies
 

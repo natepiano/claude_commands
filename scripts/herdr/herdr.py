@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 import json
+import hashlib
 import ctypes
 import os
 import re
@@ -281,6 +282,11 @@ class PromptInputNotReady:
 
 
 @dataclass(frozen=True)
+class PromptInputHoldsDraft:
+    screen: str
+
+
+@dataclass(frozen=True)
 class PromptInputTimedOut:
     """The destination did not become ready before the launch deadline."""
 
@@ -310,6 +316,11 @@ class PromptNotSubmitted:
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
     # True only when the launcher never typed the prompt: the session then holds no work of it.
     never_typed: bool = False
+
+
+@dataclass(frozen=True)
+class AgentNotStarted(PromptNotSubmitted):
+    """The start command failed, and no agent runs in the pane."""
 
 
 @dataclass(frozen=True)
@@ -1931,7 +1942,7 @@ class Herdr:
             print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
             if screen:
                 print(screen, file=sys.stderr)
-            return PromptNotSubmitted(str(error))
+            return AgentNotStarted(str(error))
         if kind == "codex":
             try:
                 entry = self.codex_launch(pane, agent_arguments)
@@ -2127,7 +2138,7 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2141,19 +2152,25 @@ class Herdr:
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
         screen = _prompt_screen(raw)
         composer = _composer_input(raw)
-        if isinstance(composer, ComposerInput) and not composer.text.strip():
+        if isinstance(composer, ComposerInput):
+            if composer.text.strip():
+                return PromptInputHoldsDraft(screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
     def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        draft_stashed = False
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
+            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
+                self._send_keys(pane, "ctrl+s")
+                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
@@ -4746,7 +4763,9 @@ def _agent_name(name: str) -> str:
     mapped = re.sub(r"[^a-z0-9_-]", "-", name.lower())
     if not mapped or not "a" <= mapped[0] <= "z":
         mapped = "a-" + mapped
-    return mapped[:32]
+    if len(mapped) <= 32:
+        return mapped
+    return mapped[:23] + "-" + hashlib.sha256(mapped.encode()).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
@@ -4845,10 +4864,15 @@ def prepare_session_environment(session_id: str, cwd: str, environment: dict[str
     return prepare_agent_environment(cwd, environment, unset_variables)
 
 
+class AgentNameSource(Enum):
+    MEMBER_REFERENCE = "member_reference"
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
-                          timeout_ms: int, *, agent: str, reported_unknown: str = "") -> AgentLaunched:
-    """Launch an already proved environment without another potentially slow load."""
+                          timeout_ms: int, *, agent: str, reported_unknown: str = "",
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+    """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
@@ -4901,7 +4925,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
             client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
-        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
     except AgentExited:
         if isinstance(destination, NewTab):
             close_agent(name, pane)
@@ -4913,6 +4938,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             raise
         print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
         return AgentLaunched(pane, PromptNotSubmitted(str(error)))
+    if isinstance(outcome, AgentNotStarted) and not isinstance(destination, ExistingPane):
+        if isinstance(destination, NewTab):
+            close_agent(name, pane)
+        else:
+            _ = client.close_retained_pane(pane)
+        print(f"herdr {name}:{pane}: agent start failed: {outcome.reason}; pane closed", file=sys.stderr)
     return AgentLaunched(pane, outcome)
 
 

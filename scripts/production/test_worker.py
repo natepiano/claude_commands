@@ -340,8 +340,8 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
-        self.assertEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
-                                       PaneWorkerResume(idle.row.id, IdleWorker())])
+        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
+                                             PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
@@ -691,7 +691,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.submitted, [(pane, line)])
         self.assertEqual(self.reply.read_text(), previous)
 
-    def test_a_delivered_result_absent_from_the_transcript_waits_only_while_its_run_is_live(self) -> None:
+    def test_done_with_a_result_absent_from_the_transcript_completes_after_its_run_finishes(self) -> None:
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
@@ -719,12 +719,37 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertLessEqual(waits, 3 if live else 1, "a quiet ended turn must return")
                         return codex_mesh.WaitDeadlineExpired.EXPIRED
 
-                    with patch.object(watch_class, "wait", side_effect=finish_run):
-                        self.assertEqual(self.dispatch(), worker.ExitCode.NO_DONE)
+                    with (redirect_stderr(io.StringIO()) as errors,
+                          patch.object(watch_class, "wait", side_effect=finish_run)):
+                        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
                     self.assertEqual(waits, 3 if live else 1)
+                    self.assertEqual(errors.getvalue().splitlines(), [
+                        f"anomaly: {row.name}: run private-check finished, but its result is not in the transcript"])
+                    self.assertEqual(self.agent.submitted, [(pane, line)])
+                    self.assertEqual(self.reply.read_text(), previous)
             assert supervisor.stdin is not None
             supervisor.stdin.close()
             self.assertEqual(supervisor.wait(timeout=LauncherHangGuard("private run exit").remaining()), 0)
+        self.assertEqual(self.agent.submitted, [(pane, line)])
+        self.assertEqual(self.agent.waited, [])
+        self.assertEqual(self.reply.read_text(), previous)
+
+    def test_a_reply_without_done_with_a_finished_run_absent_from_the_transcript_returns_no_done(self) -> None:
+        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        pane, line = self.agent.submitted[-1]
+        previous = self.reply.read_text()
+        self.agent.without_done = True
+        self.agent.complete(pane)
+        row = self.agent.row(pane)
+        path, record = self.detached_record(row, "private-check")
+        record["delivery"] = f"sent: worker {row.name} at {pane}"
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(watch_class, "wait", return_value=codex_mesh.WaitDeadlineExpired.EXPIRED) as wait):
+            self.assertEqual(self.dispatch(), worker.ExitCode.NO_DONE)
+        wait.assert_called_once()
+        self.assertEqual(errors.getvalue(), "")
         self.assertEqual(self.agent.submitted, [(pane, line)])
         self.assertEqual(self.agent.waited, [])
         self.assertEqual(self.reply.read_text(), previous)

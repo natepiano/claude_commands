@@ -151,8 +151,8 @@ signal.pause()
                 _ = (lock / "holder_pid").write_text(str(os.getpid()))
                 _ = (lock / "owned").write_text(json.dumps({"group": leader.pid, "start": start.start, "start_format": identity.process_start_format()}))
                 with mock.patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps")}):
-                    step_record.write(step_record.StepRecord("zombie", leader.pid, start.start, root, "check", None,
-                        step_record.MacAllowed(), step_record.StepState.ON_NATEDEV, "now"))
+                    step_record.write(step_record.StepRecord("zombie", leader.pid, start.start, root, "check", step_record.WorkspacePackages(),
+                        step_record.AnyTarget(("mac", "natedev"), ("mac",)), step_record.StepState.ON_NATEDEV, "now"))
                     self.assertIs(type(step_record.read("zombie")), step_record.StaleRecord)
                 result = subprocess.run(["bash", str(BOARD), "release", str(root), "first", "cargo", "--pid", str(os.getpid())],
                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)

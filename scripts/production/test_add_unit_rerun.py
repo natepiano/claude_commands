@@ -16,9 +16,9 @@ from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions
-import resume_unit
-import unit_lookup as script_unit_lookup
-import retire_unit
+from scripts.production import resume_unit
+from scripts.production import unit_lookup as script_unit_lookup
+from scripts.production import retire_unit
 from scripts.lib import atomic_file
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config

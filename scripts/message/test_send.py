@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TextIO, cast, final, override
+from typing import TextIO, cast, final, override
 from unittest import mock
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
@@ -58,10 +58,7 @@ from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 from scripts.message import roster
 from scripts.message import sessions
-if TYPE_CHECKING:
-    from scripts.accounts import accounts
-else:
-    from scripts.accounts import accounts
+from scripts.accounts import accounts
 from scripts.shutdown.test_support import ShutdownTestCase
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -89,7 +91,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         staff_environment: dict[str, str] = {}
         resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
         _ = fixture_member("showrunner", name="expected-showrunner",
-                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc("natedev", document))
+                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc(remote.local_machine(), document))
         _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         sessions = root / "sessions"
         sessions.mkdir()
@@ -105,8 +107,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         _ = session_lookup.write_text("\n".join((
             "import runpy, sys",
             "from pathlib import Path",
-            f"sys.path.insert(0, {str(HOOKS.parents[1])!r})",
-            f"sys.path.insert(0, {str(HOOKS)!r})",
+            f"with open({str(HOOKS.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
             "from scripts.message import sessions",
             "from unittest.mock import patch",
             "read_sessions = sessions.live_sessions",

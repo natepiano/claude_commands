@@ -20,6 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
@@ -64,7 +65,7 @@ if tool == "nix":
 event = {
     "tool": tool, "args": arguments, "cwd": str(Path.cwd()), "inputs": inputs,
     "environment": {key: value for key, value in os.environ.items()
-                    if key.startswith(("BUILDLOG_", "LINT_", "TEST_SHELL_"))},
+                    if key.startswith(("BUILDLOG_", "LINT_", "TEST_SHELL_", "RUSTUP_"))},
     "warm": (Path.cwd() / "target/warm-proof").exists(),
 }
 with Path(os.environ["TOOL_EVENTS"]).open("a") as output:
@@ -84,7 +85,7 @@ if tool == "df":
     if "-g" in arguments:
         raise SystemExit("Linux must not use df -g")
     free = int(os.environ.get("FAKE_FREE_GIB", "100"))
-    if any("G" in argument for argument in arguments):
+    if any("G" in argument for argument in arguments if argument.startswith("-")):
         available = str(free) + "G"
     elif "-B1" in arguments:
         available = str(free * 1024 ** 3)
@@ -97,7 +98,23 @@ if tool == "rustc":
     assert arguments == ["-V"]
     print("rustc " + os.environ.get("TEST_SHELL_TOOL_VERSION", "fixture"))
     raise SystemExit(0)
-if tool == "cargo":
+if tool == "rustup":
+    assert arguments == ["toolchain", "install", "--no-self-update", "--no-update"]
+    if os.environ.get("FAKE_RUSTUP_FAIL"):
+        print("error: toolchain download failed", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0)
+if tool in ("cargo", "cargo-nextest", "cargo-mend"):
+    if tool == "cargo" and arguments == ["metadata", "--format-version", "1", "--no-deps"]:
+        if (os.environ.get("FAKE_CARGO_NEEDS_TOOLCHAIN") and not os.environ.get("RUSTUP_TOOLCHAIN")
+                and not any(Path(name).is_file() for name in ("rust-toolchain", "rust-toolchain.toml"))):
+            print("error: rustup could not choose a version of cargo to run", file=sys.stderr)
+            raise SystemExit(1)
+        if os.environ.get("FAKE_RUSTUP_FAIL"):
+            print("error: toolchain is not installed", file=sys.stderr)
+            raise SystemExit(1)
+        print(json.dumps({"workspace_root": str(Path.cwd()), "target_directory": str(Path.cwd() / "target")}))
+        raise SystemExit(0)
     assert arguments in (["nextest", "--version"], ["mend", "--version"])
     if arguments[0] == "nextest" and "TEST_NEXTEST_VERSION" in os.environ:
         print(os.environ["TEST_NEXTEST_VERSION"])
@@ -163,7 +180,7 @@ class LinuxShellTests(unittest.TestCase):
         self.event_path = self.root / "events.jsonl"
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in ("nix", "df", "rm"):
+        for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
         self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
@@ -289,6 +306,29 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(evaluations[0]["inputs"], ["flake.lock", "flake.nix", "nix/shell.nix"])
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
+
+    def test_forwarded_test_environment_survives_the_development_shell(self) -> None:
+        _ = write_config_fixture(self.root / "direct.conf")
+        values = {"NO_COLOR": "1", "TERM": "xterm-256color", "COLORTERM": "truecolor",
+                  "TERM_PROGRAM": "verify", "COLUMNS": "80", "LINES": "24"}
+        self.environment.update(copies_environment(self.root))
+        self.environment["FAKE_NIX_EXPORTS"] = "\n".join(
+            "export " + name + "=shell-value"
+            for name in (*values, "CLICOLOR", "HANA_TARGET_ONLY", "LC_TERMINAL"))
+        capture = self.mirror / "received-environment.json"
+        lint = self.root / ".claude/scripts/lint/lint"
+        original = lint.read_text()
+        _ = lint.write_text(original.replace("tool = Path(sys.argv[0]).name",
+            "Path(" + repr(str(capture)) + ").write_text(json.dumps(dict(os.environ)))\n"
+            + "tool = Path(sys.argv[0]).name"))
+        request = replace(self.request(), environment=tuple(values.items()))
+        result = self.execute(request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads(capture.read_text()))
+        self.assertEqual({name: observed[name] for name in values}, values)
+        self.assertNotIn("CLICOLOR", observed)
+        self.assertNotIn("HANA_TARGET_ONLY", observed)
+        self.assertEqual(observed["LC_TERMINAL"], "shell-value")
 
     def test_pinned_selection_reaches_the_remote_step_environment(self) -> None:
         with mock.patch.dict(os.environ, {"BUILDLOG_PINNED_TARGET": "aws"}):
@@ -505,7 +545,7 @@ class LinuxShellTests(unittest.TestCase):
         _ = self.settings.write_text(self.settings.read_text().replace("target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
         recent = self.build_output("target", "recent", 1_793_570_400, 8192)
-        other = self.mirror.parent / "1/target/retained"
+        other = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/retained"
         other.parent.mkdir(parents=True)
         _ = other.write_text("another slot\n")
 
@@ -524,7 +564,7 @@ class LinuxShellTests(unittest.TestCase):
             "target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
         recent = self.build_output("target", "recent", 1_793_570_400, 8192)
-        neighbor = self.mirror.parent / "1/target/recent-output"
+        neighbor = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/recent-output"
         neighbor.parent.mkdir(parents=True)
         _ = neighbor.write_text("another slot\n")
 
@@ -562,10 +602,10 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
 
     def test_explicit_build_folder_cannot_escape_the_selected_slot(self) -> None:
-        neighbor = self.mirror.parent / "1/target/retained"
+        neighbor = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/retained"
         neighbor.parent.mkdir(parents=True)
         _ = neighbor.write_text("another slot\n")
-        for words in (("--target-dir", "../1/target"), (f"--target-dir={neighbor.parent}",)):
+        for words in (("--target-dir", f"../{neighbor.parent.parent.name}/target"), (f"--target-dir={neighbor.parent}",)):
             with self.subTest(words=words):
                 result = self.execute(self.request(words=words))
 
@@ -573,11 +613,124 @@ class LinuxShellTests(unittest.TestCase):
                 self.assertFalse(self.events("lint"))
                 self.assertEqual(neighbor.read_text(), "another slot\n")
 
+    def test_toolchain_install_runs_in_the_mirror_before_parity_and_work(self) -> None:
+        self.write_input("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\ncomponents = ["clippy", "rustfmt"]\n')
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = self.settings.write_text(self.settings.read_text() + "parity.rustc=rustc fixture\n")
+
+        result = self.execute(self.request())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tools = [cast(ToolEvent, json.loads(line))["tool"] for line in self.event_path.read_text().splitlines()]
+        self.assertLess(tools.index("rustup"), tools.index("rustc"))
+        self.assertLess(tools.index("rustc"), tools.index("lint"))
+        install = self.events("rustup")[0]
+        self.assertEqual(install["cwd"], str(self.mirror))
+        self.assertEqual(install["args"], ["toolchain", "install", "--no-self-update", "--no-update"])
+
+    def test_cleanup_uses_the_step_toolchain_without_a_default(self) -> None:
+        self.use_real_sweep = True
+        self.write_input("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.1.0"\n')
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = self.settings.write_text(self.settings.read_text() + "parity.rustc=rustc 1.99.0\n")
+        self.environment.update({"FAKE_CARGO_NEEDS_TOOLCHAIN": "1", "TEST_SHELL_TOOL_VERSION": "1.99.0"})
+
+        for mode, expected in (("fallback", "1.99.0"), ("inherited", "nightly-2026-08-01"),
+                               ("shellHook", "nightly-2026-08-02"), ("file", "")):
+            with self.subTest(mode=mode):
+                _ = self.environment.pop("RUSTUP_TOOLCHAIN", None)
+                _ = self.environment.pop("FAKE_NIX_EXPORTS", None)
+                if mode == "inherited":
+                    self.environment["RUSTUP_TOOLCHAIN"] = expected
+                elif mode == "shellHook":
+                    self.environment["FAKE_NIX_EXPORTS"] = f"export shellHook='export RUSTUP_TOOLCHAIN={expected}'"
+                elif mode == "file":
+                    self.write_input("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n')
+                self.event_path.unlink(missing_ok=True)
+                shutil.rmtree(self.root / ".local/state/build-target/shells", ignore_errors=True)
+
+                result = self.execute(self.request())
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("mac_exit=0", result.stdout)
+                self.assertIn("mac_cleanup=kept", result.stdout, result.stderr)
+                metadata = [event for event in self.events("cargo") if event["args"][0] == "metadata"]
+                self.assertGreaterEqual(len(metadata), 2)
+                for event in [self.events("lint")[-1], *metadata]:
+                    self.assertEqual(event["environment"].get("RUSTUP_TOOLCHAIN", ""), expected)
+
+    def test_toolchain_locks_follow_the_channel_across_trees(self) -> None:
+        commands = self.root / "lock-commands"
+        _ = commands.write_text('')
+        flock = self.root / "bin/flock"
+        _ = flock.write_text('#!/bin/bash\nprintf "%s\\n" "$(readlink /proc/$$/fd/9)" >> "$LOCK_COMMANDS"\n')
+        flock.chmod(0o755)
+        for name, channel in (("one", "1.99.0"), ("two", "1.99.0"), ("three", "1.99.1")):
+            tree = self.root / name
+            tree.mkdir()
+            _ = (tree / "rust-toolchain.toml").write_text(f'[toolchain]\nchannel = "{channel}"\n')
+            result = subprocess.run(["bash", "-c", linux_runner.toolchain_install_script("rustc 1.99.1")],
+                cwd=tree, env={**self.environment, "LOCK_COMMANDS": str(commands)},
+                capture_output=True, text=True, check=False, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        locks = commands.read_text().splitlines()
+        self.assertEqual(locks[0], locks[1])
+        self.assertNotEqual(locks[1], locks[2])
+        self.assertEqual(Path(locks[0]).name, "1.99.0.lock")
+
+    def test_path_toolchain_uses_the_file_hash_as_its_lock_name(self) -> None:
+        text = '[toolchain]\npath = "/toolchains/custom"\n'
+        self.write_input("rust-toolchain.toml", text)
+        result = subprocess.run(["bash", "-c", linux_runner.toolchain_install_script("rustc 1.99.0")],
+            cwd=self.mirror, env=self.environment, capture_output=True, text=True, check=False, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lock = self.root / ".rustup" / (hashlib.sha256(text.encode()).hexdigest() + ".lock")
+        self.assertTrue(lock.exists())
+        self.assertEqual(len(self.events("rustup")), 1)
+        self.assertNotIn("RUSTUP_TOOLCHAIN", self.events("rustup")[0]["environment"])
+
+    def test_toolchain_environment_wins_before_the_file_and_plain_version_fallback(self) -> None:
+        for file, version, expected in (("", "rustc 1.99.0 (fixture today)", "1.99.0"),
+                                        ("", "rustc 1.99.0-nightly (fixture today)", ""),
+                                        ("rust-toolchain.toml", "rustc 1.99.1", ""),
+                                        ("rust-toolchain", "rustc 1.99.1", "")):
+            with self.subTest(file=file, version=version):
+                for name in ("rust-toolchain", "rust-toolchain.toml"):
+                    (self.mirror / name).unlink(missing_ok=True)
+                if file:
+                    _ = (self.mirror / file).write_text(
+                        '[toolchain]\nchannel = "1.99.0"\n' if file.endswith(".toml") else '1.99.0\n')
+                script = linux_runner.toolchain_install_script(version)
+                script += '\nprintf "fallback=%s\\n" "${RUSTUP_TOOLCHAIN-unset}"\n'
+                for inherited in (None, "nightly-2026-08-01"):
+                    with self.subTest(inherited=inherited):
+                        environment = dict(self.environment)
+                        if inherited:
+                            environment["RUSTUP_TOOLCHAIN"] = inherited
+                        result = subprocess.run(["bash", "-c", script], cwd=self.mirror,
+                            env=environment, capture_output=True, text=True, check=False, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, f"fallback={inherited or expected or 'unset'}\n")
+                        if inherited:
+                            self.assertTrue((self.root / ".rustup" / (inherited + ".lock")).exists())
+                            self.assertEqual(self.events("rustup")[-1]["environment"]["RUSTUP_TOOLCHAIN"], inherited)
+
+    def test_probe_uses_direct_tools_without_reading_rustc(self) -> None:
+        script = linux_runner.probe_script("mirror")
+        self.assertNotIn("rustc -V", script)
+        self.assertNotIn("cargo nextest", script)
+        self.assertNotIn("cargo mend", script)
+        self.assertIn("cargo-nextest nextest --version", script)
+        self.assertIn("cargo-mend mend --version", script)
+
     def test_selected_target_probe_reads_tools_inside_the_cached_shell(self) -> None:
         for tool in ("rustc", "cargo", "hostname"):
             self.write_tool(self.root / "bin" / tool)
         _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
-        self.environment["FAKE_NIX_EXPORTS"] = "export TEST_SHELL_TOOL_VERSION=shell"
+        self.write_input("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.1.0"\n')
+        self.environment["FAKE_NIX_EXPORTS"] = "export PATH=/shell-tools\nexport TEST_SHELL_TOOL_VERSION=shell"
         arguments = shlex.split(linux_runner.probe_command_script(
             str(self.mirror), offload.read_config(self.settings).values, "hana",
         ))
@@ -602,11 +755,82 @@ class LinuxShellTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         values = dict(line.split("=", 1) for line in output.getvalue().splitlines())
-        self.assertEqual(values["rustc"], "rustc shell")
+        self.assertNotIn("rustc", values)
         self.assertEqual(values["nextest"], "nextest shell")
         self.assertEqual(values["mend"], "mend shell")
         self.assertEqual(values["scripts_commit"], "fixture-commit")
         self.assertEqual(len(self.events("nix")), 1)
+        self.assertFalse(self.events("cargo"))
+        self.assertFalse(self.events("rustup"))
+        self.assertFalse(self.events("rustc"))
+        self.assertEqual(self.events("df")[-1]["args"], ["-Pk", str(self.mirror)])
+
+    def test_runner_keeps_caller_tools_when_exports_replace_path(self) -> None:
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        self.write_input("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n')
+        self.environment["FAKE_NIX_EXPORTS"] = "export PATH=/shell-tools"
+        _ = self.settings.write_text(self.settings.read_text() + "parity.rustc=rustc fixture\n")
+
+        _ = self.assert_ran(self.request())
+
+        self.assertEqual(len(self.events("rustup")), 1)
+        self.assertEqual(len(self.events("rustc")), 1)
+
+    def test_shell_hook_toolchain_installs_under_its_own_lock_without_a_file(self) -> None:
+        self.write_tool(self.root / "bin" / "cargo")
+        self.environment["FAKE_NIX_EXPORTS"] = (
+            "export shellHook='export RUSTUP_TOOLCHAIN=nightly-2026-08-01'"
+        )
+        _ = self.settings.write_text(self.settings.read_text() + "parity.rustc=rustc 1.99.0\n")
+        self.write_tool(self.root / "bin" / "rustc")
+        self.environment["TEST_SHELL_TOOL_VERSION"] = "1.99.0"
+
+        _ = self.assert_ran(self.request())
+
+        install = self.events("rustup")
+        self.assertEqual(len(install), 1)
+        self.assertEqual(install[0]["environment"]["RUSTUP_TOOLCHAIN"], "nightly-2026-08-01")
+        self.assertTrue((self.root / ".rustup/nightly-2026-08-01.lock").exists())
+        self.assertFalse((self.root / ".rustup/1.99.0.lock").exists())
+
+    def test_install_failure_declines_with_its_text_instead_of_losing_the_run(self) -> None:
+        self.write_input("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n')
+        self.write_tool(self.root / "bin" / "cargo")
+        self.environment["FAKE_RUSTUP_FAIL"] = "1"
+        wire = self.execute(self.request())
+        self.assertEqual(wire.returncode, 75, wire.stderr)
+        self.assertNotIn("mac_exit=", wire.stdout)
+        self.assertFalse(self.events("lint"))
+
+        dispatch = LinuxDispatchTests()
+        self.addCleanup(dispatch.doCleanups)
+        dispatch.setUp()
+
+        class CompletedRemoteStep:
+            stdout: io.StringIO = io.StringIO(wire.stdout + wire.stderr)
+
+            def wait(self) -> int:
+                return wire.returncode
+
+        def stream(arguments: Sequence[str]) -> offload.RemoteRunStatus:
+            with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
+                return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
+
+        with mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream):
+            result, _, output = dispatch.run_request(dispatch.request())
+
+        self.assertIsInstance(result, offload.DeclinedMacRun)
+        assert isinstance(result, offload.DeclinedMacRun)
+        self.assertIn("toolchain download failed", result.detail)
+        self.assertNotIn("local fallback requires admission", output)
+        self.assertFalse(dispatch.fixture.claims("aws"))
+        destination = self.root / "decline-result"
+        with redirect_stdout(io.StringIO()):
+            status = offload.write_result(result, offload.ResultFile(destination), target="aws")
+        self.assertEqual(status, 75)
+        self.assertIn("outcome=declined", destination.read_text())
+        self.assertNotIn("outcome=lost", destination.read_text())
 
     def test_probe_uses_linux_disk_units_and_reports_all_parity_fields(self) -> None:
         for tool in ("rustc", "cargo", "hostname"):
@@ -622,11 +846,28 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         values = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(float(values["free_gib"]), 100.0)
-        self.assertEqual(values["rustc"], "rustc fixture")
+        self.assertNotIn("rustc", values)
         self.assertEqual(values["nextest"], "nextest fixture")
         self.assertEqual(values["mend"], "mend fixture")
         self.assertEqual(values["scripts_commit"], "fixture-commit")
         self.assertNotIn("-g", self.events("df")[-1]["args"])
+
+    def test_probe_disk_units_do_not_depend_on_the_mirror_path(self) -> None:
+        identity = offload.KnownRepository("phase-copy", "https://example.com/team/GiB")
+        mirror = self.root / offload.remote_mirror(identity, "aws", 2)
+        mirror.mkdir(parents=True)
+        for tool in ("rustc", "cargo", "hostname"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
+
+        result = subprocess.run(
+            ["bash", "-c", offload.probe_script(identity, "aws", 2)], cwd=self.root,
+            env=self.environment, text=True, capture_output=True, check=False, timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(float(values["free_gib"]), 100.0)
 
     def test_matching_shell_tools_run_when_the_base_environment_versions_differ(self) -> None:
         for tool in ("rustc", "cargo"):
@@ -741,6 +982,20 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "builder version mismatch: rustc box=rustc fixture "
                          + "natedev=rustc required; move the box pins in nixos hosts/builder.nix\n")
         self.assertFalse(self.events("lint"))
+
+    def test_remote_build_and_judgments_receive_their_verbs_and_kinds(self) -> None:
+        _ = self.settings.write_text(self.settings.read_text().replace(
+            "kinds=test,check,doc", "kinds=test,check,doc,lint,example,build"))
+        cases: tuple[tuple[offload.MacVerb, str, tuple[str, ...]], ...] = (
+            ("build", "build", ("--workspace", "--bins")),
+            ("clippy", "lint", ("--workspace", "--all-features")),
+            ("mend-check", "lint", ("--workspace",)),
+            ("clippy", "example", ("--workspace", "--example", "demo")),
+        )
+        for verb, kind, words in cases:
+            with self.subTest(verb=verb, kind=kind):
+                event = self.assert_ran(replace(self.request(verb, words), kind=kind))
+                self.assertEqual(event["args"], [verb, *words])
 
     def test_check_and_staged_doc_keep_their_arguments_and_document_policy(self) -> None:
         check = self.assert_ran(self.request("check", ("--workspace", "--all-features")))
@@ -1597,7 +1852,7 @@ class LinuxDispatchTests(unittest.TestCase):
                                     + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n")
         self.commands, self.actions, self.filters, self.manifests = [], [], [], []
         self.probe_wire = (
-            "free_gib=200\nhost=fake-linux\nrustc=rustc fixture\nnextest=nextest fixture\n"
+            "free_gib=200\nhost=fake-linux\nnextest=nextest fixture\n"
             + "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
         )
         self.controller = offload.ProcessController()
@@ -1725,9 +1980,18 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertFalse(self.actions)
         self.assertFalse(self.fixture.claims("aws"))
 
+    def test_linux_probe_accepts_no_rustc_value(self) -> None:
+        self.assertNotIn("rustc=", self.probe_wire)
+        identity = offload.repository_identity(self.source)
+        self.assertIsInstance(identity, offload.KnownRepository)
+        if not isinstance(identity, offload.KnownRepository):
+            self.fail("The fixture must have a repository identity")
+        probe = offload.probe_mac(self.controller, offload.read_config(self.settings), identity, "aws", 2)
+        self.assertIsInstance(probe, offload.ProbeSnapshot)
+
     def test_each_parity_mismatch_blocks_source_execution(self) -> None:
         matching = self.probe_wire
-        for field in ("rustc", "nextest", "mend", "scripts_commit"):
+        for field in ("nextest", "mend", "scripts_commit"):
             with self.subTest(field=field):
                 self.probe_wire = "\n".join(field + "=wrong" if line.startswith(field + "=") else line
                                              for line in matching.splitlines()) + "\n"

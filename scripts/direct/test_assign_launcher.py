@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import assign, progress_history
+from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr
@@ -269,6 +270,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         self.assertEqual((other / state.name).read_bytes(), before)
 
     def test_a_herdr_exit_that_keeps_a_worker_keeps_the_run(self) -> None:
+        self.commit_project()
         _ = (self.session_dir / "worker_transport").write_text("herdr\n")
         calls = self.failing_worker(7)
         self.assert_run_active(self.launch(), 7)
@@ -283,6 +285,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_a_retry_without_a_run_starts_a_new_run_after_launch_failure(self) -> None:
+        self.commit_project()
         calls = self.failing_worker()
         self.assert_run_ended(self.launch())
         director = staff.runtime_id()
@@ -471,6 +474,15 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
 
 @final
+class HerdrClaimFixture(AssignClaudeLauncherFixture):
+    """Use the shared claim fixture with the active launcher environment."""
+
+    @override
+    def environment(self) -> dict[str, str]:
+        return os.environ.copy()
+
+
+@final
 class AssignLauncherTests(AssignLauncherFixture):
     def test_claude_worker_returns_through_start_and_then_follows_its_codex_thread(self) -> None:
         self.commit_project()
@@ -630,6 +642,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertTrue(edited)
 
     def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
+        self.commit_project()
         _ = (self.session_dir / "worker_transport").write_text("herdr\n")
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         prompt = self.prompt.read_bytes()
@@ -641,6 +654,60 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
         self.assertEqual(self.prompt.read_bytes(), prompt)
         self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
+    def herdr_claim_launch(self, claim_status: str, role: str = "implement") -> subprocess.CompletedProcess[str]:
+        self.commit_project()
+        self.record("start-phase", "--phase-id", "3", "--phase-title", "Claim before assignment")
+        write_text_atomic(self.prompt, "Phase 3 — Claim before assignment\nImplement the assigned change.\n")
+        write_text_atomic(self.session_dir / "worker_transport", "herdr\n")
+        write_text_atomic(self.session_dir / "mesh_events.txt", "")
+        environment, calls = HerdrClaimFixture().claim_fixture(self.session_dir, claim_status)
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        with patch.dict(os.environ, environment):
+            self.instrument_launcher("\n".join((
+                "from pathlib import Path",
+                "from scripts.direct import assign",
+                "from scripts.lib.atomic_file import write_text_atomic",
+                "run_command = assign.subprocess.run",
+                "def observe(command, *arguments, **options):",
+                "    if len(command) > 2 and Path(command[1]).name == 'worker.py' and command[2] == 'assign':",
+                f"        events = Path({str(self.session_dir / 'mesh_events.txt')!r})",
+                "        write_text_atomic(events, events.read_text() + 'assign\\n')",
+                *((f"        baseline = Path({str(self.session_dir / 'phases/3/phase_baseline')!r})",
+                   f"        write_text_atomic(Path({str(self.session_dir / 'baseline-at-worker-assign')!r}), baseline.read_text())")
+                  if role != "review" else ()),
+                "    return run_command(command, *arguments, **options)",
+                "assign.subprocess.run = observe",
+            )))
+            result = self.launch(role, "--phase", "3")
+        if role != "review":
+            self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
+        return result
+
+    def test_herdr_assignment_claims_the_phase_before_the_worker_assignment(self) -> None:
+        result = self.herdr_claim_launch("clear")
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["claim", "assign"])
+        head = subprocess.run(["git", "-C", str(self.project), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout
+        self.assertEqual((self.session_dir / "phases/3/phase_baseline").read_text(), head)
+        self.assertEqual((self.session_dir / "baseline-at-worker-assign").read_text(), head)
+
+    def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
+        result = self.herdr_claim_launch("blocked")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        log = self.session_dir / "phases/3/impl_agent.log"
+        self.assertEqual(result.stderr,
+                         f"ERROR: phase 3 could not claim its files before its worker opens; see {log}.\n")
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["claim"])
+        self.assertEqual((self.session_dir / "phases/3/impl_status").read_text(), "error\n")
+        self.assertIn("launcher: phase 3 could not claim its files; its worker did not open",
+                      (self.session_dir / "board.log").read_text())
+
+    def test_herdr_review_assigns_the_worker_without_a_phase_claim(self) -> None:
+        result = self.herdr_claim_launch("blocked", "review")
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["assign"])
 
     def finding_command(self, verb: str, *options: str, phase: str = "7") -> str:
         result = invoke_findings([verb, "--session-dir", str(self.session_dir), "--phase", phase, *options],

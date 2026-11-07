@@ -862,7 +862,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value)
+            int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:

@@ -59,6 +59,7 @@ class DispatchEvidenceUnknown:
 class DispatchWaitingForRuns:
     runs: tuple[str, ...]
     has_live_run: bool
+    reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply
 
 
 @dataclass(frozen=True)
@@ -179,7 +180,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     pending = mesh_runs.delivered_worker_results(directory, row.name, since=since) - received
     live = mesh_runs.live_runs(directory, row.name)
     pending.update(record["run_id"] for record in live)
-    return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live)) if pending else reply
+    return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
 
 
 def _client() -> herdr.Herdr:
@@ -372,6 +373,13 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
             return ExitCode.BLOCKED
         if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
             if last_wait_was_quiet:
+                if (isinstance(receipt, DispatchWaitingForRuns) and not receipt.has_live_run
+                        and isinstance(receipt.reply, DispatchComplete)
+                        and current.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)):
+                    for run_id in receipt.runs:
+                        print(f"anomaly: {name.value}: run {run_id} finished, but its result is not in the transcript",
+                              file=sys.stderr)
+                    return receipt.reply
                 return ExitCode.NO_DONE
             last_wait_was_quiet = not _wait_for_dispatch(row, line, dispatch_id, run)
             continue

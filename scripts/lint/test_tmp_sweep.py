@@ -4,11 +4,16 @@ of the clock, so every file a test writes is old, ctime included, unless the tes
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import fcntl
 import json
 import os
+import select
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,10 +21,11 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.lint import tmp_sweep
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
 from scripts.message import sessions
 from scripts.production import staff
@@ -1297,6 +1303,63 @@ class HandCleanupTests(TmpSweepCase):
 
 
 class WorkerAndGitTests(TmpSweepCase):
+    def test_sweep_removes_a_killed_fresh_gate_but_keeps_unmarked_git_work(self) -> None:
+        source = self.tmp.parent / "fresh-source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        _ = write(source / "file", "saved\n")
+        self.git(source, "add", "file")
+        self.git(source, "commit", "-qm", "saved")
+        _ = write(source / "file", "working edit\n")
+        code = '''
+from pathlib import Path
+import signal
+import sys
+from scripts.copies import copies
+source = Path(sys.argv[1])
+with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source)) as tree:
+    (tree / "untracked").write_text("test output\\n")
+    print(tree.parent, flush=True)
+    signal.pause()
+'''
+        environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
+                       "SCRATCH_ROOT": str(self.tmp / "scratch"),
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+        for marked in (True, False):
+            with self.subTest(marked=marked), mock.patch.dict(os.environ, environment):
+                with subprocess.Popen([sys.executable, "-c", code, str(source)], env=environment,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                    try:
+                        assert child.stdout is not None
+                        output = cast(TextIO, child.stdout)
+                        ready, _, _ = select.select([output.fileno()], [], [], 30)
+                        self.assertTrue(ready, "The child must enter the fresh gate before the kill")
+                        line = output.readline().strip()
+                        self.assertTrue(line, "The child must report its fresh task folder")
+                        folder = Path(line)
+                        self.now = time.time() + 8 * DAY
+                        _ = self.sweep()
+                        self.assertTrue(folder.exists(), "The busy lock must protect an expired fresh gate")
+                    finally:
+                        child.kill()
+                        _, errors = child.communicate(timeout=30)
+                    self.assertEqual(child.returncode, -signal.SIGKILL, errors)
+                checkout = folder / "checkout"
+                self.assertEqual((checkout / "file").read_text(), "working edit\n")
+                self.assertEqual((checkout / "untracked").read_text(), "test output\n")
+                if not marked:
+                    record_path = folder / copy_record.RECORD
+                    fields = cast(dict[str, object], json.loads(record_path.read_text()))
+                    del fields["throwaway"]
+                    _ = record_path.write_text(json.dumps(fields))
+                result = self.sweep()
+                if marked:
+                    self.assertFalse(folder.exists())
+                    self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+                else:
+                    self.assertTrue(folder.exists())
+                    self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
+
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
                             *arguments], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
@@ -1609,7 +1672,7 @@ class PaneRunTests(TmpSweepCase):
         self.assertEqual(snapshot.call_count, 1)
 
     def test_five_states_keep_only_open_or_unproved_runs(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.tmp.parent))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
         worker = fixture_worker("reader", parent.id)
         run = self.unit / "pane-run"
         self.now = self.now + 8 * DAY
@@ -1638,7 +1701,7 @@ class PaneRunTests(TmpSweepCase):
                 self.assertIn(str(run), result.kept[tmp_sweep.RunKeepReason.UNENDED_WORKER.value])
 
     def test_pane_worker_thread_keeps_its_session_folder(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.tmp.parent))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
         worker = fixture_worker("reader", parent.id)
         run = self.unit / "pane-run"
         write_text_atomic(run / "payload", "payload")

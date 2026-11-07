@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import contextlib
 import io
 import json
@@ -42,7 +44,7 @@ class QuestionLibraryTests(unittest.TestCase):
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})):
                 doc = root / "different-document-production.md"
                 _ = doc.write_text("> **Status: PRODUCTION — running.** Test\n")
-                owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc("natedev", doc))
+                owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(remote.local_machine(), doc))
                 other = fixture_member("showrunner", name="another-owner")
                 instance = root / f"showrunner-{owner.id}"
                 instance.mkdir()
@@ -97,7 +99,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(
                     f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
-                _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+                _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
                 identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
@@ -131,7 +133,7 @@ class QuestionLibraryTests(unittest.TestCase):
             doc = root / "production.md"
             _ = doc.write_text("> **Status: PRODUCTION — wrapped.** demo\n- **User zone:** America/Los_Angeles — demo\n")
             with isolated_staff_file(root / "staff.json", {}):
-                owner = fixture_member("showrunner", name="demo", doc=staff.WrappedDoc("natedev", doc))
+                owner = fixture_member("showrunner", name="demo", doc=staff.WrappedDoc(remote.local_machine(), doc))
                 instance = root / f"showrunner-{owner.id}"
                 instance.mkdir()
                 _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {owner.id}\n")
@@ -153,7 +155,7 @@ class QuestionLibraryTests(unittest.TestCase):
                     "> **Status: PRODUCTION — running.** demo\n"
                     + f"- **Proposals:** {folder}\n", encoding="utf-8")
                 owner = fixture_member("showrunner", name="renamed-owner",
-                                       doc=staff.LiveDoc("natedev", doc))
+                                       doc=staff.LiveDoc(remote.local_machine(), doc))
                 instance = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(

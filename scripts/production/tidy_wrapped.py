@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
-from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
 
@@ -67,19 +66,18 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
                     paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
-    owners = {production_name}
+    owners = {str(row.id)}
     if document is not None:
         record = identities.record
         try:
             for row in unit_lookup.doc_units(document, record):
-                owners.add(row.name)
-                owners.add(copies.unit_owner(row.name))
+                owners.add(str(row.id))
         except staff.StaffUnreadable:
             pass  # a production with no showrunner row has no units
     try:
         for owner in sorted(owners):
             copies.remove_trees(owner)
-    except (copies.CopyError, OSError, scratch.ScratchError) as error:
+    except copies.CopyError as error:
         raise TidyRefused(str(error)) from error
     removed: list[Path] = []
     for path in paths:

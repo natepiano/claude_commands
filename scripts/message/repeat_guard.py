@@ -28,7 +28,6 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 

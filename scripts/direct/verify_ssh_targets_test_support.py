@@ -8,16 +8,13 @@ from pathlib import Path
 from decimal import Decimal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
+from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger
-else:
-    from scripts.aws_target import ledger
+from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -161,12 +158,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
-    wire = "free_gib=1000\nhost=aws-build\nrustc=rustc fixture\nnextest=nextest fixture\n"
+    wire = "free_gib=1000\nhost=aws-build\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
     if mode == "disk":
         wire = wire.replace("free_gib=1000", "free_gib=0")
     if mode == "version-mismatch":
-        wire = wire.replace("rustc=rustc fixture", "rustc=rustc other")
+        wire = wire.replace("nextest=nextest fixture", "nextest=nextest other")
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()

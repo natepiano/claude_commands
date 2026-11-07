@@ -26,7 +26,7 @@ class StepRecordTests(unittest.TestCase):
             environment = {**os.environ, "VERIFY_STEPS_DIR": directory}
             arguments = [sys.executable, str(Path(steps.__file__)), "write", "--call-id", "clock",
                          "--pid", str(os.getpid()), "--repo", directory, "--kind", "test",
-                         "--runs-on", "ssh_allowed", "--eligible-targets", "mac,aws", "--mac-targets", "mac",
+                         "--runs-on", "any_target", "--eligible-targets", "mac,aws", "--mac-targets", "mac",
                          "--pinned-target", "mac", "--package", "sample", "--state", "waiting_hold"]
             before = (time.time_ns() - time.monotonic_ns()) // 1000
             result = subprocess.run([*arguments, "--report"], env=environment,
@@ -44,15 +44,15 @@ class StepRecordTests(unittest.TestCase):
                 record = steps.read("clock")
             self.assertIsInstance(record, steps.StepRecord)
             assert isinstance(record, steps.StepRecord)
-            self.assertEqual(record.runs_on, steps.SshAllowed(("mac", "aws"), ("mac",)))
+            self.assertEqual(record.runs_on, steps.AnyTarget(("mac", "aws"), ("mac",)))
             self.assertEqual(record.selection, steps.Pinned("mac"))
             self.assertEqual((record.kind, record.package), ("test", steps.NamedPackage("sample")))
             self.assertTrue((root / "clock.json").is_file())
 
     def join_record(self, root: Path) -> steps.StepRecord:
         pid = os.getpid()
-        record = steps.StepRecord("joined", pid, steps.process_start(pid), root, "test", "sample",
-                                  steps.SshAllowed(("mac", "aws"), ("mac",)),
+        record = steps.StepRecord("joined", pid, steps.process_start(pid), root, "test", steps.NamedPackage("sample"),
+                                  steps.AnyTarget(("mac", "aws"), ("mac",)),
                                   steps.StepState.WAITING_HOLD, "2026-01-01T00:00:00+00:00",
                                   selection=steps.Pinned("mac"))
         steps.write(record)
@@ -107,6 +107,7 @@ class StepRecordTests(unittest.TestCase):
             self.assertIsInstance(joined, steps.StepRecord)
             assert isinstance(joined, steps.StepRecord)
             self.assertEqual(joined.runs_on, steps.NatedevOnly("step writes the tree"))
+            self.assertEqual(joined.selection, steps.Pinned("natedev"))
             self.assertEqual(joined.state, steps.StepState.LOCAL_NONCOMPILING)
             self.assertEqual(joined.selected_target, "")
             with self.subTest(state="on_natedev"):
@@ -175,7 +176,7 @@ class StepRecordTests(unittest.TestCase):
             _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": folder, "VERIFY_PROC_ROOT": str(root / "proc")}):
                 record = steps.StepRecord("ssh", 42, "123", root, "check", steps.WorkspacePackages(),
-                                          steps.SshAllowed(("aws", "other")), steps.StepState.WAITING_SSH, "now")
+                                          steps.AnyTarget(("aws", "other")), steps.StepState.WAITING_SSH, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("ssh"), record)
                 self.assertFalse(steps.mac_eligible(record))
@@ -203,7 +204,7 @@ class StepRecordTests(unittest.TestCase):
             root = Path(folder)
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": folder}), patch.object(steps, "process_start", return_value="123"):
                 record = steps.StepRecord("mixed", 42, "123", root, "test", steps.NamedPackage("sample"),
-                                          steps.SshAllowed(("studio", "aws"), ("studio",)),
+                                          steps.AnyTarget(("studio", "aws"), ("studio",)),
                                           steps.StepState.WAITING_HOLD, "now")
                 steps.write(record)
                 decoded = steps.read("mixed")
@@ -218,7 +219,7 @@ class StepRecordTests(unittest.TestCase):
             process.mkdir(parents=True)
             _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
             legacy = dict(v=1, call_id="legacy", pid=42, proc_start="123", repo=folder,
-                          kind="test", package="sample", runs_on={"kind": "mac_allowed"},
+                          kind="test", package="sample", eligible_targets=["mac", "natedev"], runs_on={"kind": "any_target", "mac_targets": ["mac"]},
                           state="waiting_mac", updated="2026-11-02T10:00:00Z")
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": folder, "VERIFY_PROC_ROOT": str(root / "proc")}):
                 _ = (root / "legacy.json").write_text(json.dumps(legacy))
@@ -226,14 +227,14 @@ class StepRecordTests(unittest.TestCase):
                 self.assertIsInstance(decoded, steps.StepRecord)
                 if not isinstance(decoded, steps.StepRecord):
                     self.fail("The legacy record must remain readable")
-                self.assertIsInstance(decoded.runs_on, steps.MacAllowed)
+                self.assertIsInstance(decoded.runs_on, steps.AnyTarget)
                 steps.write(replace(decoded, state=steps.StepState.ON_MAC, selected_target="mac"))
                 current = steps.read("legacy")
                 self.assertIsInstance(current, steps.StepRecord)
                 if not isinstance(current, steps.StepRecord):
                     self.fail("The updated record must remain readable")
                 self.assertEqual(current.state, steps.StepState.ON_MAC)
-                self.assertIsInstance(current.runs_on, steps.MacAllowed)
+                self.assertIsInstance(current.runs_on, steps.AnyTarget)
                 self.assertEqual(current.call_id, "legacy")
                 self.assertEqual(steps.live_records(), [current])
 
@@ -244,8 +245,8 @@ class StepRecordTests(unittest.TestCase):
             process.mkdir(parents=True)
             _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
-                record = steps.StepRecord("c1", 42, "123", root, "check", None,
-                                          steps.MacAllowed(), steps.StepState.WAITING_HOLD, "now")
+                record = steps.StepRecord("c1", 42, "123", root, "check", steps.WorkspacePackages(),
+                                          steps.AnyTarget(("mac", "natedev"), ("mac",)), steps.StepState.WAITING_HOLD, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("c1"), record)
                 steps.write(replace(record, state=steps.StepState.ON_MAC, selected_target="mac"))
@@ -254,7 +255,7 @@ class StepRecordTests(unittest.TestCase):
                 if not isinstance(current, steps.StepRecord):
                     self.fail("record disappeared")
                 self.assertEqual(current.state, steps.StepState.ON_MAC)
-                self.assertEqual(current.runs_on, steps.MacAllowed())
+                self.assertEqual(current.runs_on, steps.AnyTarget(("mac", "natedev"), ("mac",)))
                 self.assertEqual(steps.live_records(), [current])
                 self.assertIn('"package": null', (root / "steps/c1.json").read_text())
                 steps.record_path("c1").unlink()
@@ -264,7 +265,7 @@ class StepRecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
-                record = steps.StepRecord("old", 42, "123", root, "build", None,
+                record = steps.StepRecord("old", 42, "123", root, "build", steps.WorkspacePackages(),
                                           steps.NatedevOnly("makes natedev artifacts"), steps.StepState.ON_NATEDEV, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("old"), steps.StaleRecord("old"))
@@ -286,7 +287,7 @@ class StepRecordTests(unittest.TestCase):
     def test_atomic_update_leaves_only_complete_record(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": folder}):
-                record = steps.StepRecord("call", 42, "123", Path(folder), "test", "crate",
+                record = steps.StepRecord("call", 42, "123", Path(folder), "test", steps.NamedPackage("crate"),
                                           steps.NatedevOnly("linux_only"), steps.StepState.WAITING_HOLD, "now")
                 steps.write(record)
                 steps.write(replace(record, state=steps.StepState.ON_NATEDEV))

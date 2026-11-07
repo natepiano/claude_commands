@@ -6,7 +6,6 @@ import io
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import tomllib
 import unittest
@@ -15,7 +14,6 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import detection_rules
 from scripts.herdr import herdr

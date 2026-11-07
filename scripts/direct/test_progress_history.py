@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Integration tests for the durable unit progress history."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -230,10 +232,10 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_set_unit_selects_the_staff_name_when_another_document_uses_that_name(self) -> None:
         run = self.start_run("staff-name-owner", 1760658000)
         hana = fixture_member("showrunner", name="hana",
-                              doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+                              doc=staff.LiveDoc(remote.local_machine(), self.root / "tool-based-ui-production.md"))
         _ = fixture_member("unit", name="alpha", parent=hana.id)
         owner = fixture_member("showrunner", name="tool-based-ui",
-                               doc=staff.LiveDoc("natedev", self.root / "other-production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.root / "other-production.md"))
         unit = fixture_member("unit", name="alpha", parent=owner.id)
         _ = self.run_command("set-unit", "--session-dir", str(run), "--production", "tool-based-ui",
                              "--unit", "alpha", at=1760658001)
@@ -243,7 +245,7 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_set_unit_does_not_select_a_showrunner_by_its_document_name(self) -> None:
         run = self.start_run("document-name-owner", 1760658000)
         owner = fixture_member("showrunner", name="hana",
-                               doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.root / "tool-based-ui-production.md"))
         _ = fixture_member("unit", name="alpha", parent=owner.id)
         path = run / "progress_history_state.json"
         before = path.read_bytes()
@@ -497,7 +499,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             _ = (self.working_dir / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
             owner = fixture_member("showrunner", name="reservation")
             row = fixture_member("unit", name="reservation", parent=owner.id,
-                                 worktree=staff.PresentWorktree("natedev", self.working_dir))
+                                 worktree=staff.PresentWorktree(remote.local_machine(), self.working_dir))
             main_session = row.current_session
         session_dir = self.root / name
         session_dir.mkdir()
@@ -3065,7 +3067,7 @@ with patch.object(fcntl, "flock", admission):
         if recorded:
             owner = recorded_showrunner(production, document)
             _ = fixture_member("unit", name=unit, parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", worktree))
+                               worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         _ = (worktree / ".unit.toml").write_text(f'plan = "{plan.name}"\nresponsibilities = []\n')
         state_path = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3096,7 +3098,7 @@ with patch.object(fcntl, "flock", admission):
         session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         owner = fixture_member("showrunner", name="Other production")
         _ = fixture_member("unit", name="other", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         _ = self.run_command("set-unit", "--session-dir", str(session), "--production", "Other production",
                              "--unit", "other", at=1005)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
@@ -3535,7 +3537,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_last_dispatch_selects_the_new_open_pass_when_the_same_slot_starts_again(self) -> None:
         run = self.start_run("dispatch-history", 20_000, unit_owned=True)
-        parent = staff.local_snapshot().unit_by_worktree("natedev", self.working_dir)
+        parent = staff.local_snapshot().unit_by_worktree(remote.local_machine(), self.working_dir)
         assert parent is not None
         worker = fixture_worker("dispatch-worker", parent.id)
         self.start_phase(run, 20_010)
@@ -3771,7 +3773,7 @@ with patch.object(fcntl, "flock", admission):
     def test_all_dispatch_roles_record_launcher_arguments_for_each_parent_kind(self) -> None:
         showrunner = fixture_member("showrunner", name="role-owner")
         unit = fixture_member("unit", name="role-unit", parent=showrunner.id)
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.working_dir), expected=unit.worktree)
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=unit.worktree)
         roles = ("impl", "test", "fix", "review", "astra-designer", "astra-reviewer")
         plan = self.working_dir / "roles.md"
         _ = (self.working_dir / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
@@ -8570,7 +8572,7 @@ class LastDispatchTests(StaffTestCase):
         run, worker = self.dispatch_fixture({"finished": {
             "instance_id": "finished", "worker_id": "", "worker_name": "dispatch-worker", "kind": "test"}})
         parent = fixture_member("unit", name="other-parent", parent=fixture_member("showrunner", name="other-owner").id,
-                                worktree=staff.PresentWorktree("natedev", self.root))
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         history = self.root / "unreadable-history.jsonl"
         _ = history.write_bytes(b"\xff\n")
         self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
@@ -8599,7 +8601,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         owner = fixture_member("showrunner", name="records")
         first, second = self.root / "first", self.root / "second"
         row = fixture_member("unit", name="first", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", first))
+                             worktree=staff.PresentWorktree(remote.local_machine(), first))
         runs = self.root / "history/runs"
         runs.mkdir(parents=True)
         events = [
@@ -8629,7 +8631,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         _ = subprocess.run(["git", "init", "-b", "current-branch", str(second)],
                            capture_output=True, check=True)
         row = fixture_member("unit", name="progress", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", first))
+                             worktree=staff.PresentWorktree(remote.local_machine(), first))
         run = self.root / "run"
         state: dict[str, object] = {"status": "active", "owner_staff_id": row.id,
                                    "main_agent": {"session_id": row.current_session},
@@ -8641,7 +8643,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         before = path.read_bytes(), path.stat().st_mtime_ns
         replacement = fixture_runtime_id("replacement-run-director")
         _ = staff.update_current_session(row.id, staff.StaffId(replacement))
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", second), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), second), expected=row.worktree)
         current = read(run)
         self.assertEqual(current["owner_staff_id"], row.id)
         self.assertEqual((current["working_dir"], current["branch"]), (str(second), "current-branch"))
@@ -8649,8 +8651,8 @@ class StaffProgressHistoryTests(StaffTestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         current["status"] = "completed"
         write(run, current)
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", first),
-                               expected=staff.PresentWorktree("natedev", second))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), first),
+                               expected=staff.PresentWorktree(remote.local_machine(), second))
         finished = read(run)
         self.assertEqual((finished["working_dir"], finished["branch"]), (str(second), "current-branch"))
         history = self.root / "history.jsonl"
@@ -8665,7 +8667,7 @@ class StaffProgressHistoryTests(StaffTestCase):
     def test_plan_history_finds_folderless_runs_after_the_staff_folder_changes(self) -> None:
         owner = fixture_member("showrunner", name="progress")
         row = fixture_member("unit", name="progress", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", self.root / "first"))
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "first"))
         runs = self.root / "history/runs"
         runs.mkdir(parents=True)
         history = runs / "run.jsonl"
@@ -8683,7 +8685,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         destination.mkdir()
         plan = destination / "plan.md"
         _ = plan.write_text("# Plan\n\n### Phase 1 — History · status: done\n")
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
         with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(runs.parent)}):
             self.assertEqual(plan_history.plan_runs(plan), [history])
             record = phase_table.build_plan(plan)
@@ -8699,7 +8701,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         owner = fixture_member("showrunner", name="progress")
         first = self.root / "first"
         row = fixture_member("unit", name="progress", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", first))
+                             worktree=staff.PresentWorktree(remote.local_machine(), first))
         run = self.root / "run"
         run.mkdir()
         history = self.root / "history.jsonl"
@@ -8722,7 +8724,7 @@ class StaffProgressHistoryTests(StaffTestCase):
             self.assertEqual(stored["plan_doc"], "plan.md")
         before = [(item.read_bytes(), item.stat().st_mtime_ns) for item in (path, history)]
         destination = self.root / "second"
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
         loaded = read(run)
         self.assertEqual(loaded["working_dir"], str(destination))
         self.assertEqual(loaded["worktree"], destination.name)

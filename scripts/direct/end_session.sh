@@ -14,6 +14,7 @@
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
+# Removes the unit's idle standing trees and workspaces.
 #
 # Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
 # records (verify_cache/), whose saved time is already in
@@ -96,6 +97,8 @@ if (( ${#RUNS[@]} > 0 )); then
   "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
   # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
 fi
+
+"$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
 if [[ -f "${MARKER}" ]]; then
   rm -f "${MARKER}"

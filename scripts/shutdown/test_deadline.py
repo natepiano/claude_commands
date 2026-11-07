@@ -25,6 +25,7 @@ class DeadlineTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value=str(Path(herdr.__file__).with_name("fake_herdr.py"))))
         self.now = 100.0
         config = Path(self.enterContext(tempfile.TemporaryDirectory()))
         atomic_file.write_text_atomic(config / "shutdown.conf",
