@@ -475,6 +475,15 @@ class WorkerPaneTests(StaffTestCase):
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
+    def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
+        name = self.parent.name + "-astra-reviewer"
+        opened = self.start(name, "astra-reviewer")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.assertEqual(self.world.agent_names, [name])
+        self.assertEqual(self.world.locations[opened.pane]["label"], name)
+        self.assertEqual(opened.row.name, name)
+
     def test_each_parent_uses_its_name_for_the_server_agent_and_keeps_the_worker_name(self) -> None:
         first = self.start("impl")
         self.assertIsInstance(first, worker_panes.OpenWorker)
