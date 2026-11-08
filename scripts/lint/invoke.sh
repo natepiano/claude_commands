@@ -196,7 +196,7 @@ buildlog_end() {
 }
 
 buildlog_sample_anon() {
-    local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon peak=0
+    local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon shmem use peak=0
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
@@ -220,66 +220,70 @@ buildlog_sample_anon() {
         if [[ -r "$sidecar" ]]; then
             IFS= read -r scope < "$sidecar" || true
             if [[ -n "$scope" && -r "$scope/memory.stat" ]]; then
+                anon=""
+                shmem=""
                 while IFS= read -r line; do
                     if [[ "$line" == 'anon '* ]]; then
                         anon=${line#anon }
-                        if [[ "$anon" =~ ^[0-9]+$ ]]; then
-                            sampled_at=$(date +%s)
-                            if [[ -n "$phase_file" ]]; then
-                                if [[ "$phase_started" == null ]]; then
-                                    # memory.stat is hierarchical: one reading includes every
-                                    # parallel test, even when a child uses a nested cgroup.
-                                    executables=()
-                                    while IFS= read -r membership; do
-                                        while IFS= read -r pid; do
-                                            [[ "$pid" =~ ^[0-9]+$ ]] || continue
-                                            executables+=("${BUILDLOG_PROC:-/proc}/$pid/exe")
-                                        done < "$membership"
-                                    done < <(find "$scope" -name cgroup.procs -type f 2>/dev/null)
-                                    if (( ${#executables[@]} )); then
-                                        # One readlink process per tick, rather than one per
-                                        # compiler in a wide compilation before tests begin.
-                                        while IFS= read -r executable; do
-                                            if [[ "$executable" =~ /deps/[^/]+$ ]]; then
-                                                phase_started=$sampled_at
-                                                break
-                                            fi
-                                        done < <(readlink "${executables[@]}" 2>/dev/null)
+                    elif [[ "$line" == 'shmem '* ]]; then
+                        shmem=${line#shmem }
+                    fi
+                done < "$scope/memory.stat"
+                if [[ "$anon" =~ ^[0-9]+$ && "$shmem" =~ ^[0-9]+$ ]]; then
+                    use=$((10#$anon + 10#$shmem))
+                    sampled_at=$(date +%s)
+                    if [[ -n "$phase_file" ]]; then
+                        if [[ "$phase_started" == null ]]; then
+                            # memory.stat is hierarchical: one reading includes every
+                            # parallel test, even when a child uses a nested cgroup.
+                            executables=()
+                            while IFS= read -r membership; do
+                                while IFS= read -r pid; do
+                                    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+                                    executables+=("${BUILDLOG_PROC:-/proc}/$pid/exe")
+                                done < "$membership"
+                            done < <(find "$scope" -name cgroup.procs -type f 2>/dev/null)
+                            if (( ${#executables[@]} )); then
+                                # One readlink process per tick, rather than one per
+                                # compiler in a wide compilation before tests begin.
+                                while IFS= read -r executable; do
+                                    if [[ "$executable" =~ /deps/[^/]+$ ]]; then
+                                        phase_started=$sampled_at
+                                        break
                                     fi
-                                fi
-                                if [[ "$phase_started" != null ]]; then
-                                    if [[ "$phase_peak" == null ]] || (( anon > phase_peak )); then
-                                        if printf '{"test_phase_peak_bytes":%s,"test_phase_started_at":%s,%s\n' \
-                                            "$anon" "$phase_started" "${phase_context#\{}" > "$phase_temporary" \
-                                            && mv -f "$phase_temporary" "$phase_file"; then
-                                            phase_peak=$anon
-                                        else
-                                            rm -f "$phase_temporary" || true
-                                        fi
-                                    fi
-                                fi
+                                done < <(readlink "${executables[@]}" 2>/dev/null)
                             fi
-                            peak_published=0
-                            if (( anon > peak )); then
-                                if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
-                                    peak=$anon
-                                    peak_published=1
+                        fi
+                        if [[ "$phase_started" != null ]]; then
+                            if [[ "$phase_peak" == null ]] || (( use > phase_peak )); then
+                                if printf '{"test_phase_peak_bytes":%s,"test_phase_started_at":%s,%s\n' \
+                                    "$use" "$phase_started" "${phase_context#\{}" > "$phase_temporary" \
+                                    && mv -f "$phase_temporary" "$phase_file"; then
+                                    phase_peak=$use
                                 else
-                                    rm -f "$temporary" || true
-                                fi
-                            fi
-                            if (( peak_published || (anon * 2 >= peak && sampled_at - last_near_peak_at >= 60) )); then
-                                # Pair the time with the published peak; an old pair cannot decay a new peak.
-                                if printf '%s %s\n' "$peak" "$sampled_at" > "$near_peak_temporary" && mv -f "$near_peak_temporary" "$near_peak"; then
-                                    last_near_peak_at=$sampled_at
-                                else
-                                    rm -f "$near_peak_temporary" || true
+                                    rm -f "$phase_temporary" || true
                                 fi
                             fi
                         fi
-                        break
                     fi
-                done < "$scope/memory.stat"
+                    peak_published=0
+                    if (( use > peak )); then
+                        if printf '%s\n' "$use" > "$temporary" && mv -f "$temporary" "$maximum"; then
+                            peak=$use
+                            peak_published=1
+                        else
+                            rm -f "$temporary" || true
+                        fi
+                    fi
+                    if (( peak_published || (use * 2 >= peak && sampled_at - last_near_peak_at >= 60) )); then
+                        # Pair the time with the published peak; an old pair cannot decay a new peak.
+                        if printf '%s %s\n' "$peak" "$sampled_at" > "$near_peak_temporary" && mv -f "$near_peak_temporary" "$near_peak"; then
+                            last_near_peak_at=$sampled_at
+                        else
+                            rm -f "$near_peak_temporary" || true
+                        fi
+                    fi
+                fi
             fi
         fi
         sleep 1
