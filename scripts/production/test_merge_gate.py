@@ -342,6 +342,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
+        original = review.read_bytes()
         producer = self.review_producer(doc)
         member = staff.snapshot().by_id(producer)
         assert member is not None and isinstance(member.parent, staff.ReportsTo)
@@ -362,6 +363,16 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        for explicit_checkout in (True, False):
+            with self.subTest(promote_only=True, explicit_checkout=explicit_checkout):
+                _ = review.write_bytes(original)
+                promoted = self.run_promote_only("--production", "fixture-showrunner",
+                                                 explicit_checkout=explicit_checkout)
+                self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+                promoted_rows = change_review.pending(review)
+                self.assertEqual([row["Change"] for row in promoted_rows], ["old", "The grid fades gently"])
+                self.assertEqual(promoted_rows[-1]["Producer"], producer)
+                self.assertEqual(promoted_rows[-1]["Production"], production)
 
     def test_a_change_row_uses_the_user_date_when_utc_has_the_next_date(self) -> None:
         review, doc = self.review_list()

@@ -404,7 +404,7 @@ The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not na
 
 Add no new check.
 
-As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone.
+As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone. `merge_gate.py --promote-only` locks and scans the promoted main repository, not the working directory it runs from.
 
 ### Phase 10e — Two test rules in the direct contract  · status: done
 **Depends on:** Phase 10c (it moves FixDispatch)
