@@ -8,7 +8,7 @@ the phase's `delegated_phase_reservation_state.json` before dispatch, and the fi
 a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its own berth
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
-reservation, which is never recorded here (`commands/unit/direct.md` →
+reservation, which is never recorded here (`docs/direct/phase_reservation.md` →
 <PhaseReservationContract/>). A `left_unmapped` reservation belongs to this phase when the map names it and its run for the director's bare session id.
 No other open phase may hold it through an `Active` state, a pending release, or its berth session map.
 Codex workers edit through `apply_patch`, so the Codex

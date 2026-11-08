@@ -139,7 +139,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual((rows[0].id, rows[0].current_session), (registry["sessionId"], registry["sessionId"]))
 
     def test_showrunner_and_unit_add_paths_share_the_live_doc_admission_writer(self) -> None:
-        import add_unit
+        from scripts.production import add_unit
 
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         original = add_showrunner.ensure_staff_showrunner

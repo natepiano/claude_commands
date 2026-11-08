@@ -1205,6 +1205,45 @@ class PromptSubmissionTests(unittest.TestCase):
             herdr.PromptNotSubmitted("empty visible screen", ""))),
             herdr.PromptNotSubmitted("empty visible screen", ""))
 
+    def test_prelaunch_cursor_skips_complete_history_without_parsing_json(self) -> None:
+        self.write_turn("old context", kind="assistant", seconds_after_launch=-1)
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        with patch.object(json, "loads", side_effect=AssertionError("historical JSON read")):
+            cursor.skip_existing_turns()
+        self.assertEqual(cursor.offsets[self.path], self.path.stat().st_size)
+        self.assertEqual(cursor.read_turns(), [])
+        self.write_turn("resume the saved work")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+
+    def test_prelaunch_cursor_keeps_an_incomplete_final_row(self) -> None:
+        text = "resume the saved work – saved context"
+        row = (json.dumps({
+            "type": "user",
+            "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat(),
+            "message": {"role": "user", "content": script_prompt(text)},
+        }, ensure_ascii=False) + "\n").encode()
+        split = row.index("–".encode()) + 1
+        _ = self.path.write_bytes(row[:split])
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        cursor.skip_existing_turns()
+        self.assertEqual(cursor.offsets[self.path], 0)
+        with self.path.open("ab") as stream:
+            _ = stream.write(row[split:])
+        self.assertIsInstance(cursor.submitted_prompt(text), herdr.PromptSubmitted)
+
+    def test_prompt_submission_keeps_the_prelaunch_cursor(self) -> None:
+        self.write_turn("old context", kind="assistant", seconds_after_launch=-1)
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        cursor.skip_existing_turns()
+        before = cursor.offsets[self.path]
+        self.submit_on_type = True
+        result = self.client.submit_opening_prompt(
+            "destination:p1", herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor),
+            self.launched_at, 1000,
+        )
+        self.assertIsInstance(result, herdr.PromptSubmitted)
+        self.assertGreater(cursor.offsets[self.path], before)
+
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
         first_size = self.path.stat().st_size
@@ -2323,6 +2362,34 @@ class HerdrTests(unittest.TestCase):
                                  state in {herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
                 if isinstance(observation, herdr.PromptInputReady):
                     self.assertEqual(observation.idle, state in {herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
+
+    def test_agent_inventory_decodes_a_reported_session_id(self) -> None:
+        identity = fixture_runtime_id("agent-inventory-report")
+        self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+            "pane_id": "worker", "agent": "codex", "agent_status": "idle",
+            "agent_session": {"kind": "id", "value": identity},
+        }]}}))
+        self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.ReportedAgentSession(identity))
+
+    def test_agent_inventory_decodes_no_reported_session(self) -> None:
+        reports: list[dict[str, object]] = [{}, {"agent_session": {"kind": "pending"}}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", **report,
+                }]}}))
+                self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.NoReportedAgentSession())
+
+    def test_agent_inventory_rejects_a_malformed_session_report(self) -> None:
+        reports: list[object] = [None, "thread", [], {}, {"kind": 7}, {"kind": "id"},
+                                 {"kind": "id", "value": 7}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", "agent_session": report,
+                }]}}))
+                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr agent session"):
+                    _ = self.herdr.agents()
 
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
@@ -4719,7 +4786,8 @@ class HerdrTests(unittest.TestCase):
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
-                  "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
+                  "agent": "codex", "pane_id": "pane-codex", "agent_status": herdr.AgentStatus.IDLE,
+                  "agent_session": herdr.ReportedAgentSession(str(codex.current_session)),
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
