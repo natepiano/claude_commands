@@ -579,8 +579,28 @@ IDLE_PROCESS = IdleProcess()
 
 
 @dataclass(frozen=True)
+class MeasuredCleanupSize:
+    """The target size measured before removal, in KiB."""
+
+    kib: int
+
+
+@dataclass(frozen=True)
+class CleanupSizeNotMeasured:
+    """The target size could not be measured before removal."""
+
+
+@dataclass(frozen=True)
 class CleanupDone:
     """The remote mirror's build output was removed."""
+
+    size: MeasuredCleanupSize | CleanupSizeNotMeasured
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class CleanupRemovedWithoutFacts:
+    """The remote output was removed without size or free-space facts."""
 
 
 @dataclass(frozen=True)
@@ -605,7 +625,7 @@ class CleanupUnconfirmed:
     """The remote command did not report a usable cleanup status."""
 
 
-CleanupOutcome = CleanupDone | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
+CleanupOutcome = CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
 
 
 @dataclass(frozen=True)
@@ -893,6 +913,10 @@ class ProcessController:
 
 
 def parse_cleanup(value: str) -> CleanupOutcome:
+    removed = re.fullmatch(r"0 ([0-9]+|-) ([0-9]+(?:[.][0-9]+)?)", value)
+    if removed:
+        size = CleanupSizeNotMeasured() if removed[1] == "-" else MeasuredCleanupSize(int(removed[1]))
+        return CleanupDone(size, float(removed[2]))
     if value == "skipped":
         return CleanupSkipped()
     if value == "kept":
@@ -903,14 +927,18 @@ def parse_cleanup(value: str) -> CleanupOutcome:
     if len(digits) > 3:
         return CleanupUnconfirmed()
     rc = int(digits)
-    if rc > 255:
-        return CleanupUnconfirmed()
-    return CleanupDone() if rc == 0 else CleanupFailed(rc)
+    if rc == 0:
+        return CleanupRemovedWithoutFacts()
+    return CleanupFailed(rc) if 0 < rc <= 255 else CleanupUnconfirmed()
 
 
-def report_cleanup(cleanup: CleanupOutcome, target: str = "") -> None:
+def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floor_gib: float) -> None:
     label = target or "Mac"
-    if isinstance(cleanup, CleanupFailed):
+    if isinstance(cleanup, CleanupDone):
+        size = sweep.gib(cleanup.size.kib * 1024) if isinstance(cleanup.size, MeasuredCleanupSize) else "size not measured"
+        print(f"{label} build output removed: {path}, {size}; "
+              + f"Mac free {cleanup.free_gib:g} GiB under the {free_floor_gib:g} GiB floor", flush=True)
+    elif isinstance(cleanup, CleanupFailed):
         print(f"{label} build output not removed: {cleanup.rc}", flush=True)
     elif isinstance(cleanup, CleanupSkipped):
         print(f"{label} build output kept: the run used another target dir", flush=True)
@@ -1163,6 +1191,10 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
     name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
     return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
         kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
+
+
+def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
+    return f"{remote_mirror(repository, target, slot)}/target"
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1687,7 +1719,7 @@ def remote_test_command(
     elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
         cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(f"{remote_mirror(repository, request.target, request.slot)}/target")
+        target = shlex.quote(mirror_target(repository, request.target, request.slot))
         floor = shlex.quote(f"{config.free_floor_gib:g}")
         cleanup_command = (
             'if free_gib=$(df -g "$HOME"); then '
@@ -1695,7 +1727,10 @@ def remote_test_command(
             + 'else free_gib=; fi; '
             + f'if awk -v free="$free_gib" -v floor={floor} '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if rm -rf -- "$HOME"/{target}; then echo mac_cleanup=0; '
+            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+            + f'if rm -rf -- "$HOME"/{target}; then '
+            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
@@ -2114,7 +2149,9 @@ def claimed_run(
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
-        report_cleanup(remote_status.cleanup, request.target)
+        report_cleanup(remote_status.cleanup, request.target,
+                       path=f"~/{mirror_target(repository, request.target, request.slot)}",
+                       free_floor_gib=config.free_floor_gib)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)

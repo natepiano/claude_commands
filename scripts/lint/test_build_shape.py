@@ -6,34 +6,18 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from collections.abc import Generator
+from contextlib import closing, contextmanager
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from collections.abc import Sequence
 from typing import final, override
+from unittest.mock import patch
 
-from scripts.lint.build_shape import (AbsoluteRecordedRoot, CompileCountUnknown, CompiledCrates, NoBuildShape,
-                         NoCratesCompiled, RecordedOutputPair, RecordedOutputRoots, RecordedRootsUnavailable,
-                         RelativeRecordedRoot, StepEvidence, UnknownRecordedRoot, build_shape,
-                         index_step_evidence, recorded_output_roots)
+from scripts.lint.build_shape import (CompileCountUnknown, CompiledCrates, NoBuildShape, NoCratesCompiled,
+                         StepEvidence, build_shape, index_step_evidence, step_index)
 
-
-def create_step_index(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as connection, connection:
-        _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                               + "call_id TEXT, argv TEXT, crates_compiled INTEGER, worktree TEXT, cwd TEXT, "
-                               + "target_directory TEXT, build_directory TEXT, target_dir TEXT, target_folder TEXT)")
-
-
-def record_root_attempt(path: Path, workspace: str, target: str, build: str, *, cwd: str = "",
-                        host: str = "natedev", step: str = "build", call_id: str = "attempt",
-                        argv: Sequence[str] = (), target_folder: str = "") -> None:
-    with closing(sqlite3.connect(path)) as connection, connection:
-        _ = connection.execute("INSERT INTO steps(host, step, call_id, worktree, cwd, "
-                               + "target_directory, build_directory, argv, target_folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (host, step, call_id, workspace, cwd, target, build, json.dumps(list(argv)), target_folder))
+from scripts.buildlog.step_outputs_test_support import create_step_index
 
 
 class BuildShapeTests(unittest.TestCase):
@@ -106,6 +90,9 @@ class IndexStepEvidenceTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         create_step_index(self.index)
 
+    def evidence(self, *call_ids: str, step: str = "build") -> dict[tuple[str, str], StepEvidence]:
+        return index_step_evidence(self.index, "natedev", (step,), call_ids, self.before)
+
     def row(self, call_id: str | None, argv: object, *, host: str = "natedev", repo: str = "hana",
             step: str = "build", at: datetime | None = None, crates: int | None = 3) -> None:
         with closing(sqlite3.connect(self.index)) as connection, connection:
@@ -114,24 +101,62 @@ class IndexStepEvidenceTests(unittest.TestCase):
                                    (host, repo, step, (at or self.cutoff).isoformat(), call_id,
                                     json.dumps(argv) if argv is not None else None, crates))
 
-    def test_join_uses_call_and_step_and_filters_host_and_window(self) -> None:
+    def test_join_filters_host_and_excludes_later_attempts(self) -> None:
         arguments = ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "hana"]
         self.row("release", arguments)
         self.row("wrong-host", arguments, host="mac")
         self.row("wrong-repo", arguments, repo="other")
         self.row("release", ["cargo", "check"], step="check")
-        self.row("old", arguments, at=self.cutoff - timedelta(microseconds=1))
         self.row("future", arguments, at=self.before)
         self.row("later", arguments, at=self.before + timedelta(seconds=1))
-        self.assertEqual(index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before),
+        self.assertEqual(self.evidence("release", "wrong-host", "wrong-repo", "future", "later"),
                          {("release", "build"): StepEvidence(build_shape(arguments), CompiledCrates(3)),
                           ("wrong-repo", "build"): StepEvidence(build_shape(arguments), CompiledCrates(3))})
+
+    def test_only_window_call_ids_join_even_when_other_attempts_are_recent(self) -> None:
+        arguments = ["cargo", "build", "--release"]
+        self.row("window", arguments, at=self.cutoff - timedelta(days=1), crates=4)
+        self.row("outside", arguments, at=self.before - timedelta(seconds=1), crates=9)
+        self.assertEqual(
+            self.evidence("window"),
+            {("window", "build"): StepEvidence(build_shape(arguments), CompiledCrates(4))})
+
+    def test_evidence_query_uses_the_call_index_with_a_host_index_present(self) -> None:
+        self.row("selected", ["cargo", "build"])
+        with closing(sqlite3.connect(self.index)) as connection, connection:
+            _ = connection.execute("CREATE INDEX steps_call ON steps(call_id)")
+            _ = connection.execute("CREATE INDEX steps_host_started ON steps(host, started_at)")
+        queries: list[str] = []
+
+        @contextmanager
+        def traced_index(path: Path) -> Generator[tuple[sqlite3.Connection, set[str]]]:
+            with step_index(path) as (connection, columns):
+                connection.set_trace_callback(queries.append)
+                yield connection, columns
+
+        with patch("scripts.lint.build_shape.step_index", side_effect=traced_index):
+            self.assertEqual(self.evidence("selected"), {
+                ("selected", "build"): StepEvidence(build_shape(["cargo", "build"]), CompiledCrates(3)),
+            })
+        query, = (query for query in queries if query.startswith("SELECT call_id,"))
+        with closing(sqlite3.connect(self.index)) as connection:
+            plan = connection.execute("EXPLAIN QUERY PLAN " + query).fetchall()
+        self.assertIn("steps_call", str(plan))
+
+    def test_later_attempts_cannot_change_evidence_before_admission(self) -> None:
+        arguments = ["cargo", "build"]
+        self.row("retried", arguments, crates=2)
+        self.row("retried", arguments, at=self.before, crates=5)
+        self.row("retried", arguments, at=self.before + timedelta(seconds=1), crates=7)
+        self.assertEqual(
+            self.evidence("retried"),
+            {("retried", "build"): StepEvidence(build_shape(arguments), CompiledCrates(2))})
 
     def test_origin_and_checkout_names_find_the_same_call(self) -> None:
         arguments = ["cargo", "build", "--release", "--bin", "hana"]
         self.row("shared-call", arguments, repo="hana-copy")
         self.row("origin-call", arguments, repo="hana")
-        self.assertEqual(index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before),
+        self.assertEqual(self.evidence("shared-call", "origin-call"),
                          {("shared-call", "build"): StepEvidence(build_shape(arguments), CompiledCrates(3)),
                           ("origin-call", "build"): StepEvidence(build_shape(arguments), CompiledCrates(3))})
 
@@ -147,7 +172,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
             _ = connection.execute("INSERT INTO steps(host, repo, step, started_at, call_id, argv, crates_compiled) "
                                    + "VALUES ('natedev', 'hana', 'build', ?, 'broken', 'not json', 3)",
                                    (self.cutoff.isoformat(),))
-        evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+        evidence = self.evidence("", "missing", "empty", "object", "mixed", "broken-flag", "broken")
         self.assertEqual(evidence, {
             (name, "build"): StepEvidence(NoBuildShape(), CompiledCrates(3))
             for name in ("missing", "empty", "object", "mixed", "broken-flag", "broken")
@@ -159,7 +184,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
         self.row("count-only", None, crates=0)
         self.row("shape-only", arguments, crates=None)
         self.row("unmatched", arguments, host="other-host")
-        evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+        evidence = self.evidence("both", "count-only", "shape-only", "unmatched")
         self.assertEqual(evidence, {
             ("both", "build"): StepEvidence(build_shape(arguments), CompiledCrates(8)),
             ("count-only", "build"): StepEvidence(NoBuildShape(), NoCratesCompiled()),
@@ -172,14 +197,14 @@ class IndexStepEvidenceTests(unittest.TestCase):
         full = ["cargo", "nextest", "run", "-E", "package(cargo-handler)"]
         self.row("filtered", filtered, step="nextest")
         self.row("full", full, step="nextest")
-        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", self.cutoff, self.before), {
-            ("filtered", "nextest"): StepEvidence(build_shape(filtered), CompiledCrates(3), tuple(filtered)),
-            ("full", "nextest"): StepEvidence(build_shape(full), CompiledCrates(3), tuple(full)),
+        self.assertEqual(self.evidence("filtered", "full", step="nextest"), {
+            ("filtered", "nextest"): StepEvidence(NoBuildShape(), CompiledCrates(3), tuple(filtered)),
+            ("full", "nextest"): StepEvidence(NoBuildShape(), CompiledCrates(3), tuple(full)),
         })
 
     def test_missing_test_arguments_keep_the_compile_count(self) -> None:
         self.row("count-only", None, step="nextest", crates=7)
-        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", self.cutoff, self.before), {
+        self.assertEqual(self.evidence("count-only", step="nextest"), {
             ("count-only", "nextest"): StepEvidence(NoBuildShape(), CompiledCrates(7), ()),
         })
 
@@ -201,21 +226,21 @@ class IndexStepEvidenceTests(unittest.TestCase):
             self.row(call_id, ["cargo", "build"], crates=first)
             self.row(call_id, ["cargo", "build"], crates=second)
             with self.subTest(first=first, second=second):
-                evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+                evidence = self.evidence(call_id)
                 self.assertEqual(evidence[call_id, "build"].compilation, expected)
 
     def test_no_matching_attempt_has_no_evidence_key(self) -> None:
-        self.assertEqual(index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before), {})
+        self.assertEqual(self.evidence("unmatched"), {})
 
     def test_single_zero_attempt_proves_no_crates_compiled(self) -> None:
         self.row("zero", ["cargo", "build"], crates=0)
-        evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+        evidence = self.evidence("zero")
         self.assertEqual(evidence["zero", "build"].compilation, NoCratesCompiled())
 
     def test_unknown_attempt_between_zero_attempts_keeps_the_count_unknown(self) -> None:
         for count in (0, None, 0):
             self.row("retried", ["cargo", "build"], crates=count)
-        evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+        evidence = self.evidence("retried")
         self.assertEqual(evidence["retried", "build"].compilation, CompileCountUnknown())
 
     def test_undated_attempt_prevents_a_zero_compile_result(self) -> None:
@@ -227,7 +252,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
                 _ = connection.execute("UPDATE steps SET started_at=? WHERE rowid="
                                        + "(SELECT MAX(rowid) FROM steps WHERE call_id=?)", (stamp, call_id))
             with self.subTest(started_at=stamp):
-                evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
+                evidence = self.evidence(call_id)
                 self.assertEqual(evidence[call_id, "build"].compilation, CompileCountUnknown())
 
     def test_join_does_not_write_index_or_create_a_missing_index(self) -> None:
@@ -235,10 +260,11 @@ class IndexStepEvidenceTests(unittest.TestCase):
         before = self.index.read_bytes(), self.index.stat().st_mtime_ns
         for repetition in range(2):
             with self.subTest(repetition=repetition):
-                self.assertEqual(len(index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)), 1)
+                self.assertEqual(len(self.evidence("one")), 1)
                 self.assertEqual((self.index.read_bytes(), self.index.stat().st_mtime_ns), before)
         missing = self.index.with_name("missing.sqlite")
-        self.assertEqual(index_step_evidence(missing, "natedev", "build", self.cutoff, self.before), {})
+        self.index = missing
+        self.assertEqual(self.evidence("one"), {})
         self.assertFalse(missing.exists())
 
     def test_index_path_uri_characters_are_literal(self) -> None:
@@ -246,102 +272,8 @@ class IndexStepEvidenceTests(unittest.TestCase):
         _ = self.index.rename(special)
         self.index = special
         self.row("literal", ["cargo", "build", "--lib"])
-        self.assertEqual(index_step_evidence(special, "natedev", "build", self.cutoff, self.before),
+        self.assertEqual(self.evidence("literal"),
                          {("literal", "build"): StepEvidence(build_shape(["cargo", "build", "--lib"]), CompiledCrates(3))})
-
-
-@final
-class RecordedOutputRootsTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.directory.name).resolve()
-        self.index = self.root / "steps?#.sqlite"
-
-    @override
-    def setUp(self) -> None:
-        self.addCleanup(self.directory.cleanup)
-        create_step_index(self.index)
-
-    def test_every_step_kind_and_attempt_retains_its_workspace_and_root_pair(self) -> None:
-        workspace = str(self.root / "checkout")
-        expected: list[RecordedOutputPair] = []
-        for number, step in enumerate(("build", "check", "clippy", "mend", "doc", "nextest", "test", "t")):
-            target, build = self.root / f"target-{number}", self.root / f"build-{number}"
-            record_root_attempt(self.index, workspace, str(target), str(build), step=step, call_id="same-call")
-            expected.append(RecordedOutputPair(AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(build)))
-        record_root_attempt(self.index, workspace, "/wrong-host/target", "/wrong-host/build", host="other")
-        fallback = self.root / "cwd"
-        record_root_attempt(self.index, "unknown", str(fallback / "target"), str(fallback / "target"),
-                            cwd=str(fallback), call_id="")
-        before = self.index.read_bytes(), self.index.stat().st_mtime_ns
-        roots = recorded_output_roots(self.index, "natedev")
-        self.assertEqual(roots, RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): tuple(expected),
-            AbsoluteRecordedRoot(fallback): (RecordedOutputPair(AbsoluteRecordedRoot(fallback / "target"),
-                                               AbsoluteRecordedRoot(fallback / "target")),),
-        }))
-        self.assertEqual((self.index.read_bytes(), self.index.stat().st_mtime_ns), before)
-
-    def test_target_overrides_do_not_authorize_recorded_output_pairs(self) -> None:
-        workspace, target = self.root / "workspace", self.root / "default-target"
-        valid = self.root / "valid"
-        record_root_attempt(self.index, str(valid), str(valid / "target"), str(valid / "target"))
-        arguments = (["cargo", "build", "--target-dir", str(target)],
-                     ["cargo", "build", f"--target-dir={target}"],
-                     ["cargo", "build", "--config", f'build.target-dir="{target}"'],
-                     ["cargo", "build", f'--config=build.target-dir="{target}"'])
-        for argv in arguments:
-            record_root_attempt(self.index, str(workspace), str(target), str(target), argv=argv)
-        record_root_attempt(self.index, str(workspace), str(target), str(target),
-                            target_folder=str(self.root / "different-target"))
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(valid): (RecordedOutputPair(AbsoluteRecordedRoot(valid / "target"),
-                                                             AbsoluteRecordedRoot(valid / "target")),),
-        }))
-
-    def test_unknown_and_relative_roots_have_distinct_states(self) -> None:
-        workspace = str(self.root / "workspace")
-        record_root_attempt(self.index, workspace, "unknown", "relative/build")
-        record_root_attempt(self.index, "", "target", "unknown", cwd=str(self.root / "fallback"))
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): (RecordedOutputPair(UnknownRecordedRoot(), RelativeRecordedRoot()),),
-            AbsoluteRecordedRoot(self.root / "fallback"): (RecordedOutputPair(RelativeRecordedRoot(), UnknownRecordedRoot()),),
-        }))
-
-    def test_unavailable_index_has_a_named_state_and_creates_no_index(self) -> None:
-        missing = self.root / "missing.sqlite"
-        self.assertIsInstance(recorded_output_roots(missing, "natedev"), RecordedRootsUnavailable)
-        self.assertFalse(missing.exists())
-        _ = self.index.write_text("broken index")
-        self.assertIsInstance(recorded_output_roots(self.index, "natedev"), RecordedRootsUnavailable)
-
-    def test_legacy_index_without_build_root_uses_the_target_root(self) -> None:
-        workspace, target = str(self.root / "workspace"), self.root / "target"
-        record_root_attempt(self.index, workspace, str(target), "unknown")
-        with closing(sqlite3.connect(self.index)) as connection, connection:
-            _ = connection.execute("ALTER TABLE steps DROP COLUMN build_directory")
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): (RecordedOutputPair(AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(target)),),
-        }))
-
-    def test_root_reader_keeps_the_existing_step_evidence_result(self) -> None:
-        argv = ["cargo", "nextest", "run", "--release", "-E", "package(app)"]
-        at = datetime(2026, 10, 30, 9, tzinfo=UTC)
-        with closing(sqlite3.connect(self.index)) as connection, connection:
-            for target, count in (("old-target", 2), ("new-target", 3)):
-                _ = connection.execute("INSERT INTO steps(host, step, call_id, started_at, argv, crates_compiled, "
-                                       + "worktree, target_directory, build_directory) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                       ("natedev", "nextest", "retry", at.isoformat(), json.dumps(argv), count,
-                                        str(self.root), str(self.root / target), str(self.root / (target + "-build"))))
-        before = at - timedelta(days=1)
-        after = at + timedelta(days=1)
-        expected = {("retry", "nextest"): StepEvidence(build_shape(argv), CompiledCrates(5), tuple(argv))}
-        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", before, after), expected)
-        roots = recorded_output_roots(self.index, "natedev")
-        self.assertIsInstance(roots, RecordedOutputRoots)
-        assert isinstance(roots, RecordedOutputRoots)
-        self.assertEqual(len(roots.workspaces[AbsoluteRecordedRoot(self.root)]), 2)
 
 
 if __name__ == "__main__":

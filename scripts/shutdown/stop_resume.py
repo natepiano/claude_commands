@@ -24,7 +24,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
 from io import StringIO
 from importlib import import_module
-from threading import Event
+from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Never, Protocol, cast
@@ -61,6 +61,7 @@ from scripts.message import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.shutdown.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable, StaffId
 
@@ -162,6 +163,9 @@ def _signal_process(pid: int, number: int) -> None:
     os.kill(pid, number)
 
 
+_launch_note_output = Lock()
+
+
 def _record_launches(selected: list[str]) -> None:
     """Seed only selected panes while their Claude still exposes its launch flags."""
     if not selected:
@@ -173,7 +177,7 @@ def _record_launches(selected: list[str]) -> None:
             entry = entries.get(pane["pane_id"])
             return (pane["session_id"] in selected or pane.get("label") in selected
                     or entry is not None and entry["session_id"] in selected)
-        with redirect_stdout(StringIO()):
+        with _launch_note_output, redirect_stdout(StringIO()):
             _ = pane_record.seed(client.session, select=selected_pane)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
@@ -199,18 +203,23 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     return SourceReleased()
 
 
-def stop(session: str, kind: str = "", *, deadline: float = math.inf) -> StopResult:
+def stop(session: str, kind: str = "", *, deadline: float = math.inf,
+         codex: herdr.CodexConversations | None = None,
+         runs: dict[str, list[str]] | None = None) -> StopResult:
     from scripts.production import staff
 
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
-            return _stop_recorded(session, kind)
+            shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+            return _stop_recorded(session, kind, **shared)
     except TimeoutError as error:
         reason = str(error)
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
-def _stop_recorded(session: str, kind: str = "") -> StopResult:
+def _stop_recorded(session: str, kind: str = "", *,
+                   codex: herdr.CodexConversations | None = None,
+                   runs: dict[str, list[str]] | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     from scripts.herdr import worker_panes
     from scripts.production import staff
@@ -223,17 +232,22 @@ def _stop_recorded(session: str, kind: str = "") -> StopResult:
     from scripts.lib import unit_runs
     parent = record.parent_of(row) if row is not None else None
     pane_worker = row is not None and row.kind == "worker" and (parent is None or
-        unit_runs.worker_transport(worker_panes.worker_run(parent)) == "herdr")
+        unit_runs.worker_transport(worker_panes.worker_run(parent, record=record, scanned=runs)) == "herdr")
     before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return StopFailed(str(before.row.current_session), before.reason)
-    if isinstance(before, worker_panes.StoppedWorker) and _worker_stopped(before):
+    if isinstance(before, worker_panes.StoppedWorker) and _worker_stopped(
+            before, **({"codex": codex} if codex is not None else {})):
         result: StopResult = NotRunning(str(before.row.current_session))
     else:
         _record_launches([session])
-        result = _stop(session, kind)
-        if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(before):
+        result = _stop(session, kind, **({"codex": codex} if codex is not None else {}))
+        after = (None if codex is None else herdr.CodexConversations(
+            {identity: pids for identity, pids in codex.live.items() if identity != result.session_id},
+            codex.unknown)) if isinstance(result, (Stopped, NotRunning)) else codex
+        if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(
+                before, **({"codex": after} if after is not None else {})):
             return StopFailed(str(before.row.current_session), "worker stop has no fresh shell proof on the same terminal")
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
@@ -248,7 +262,8 @@ def _stop_recorded(session: str, kind: str = "") -> StopResult:
     return result
 
 
-def _worker_stopped(before: worker_panes.WorkerPane) -> bool:
+def _worker_stopped(before: worker_panes.WorkerPane, *,
+                    codex: herdr.CodexConversations | None = None) -> bool:
     """Prove the recorded worker pane directly, even when the director has no tab."""
     from scripts.herdr import worker_panes
 
@@ -259,7 +274,7 @@ def _worker_stopped(before: worker_panes.WorkerPane) -> bool:
         try:
             return (any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in client.panes())
                     and isinstance(client.pane_activity(before.pane), herdr.PaneAtShell)
-                    and not isinstance(herdr.read_conversation(str(before.row.current_session)), herdr.LiveConversation))
+                    and not isinstance(herdr.read_conversation(str(before.row.current_session), codex=codex), herdr.LiveConversation))
         except (OSError, ValueError, herdr.HerdrFailure):
             return False
     return False
@@ -279,7 +294,8 @@ def stop_grace_seconds() -> float:
     return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
 
 
-def _stop(session: str, kind: str = "") -> StopResult:
+def _stop(session: str, kind: str = "", *,
+          codex: herdr.CodexConversations | None = None) -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
     last_signal = ""
@@ -310,7 +326,7 @@ def _stop(session: str, kind: str = "") -> StopResult:
             except (OSError, ValueError) as error:
                 print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 kind = ""
-        observed = herdr.read_conversation(identity, kind)
+        observed = herdr.read_conversation(identity, kind, **({"codex": codex} if codex is not None else {}))
         if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)
         if isinstance(observed, herdr.UnknownConversation):
@@ -369,7 +385,9 @@ def _stop(session: str, kind: str = "") -> StopResult:
         return StopFailed(identity, reason)
 
 
-def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
+def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
+                      codex: herdr.CodexConversations | None = None,
+                      runs: dict[str, list[str]] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
@@ -377,21 +395,30 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     from scripts.shutdown import restart
 
     holder = record.by_id(unit)
-    if not record.find(kind="worker", parent=unit) or holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
+    if not record.find(kind="worker", parent=unit):
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
+        if holder is not None:
+            run = worker_panes.worker_run(holder, record=record, scanned=runs)
+            if unit_runs.worker_transport(run) == "mesh":
+                from scripts.agents import codex_mesh
+
+                codex_mesh._pause_roster(str(run), stop_servers=True, deadline=deadline)  # pyright: ignore[reportPrivateUsage]
+                return []
         states = worker_panes.observe(unit, record)
         unresolved = [f"{item.row.name}: {item.reason}" for item in states
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
         client = herdr.Herdr(herdr.shared_session())
+        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(restart.stop_row, item.row, client, deadline=deadline)) for item in live]
+            futures = [(item, pool.submit(restart.stop_row, item.row, client,
+                deadline=deadline, **shared)) for item in live]
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr.HerdrFailure, SystemExit) as error:
         unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
         print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     return unresolved
@@ -401,8 +428,8 @@ def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
     return pane_record.resume_arguments(LaunchNames.read().resume(entry))
 
 
-def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
-    """Build the account command for both terminal paths."""
+def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> tuple[list[str], dict[str, str]]:
+    """Read the pane environment and remove inherited launch proofs."""
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
@@ -412,7 +439,15 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
+    return unset, environment
+
+
+def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
+    """Build the account command for a shell in another pane."""
+    unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.agent_kind(entry)
+    if kind == "claude":
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
         environment["CODEX_HOME"] = entry["config_dir"]
@@ -426,9 +461,38 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
                       account: str, message: str) -> Never:
     """Replace the foreground command with the saved account launch."""
-    command = _pane_command(tab, entry, account)
+    from scripts.production import staff
+
+    from scripts.lib.agent_program import resolve_program
+
+    kind = pane_launch.agent_kind(entry)
+    environment = accounts.launch_shell_environment(Path(entry["cwd"]))
+    unset, pane_environment = _pane_environment(tab, entry)
+    environment.update(pane_environment)
+    for key in unset:
+        _ = environment.pop(key, None)
+    if kind == "claude":
+        prepared = accounts.prepare_claude_launch(account, resume=True)
+        for key in prepared.remove:
+            _ = environment.pop(key, None)
+        environment.update(prepared.variables)
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
+    else:
+        environment["CODEX_HOME"] = entry["config_dir"]
+    program = resolve_program(kind, environment=environment)
+    command = [program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
+    if message and kind == "claude":
+        command.append(message)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, *([message] if message and pane_launch.agent_kind(entry) == "claude" else [])])
+    row = staff.initial_snapshot().by_member_reference(entry["session_id"])
+    if row is not None and isinstance(row.exited, staff.Exited):
+        _ = staff.resume(str(row.id))
+    try:
+        os.execvpe(program, command, staff.child_environment(environment))
+    except OSError:
+        if row is not None and isinstance(row.exited, staff.Exited):
+            _ = staff.set_hold(str(row.id), row.exited)
+        raise
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
@@ -708,8 +772,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
-            trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
-            copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if original is not None and Path(original.entry["config_dir"]) != target_dir:

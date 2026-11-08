@@ -85,6 +85,8 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("build-hold-guard", ShellHookFront("pre-tool-use-build-hold-guard.sh"), "PreToolUse", 10, "Bash"),
     CodexHook("ste", PythonHookScript("session-start-ste.py"), "SessionStart", 10, "*"),
     CodexHook("ste-subagent", PythonHookScript("session-start-ste.py"), "SubagentStart", 10, "*"),
+    CodexHook("queue-start", PythonHookScript("codex-queue-drain.py"), "SessionStart", matcher="*"),
+    CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
 )
 
 

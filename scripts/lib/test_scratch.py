@@ -47,6 +47,7 @@ class ScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.base),
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
             "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))

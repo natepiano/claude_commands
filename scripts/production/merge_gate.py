@@ -42,6 +42,7 @@ from enum import Enum, auto
 import fcntl
 import hashlib
 import inspect
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -56,7 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast
 
 from scripts.lib import process_group
 from scripts.copies import copies
@@ -174,6 +175,18 @@ class WholeMachine:
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
 
 
+@dataclass(frozen=True)
+class AllModules:
+    """Run every discovered module."""
+
+
+@dataclass(frozen=True)
+class SelectedModules:
+    """Run the paths selected on natedev, including a certified empty selection."""
+    paths: tuple[str, ...]
+
+
+ALL_MODULES = AllModules()
 SHARED_MACHINE = SharedMachine()
 
 
@@ -210,6 +223,7 @@ class GateRun:
     tests_reused: bool = False
     # A valid affected selection may have no test modules at all.
     selection_certified: bool = False
+    executions: tuple[GateJobResult, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -981,7 +995,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.MERGE_GATE,
-               machine: SharedMachine | WholeMachine = SHARED_MACHINE) -> GateRun:
+               machine: SharedMachine | WholeMachine = SHARED_MACHINE,
+               selected: AllModules | SelectedModules = ALL_MODULES) -> GateRun:
     shared = isinstance(machine, SharedMachine)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
     if isinstance(machine, WholeMachine):
@@ -996,6 +1011,12 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     modules = discover_test_modules(repo)
     if not modules:
         raise GateRefused("the test list is empty")
+    if isinstance(selected, SelectedModules):
+        paths = set(selected.paths)
+        discovered = {str(path.relative_to(repo)) for _, path in modules}
+        if not paths <= discovered:
+            raise GateRefused('selected modules are absent from the tested tree')
+        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
@@ -1034,8 +1055,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                             state_dir=gate_state_dir())
             report_selection(selection, len(modules))
             if isinstance(selection, AffectedSelection):
-                selected = set(selection.modules)
-                modules = [(suite, path) for suite, path in modules if path in selected]
+                selected_paths = set(selection.modules)
+                modules = [(suite, path) for suite, path in modules if path in selected_paths]
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1236,7 +1257,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         results.append(result)
                     if job.kind is GateJobKind.TEST_MODULE:
                         suite_finished[job.suite] = job.started + result.seconds
-                if shared and not pending and not running and not rerunning:
+                if (shared or isinstance(selected, SelectedModules)) and not pending and not running and not rerunning:
                     failed = [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -1271,7 +1292,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     peak_mib = admission.peak_mib if admission is not None else 0.0
     elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
     run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, AffectedSelection))
+                  isinstance(selection, AffectedSelection) or isinstance(selected, SelectedModules), tuple(executions))
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -1571,7 +1592,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
         os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_suites(repo, args.type_dirs, float(args.module_time_limit_s),
+            suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
                                 source="checkpoint", full=args.full)
         finally:
             if previous_unit is None:
@@ -1802,10 +1823,36 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
 
 
+class CloudGateRoute(Protocol):
+    """Define the cloud route boundary without coupling the local runner to AWS."""
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
+              module_time_limit_s: float) -> GateRun | str: ...
+
+
+def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
+                    module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
+                    source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
+                    mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
+    """Use the scaler service and retain the permitted local fallback."""
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
+    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s)
+    if isinstance(outcome, str):
+        print('Cloud gate uses natedev: ' + outcome, flush=True)
+        return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
+    remote = outcome
+    if not type_dirs:
+        return remote
+    local = run_suites(repo, type_dirs, module_time_limit_s, source=source, full=True,
+                       mode=mode, selected=SelectedModules(()))
+    return GateRun(remote.jobs + local.jobs, remote.seconds + local.seconds,
+                   max(remote.peak_memory_mib, local.peak_memory_mib), selection_certified=True,
+                   executions=remote.executions + local.executions)
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
-            return 0 if run_suites(Path(args.repo).resolve(), args.type_dirs,
+            return 0 if run_gate_suites(Path(args.repo).resolve(), args.type_dirs,
                                    module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode).passed else 1
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
@@ -1847,14 +1894,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
-        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
+        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        with rollback_signals(), scratch.copy_lock(checkout):
             if args.nightly:
                 return nightly(args)
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)
                 if review_list is not None:
-                    record_changes(Path(args.repo).expanduser().resolve(), review_list, production, args.merge_branch)
+                    record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
             return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
