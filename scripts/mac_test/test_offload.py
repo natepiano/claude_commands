@@ -695,7 +695,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.sync_fixture()
         result = self.command(separate_stderr=True)
         self.assert_declined(result, "unreachable")
-        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: ssh: connection refused host mac is unavailable\n")
+        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: host mac is unavailable\n")
         self.assertEqual(self.events_for("rsync"), [])
         self.assertTrue((self.state_directory / "unreachable_until").exists())
 

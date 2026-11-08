@@ -1041,7 +1041,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Ruled out:**
 - A change to a guard decision or the allow list: the builds showrunner ruled that this phase is the text and one line only.
 
-### Phase 41e — Answer not free for a target whose last probe failed  · status: todo
+### Phase 41e — Answer not free for a target whose last probe failed  · status: done
 
 **Depends on:** Phase 8, Phase 41b, Phase 41m, and aws's `offload.py` work on `builds` (commit f0850070b; on 2026-11-07 it is on `origin/builds-aws` only).
 
@@ -1065,7 +1065,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 3. **The probe owns the target mark.** `probe_mac` is the one writer. An `UnavailableProbe` result with no `detail` writes the mark, from each of its return points. A good `ProbeSnapshot` removes it. `UnresolvedSlotStartup` and `InterruptedTargetStatus` leave it as it is.
 4. **`free_now` answers not free.** `free_now` and `FreeNowAnswer` are in `scripts/mac_test/mac_test.py` (near lines 2280 and 427). Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no.
 5. **A new step still tries, and a waiting step does not leave.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` accepts `"bad"` as it accepts `"free"`. The `reserve` command refuses `"bad"` unless it receives a new flag `--new-step`. `ssh_retry_hook` calls `reserve` directly for a route that allows SSH (`any_target`), so its command never carries the flag. The first pass of `route_test` (`retry` 0) adds the flag to its own `reserve` call, and no later pass adds it. The timed backoff keeps its current effect on new steps.
-5a. **A new step probes a marked target** (builds, 2026-11-07, Answer A). Since Phase 41h, the first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target never gets `reserve --new-step`. In a new step's eligibility read (`ssh_target_eligibility`, `build_targets.py:369`), a target that answers `"bad"` starts one detached probe (builds, 2026-11-07). It takes the target claim as `claimed_run` (`offload.py:1923`) does, runs `copy_tracked_scripts`, runs `probe_mac`, and releases the claim. The script copy is needed because `probe_mac` compares the remote `scripts_commit` stamp (`offload.py:1317`), and an old stamp fails the probe. It copies no repository tree: the target mark is per target, and only `run_offload`'s match removes a repository's version record. A busy claim skips the probe; the mark stays, and the next new step tries again. A good probe removes the mark; a failed probe keeps it. At most one probe runs on a target at a time: a second new step reads the mark as it is. The probe never makes the step wait: the step routes on the current answer. Steps already in a wait never probe. A new step is each step's first eligibility read, not each call: `initialize_step_record` (defined at `verify.sh:2245`, called at `:3138`) runs once per call, so a call with several steps (a `lint` with local steps) gives each step its own first read. The repeated eligibility reads of a pinned wait (`verify.sh:2658`) start no probe.
+5a. **A new step probes a marked target** (builds, 2026-11-07, Answer A). Since Phase 41h, the first pass of `route_test` takes natedev whenever `check_routing_hold` admits, so a later SSH target never gets `reserve --new-step`. In a new step's eligibility read (`ssh_target_eligibility`, `build_targets.py:369`), a target that answers `"bad"` starts one detached probe (builds, 2026-11-07). It takes the target claim as `claimed_run` (`offload.py:1923`) does, runs `copy_tracked_scripts`, copies the repository tree as `run_offload` does, runs `probe_mac`, and releases the claim (builds, 2026-11-07, Answer B: recovery and a run prove the same thing in one way). The script copy is needed because `probe_mac` compares the remote `scripts_commit` stamp (`offload.py:1317`), and an old stamp fails the probe. The tree copy is needed because the Linux probe builds its shell from the repository mirror. Only `run_offload`'s match removes a repository's version record. A busy claim skips the probe; the mark stays, and the next new step tries again. A good probe removes the mark; a failed probe keeps it. At most one probe runs on a target at a time: a second new step reads the mark as it is. The probe never makes the step wait: the step routes on the current answer. Steps already in a wait never probe. A new step is each step's first eligibility read, not each call: `initialize_step_record` (defined at `verify.sh:2245`, called at `:3138`) runs once per call, so a call with several steps (a `lint` with local steps) gives each step its own first read. A pinned step starts no recovery probe: its own run calls `probe_mac`, which clears the mark.
 6. **One line in the log.** The `could not reach` reason is the last non-empty line of the remote stderr. A traceback never reaches the log.
 7. **Status tells the truth.** `/build:status` (`targets.py` `target_state` at line 302, its AWS status branch at 328) and `mac_test.py status` report a target with the mark as unreachable, not free.
 8. **Docs.** Update `docs/as-built/mac-test-offload.md`: the probe, the decline list and the two records.
@@ -1098,12 +1098,75 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_verify_wait_holder.py` passes, including the Linux claim race case and the refusal with no live claim.
 - The hana sequence, in `test_failed_probe_mark.py`, through the real `probe_mac`, `free_now`, `free-now` and `reserve` with a fake SSH: a mismatch probe, then the end of the timed backoff, then `free-now` still exits 1 with `bad` for that repository and exits 0 for another. A failed reach, then the end of the timed backoff, then `free-now` exits 1 with `bad` for each repository. A good probe by a new step removes the mark, and `free-now` exits 0 with no waiting step involved.
 - With the mark set, the command that `ssh_retry_hook` prints for a route that allows SSH takes no reservation, and `reserve --new-step` goes on to its reach check and claim.
-- With the Mac unavailable and natedev free, a new step runs on natedev and its probe clears a healthy AWS mark; the next step sees AWS as before. A second new step during that probe starts no second probe. The new step does not wait for the probe. A `lint` call with two local steps probes at each step's first eligibility read. A pinned wait that reads eligibility again starts no probe. With an old remote script stamp and a stale repository mirror, and no remote build, the probe copies the scripts, clears the target mark and leaves the repository record as it was. A busy target claim starts no probe and keeps the mark. Measure the script copy plus probe time per new step and put it in the checkpoint notice.
+- With the Mac unavailable and natedev free, a new step runs on natedev and its probe clears a healthy AWS mark; the next step sees AWS as before. A second new step during that probe starts no second probe. The new step does not wait for the probe. A `lint` call with two local steps probes at each step's first eligibility read. A pinned wait that reads eligibility again starts no probe. With an old remote script stamp and a stale or absent repository mirror, and no remote build, the probe copies the scripts and the tree, clears the target mark and leaves the repository record as it was. A busy target claim starts no probe and keeps the mark. Measure the script copy plus probe time per new step and put it in the checkpoint notice.
 - `busy`, `blocked` and `off` keep their answers with the mark set. A remote stderr with a traceback prints one `could not reach` line that holds no `Traceback`.
 - With the mark set, the AWS status (`targets.target_state` returns it before the general unreachable logic, at line 328) and the Mac status each show the mark. After a good probe, each shows the target as free again.
 - Each case fails when the matching code is removed. Show this on a tempdir copy.
 - `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41n — One build_targets.py start per verify.sh step  · status: todo
+
+**Depends on:** Phase 41e.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-07 17:50, ruling option B. natest measured about 6 `build_targets.py` starts per `verify.sh` start, each about 0.71 CPU s, almost all imports (`targets` 375 ms, `build_hold` 218 ms, `roster` 206 ms, `admission_service` 193 ms, `mac_test` 125 ms). In `test_verify_mac_only.py`, 84 starts cost 60 of 96.5 CPU s.
+
+**Goal:** a `verify.sh` step starts `build_targets.py` once for the facts it reads at step start, and gets them as one JSON answer.
+
+**Spec:**
+
+1. Read each `BUILD_TARGETS_SCRIPT` call in `scripts/direct/verify.sh` (`register-local`, `eligible`, the pinned `eligible`, `reserve`, `release-wait`, `interrupt-local`, the hold wait). Find which run at each step start with no wait between them.
+2. Add one subcommand that does the work of those start-time calls in one process and prints one JSON object. `verify.sh` reads each fact from it. Keep each old subcommand that other callers still use.
+3. Calls that must run at a later time (a reservation after a wait, a release, an interrupt) stay separate. State in the checkpoint each call that stays, and why.
+4. Do not make per-subcommand lazy imports (builds' ruling: option B, not A).
+5. Reuse what still applies from old Phase 1 (766b3e87d, "Cut Python helper starts in each verify run"): `VERIFY_PY_TRACE=<file>` writes one line per helper start. `verify_metadata.py` is already on `builds`.
+6. Keep Phase 41e: a new step's first eligibility read starts at most one recovery probe, and a pinned wait's repeated reads start none.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/build_targets/build_targets.py`
+- a new test file under `scripts/build_targets/`
+
+**Workers:** 1 writer: a new worker, not fix16 (builds, 2026-11-07 18:40).
+
+**Constraints from prior phases:**
+- natest owns the `test_verify*` files. Put new tests in a new file. Name natest in the notice for any change to its files.
+- Add no guard, refusal or check that this Spec does not ask for.
+- Tests use a temporary state folder.
+
+**Acceptance gate:**
+- With `VERIFY_PY_TRACE`, one `verify.sh test` step on a fake target starts `build_targets.py` once before its step runs. Report the count before and after.
+- The CPU of `test_verify_mac_only.py`, measured before and after under the same load, goes down. Report both numbers.
+- `test_verify_wait_holder.py`, `test_failed_probe_mark.py`, `test_ssh_eligibility.py`, `test_build_targets.py` and `test_verify_ssh_targets.py` pass. The merge gate runs all modules.
+- basedpyright 0/0/0 on the changed Python files.
+
+### Phase 41o — test_verify_token_release.py passes on every run  · status: todo
+
+**Depends on:** Phase 41n.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-07. natest saw `scripts/direct/test_verify_token_release.py` fail once with `BrokenPipeError` at a socket send. It passed when run alone. devtools 8r fixed the same pattern in `test_claude_worker`: the cancel path accepts a closed socket on that send.
+
+**Goal:** the test passes on every run.
+
+**Spec:**
+
+1. Find the send that raises and the order of events that closes the other end first. Prove the cause with a forced order, not with a loop of runs.
+2. Fix the cause where it is: in the test fixture if the fixture closes early, in the code if the code sends after a stop.
+3. Do not retry the send, and do not catch `BrokenPipeError` in the test.
+
+**Files:**
+- `scripts/direct/test_verify_token_release.py` (natest owns it; name natest in the notice)
+- the code file that holds the send, if the cause is there
+
+**Workers:** 1 writer.
+
+**Acceptance gate:**
+- A test that forces the failing order fails before the fix and passes after it.
+- `test_verify_token_release.py` passes 50 runs in a row under the merge gate's load.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
