@@ -395,7 +395,6 @@ if sys.argv[1] == "eligible":
     if {runs_on!r} == "any_target":
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
-    sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
 ''')
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)

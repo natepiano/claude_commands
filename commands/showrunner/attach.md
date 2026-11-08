@@ -28,7 +28,7 @@ with the sandbox off, and print its output as it comes:
 - the child already reports to a showrunner: detach it first;
 - the parent already reports to the child, directly or through others;
 - a running child or parent has a session name that is not its production's
-  staff name: rename the showrunner first (`/showrunner:rename`).
+  staff name: rename the showrunner first (`/agents rename`).
 
 A child showrunner is never a unit. It keeps its own production doc, update
 timer, merge branch and units, and its staff row is a showrunner row.

@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402

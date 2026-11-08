@@ -15,6 +15,7 @@ from scripts.buildlog import index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import moments
 from scripts.buildlog import store
+from scripts.lib.intervals import merged_spans
 
 
 type Cause = Literal["Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs", "Cancelled CI", "Mac idle while natedev waits"]
@@ -207,16 +208,14 @@ def source_coverage(sources: Sequence[IndexedMonthlySource], observations: Seque
     latest: dict[str, float] = {}
     for observation in observations:
         latest[observation.machine] = max(latest.get(observation.machine, 0), observation.at)
-    coverage = [IndexedSourceCoverage(source.machine, source.start, min(source.end, latest.get(source.machine, 0)))
-                for source in sources if source.complete and latest.get(source.machine, 0) > source.start]
-    merged: list[IndexedSourceCoverage] = []
-    for item in sorted(coverage, key=lambda span: (span.machine, span.start)):
-        if merged and item.machine == merged[-1].machine and item.start <= merged[-1].end:
-            previous = merged.pop()
-            merged.append(IndexedSourceCoverage(item.machine, previous.start, max(previous.end, item.end)))
-        else:
-            merged.append(item)
-    return tuple(merged)
+    coverage: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for source in sources:
+        seen = latest.get(source.machine, 0)
+        if source.complete and seen > source.start:
+            coverage[source.machine].append((source.start, min(source.end, seen)))
+    return tuple(IndexedSourceCoverage(machine, start, end)
+                 for machine, spans in sorted(coverage.items())
+                 for start, end in merged_spans(spans))
 
 
 @dataclass(frozen=True)

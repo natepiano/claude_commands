@@ -7,5 +7,5 @@ Cap 21.5 GiB; anonymous use 0.0 GiB + free 24.5 GiB − safety 3.0 GiB; kept asi
   # showrunner   unit       step    min pid   GiB: kept/use; need
 
 Cloud · 1 of 1 slots
-   cloud-unit · merge-gate · running · 7 of 12 modules · 32 vCPUs · elapsed 4 min · 1 failed modules · no update for 2 minutes
+   cloud-unit · merge-gate · running · 7 of 12 modules · 32 vCPUs · elapsed 4 min · 1 failed module · no update for 2 minutes
    waiting-unit · targeted-test · waiting; waits for a cloud slot: 1 of 1 in use · modules unknown · vCPUs unknown · elapsed 1 min

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import subprocess
+import tempfile
 import time
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -28,7 +29,7 @@ from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, 
 from scripts.message import roster
 from scripts.buildlog import record, store
 from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
 SHIPPED_STATUS = "\n".join((
@@ -57,15 +58,61 @@ def pacific_zone() -> Generator[None, None, None]:
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
-    def test_clean_target_import_loads_mac_test_once(self) -> None:
+    def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(directory)
+        environment.update({**config_environment(root), "HOME": directory, "BUILDLOG_DIR": directory,
+                            "MAC_TEST_STATE_DIR": str(root / "mac-state")})
         result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
-            "import sys; from scripts.build_targets import build_targets; "
+            "import os,sys; from pathlib import Path; from scripts.build_targets import build_targets; "
+            + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
+            + "build_targets.target_state(build_targets.SshTarget('mac', 'macos', Path(os.environ['CONF_DIR']) / 'mac_test.conf')); "
             + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
             + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
             + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
             capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_local_commands_omit_ssh_modules(self) -> None:
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(directory)
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment.update({**config_environment(root), "HOME": directory,
+                            "BUILDLOG_DIR": str(root / "buildlog"),
+                            "BUILD_HOLD_DIR": str(root / "holds"),
+                            "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
+                            "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                            "MAC_IDLE_STATE_DIR": str(root / "mac-idle"),
+                            "UNIT_RUN_DIR": str(root / "board"),
+                            "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
+        common = ["--repo-root", directory, "--kind", "test"]
+        reservation = ["reserve", *common, "--pid", str(os.getpid()),
+                       "--reservation-file", str(root / "reservation")]
+        cases = (
+            ("bare-eligible", False, ["eligible", "--repo-root", directory], 0),
+            ("kind-eligible", False, ["eligible", *common], 0),
+            ("release-wait", False, ["release-wait", "--pid", str(os.getpid())], 0),
+            ("filtered-reserve", True, [*reservation, "--target", "natedev"], 1),
+        )
+        for name, ssh_target, arguments, status in cases:
+            with self.subTest(command=name):
+                _ = (root / "build_targets.conf").write_text(
+                    f"targets={'natedev,mac' if ssh_target else 'natedev'}\n"
+                    + "kind.natedev=local\nplatform.natedev=linux\n"
+                    + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                code = (
+                    "import sys; from scripts.build_targets import build_targets; "
+                    + "sys.argv=['build_targets.py', *sys.argv[1:]]; "
+                    + f"assert build_targets.main()=={status}; "
+                    + "loaded=[name for name in sys.modules if name in "
+                    + "('scripts.mac_test.mac_test', 'scripts.mac_test.offload')]; "
+                    + "assert not loaded, loaded")
+                result = REAL_SUBPROCESS_RUN(
+                    [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", code, *arguments],
+                    cwd=Path(__file__).parent, env=environment,
+                    capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_folder_invocation_records_hold_events(self) -> None:
         result = subprocess.run(

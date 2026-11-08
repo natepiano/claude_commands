@@ -289,6 +289,10 @@ It imports live reservations, saved intents, waiter places, token handoffs, prio
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
+`build_hold` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
+Importing `build_hold` or `build_targets` does not load the admission service.
+`ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
+The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
@@ -410,13 +414,115 @@ With one to four own rows, a non-build estimate uses their largest peak or a low
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
 Other steps, and requests with no package, keep the recorded scope rule.
-A filtered compile estimate (`filtered_peak`) takes the larger of two anonymous p90 values:
+A filtered compile estimate (`filtered_history_peak`) takes the larger of two anonymous p90 values:
 the exact filter set's rows and the package's filtered rows.
 Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
 A full-suite estimate does not cap a filtered compile estimate.
 The 1 GiB filtered floor applies when the repository has no usable compile history.
 Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
 Freshness still requires both Cargo output roots to survive.
+
+The Phase 18 replay found no gain, so no estimate splits its history by build feature or commit.
+
+#### Phase 19 source shares
+
+Run date: 2026-11-05.
+The snapshot ends at 2026-11-05 13:07:40 UTC.
+The requested window starts at 2026-10-29 13:07:40 UTC.
+The lifecycle file retains 571 events across 4.92 days, including older token-gap records.
+The 220 admissions cover 2026-11-04 20:45:52 through 2026-11-05 13:03:36 UTC: 16.30 hours.
+The anonymous file retains 46,262 rows from 2026-10-07 through 2026-11-05.
+The requested window contains 5,205 anonymous rows.
+Replay reconstructs 4,267 estimates and keeps 815 merge-gate cap rows separate.
+Another 123 rows lack their own dated index match.
+Recorded intervals and reconstructed estimates are separate populations. Do not add their counts.
+
+| Population | Step kind | measured | pooled | buildlog | fallback | shape | cap |
+|---|---|---:|---:|---:|---:|---:|---:|
+| before Phase 60 | full nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | clippy | 6 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | build | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | doc | 2 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | other | 6 | 0 | 0 | 0 | 0 | 9 |
+| before Phase 60 | **Total** | 14 | 0 | 0 | 0 | 0 | 9 |
+| after Phase 60 | full nextest | 6 | 0 | 0 | 1 | 0 | 0 |
+| after Phase 60 | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | clippy | 20 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | build | 0 | 0 | 0 | 0 | 2 | 0 |
+| after Phase 60 | doc | 4 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | other | 19 | 0 | 0 | 0 | 0 | 145 |
+| after Phase 60 | **Total** | 49 | 0 | 0 | 1 | 2 | 145 |
+| before queue 10z | full nextest | 6 | 0 | 0 | 1 | 0 | 0 |
+| before queue 10z | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | clippy | 26 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | build | 0 | 0 | 0 | 0 | 2 | 0 |
+| before queue 10z | doc | 6 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | other | 25 | 0 | 0 | 0 | 0 | 86 |
+| before queue 10z | **Total** | 63 | 0 | 0 | 1 | 2 | 86 |
+| after queue 10z | full nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | clippy | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | build | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | doc | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | other | 0 | 0 | 0 | 0 | 0 | 68 |
+| after queue 10z | **Total** | 0 | 0 | 0 | 0 | 0 | 68 |
+| Replay | full nextest | 655 | 23 | 0 | 3 | 0 | 0 |
+| Replay | filtered nextest | 475 | 0 | 10 | 49 | 0 | 0 |
+| Replay | clippy | 1429 | 20 | 0 | 0 | 0 | 0 |
+| Replay | check | 426 | 13 | 0 | 0 | 0 | 0 |
+| Replay | build | 0 | 0 | 0 | 0 | 149 | 0 |
+| Replay | doc | 215 | 7 | 0 | 0 | 0 | 0 |
+| Replay | other | 765 | 28 | 0 | 0 | 0 | 815 |
+| Replay | **Total** | 3965 | 91 | 10 | 52 | 149 | 815 |
+
+The Phase 60 boundary is its first origin/main ancestor at 2026-11-04 21:52:05 UTC.
+The queue 10z boundary is its first origin/main ancestor at 2026-11-05 07:24:57 UTC.
+Git merge times delimit cohorts. The records contain no process version, so these boundaries do not prove deployment times.
+
+| Fresh tier | Full nextest | Filtered nextest |
+|---|---:|---:|
+| measured | 162 | 49 |
+| buildlog | 0 | 0 |
+| NoFreshHistory | 14 | 7 |
+
+The fresh table contains replay subsets, not extra estimates. Recorded events contain no fresh-tier field.
+A zero indexed compile count selects a fresh scenario; the records cannot prove that both output roots survived.
+The 21 NoFreshHistory cases take the compile estimate. Fresh buildlog includes the fresh floor.
+
+No recorded admission uses ANON_SHARE: 0 of 220, and 0 of 66 without caps.
+Reconstructed ANON_SHARE share: 10/5,082 (0.20%); without caps: 10/4,267 (0.23%).
+The 10 ANON_SHARE promises have 0 under-half cases and 1 over-three cases against their measured anonymous peaks.
+
+| Replay step kind | ANON_SHARE share | Share without caps |
+|---|---:|---:|
+| full nextest | 0/681 (0.00%) | 0/681 (0.00%) |
+| filtered nextest | 10/534 (1.87%) | 10/534 (1.87%) |
+| clippy | 0/1,449 (0.00%) | 0/1,449 (0.00%) |
+| check | 0/439 (0.00%) | 0/439 (0.00%) |
+| build | 0/149 (0.00%) | 0/149 (0.00%) |
+| doc | 0/222 (0.00%) | 0/222 (0.00%) |
+| other | 0/1,608 (0.00%) | 0/793 (0.00%) |
+
+Request selection evidence: 11 recovered legacy test rows and 1,204 rows with recorded fields.
+Available fourteen-day test history: 3,655 recovered legacy rows, 1,250 recorded rows, and 39 rows with unknown selection.
+All 149 replayed builds have shape evidence. ShapeFallback supplies 31 promises; these remain shape sources, not ordinary fallback sources.
+Observed waits: 225 logical steps have recorded totals of 1,162.98 minutes.
+3 steps have incomplete waits and contribute no value.
+4 intervals remain open. No ended recorded interval has NoPositiveSample.
+Phase 18 and Phase 68 are absent from origin/main at this snapshot, so their deployed cohorts are unavailable.
+No evidence reaches 2026-11-12, when the legacy rows leave the window. An after-expiry share is unavailable.
+The current estimator and configuration reconstruct earlier requests using only evidence available before each request.
+The replay assigns each indexed attempt to at most one sample, including samples before the requested window.
+Eight samples without their own indexed attempt are unresolved. The replay excludes them instead of using another attempt’s request time.
+The earlier repairs corrected retry times and used the production repository identity rule.
+Queue 10s changes no estimator function or configuration value in this comparison.
+The showrunner stopped this phase at Spec 2 because the overall ANON_SHARE share is under 5%.
+This measurement changes no estimator tier.
 
 #### Phase 11 replay comparison
 
@@ -455,7 +561,6 @@ The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to
 A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
 The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
 Phase 60 found the promise source of these over-three runs and fixed it there; see the Phase 60 replay below.
-Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
 
 #### Phase 60 replay comparison
 
@@ -484,7 +589,6 @@ and takes the larger of the exact-filter and package p90 before any indexed tier
 Bar met: cargo-liner nextest compile runs at 21 GiB go from under-half 7 to 0 and over-three 166 to 65 (bar: 101 or lower, under-half 7 or lower).
 At 24 GiB, the same group goes from over-three 6 to 2.
 Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
-Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
 
 #### Phase 17 compile-band measurement (not adopted)
 
@@ -947,7 +1051,7 @@ While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf`
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
 - **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
-- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, which has no disk-floor job, the hourly `tmp-sweep` job (nixos `modules/darwin/tmp-sweep.nix`) runs `tmp_sweep.py`. The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per task folder; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. These stay: the roots and both `active/` run-marker folders with every marker in them; a run folder under `unit/` or `delegate/` named by any active marker, with any `mesh_roster.json` worker not ended (paused included), or whose `progress_history_state.json` worktree belongs to a live session or a paused session in the shutdown mover's records; these runs and their temp entries stay even when their director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `mesh_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty mesh run file is not a record. Each roster thread whose worker is not ended keeps its `/tmp/claude/session/<thread_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty mesh run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Any unreadable marker, roster, session, shutdown or run ownership record keeps the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
+- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, the hourly `tmp-sweep` job (`modules/darwin/tmp-sweep.nix` in nixos) runs `tmp_sweep.py`. The separate disk-floor job runs every 120 seconds. The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per task folder; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. These stay: the roots and both `active/` run-marker folders with every marker in them; a run folder under `unit/` or `delegate/` named by any active marker, with any `mesh_roster.json` worker not ended (paused included), or whose `progress_history_state.json` worktree belongs to a live session or a paused session in the shutdown mover's records; these runs and their temp entries stay even when their director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `mesh_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty mesh run file is not a record. Each roster thread whose worker is not ended keeps its `/tmp/claude/session/<thread_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty mesh run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Any unreadable marker, roster, session, shutdown or run ownership record keeps the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
 - **Use stamp.** `sweep_workspace()` sets the mtime of `.lint-sweep-used` (`USE_STAMP`) in every root `cargo_roots()` returns, before `lock_trees`, so a step that compiled nothing, or whose sweep was skipped because a build held a lock, still counts as use. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
 - **Target last use.** `target_last_use(root, groups)` is the newest of the stamp's mtime and the target's build units' `last_used`.
 - **Order.** `shrink()` and `choose()` take a `RemovalOrder`, a sort key over `Group`; the smallest key goes first. The workspace budget sweep passes `unit_age` (most whole days unused, then oldest compile). For the floor's target order, see [Build output retained by the sweep](build-targets.md#build-output-retained-by-the-sweep). A scratch target a build holds is left like any held target. Orphaned files (`Scan.orphans`, one group per build tree) go first from any idle target, whatever the order.
@@ -1018,13 +1122,43 @@ Before its checks, the scratch guard uses the session-start path helper to resto
 
 Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers, its codex app-server (`codex_mesh.py`) and `verify.sh --session-dir` use `<run folder>/tmp`. So mktemp, tempfile and Rust `.tmpXXXXXX` folders land there, and the hourly tmp sweep judges each entry with its 4 h rule; the root goes only once its session or director stops, and nothing waits on that. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
 
-The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job on natedev and on the Mac) is the backstop for loose folders that can hold work: ~/rust, ~/rust/scratch, and the /tmp, /tmp/claude and `$TMPDIR` folders the sweep leaves. A folder in ~/rust is loose when its name is not in `config/rust_roots.txt` (one list for both machines) and it is not `repro` or `scratch`; every folder in ~/rust/scratch is loose, since `scratch.py` never makes one there; a folder in /tmp, /tmp/claude or `$TMPDIR` is loose when it is no session scratchpad, scratch root, run folder root, tempfile folder, `verify.sh` run folder or folder that holds only folders (the sweep judges those) or name a system tool owns. When `config/rust_roots.txt` cannot be read (an old checkout), nothing in ~/rust is judged. Only folders this user owns that did not change for a day count. Idle time comes from the newest mtime of the folder and of what is in it down to 3 folders (`target/`, `node_modules/` and `.git/` passed over), and of each git repo's `HEAD`, `index` and `logs/HEAD`, so a commit counts; ctime never counts. A folder with more than 50,000 entries in that depth stays and is named. A loose folder idle 7 days (`folder_remove_after_seconds`) is removed when no open hold names it, a folder in it or a folder that holds it; no process works in it or has a file in it open or mapped (the sweep's `/proc` or lsof scan); no socket in it is bound by a live process (`/proc/net/unix`; on the Mac any socket keeps it); and no git repo in it holds work on no remote (`scratch.unsaved_work`: uncommitted changes, a stash, commits on no remote, or a repo git cannot read). A removed linked worktree is pruned from its source repo, and each removal appends a line to `~/.local/state/folder-sweep/removed.jsonl`. It removes only once armed: `folder_audit.py arm` writes `~/.local/state/folder-sweep/armed` and `disarm` removes it; until then each line says `would remove`. Its first dry runs (2026-10-27) found 106 loose folders on natedev, 36 to remove (all old /tmp leftovers), and 13 on the Mac, 8 to remove (mostly ~/rust/scratch). The maker is the earliest-started session whose transcript holds a command (a JSON `"command"` string) that names the folder, since a listing in a command's output names every folder it shows, found in one ripgrep pass over all transcripts (about 6 s over 22 GB; a Python scan took 4 h 24 min); the name must end at a path boundary. Each maker gets one message that lists its folders with what happened to each and names `scratch.py adopt` and `scratch.py hold`; a folder no transcript names is printed only.
+The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
+A `nate.jobs` job runs it on natedev and the Mac.
+It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
+In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+Every folder in ~/rust/scratch is loose.
+In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
+The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
+The sweep checks tempfile folders, `verify.sh` folders and folders that contain only folders.
+If the audit cannot read `config/rust_roots.txt`, it does not check ~/rust.
+Only folders owned by this user and idle for a day enter the audit.
+The audit checks modification times down to three folder levels and each repository's `HEAD`, `index` and `logs/HEAD`.
+It skips `target/`, `node_modules/` and `.git/` during that scan.
+It keeps folders with more than 50,000 entries at that depth.
+A loose folder idle for `folder_remove_after_seconds` can be removed after seven days.
+An open hold, process use, live socket or unsaved git work keeps it.
+On the Mac, any socket in a folder keeps it.
+A failed git check also keeps it.
+The audit prunes removed linked worktrees from their source repositories.
+It records each removal in `~/.local/state/folder-sweep/removed.jsonl`.
+`folder_audit.py arm` enables removal, and `disarm` disables it.
+Before arming, each selected folder prints `would remove`.
+The first dry runs on 2026-10-27 found 106 loose folders on natedev and 13 on the Mac.
+They selected 36 and eight folders for removal.
+
+The maker is the earliest-started session whose own command creates the folder.
+The audit uses the scratch guard's `commands()` and `targets()` parser and resolves targets against the transcript row's `cwd`.
+Read-only commands, command output and message text do not prove ownership.
+One ripgrep pass selects possible transcript rows by folder name before the parser checks their commands.
+Each proven maker receives one message with its folders, outcomes, `scratch.py adopt` and `scratch.py hold`.
+A folder without a proven maker prints `maker unknown` and receives no message.
+
 
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
 `hold_floor` writes `floor.json` in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}` under `FLOOR_LOCK` after each floor sweep: time, free bytes, build-cache bytes (idle and busy target dirs plus both CI runner trees), `last_alert_at` and `last_push_at`. After a non-dry sweep it sends at most one alert:
 
-- **Floor out of reach** (every removable unit chosen, still `left > budget`, and free space under the floor after removals), on its own hour (`push_history`). It never asks the user to free space by hand (2026-10-21). `floor_holders` names each busy target with its size, the pid that holds it (`process_uses`, or for a held cargo lock `lock_holder` from `/proc/locks`, read up to `sweep_proc_locks_reads` (3) times before it answers no holder, because under load one read can skip a line) and that pid's Claude session (`holder_sessions`: the nearest ancestor a live session record names, through `process_table.nearest_named`). Each session found gets `holder_message_text` through `send_holder_message` (`send.py --to <session> --from disk_floor`). natedev gets `floor_out_of_reach_text`, one line per busy target and who was told. Only when no session was told does the phone get a page too (catalog entry `sweep.disk_floor`, sent through `push_texts.user_send_argv` as `send.py --to user --text-id sweep.disk_floor`; `docs/as-built/message-clarity.md`): `page_paths` lists exact paths, busy targets first, then the deepest measured folders outside build caches by size, as many as fit under 500 characters (`sweep_page_paths` at most), and the action asks the natedev session which paths it may remove.
+- **Floor out of reach.** The sweep reports this state when it selects every removable unit and free space remains below the floor. It uses the `push_history` interval. It never asks the user to free space by hand (2026-10-21). `floor_holders` identifies each busy target, its size, its holding process and its session. `process_uses` finds the process, or `lock_holder` reads `/proc/locks` up to `sweep_proc_locks_reads` times for a held Cargo lock. `holder_sessions` finds the nearest ancestor with a live session record through `process_table.nearest_named`. Each session holding busy targets gets `holder_message_text` through `send_holder_message`. natedev gets `floor_out_of_reach_text`, which lists busy targets and the sessions that received a message. This report sends no phone page.
 - **Growth** (free space fell more than `sweep_unexplained_fall_bytes` 10 GiB beyond build-cache growth since a floor sweep at most `sweep_growth_window_seconds` 30 min earlier; this sweep's free is read after the scan that measures its caches (`scanned_free`), and the record's free before its caches walk, so a target another process deletes during either walk cannot read as a fall. On 2026-10-25 a free read from before the scan reported a 122.6 GiB fall while 123 GiB was freed. A target held by a build hold counts 0 bytes, so the growth check runs only when the previous record's `held_roots` equals this pass's held set; an older record without it skips the check. The sweeper records its own last delete per target in `target-deletes.json` beside `floor.json`, and a directory mtime no later than that time plus 2 s does not make a target held. On 2026-10-29 its own deletes made a 34.7 GiB target look written during a hold, and a false 36.4 GiB fall was reported) and **large removal** (more than `sweep_large_removal_bytes` 32 GiB): natedev alone (`send.py --to natedev --from disk_floor`), at most one per `sweep_alert_interval_seconds` (1 h) counted from the last delivered alert.
 
 `send_floor_alert(message, channels: FloorAlertChannels.NATEDEV | NATEDEV_AND_PHONE)` returns whether either `send.py` call delivered: exit 0 or 1 counts for the natedev message, while only exit 0 counts for the user channel. The texts name what fell, what grew and the largest directories outside the caches, read from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`. `buildlog disk` adds `outside_build_caches` (directories one and two levels under each measured folder holding at least 1 GiB outside cargo target dirs as `sweep.is_cargo_target` decides them, with growth and largest child, so a scratch target is never listed as unexplained growth), `outside_build_cache_totals` and `previous_measured_at`. `send.py`'s `log.jsonl` lines carry `text`.
@@ -1252,7 +1386,16 @@ The sweep checks protection again before each target deletion.
 It takes only the shortfall, in the existing least recently used order.
 The result line reports removed bytes, free bytes before and after, and skipped busy targets.
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
-The nix-darwin job is a separate deployment step.
+The nix-darwin `nate.jobs.disk-floor` job runs this same command every 120 seconds on the Mac.
+`modules/darwin/default.nix` imports the new `modules/darwin/disk-floor.nix` module.
+The job uses the mirror leases and claim locks above, plus the shared floor lock.
+It trims only the shortfall below `sweep_floor_gib`, without an offload request.
+`ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
+
+The launchd job PATH includes `/usr/sbin` after `/usr/bin:/bin`.
+This lets the floor, scratch and folder-audit jobs find the system `lsof`.
+The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor.log`.
+The nixos patch must be applied and nix-darwin activated before this job runs.
 
 
 ### Free memory, head protection, and step slots
@@ -1304,6 +1447,10 @@ The formatters read the captured cause and room without a second room calculatio
 No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.
 
 ### Progress memory profiles
+
+Merge gates start with the p90 of their host's recorded peaks from the last 14 days, as other programs do.
+Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Matching progress profiles still determine the running need; `progress_profile_rank` applies only to progress bins.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
 Each bin selects the Nth-highest run value from matching completed profiles.

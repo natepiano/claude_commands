@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Sequence
@@ -16,7 +15,6 @@ from scripts.model_study.compare import OPUS, SONNET, load_turns
 from scripts.model_study.stats import bootstrap_diff, percentile, request_cost
 from scripts.model_study.turns import Turn, load_roster, session_ids
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.unit_runs import history_root  # noqa: E402
 
 DEFAULT_RUNS = history_root() / "runs"

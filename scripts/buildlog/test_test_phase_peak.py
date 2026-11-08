@@ -10,10 +10,9 @@ import unittest
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.buildlog import launches
 from scripts.buildlog import record
@@ -21,10 +20,7 @@ from scripts.buildlog import store
 from scripts.buildlog import test_record as record_tests
 from scripts.buildlog import test_record_rerun as recovery_tests
 
-if TYPE_CHECKING:
-    from ..lint import test_invoke_scope as scope_tests
-else:
-    from scripts.lint import test_invoke_scope as scope_tests
+from scripts.lint import test_invoke_scope as scope_tests
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
@@ -186,12 +185,10 @@ def tool_version_filter() -> str:
     """Use the same normalizer for versions read by Bash."""
     code = "\n".join((
         "import sys",
-        "from pathlib import Path",
-        "sys.path.insert(0, str(Path.home() / '.claude'))",
         "from scripts.mac_test.linux_runner import normalize_tool_version",
         "print(normalize_tool_version(sys.stdin.read()))",
     ))
-    return f'python3 -c {shlex.quote(code)}'
+    return f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)}'
 
 
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
@@ -664,9 +661,8 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     code = '\n'.join((
         'import sys',
         'from pathlib import Path',
-        "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
-        'import sweep',
-        'import conf',
+        'from scripts.lint import sweep',
+        'from scripts.lib import conf',
         'config = conf.read(conf.path("lint"))',
         'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
         'import os',
@@ -676,7 +672,7 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
         'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
-    return subprocess.run([sys.executable, '-c', code, str(target)],
+    return subprocess.run([str(Path.home() / '.claude/scripts/lib/py'), '-c', code, str(target)],
                           env={**os.environ, **environment}, check=False).returncode
 
 

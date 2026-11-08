@@ -15,9 +15,6 @@ from pathlib import Path
 from typing import cast
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.production import staff, unit_config
 from scripts.shutdown import remote
 from scripts.herdr import herdr
@@ -145,8 +142,7 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
     if machine != destination:
         return unavailable_details(row, holder, f"machine {machine} has no configured connection")
     code = (
-        "import sys,json; from pathlib import Path; from dataclasses import asdict; "
-        "sys.path.insert(0,str(Path.home()/'.claude')); "
+        "import sys,json; from dataclasses import asdict; "
         "from scripts.production.unit_command import staff,local_details; "
         "rows=json.load(sys.stdin); "
         "print(json.dumps(asdict(local_details(*(staff.StaffRow.from_json(row) for row in rows)))))"

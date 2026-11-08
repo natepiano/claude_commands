@@ -53,7 +53,9 @@ class UnroutedAlertTests(unittest.TestCase):
 
     def test_importing_the_alert_does_not_load_the_sender(self) -> None:
         command = """import sys
-sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+with open(Path(sys.argv[1]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production import unrouted_alert
 assert 'scripts.message.send' not in sys.modules
 assert 'send' not in sys.modules

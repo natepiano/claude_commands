@@ -16,7 +16,7 @@ from contextlib import ExitStack, closing, contextmanager, redirect_stderr
 from enum import Enum
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import index
@@ -26,19 +26,11 @@ from scripts.buildlog import report
 from scripts.buildlog import store
 from scripts.buildlog.test_index import Record, encode, point_root_at, step
 from scripts.buildlog.test_launches import CLI, result_line
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
-if TYPE_CHECKING:
-    from ..hana_shot import hana_shot
-    from ..hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
-else:
-    from scripts.hana_shot import hana_shot
-    from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
+from scripts.hana_shot import hana_shot
+from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
 class RecordingStopped(BaseException):
@@ -282,7 +274,7 @@ class LaunchRecordingTests(unittest.TestCase):
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",
-                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'record' in sys.modules}))",
+                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules}))",
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},

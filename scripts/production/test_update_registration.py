@@ -15,7 +15,8 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import rename, session_staff, staff, showrunners
+from scripts.production import session_staff, staff, showrunners
+from scripts.shutdown import shutdown
 from scripts.shutdown import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
@@ -154,7 +155,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("register: warn", result.stdout)
         self.assertIn("production example has showrunner other", result.stdout)
-        self.assertIn("/showrunner:rename plan example other", result.stdout)
+        self.assertIn("/agents rename example other", result.stdout)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
 
@@ -327,11 +328,11 @@ class QuestionIdentityTests(RegistrationFixture):
         displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
               displays.installed(), redirect_stdout(io.StringIO())):
-            _ = rename.apply(str(self.asker_id), "renamed")
+            _ = shutdown.rename_apply(str(self.asker_id), "renamed")
             renamed = staff.by_id(self.asker_id)
             assert renamed is not None
             self.assertEqual((renamed.id, renamed.name), (self.asker_id, "renamed"))
-            _ = rename.apply(str(self.asker_id), "renamed")
+            _ = shutdown.rename_apply(str(self.asker_id), "renamed")
         self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
         self.assertEqual(self.question_rows()[0]["asked_by"], self.asker_id)
 

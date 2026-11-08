@@ -2,6 +2,10 @@
 """Check each installed cargo-berth hook wrapper after an install."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -11,7 +15,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
-from berth.tests.installed_front_end import (
+from scripts.berth.tests.installed_front_end import (
     INSTALL_SCRIPT,
     POST_BASH_HOOK,
     PRE_EDIT_HOOK,

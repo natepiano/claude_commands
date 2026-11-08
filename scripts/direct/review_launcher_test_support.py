@@ -56,8 +56,8 @@ Path(log).write_text('stub agent log\\n')
 if os.environ.get('TEST_WORKER_STARTED'):
     Path(os.environ['TEST_WORKER_STARTED']).touch()
 if os.environ.get('STUB_REVIEW_FINISH_FILE'):
-    sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
-    from wait_for_test_state import wait_for_file
+    with open(Path(os.environ['TEST_WAIT_HELPER_DIR']).parent / 'lib/package_root.py') as package_root: exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(Path(os.environ['STUB_REVIEW_FINISH_FILE']))
 if os.environ.get('STUB_REVIEW_EDIT'):
     Path(os.environ['STUB_REVIEW_EDIT']).write_text('changed by reviewer\\n')
@@ -170,7 +170,7 @@ class ReviewLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
-        for name in ("conf.py", "conf.sh", "session_paths.py", "boot_identity.py"):
+        for name in ("conf.py", "conf.sh", "session_paths.py", "boot_identity.py", "package_root.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
                          self.root / "scripts/production/fast_track.py")
