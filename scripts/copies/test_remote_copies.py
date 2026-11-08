@@ -450,7 +450,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "shutdown/shutdown.py",
-            "style/add_style.py", "worktree/make_worktree.sh", "berth_fix/launch.sh",
+            "style/add_style.py", "worktree/make_worktree.sh",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
 
 if __name__ == "__main__":
