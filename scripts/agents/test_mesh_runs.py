@@ -792,8 +792,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         for family, variable in families:
             with self.subTest(family=family):
                 row = self.fixture.worker("worker-" + family, family=family)
-                with patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}):
+                before = self.fixture.staff_state()
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}), \
+                        patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as read:
                     caller = mesh_runs.caller_from_environment({variable: row.current_session, "UNIT_RUN_DIR": str(self.run_dir)})
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(self.fixture.staff_state(), before)
                 self.assertIsInstance(caller, mesh_runs.PaneCaller)
                 assert isinstance(caller, mesh_runs.PaneCaller)
                 self.assertEqual((caller.session_dir, caller.name, caller.staff_id), (str(self.run_dir), row.name, row.id))
@@ -889,7 +893,17 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         self.defer_transcript = True
 
-        self.assertEqual(mesh_runs.main(["supervise", str(path)]), 0)
+        statuses: list[object] = []
+        run = self.fixture.world.run
+
+        def delivery(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:2] == ("agent", "prompt"):
+                statuses.append(cast(dict[str, object], json.loads(path.read_text()))["status"])
+            return run(*arguments, deadline=deadline)
+
+        with patch.object(self.fixture.world, "run", side_effect=delivery):
+            self.assertEqual(mesh_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(statuses, ["running"])
         finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
         result = mesh_runs.deliver(finished, mesh_runs.CompletedCommand(0))
 

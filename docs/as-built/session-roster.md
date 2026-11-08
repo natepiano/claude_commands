@@ -69,7 +69,7 @@ Codex rows:
   A missing backend prints an anomaly and skips that role.
   The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
   The holder adds pending messages through `design_roles.py`.
-  The [held-role design](long-lived-workers.md#held-interfaces) defines its authority.
+  The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
 - **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
   A native Codex pane uses its reported session when available.
@@ -494,7 +494,7 @@ Release recalculates the priority of a kept decision.
 
 - Live checks never message a real session: they use a scratch background Claude session, a private pane worker and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
 
-- `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery, outcome/recovery rules and `<HeldRoleMessages>` (a held Astra role takes no direct message; its text is queued for the holder's next authorized assignment, `docs/as-built/long-lived-workers.md#held-interfaces`). Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
+- `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery, outcome/recovery rules and `<HeldRoleMessages>` (a held Astra role takes no direct message; its text is queued for the holder's next authorized assignment, `docs/as-built/long-lived-workers.md#lasting-roles`). Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
 
 ## Calibration / gotchas
 

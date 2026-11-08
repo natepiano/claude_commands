@@ -47,7 +47,7 @@ A change that old code cannot read safely requires a new schema number.
 
 Run records identify workers through fixed staff references.
 The [worker lifecycle](long-lived-workers.md#staff-membership-and-dispatch) defines their stored fields.
-Its [admission boundary](long-lived-workers.md#staff-membership-and-dispatch) publishes the current runtime.
+Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) publishes the current runtime.
 
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.

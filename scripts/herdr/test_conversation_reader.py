@@ -13,6 +13,7 @@ from unittest.mock import call, patch
 
 from scripts.herdr import herdr
 from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline
 from scripts.message import codex_daemon, sessions
 from scripts.production import fake_unit_host
@@ -64,6 +65,53 @@ class ConversationReaderTests(StaffTestCase):
             return arguments(path)
 
         _ = self.enterContext(patch.object(herdr, "_process_arguments", side_effect=read_arguments))
+
+    def test_snapshot_scan_keeps_the_operation_deadline(self) -> None:
+        run = self.runs / "test-run"
+        run.mkdir()
+        (run / unit_runs.SERVER_FILE).touch()
+        with (operation_deadline.within(deadline := time.monotonic() + 0.5),
+              patch.object(herdr, "loaded_threads", return_value={self.identity}) as loaded):
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(snapshot.live, {self.identity: ()})
+        self.assertLessEqual(cast(float, loaded.call_args.args[1]), deadline + 0.001)
+
+    def test_app_server_loaded_threads_prove_live_without_a_tui(self) -> None:
+        run = self.runs / "test-run"
+        run.mkdir()
+        (run / unit_runs.SERVER_FILE).touch()
+        with patch.object(herdr, "loaded_threads", return_value={self.identity}) as loaded:
+            self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
+        loaded.assert_called_once()
+        self.assertEqual(loaded.call_args.args[0], run)
+        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
+
+    def test_idle_astra_app_server_proves_its_thread_live_without_an_unknown_pid(self) -> None:
+        astra = self.root / "astra-runs"
+        run = astra / "test-review"
+        run.mkdir(parents=True)
+        write_text_atomic(run / unit_runs.SERVER_FILE, json.dumps({"pid": 998071}))
+        self.codex(rollout=False, arguments=["codex", "app-server"],
+                   environment={"CODEX_HOME": str(self.root / "account")})
+        with (patch.object(unit_runs, "ASTRA_RUN_ROOT", astra),
+              patch.object(herdr, "loaded_threads", return_value={self.identity}) as loaded):
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), herdr.LiveConversation("codex", ()))
+        self.assertEqual(snapshot.unknown, ())
+        loaded.assert_called_once()
+        self.assertEqual(loaded.call_args.args[0], run)
+        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
+
+    def test_failed_app_server_read_is_unknown(self) -> None:
+        run = self.runs / "test-run"
+        run.mkdir()
+        (run / unit_runs.SERVER_FILE).touch()
+        with patch.object(herdr, "loaded_threads", side_effect=ValueError("loaded threads unavailable")):
+            observed = herdr.read_conversation(self.identity, "codex")
+        self.assertIsInstance(observed, herdr.UnknownConversation)
+        assert isinstance(observed, herdr.UnknownConversation)
+        self.assertIn("test-run", observed.reason)
+        self.assertIn("loaded threads unavailable", observed.reason)
 
     def test_current_identity_requires_current_evidence(self) -> None:
         for evidence in (herdr.RolloutThread(self.identity), herdr.EnvironmentThread(self.identity)):

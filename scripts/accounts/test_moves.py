@@ -21,7 +21,7 @@ from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
 from scripts.herdr import worker_panes
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
-from scripts.production import staff
+from scripts.production import staff, session_staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
 )
@@ -739,6 +739,47 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("replacement director")))
         return row, run
 
+
+    def test_account_moves_stop_fixed_workers_and_keep_pending_rows_in_both_families(self) -> None:
+        for family in ("claude", "codex"):
+            for target in ("codex1", "claude1"):
+                with self.subTest(family=family, target=target):
+                    self.stop_requests.clear()
+                    row, run = self.worker("worker-" + family + target, family)
+                    before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+                    result = accounts.move_workers(target, dry_run=True)
+                    assert isinstance(result, accounts.GroupMoveDryRun)
+                    same_family = target.startswith(family)
+                    preview = (f"would stop and resume the same conversation on {target} in its worker pane" if same_family
+                               else f"not moved: cannot restart on {target} through assign.sh")
+                    self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",))
+                    self.assertIn(str(row.id), "\n".join(result.lines))
+                    self.assertIn(target, "\n".join(result.lines))
+                    self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.stop_requests, [])
+                    inbox = session_staff.inbox_path(row.id)
+                    inbox.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(inbox, '{"messages": ["held assignment"], "accepting_messages": true}')
+                    reference = (run / "progress_history_state.json").read_bytes(), inbox.read_bytes()
+                    saved = self.staff_file.read_bytes()
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = accounts.main(["move", "workers", target])
+                    self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+                    self.assertEqual(self.stop_requests, [row.id] if same_family else [])
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.staff_file.read_bytes(), saved)
+                    self.assertEqual(((run / "progress_history_state.json").read_bytes(), inbox.read_bytes()), reference)
+                    self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), row.id), self.root)
+                    lines = (output.getvalue() + errors.getvalue()).splitlines()
+                    self.assertEqual(len(lines), 1, lines)
+                    self.assertIn(str(row.id), lines[0])
+                    self.assertIn(target, lines[0])
+                    if same_family:
+                        self.assertIn("pending", lines[0])
+                    else:
+                        self.assertIn(f"cannot restart on {target} through assign.sh", lines[0])
+                    self.assertEqual(staff.retire(row.id), row)
 
     def test_one_failed_stop_reports_the_worker_and_keeps_other_moves_pending(self) -> None:
         for failure in ("stop", "locked"):

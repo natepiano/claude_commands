@@ -5354,6 +5354,16 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "FAILED: agent_prompt_stalled: private pane did not start\n")
         self.assertEqual(send.pending(f"staff:{row.id}"), "")
 
+    def test_roster_problem_is_silent_while_a_usable_worker_still_succeeds(self) -> None:
+        with (mock.patch.object(roster, "roster", return_value=roster.Roster([], ["one run was unreadable"])),
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.deliver(f"worker:{self.fixture.parent.name}/{self.row.name}", "Read the private report.")
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual(errors.getvalue(), "")
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual([command[2] for command in prompts], ["w1:p1"])
+        self.assertIn("Read the private report.", prompts[0][3])
+
     def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
         message = "Detached run: private-run\nResult: PASS"
         result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="mesh-runs", timeout=60)

@@ -8,6 +8,7 @@ import math
 import os
 import socket
 from pathlib import Path
+from datetime import datetime, timezone
 import subprocess
 import sys
 import time
@@ -367,6 +368,53 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
+
+    def test_resume_workers_keeps_a_claude_child_launcher_without_a_native_pass(self) -> None:
+        from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, Resumable, Unavailable, resume_message
+
+        child = self.fixture.worker("legacy-child", family="claude")
+        unavailable = self.fixture.worker("unavailable-child", family="claude")
+        native = self.fixture.worker("native-child", family="claude")
+        idle = self.fixture.worker("native-idle", family="claude")
+        command = ["bash", str(self.fixture.root / "assign.sh"), "--role", "implement",
+                   "--phase", "8", "--session-dir", str(self.run_dir), "--cwd", str(self.fixture.root),
+                   "--prompt", str(self.prompt)]
+        process = self.fixture.root / "proc" / str(os.getpid())
+        process.mkdir(parents=True)
+        _ = (process / "cmdline").write_bytes(b"\0".join(os.fsencode(word) for word in command) + b"\0")
+        atomic_file.write_text_atomic(process / "stat", f"{os.getpid()} (private launcher) S 1 0 0")
+        atomic_file.write_text_atomic(self.run_dir / "impl_worker_legacy-child.json", json.dumps({
+            "staff_id": child.id, "slot": "legacy-child", "launcher_pid": os.getpid()}))
+        atomic_file.write_text_atomic(self.run_dir / "impl_status_legacy-child", "implementing")
+        for row in (unavailable, native):
+            atomic_file.write_text_atomic(self.run_dir / f"impl_worker_{row.name}.json", json.dumps({
+                "staff_id": row.id, "slot": row.name, "launcher_pid": 0}))
+        atomic_file.write_text_atomic(self.run_dir / "impl_status_native-child", "implementing")
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.fixture.root / "usage")}):
+            dispatch = progress_history.begin_dispatch(self.run_dir, slot="native-child", phase="8", role="impl",
+                worker_name=native.name, worker_id=native.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                kind="impl", lens="")
+            agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
+            agents_log.append(native.current_session, "impl", None, datetime.now(timezone.utc))
+            result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+        saved = next(item for item in result.results if isinstance(item, Resumable))
+        self.assertEqual(saved.seat["staff_id"], child.id)
+        self.assertEqual(saved.seat["launcher_command"], command)
+        self.assertTrue(saved.seat["turn_live"])
+        self.assertEqual(result.cwd, str(self.fixture.root))
+        missing = next(item for item in result.results if isinstance(item, Unavailable))
+        self.assertEqual(missing.staff_id, unavailable.id)
+        self.assertIn("last assignment is unavailable", missing.reason)
+        child_ids = {staff.StaffId(item.staff_id if isinstance(item, Unavailable) else item.seat["staff_id"])
+                     for item in result.results}
+        self.assertEqual(child_ids, {child.id, unavailable.id})
+        self.assertTrue(child_ids.isdisjoint(pane.staff_id for pane in result.panes))
+        self.assertIn(PaneWorkerResume(native.id, BusyPass(dispatch)), result.panes)
+        self.assertIn(PaneWorkerResume(idle.id, IdleWorker()), result.panes)
+        text = resume_message("a shutdown", workers=result)
+        self.assertIn("legacy-child (impl, was working):", text)
+        self.assertIn(str(self.run_dir / "legacy-child.resume-prompt.md"), text)
+        self.assertIn(missing.reason, text)
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
         from scripts.lib.resume_message import BusyPass, NO_OWN_PASS

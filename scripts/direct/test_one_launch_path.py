@@ -8,6 +8,11 @@ import re
 import shlex
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from scripts.direct.progress_history import DispatchDetailNotRecorded, RecordedDispatch
+from scripts.lib import resume_message
+from scripts.lib.resume_message import ClaudeChildResume
 
 
 from scripts.lib.code_kind import is_test_code
@@ -147,6 +152,57 @@ class OneLaunchPathTests(unittest.TestCase):
             _ = (root / "inspect.sh").write_text(
                 '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')
             self.assertEqual(forbidden_launches(root), [])
+
+
+class ResumeAssignmentTests(unittest.TestCase):
+    def test_saved_shell_commands_resume_through_assign_with_their_role_and_phase(self) -> None:
+        for launcher, role, arguments in (
+            ("assign.sh", "impl", ["--role", "implement", "--prompt", "/old/prompt"]),
+            ("assign.sh", "fix", ["--role", "fix", "--prompt", "/old/prompt", "--fix-cause", "resume after a move"]),
+            ("review.sh", "review", ["review", "the review", "reviewing", "3"]),
+        ):
+            with self.subTest(launcher=launcher, role=role):
+                command = ["bash", str(ROOT / "scripts/direct" / launcher), "--phase", "3t"]
+                if role == "review":
+                    command.extend(("--lens", "contract"))
+                if launcher == "assign.sh":
+                    command.extend(("--session-dir", "/old/run", "--cwd", "/old/tree", *arguments))
+                else:
+                    command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
+                seat = ClaudeChildResume(run_dir="/run", seat="worker", role=role, staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(resume_message.resume_worker_command(seat, "/current/tree"))
+                self.assertEqual(rebuilt[:2], ["bash", str(ROOT / "scripts/direct/assign.sh")])
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--to"], "worker")
+                self.assertEqual(options["--role"], "implement" if role == "impl" else role)
+                self.assertEqual(options["--phase"], "3t")
+                self.assertEqual(options["--cwd"], "/current/tree")
+                self.assertEqual(options["--session-dir"], "/run")
+                self.assertEqual(options["--prompt"], "/run/worker.resume-prompt.md")
+                if role == "review":
+                    self.assertEqual(options["--lens"], "contract")
+                    self.assertEqual(options["--pass"], "3")
+                    self.assertNotIn("--paths", options)
+                else:
+                    self.assertEqual(options["--paths"], "/run/phases/3t/files")
+                if role == "fix":
+                    self.assertEqual(options["--fix-cause"], "resume after a move")
+                self.assertEqual(seat["launcher_command"], command)
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(resume_message.resume_worker_command(seat, "/current/tree")), rebuilt)
+
+    def test_worker_without_a_saved_launcher_uses_assign_and_the_recorded_phase(self) -> None:
+        seat = ClaudeChildResume(run_dir="/run", seat="worker", role="test", staff_id="worker-id",
+                          turn_live=True, launcher_command=[])
+        with patch("scripts.lib.resume_message.progress_history.last_dispatch", return_value=RecordedDispatch(
+                "test", "3t", DispatchDetailNotRecorded.UNRECORDED, "/run/phases/3t/files")):
+            command = shlex.split(resume_message.resume_worker_command(seat, "/tree"))
+        self.assertEqual(command[:2], ["bash", str(ROOT / "scripts/direct/assign.sh")])
+        options = dict(zip(command[2::2], command[3::2]))
+        self.assertEqual(options["--role"], "test")
+        self.assertEqual(options["--paths"], "/run/phases/3t/files")
+
 
 
 if __name__ == "__main__":

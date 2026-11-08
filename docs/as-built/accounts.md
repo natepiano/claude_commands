@@ -203,7 +203,7 @@ Unavailable family evidence also refuses the restart.
 The real refusal leaves the source running.
 
 Source release preserves each stop reason and gives the next action.
-The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and server evidence.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and native source evidence.
 A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
 
 ## Recovery and alert ownership

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import io
+import json
 from contextlib import redirect_stderr
 import shlex
 import subprocess
@@ -70,6 +71,21 @@ class NativeSessionLabelTests(StaffTestCase):
 
 
 class RowResolverTests(StaffTestCase):
+    def test_retired_worker_keeps_its_fixed_inbox_path_for_cleanup_retries(self) -> None:
+        worker = self.tree()[2]
+        before = session_staff.inbox_path(worker.id)
+        before.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(before, json.dumps({"messages": ["cleanup evidence"]}))
+        evidence = before.read_bytes()
+        retired = staff.retire(worker.id)
+        self.assertEqual(retired, worker)
+        self.assertIsNone(staff.by_id(worker.id))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                after = session_staff.inbox_path(worker.id)
+                self.assertEqual(after, before)
+                self.assertEqual(after.read_bytes(), evidence)
+
     def test_unit_and_worker_read_the_row_location_config_and_git_from_one_snapshot(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()

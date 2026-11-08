@@ -18,10 +18,11 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
-from scripts.herdr import worker_panes
+from scripts.herdr import herdr, worker_panes
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import staff
+from scripts.production import staff, session_staff
 from scripts.whoami.account import UnreadableAccount
 from scripts.shutdown.inventory import Inventory
 
@@ -83,6 +84,22 @@ def setUpModule() -> None:
 
 @final
 class ShutdownStatusTests(ShutdownTestCase):
+    def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
+        parent = fixture_member("unit", name="readiness-unit",
+                                parent=fixture_member("showrunner", name="readiness-owner").id)
+        row = fixture_worker("test-worker", parent.id)
+        record = staff.local_snapshot()
+        busy = worker_panes.OpenWorker(row, "w1:p1", "agents", herdr.AgentStatus.WORKING)
+        idle = worker_panes.OpenWorker(row, "w1:p1", "agents", herdr.AgentStatus.IDLE)
+        with (patch.object(session_staff, "pane_parents", return_value=[parent]),
+              patch.object(worker_panes, "observe_parents", side_effect=[{parent.id: [busy]}, {parent.id: [idle]}]),
+              patch("scripts.shutdown.shutdown.time.sleep") as delay,
+              redirect_stdout(io.StringIO()) as output):
+            shutdown.wait_for_workers(record)
+        delay.assert_called_once_with(1)
+        self.assertEqual(output.getvalue().splitlines(),
+                         [f"{row.name}: {row.current_session}: waiting for worker turn"])
+
     def test_stop_reports_each_unresolved_worker_and_the_director_result(self) -> None:
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("director-session"))

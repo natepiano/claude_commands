@@ -45,6 +45,7 @@ from scripts.agents.codex_mesh_test_support import FixtureLoopBudget, LifecycleT
 from scripts.agents import codex_mesh, worker_lifecycle
 from scripts.direct import assign_gate, plan_history
 from scripts.lib import atomic_file
+from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions, unit_labels, roster as message_roster
 from scripts.herdr import herdr
 from scripts.usage import agents_log
@@ -1387,6 +1388,39 @@ class MeshCommandFixture(unittest.TestCase):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id})))
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent.id}))
         yield
+
+
+class FixtureModelDefaultsTests(unittest.TestCase):
+    def test_only_unchanged_baseline_results_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            registry = write_registry(Path(root) / "models.conf")
+            with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
+                resolve = MagicMock(return_value=("gpt-test", "high"))
+                defaults = FixtureModelDefaults(resolve)
+                configuration = models_registry.launch_configuration({})
+                args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+                self.assertEqual(resolve.call_count, 1)
+                _ = write_registry(registry, {"direct.codex": {"impl": "gpt-test:max"}}, update=True)
+                resolve.return_value = ("gpt-test", "max")
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
+                self.assertEqual(resolve.call_count, 3, "changed registries must resolve on every turn")
+
+    def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
+        resolve = MagicMock(return_value=("gpt-test", "high"))
+        defaults = FixtureModelDefaults(resolve)
+        configuration = models_registry.launch_configuration({})
+        args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
+        self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+        with patch.object(subprocess, "run"):
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+        self.assertEqual(resolve.call_count, 4)
+
 
 
 if __name__ == "__main__":

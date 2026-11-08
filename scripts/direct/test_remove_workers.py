@@ -88,6 +88,32 @@ class RemoveWorkersTests(StaffTestCase):
         code, names, errors = self.invoke(self.parent.current_session, [self.run_dir], 8)
         self.assertEqual((code, names, errors), (8, [self.first.name], ""))
 
+    def test_retirement_retries_after_the_staff_publication_is_interrupted(self) -> None:
+        selected = self.first
+
+        def end_then_interrupt(arguments: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertFalse(check)
+            self.assertEqual(arguments[-1], selected.name)
+            self.assertEqual(staff.retire(selected.id), selected)
+            raise InterruptedError("lost staff acknowledgement")
+
+        with (patch.object(sys, "argv", ["remove_workers.py", "--session-dir", str(self.run_dir)]),
+              patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(subprocess, "run", side_effect=end_then_interrupt),
+              self.assertRaisesRegex(InterruptedError, "lost staff acknowledgement")):
+            result = remove_workers.main()
+            self.fail(f"worker end returned {result} without the acknowledgement failure")
+        self.assertIsNone(staff.by_id(selected.id))
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(self.invoke(self.parent.current_session, [self.run_dir]), (0, [], ""))
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_a_worker_caller_cannot_remove_itself_or_its_peers(self) -> None:
+        code, names, errors = self.invoke(self.first.current_session, [self.run_dir])
+        self.assertEqual((code, names), (2, []))
+        self.assertIn("does not belong to the native caller", errors)
+        self.assertEqual(staff.by_id(self.first.id), self.first)
+
     def test_no_given_run_selects_no_workers(self) -> None:
         self.assertEqual(self.invoke(self.parent.current_session, []), (0, [], ""))
 

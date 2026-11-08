@@ -1,6 +1,8 @@
 """Retained worker clocks, file events and run status."""
 from __future__ import annotations
 
+import fcntl
+import io
 import json
 import os
 import socket
@@ -9,8 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.agents import worker_lifecycle
@@ -304,3 +307,98 @@ class FixtureHomeSafetyTests(unittest.TestCase):
                             fixture_support.assert_real_codex_unchanged()
                     fixture_support.assert_real_codex_unchanged()
 
+
+class LifecycleDeadlineTests(unittest.TestCase):
+    session_dir: Path = Path()
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.lifecycle_clock: LifecycleTestClock = LifecycleTestClock()
+
+    @override
+    def setUp(self) -> None:
+        self.session_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.lifecycle_clock = LifecycleTestClock()
+
+    def test_sequential_lock_waits_share_one_monotonic_budget(self) -> None:
+            first, second = self.session_dir / "first.lock", self.session_dir / "second.lock"
+            self.lifecycle_clock.freeze()
+            started = self.lifecycle_clock.monotonic()
+            contended: list[str] = []
+            flock = fcntl.flock
+            with first.open("a+") as first_owner, second.open("a+") as second_owner:
+                flock(first_owner, fcntl.LOCK_EX)
+                flock(second_owner, fcntl.LOCK_EX)
+
+                def acquire(descriptor: int | io.IOBase, mode: int) -> None:
+                    try:
+                        flock(descriptor, mode)
+                    except BlockingIOError:
+                        handle = descriptor if isinstance(descriptor, io.IOBase) else next((owner for owner in (first_owner, second_owner) if os.path.samestat(os.fstat(owner.fileno()), os.fstat(descriptor))), None)
+                        assert handle is not None
+                        contended.append(Path(str(cast(TextIO, cast(object, handle)).name)).name)
+                        self.lifecycle_clock.advance(3)
+                        if len(contended) == 1:
+                            flock(first_owner, fcntl.LOCK_UN)
+                        raise
+
+                with (patch.object(fcntl, "flock", acquire),
+                      patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                      worker_lifecycle.operation_deadline(timeout=5) as deadline,
+                      first.open("a+") as one, second.open("a+") as two):
+                    self.assertEqual(deadline, started + 5)
+                    worker_lifecycle.acquire_flock(one)
+                    with self.assertRaisesRegex(TimeoutError, "second.lock"):
+                        worker_lifecycle.acquire_flock(two, deadline=started + 100)
+            self.assertEqual(contended, ["first.lock", "second.lock"])
+            self.assertEqual(self.lifecycle_clock.monotonic() - started, 6)
+
+    def test_nested_deadlines_restore_after_failure_without_extending_the_operation(self) -> None:
+            path = self.session_dir / "scope.lock"
+            self.lifecycle_clock.freeze()
+            started = self.lifecycle_clock.monotonic()
+            with (patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  worker_lifecycle.operation_deadline(timeout=10) as outer):
+                with self.assertRaisesRegex(ValueError, "nested failure"):
+                    with worker_lifecycle.operation_deadline(timeout=1) as inner:
+                        self.assertEqual(inner, started + 1)
+                        raise ValueError("nested failure")
+                self.lifecycle_clock.advance(2)
+                with worker_lifecycle.operation_deadline(deadline=started + 100) as restored:
+                    self.assertEqual(restored, outer)
+                    with path.open("a+") as handle:
+                        worker_lifecycle.acquire_flock(handle)
+                with worker_lifecycle.operation_deadline(timeout=3) as shortened:
+                    self.assertEqual(shortened, started + 5)
+            # A new operation has its own deadline.
+            with worker_lifecycle.operation_deadline(timeout=20) as fresh:
+                self.assertGreater(fresh, outer)
+
+    def test_concurrent_shutdown_deadlines_do_not_leak_between_threads(self) -> None:
+            self.lifecycle_clock.freeze()
+            started = self.lifecycle_clock.monotonic()
+            ready = threading.Barrier(3)
+            release = threading.Event()
+            guard = LauncherHangGuard("concurrent shutdown deadline scopes")
+
+            def operation(timeout: float) -> float:
+                with worker_lifecycle.operation_deadline(timeout=timeout) as deadline:
+                    _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                    guard.event(release)
+                    with worker_lifecycle.operation_deadline() as inherited:
+                        self.assertEqual(inherited, deadline)
+                    path = self.session_dir / f"operation-{timeout}.lock"
+                    with path.open("a+") as handle:
+                        worker_lifecycle.acquire_flock(handle)
+                    return deadline
+
+            with patch.object(worker_lifecycle, "time", self.lifecycle_clock), ThreadPoolExecutor(max_workers=2) as executor:
+                short = executor.submit(operation, 1)
+                long = executor.submit(operation, 10)
+                try:
+                    _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.lifecycle_clock.advance(2)
+                finally:
+                    release.set()
+                with self.assertRaises(TimeoutError):
+                    _ = guard.result(short)
+                self.assertEqual(guard.result(long), started + 10)

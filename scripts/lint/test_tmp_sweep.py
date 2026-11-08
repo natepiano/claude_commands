@@ -1311,6 +1311,24 @@ class HandCleanupTests(TmpSweepCase):
 
 
 class WorkerAndGitTests(TmpSweepCase):
+    def test_finished_detached_records_do_not_keep_a_folder_for_a_worker(self) -> None:
+        self.now = time.time() + 8 * DAY
+        for guard in ("paused worker", "active run"):
+            with self.subTest(guard=guard):
+                folder = write(self.tmp / "scratch" / guard.replace(" ", "-") / "repo" / "file").parents[1]
+                run = self.live_worker(folder / "repo", run_status="finished")
+                if guard == "active run":
+                    self.pane_world.remove_leaf("w1:p2")
+                    write_text_atomic(self.unit / "active" / LIVE_SESSION, str(run))
+                for exit_code in (0, 1, 143):
+                    write_text_atomic(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                        "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
+                    }))
+                result = self.sweep()
+                self.assertNotIn(str(folder), result.kept.get(tmp_sweep.WORKER_USES, []))
+                self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+                self.assertFalse(folder.exists())
+
     def test_sweep_removes_a_killed_fresh_gate_but_keeps_unmarked_git_work(self) -> None:
         source = self.tmp.parent / "fresh-source"
         source.mkdir()
@@ -1638,6 +1656,18 @@ class RunningSessionTests(unittest.TestCase):
 
 
 class PaneRunTests(TmpSweepCase):
+    def test_live_director_keeps_its_run_without_an_extra_staff_read(self) -> None:
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="runner").id,
+                                runtime_id=LIVE_SESSION)
+        payload = write(self.unit / "mesh-run" / "payload")
+        write_text_atomic(payload.parent / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, mock.patch.object(
+                staff, "local_snapshot", side_effect=AssertionError("extra local staff read")):
+            result = self.sweep()
+        self.assertTrue(payload.exists())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.DIRECTOR_RUNS])
+        self.assertEqual(snapshot.call_count, 1)
+
     now: float = 0.0
 
 

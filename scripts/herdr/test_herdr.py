@@ -6649,10 +6649,6 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(fresh.layout(), [("hana", ["late-session"])])
 
 
-if __name__ == "__main__":
-    _ = unittest.main()
-
-
 class RunLoadedThreadsTests(unittest.TestCase):
     def test_current_and_retired_servers_are_read_with_all_pages(self) -> None:
         from scripts.agents.codex_mesh_test_support import StubAppServer
@@ -6698,3 +6694,7 @@ class RunLoadedThreadsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "timed out"):
                 _ = herdr.loaded_threads(Path(folder), time.monotonic())
             self.assertEqual(server.requests, requests)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

@@ -24,9 +24,9 @@ from scripts.accounts import accounts
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, conf, unit_runs
-from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
+from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import staff, worker_admission
+from scripts.production import session_staff, staff, worker_admission
 from scripts.shutdown import member_account
 
 from scripts.herdr import herdr
@@ -544,21 +544,33 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | NoO
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
-    """Supply pane dispatch ids to the shared builder."""
+    """Supply Claude child launchers and pane dispatch ids to the shared builder."""
+    from scripts.shutdown.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:
         return ResumeWorkers()
+    results = {staff.StaffId(result.staff_id if isinstance(result, Unavailable) else result.seat["staff_id"]): result
+               for result in worker_resumes(holder, record)}
+    members = record.find(kind="worker", parent=parent)
+    unavailable = [row for row in members if isinstance(results.get(row.id), Unavailable)]
+    recorded = session_staff.worker_run_entries(record, unavailable) if unavailable else {}
+    results = {identity: result for identity, result in results.items()
+               if not isinstance(result, Unavailable) or identity in recorded}
     panes: list[PaneWorkerResume] = []
-    run = worker_panes.worker_run(holder)
-    for row in record.find(kind="worker", parent=parent):
+    run = worker_panes.worker_run(holder, record=record)
+    for row in members:
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
             continue
+        if isinstance(active, progress_history.ActiveDispatch):
+            _ = results.pop(row.id, None)
+        elif row.id in results:
+            continue
         panes.append(PaneWorkerResume(row.id, BusyPass(active.instance_id)
             if isinstance(active, progress_history.ActiveDispatch) else IdleWorker()))
-    return ResumeWorkers([], panes=panes)
+    return ResumeWorkers(list(results.values()), str(session_staff.worker_directory(record, parent)) if results else "", panes)
 
 
 @dataclass(frozen=True)

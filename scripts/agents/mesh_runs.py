@@ -120,7 +120,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
 
         parent = membership.parent_of(member)
         if parent is not None:
-            return PaneCaller(str(worker_panes.worker_run(parent)), member.name, member.id)
+            return PaneCaller(str(worker_panes.worker_run(parent, record=membership)), member.name, member.id)
     return NotMeshWorker()
 
 

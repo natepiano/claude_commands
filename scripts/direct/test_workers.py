@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.direct import workers
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production import staff
@@ -114,6 +115,49 @@ class DirectorResolutionTests(StaffTestCase):
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(renamed.current_session, os.getpid()))
 
 
+
+
+class DetachedWorkerSafetyTests(StaffTestCase):
+    def detached_worker(self) -> tuple[staff.StaffRow, staff.StaffRow, Path]:
+        parent = unit_membership("demo", "builders")
+        member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        run = self.worker_run("demo", "builders", parent.current_session)
+        return parent, member, run
+
+    def test_reused_supervisor_pid_does_not_retain_detached_work(self) -> None:
+        run = self.detached_worker()[2]
+        records = run / "mesh_runs"
+        records.mkdir()
+        record = records / "abandoned.json"
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as unrelated:
+            write_text_atomic(record, json.dumps({"worker": "w7", "status": "running", "pid": unrelated.pid,
+                                                  "cwd": str(run)}))
+            self.assertEqual(workers.live_detached_runs(run), ())
+            self.assertEqual(workers.protected_working_directories(run), ())
+            self.assertEqual(workers.retained_detached_runs(run), ())
+            self.assertIsNone(unrelated.poll())
+            result = unrelated.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(unrelated.returncode, 0, result)
+
+    def test_a_supervisor_started_through_a_linked_run_protects_its_resolved_checkout(self) -> None:
+        parent, member, run = self.detached_worker()
+        linked = run.parent / "linked-run"
+        linked.symlink_to(run, target_is_directory=True)
+        records = run / "mesh_runs"
+        records.mkdir()
+        record = records / "linked-command.json"
+        checkout = run / "phases" / "5" / "gate"
+        checkout.mkdir(parents=True)
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+            "mesh_runs.py", "supervise", str(linked / "mesh_runs" / record.name)], stdin=subprocess.PIPE)
+        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
+        located = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", checkout), expected=parent.worktree)
+        assert isinstance(located.worktree, staff.PresentWorktree)
+        write_text_atomic(record, json.dumps({"staff_id": member.id, "worker": member.name,
+                                              "status": "running", "pid": child.pid}))
+        self.assertEqual([entry[0] for entry in workers.live_detached_runs(run.resolve())], [record])
+        self.assertEqual(workers.protected_working_directories(run.resolve()), (located.worktree.path.resolve(),))
 
 
 if __name__ == "__main__":

@@ -1223,10 +1223,12 @@ def _unit_workers(
                         role="worker", name=row.name, status=status, reach=reach,
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
-                        assignment=_worker_assignment(run, _slot_role(row.name), {"staff_id": row.id}, membership, role_log),
+                        assignment=_worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
+                                                      {"staff_id": row.id}, membership, role_log),
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
-                        account=AccountUnread("worker account not read")))
+                        account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
+                        else AccountUnread("worker account not read")))
     except (OSError, ValueError, herdr.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
     for run in runs:
@@ -1251,8 +1253,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                     continue
                 parent = design_roles.worker_parent(design, instance.role, membership)
                 showrunner, director = _held_location(parent, membership, claude)
-                member = next((row for row in membership.find(kind="worker", parent=parent.id)
-                               if row.name == instance.name), None)
+                member = membership.by_id(instance.lifecycle.staff_id)
                 evidence = session_staff.worker_backend(membership, member.id) if member is not None else session_staff.WorkerBackendUnavailable("worker is absent")
                 thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
                           and isinstance(evidence.backend, staff.CodexBackend) else "")
@@ -1377,6 +1378,8 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         machine, runs, claude, production_places, problems, home_state=home_state, membership=membership
     )
     durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership=membership)
+    unit_workers = [entry for entry in unit_workers
+                    if not isinstance(entry.thread, CodexThread) or entry.thread.thread_id not in durable_threads]
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
     codex_sessions: list[RosterEntry] = []

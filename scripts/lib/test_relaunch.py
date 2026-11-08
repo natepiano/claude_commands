@@ -373,6 +373,19 @@ class RelaunchTests(ShutdownTestCase):
         self.assert_relaunched(process, request)
         self.assertEqual((self.root / "interrupted").read_text(), str(signal.SIGINT))
 
+    def test_resume_message_keeps_busy_and_idle_claude_children(self) -> None:
+            from scripts.lib.resume_message import Idle, Resumable, ResumeWorkers, resume_message
+            from scripts.lib.resume_message import ClaudeChildResume
+
+            seats = [ClaudeChildResume(run_dir=str(self.root), seat=name, role="impl", staff_id=name,
+                                turn_live=busy, launcher_command=[]) for name, busy in (("busy", True), ("idle", False))]
+            with patch("scripts.lib.resume_message.resume_worker_command", return_value="saved assignment") as command:
+                text = resume_message("a shutdown", workers=ResumeWorkers(results=[Resumable(seats[0]), Idle(seats[1])], cwd=str(self.root)))
+            command.assert_called_once_with(seats[0], str(self.root))
+            self.assertIn("busy (impl, was working): saved assignment", text)
+            self.assertIn("idle (impl, idle): paused on its thread", text)
+            self.assertIn("for messages kept while you were down", text)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.shutdown import remote
+from scripts.lib.atomic_file import write_text_atomic
 
 import io
 import json
@@ -167,13 +168,14 @@ class UnitFolderMoveTests(FolderRenameFixture):
                     self.assert_finished_rerun(backend)
 
     def test_history_and_launch_files_keep_their_bytes_and_times(self) -> None:
-        files = (self.records / "agents.json", self.root / "runs/progress_history_state.json",
+        files = (self.records / "agents.json", self.root / "runs/mesh_roster.json",
+                 self.root / "runs/progress_history_state.json",
                  self.root / "history.jsonl")
         text = json.dumps({"session_id": self.owner.current_session, "cwd": str(self.source),
                            "branch": "cargo-liner-source", "queued_message": "Keep this task"}) + "\n"
         for path in files:
             path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(text)
+            write_text_atomic(path, text)
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in files]
         backend = FolderSessionFixture(self.owner, live=True)
         with backend.installed():
