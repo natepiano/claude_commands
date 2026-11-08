@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from typing import cast, override
 
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class VerifySshResultsTests(VerifySshTargetsFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.control_admission_clock()
+
     def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
         self.configure("aws,spare,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={
@@ -65,7 +70,7 @@ import os
 from pathlib import Path
 import sys
 
-sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 if sys.argv[1:3] == ["nextest", "run"]:
     from scripts.direct.test_verify_step_state import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])

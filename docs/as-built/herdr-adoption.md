@@ -107,7 +107,7 @@ Short tab titles can repeat across workspaces.
   1. Refuse outside the Mac desktop.
   2. Resolve the folder and validate the name.
   3. Pick the account with `accounts.account_for_unscoped_launch`. A `LegacyHomeLaunch` uses `~/.claude.json` and unsets the named-account variables. Otherwise the pane gets `named_account_environment(dir)`.
-  4. Check Claude folder trust. Print an anomaly if trust is absent or unreadable. Continue the launch.
+  4. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
   5. Launch without a shutdown hold or admission claim.
   6. Run `start_server(agents, 90_000)`, and refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` (or the named-account variables for a legacy home), since a new tab inherits it.
   7. Open a tab in a workspace with the tab name (`open_tab`). Refuse a supplied `--name` when an open tab already uses it. Otherwise, generate a name with `generated_session_name(<folder>, "1")`. Increase the suffix until the name is free.
@@ -118,20 +118,31 @@ Short tab titles can repeat across workspaces.
 
 ### Claude trust before every launch
 
-A Claude session started in a folder the account has not trusted stops at the trust prompt. A launcher that sends it a prompt then waits on a session that never answers. Every launcher checks trust first and refuses with the one command the user runs, before it writes or launches anything.
+`copies.py clone` checks source trust through `herdr.claude_trust` in every Claude account home.
+Trust in any home authorizes the clone in every existing account file.
+The clone record stores its resolved `claude_trust_folder` before the locked accounts writer grants trust.
+Removal deletes that folder's complete project entry after the external removal mark exists.
+It preserves other project entries and settings and skips missing account files.
+Malformed or unreadable account files produce an anomaly while the other homes continue.
 
-- `herdr.claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile` is the one check. A folder is trusted when `projects[k].hasTrustDialogAccepted is True` in the account's `.claude.json` for a key `k` in: the folder itself, its `git rev-parse --show-toplevel` (`repository_root`), and its main checkout (`repository_trust_key`, the parent of `--git-common-dir`). Both git helpers share `_repository_key`, which strips inherited `GIT_*` variables and runs git with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`.
-  - `Untrusted` carries `keys_tried`.
-  - `UnreadableTrustFile` prints `cannot read <file> to check Claude trust (<ErrorClass>)`: the path and the error's class name, never the file's contents.
-- `accounts.trust_command(folder, selected: ClaudeLaunchAccount) -> str` is the line the user runs, accepts the prompt in, then leaves with `/exit`: `cd <folder> && <account prefix> claude`. The prefix is `named_account_prefix`, the numbered `CLAUDE_CONFIG_DIR` plus the shared memory directory. A legacy home launch in `herdr_sessions.py` prints `cd <folder> && env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude` instead.
-- Callers. Each refuses with `<unit | child showrunner name | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`:
-  - `add_unit.preflight(request, selected)` exits 2 before any stub, table row or worktree is written. A worktree that does not exist yet is checked by its main checkout's key, and its trust command runs in the main checkout.
-  - `add_showrunner.checked`, and through it `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` sets the account file in tests.
-  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. Nothing writes `hasTrustDialogAccepted`.
-  - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
-  - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
-- Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.
-- `pyrightconfig.json` gives `scripts/herdr` an environment with `.` and the message, production and lib paths. It puts `scripts/herdr` in the production, message, shutdown and nightly review environments.
+Every Claude launch writes trust before starting Claude. The target account does not need an existing trust entry.
+
+- `trust_claude_launch(folder, config_dir)` calls the shared `_write_claude_trust` writer.
+  The writer sets `projects[key].hasTrustDialogAccepted` in the target account's `.claude.json`.
+  It holds `accounts.claude_config_lock` across the read and atomic replacement.
+  It preserves other settings and writes the file with private permissions.
+  `claude_config_file` selects the account file. The legacy home uses `~/.claude.json`; named accounts use their config directory.
+- `repository_trust_key(folder)` gives the exact repository key from `git rev-parse --git-common-dir`.
+  A folder outside Git uses its own resolved path.
+  The Git call removes inherited `GIT_*` overrides and disables global and system configuration.
+- `launch_agent`, `restart.start_row`, `add_unit`, and `add_showrunner` use `launch_prepared_agent` for the trust write.
+  The direct `stop_resume` path calls the same trust helper before running its pane command.
+  Preflight does not refuse a folder because the account lacks trust.
+- A failed write returns the existing launch failure result and starts no Claude process.
+  One anomaly line names the folder, account file, and error.
+  The line excludes account settings and file contents.
+- `claude_trust` remains a reader with `Trusted`, `Untrusted`, and `UnreadableTrustFile` results.
+  `copy_claude_trust` retains its source-account behavior and uses the same JSON writer.
 
 ### Pane access
 
@@ -140,6 +151,20 @@ A Claude session started in a folder the account has not trusted stops at the tr
 The CLI takes `read|type|keys|where` and either `unit <showrunner name> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
 These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
+
+### Worker questions
+
+`worker.py assign` returns exit 4 when a worker asks a question or is blocked, including before dispatch submission.
+It prints `question: <worker> pane <pane>` and the pane's recent visible lines.
+Exit 6 means busy before submission.
+
+1. Read the question text after the `question:` line.
+2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
+3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
+
+The answer uses the existing herdr pane input path.
+The command refuses workers held by another parent.
+The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
 
 ### Matching a running session to its staff row
 
@@ -179,7 +204,7 @@ Exit codes are 0 for success, 1 for an absent unit, 2 for usage, and 3 for unava
 - The launcher uses the production workspace and the requested directory.
   `AgentExited` closes the new tab.
 
-Before starting the agent, add_unit saves its exact opening, conversation id, account directory and start time in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears this pending record only after prompt submission is proved. A rerun with that same marked conversation checks the live transcript and submits an absent opening to its existing pane, including a live `--resume` and a retry through `resume_unit`. A pending record for a closed conversation is removed; a different live conversation still refuses. It starts no second session. Brief stubs and unit configuration writes use the shared atomic writer.
+Before starting the agent, add_unit saves its exact opening, conversation id, account directory and start time in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears this pending record only after prompt submission is proved. A rerun with that same marked conversation checks the live transcript and submits an absent opening to its existing pane, including a live `--resume` and a retry through `agents resume NAME --retired`. A pending record for a closed conversation is removed; a different live conversation still refuses. It starts no second session. Brief stubs and unit configuration writes use the shared atomic writer.
 
 `add_unit.main` selects the account and runs preflight before it writes launch state.
 A running native session refuses a plain resume and names `--attach` as the next action.
@@ -193,7 +218,7 @@ A new unit waits for Remote Control readiness.
 The launcher prints the unit's attach hint after launch.
 `AgentNotReady` and other failures exit 1; a refusal exits 2.
 
-`--attach <id> --cwd <dir>` accepts a running session with `--plan`, `--standby` or `--permanent`. It checks the row, worktree, trust and source account, calls `stop_resume.stop`, and requires the old process to be gone. It then writes the unit, resumes the same conversation once with session labels, checks prompt submission, and proves one new registered pid. Unknown liveness or account, a surviving old process, or an ambiguous final process count refuses. Plain `--resume` refuses a running session and directs the caller to `--attach`.
+`--attach <id> --cwd <dir>` accepts a running session with `--plan`, `--standby` or `--permanent`. It checks the row, worktree and source account, calls `stop_resume.stop`, and requires the old process to be gone. It then writes the unit, resumes the same conversation once with session labels, checks prompt submission, and proves one new registered pid. Unknown liveness or account, a surviving old process, or an ambiguous final process count refuses. Plain `--resume` refuses a running session and directs the caller to `--attach`.
 
 **Lower showrunners.** `add_showrunner.launch` starts the selected model and effort through `herdr.launch_agent`.
 It uses the production workspace and selected account environment.
@@ -221,7 +246,7 @@ The command waits for the showrunner's registration before it attaches the child
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
   1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
-  2. Copy existing Claude folder trust from another account. An untrusted folder or unreadable trust file prints one anomaly line. The launch continues.
+  2. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
   5. Refuse a live agent in the recorded pane. A recorded pane left at its shell is closed; one running a command is left open, with a printed line, because the session resumes in a new tab.
@@ -280,7 +305,8 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 ## Invariants
 
 - Tests never start real herdr, Claude or Codex. They use `fake_herdr.py`, `fake_unit_host.py`, a fake `/proc` and fake session records, in temporary folders.
-- Nothing answers a trust, permission or question prompt. Launchers refuse an untrusted folder before any write or launch, and the refusal names the exact command that fixes it. `agent_not_ready` reports the screen and sends no key. New launchers call `claude_trust` and `accounts.trust_command`, not a check of their own.
+- Launchers write trust before starting Claude. They send no key to a trust, permission or question prompt.
+  `agent_not_ready` reports the screen and sends no key.
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
@@ -307,7 +333,7 @@ The resume message builder retains the launcher prompt path for restored workers
 - A non-empty `TMUX_PANE` means the process is never a herdr place.
 - Native session ids select staff rows for launch and restore names.
   The Stop hook keeps member titles consistent with their rows.
-  A unit name mismatch prints `/showrunner:rename_unit` and never changes staff.
+  A unit name mismatch prints `/agents rename` and never changes staff.
 - Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
 - Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
 - Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.
@@ -404,7 +430,7 @@ The resume message builder retains the launcher prompt path for restored workers
 
 - **One herdr session, one tab per Claude session (user, 2026-10-26).** One attach shows every session, with one workspace per production. `attach <tab>` and `attach-remote` focus the named tab first, so an attach still opens the session the user names. A tab has its session's name, so `list` and attach lines need no lookup table. A stop closes one tab and changes nothing else in the session.
 - **Codex workers stay headless.** App-server threads ask for no trust and already report through the worker ledger. Only Claude sessions, which the user watches, need a terminal.
-- **Trust is checked, never answered.** Answering grants trust the user never gave. Sending a prompt into a trust screen waits forever. A refusal with one paste line costs the user one prompt, once per repository.
+- **Launches write trust.** The shared writer grants the exact repository key before Claude starts. A failed write prints one anomaly and prevents the start.
 - **Unique tab names.** A tab name is a session name, so two sessions must never share one. A taken `--name` refuses, and a generated name moves to the next suffix. Every launcher adopts the one shared server, so only the tab name must be unique.
 - **Socket ownership as identity.** Argv and `HERDR_SESSION` both mislead (attach-started servers, inherited variables). The process holding the listening socket cannot.
 - **Resume from our own ids.** Shutdown records and pane launch entries already hold session ids, accounts and cwds. herdr's Claude integration would add hooks to every session to learn the same thing.

@@ -61,14 +61,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import recorder_state  # noqa: E402
 
 PHASES_DIR = "phases"
@@ -889,7 +886,12 @@ def _claim_command(args: argparse.Namespace) -> int:
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
-    root = repository_root(Path(cast(str, args.repo)))
+    requested = Path(cast(str, args.repo))
+    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+        recorded = phase_worktree(directory).root
+        if recorded.is_dir():
+            requested = recorded
+    root = repository_root(requested)
     if root is None:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0

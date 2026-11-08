@@ -1,13 +1,9 @@
 """Read the showrunner reporting tree from one staff snapshot."""
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff
 from scripts.production import showrunners
 

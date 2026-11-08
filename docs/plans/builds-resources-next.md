@@ -14,13 +14,14 @@
   - Completion condition: on or after 2026-12-05 the reader and the file are deleted, `sweep.py rebuilds` reads only the journal and the build-log rows, and `test_sweep.py` passes.
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
-- [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after both Phase 39 checkpoints reach main and seven days exist within one unchanged policy and configuration span. Calibrate the deployed model first. Stop comparison if calibration fails.
-  - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
-  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
-  - Use the shipped `head_policy` for the deployed baseline. Add any alternate analysis rule explicitly; Phase 20 provides no alternate rule argument.
+- [ ] **Measure EASY backfill against the deployed captured-room rule**
+  - Start after deployment of the current rule and seven days within one unchanged policy and configuration span.
+  - Calibrate the deployed model first. Stop comparison if calibration fails.
+  - Bound the cohort at changes to priority, head policy, estimation, memory charges, slots, spacing, safety settings or headroom.
+  - Use the shipped `head_policy` and `admission_walk` for the baseline.
+  - Include head protection, continuation slots, the starts-alone exception and start spacing.
   - Report additional wait savings and head delay.
-  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
+  - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
 - [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
   - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
@@ -28,11 +29,11 @@
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
 - [ ] **Match trims against each step's recorded Cargo output roots**
-  - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/lint/build_shape.py`, and their tests.
-  - Dependency: Phase 62's shared root types and recorded-root safety rules.
+  - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
+  - Dependency: Phase 64's shared root decoding and row facts, with Phase 62's recorded-root safety rules.
   - Why needed: `_rebuild_causes()` still matches trims through saved workspace mappings.
   - Completion condition: retain each attempt's identity and root pair in the existing locked-row reader.
-  - Reuse the shared root decoding. Never infer an attempt's roots from the workspace aggregate returned by `recorded_output_roots`.
+  - Reuse root decoding from `step_outputs.py` while retaining attempt identity in the existing locked-row reader. Do not use host-wide distinct rows or saved workspace mappings as attempt evidence.
   - Keep unknown, relative, and override-affected roots explicit. Do not attribute a trim through an uncertain root.
   - Keep the `store.locked_rows` reads; do not create or refresh the index during rebuild reporting.
   - Test removed copies, changed mappings, repeated attempts with different roots, unknown roots, relative roots, overrides, and a missing index.
@@ -47,12 +48,52 @@
 
 - [ ] **A stopped sweep plan ends with one line, and a plan run prints a short summary**
   - Target: `scripts/lint/tmp_sweep.py` (`--plan`), its tests
-  - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback, and a plan run prints 79,530 lines, so the plan cannot be read on screen
+  - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback. `write_cleanup_plan()` prints every entry. Phase 72 changed the kept entries; the current output line count is not measured.
   - Completion condition: Ctrl-C ends with one line and exit 130; a plan run prints a short summary (counts and bytes per group) and the path of the full plan file; a test pins both
   - Revealed by: builds C617 (builds showrunner 2026-10-30: next)
 
-- [ ] **The user's typed queue bump works from any pane**
-  - Target: `mods/unit-board/hooks/register.tsx`, `mods/unit-board/tests/queue.test.ts`, the shared queue-priority writer and its tests, and `commands/build/queue.md`.
-  - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
-  - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
+- [ ] **The user's typed queue bump accepts a unit name**
+  - Target: `scripts/build_queue/build_queue.py`, its selector and tests, `mods/unit-board/tests/queue.test.ts`, and `commands/build/queue.md`.
+  - Completion condition: `/build:queue bump <unit>` selects that unit's waiting step and sets or replaces priority through the existing writer.
+  - Test a unit name that differs from every session label and folder name.
+  - Preserve position, session and folder selectors.
+  - Preserve access from any pane and the current direct-command behavior.
+  - Test unit selection from a non-showrunner pane and replacement of existing priority.
+  - Revealed by: Phase 26; narrowed after the existing pane route and writer tests satisfied the access requirement.
 
+- [ ] **Mac claims and releases read session ownership without importing the build queue**
+  - Target: `scripts/build_hold/build_hold.py`, a new `scripts/build_hold/session_owner.py`, `scripts/mac_test/mac_test.py` (:31), and their tests.
+  - Why needed: six modules import `build_hold` at module level, and each one loads the build queue modules that only `admitted_processes()` uses.
+  - Measured (natest): `build_hold.py:43` imports `admission_service` at once, 126-132 ms on each `mac_test.py` claim and release.
+  - Design (builds showrunner 2026-11-05): move `owning_session()`, `OwningSession` and `NoOwningSession` into `scripts/build_hold/session_owner.py`, which imports only `os` and `unit_runs`.
+    `build_hold.py` imports the three from it, so its callers keep their names. Change `mac_test.py:31` to import the light module (one owner switches all callers; the showrunner settles that edit in verify's file).
+  - Completion condition: a fresh-interpreter test shows that importing `session_owner` loads no build queue module; `mac_test.py` claim and release are measured before and after (126-132 ms of `admission_service` import today).
+  - Start: when natedev says the send.py freeze on `build_hold.py` ends (the showrunner tells us).
+  - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
+
+- [ ] **One owner for Cargo target detection in scripts/lib/cargo_output.py** (after the held 63-64 hash lands)
+  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`) and their tests.
+  - Why needed: `memory.py` loads the whole sweeper to ask whether a folder is Cargo output, and the sweeper imports buildlog modules back. One owner in `scripts/lib` removes that cycle.
+  - Completion condition: no copy of the detection is left in `sweep.py`; `memory.py` imports it at the top and drops its run-time `import sweep`. This replaces the Phase 67 import rule for `memory.py`. The change reports `memory.py` import time before and after, and the sweep, memory, disk and offload tests pass.
+  - Revealed by: Phase 70 simplify review F008 (builds showrunner 2026-11-05: next; run after the held 63-64 hash lands, so `sweep.py` changes in one place at a time)
+
+- [ ] **Measure the ANON_SHARE estimate share again after the legacy rows expire** (on or after 2026-11-12)
+  - Target: repeat the Phase 19 lifecycle measurement and `expected_peak` replay on a copy of natedev state.
+  - Update `#### Phase 19 source shares` in `docs/as-built/build-memory-admission.md`.
+  - Report retained coverage and shares by step kind. Keep recorded admissions separate from reconstructed estimates.
+  - Phase 19 measured 10/4,267 reconstructed estimates using `ANON_SHARE`, excluding caps. Recorded admissions covered only 16.30 hours.
+  - If the reconstructed share excluding caps reaches 5%, create a self-contained Work Order for the measured remaining matching gaps.
+  - Require replay evidence before narrowing or removing indexed tiers.
+  - Preserve same-shape build rules, compile selection, the single history decode and bounded evidence queries.
+  - Preserve historical `buildlog` decoding and unknown source text through semantic source types.
+  - Revealed by: Phase 19; the showrunner defined "small" as under 5% of estimates.
+- [ ] **The folder audit names the maker of a folder made by mktemp**
+  - Target: `scripts/lint/folder_audit.py` `makers()` and the guard's `creation_targets()`.
+  - Today a `mktemp -d` target resolves to its template path with `X`s, so the folder prints `maker unknown`.
+  - Prove the folder by a template match (same parent, same fixed part, same count of random characters) or by pairing the command with its tool result path.
+  - Keep the exact-path proof rule for every other command. Add no second command parser.
+  - Revealed by: Phase 79; the builds showrunner placed it in next items on 2026-11-07.
+
+## Dropped
+
+- **The floor pass keeps an existing hana `target/external-client`** — dropped by the builds showrunner 2026-11-05: the measured cause (fresh-clone CI points) is already gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout (Phase 73).

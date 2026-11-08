@@ -942,11 +942,12 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     """Build one gate record without changing the gate verdict."""
     try:
         slow_test_s = gate_record.slow_test_s()
-        modules = gate_record.module_runs([
+        recorded_executions = [
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
-                                  job.peak_mib, job.returncode, job.restart, job.times)
+                                  job.peak_mib, job.returncode, job.restart, job.times, job.output)
             for job in executions
-        ], slow_test_s)
+        ]
+        modules = gate_record.module_runs(recorded_executions, slow_test_s)
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": suite_finished.get(suite, began) - began,
              "status": int(any(job.returncode for job in results
@@ -971,7 +972,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     except Exception as error:
         gate_record.report_not_written(error)
         return
-    gate_record.write_gate_run(run)
+    gate_record.write_gate_run(run, recorded_executions)
 
 
 def python_shim(repo: Path) -> Path:
@@ -1894,14 +1895,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
-        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
+        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        with rollback_signals(), scratch.copy_lock(checkout):
             if args.nightly:
                 return nightly(args)
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)
                 if review_list is not None:
-                    record_changes(Path(args.repo).expanduser().resolve(), review_list, production, args.merge_branch)
+                    record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
             return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:

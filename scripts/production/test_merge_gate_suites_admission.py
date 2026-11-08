@@ -386,7 +386,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_legacy_gate_peak_does_not_change_the_next_first_need(self) -> None:
+    def test_measured_gate_peak_sets_the_next_claim(self) -> None:
         self.configure_gate("program_first_peak_gib.merge-gate=0.5")
         profiles: list[memory_admit.ProgramProfile] = []
         admit = client.admit
@@ -417,7 +417,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with mock.patch.object(client, "admit", side_effect=acquire):
             second = self.run_gate("--tests-only")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual((profiles[-1].peak.bytes, profiles[-1].peak.source), (512 * 1024 * 1024, "fallback"))
+        self.assertEqual((profiles[-1].peak.bytes, profiles[-1].peak.source), (123 * 1024 * 1024, "measured"))
         self.assert_gate_released()
 
     @gate_suites("lib", "hooks")

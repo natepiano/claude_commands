@@ -71,16 +71,25 @@ class CloudQueueViewTests(unittest.TestCase):
 
     def test_cloud_group_shows_slots_progress_size_elapsed_and_wait(self) -> None:
         model, _fixture = self.cloud_model()
-        text = plain(queue_view.render_view(model, 140))
-        self.assertIn("Cloud", text)
-        self.assertIn("1 of 1 slots", text)
-        for value in ("cloud-unit", "merge-gate", "running", "waiting-unit", "targeted-test", "32", "vCPUs"):
-            self.assertIn(value, text)
-        self.assertRegex(text, r"7(?: of |/)12")
-        self.assertIn("4 min", text)
-        self.assertIn("no update for 2 min", text)
-        self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
-        self.assertEqual(text + "\n", (GOLDEN / "cloud_view.txt").read_text())
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        expected = (GOLDEN / "cloud_view.txt").read_text()
+        for failures, failure_text in ((1, "1 failed module"), (2, "2 failed modules")):
+            with self.subTest(failures=failures):
+                current = replace(row, progress=replace(row.progress, failed_modules=failures))
+                model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn("Cloud", text)
+                self.assertIn("1 of 1 slots", text)
+                for value in ("cloud-unit", "merge-gate", "running", "waiting-unit", "targeted-test", "32", "vCPUs"):
+                    self.assertIn(value, text)
+                self.assertRegex(text, r"7(?: of |/)12")
+                self.assertIn("4 min", text)
+                self.assertIn("no update for 2 min", text)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
+                self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
 
     def test_missing_cloud_progress_has_a_named_display_state(self) -> None:
         model, _fixture = self.cloud_model()

@@ -725,6 +725,14 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
             checkout.mkdir()
             initialize_git(checkout, source.resolve())
             _ = git(checkout, "reset", "--hard", "--quiet")
+            from scripts.accounts import accounts
+
+            if accounts.source_has_claude_trust(source):
+                _ = scratch.update_record(path, lambda record: {
+                    **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                    "claude_trust_folder": str(checkout.resolve()),
+                }, scratch_settings=scratch_settings)
+                accounts.set_claude_folder_trust(checkout, trusted=True)
             source_commit = git(checkout, "rev-parse", "HEAD").decode().strip()
             _ = scratch.update_record(path, lambda record: {
                 **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -1427,16 +1435,14 @@ def inherited_mirror_descriptors() -> tuple[int, ...]:
 def mirror_probe_setup(path: str) -> str:
     """Create a marked probe copy through the registered remote kind."""
     program = "\n".join((
-        "from pathlib import Path",
         "import sys",
-        "sys.path.insert(0, str(Path.home() / '.claude'))",
         "from scripts.copies import copies",
         "copies.probe_remote_folder(sys.argv[1])",
     ))
     relative = path.removeprefix("~/")
     mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
     shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
-    return ("test -f " + shell_mark + " || python3 -c " + shlex.quote(program) + " " +
+    return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
             shlex.quote(path) + " || exit 1")
 
 
@@ -1633,8 +1639,12 @@ def mirror_remove(args: CopyArguments) -> int:
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
             if tree.exists():
                 write_text_atomic(authority, json.dumps(raw) + "\n")
-                clear_mirror_content(tree)
-                tree.rmdir()
+                task_record = copy_record.record_path(tree)
+                if task_record is not None and task_record.parent != tree:
+                    scratch.remove_marked(task_record.parent, scratch.remove)
+                else:
+                    clear_mirror_content(tree)
+                    tree.rmdir()
             authority.unlink(missing_ok=True)
     return 0
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import statistics
-import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -16,7 +15,6 @@ from typing import Literal, TypedDict, cast
 
 from scripts.model_study.stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
 from scripts.model_study.turns import Compaction, Turn
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 OPUS = "claude-opus-5-5"

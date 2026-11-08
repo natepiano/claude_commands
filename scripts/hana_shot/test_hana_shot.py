@@ -459,6 +459,25 @@ def face_transforms() -> dict[str, list[float]]:
     }
 
 
+class ByPathImportTests(unittest.TestCase):
+    def test_help_prepares_the_recorder_import_from_an_unrelated_folder(self) -> None:
+        source = """import runpy, sys
+sys.argv = [sys.argv[1], "--help"]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+except SystemExit as error:
+    if error.code:
+        raise
+import scripts.buildlog.record
+"""
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.resolve())],
+                                    cwd=folder, env=environment, capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class FaceAngleTests(BuildLogIsolatedTest):
     def test_all_local_axes_round_trip_through_hana_camera_offset(self) -> None:
         for label, matrix in face_transforms().items():

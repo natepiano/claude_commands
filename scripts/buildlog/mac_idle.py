@@ -269,6 +269,11 @@ def session_is_live(call: VerifyCall, paths: MacIdlePaths, live: dict[int, LiveP
 class OutageMessage:
     since: int
     now: float
+    key: str
+
+
+def outage_key(saved: mac_idle_alert.SavedAlert) -> str:
+    return f"mac-idle-showrunner-{int(saved['since'])}-{int(saved['changed'])}"
 
 
 class RepairMessage:
@@ -303,7 +308,7 @@ def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = RE
         command = session_send.send_argv("--to", address, "--from", "Mac idle watch", "--text", text)
         if isinstance(identity, OutageMessage):
             window = outage_repeat_minutes(identity.since, identity.now, mac_idle_alert.read_idle_config())
-            command.extend(["--key", f"mac-idle-showrunner-{identity.since}", "--repeat-minutes", str(window),
+            command.extend(["--key", identity.key, "--repeat-minutes", str(window),
                             "--recipient-key", "showrunner:builds"])
         sent = subprocess.run(command, capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
         if sent.returncode != push_texts.SEND_RETRY_EXIT and sent.returncode in (0, 1):
@@ -337,6 +342,7 @@ class IdleReservation:
     holder: str
     detail: str
     delivery: mac_test.MessageDelivery
+    claims: tuple[mac_test.HeldClaim, ...] = ()
 
 
 IdleMac = FreeMac | IdleReservation
@@ -357,16 +363,12 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
     from scripts.mac_test import mac_test
 
     try:
-        # read_run is the single JSON boundary for claim records.
-        try:
-            claim_paths = sorted((paths.mac_state / "claims").iterdir())
-        except FileNotFoundError:
-            claim_paths = []
-        claims = tuple(claim for path in claim_paths if path.suffix == ".json"
-                       if not isinstance(claim := mac_test.read_run(path), mac_test.NoRun))
+        if (paths.mac_state / "run.json").exists():
+            return NatedevJobOnMac()
+        live = tuple(claim for claim in mac_test.read_claims(mac_test.StatePaths(paths.mac_state))
+                     if mac_test.run_is_live(claim.record))
         block = mac_test.read_block(paths.mac_state / "block.json")
-        live = tuple(claim for claim in claims if mac_test.run_is_live(claim))
-        if (paths.mac_state / "run.json").exists() or any("work_idle_since" not in claim for claim in live):
+        if any("work_idle_since" not in claim.record for claim in live):
             return NatedevJobOnMac()
         try:
             until = float((paths.mac_state / "unreachable_until").read_text())
@@ -377,12 +379,12 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
         if until > now:
             return MacUnreachable(until)
         if not isinstance(block, mac_test.NoMacBlock):
-            return IdleReservation("blocked", block.holder, block.reason, block.delivery)
+            return IdleReservation("blocked", block.holder, block.reason, block.delivery, live)
         if live:
-            claim = live[0]
+            claim = live[0].record
             holder = claim.get("holder_session", "")
             delivery = mac_test.RecordedSession(holder, holder) if holder else mac_test.HolderQueue("unknown")
-            return IdleReservation("claim_idle", holder, claim["what"], delivery)
+            return IdleReservation("claim_idle", holder, claim["what"], delivery, live)
         return FreeMac()
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))
@@ -399,7 +401,7 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
         f"\nRepo {mac_idle_alert.display_field(call.repo)}; {call.kind} "
         + f"{mac_idle_alert.display_field(call.package)}; pid {call.pid}; "
         + f"wait {call.local_reason or _waiting_evidence(call, live, waiters)}" for call in calls)
-    return notify_showrunner(text, identity=OutageMessage(int(saved["since"]), now))
+    return notify_showrunner(text, identity=OutageMessage(int(saved["since"]), now, outage_key(saved)))
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
@@ -491,9 +493,10 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
         settings = mac_idle_alert.read_idle_config()
         calls = calls_past_wait_limit(paths, calls, now, settings.alert_seconds)
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")
-        saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0,
+        saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0, "changed": 0.0,
             "waiting": len(calls), "cause": "", "holder": "", "detail": "", "until": 0.0,
             "messaged": False, "pushed": False}
+        kept: mac_idle_alert.SavedAlert | None = None
         if isinstance(reading, NatedevJobOnMac):
             idle_file.unlink(missing_ok=True)
         else:
@@ -502,15 +505,16 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
             since = float(cast(float, since)) if mac_idle_alert.nonnegative_time(since) else now
             if since > now:
                 since = now
-            try:
-                since = max(since, min(now, (paths.mac_state / "claims").stat().st_mtime))
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass  # mac_work already reports an unreadable claims directory.
+            if isinstance(reading, IdleReservation):
+                latest_idle = since
+                for claim in reading.claims:
+                    if mac_test.aware_timestamp(claim.record["since"], claim.path, "since").timestamp() < since:
+                        work_idle_since = mac_test.aware_timestamp(
+                            claim.record.get("work_idle_since"), claim.path, "work_idle_since").timestamp()
+                        latest_idle = max(latest_idle, min(now, work_idle_since))
+                since = latest_idle
+            kept = previous if isinstance(previous, dict) and int(previous["since"]) == int(since) else None
             saved["since"] = since
-            if isinstance(previous, dict) and int(previous["since"]) == int(since):
-                saved["messaged"], saved["pushed"] = previous["messaged"], previous["pushed"]
             if isinstance(reading, MacStateUnreadable):
                 saved["state"], saved["detail"] = "unreadable", reading.reason
             elif isinstance(reading, MacUnreachable):
@@ -524,9 +528,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                     saved["cause"], saved["detail"] = reading.cause, reading.detail
                     owner = {"holder": reading.holder,
                              "session": reading.delivery.name if isinstance(reading.delivery, mac_test.RecordedSession) else None}
-                    if (isinstance(previous, dict) and int(previous["since"]) == int(since)
-                            and previous["cause"] == reading.cause and idle.get("owner") == owner):
-                        saved["holder"] = previous["holder"]
+                    if kept is not None and kept["cause"] == reading.cause and idle.get("owner") == owner:
+                        saved["holder"] = kept["holder"]
                     else:
                         labels = (unit_labels_for([reading.delivery.name], os.environ)
                                   if isinstance(reading.delivery, mac_test.RecordedSession) else {})
@@ -537,6 +540,13 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
             if saved["cause"] == "free":
                 saved["cause"] = "disk"
             saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
+        saved["changed"] = saved["since"]
+        if kept is not None:
+            saved["pushed"] = kept["pushed"]
+            saved["changed"] = (kept["changed"]
+                                if (kept["cause"], kept["holder"]) == (saved["cause"], saved["holder"]) else now)
+            if outage_key(kept) == outage_key(saved):
+                saved["messaged"] = kept["messaged"]
         write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds or not calls:
             return

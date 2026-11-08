@@ -33,6 +33,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record, write_mesh_server_record
+from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
@@ -373,8 +374,10 @@ class DurableRolesTests(HeldRolePaneCase):
         def native_start(identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
             label = str(self.panes.world.locations[pane]["label"])
             role: Role = "reviewer" if "reviewer" in label else "designer"
-            if label.startswith("astra-"):
-                existing = staff.snapshot().by_current_session(identity)
+            membership = staff.snapshot()
+            if any(label.startswith(worker_panes.agent_name(owner, "astra-"))
+                   for owner in membership.rows if owner.kind in ("unit", "showrunner")):
+                existing = membership.by_current_session(identity)
                 if existing is None:
                     identity = fixture_runtime_id("astra-" + role if not any(
                         item[0] == role for item in self.launches) else label)

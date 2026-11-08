@@ -5,16 +5,14 @@ from __future__ import annotations
 import json
 import os
 import stat
-import sys
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import rename_state
+from scripts.production import rename_state
 from scripts.lib import atomic_file
 
 

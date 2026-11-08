@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,7 +13,6 @@ from typing import TypedDict, cast
 from scripts.model_study.compare import CLASSES, ComparisonReport, DirectorComparison, DifferenceEstimate, TurnClassStatistics
 from scripts.model_study.phases import PhaseComparison, PhaseReport, PhaseRow
 from scripts.model_study.turns import RECORDED_ZONE
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 # The deadline was set as a Pacific wall time. It is shown in the user's zone.

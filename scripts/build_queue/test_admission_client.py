@@ -48,6 +48,33 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_history_generation_reads_current_configuration_at_use(self) -> None:
+        with AdmissionFixture() as fixture:
+            transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))
+            with mock.patch.object(records, "read_memory_config", wraps=records.read_memory_config) as read:
+                generation = client.build_history_generation(client.READ_CONFIGURATION_AT_USE)
+            self.assertEqual(generation, gate.BuildHistoryGeneration(7))
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
+            read.assert_called_once()
+
+    def test_history_generation_uses_supplied_configuration_without_another_read(self) -> None:
+        with AdmissionFixture() as fixture:
+            configuration = gate.read_memory_config()
+            transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(8))))
+            with mock.patch.object(records, "read_memory_config", side_effect=AssertionError("supplied configuration was not used")):
+                generation = client.build_history_generation(configuration)
+            self.assertEqual(generation, gate.BuildHistoryGeneration(8))
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
+
+    def test_history_generation_refuses_an_unusable_current_configuration(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", silence_seconds="invalid")
+            with redirect_stderr(io.StringIO()), self.assertRaises(client.CheckerFailure) as error:
+                _ = client.build_history_generation(client.READ_CONFIGURATION_AT_USE)
+            self.assertIn("silence_seconds", str(error.exception))
+
     def test_cloud_admit_uses_the_private_service_and_releases_its_slot(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -73,6 +100,7 @@ class ClientTests(unittest.TestCase):
             for sent in transport.requests:
                 assert isinstance(sent, wire.AdmitRequest)
                 self.assertEqual(sent.place, wire.CloudPlace("aws"))
+
     def test_import_does_not_load_memory_admission(self) -> None:
         result = subprocess.run([sys.executable, "-c",
             "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],

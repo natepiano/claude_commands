@@ -1376,7 +1376,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = ()) -> Roster:
-    """Use reported Codex threads to address interactive panes."""
+    """Use the reported session or the pane process to address Codex."""
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
@@ -1407,8 +1407,15 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 continue
             pane = agent["pane_id"]
             report = agent["agent_session"]
-            thread = (CodexThread(report.session_id) if isinstance(report, herdr.ReportedAgentSession)
-                      else NoCodexThread())
+            thread: CodexThread | NoCodexThread = NoCodexThread()
+            if isinstance(report, herdr.ReportedAgentSession):
+                thread = CodexThread(report.session_id)
+            else:
+                try:
+                    thread = CodexThread(herdr.Herdr(name).native_pane_process(
+                        pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
+                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                    pass
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
                 continue

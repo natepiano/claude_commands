@@ -15,7 +15,7 @@ import sys
 from collections.abc import Mapping
 from typing import TypedDict, cast
 
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff
 from scripts.shutdown import pane_record
@@ -79,9 +79,11 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     row = record.by_current_session(session_id)
     if row is not None:
         if row.kind == "unit" and name and name != row.name:
-            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename.", file=sys.stderr)
+            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /agents rename.", file=sys.stderr)
         client = herdr.Herdr(shared)
-        return client.retitle(pane, row.name, tab=row.kind != "worker")
+        title = (worker_panes.agent_name(record.rows_by_id[cast(staff.ReportsTo, row.parent).id], row.name)
+                 if row.kind == "worker" else row.name)
+        return client.retitle(pane, title, tab=row.kind != "worker")
     if _clear_handoff_pending(session_id, shared, pane, record):
         print(f"herdr title: no staff row for current session {session_id}.", file=sys.stderr)
     if not name:
