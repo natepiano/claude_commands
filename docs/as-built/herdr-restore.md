@@ -43,6 +43,7 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   `agent_session` only when the pane has one.
 - `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
   It resumes staff rows through `restart.start_row`.
+  For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.
   It resumes saved panes without staff rows through `herdr.launch_agent`.
   A pane without a saved entry or a staff row stays open.
 - Restore keeps live conversations. Unknown conversation evidence prints one anomaly line and permits a guarded launch.

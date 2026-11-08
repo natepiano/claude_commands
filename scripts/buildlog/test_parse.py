@@ -309,13 +309,15 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         source = """\
 import json
 from pathlib import Path
+import os
 import runpy
 import sys
 
-mode, script, arguments = sys.argv[1:]
+mode, script, checkout, arguments = sys.argv[1:]
 path = Path(script)
 arguments = json.loads(arguments)
 if mode == "script":
+    os.chdir(checkout)
     sys.argv = [script, *arguments]
     try:
         runpy.run_path(script, run_name="__main__")
@@ -323,6 +325,7 @@ if mode == "script":
         assert result.code == 0, result.code
 else:
     from scripts.buildlog import record
+    os.chdir(checkout)
     assert record.main(arguments) == 0
 conf_path = path.parents[1] / "lib/conf.py"
 modules = {name: module for name, module in sys.modules.copy().items()
@@ -336,8 +339,8 @@ assert len({id(module) for module in modules.values()}) == 1, list(modules)
                 arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
                              "0", str(handoff), "", *record_tests.NEXTEST]
                 result = subprocess.run(
-                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
-                    cwd=self.fixture.repo, env=self.fixture.environment(), capture_output=True, text=True,
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, mode, str(record_tests.SCRIPT), str(self.fixture.repo), json.dumps(arguments)],
+                    cwd=Path(__file__).resolve().parents[2], env=self.fixture.environment(), capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

@@ -1099,7 +1099,7 @@ class FastTrackTests(MergeCheckpointFixture):
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
                       "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/production/rename.py",
+                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",

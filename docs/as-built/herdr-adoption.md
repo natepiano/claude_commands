@@ -152,6 +152,20 @@ The CLI takes `read|type|keys|where` and either `unit <showrunner name> <unit>` 
 
 These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
+### Worker questions
+
+`worker.py assign` returns exit 4 when a worker asks a question or is blocked, including before dispatch submission.
+It prints `question: <worker> pane <pane>` and the pane's recent visible lines.
+Exit 6 means busy before submission.
+
+1. Read the question text after the `question:` line.
+2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
+3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
+
+The answer uses the existing herdr pane input path.
+The command refuses workers held by another parent.
+The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
+
 ### Matching a running session to its staff row
 
 `unit_lookup.py` reads process evidence through herdr.
@@ -319,7 +333,7 @@ The resume message builder retains the launcher prompt path for restored workers
 - A non-empty `TMUX_PANE` means the process is never a herdr place.
 - Native session ids select staff rows for launch and restore names.
   The Stop hook keeps member titles consistent with their rows.
-  A unit name mismatch prints `/showrunner:rename_unit` and never changes staff.
+  A unit name mismatch prints `/agents rename` and never changes staff.
 - Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
 - Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
 - Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.

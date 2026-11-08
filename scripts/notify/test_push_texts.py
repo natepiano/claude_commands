@@ -147,6 +147,12 @@ class PushTextTests(unittest.TestCase):
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
 
+    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertIsInstance(push.action, ActionRequired)
+        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
+
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
@@ -405,32 +411,8 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(push.title, "natedev the /nate skill is ready")
         self.assertEqual(push.message, "It is ready now.")
 
-    def test_vault_stopped_text_names_the_cause_and_the_safe_fix_for_each_outage(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "vault.stopped")
-        fixes = {
-            "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.":
-                "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs.",
-            "~/rust/hanadocs on the Mac is not on the main branch.":
-                "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch.",
-            "The Mac copy has commits that GitHub does not have, so a safe update is not possible.":
-                "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub.",
-            "An update would replace a file on the Mac that git does not track.":
-                "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name.",
-            "natedev could not reach the Mac for more than 24 hours.":
-                "Wake the Mac and connect it to the network.",
-            "The update failed with an error the job does not know.":
-                "In the Claude session named natedev, ask it to read the vault update error in the hourly log.",
-        }
-        self.assertEqual({example.values["reason"] for example in entry.examples}, set(fixes))
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                push = push_texts.render_entry(entry, example.values)
-                self.assertEqual(push.title, "Mac vault copy is not updating")
-                self.assertIn(example.values["reason"], push.body)
-                self.assertIn("It tries again each hour", push.body)
-                self.assertIsInstance(push.action, ActionRequired)
-                self.assertTrue(push.message.startswith("Action: "))
-                self.assertEqual(push.message.splitlines()[0], "Action: " + fixes[example.values["reason"]])
+    def test_vault_stops_have_no_phone_template(self) -> None:
+        self.assertNotIn("vault.stopped", {entry.id for entry in push_texts.catalog()})
 
     def test_auto_mode_refusal_says_what_happened_and_what_to_type(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")

@@ -57,6 +57,7 @@ class SavedAlert(TypedDict):
     written: float
     state: Literal["busy", "idle", "unreachable", "unreadable"]
     since: float
+    changed: float
     waiting: int
     cause: Literal["blocked", "claim_idle", "free", "disk", ""]
     holder: str
@@ -89,7 +90,7 @@ def read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert:
     row = cast(dict[str, object], raw)
     if type(row.get("version")) is not int or row["version"] != 1:
         return UnreadableAlert("invalid version")
-    for field in ("written", "since", "until"):
+    for field in ("written", "since", "changed", "until"):
         if not nonnegative_time(row.get(field)):
             return UnreadableAlert(f"invalid {field}")
     if row.get("state") not in ("busy", "idle", "unreachable", "unreadable"):

@@ -1828,3 +1828,60 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Ruled out:**
 - A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.
+
+### Phase 81 — A Mac test build never links stale objects from an old build  · status: todo
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 ("a Mac build fault from hana, as your next phase now").
+
+#### Work Order
+
+**Goal:** find why Mac test builds of hana failed to link with undefined ThinLTO-promoted symbols, and fix the cause in the build tooling. No `incremental = false`, and no other workaround.
+
+**Measured (demo via hana, 2026-11-07 23:59 to 2026-11-08 01:18 EST):** three Mac runs failed the same way. Log on natedev: `/tmp/claude/unit/11db7b37-3b59-4a18-a50c-f71ae8c8b561/evidence/mac-link-undefined-llvm-symbols.log`.
+1. The command was `verify.sh test hana_catalyst`. verify.sh ran on natedev and sent a copy to the Mac mirror `/Users/natemccoy/.local/state/mac-test/mirror/hana` (`mac_test: running a copy on the Mac while natedev compiles`).
+2. The linker printed `Undefined symbols for architecture arm64`. The missing names have `.llvm.<hash>` suffixes: `World::get_resource::<CascadeCombine<hana_diegetic::render::HairlineFade>>`, referred from `hana_diegetic::panel::lifecycle::prepare_cascade_seed::<HairlineFade>` in `libhana_diegetic-46693889639531b7.rlib`, and `_anon.07f7ce924af2bea6e273f39da1024b91.146` to `.150`.
+3. `incremental = false` in `[profile.dev]` made the run pass. demo reverted that change.
+
+**Spec:**
+1. Find the cause first, with read-only commands only. Write the report to `phases/81/mac_link_report.md` in the run folder. Change no Mac setting and start no Mac test for measurement.
+   - Read the log. Find which target folder, profile and toolchain the Mac build used, and what the offload copies or removes in it.
+   - Check each candidate and give its evidence: stale incremental objects in the Mac target; a partial target removal by the Mac post-run cleanup (Phase 75) or the floor sweep (Phase 78) while a build used the target; two toolchains or two builds that share one target folder at the same time; a copy of build output from natedev into the Mac target.
+   - Give one line for each proven cause with its evidence. Say which candidates you ruled out and how.
+2. Fix the proven cause where it lives in the build tooling, so a Mac build never links objects that a different or interrupted build left. If the cause lives in verify.sh or the offload and another unit owns that code, name the owner in the report and post blocked.
+3. Add a test that fails without the fix and passes with it.
+4. Update the as-built doc that describes the changed tooling.
+
+**Files:**
+- `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
+- `scripts/mac_test/floor_claims.py` — the floor claims, when the cause is there.
+- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/test_floor_sweep.py`, `scripts/mac_test/test_offload.py` — the regression test.
+- `docs/as-built/build-memory-admission.md` — the changed rule.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the report, the source files and the as-built doc, and runs the final suites.
+- `test` owns the test files.
+
+**Acceptance gate:**
+- The report names each proven cause with its evidence, or states that no cause could be proven and what was ruled out.
+- The regression test fails before the fix and passes after it.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+
+### Phase 82 — The Mac keeps its disk floor without waiting for a test run  · status: done
+**Approved:** builds showrunner, 2026-11-08. Checkpoint `ab051b13a`.
+
+#### As-built
+- nixos branch `resources-mac-floor` (`efdf8bfc1`, on nixos main `064af4a3c`) adds `modules/darwin/disk-floor.nix`: `nate.jobs.disk-floor` runs `sweep.py --floor-only --host mac` on the Mac every 120 s. It is the same command as the on-demand sweep in `offload.ensure_mac_disk_floor()`, so it takes the same mirror leases, both claim locks and the floor lock, and trims only the shortfall below `sweep_floor_gib` (150 GiB). The 100 GiB on-demand trigger is unchanged.
+- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep, folder-audit and codex-mesh-sweep kept every entry.
+- `docs/as-built/build-memory-admission.md` describes the Mac floor job.
+- The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
+- No Python change and no new test: the job calls an existing entry point.
+
+### Phase 83 — Memory admission holds a gate's tests back before the memory kill  · status: done
+**Approved:** builds showrunner, 2026-11-08. Closed as research with no code (builds, 2026-11-08: "Close Phase 83 as research with no code. Its report stays the evidence.").
+
+#### As-built
+- Report: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
+- earlyoom stopped hana `b2f5eb9641`'s gate nextest at 11:19:14, 11:19:28 and 11:19:51 UTC on 2026-11-08, with about 1.2 GiB available and no free swap. hana's nextest stayed inside its claim (8.6 GiB anonymous peak against 12.1 GiB).
+- A herdr merge gate that ran at the same time had a 4 GiB claim and a 26.4 GiB anonymous peak. Its first attempts of `test_verify_mac_memory_handoff.py` (27.0 GiB) and `test_verify_mac_local_release.py` (9.4 GiB) ran away; their retries passed at about 250 MiB. The builds slice also held up to 27 GiB of shmem that no reservation counts.
+- Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.

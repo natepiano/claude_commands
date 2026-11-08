@@ -17,17 +17,20 @@ import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from functools import partial
 from importlib import import_module
-from typing import Literal, cast, final
+from typing import TYPE_CHECKING, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
 from scripts.agents import worker_lifecycle
 from scripts.direct import recorder_state
+
+if TYPE_CHECKING:
+    from scripts.accounts import accounts
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName
@@ -308,6 +311,24 @@ def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
     return UncertainWorker(row, reason)
 
 
+def agent_name(owner: staff.StaffRow, name: str) -> str:
+    """Use the owner name to distinguish workers on the shared server."""
+    return f"{owner.name}-{name}"
+
+
+def rename_workers(owner: staff.StaffRow, client: herdr.Herdr) -> None:
+    """Rename worker panes before the owner name changes."""
+    record = staff.snapshot()
+    if not record.find(kind="worker", parent=owner.id):
+        return
+    for observed in _evidence(owner.id, record, client).states:
+        if isinstance(observed, (OpenWorker, StoppedWorker)):
+            name = agent_name(owner, observed.row.name)
+            if isinstance(observed, OpenWorker):
+                _ = client.run("agent", "rename", observed.pane, name)
+            _ = client.retitle(observed.pane, name, tab=False)
+
+
 def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
     """Read agent status for worker and freestanding displays."""
     return client.agents()
@@ -360,9 +381,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
             else:
                 states.append(OpenWorker(row, identity, terminal, statuses.get(identity, herdr.AgentStatus.UNKNOWN)))
             continue
-        labels = {row.name}
-        if isinstance(selection, SelectedWorkers) and parent_row is not None:
-            labels.add(f"{parent_row.name}-{row.name}")
+        labels = {row.name, agent_name(parent_row, row.name)} if parent_row else {row.name}
         labelled = [pane for pane in panes if pane.get("label") in labels
                     and _text(pane, "tab_id") in parent_tabs]
         related_unknown = [item for item in scan.unknown if any(
@@ -466,13 +485,33 @@ def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *
     return pane
 
 
-def worker_run(parent: staff.StaffRow, *,
+def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
+                         owner: staff.StaffRow, name: str) -> Mapping[str, object] | herdr.NoPane:
+    """Find the full worker label, or a retained short label."""
+    for label in (agent_name(owner, name), name):
+        pane = labelled_pane(panes, tab, label)
+        if not isinstance(pane, herdr.NoPane):
+            return pane
+    return herdr.NoPane(name)
+
+
+def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
+    """Use the worker's newest state pass, with the parent's run as the default."""
+    parent = member
+    if member.kind == "worker":
+        record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+        parent = record.parent_of(member) or member
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)
-    if runs:
-        return Path(runs[0])
-    return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
+    fallback = (Path(runs[0]) if runs else Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR")
+                else unit_runs.state_dir() / "staff" / "workers" / parent.id)
+    if member.kind == "worker":
+        candidates = dict.fromkeys((*(Path(run) for run in runs), fallback))
+        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run))]
+        if passes:
+            return max(passes, key=lambda item: _pass_started_at(item[1]))[0]
+    return fallback
 
 
 def _passes(run: Path) -> list[dict[str, object]]:
@@ -486,14 +525,17 @@ def _passes(run: Path) -> list[dict[str, object]]:
         for item in fields.values() if isinstance(item, dict)]
 
 
-def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
-    def started_at(item: dict[str, object]) -> float:
-        value = item.get("started_at")
-        return value if isinstance(value, (int, float)) else float("-inf")
+def _pass_started_at(item: dict[str, object]) -> float:
+    value = item.get("started_at")
+    return value if isinstance(value, (int, float)) else float("-inf")
 
+
+def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
     no_pass: dict[str, object] = {}
-    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
+    return max((item for item in reversed(_passes(run))
+                if item.get("worker_id") == row.id or item.get("worker_name") == row.name
+                or (not item.get("worker_id") and not item.get("worker_name") and item.get("team_slot") == row.name)),
+               key=_pass_started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
@@ -506,8 +548,29 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     return WorkerRoleUnavailable("dispatch role is unavailable")
 
 
+def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:
+    try:
+        backend = staff.backend(row)
+        if isinstance(backend, staff.BackendUnavailable):
+            return Kept("worker transcript backend is unavailable")
+        source = worker_admission.transcript_source(row, backend)
+        entries = list(worker_admission.transcript_entries(source, set()))
+        if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
+            return Kept("worker transcript has incomplete records")
+        messages = [entry for entry in entries if isinstance(entry, str) and entry]
+        if (not isinstance(dispatch, str) or not dispatch or not messages
+                or not messages[-1].startswith("assistant:\n")
+                or messages[-1].rstrip().splitlines()[-1] not in
+                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
+            return Kept("last turn does not end with the dispatch DONE line")
+    except (OSError, ValueError) as error:
+        return Kept(f"completion evidence is unavailable: {error}")
+    return CloseAllowed()
+
+
 def _idle_checks(row: staff.StaffRow, run: Path,
-                 lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+                 lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
+                 closing_turn: bool = False) -> CloseAllowed | Kept:
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
         path = _worker_lock_path(row.id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,7 +587,8 @@ def _idle_checks(row: staff.StaffRow, run: Path,
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     return Kept("dispatch lock is held")
-    if worker_pass(row, run).get("status") in ("active", "refused"):
+    passed = worker_pass(row, run)
+    if not closing_turn and passed.get("status") in ("active", "refused"):
         return Kept("launcher has not recorded a completed pass")
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
     if live_runs(run / "mesh_runs", row.name):
@@ -546,10 +610,9 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
-    directory = run.directory if isinstance(run, DispatchRun) else worker_run(parent)
-    idle = _idle_checks(worker.row, directory, lock)
-    if isinstance(idle, Kept) or isinstance(worker, StoppedWorker):
-        return idle
+    directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
+    if isinstance(worker, StoppedWorker):
+        return _idle_checks(worker.row, directory, lock)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
     passed = worker_pass(worker.row, directory)
@@ -559,25 +622,12 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         latest = progress_history.last_dispatch(worker.row.id)
         status, dispatch = ((latest.status, latest.instance_id)
                             if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
-    if status != "completed":
+    if status not in ("canceled", "completed", "active"):
         return Kept("launcher has not recorded a completed pass")
-    try:
-        backend = staff.backend(worker.row)
-        if isinstance(backend, staff.BackendUnavailable):
-            return Kept("worker transcript backend is unavailable")
-        source = worker_admission.transcript_source(worker.row, backend)
-        entries = list(worker_admission.transcript_entries(source, set()))
-        if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
-            return Kept("worker transcript has incomplete records")
-        messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        if (not isinstance(dispatch, str) or not dispatch or not messages
-                or not messages[-1].startswith("assistant:\n")
-                or messages[-1].rstrip().splitlines()[-1] not in
-                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
-            return Kept("last turn does not end with the dispatch DONE line")
-    except (OSError, ValueError) as error:
-        return Kept(f"completion evidence is unavailable: {error}")
-    return CloseAllowed()
+    completion = CloseAllowed() if status == "canceled" else _completed_turn(worker.row, dispatch)
+    if isinstance(completion, Kept):
+        return completion
+    return _idle_checks(worker.row, directory, lock, closing_turn=status == "active")
 
 
 def launch_policy(role: WorkerRole) -> LaunchPolicy:
@@ -638,11 +688,21 @@ def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str)
     return launch + _policy_arguments(policy)
 
 
-def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount,
+def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                          resume: bool) -> dict[str, str] | StartRefused:
     from scripts.accounts import accounts
     from scripts.whoami import account as account_reader, agent_accounts
     try:
+        if policy.settings.kind == "codex":
+            if isinstance(account, accounts.CodexWorkersAccount):
+                return {"CODEX_HOME": str(account.home)}
+        elif isinstance(account, accounts.NamedAccount):
+            return account_reader.named_account_environment(account.dir)
+        if isinstance(account, (accounts.CodexWorkersAccount, accounts.NamedAccount)):
+            family = "codex" if isinstance(account, accounts.CodexWorkersAccount) else "claude"
+            print(f"anomaly: {account.label}: account family {family} does not match the {policy.settings.kind} worker; "
+                  + "using the configured account", file=sys.stderr)
+            account = ConfiguredWorkerAccount.CURRENT
         if policy.settings.kind == "codex":
             selected = (agent_accounts.codex_account_home(account.label) if isinstance(account, DestinationWorkerAccount)
                         else accounts.role_account("workers"))
@@ -694,8 +754,9 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         return _uncertain(parent, "parent pane is unavailable or duplicated")
     parent_pane = parents[0]
     tab = _text(parent_pane, "tab_id")
+    label = agent_name(parent, name)
     try:
-        pane = labelled_pane(evidence.panes, tab, name)
+        pane = worker_labelled_pane(evidence.panes, tab, parent, name)
     except ValueError as error:
         return _uncertain(parent, str(error))
     if not isinstance(pane, herdr.NoPane):
@@ -709,7 +770,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     workers.update(_text(pane, "pane_id") for pane in evidence.panes
                    if _text(pane, "terminal_id") in evidence.layout_terminals and _text(pane, "tab_id") == tab)
     if not workers:
-        return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, name)
+        return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, label)
     layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
     nodes = [layout.get("root")]
     ordered: list[str] = []
@@ -722,11 +783,11 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
             nodes.extend((node.get("second"), node.get("first")))
     if not ordered:
         return _uncertain(parent, "worker panes are absent from the split tree")
-    return herdr.SplitPane(ordered[-1], "down", ratio, name)
+    return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
-                    account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
+                    account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: LaunchPolicy | None = None, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
@@ -739,7 +800,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
-    run = worker_run(owner, record=record, scanned=runs)
+    run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+    if existing is not None and worker_pass(existing, run).get("status") not in ("active", "refused"):
+        run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
@@ -792,7 +855,7 @@ def _codex_start_session(client: herdr.Herdr, pane: str, *,
 
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
-                  account: ConfiguredWorkerAccount | DestinationWorkerAccount,
+                  account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead) -> WorkerStart:
     started = time.monotonic()
@@ -815,7 +878,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         parents = evidence.scan.found.get(owner.id, [])
         tab = _text(parents[0], "tab_id") if len(parents) == 1 else ""
         try:
-            pane = labelled_pane(evidence.panes, tab, name.value) if tab else herdr.NoPane(name.value)
+            pane = worker_labelled_pane(evidence.panes, tab, owner, name.value) if tab else herdr.NoPane(name.value)
         except ValueError as error:
             return _uncertain(owner, str(error))
         if not isinstance(pane, herdr.NoPane):
@@ -851,7 +914,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
         if passed.get("status") in ("active", "refused") and passed.get("kind") != role:
-            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "active dispatch has another role")
+            if (passed.get("status") != "active" or not current.status.idle
+                    or isinstance(_completed_turn(current.row, passed.get("instance_id")), Kept)):
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "active dispatch has another role")
         matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
         if isinstance(matches, UncertainWorker):
             return matches
@@ -907,7 +972,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         launched = launch(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
+            int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
@@ -943,16 +1008,44 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
+def _close_target(observed: WorkerPane, evidence: PaneEvidence, parent: StaffId,
+                  client: herdr.Herdr) -> WorkerPane:
+    if not isinstance(observed, UncertainWorker) or observed.reason != "labelled recovery pane runs other work":
+        return observed
+    parents = evidence.scan.found.get(parent, [])
+    if len(parents) != 1:
+        return observed
+    pane = labelled_pane(evidence.panes, _text(parents[0], "tab_id"), observed.row.name)
+    if isinstance(pane, herdr.NoPane):
+        return observed
+    pane = dict(pane)
+    identity = client.native_session(_text(pane, "pane_id"), "codex", herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+    status = client.readiness(_text(pane, "pane_id"))["agent_status"]
+    return OpenWorker(replace(observed.row, current_session=staff.native_id(identity)),
+                      _text(pane, "pane_id"), _text(pane, "terminal_id"), status)
+
+
 def close(parent: StaffId, name: WorkerName, *,
           run: DispatchRun | HolderRun = HolderRun.CURRENT,
-          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
+          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+          interrupt: bool = False) -> Closed | Kept | UncertainWorker:
     record = staff.snapshot()
     row = worker_admission.find_worker(record, parent, name.value)
     if row is None:
         _layout(parent, _evidence(parent, record, _client()))
         return Closed()
+    if interrupt:
+        client = _client()
+        evidence = _evidence(parent, record, client)
+        observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
+        target = _close_target(observed, evidence, parent, client)
+        if isinstance(target, (UncertainWorker, ProcessUnknownWorker)):
+            return _uncertain(row, target.reason)
+        if isinstance(target, OpenWorker):
+            client.quit_agent(target.pane, target.terminal, str(target.row.current_session),
+                              conf.read("direct").number("PANE_AGENT_START_SECONDS"))
     with ExitStack() as operations:
-        held = operations.enter_context(worker_lock(parent, name)) if isinstance(lock, WorkerLockAtUse) else lock
+        held = operations.enter_context(worker_lock(parent, name, blocking=interrupt)) if isinstance(lock, WorkerLockAtUse) else lock
         if isinstance(held, Kept):
             return held
         if not held.active or held.parent != parent or held.name != name or not held.owns(row):
@@ -963,6 +1056,14 @@ def close(parent: StaffId, name: WorkerName, *,
             evidence = _evidence(parent, record, client)
             observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
             row = observed.row
+            recovered = isinstance(observed, UncertainWorker) and observed.reason == "labelled recovery pane runs other work"
+            if isinstance(observed, UncertainWorker) and recovered:
+                target = _close_target(observed, evidence, parent, client)
+                if not isinstance(target, OpenWorker):
+                    return observed
+                if not interrupt and not target.status.idle:
+                    return Kept(f"agent state is {target.status.value}")
+                observed = target
             if isinstance(observed, UncertainWorker):
                 return observed
             if isinstance(observed, ClosedWorker):
@@ -970,8 +1071,9 @@ def close(parent: StaffId, name: WorkerName, *,
                 _layout(parent, evidence)
                 return Closed()
             owner = record.parent_of(row)
-            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(owner), held)
-                        if isinstance(observed, ProcessUnknownWorker) and owner is not None
+            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(row, record=record), held,
+                                     closing_turn=interrupt or recovered)
+                        if (interrupt or recovered or isinstance(observed, ProcessUnknownWorker)) and owner is not None
                         else can_close(observed, run=run, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):
@@ -981,7 +1083,9 @@ def close(parent: StaffId, name: WorkerName, *,
                     seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
                 except conf.Unusable as error:
                     return Kept(str(error))
-                if not _stop_row(observed.row, client, deadline=time.monotonic() + seconds):
+                if recovered:
+                    client.quit_agent(observed.pane, observed.terminal, str(observed.row.current_session), seconds)
+                elif not _stop_row(observed.row, client, deadline=time.monotonic() + seconds):
                     return _uncertain(row, "agent stop is incomplete; pane retained")
             panes = client.panes()
             matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
@@ -1051,6 +1155,7 @@ class Arguments(argparse.Namespace):
     role: str = ""
     account: str = ""
     json: bool = False
+    interrupt: bool = False
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -1062,6 +1167,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = start.add_argument("--account", default="")
     end = commands.add_parser("close")
     _ = end.add_argument("name")
+    _ = end.add_argument("--interrupt", action="store_true")
     listing = commands.add_parser("list")
     _ = listing.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments, namespace=Arguments())
@@ -1083,7 +1189,7 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.OK
         name = WorkerName.parse(args.name)
         if args.command == "close":
-            return _result(close(owner.id, name))
+            return _result(close(owner.id, name, interrupt=args.interrupt))
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr.HerdrFailure) as error:
