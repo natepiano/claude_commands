@@ -1896,7 +1896,7 @@ The build queue shows each step by its configured name. `config/build_steps.conf
 **Gotchas:**
 - A shown name can hold a space. Row tests read table cells by header column, not by a whitespace split.
 
-### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: todo
+### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: done
 **Depends on:** none
 
 #### Work Order
