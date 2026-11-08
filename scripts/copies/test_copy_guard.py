@@ -290,7 +290,8 @@ class CopyGuardTests(unittest.TestCase):
         self.assertIn("copies.py run", refusal)
         self.assertIn("make_worktree.sh <path> <branch>", refusal)
         result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
-                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False)
+                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
+                                env={**os.environ, "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
         self.assertEqual(result.returncode, 0, result.stderr)
         branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
                                 text=True, capture_output=True, timeout=10, check=True).stdout.strip()

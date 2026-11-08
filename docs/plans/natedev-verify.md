@@ -1135,6 +1135,138 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_verify_token_reclaim.py` matches the exact command text in `start_token_renewer`. A change to that line must update the hook, or the test waits to its 600 s timeout.
 - Reproduce memory growth only in `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`.
 
+### Phase 41s — A worktree and its branch end when their work lands  · status: done
+
+**Depends on:** none.
+
+#### Work Order
+
+**Goal:** the production merge that lands a tree's work also removes that worktree and its branch, local and on origin, in the same run. No person, timer or cleanup command removes them.
+
+**Source:** the user, 2026-11-08, via builds: "i consider cleaning up a gross bug - you need to assign to verify that it needs to fix itself so that cleaning up is not necessary". Then: "make sure that whatever tool verify creates that it is part of the natural production process and not something that we use to 'cleanup' - our process should clean up after itself". Builds' ruling, same day: no separate cleanup tool, no sweep and no timer; the step that makes a worktree records its owner and its work, and the step that lands that work removes the worktree and branch. A tree whose work did not land stays, because it is live work.
+Cleanup analysis: 4 worktrees and 11 branches stayed after their work landed. Causes: (A) `make_worktree.sh` is one line, `git worktree add "$1" -b "$2"`, and records nothing, so no step knows when a tree's work ends. (B) Landing is not visible by ancestry: plan-only shrink commits follow the merged checkpoint, and remakes land the same content under new hashes. Backups: `~/.local/state/verify-cleanup-2026-11-08/`.
+
+**Spec:**
+1. New `scripts/worktree/worktrees.py`, a module with one CLI command, `make`. `make_worktree.sh <path> <branch>` keeps its two-argument form and calls `worktrees.py make`. There is no `end` or `sweep` command.
+2. `make <path> <branch>`: run `git worktree add <path> -b <branch>`, then write one record to `~/.local/state/worktrees/made/<sha256 of the absolute path>.json` (override `WORKTREES_STATE_DIR`). The record holds `version`, `path`, `branch`, `repo` (the main checkout's top folder), `base` (the commit the branch started at), `merge_branch`, `owner` and `made_at`.
+   - `owner` and `merge_branch`: find the caller's staff row with `session_staff` `member_by_folder(machine, <caller's worktree top>)`, then use its `merge_branch(row)`. With no row, or when `merge_branch` is `BranchUnreadable`, use the name in `refs/remotes/origin/HEAD` and set `owner` to `""`.
+   - A failed `git worktree add` writes no record.
+3. Landing rule, `landed(record) -> Landed | NotLanded(commits, paths)`, read against `origin/<merge_branch>` as the caller fetched it. A commit in `<merge_branch>..<branch>` counts as landed when one of these is true:
+   - `git cherry origin/<merge_branch> <branch>` marks it `-` (same patch under another hash);
+   - it is a merge commit;
+   - it changes only paths under `docs/plans/`. Plan files reach the unit's home branch through the plan copy, not the merge branch.
+   - Then check content. For every path the branch changed since `base` (`git diff --name-only <base> <branch>`), the content at `origin/<merge_branch>` must equal the content at the branch tip, or the merge branch must have changed that path after the branch's last commit date. Plan paths are excluded from this check.
+   - Any other commit, or a path that fails the content check, gives `NotLanded` with the commit hashes and paths.
+4. `end_landed(repo, merge_branch) -> list[Ended | Kept]`: for each record with that repo and merge branch, end the tree when its work landed; otherwise keep it with a reason.
+   - Keep: the tree has uncommitted changes (`git -C <path> status --porcelain` not empty); `NotLanded` (name the commits); a staff row holds the tree as its worktree (`member_by_folder` finds a row), because a live session works there.
+   - End: `git worktree remove <path>`, `git branch -D <branch>`, then `git push origin --delete <branch>` when `origin/<branch>` exists. Delete the record last.
+   - A missing tree, branch or remote branch is not an error, so the next merge finishes an end that stopped halfway.
+   - A failed git step keeps that record and gives `Kept` with the git error. `end_landed` never raises for one tree.
+5. The landing step calls it. In `scripts/production/merge_checkpoint.py`, after the merge branch push reports `ok`, call `end_landed(<production checkout>, <merge branch>)`. Report each `Ended` and each `Kept` as a step line (`report("worktrees", ...)`). A `Kept` line never fails or holds the merge. Unit checkpoints, shrinks and as-builts reach the merge branch only through this merge, so this one call covers them. `merge_checkpoint.py` belongs to sdlc; name the change to sdlc in the checkpoint notice.
+6. No new cleanup path: no sweep, no timer, no `end` command, no call from `end_session.sh` or from the phase-start merge.
+
+**Files:**
+- `scripts/worktree/worktrees.py` — new: `make`, the record, the landing rule and `end_landed`.
+- `scripts/worktree/make_worktree.sh` — calls `worktrees.py make`.
+- `scripts/production/merge_checkpoint.py` — calls `end_landed` after its push (owner: sdlc).
+- `scripts/worktree/test_worktrees.py` — new: test rows.
+- `scripts/production/test_merge_checkpoint.py` — one row for the call (owner: sdlc).
+
+**Workers:** 1 writer + 1 tester; the tester writes test rows from the Spec alone.
+- `impl` — `worktrees.py`, `make_worktree.sh`, `merge_checkpoint.py`.
+- `test` — `test_worktrees.py`, the row in `test_merge_checkpoint.py`. Each test makes its own bare origin and clone in a temp folder, with `WORKTREES_STATE_DIR`, `STAFF_CONFIG` and `HOME` in that folder. No test reads live staff, live worktrees or GitHub.
+
+**State:** records under `~/.local/state/worktrees/made/`; a production merge deletes landed worktrees and branches, local and on origin. Each end step can fail; the next merge completes it.
+
+**Constraints from prior phases:**
+- Merge commits on unit branches carry no Change-Review line. Shrink commits change only `docs/plans/<plan>.md`.
+- `git stash` is denied, and a `+` on a push line hits the force-push rule. Use `git push origin --delete <branch>` alone.
+- The leftover verify worktrees and branches from before this phase are deleted once by hand on 2026-11-08, with a backup bundle. This phase needs no step for them.
+
+**Acceptance gate:**
+- `env -C <tree> HERDR_BIN=/nonexistent/herdr PYTHONPATH=<tree> ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>` passes.
+- Test rows, each of which fails without the change:
+  1. `make` writes a record with the owner and merge branch from a temp staff row.
+  2. A branch whose checkpoint is merged, then a plan-only shrink, ends (tree, branch, origin branch and record gone).
+  3. A branch whose content landed as a cherry-pick under a new hash ends.
+  4. A branch with one commit that is not on the merge branch is kept with that hash; nothing is removed.
+  5. A dirty tree is kept, and a tree that a staff row holds is kept.
+  6. A second `end_landed` after an end that stopped halfway finishes without error.
+  7. In `test_merge_checkpoint.py`: a merge whose push succeeds ends a recorded landed tree and reports it; a kept tree does not fail the merge.
+- `basedpyright` reports 0 errors and 0 warnings on the changed files.
+
+### Phase 41t — The copy guard refuses only what makes a repository tree  · status: todo
+
+**Depends on:** none. (Queue Phase 16 moved here by builds, 2026-11-08. Its queue dependencies are met: queue 18c is done, and verify Phase 35 is on builds.)
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, moving queue-unit Phase 16 (`docs/plans/builds-queue.md`) to this unit. The builds ruling of 2026-11-05 stands: "A broken guard is fixed at once".
+
+**Goal:** a command that makes no repository tree passes the copy guard, and a refusal says what the guard could not read.
+
+**Spec:**
+1. **Refused today.** Real commands from the Claude transcripts of 2026-11-05 to 2026-11-08: 268 distinct commands were refused with a "cannot ..." reason, and 247 of them are still refused on builds at f3e397bdd. None of them makes a tree. The classes:
+   - 119 `cannot resolve interpreter program`: for example `python3 -c "...open('$f')..."` with an expansion in the program text.
+   - 54 `cannot resolve interpreter invocation`: for example `python3 "$f" --diff` or `python3 $(ls …/copies.py | head -1) --help`.
+   - 46 `cannot resolve expanded interpreter stdin`: `python3 - <<EOF` whose body holds `$S`.
+   - 9 `cannot parse Python program`: for example a `python3 - <<'EOF'` program that rewrites a showrunner state file.
+   - 19 `cannot parse shell program`: ANSI-C `$'\x1b'`, a backtick fence inside a grep pattern, an unterminated expansion, and similar.
+   Queue's text also named `python3 /dev/stdin`, `sed` loops and `bash -n`; a plain form of each passes today, and `bash -n "$f"` in a `for` loop over a glob is still refused.
+2. **Fix.** A form with no tree-making operation passes. Where the guard cannot read an input, it reads what it can. An expansion is an unknown word, not an unknown program. Parse valid Python whose strings hold nested quotes. An input that the guard still cannot read gets a message that names what it could not read. The message names `copies.py` only for a tree-making operation.
+3. **Keep.** Each tree-making form in `test_copy_guard.py` stays refused. Change an assertion only for a form that item 1 names, and give the reason in the summary.
+4. **Proof.** One regression row for each class in item 1, with the real command text from `refused_commands.md`. Add rows to the existing tests of the same behavior.
+5. **Command list.** Before dispatch, the director writes `<phase folder>/refused_commands.md`: real commands from each class, each with its expected result, and the tree-making forms that stay refused. The prompt names this file.
+6. **Run-place fixture (builds, 2026-11-08).** `scripts/direct/test_verify_run_place.py` fails without `PYTHONPATH`. Its fixture copies `scripts` but not `lib/package_root.py`, so the repo-root import fails. Add that file to the fixture. The tester owns this item.
+7. **Retained-claim flake (builds, 2026-11-08).** `test_verify_ssh_targets_retained.py` `test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits` fails with `LiveMemoryReading` while a real build runs in `builds.slice`. The test does not fake `BUILDLOG_BUILDS_CGROUP`, so `slice_working_set` (`memory_admit.py:2641`) reads the live scope. Fake that cgroup in the test. The tester owns this item.
+8. **Clock offset flake (builds, 2026-11-08).** `test_step_record.py` `test_write_reports_the_clock_offset_and_both_record_paths` failed under load 138 and passed alone. Find the wall-clock bound that load breaks, and remove it from the test. The tester owns this item.
+
+**Files:**
+- `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
+- `scripts/copies/test_copy_guard.py` — the tests.
+- `scripts/direct/test_verify_run_place.py` — the fixture (item 6).
+- `scripts/direct/test_verify_ssh_targets_retained.py` — the faked cgroup (item 7).
+- `scripts/direct/test_step_record.py` — the clock offset test (item 8).
+
+**Workers:** 1 writer + 1 tester.
+
+**Acceptance gate:**
+- Every command in `refused_commands.md` gives its expected result.
+- `test_verify_run_place.py` passes with no `PYTHONPATH` set.
+- The retained-claim test reads no live `builds.slice` scope.
+- The clock offset test has no wall-clock bound that load can break.
+- The copies and hook suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test.
+- Change-Review: a command that the guard refused now runs.
+
+### Phase 41u — copies.py list shows remote mirrors  · status: todo
+
+**Depends on:** 41t. (Queue Phase 17 moved here by builds, 2026-11-08. Queue order: 18c, then 16, then 17.)
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, moving queue-unit Phase 17 to this unit. Builds rulings of 2026-11-05: the verify 35b unit keeps the 26 simplify items; the copy start object scan moved to natest's copies.py Git-work speed phase. On `copies.py` the second lander resolves.
+
+**Goal:** `copies.py list` answers who holds a mirror.
+
+**Spec:**
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
+2. **Holder states (architect review of queue 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through queue 18c's row id), idle, or unavailable.
+3. **Owner and holder are two columns (architect review of queue 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2233`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
+4. **Owner name states (architect review of queue 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:82`). The list must not show a row id. The owner is in one of these named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
+5. **Proof.** List tests for remote-only records and for mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state.
+
+**Files:**
+- `scripts/copies/copies.py` — the list.
+- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
+
+**Workers:** 1 writer + 1 tester — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
+
+**Acceptance gate:**
+- The copies suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test.
+- Change-Review: `copies.py list` output.
+
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
 #### As-built
