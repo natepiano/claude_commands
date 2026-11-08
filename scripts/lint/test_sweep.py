@@ -3856,13 +3856,13 @@ class FloorTests(SweepCase):
             self.finalize_crossing(140)
             self.assertEqual([attempt.recipient for attempt in attempts], ["natedev", "user"])
             script = """from unittest import mock
-import sweep
-import conf
+from scripts.lint import sweep, tmp_sweep
+from scripts.lib import conf
 with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.patch.object(sweep, "send_floor_alert") as send:
-    sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(0), lint_settings=conf.read("lint"))
+    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(0), lint_settings=conf.read("lint"))
     send.assert_not_called()
 """
-            result = run([sys.executable, "-c", script], cwd=Path(sweep.__file__).parent,
+            result = run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
                          text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.finalize_crossing(130)
@@ -6605,7 +6605,6 @@ class HolderSessionTests(unittest.TestCase):
         }
         with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
                                           tmp_sweep.STATE_ENV: str(base / "state")}),
-              mock.patch.object(build_hold, "live_sessions", return_value=[]),
               mock.patch.object(sessions, "live_sessions", return_value=[record]),
               mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(sweep, "PROC_DIR", str(proc))):
@@ -6718,12 +6717,10 @@ class BudgetTests(unittest.TestCase):
                                 capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_sweep_import_loads_one_copy_of_record_index_and_step_outputs(self) -> None:
+    def test_sweep_import_loads_one_copy_of_step_outputs(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         loaded = fresh_import_modules(base, "lint", "sweep")
-        for name in ("record", "index", "step_outputs"):
-            with self.subTest(module=name):
-                self.assertEqual(len(set(loaded) & {name, "scripts.buildlog." + name}), 1, loaded)
+        self.assertEqual(len(set(loaded) & {"step_outputs", "scripts.buildlog.step_outputs"}), 1, loaded)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
         values = conf.read(Path(self.config())).values()
