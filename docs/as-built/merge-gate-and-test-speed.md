@@ -242,7 +242,7 @@ A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 **Refusals before merging** (`merge_checkpoint`):
 - tracked uncommitted changes. Untracked files never block (`--untracked-files=no`), because each showrunner keeps a LOG there; a merge that would overwrite an untracked file fails and is aborted.
 - checkout not on the merge branch.
-- HEAD not `origin/<merge branch>` plus only local production doc commits after the fetch. `check_local_doc_commits` accepts a non-merge commit whose subject starts `production(` (`add_unit.commit_paths` makes them for add_unit, promote_showrunner and retire_unit, and leaves their push to the gate). Each one is printed, rolled back to on red, and pushed with the merge (2026-10-18: retire_unit's commit stopped every merge). Fetches use explicit `+refs/heads/X:refs/remotes/origin/X` refspecs.
+- HEAD not `origin/<merge branch>` plus only local production doc commits after the fetch. `check_local_doc_commits` accepts a non-merge commit whose subject starts `production(` (`add_unit.commit_paths` makes them for add_unit and promote_showrunner, and leaves their push to the gate). Each one is printed, rolled back to on red, and pushed with the merge. Fetches use explicit `+refs/heads/X:refs/remotes/origin/X` refspecs.
 - checkpoint not an ancestor of `origin/<unit branch>`.
 - previous checkpoint not an ancestor of the checkpoint.
 

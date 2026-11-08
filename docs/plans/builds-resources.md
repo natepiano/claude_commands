@@ -254,7 +254,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - Phase 20: `PendingLeft` saves durable cancellation facts. Restart publishes one cancellation with its original time.
   Keep the one lifecycle outbox and the saved finalization intent. Add no second lifecycle writer.
 - Phase 20: an old `NoWaiter` place identity is migration input, not proof that a step ended.
-  `WaiterPlace.queue_identity` carries the logical identity. Preserve it through import, restart and owner exit.
+  `WaiterPlace.queue_identity` carries the logical identity. Preserve it through restart and owner exit.
+  builds-queue Phase 10x (89ba4f087) removed the legacy import and its test `test_imported_and_restored_places_record_one_owner_exit_after_restarts`.
   Add no user control or display for either migration or pending cancellation.
 - Phase 41: token waiters keep their arrival and priority times. They hold neither the head position nor head room.
   Preserve the saved offset and transition identity for priority publication retries.
@@ -291,7 +292,6 @@ Own what a build may use and when it starts: memory admission and the memory que
   6. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
   7. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
-- Preserve `test_imported_and_restored_places_record_one_owner_exit_after_restarts` unchanged in the same module.
 - Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
   Both tests are in `scripts/production/test_merge_gate_suites_admission.py`.
 - Preserve these hold tests unchanged in `scripts/build_hold/test_build_hold.py`:
@@ -1804,3 +1804,27 @@ The folder audit names a session as a folder's maker only when one of that sessi
 
 **Ruled out:**
 - Exit-status reasoning (`false && mkdir x`, `(cd x); mkdir y`): the static parser cannot know an exit status, and the earliest-session rule limits the risk.
+
+### Phase 80 — Every Mac test run states its threads and the Mac's load  · status: done
+
+#### As-built
+
+Every nextest run that lint starts prints one line after admission: `nextest: <granted> of <requested> test threads; load <one-minute load> on <cpu count> CPUs (<host>)`. A run narrowed by the share claim adds `; shared with the runs in flight`. A missing load prints `load unknown`. The line covers the share claim, a caller width (`--test-threads`, `--jobs`, `-j`), trial mode, and the fallback paths (no marker folder, a failed claim).
+
+- `scripts/lint/nextest_budget.py` owns the one formatter, `thread_line(granted, requested)`. Widths are `TestWidth = SpecifiedTestWidth | UnknownTestWidth`. `requested_threads(argv)` reads `--test-threads`, `--jobs`, `-j` (all spellings) before `--`, then `NEXTEST_TEST_THREADS`, then the CPU count. The `report` action prints the line for an unshared run; `claim ... --show-load` prints the width, then the line.
+- `scripts/lint/invoke.sh`: `run_step_attempt` calls `nextest_thread_report` for a `cargo nextest run` with no share marker. `nextest_share_claim` prints the claim's line, or the report line when the marker or claim fails. `run_nextest` treats `--jobs` and `--jobs=N` as a caller width, so it adds no second width option.
+- The cause report for the slow hana Mac runs (three runs that fastest-unit timed, 2026-11-07) proved overlapping load: another session's hana demo (about 220–250% CPU), cargo-liner checks, clippy and 6-thread nextest runs, Chrome and battery power. A full-width grant is not rebalanced when later runs start. Spotlight, Time Machine, thermal limits, swap and a cold cache stay unproven.
+
+**Files:**
+- `scripts/lint/nextest_budget.py` — the width types, the request reader and the formatter.
+- `scripts/lint/invoke.sh` — the report call on every nextest path.
+- `scripts/lint/test_nextest_budget.py` — the line on shared, full, caller-width (`--jobs` rows), trial, marker-failure, claim-failure and unreadable-load runs, through the real dispatch.
+- `scripts/lint/test_memory_admit.py` — the line on a shared admission.
+- `docs/as-built/nextest-width-and-lint-scope.md` — the line and its paths.
+
+**Gotchas:**
+- The test fixture keeps the real `run`, `run_once` and `run_step_attempt`. It replaces only admission and `buildlog_exec`, and it drops the command banner line.
+- Each run starts one more short Python process to read the load.
+
+**Ruled out:**
+- A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.

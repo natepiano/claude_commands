@@ -58,19 +58,20 @@ def pacific_zone() -> Generator[None, None, None]:
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
-    def test_clean_target_import_loads_mac_test_once(self) -> None:
+    def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            environment.update({**config_environment(root), "HOME": temporary,
-                                "MAC_TEST_STATE_DIR": str(root / "mac-state")})
-            result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
-                "import os,sys; from pathlib import Path; from scripts.build_targets import build_targets; "
-                + "build_targets.target_state(build_targets.SshTarget('mac', 'macos', Path(os.environ['CONF_DIR']) / 'mac_test.conf')); "
-                + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
-                + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
-                + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
-                capture_output=True, text=True, timeout=30, check=False)
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(directory)
+        environment.update({**config_environment(root), "HOME": directory, "BUILDLOG_DIR": directory,
+                            "MAC_TEST_STATE_DIR": str(root / "mac-state")})
+        result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
+            "import os,sys; from pathlib import Path; from scripts.build_targets import build_targets; "
+            + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
+            + "build_targets.target_state(build_targets.SshTarget('mac', 'macos', Path(os.environ['CONF_DIR']) / 'mac_test.conf')); "
+            + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
+            + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
+            + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
+            capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_folder_invocation_records_hold_events(self) -> None:
