@@ -771,39 +771,18 @@ A failed merge gate attempt keeps the end of its output in the build log, for lo
 - Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).
 
 ### Phase 35 — One full rebuild of the build log index has a measured memory cost  · status: done
-**Depends on:** Phase 34
 
-From the builds showrunner (not the user), 2026-11-06: "Measure the memory of one full rebuild of the test-time index (scripts/buildlog/index.py) at live scale (about 2.2 GB). Use a private disk root. Record peak RSS, page size, spill settings and report latency during spill. Source: natest Phase 71 measured only an ordinary refresh."
+#### As-built
 
-From the builds showrunner (not the user), 2026-11-08: "Yes, make "One full rebuild of the test-time index has a measured memory cost" a phase in your plan and start it now."
-
-From the builds showrunner (not the user), 2026-11-08: "If the measurement says INDEX_SPILL_PAGES should change value, the user approves that first. Send me the old value, the new value and the measured reason before you commit it. A comment-only basis update needs no go."
-
-#### Work Order
-
-**Goal:** The memory and reader cost of one full rebuild of the build log index at live scale is measured and written down, so `INDEX_SPILL_PAGES` has a measured basis for a full rebuild. No code changes.
-
-**Spec:**
-- Copy every `*/*.jsonl` file of the live build log root (`~/.local/state/buildlog`, about 1.7 GB of JSONL; the current live index is about 3.0 GB) into a private disk root under the run folder. Copy no index file. Read the live root only; never write it.
-- Run one full rebuild with `BUILDLOG_DIR` set to the private root: `index.update_in(root)` on a root that has no index (as `reindex` does). Run it through `mesh_runs.py start`; a rebuild takes minutes (natest Phase 71: a new index took 222 CPU s and 351.6 s wall).
-- Record: peak RSS of the rebuild process (from `/usr/bin/time -v` or a `/proc/<pid>/status` VmHWM read at the end), wall and CPU seconds, the final index size, `PRAGMA page_size`, `PRAGMA cache_size`, the `INDEX_SPILL_PAGES` value and the `cache_spill` value in force, and the lines read.
-- Reader latency during spill: while the rebuild runs and after its changed pages pass the spill size, time a `buildlog query "SELECT COUNT(*) FROM gate_runs"` and a `test_times` list against the same private root, at least three times. Record each wall time and whether it waited, failed, or read an older index (`complete_gate_index_in` falls back to an older complete index).
-- Write the result:
-  - `config/buildlog.conf`: the `INDEX_SPILL_PAGES` basis comment adds the full-rebuild figures (peak RSS, page size, rebuild time, reader wait). The value stays 65536 unless the measurement shows a reader failure; then report it and do not change the value.
-  - `docs/as-built/buildlog-memory-stalls.md`, "Calibration and gotchas": one short entry with the measured figures, the date and the JSONL size.
-- Delete the private root after the measurement. Keep the measurement scripts in the run folder, not in the repo.
+Measurement only; no code changed. Two full rebuilds ran on private copies of the live JSONL (443 files, 1.16 GiB, about 276,000 records; a 3.0 GB index with 4096-byte pages).
+- SQLite 3.51.2 reads `PRAGMA cache_spill = N` as a boolean through 8 bits. `INDEX_SPILL_PAGES=65536` gives 0, so `open_for_update` turns spill off. 65535 stays on; `PRAGMA cache_spill = ON` after the size keeps 65536 in effect.
+- Spill off (as shipped): peak RSS 3.75 GiB, 132.7 s wall, 102 CPU s. Six readers waited 9.4–10.9 s at commit and read the new index.
+- Spill on (trial wrapper only): peak RSS 1.34 GiB, 252.7 s wall, 110 CPU s, under a higher load. The first spill came at 11.5 s. Readers started near the first spill, the middle and the end waited until commit (43.6–245.8 s) and read the new index.
 
 **Files:**
-- `config/buildlog.conf` — the `INDEX_SPILL_PAGES` basis.
-- `docs/as-built/buildlog-memory-stalls.md` — the measured full-rebuild cost.
+- `config/buildlog.conf` — the `INDEX_SPILL_PAGES` basis gives both runs; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — "Calibration and gotchas": the full-rebuild entry.
 
-**Workers:** 1 writer — `rowcpu` runs the measurement and writes both files.
-
-**State:** none in the repo. The private root is deleted after the run.
-
-**Constraints from prior phases:** Phase 34 set `SCHEMA_VERSION` 36, so the live index rebuilds once on natedev; this phase measures that cost on a copy. natest Phase 71: the index uses the rollback journal; `cache_spill` is not a hard memory limit; a refresh above the spill size blocks readers from the first spill until commit, up to the 30 s `BUSY_TIMEOUT_MS`. Never write the live build log, the live index or the live progress history. Check `build_hold.py status` before the run.
-
-**Acceptance gate:**
-- The worker's summary gives every recorded value above, the commands that produced them, and the load average at the start and end of the rebuild.
-- `config/buildlog.conf` and the as-built doc state the same figures.
-- The private root no longer exists after the run.
+**Gotchas:**
+- CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off; neither run measured the 30 s direct SQL timeout.
+- A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
