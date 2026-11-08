@@ -528,7 +528,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); a command that returns the shared page's tailnet link. Queue 10m (on builds at 72a6a3f4d) added `memory_feed.py` and `memory_live.html` but no such command; its name and owner wait on the user's answer (builds showrunner, 2026-11-08).
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); a command that returns the shared page's tailnet link. Queue 10m (on builds at 72a6a3f4d) added `memory_feed.py` and `memory_live.html` but no such command; From the builds showrunner (not the user), 2026-11-08: "queue owns the page link command and builds it after its Phase 33. The name still waits on the user."
 
 From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
 
@@ -806,7 +806,7 @@ Measurement only; no code changed. Two full rebuilds ran on private copies of th
 - In rollback-journal mode a spill takes an exclusive lock. Direct readers that skip `index.update()` wait 30 s and fail (`database is locked`): `buildlog costs`, `buildlog moments` and charts. `complete_gate_index_in` raises `NoCompleteGateIndex` after 1 s; the step estimator falls back after 5 s.
 - A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
 
-### Phase 37 — Readers get their answer during a full rebuild of the build log index · status: todo
+### Phase 37 — Readers get their answer during a full rebuild of the build log index · status: done
 **Depends on:** Phase 36
 
 From the builds showrunner (not the user), 2026-11-08: "I hold Phase 36 (419d9d038) and do not merge it alone. Reason: with spill on, a full rebuild makes costs and moments fail after 30 s, and charts show no index. That is a fault the user sees. Before this change, readers waited about 10 s. Requirement: a full rebuild keeps the low memory, and readers do not wait or fail during it. 1. Pick the mechanism yourself. Two options: rebuild into a side file and rename it over the index at the end, or WAL mode, if spill in WAL mode takes no exclusive lock. Measure the result before you choose. 2. Do it as Phase 37, or amend it into Phase 36. That choice is yours. 3. Send me the hash. I will chain 36 and the fix together. 4. In the measured run, show that a reader started during the rebuild returns its answer."
