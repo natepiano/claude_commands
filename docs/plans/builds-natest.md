@@ -1768,48 +1768,23 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 ### Phase 88 — The fast-track, staff and add-unit tests build their temporary Git repository once per module  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-07, on the Phase 87 result: "Add a phase after 85 that makes that setup once per module (one shared fixture repo, copied per test where a test writes), for test_fast_track, test_staff and add_unit first. Measure CPU before and after."
-
-**Goal:** `production/test_fast_track.py` (57.5 CPU s same-load, 52 tests), `production/test_staff.py` (28.6 CPU s, 128 tests) and `production/test_add_unit.py` (64 tests) do their Git setup once per class, and use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name the share of each module's CPU that Git setup, per-test copies and process starts take.
-2. Two modules already have a class seed. `test_fast_track.py` uses `MergeCheckpointFixture` (`merge_checkpoint_test_support.py:255`), which builds a seed and copies it. `test_add_unit.py` uses `AddUnitTestCase` with `ImmutableGitSeed` (`add_unit_test_support.py:218`). Start from the measured remaining cost in these fixtures, not from a new seed.
-3. `test_staff.py` builds repositories in `DocumentLookupTests.checkouts` (`test_staff.py:409`). Build them once per class where the tests only read them.
-4. A test that writes to a shared repository gets its own copy, made by a file copy, not by a new `git init` and commits.
-5. A shared fixture sets `maintenance.auto false` before its first commit (Phase 81).
-6. Read the importers of a shared fixture before you change it. Every importer stays green.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
-8. Showrunner order, 2026-11-07, after the first pass: in `FAKE_SSH` (`staff_test_support.py:549`), import the heavy modules after the `STAFF_TEST_SSH_FAIL` branch.
-9. Same order: share the owner imports across repeated fake SSH requests in one test. Keep a separate process where a test proves a lock or a process boundary.
-
-**First pass result (same-load pairs):** Git setup is not the cost. fast_track 55.5 -> 54.9 CPU s, add_unit 20.5 -> 20.5, staff 28.0 -> 28.0. The director dropped the `test_staff.py` class seed (no gain). Kept: `maintenance.auto false` in the seeds and two importer repairs in `add_unit_test_support.py`. The staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s).
+The staff, add-unit and fast-track test modules use less CPU, with all 14,774 assertion sites kept. The Git seeds were already built once per class; the real costs were 42 fake SSH process starts and Git maintenance. `staff_test_support.py` now runs the fake SSH calls inside one owner process per module, and the other fixtures turn off Git maintenance in their test repositories. Same-load CPU: the staff modules 49.2 to 26.2 s, add-unit 23.7 to 14.6 s, fast-track 66.6 to 58.4 s.
 
 **Files:**
-- `scripts/production/test_fast_track.py`
-- `scripts/production/test_add_unit.py`
-- `scripts/production/merge_checkpoint_test_support.py`
-- `scripts/production/add_unit_test_support.py`
-- `scripts/production/staff_test_support.py`
+- `scripts/production/staff_test_support.py` — the staff fixture and its fake SSH owner process
+- `scripts/production/add_unit_test_support.py` — the add-unit fixture; serializes fake process publication
+- `scripts/production/merge_checkpoint_test_support.py` — the merge-checkpoint fixture
+- `scripts/production/test_fast_track.py` — the fast-track tests
 
-**Workers:** 2 writers; split by module and its fixture
-- `impl` — `test_fast_track.py` and `test_add_unit.py`, hub: `merge_checkpoint_test_support.py`, `add_unit_test_support.py` (done)
-- `test` — Spec 8 and 9, hub: `staff_test_support.py`, opens as impl
+**Gotchas:**
+- Cleanup kills the owner's process group after a timeout, then reaps the owner. A hung fake SSH call otherwise leaves a forked child, and cleanup waits with no limit.
+- A group signal in `scripts/` goes through `process_group.send_process_group`; `lib/test_process_group.py` fails on a direct `os.killpg`.
+- The fake SSH script loads the package with `scripts/lib/package_root.py`, not `sys.path`.
 
-**Constraints from prior phases:**
-- Phase 87: rule 2 removal gave no CPU gain in these modules. The first pass (above) measured no Git setup gain; the staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s). Keep the real lock and process boundaries.
-- The showrunner assigned `scripts/production/staff_test_support.py` to this phase (2026-11-07). The checkpoint notice says `also touches staff_test_support.py (owner sdlc), tested against origin/main`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- Each changed file and every importer of a changed fixture pass.
-- Same-load CPU before and after for `test_staff.py` and the other heaviest `StaffTestCase` users.
-- the targeted test green on the phase commit merged with `origin/builds`, and a trial merge with `origin/main` for `staff_test_support.py`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- One Git seed per module: the seeds were already built once per class.
 
 ### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
 **Depends on:** Phase 68
