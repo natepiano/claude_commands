@@ -35,7 +35,6 @@ from scripts.lib import unit_runs
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-from scripts.build_queue import admission_service
 from scripts.buildlog import store
 from scripts.message import session_send
 
@@ -563,6 +562,8 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
 
 def admitted_processes() -> frozenset[ProcessIdentity]:
     """Read durable grants, which precede replies and the next decision pass."""
+    from scripts.build_queue import admission_service
+
     try:
         state = admission_service.read_state(store.root() / "admission")
     except (OSError, ValueError) as error:
