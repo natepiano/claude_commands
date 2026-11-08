@@ -18,11 +18,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
@@ -33,16 +32,24 @@ from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
-if TYPE_CHECKING:
-    from ..direct import step_record
-    from ..build_queue import admission_protocol, admission_service
-    from ..build_queue.admission_test_support import only_admitted
-    from ..lib import test_hang_guard
-else:
-    from scripts.direct import step_record
-    from scripts.build_queue import admission_protocol, admission_service
-    from scripts.build_queue.admission_test_support import only_admitted
-    from scripts.lib import test_hang_guard
+from scripts.direct import step_record
+from scripts.build_queue import admission_protocol, admission_service
+from scripts.build_queue.admission_test_support import only_admitted
+from scripts.lib import test_hang_guard
+
+
+class ImportTests(unittest.TestCase):
+    def test_clean_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.build_queue.admission_service", "scripts.message.sessions")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.build_hold import build_hold; "
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
@@ -2331,7 +2338,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     "VERIFY_PROC_ROOT": str(self.proc), "VERIFY_STEPS_DIR": str(self.scratch / "steps"),
                 }):
                     step_record.write(step_record.StepRecord(
-                        "kept-step", 90, "900", self.scratch, "test", None,
+                        "kept-step", 90, "900", self.scratch, "test", step_record.WorkspacePackages(),
                         step_record.NatedevOnly("fixture"), step_record.StepState.ON_NATEDEV,
                         "2026-10-28T12:00:00+00:00",
                     ))
@@ -2537,13 +2544,32 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
         (self.holders / "holder").unlink()
-        for action in ("hold", "status", "audit"):
+        for action, entry in (("hold", "import"), ("status", "import"),
+                              ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "hold":
                 args.extend(["--holder", "holder", "--for", "app test"])
             output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(build_hold.main(args), 0)
+            if entry == "__main__":
+                program = """import runpy, sys
+from unittest import mock
+path = sys.argv.pop(1)
+def exit_code(status):
+    module = sys.modules["__main__"]
+    assert module.hold_enforcer().build_hold is module, "the enforcer loads a second module"
+    assert "build_hold" not in sys.modules, "the CLI registers a bare alias"
+    assert status == 0, status
+with mock.patch("sys.exit", side_effect=exit_code):
+    runpy.run_path(path, run_name="__main__")
+"""
+                with self.subTest(entry=entry):
+                    result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program, str(SCRIPT), *args],
+                                            capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                _ = output.write(result.stdout)
+            else:
+                with redirect_stdout(output):
+                    self.assertEqual(build_hold.main(args), 0)
             self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
             if action == "audit":
                 self.assertNotIn("unowned", output.getvalue())

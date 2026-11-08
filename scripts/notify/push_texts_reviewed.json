@@ -987,32 +987,32 @@
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:12.544136-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:46.071567-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:06.696247-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:38.245148-05:00"
     }
   },
   "shutdown.restart_incomplete": {
     "long_account": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:31.310232-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:09.523293-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:20.109165-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:02.062164-05:00"
     }
   },
   "shutdown.restart_untrusted": {
     "typical": {
       "reviewer": "opus",
-      "sha256": "f57b6487a5078fa11193be0ca11dfc0b3c14d83684cc0d4d77e22cec98a3a7a6",
-      "time": "2026-11-01T23:38:17.230240-05:00"
+      "sha256": "ac22944a6753615e074a27bffe4dbba0c64c654aebf4f560a00a2ad57e560c95",
+      "time": "2026-11-07T12:59:55.219819-05:00"
     }
   },
   "shutdown.restart_untrusted_unlisted": {
@@ -1168,6 +1168,28 @@
       "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
       "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
       "time": "2026-10-23T09:50:57.721466-04:00"
+    }
+  },
+  "sweep.disk_floor": {
+    "available": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:44.139656-05:00"
+    },
+    "insufficient": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:55.296319-05:00"
+    },
+    "protected": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:33:00.403543-05:00"
+    },
+    "unavailable": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:50.001653-05:00"
     }
   },
   "vault.stopped": {

@@ -13,40 +13,22 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..lib.process_start_test_support import process_reader
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.lib.process_start_test_support import process_reader
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import process_reader
 
 import unittest
 from unittest import mock
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("build_targets", "mac_test", "build_hold"):
-    sys.path.insert(0, str(SCRIPTS / directory))
-
-if TYPE_CHECKING:
-    from . import build_targets, targets
-    from ..aws_target import ledger
-    from ..aws_target.ledger_test_support import (
-        REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
-    )
-    from ..mac_test import mac_test as mac_test, offload as offload
-    from ..build_hold import build_hold
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.build_targets import build_targets, targets
-    from scripts.mac_test import mac_test, offload
-    from scripts.build_hold import build_hold
-    from scripts.aws_target import ledger
-    from scripts.aws_target.ledger_test_support import (
-        REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
-    )
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.build_targets import build_targets as build_targets, targets
+from scripts.mac_test import mac_test as mac_test, offload as offload
+from scripts.build_hold import build_hold
+from scripts.aws_target import ledger
+from scripts.aws_target.ledger_test_support import (
+    REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
+)
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class SshEligibilityTests(unittest.TestCase):
@@ -165,6 +147,21 @@ class SshEligibilityTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
         self.assertTrue(self.commands)
+
+    def test_pinned_final_requires_check_and_test_before_waiting_for_aws(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "final", str(self.root), "linux-part"
+        settings = self.root / "aws_target.conf"
+        original = settings.read_text()
+        for kinds, expected in (("check", 2), ("test", 2), ("test,check", 0)):
+            with self.subTest(kinds=kinds):
+                _ = settings.write_text(original.replace("kinds=test,check,doc", "kinds=" + kinds))
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), expected)
+        self.assertEqual(self.commands, [])
 
     def test_pinned_stopped_aws_still_refuses_a_spending_limit(self) -> None:
         paths = mac_test.state_paths("aws")
@@ -470,7 +467,7 @@ class SshEligibilityTests(unittest.TestCase):
                 numeric_settings(settings, {key: "3"})
                 with redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(self.aws()[1:3], ["excluded", "spending_limit"])
-                    self.assertEqual(self.decision(), "ssh_allowed")
+                    self.assertEqual(self.decision(), "any_target")
                     self.assertEqual(self.reserve(), 1)
                 self.assertIn("spending refused", errors.getvalue())
                 self.assertEqual(self.commands, [])
@@ -510,7 +507,7 @@ class SshEligibilityTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(self.aws()[1:3], ["excluded", "spending_unavailable"])
             self.assertEqual(self.reserve(), 1)
-            self.assertEqual(self.decision(), "ssh_allowed")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
         self.assertEqual(book.path.read_bytes(), b"{unfinished ledger")
@@ -541,25 +538,25 @@ class SshEligibilityTests(unittest.TestCase):
 
     def test_linux_backoff_keeps_the_memory_leave_route(self) -> None:
         offload.write_backoff(10**12, "aws")
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_unreachable_linux_target_keeps_the_memory_leave_route(self) -> None:
         self.reachable = False
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         self.assertTrue(self.commands)
 
     def test_disk_refusal_keeps_the_memory_leave_route(self) -> None:
         with mock.patch.object(mac_test, "free_now", return_value="disk"):
-            self.assertEqual(self.decision(), "natedev_only disk")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_capacity_exclusions_keep_the_memory_leave_route_available(self) -> None:
         self.occupy(71)
         self.occupy(72)
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         with mock.patch.object(mac_test, "free_now", return_value="blocked"):
-            self.assertEqual(self.decision(), "ssh_allowed")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_linux_only_work_keeps_linux_capacity_without_a_mac(self) -> None:

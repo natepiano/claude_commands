@@ -26,30 +26,27 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
-import fake_unit_host
-from fake_unit_host import HostedUnit
-import fake_herdr
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
-import stall_watch
+from scripts.production import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
-import context_usage
-import rca
+from scripts.hooks import context_usage
+from scripts.message import rca
 from scripts.production.cli_fixture import invoke_cli
-from test_showrunners import stalled_session_reader
-import unit_lookup
+from scripts.production.test_showrunners import stalled_session_reader
+from scripts.production import unit_lookup
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -522,7 +519,7 @@ always=natedev
     def stop_unit(self) -> Path:
         """Stop the fixture's unit through the real cancellation boundary; return its isolated launch file."""
         from scripts.shutdown import stop_resume
-        import pane_record
+        from scripts.shutdown import pane_record
         with (mock.patch.object(pane_record, "RECORD_DIR", self.root / "launches"),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
@@ -759,9 +756,9 @@ always=natedev
         self.assertEqual(self.sent(), [])
 
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         from scripts.production import showrunners
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         marked: dict[str, dict[str, lookup.LabeledSession]] = {}
         for production_name in ("first", "second"):
@@ -1234,7 +1231,7 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
-        import pane_record
+        from scripts.shutdown import pane_record
         from scripts.shutdown import pane_record as staff_launches
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})
@@ -1541,7 +1538,7 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 1)
 
     def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
         self.assertEqual(stall_watch.prompt_request(BASH_PROMPT),
                          "run a shell command to read lines 5 to the end of a saved output")
@@ -1551,7 +1548,7 @@ always=natedev
         self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
 
     def test_the_request_skips_the_auto_deny_banner(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(AUTO_DENY_PROMPT),
                          "run a shell command to read lines 5 to the end of a saved output")
         self.assertTrue(stall_watch.auto_denied(AUTO_DENY_PROMPT))
@@ -1560,7 +1557,7 @@ always=natedev
         self.assertFalse(stall_watch.auto_denied(quoted))
 
     def test_the_request_comes_from_the_pending_tool_call_in_the_transcript(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         call = stall_watch.PendingTool("toolu_1", "Bash", dict(DELETE_CALL), START)
         # A Bash call reads as its command with each path shown by its file name, never as its description,
         # also when the screen shows a description or the outside warning.
@@ -1573,7 +1570,7 @@ always=natedev
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
 
     def test_a_wrapped_prompt_with_the_outside_warning_reads_as_a_whole_sentence(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT),
                          DELETE_REQUEST)
         # Without the warning, the wrapped description is the request, joined into one sentence.
@@ -1804,7 +1801,7 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         from scripts.notify import push_texts
         helpers = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee" / "subagents"
         helpers.mkdir(parents=True)
@@ -2573,7 +2570,7 @@ always=natedev
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
 
     def test_detached_processes_use_native_sessions_without_production_name_resolution(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         from scripts.production import showrunners
 
         rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),

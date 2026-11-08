@@ -7,17 +7,11 @@ import os
 import shlex
 import signal
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.mac_test import offload
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -44,6 +38,16 @@ class OffloadForwardTests(OffloadCommandFixture):
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
 
+    def test_named_environment_reaches_the_remote_copy_command(self) -> None:
+        self.environment["SHOT_OUTPUT"] = "target/shots"
+        answer = self.command(
+            "--workspace", runner_options=("--env", "SHOT_OUTPUT", "--copy"), call_id="call-forward",
+            subprocess_cli=True, separate_stderr=True,
+        )
+        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
+
     def test_values_keep_their_bytes_and_only_named_variables_are_forwarded(self) -> None:
         value = "spaces 'quotes' \"double\"\nand a newline; $(do-not-run)"
         self.environment.update({"SHOT_OUTPUT": value, "UNNAMED_PRIVATE_VALUE": "never sent"})
@@ -54,8 +58,9 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         remote = self.events_for("ssh")[-1]["args"][-1]
         words = shlex.split(remote)
-        self.assertEqual(words[3:6], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
-        self.assertEqual(words[6], "PATH=$HOME/.cargo/bin:$PATH")
+        forwarded_start = words.index(f"SHOT_OUTPUT={value}")
+        self.assertEqual(words[forwarded_start:forwarded_start + 3], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
+        self.assertEqual(words[forwarded_start + 3], "PATH=$HOME/.cargo/bin:$PATH")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", words)
         self.assertNotIn("UNNAMED_PRIVATE_VALUE", remote)
         self.assertNotIn("never sent", remote)
@@ -73,7 +78,10 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/mirror/hana/target; then echo mac_cleanup=0; '
+            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+            + 'if rm -rf -- "$HOME"/.local/state/mac-test/mirror/hana/target; then '
+            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
@@ -89,7 +97,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         cases = [
             ("--env",), ("--fetch",), ("--env", "bad-name"), ("--env", "1BAD"),
             ("--env", "NOT_SET_HERE"), ("--env", "SHOT_OUTPUT", "--verb", "check"),
-            ("--env", "SHOT_OUTPUT", "--copy"), ("--fetch", "target/shots", "--verb", "doc"),
+            ("--fetch", "target/shots", "--verb", "doc"),
             ("--fetch", "target/shots", "--copy"),
         ]
         cases.extend(("--fetch", folder) for folder in (

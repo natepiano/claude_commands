@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import ast
 import io
 import os
@@ -17,12 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-if TYPE_CHECKING:
-    from . import override_guard
-    from ..lib import test_hang_guard
-else:
-    from scripts.build_hold import override_guard
-    from scripts.lib import test_hang_guard
+from scripts.build_hold import override_guard
+from scripts.lib import test_hang_guard
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent

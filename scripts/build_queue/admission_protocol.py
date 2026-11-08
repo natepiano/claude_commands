@@ -13,8 +13,9 @@ from scripts.build_queue.admission_code import (
     admission_code_version as admission_code_version,
 )
 from scripts.build_queue import admission_records as records
+from scripts.build_queue import cloud_progress, progress_profile
 
-VERSION = 1
+VERSION = 2
 
 
 class AdmissionUnavailable(RuntimeError):
@@ -48,6 +49,16 @@ class NoRun:
 
 
 NO_RUN = NoRun()
+
+
+@dataclass(frozen=True)
+class LocalPlace:
+    pass
+
+
+@dataclass(frozen=True)
+class CloudPlace:
+    target: str
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,7 @@ class AdmitRequest(CallerCode):
     fresh_test: bool
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
+    place: LocalPlace | CloudPlace = LocalPlace()
 
 
 @dataclass(frozen=True)
@@ -183,8 +195,18 @@ Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseReques
 
 
 @dataclass(frozen=True)
+class CloudSlotWait:
+    used: int
+    slots: int
+
+    @property
+    def text(self) -> str:
+        return f"waits for a cloud slot: {self.used} of {self.slots} in use"
+
+
+@dataclass(frozen=True)
 class Wait:
-    reason: records.WaitReason
+    reason: records.WaitReason | CloudSlotWait
     position: int
     head: str
     text: str
@@ -261,8 +283,27 @@ class BuildHistoryReply:
 
 
 @dataclass(frozen=True)
+class CloudRow:
+    owner: Owner
+    identity: Identity
+    place: CloudPlace
+    since: float
+    started_at: float
+    progress: cloud_progress.CloudProgress | cloud_progress.NoCloudProgress
+    counter: progress_profile.ProgressCounter | progress_profile.NoCounter
+    wait: CloudSlotWait | records.ReadyForAdmission
+
+
+@dataclass(frozen=True)
+class CloudQueueRead(records.QueueRead):
+    cloud: tuple[CloudRow, ...] = ()
+    cloud_slots: int = 0
+    cloud_gate_stale_pushes: int = field(kw_only=True)
+
+
+@dataclass(frozen=True)
 class ViewReply:
-    reading: records.QueueRead
+    reading: records.QueueRead | CloudQueueRead
 
 
 @dataclass(frozen=True)
@@ -273,7 +314,7 @@ class ExplainReply:
 
 @dataclass(frozen=True)
 class MineReply:
-    reading: records.QueueRead
+    reading: records.QueueRead | CloudQueueRead
 
 
 Reply = Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
@@ -307,27 +348,27 @@ def parse_record(text: str, schema: type[T]) -> T:
     return cast(T, codec.parse_snapshot_value(value, schema))
 
 
-def _encode(value: object, variants: dict[str, type]) -> str:
+def _encode(value: object, variants: dict[str, type], version: int = VERSION) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    data = codec.snapshot_value(value)
-    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
+    return encode_record({"v": version, "type": name, "data": value}) + "\n"
 
 
-def _parse(line: str | bytes, variants: dict[str, type]) -> object:
+def _parse(line: str | bytes, variants: dict[str, type]) -> tuple[int, object]:
     try:
         value = cast(object, json.loads(line))
         if not isinstance(value, dict):
             raise ValueError("invalid admission envelope")
         envelope = cast(dict[str, object], value)
-        if type(envelope.get("v")) is not int or envelope["v"] != VERSION:
-            raise UnsupportedVersion(envelope.get("v"))
+        version = envelope.get("v")
+        if type(version) is not int or not 1 <= version <= VERSION:
+            raise UnsupportedVersion(version)
         name = envelope.get("type")
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         data = envelope["data"]
-        return codec.parse_snapshot_value(data, variants[name])
+        return version, codec.parse_snapshot_value(data, variants[name])
     except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
@@ -348,9 +389,14 @@ def encode_request(request: Request) -> str:
 
 
 def parse_request(line: str | bytes) -> Request:
-    request = cast(Request, _parse(line, _REQUESTS))
+    return parse_request_envelope(line)[1]
+
+
+def parse_request_envelope(line: str | bytes) -> tuple[int, Request]:
+    version, value = _parse(line, _REQUESTS)
+    request = cast(Request, value)
     _validate_cleanup(request)
-    return request
+    return version, request
 
 
 def noncleanup_request_started(data: bytes) -> bool:
@@ -378,12 +424,16 @@ def noncleanup_request_started(data: bytes) -> bool:
     return False
 
 
-def encode_reply(reply: Reply) -> str:
-    return _encode(reply, _REPLIES)
+def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
+    if version == 1 and isinstance(reply, (ViewReply, MineReply)) and isinstance(reply.reading, CloudQueueRead):
+        reading = reply.reading
+        local = records.QueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics)
+        reply = type(reply)(local)
+    return _encode(reply, _REPLIES, version)
 
 
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
-    reply = cast(Reply, _parse(line, _REPLIES))
+    reply = cast(Reply, _parse(line, _REPLIES)[1])
     if (isinstance(request, LaunchRequest) and isinstance(reply, Admitted)
             or isinstance(request, (AdmitRequest, ServiceEstimateRequest)) and isinstance(reply, LaunchAdmitted)):
         raise ValueError("admission outcome does not match request")

@@ -25,6 +25,10 @@ class AdmissionRefused(ValueError):
     """Permission or native publication failed; no work may be dispatched."""
 
 
+class RunOwnerUnavailable(ValueError):
+    """The run records identify no staff owner."""
+
+
 @dataclass(frozen=True)
 class NewWorkerSlot:
     """The slot has no staff row yet."""
@@ -129,9 +133,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             owner = record.parent_of(child) if child is not None else None
             if owner is not None:
                 return owner
-    row = record.by_current_session(staff_id) if staff_id else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
     if production:
@@ -139,10 +141,11 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
         found = sources.member(session_staff.ShowrunnerMember(production), record)
         if isinstance(found, session_staff.MemberFound):
             return found.row
+    error = RunOwnerUnavailable if run is not None else ValueError
     if unit or production:
-        raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
-    raise ValueError(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
-                     if run is not None else "the caller has no staff row and names no unit or production")
+        raise error(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
+    raise error(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+                if run is not None else "the caller has no staff row and names no unit or production")
 
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:

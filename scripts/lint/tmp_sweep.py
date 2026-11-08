@@ -100,15 +100,17 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
 from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.production import staff, session_staff  # noqa: E402
 from scripts.shutdown import remote
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 GIB = 1 << 30
 HOUR_SECONDS = 3600
@@ -674,17 +676,29 @@ def record_entries(directory: Path) -> list[Path]:
         return []
 
 
-def marked_runs(roots: Roots) -> dict[str, str]:
-    """Markers protect their run even when the director is paused. Read errors reach the guard."""
+@dataclass(frozen=True)
+class RunMarkers:
+    paths: dict[str, str]
+    unreadable_sessions: frozenset[str]
+
+
+def marked_runs(roots: Roots) -> RunMarkers:
+    """Read valid run paths and the session names of bad markers."""
     marked: dict[str, str] = {}
+    unreadable: set[str] = set()
     for root in roots.runs:
         for marker in record_entries(Path(root) / RUN_MARKERS):
-            with marker.open(encoding="utf-8") as handle:
-                run = handle.readline().strip()
-            if not run or not os.path.isabs(run):
-                raise ValueError(f"{marker}: expected a run path")
-            marked[os.path.realpath(run)] = marker.name
-    return marked
+            try:
+                if marker.is_file(follow_symlinks=False):
+                    with marker.open(encoding="utf-8") as handle:
+                        run = handle.readline().strip()
+                    if os.path.isabs(run):
+                        marked[os.path.realpath(run)] = marker.name
+                        continue
+            except (OSError, UnicodeError, ValueError):
+                pass
+            unreadable.add(marker.name)
+    return RunMarkers(marked, frozenset(unreadable))
 
 
 @dataclass(frozen=True)
@@ -725,6 +739,8 @@ class ReadPaneRuns(Enum):
 
 
 def read_pane_runs() -> PaneRunUse | PaneRunsUnreadable:
+    from scripts.production import staff
+
     try:
         return pane_run_use()
     except (staff.StaffUnreadable, OSError, ValueError) as error:
@@ -732,6 +748,8 @@ def read_pane_runs() -> PaneRunUse | PaneRunsUnreadable:
 
 
 def pane_run_use() -> PaneRunUse:
+    from scripts.production import staff, session_staff
+
     record = staff.snapshot()
     parents = session_staff.pane_parents(record)
     active: set[staff.StaffId] = set()
@@ -753,6 +771,8 @@ def pane_run_use() -> PaneRunUse:
 
 
 def run_pane_owner(folder: Path, use: PaneRunUse) -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    from scripts.production import staff
+
     selected = unit_runs.run_pin(folder)
     if selected == "mesh":
         return unit_runs.RunOwnerUnrecorded("mesh run")
@@ -771,13 +791,16 @@ def run_pane_owner(folder: Path, use: PaneRunUse) -> staff.StaffRow | unit_runs.
 
 
 def run_folder_guards(roots: Roots, live: frozenset[str] | None,
-                      marked: dict[str, str], workers: PaneRunUse) -> dict[str, RunKeepReason]:
+                      workers: PaneRunUse) -> dict[str, RunKeepReason]:
+    from scripts.production import staff
+
     folders = [entry.path for root in roots.runs for entry in listing(root)
                if entry.name != RUN_MARKERS and entry.is_dir(follow_symlinks=False)]
     try:
         if live is None:
             raise ValueError("session registry unreadable")
         use = session_run_use(live)
+        markers = marked_runs(roots)
     except (OSError, UnicodeError, ValueError):
         return dict.fromkeys(folders, RunKeepReason.UNREADABLE_RECORD)
     kept: dict[str, RunKeepReason] = {}
@@ -806,10 +829,14 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                     raise ValueError("run worktree unreadable")
                 if working and os.path.realpath(working) in use.worktrees:
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
-            if os.path.realpath(folder) in marked:
+            if os.path.realpath(folder) in markers.paths:
                 kept[folder] = RunKeepReason.ACTIVE_MARKER
             if folder not in kept:
-                if unit_runs.director(Path(folder), record=workers.record) in live:
+                director = unit_runs.director(Path(folder), record=workers.record)
+                if director in markers.unreadable_sessions:
+                    kept[folder] = RunKeepReason.UNREADABLE_RECORD
+                elif director in live:
+                    kept[folder] = RunKeepReason.DIRECTOR
                     kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
                 history = state["history_file"]
@@ -834,6 +861,8 @@ class WorkerUse:
 
 def worker_use(guarded: dict[str, RunKeepReason], use: PaneRunUse) -> WorkerUse:
     """Read working folders and live thread ids only from runs that must stay."""
+    from scripts.production import staff, session_staff
+
     folders: set[str] = set()
     threads: set[str] = set()
     unreadable: list[str] = []
@@ -960,7 +989,7 @@ def when(timestamp: float) -> str:
 
 
 def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None,
-                 marked: dict[str, str], *,
+                 *,
     record: staff.StaffSnapshot | PaneRunsUnreadable,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str | None:
@@ -980,11 +1009,10 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     if root in roots.runs and entry.is_dir(follow_symlinks=False):
         if isinstance(record, PaneRunsUnreadable):
             return UNREADABLE
-        names = (marked.get(os.path.realpath(entry.path)), unit_runs.director(Path(entry.path), record=record))
-        owners = {name for name in names if name}
-        if owners and live is None:
+        director = unit_runs.director(Path(entry.path), record=record)
+        if director and live is None:
             return NO_SESSIONS
-        return DIRECTOR_RUNS if live is not None and owners & live else None
+        return DIRECTOR_RUNS if live is not None and director in live else None
     return None
 
 
@@ -1033,6 +1061,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
+    from scripts.production import staff
+
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
@@ -1055,13 +1085,11 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
         if isinstance(pane_use, PaneRunsUnreadable):
             raise staff.StaffUnreadable(pane_use.reason)
-        marked = marked_runs(roots)
-        guarded = run_folder_guards(roots, live, marked, pane_use)
+        guarded = run_folder_guards(roots, live, pane_use)
         workers = worker_use(guarded, pane_use)
     except (staff.StaffUnreadable, OSError, UnicodeError, ValueError) as error:
         print(f"tmp sweep: {error}", file=sys.stderr)
         pane_use = PaneRunsUnreadable(str(error))
-        marked = {}
         guarded = {entry.path: RunKeepReason.UNREADABLE_RECORD for root in roots.runs
                    for entry in listing(root) if entry.name != RUN_MARKERS}
         workers = WorkerUse(frozenset(), frozenset(), (str(staff.record_path()),))
@@ -1073,7 +1101,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
         for entry in roots.entries(root, scratch_settings=scratch_settings):
-            reason = owner_reason(entry, root, roots, temp_live, marked,
+            reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
             if root in roots.copies and reason is None:
@@ -1106,7 +1134,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -1129,7 +1157,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
                 result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
                 return False
             pending = isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 result.keep(entry.path, git.value)
                 return False
@@ -1142,10 +1170,7 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     if not dry_run:
         try:
             path = Path(entry.path)
-            if copy_record.copy_folder(path) == path.resolve():
-                scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
-            else:
-                scratch.remove_with_cargo_output(path, lambda folder: delete_tree(str(folder)))
+            scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
         except OSError as error:
             if os.path.lexists(entry.path):
                 result.failed.append(FailedEntry(path=entry.path, error=str(error)))
@@ -1226,10 +1251,10 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
         for root in roots.runs:
             relative = Path(entry.path).relative_to(root) if Path(entry.path).is_relative_to(root) else Path()
             if relative.parts:
-                folder = Path(root) / relative.parts[0]
-                if unit_runs.run_pin(folder) == "herdr":
+                run = Path(root) / relative.parts[0]
+                if not run.is_dir(follow_symlinks=False) or unit_runs.run_pin(run) == "herdr":
                     continue
-                roster = record_object(folder / "mesh_roster.json")
+                roster = record_object(run / "mesh_roster.json")
                 if isinstance(roster, dict) and roster and all(
                         isinstance(worker, dict) and cast(dict[str, object], worker).get("status") == "ended"
                         for worker in roster.values()):

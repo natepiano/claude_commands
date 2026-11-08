@@ -14,9 +14,9 @@ from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import merge_gate
-from scripts.production.affected_modules import CertifiedBase, FullSuite, NoCertifiedBase
+from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
-from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, gate_suites
 
 
 @final
@@ -52,14 +52,88 @@ class MergeGateLedgerTests(MergeGateFixture):
                     _ = self.git(self.checkout, "add", "subject.txt")
                 elif state == "untracked":
                     _ = self.git(self.checkout, "restore", "--staged", "--worktree", "subject.txt")
-                    self.write(self.checkout / "notes", "untracked\n")
+                    self.write(self.checkout / "new file.txt", "untracked\n")
                 else:
-                    (self.checkout / "notes").unlink()
+                    (self.checkout / "new file.txt").unlink()
                     self.write(self.state / "red-hooks", "red")
                 result = self.run_gate("--tests-only")
                 self.assertEqual(result.returncode, 1 if state == "failed" else 0, result.stdout + result.stderr)
                 self.assertEqual(self.pass_records(), [])
                 self.assertTrue(self.module_events())
+                if state in {"tracked", "untracked"}:
+                    path = "subject.txt" if state == "tracked" else "new file.txt"
+                    self.assertEqual(self.gate_run_records()[-1]["dirty_paths"], [path])
+                    self.assertIn("Dirty checkout: 1 paths", result.stdout)
+
+    @gate_suites("lib", "hooks")
+    def test_full_flag_and_red_marker_force_all_modules_and_green_clears_the_marker(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        for trigger in ("--full", "red marker"):
+            with self.subTest(trigger=trigger):
+                marker = self.write_nightly_red_marker()[0]
+                if trigger == "--full":
+                    marker.unlink()
+                self.clear_gate_events()
+                result = self.run_gate("--tests-only", *(["--full"] if trigger == "--full" else []))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_all_modules_started()
+                self.assertNotIn("tests reused from", result.stdout)
+                reason = ("--full" if trigger == "--full" else
+                          "last nightly run was red (red-tree, 2026-10-29T00:00:00+00:00)")
+                self.assertIn("full suite: " + reason, result.stdout)
+                summary = next(line for line in result.stdout.splitlines() if line.startswith("Gate tests:"))
+                self.assertIn("full suite: " + reason, summary)
+                self.assertEqual(self.pass_records()[-1]["reason"], reason)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.pass_records()[-1]["kind"], "full")
+
+    @gate_suites("lib", "hooks")
+    def test_merge_gate_runs_all_modules_on_a_small_change(self) -> None:
+        subject, _ = self.prepare_affected_subject()
+        first = self.run_gate("--tests-only", "--full")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.write(subject, "VALUE = 2\n")
+        _ = self.commit(self.checkout, "subject changed")
+        self.clear_gate_events()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        record = self.gate_run_records()[-1]
+        self.assertEqual(record["step"], "merge-gate")
+        self.assertEqual(record["selection"], "full")
+
+    def test_dirty_path_record_keeps_fifty_names_and_the_total(self) -> None:
+        paths = [f"dirty-{number:02}.txt" for number in range(51)]
+        for path in paths:
+            self.write(self.checkout / path, "dirty\n")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = self.gate_run_records()[-1]
+        self.assertEqual(record["dirty_paths"], paths[:50])
+        self.assertEqual(record["dirty_path_count"], 51)
+        self.assertIn("Dirty checkout: 51 paths", result.stdout)
+        self.assert_all_modules_started()
+
+    def test_dirty_path_with_non_utf8_bytes_records_the_run_result(self) -> None:
+        path = self.checkout / os.fsdecode(b"dirty-\xff.txt")
+        self.write(path, "dirty\n")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = self.gate_run_records()[-1]
+        self.assertEqual(record["dirty_paths"], ["dirty-\ufffd.txt"])
+        self.assertEqual(record["dirty_path_count"], 1)
+        self.assertEqual(record["status"], 0)
+        self.assert_all_modules_started()
+
+    def test_staged_rename_records_the_source_and_destination_paths(self) -> None:
+        _ = self.git(self.checkout, "mv", "subject.txt", "renamed subject.txt")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = self.gate_run_records()[-1]
+        self.assertEqual(record["dirty_paths"], ["renamed subject.txt", "subject.txt"])
+        self.assertEqual(record["dirty_path_count"], 2)
+        self.assert_all_modules_started()
 
     def test_second_tests_only_run_reuses_without_starting_any_module(self) -> None:
         first = self.run_gate("--tests-only")
@@ -73,32 +147,6 @@ class MergeGateLedgerTests(MergeGateFixture):
         when = datetime.fromisoformat(cast(str, record["at"])).astimezone(
             ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
-
-    def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
-        first = self.run_gate("--tests-only")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        original, = self.pass_records()
-        self.write(self.checkout / "scripts" / "added_folder" / "test_added.py", SUITE_MODULE)
-        _ = self.commit(self.checkout, "new test folder")
-        tree = merge_gate.clean_test_tree(self.checkout)
-        folders = sorted([*self.suites, "added_folder"])
-        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", tree, folders)
-        with mock.patch.dict(os.environ, self.environment):
-            # The old full pass cannot certify an ancestor after a folder is added.
-            self.assertIsInstance(ledger.certified_base(), NoCertifiedBase)
-            # A pass from the old gate could have this same tree but omit its new folder.
-            original["tree"] = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
-            self.write(ledger.path, json.dumps(original) + "\n")
-            self.assertFalse(ledger.reuse())
-            self.assertIsInstance(ledger.certified_base(), NoCertifiedBase)
-        self.clear_gate_events()
-        result = self.run_gate("--tests-only")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("tests reused from", result.stdout)
-        self.assertIn("full suite: no certified base", result.stdout)
-        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
-        self.assertCountEqual(starts, [("hooks", "test_first.py"), ("added_folder", "test_added.py")])
-        self.assertEqual(self.pass_records()[-1]["suites"], folders)
 
     def test_checkpoint_reuses_unit_tree_and_still_runs_types(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
@@ -147,65 +195,6 @@ class MergeGateLedgerTests(MergeGateFixture):
                 self.assertNotIn("tests reused from", result.stdout)
                 self.assert_all_modules_started()
 
-    @gate_suites("lib", "hooks", "message")
-    def test_affected_modules_are_reported_run_and_recorded_without_certifying_a_full_pass(self) -> None:
-        subject = self.checkout / "scripts/hooks/affected_subject.py"
-        self.write(subject, "VALUE = 1\n")
-        test = self.checkout / "scripts/hooks/test_first.py"
-        self.write(test, "import affected_subject\n" + SUITE_MODULE)
-        base = self.commit(self.checkout, "dependency fixture")
-        first = self.run_gate("--tests-only")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.write(subject, "VALUE = 2\n")
-        _ = self.commit(self.checkout, "subject changed")
-        for _attempt in range(2):
-            self.clear_gate_events()
-            result = self.run_gate("--tests-only")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
-            self.assertEqual(starts, [("hooks", "test_first.py")])
-            self.assertIn(f"affected: 1 of {self.module_count} modules (base {base[:12]}, ", result.stdout)
-            self.assertIn("), 1 changed files\nhooks/test_first.py\n", result.stdout)
-            self.assertIn("message: skipped (not affected)", result.stdout)
-            self.assertIn("Tree-scanning modules: 0 (always affected)", result.stdout)
-            self.assertNotIn("tests reused from", result.stdout)
-        self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
-
-    def test_unrelated_change_can_pass_with_zero_selected_modules(self) -> None:
-        first = self.run_gate("--tests-only")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.write(self.checkout / "subject.txt", "unrelated document\n")
-        _ = self.commit(self.checkout, "documentation changed")
-        self.clear_gate_events()
-        result = self.run_gate("--tests-only")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"affected: 0 of {self.module_count} modules", result.stdout)
-        self.assertEqual(self.module_events(), [])
-        self.assertEqual(self.pass_records()[-1]["kind"], "affected")
-
-    @gate_suites("lib", "hooks")
-    def test_full_flag_and_red_marker_force_all_modules_and_green_clears_the_marker(self) -> None:
-        first = self.run_gate("--tests-only")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
-        for trigger in ("--full", "red marker"):
-            with self.subTest(trigger=trigger):
-                if trigger == "red marker":
-                    self.write(marker, json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"}))
-                self.clear_gate_events()
-                result = self.run_gate("--tests-only", *(["--full"] if trigger == "--full" else []))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_all_modules_started()
-                self.assertNotIn("tests reused from", result.stdout)
-                reason = ("--full" if trigger == "--full" else
-                          "last nightly run was red (red-tree, 2026-10-29T00:00:00+00:00)")
-                self.assertIn("full suite: " + reason, result.stdout)
-                summary = next(line for line in result.stdout.splitlines() if line.startswith("Gate tests:"))
-                self.assertIn("full suite: " + reason, summary)
-                self.assertEqual(self.pass_records()[-1]["reason"], reason)
-                self.assertFalse(marker.exists())
-                self.assertEqual(self.pass_records()[-1]["kind"], "full")
-
     @gate_suites("lib", "hooks")
     def test_base_search_uses_only_newest_full_same_host_suite_ancestor_and_accepts_legacy_records(self) -> None:
         ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout),
@@ -237,6 +226,36 @@ class MergeGateLedgerTests(MergeGateFixture):
             self.assertIsInstance(selected, CertifiedBase)
             assert isinstance(selected, CertifiedBase)
             self.assertEqual(selected.commit, head)
+
+    def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
+        from scripts.production import showrunners
+
+        _ = self.git(self.checkout, "rm", "Cargo.toml")
+        tip = self.commit(self.checkout, "repository without a build cache")
+        _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
+        self.write(self.state / "red-hooks", "red")
+        with mock.patch.object(showrunners, "tell", return_value="sent to quiet") as notice:
+            result = self.run_gate("--nightly")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [(suite, "test_first.py") for suite in self.suites]
+                              + ([("lib", "test_second.py")] if "lib" in self.suites else [])
+                              + [("hooks", "test_first.py")])
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        checkout = Path(type_call["cwd"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertFalse(checkout.exists())
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        record = cast(dict[str, object], json.loads(marker.read_text()))
+        tree = self.git(self.checkout, "rev-parse", f"{tip}^{{tree}}")
+        self.assertEqual(record["tree"], tree)
+        self.assertEqual(record["failed_modules"], ["hooks/test_first.py"])
+        notice.assert_called_once()
+        self.assertEqual(notice.call_args.args[:2], ("quiet", f"merge-gate-nightly:{tree}"))
+        message = cast(str, notice.call_args.args[2])
+        self.assertIn("hooks/test_first.py", message)
+        self.assertNotIn(str(checkout), message)
 
     def test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
@@ -281,7 +300,6 @@ class MergeGateLedgerTests(MergeGateFixture):
                     notice.assert_called_once()
                     self.assertEqual(notice.call_args.args[2], ["hooks/test_first.py"])
                 else:
-                    self.assertFalse(marker.exists())
                     notice.assert_not_called()
 
     def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -42,6 +44,7 @@ class WasteWatchTests(unittest.TestCase):
     docs: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     worktree: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     sends: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    models_cache: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     lookup: waste_watch.ShowrunnerLookup  # pyright: ignore[reportUninitializedInstanceVariable]
     lookups: int  # pyright: ignore[reportUninitializedInstanceVariable]
 
@@ -50,6 +53,14 @@ class WasteWatchTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "CODEX_HOME": str(self.root / ".codex")}))
+        self.models_cache = self.root / ".codex/models_cache.json"
+        self.models_cache.parent.mkdir()
+        _ = self.models_cache.write_text(json.dumps({"models": [
+            {"slug": "gpt-5.6-sol", "context_window": 272_000, "effective_context_window_percent": 95},
+            {"slug": "gpt-6.1-sol", "context_window": 500_000, "effective_context_window_percent": 95},
+        ]}), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         state = self.root / "state"
         state.mkdir()
@@ -88,13 +99,13 @@ class WasteWatchTests(unittest.TestCase):
 
     def request(self, thread: str, minute: int, uncached: int, cached: int = 0, *, activity: str = "work",
                 action: str | None = None, role: str | None = "impl", family: str = "codex",
-                folder: str | None = None, hour: int = 11) -> None:
+                folder: str | None = None, hour: int = 11, model: str = "gpt-5.6-sol") -> None:
         """gpt-5.6-sol weighs cached input 0.1 and output 8; these requests have no output."""
-        at = NOW.replace(hour=hour, minute=minute, second=0)
+        at = NOW.replace(hour=hour, minute=0, second=0) + timedelta(minutes=minute)
         with closing(sqlite3.connect(self.db_path)) as db, db:
             _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            ("natedev", family, "thread" if family == "codex" else "session", "", thread,
-                            f"{thread}.jsonl:{hour * 60 + minute:05d}", at.isoformat(), "gpt-5.6-sol", None,
+                            f"{thread}.jsonl:{hour * 60 + minute:05d}", at.isoformat(), model, None,
                             uncached, 0, 0, cached, 0, 0, role, None, "recorded", "not_applicable",
                             activity, action))
             _ = db.execute("INSERT OR IGNORE INTO folders VALUES (?,?,?,?,?)",
@@ -233,7 +244,7 @@ class WasteWatchTests(unittest.TestCase):
         _ = doc.write_text("# Loose production\n")
         owner = recorded_showrunner("loose-owner", doc)
         _ = fixture_member("unit", name="loose", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", Path("/invented/loose")))
+                           worktree=staff.PresentWorktree(remote.local_machine(), Path("/invented/loose")))
         self.request("loose", 0, 900_000, folder="/invented/loose")
         self.wait("loose", 1, 500_000, folder="/invented/loose")
         output = self.run_watch()
@@ -271,19 +282,18 @@ class WasteWatchTests(unittest.TestCase):
         self.assertEqual(list(self.alert_times()), ["alpha"])
 
     def context_requests(self, thread: str, sizes: list[int], *, role: str | None = "impl",
-                         family: str = "codex") -> None:
+                         family: str = "codex", model: str = "gpt-5.6-sol") -> None:
         for minute, size in enumerate(sizes):
-            self.request(thread, minute, 1_000, size - 1_000, role=role, family=family)
+            self.request(thread, minute, 1_000, size - 1_000, role=role, family=family, model=model, hour=10)
 
-    def test_five_requests_in_a_row_above_250000_flag_a_codex_worker(self) -> None:
+    def test_five_requests_above_the_model_limit_flag_a_codex_worker(self) -> None:
         self.context_requests("stuck-worker", [100_000, 260_000, 270_000, 280_000, 290_000, 300_000, 120_000])
         output = self.run_watch(dry_run=True)
         self.assertEqual(output.splitlines(), [
             f"waste_watch dry run: would send to {ADDRESS}:",
-            "Message from usage-waste-watch: alpha has 1 Codex worker thread whose context stayed above "
-            + "250,000 tokens for 5 or more requests in a row in the last 2 hours",
-            "Context above 250,000 tokens, so compaction is not happening:",
-            "- impl codex k-worker: 5 requests in a row, peak 300,000 tokens",
+            "Message from usage-waste-watch: alpha has 1 Codex worker thread above the model compaction limit.",
+            "Context exceeded the model compaction limit for 5 or more consecutive requests in the last 2 hours:",
+            "- impl codex k-worker: limits gpt-5.6-sol: 244,800 tokens; 5 consecutive requests; peak 300,000 tokens.",
             "See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
             + "--since 2026-10-16T10:00:00+00:00",
         ])
@@ -301,8 +311,106 @@ class WasteWatchTests(unittest.TestCase):
         self.context_requests("unassigned", [300_000] * 5, role=None)
         lines = self.run_watch(dry_run=True).splitlines()
         self.assertIn("Message from usage-waste-watch: alpha spent", lines[1])
-        self.assertIn("- unassigned codex assigned: 5 requests in a row, peak 300,000 tokens", lines)
+        self.assertIn("- unassigned codex assigned: limits gpt-5.6-sol: 244,800 tokens; "
+                      + "5 consecutive requests; peak 300,000 tokens.", lines)
         self.assertEqual(len([line for line in lines if line.startswith("waste_watch dry run")]), 1)
+
+    def test_sol_61_normal_growth_does_not_alert(self) -> None:
+        self.context_requests("5abb0b88", [343_068] * 61, model="gpt-6.1-sol")
+        self.assertEqual(waste_watch.model_context_limits()["gpt-6.1-sol"], 450_000)
+        self.assertEqual(self.run_watch(dry_run=True), "")
+        self.assertEqual(self.lookups, 0)
+
+    def test_each_thread_names_its_model_limit(self) -> None:
+        self.context_requests("small", [300_000] * 5)
+        self.context_requests("large", [460_000] * 5, model="gpt-6.1-sol")
+        output = self.run_watch(dry_run=True)
+        self.assertIn("alpha has 2 Codex worker threads", output)
+        self.assertIn("small: limits gpt-5.6-sol: 244,800 tokens", output)
+        self.assertIn("large: limits gpt-6.1-sol: 450,000 tokens", output)
+
+    def test_the_limit_itself_interrupts_a_run(self) -> None:
+        self.context_requests("boundary", [244_801] * 4 + [244_800] + [244_801] * 4)
+        self.assertEqual(self.run_watch(dry_run=True), "")
+        self.context_requests("above", [244_801] * 5)
+        self.assertIn("above: limits gpt-5.6-sol: 244,800 tokens", self.run_watch(dry_run=True))
+
+    def test_each_request_uses_its_model_and_unknown_models_interrupt_a_run(self) -> None:
+        for thread, model in (("changed", "gpt-6.1-sol"), ("unknown", "unknown-model")):
+            for minute in range(9):
+                self.request(thread, minute, 1_000, 299_000,
+                             model=model if minute == 4 else "gpt-5.6-sol")
+        self.assertEqual(self.run_watch(dry_run=True), "")
+        self.assertEqual(self.lookups, 0)
+
+    def test_one_run_can_report_limits_for_two_models(self) -> None:
+        for minute in range(10):
+            self.request("changed", minute, 1_000, 459_000,
+                         model="gpt-5.6-sol" if minute < 5 else "gpt-6.1-sol")
+        output = self.run_watch(dry_run=True)
+        self.assertIn("alpha has 1 Codex worker thread", output)
+        self.assertIn("changed: limits gpt-5.6-sol: 244,800 tokens, gpt-6.1-sol: 450,000 tokens; "
+                      + "10 consecutive requests", output)
+
+    def test_model_changes_keep_a_run_when_both_models_exceed_their_limits(self) -> None:
+        for minute in range(9):
+            self.request("changed", minute, 1_000, 459_000,
+                         model="gpt-6.1-sol" if minute == 4 else "gpt-5.6-sol")
+        output = self.run_watch(dry_run=True)
+        self.assertIn("9 consecutive requests", output)
+        self.assertIn("gpt-5.6-sol: 244,800 tokens, gpt-6.1-sol: 450,000 tokens", output)
+
+    def test_cache_limits_follow_codex_defaults_and_clamping(self) -> None:
+        models: list[dict[str, object]] = [
+            {"slug": "default", "context_window": 500_001, "effective_context_window_percent": 80},
+            {"slug": "lower", "context_window": 500_000, "auto_compact_token_limit": 200_000},
+            {"slug": "higher", "context_window": 500_000, "auto_compact_token_limit": 490_000},
+            {"slug": "maximum", "context_window": None, "max_context_window": 400_000},
+            {"slug": "null", "context_window": 500_000, "auto_compact_token_limit": None},
+            {"slug": "no-window"},
+            {"slug": "bad-window", "context_window": "500000"},
+            {"slug": "bad-limit", "context_window": 500_000, "auto_compact_token_limit": "200000"},
+            {"slug": "boolean-window", "context_window": True},
+            {"slug": "boolean-limit", "context_window": 500_000, "auto_compact_token_limit": True},
+        ]
+        _ = self.models_cache.write_text(json.dumps({"models": models}), encoding="utf-8")
+        self.assertEqual(waste_watch.model_context_limits(), {
+            "default": 450_000, "lower": 200_000, "higher": 450_000, "maximum": 360_000, "null": 450_000})
+
+    def test_unreadable_cache_values_skip_context_alerts_without_output(self) -> None:
+        self.context_requests("unknown", [900_000] * 5)
+        for document in ("", "{", "[]", '{"models": null}', '{"models": [null, {}]}',
+                         '{"models": [{"slug": "gpt-5.6-sol", "context_window": "bad"}]}'):
+            with self.subTest(document=document):
+                _ = self.models_cache.write_text(document, encoding="utf-8")
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(self.run_watch(dry_run=True), "")
+                self.assertEqual(errors.getvalue(), "")
+        self.models_cache.unlink()
+        self.assertEqual(self.run_watch(dry_run=True), "")
+
+    def test_an_unreadable_model_does_not_disable_other_models(self) -> None:
+        _ = self.models_cache.write_text(json.dumps({"models": [
+            {"slug": "gpt-5.6-sol", "context_window": 272_000},
+            {"slug": "gpt-6.1-sol"},
+        ]}), encoding="utf-8")
+        self.context_requests("known", [300_000] * 5)
+        self.context_requests("unknown", [900_000] * 5, model="gpt-6.1-sol")
+        output = self.run_watch(dry_run=True)
+        self.assertIn("alpha has 1 Codex worker thread", output)
+        self.assertIn("known: limits gpt-5.6-sol: 244,800 tokens", output)
+        self.assertNotIn("gpt-6.1-sol", output)
+
+    def test_wait_alert_still_works_without_a_models_cache(self) -> None:
+        self.models_cache.unlink()
+        self.request("worker", 0, 900_000)
+        self.wait("worker", 1, 500_000)
+        self.assertIn("alpha spent 36%", self.run_watch(dry_run=True))
+
+    def test_cache_defaults_to_the_patched_home(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_HOME": ""}):
+            self.assertEqual(waste_watch.model_context_limits()["gpt-6.1-sol"], 450_000)
 
     def test_the_command_line_dry_run_names_its_store_and_time(self) -> None:
         self.request("worker", 0, 900_000)
@@ -321,6 +429,7 @@ class CollectorWatchTests(CollectorFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}))
         environment = source_environment(self.root / "staff-sources")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))

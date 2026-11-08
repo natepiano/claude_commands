@@ -115,7 +115,7 @@ ENTRIES = (
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
         + "Coding work stays stopped until the restart succeeds.\n\n"
         + "The restart gave this error: {cause}.\n\n"
@@ -128,7 +128,7 @@ ENTRIES = (
         purpose="One restart problem sends one push with the failed session count."),
     PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
         ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /shutdown restart {account} in the natedev session."),
+                       + "Then run /agents restart {account} in the natedev session."),
         "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
         + "The first command trusts the configured folders. The second retries stopped sessions.",
         (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
@@ -151,7 +151,7 @@ ENTRIES = (
              "machine": "Mac", "source": "claude2", "target": "claude4"})),
         purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
         + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
         (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),
@@ -256,6 +256,26 @@ ENTRIES = (
         (PushExample("typical", {"machine": "natedev"}),
          PushExample("long_machine", {"machine": "macbook-workstation"})),
         purpose="All Codex agents stopped. You can redeem your usage reset now."),
+    PushText("sweep.disk_floor", "disk_floor", "decision", "natedev disk is low; builds can fail",
+        ActionTemplate("{folder_action}"),
+        "natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}",
+        (PushExample("available", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Delete ~/.local/share/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."}),
+         PushExample("unavailable", {
+            "folder_action": "In the natedev Claude session, reply measure or delete nothing.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low."}),
+         PushExample("insufficient", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "120.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "The largest folder is ~/Trash at 20.0 GiB. Deleting it frees only part of the 30.0 GiB shortfall; the natedev session lists every folder."}),
+         PushExample("protected", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
+        purpose="A low-disk alert recommends one folder for natedev review."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),

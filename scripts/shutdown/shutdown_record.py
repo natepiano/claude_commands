@@ -12,7 +12,6 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
@@ -30,6 +29,10 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         raise ValueError(f"{row.name}: the staff worktree is unavailable")
     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
         return row.doc.machine, row.doc.path.parent
+    if row.kind == "agent":
+        from scripts.shutdown import remote
+
+        return remote.local_machine(), Path.home()
     document = facts.production_doc(row)
     if isinstance(document, session_staff.ProductionDoc):
         return document.machine, document.path.parent

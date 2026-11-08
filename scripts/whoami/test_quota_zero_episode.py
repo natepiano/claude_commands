@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.production.staff_test_support import foreign_hostname
+
 import io
 import json
 import os
@@ -13,7 +14,6 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 
 from scripts.whoami import quota_alert_test_support as support
@@ -27,7 +27,9 @@ from scripts.notify.user_action import ActionRequired
 
 from scripts.whoami.quota_alert_test_support import REGISTRY
 
-setUpModule = support.setUpModule
+def setUpModule() -> None:
+    support.setUpModule()
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
@@ -498,7 +500,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         assert isinstance(push.action, ActionRequired)
         self.assertIn("use_credits: off", push.action.text)
         self.assertIn("codex1.md", push.action.text)
-        self.assertIn("natedev", push.action.text)
+        self.assertIn("gate-fixture", push.action.text)
         self.assertIn("Its plan refills", push.body)
         self.assertIn("paid credits", push.title + push.body)
         for minute in range(2, 32, 2):

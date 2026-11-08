@@ -1,13 +1,9 @@
 """Retain the launch contract and remove retired identity at caller boundaries."""
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import pane_launch
 from scripts.production import session_labels, staff
@@ -18,9 +14,9 @@ from scripts.herdr import herdr
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
-    def test_launch_retains_prefixed_environment_for_its_existing_contract(self) -> None:
+    def test_launch_does_not_retain_staff_environment(self) -> None:
         entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
-        self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
+        self.assertEqual(entry["environment"], {})
 
     def test_shutdown_launch_removes_retired_identity_before_the_locked_launch(self) -> None:
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])

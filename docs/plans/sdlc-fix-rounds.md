@@ -41,7 +41,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Measured facts (2026-10-20, `history.py phases --since 60d --sort fix_passes --status all`):** 2,896 fix passes over 839 phases, but only 1,621 ledger rounds (`finding_batch_dispatched`). Fix time is 41% of all agent time; 188 phases (11%) with ≥4 fix passes hold 75% of fix time. The top record, run `189487ea` phase `6` ("Palette rows highlight the matched letters", rich-text-plan), shows 70 fix passes and 2 ledger rounds over 8 days. Its pass activities name Phases 7 and 14 and merge work, so the record holds work from several phases. A fix-pass count is therefore not a repair-round count, and a `(run, phase)` record is not always one phase.
 - **Test lanes:** `scripts/history/` — `test_*.py` beside the module (none yet; Phase 1 adds `test_rounds.py`); markdown files — none.
 - **Build:** none (Python and markdown).
-- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root. Then the merge gate from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`.
+- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root.
+  Then run the targeted test from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`.
 - **Lint:** `basedpyright scripts/history` from the worktree root; pass is its `0 errors, 0 warnings` line (exit status says nothing).
 - **Invariants:**
   - `/history` reads only; it never writes a run record (`commands/history.md`, repository rule).
@@ -275,7 +276,7 @@ Design from the sdlc showrunner:
 
 **Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
 
-### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: in progress
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: done
 
 From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
 
@@ -284,6 +285,8 @@ From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-
 - One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
 - `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
 - After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+Landed on main in 9aa3b5526 (2fc784207), folded into the fix-rounds branch. devtools 8l keeps the staff row at `codex_mesh end`, so end stops the last worker's server and does not call `staff.retire`. The sweep on 2026-11-07 retired all 24 astra-reviewer rows through `staff.py retire`; none had a live process.
 
 ### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
 
@@ -347,3 +350,79 @@ The branch changes neither folder. The cause is a shared path the branch changes
 Cause: neither test failure came from this branch. `test_restart` read the live Astra root, because its fixture patched `unit_runs.run_roots` but not `unit_runs.ASTRA_RUN_ROOT`. Under load, `codex_mesh._reap` returned success while a zombie child app-server was not yet waitable, so end-friend left the consultation server alive. The fixture now patches the Astra root, and only `waitpid` confirms a child exit.
 
 The phase also folds retire-servers `7c0e6596f` (Phase 9r) into this branch. devtools 8l keeps the staff row at `codex_mesh end`, so the merge keeps the last-worker server reap and drops the retire call. The reap now also runs when an end of the last worker fails after it publishes `ended`. `scripts/message/morty_identity.py` holds the `MORTY_NATIVE_ID` rule for `send` and `session_staff`, which breaks the send → roster → session_staff → send import cycle.
+
+### Phase 10b — Git proves that a shrink's code checkpoint merged  · status: done
+
+From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink unless `merged_checkpoints` finds a `progress_history` checkpoint event for the phase. Today it held two shrinks whose code checkpoint was on sdlc:
+
+1. shutdown resume-codex-by-name: the phase ran on another branch, so its event names another worktree.
+2. herdr 21: the code checkpoint is the top hash, and it has no event.
+
+Git proves the merge. A shrink passes when its parent commit is an ancestor of the merge branch. This path no longer reads events. Add no new check. Add one test for each case.
+
+As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.
+
+### Phase 10c — `/unit:direct` loads a core and reads other sections when they apply  · status: done
+
+From the user, through accounts and the sdlc showrunner, 2026-11-07 15:10 EST: "tell sdlc to cut direct.md down to the core so that it loads other instructions as it needs them". A director reads `commands/unit/direct.md` (116 KB, about 29k tokens) again after each compaction. A core of 30-40 KB saves about 20k tokens per cycle.
+
+1. Keep in the core only what every run needs. Move each section that only one mode or one moment needs to its own file under `docs/direct/`. Use the existing `<TagReferenceContract/>` stub pattern: a table row and a stub that names the file and the moment to read it.
+2. Move text; do not copy it. Each rule stays in one place.
+3. The compaction hooks and `<CompactionContract/>` name the core and the stub files that a live moment needs.
+4. herdr edits `direct.md` after this phase lands. herdr moves its later edits into the new layout.
+
+The moved groups:
+
+| New file | Sections | Read when |
+| --- | --- | --- |
+| `repair_rounds.md` | FindingsLedger, PassOwnership, Synthesize, FixDispatch | a review, gate or verification result returns; before each repair dispatch |
+| `early_review.md` | EarlyReviewArm | at each implementation or fix dispatch |
+| `phase_reservation.md` | PhaseReservationContract, RetainPhaseReservation, CoordinatePhaseReservation | at phase start, at checkpoint release, and after compaction with a live reservation |
+| `verification.md` | VerificationContract, VerificationNarration | before a verification run |
+| `ux_review.md` | UXReview, RunApplicationSmokeTest | when a phase has a UX review or an application smoke test |
+| `launch_failure.md` | WorkerLaunchFailure | when a dispatch fails |
+| `authorization.md` | AuthorizationContract | when an action needs user authorization |
+| `held_astra_roles.md` | HeldAstraRoles | when the run holds an Astra role |
+| `standing_plan_refill.md` | StandingPlanRefill | when the plan header carries `**Standing:**` |
+| `berth_decisions.md` | BerthDecisions | when a cargo-berth decision applies |
+| `codex_dispatch_wait.md` | CodexDispatchWait | when the director is Codex |
+| `final_gate_commit.md` (exists) | FinalGate, RunSummary | at the final gate |
+
+As built: the core is 45 KB, not 30-40 KB. The five largest core sections are needed by every run, so they stay. Each moved group has one stub and one `<TagReferenceContract/>` row, so `_contract_revision` and `tag_inventory.py` cover every new file. After compaction, the hooks say to read the core in full, then each stub file whose moment is live.
+
+### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: done
+**Depends on:** Phase 10c
+
+From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges main, `merge_checkpoint` adds a row for every Change-Review line in the merged commits, with builds as Producer. So rows C1179-C1183 (merge 429d1528) show the builds session, and the user asks builds about sdlc work.
+
+Fix where the rows are made:
+1. A merge adds rows only for its own production's checkpoints.
+2. Each row's Producer is the unit that made the checkpoint.
+3. Each row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint.
+
+The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not natedev - it got renamed but whatever - the fix needs to keep changes in the production that made them based on the id of the showruner for that production". So a merged row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint, not the production that merges it. Example: shutdown's 9e8e10895 (subject natedev-shutdown), rows C1195-C1197, landed in builds; they belong to sdlc.
+
+Add no new check.
+
+As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone. `merge_gate.py --promote-only` locks and scans the promoted main repository, not the working directory it runs from.
+
+### Phase 10e — Two test rules in the direct contract  · status: done
+**Depends on:** Phase 10c (it moves FixDispatch)
+
+From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's words: "do rules 1 and 2"). The suite grew from 263 tests (Oct 1) to 18,879 (Nov 7), with one narrow test for each review finding.
+
+1. A fix adds its case to the existing test of the same behavior (a table row), not a new test method. Add a new test only when no test covers the behavior.
+2. Write or keep a rare-case test (an edge case, a refusal, malformed input, a failure path) only when its defect would show the user a wrong result, damage saved state (a file, Git, a ledger, staff, a config), or lose work (a commit, an edit, a message, a worker result). Every main-path test stays.
+
+Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
+
+As built: both rules are in `docs/direct/write_prompt_contract.md` item 6, which implementation, fix and test prompts carry verbatim. FixDispatch, the main-read closure check and `<ClosureReview/>` ask for coverage under item 6, not one new regression test for each finding. The test worker paragraph points to item 6.
+
+### Phase 10f — A checkpoint named for its plan without "-plan" gets its Producer  · status: done
+**Depends on:** Phase 10d
+
+From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` printed `no staff row for unit info-panels; Producer stays empty` for demo's rows. demo's plan is `docs/hana/info-panels-plan.md`, its branch is `tool-based-ui-demo-36`, and it commits `checkpoint(info-panels): …`. The checkpoint aliases hold the plan stem (`info-panels-plan`), not the stem without `-plan`. Hana's main uses both forms for one plan: `info-panels-plan` and `info-panels`, `widget-enhancements-plan` and `widget-enhancements`.
+
+Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
+
+As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.

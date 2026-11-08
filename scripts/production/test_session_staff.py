@@ -15,7 +15,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.herdr.pane_launch import PaneLaunch
 
 
@@ -31,18 +31,65 @@ class StatusDiscoveryTests(StaffTestCase):
 
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
         from scripts.shutdown import pane_record
+        from scripts.shutdown.launch_names import LaunchNames
 
         fixture = self.row_production()
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
                                    {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
         launch["environment"] = {"CODEX_HOME": launch["config_dir"],
                                  "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
-        membership = labels.LaunchMembership(staff.snapshot(), labels.MemberSources(()))
+        names = LaunchNames(staff.snapshot())
         before = self.staff_state()
-        self.assertEqual(membership.environment(launch), {
+        self.assertEqual(names.environment(launch), {
             "CODEX_HOME": launch["config_dir"], "CODEX_THREAD_ID": fixture.unit.current_session,
         })
         self.assertEqual(self.staff_state(), before)
+
+    def test_pane_publication_keeps_the_staff_reference_and_pane_data(self) -> None:
+        fixture = self.row_production()
+        entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
+            {"SHOWRUNNER_UNIT": "old"}, ["claude", "--model", "sonnet"])
+        self.assertEqual(entry["environment"], {})
+        entry["environment"] = {"STAFF_ID": fixture.unit.id,
+            "CLAUDE_CODE_SESSION_ID": fixture.unit.current_session, "ENABLE_TOOL_SEARCH": "true"}
+        entry["pid"], entry["proc_start"] = 123, "start"
+        path = self.root / "panes.json"
+        pane_launch.write(path, entry)
+        saved = pane_launch.read_strict(path)["w1:p1"]
+        self.assertEqual(saved, {**entry, "session_id": fixture.unit.id})
+        self.assertEqual(entry["session_id"], fixture.unit.current_session)
+
+    def test_record_membership_derives_staff_marks_only_at_launch(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.shutdown.launch_names import LaunchNames
+
+        fixture = self.row_production()
+        entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
+            {}, ["claude", "--model", "sonnet"])
+        with mock.patch.object(pane_record, "launches", return_value=[]):
+            saved = labels.record_membership(entry)
+            self.assertEqual(saved, entry)
+            self.assertEqual(LaunchNames(staff.snapshot()).environment(saved),
+                             {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session})
+
+    def test_repair_removes_saved_staff_marks_and_keeps_pane_data(self) -> None:
+        from scripts.message import sessions
+        from scripts.shutdown import pane_record
+
+        fixture = self.row_production()
+        entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
+                                  {}, ["claude", "--model", "sonnet"])
+        entry["environment"] = {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
+                                "STAFF_ID": fixture.unit.id, "ENABLE_TOOL_SEARCH": "true"}
+        directory = self.root / "retained"
+        path = directory / "agents.json"
+        write_text_atomic(path, json.dumps({"w1:p1": entry}))
+        with (mock.patch.object(pane_record, "RECORD_DIR", directory),
+              mock.patch.object(sessions, "running_sessions", return_value=[])):
+            self.assertEqual(len(labels.repair_marks()), 1)
+            saved = pane_record.read_strict("agents")["w1:p1"]
+            self.assertEqual(saved, {**entry, "environment": {"ENABLE_TOOL_SEARCH": "true"}})
+            self.assertEqual(labels.repair_marks(), [])
 
     def test_pane_parents_selects_only_local_pane_workers_from_the_record(self) -> None:
         config, runs = self.root / "config", self.root / "runs"
@@ -168,7 +215,7 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(grouped.status_units("show"), {row.name: replace(observed[1], unit=row.name)})
 
     def test_unreadable_session_record_keeps_placement_and_reports_one_failure(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
         from scripts.message import sessions
 
         row = unit_membership("show", "unit")
@@ -177,7 +224,7 @@ class StatusDiscoveryTests(StaffTestCase):
         errors = StringIO()
         with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
               mock.patch.object(herdr, "herdr_processes", return_value=processes),
-              mock.patch("unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
+              mock.patch("scripts.production.unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
               redirect_stderr(errors), labels.anomalies() as lines):
             observed = unit_lookup.observed_session_labels(record=staff.snapshot())
             grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(), sources=labels.MemberSources(()))

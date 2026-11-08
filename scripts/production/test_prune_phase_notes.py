@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import os
 import subprocess
 import sys
@@ -59,9 +61,9 @@ class PrunePhaseNotesTests(unittest.TestCase):
         )), encoding="utf-8")
         self.timer(name, doc)
         unit = unit_membership(name, "alpha")
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree(remote.local_machine(), alpha), expected=unit.worktree)
         retired = unit_membership(name, "beta")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / f"{name}-beta"),
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree(remote.local_machine(), self.root / f"{name}-beta"),
                                expected=retired.worktree)
         return doc
 

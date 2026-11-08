@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from datetime import datetime, timedelta, timezone
 import json
 import unittest
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):

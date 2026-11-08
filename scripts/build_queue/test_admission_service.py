@@ -25,24 +25,18 @@ import threading
 import time
 import subprocess
 import unittest
-from typing import TYPE_CHECKING, cast, override
+from types import ModuleType
+from typing import cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
 from scripts.accounts import outage_alerts
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
-else:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
+from scripts.buildlog import store
+from scripts.buildlog import record as buildlog_record
 
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    from scripts.lib import conf
+from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
@@ -61,6 +55,500 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, In
 
 def setUpModule() -> None:
     forbid_real_sender()
+
+
+class ImportTests(unittest.TestCase):
+    def test_clean_import_omits_cli_and_reading_alert_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.build_queue import admission_service; "
+                 + "assert not {'argparse', 'scripts.message.send_budget', 'scripts.message.send_result', "
+                 + "'scripts.message.session_send'}.intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class FixedSystemReader:
+    """Publish private evidence without an operating-system reader."""
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class ReplyPublicationTests(unittest.TestCase):
+    def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.hold_starts()
+            _ = fixture.server.handle_request(fixture.request())
+            server = fixture.server
+            inputs, result, policy = server.last_inputs, server.last_result, server.last_policy
+            assert isinstance(inputs, gate.QueueInputs)
+            assert isinstance(result, gate.PassResult)
+            assert isinstance(policy, gate.AdmissionPolicy)
+            reading = replace(gate.queue_read_from_pass(inputs, policy, result), diagnostics=server.last_diagnostics)
+            expected_view = wire.encode_reply(wire.ViewReply(reading)).encode()
+            expected_explain = wire.encode_reply(wire.ExplainReply(reading.explanation, reading.diagnostics)).encode()
+            with mock.patch.object(wire, "encode_reply", wraps=wire.encode_reply) as encode:
+                _ = server.run_pass()
+                encode.assert_not_called()
+                view, = server.handle_request(wire.ViewRequest())
+                explain, = server.handle_request(wire.ExplainRequest())
+                self.assertEqual(server.reply_bytes(view), expected_view)
+                self.assertEqual(server.reply_bytes(explain), expected_explain)
+                self.assertEqual(encode.call_count, 2)
+                encode.reset_mock()
+                self.assertEqual(server.reply_bytes(view), expected_view)
+                self.assertEqual(server.reply_bytes(explain), expected_explain)
+                encode.assert_not_called()
+
+    def test_pending_configuration_uses_new_values_with_the_published_reading(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            reader = FixedSystemReader(evidence)
+            server.system_reader = reader
+            configuration = server.configuration
+            assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+            policy = replace(configuration.config.policy, safety_bytes=9 * GIB)
+            server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
+            reply, = server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual(reply.reading.explanation.policy.safety_bytes, 9 * GIB)
+            self.assertEqual(server.reply_bytes(reply), wire.encode_reply(reply).encode())
+            self.assertIsInstance(server.pending_configuration, service.NoPass)
+
+    def test_pass_uses_the_reader_evidence_without_operating_system_reads(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            _ = fixture.server.handle_request(fixture.request())
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            reader = FixedSystemReader(replace(evidence, host=gate.HostMemory(7 * GIB, 64 * GIB)))
+            server.system_reader = reader
+            with mock.patch.object(fixture.proc, "processes", side_effect=AssertionError("process table read")), mock.patch.object(
+                    fixture.proc, "owner_start", side_effect=AssertionError("owner read")), mock.patch.object(
+                    fixture.proc, "lifetime", side_effect=AssertionError("scope read")), mock.patch.object(
+                    fixture.readings, "host", side_effect=AssertionError("memory read")), mock.patch.object(
+                    fixture.readings, "pressure", side_effect=AssertionError("pressure read")), mock.patch.object(
+                    service, "ScopeActivityReader", side_effect=AssertionError("activity read")):
+                _ = server.run_pass()
+            inputs = server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            self.assertEqual(inputs.host, reader.latest.host)
+            self.assertTrue(reader.plans)
+            used_evidence = server.system_evidence
+            assert isinstance(used_evidence, service.SystemEvidence)
+            self.assertEqual(used_evidence.read_at, evidence.read_at)
+
+    def test_reader_publishes_a_complete_reading_and_wakes_the_loop(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, gate.MemoryConfig)
+            expected_plan = service.SystemReadingPlan(replace(config,
+                running_pass_seconds=0.001, waiting_pass_seconds=0.001), (), (), False)
+            entered = threading.Event()
+            release = threading.Event()
+            updated = replace(initial, read_at=initial.read_at + 1,
+                              host=gate.HostMemory(2 * GIB, 64 * GIB))
+            threads: list[int] = []
+
+            def read(plan: service.SystemReadingPlan, readings: service.Readings,
+                     proc: service.Proc, clock: service.Clock) -> service.SystemEvidence:
+                self.assertEqual(plan, expected_plan)
+                self.assertIs(readings, fixture.readings)
+                self.assertIs(proc, fixture.proc)
+                self.assertIs(clock, fixture.clock)
+                threads.append(threading.get_ident())
+                entered.set()
+                if not release.wait(3):
+                    raise AssertionError("the test did not release the reader")
+                return updated
+
+            with mock.patch.object(service, "read_system", side_effect=read):
+                reader = service.OperatingSystemReader(expected_plan, initial, fixture.readings,
+                    fixture.proc, fixture.clock, server.reading_events)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    self.assertIs(reader.latest, initial)
+                    release.set()
+                    self.assertTrue(select.select([server.reading_events], [], [], 3)[0])
+                    self.assertIs(reader.latest, updated)
+                    self.assertTrue(threads)
+                    self.assertTrue(all(identity != threading.get_ident() for identity in threads))
+                finally:
+                    release.set()
+                    reader.close()
+
+    def test_mine_keeps_the_full_reading_and_reuses_view_bytes(self) -> None:
+        with AdmissionFixture() as fixture:
+            first = fixture.request()
+            _ = fixture.server.handle_request(first)
+            fixture.free(0)
+            second = fixture.request()
+            second = replace(second, identity=replace(second.identity, session_id="other-session"))
+            _ = fixture.server.handle_request(second)
+            server = fixture.server
+            own, = server.handle_request(wire.MineRequest(first.identity.session_id))
+            view, = server.handle_request(wire.ViewRequest())
+            assert isinstance(own, wire.MineReply)
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual(own.reading, view.reading)
+            expected = wire.encode_reply(own).encode()
+            _ = server.reply_bytes(view)
+            with mock.patch.object(wire, "encode_reply", side_effect=AssertionError("Mine repeated the encoding")):
+                self.assertEqual(server.reply_bytes(own), expected)
+                other, = server.handle_request(wire.MineRequest("other-session"))
+                self.assertEqual(server.reply_bytes(other), expected)
+            self.assertIn(b"other-session", expected)
+
+    def test_reader_starts_when_an_unusable_configuration_becomes_usable(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            usable = server.configuration
+            initial = server.system_evidence
+            assert isinstance(initial, service.SystemEvidence)
+            server.configuration = gate.UnusableAdmissionConfiguration("private invalid configuration")
+            server.last_usable_configuration = service.NoPass()
+            server.system_evidence = service.NoPass()
+            reader = FixedSystemReader(initial)
+            with mock.patch.object(service, "OperatingSystemReader", return_value=reader) as start:
+                server.start_reader()
+                start.assert_not_called()
+                server.pending_configuration = usable
+                _ = server.run_pass()
+                start.assert_called_once()
+                self.assertIs(server.system_reader, reader)
+                self.assertTrue(reader.plans)
+
+    def test_reader_sends_a_failure_to_the_pass_and_continues_after_an_early_read(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, gate.MemoryConfig)
+            plan = service.SystemReadingPlan(replace(config, running_pass_seconds=3600), (), (), False)
+            failure = OSError("private memory read failed")
+            updated = replace(initial, read_at=initial.read_at + 1)
+            with mock.patch.object(service, "read_system", side_effect=[failure, updated]) as read:
+                reader = service.OperatingSystemReader(plan, initial, fixture.readings,
+                    fixture.proc, fixture.clock, server.reading_events)
+                server.system_reader = reader
+                try:
+                    reader.request_read()
+                    self.assertTrue(select.select([server.reading_events], [], [], 3)[0])
+                    _ = os.eventfd_read(server.reading_events)
+                    with self.assertRaises(OSError) as raised:
+                        _ = server.run_pass()
+                    self.assertIs(raised.exception, failure)
+                    self.assertTrue(reader.thread.is_alive())
+                    reader.request_read()
+                    self.assertTrue(select.select([server.reading_events], [], [], 3)[0])
+                    _ = os.eventfd_read(server.reading_events)
+                    _ = server.run_pass()
+                    self.assertEqual(server.system_evidence, updated)
+                    self.assertEqual(read.call_count, 2)
+                finally:
+                    reader.close()
+
+    def test_unknown_admit_and_launch_owners_request_one_early_read(self) -> None:
+        for launch in (False, True):
+            with self.subTest(launch=launch), AdmissionFixture() as fixture:
+                server = fixture.server
+                initial = server.system_evidence
+                config = server.last_usable_configuration
+                assert isinstance(initial, service.SystemEvidence)
+                assert isinstance(config, gate.MemoryConfig)
+                reader = FixedSystemReader(initial)
+                server.system_reader = reader
+                request = fixture.launch() if launch else fixture.request()
+                self.assertNotIn(request.owner.pid, initial.processes)
+                peer = fixture.connect(request)
+                self.assertEqual(peer.replies(), [])
+                self.assertEqual(reader.requests, 1)
+                self.assertEqual(len(server.deferred_requests), 1)
+                reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                    fixture.readings, fixture.proc, fixture.clock)
+                os.eventfd_write(server.reading_events, 1)
+                replies = peer.replies()
+                self.assertTrue(replies)
+                self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies))
+                self.assertFalse(server.deferred_requests)
+                self.assertEqual(reader.requests, 1)
+
+    def test_refused_deferred_connection_cannot_admit_on_a_later_read(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, gate.MemoryConfig)
+            reader = FixedSystemReader(initial)
+            server.system_reader = reader
+            request = fixture.request()
+            peer = fixture.connect(request)
+            self.assertEqual(peer.replies(), [])
+            self.assertEqual(len(server.deferred_requests), 1)
+            connection = next(iter(server.connections.values()))
+            peer.socket.sendall(wire.encode_request(wire.ViewRequest()).encode())
+            server.run_once(0)
+            self.assertTrue(connection.finished)
+            self.assertIn(b"one request", connection.sending)
+            self.assertFalse(server.deferred_requests)
+            reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            os.eventfd_write(server.reading_events, 1)
+            server.run_once(0)
+            self.assertNotIn(request.episode, server.reservations)
+            self.assertNotIn(request.episode, server.ledger)
+            self.assertFalse(server.deferred_requests)
+            replies = peer.replies()
+            self.assertEqual(len(replies), 1)
+            self.assertIsInstance(replies[0], wire.Refused)
+
+    def test_reused_pid_defers_until_the_reader_has_the_current_owner_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            config = server.last_usable_configuration
+            assert isinstance(config, gate.MemoryConfig)
+            request = fixture.request()
+            current = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            processes = dict(current.processes)
+            process = processes[request.owner.pid]
+            processes[request.owner.pid] = replace(process, start="previous-process-start")
+            reader = FixedSystemReader(replace(current, processes=processes))
+            server.system_reader = reader
+            peer = fixture.connect(request)
+            self.assertEqual(peer.replies(), [])
+            self.assertEqual(reader.requests, 1)
+            self.assertEqual(len(server.deferred_requests), 1)
+            self.assertNotIn(request.episode, server.ledger)
+            reader.latest = current
+            os.eventfd_write(server.reading_events, 1)
+            replies = peer.replies()
+            self.assertTrue(replies)
+            self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies))
+            self.assertFalse(server.deferred_requests)
+
+    def test_pending_peak_hold_restores_the_charge_from_the_same_raw_reading(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(peak_hold_seconds=1)
+            request = fixture.request(need=8 * GIB)
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, 8 * GIB)
+            record = fixture.server.reservations[request.episode]
+            _ = Path(record.path).with_suffix(".wave").write_text(f"{8 * GIB} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(10)
+            server = fixture.server
+            _ = server.run_pass()
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            server.system_reader = FixedSystemReader(evidence)
+            configuration = server.configuration
+            assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+            policy = replace(configuration.config.policy, peak_hold=gate.PeakHold(1000))
+            server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
+            reply, = server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            inputs = server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            memory, = (step.measured for step in inputs.running if gate.running_has_reservation(step))
+            assert isinstance(memory, gate.MeasuredMemory)
+            self.assertEqual(memory.observed_peak, 8 * GIB)
+
+    def test_width_change_uses_the_current_frozen_need_with_the_same_raw_reading(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(need=12 * GIB)
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            server = fixture.server
+            old_need = gate.TestPhaseNeed(GIB, 1, 8, 8, "same_width", 1.0)
+            record = replace(server.reservations[request.episode], test_phase_need=old_need)
+            server.reservations[request.episode] = record
+            phase = gate.test_phase_path(service.reservation_row(record))
+            assert isinstance(phase, Path)
+            _ = phase.write_text(wire.encode_record({"test_phase_peak_bytes": GIB,
+                "test_phase_started_at": fixture.clock.now(), "test_threads": 8,
+                "call_id": "call-1", "test_scope": "full", "repo_identity": "fixture",
+                "package": "", "filters": []}))
+            _ = server.run_pass()
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            server.system_reader = FixedSystemReader(evidence)
+            new_need = gate.TestPhaseNeed(8 * GIB, 1, 16, 8, "scaled_up", 1.0)
+            with mock.patch.object(gate, "test_phase_need", return_value=new_need):
+                self.assertEqual(server.handle_request(wire.WidthRequest("review-width", grant.reservation, 16)), [wire.Ok()])
+            self.assertEqual(server.reservations[request.episode].test_phase_need, new_need)
+            _ = server.run_pass()
+            inputs = server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            memory, = (step.measured for step in inputs.running if gate.running_has_reservation(step))
+            assert isinstance(memory, gate.MeasuredMemory)
+            self.assertIsInstance(memory.peak_history, gate.TestPhaseStarted)
+            assert isinstance(memory.peak_history, gate.TestPhaseStarted)
+            self.assertEqual(memory.peak_history.need, new_need)
+            fixture.free(6 * GIB)
+            fixture.allow_next_start()
+            following = fixture.request(need=4 * GIB)
+            config = server.last_usable_configuration
+            assert isinstance(config, gate.MemoryConfig)
+            assert isinstance(server.system_reader, FixedSystemReader)
+            fresh = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            server.system_reader.latest = replace(fresh, reservations=evidence.reservations)
+            replies = server.handle_request(following)
+            self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies))
+            self.assertFalse(any(isinstance(reply, wire.Admitted) for reply in replies))
+
+    def test_read_started_before_the_request_does_not_refuse_a_new_owner(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            evidence = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(evidence, service.SystemEvidence)
+            assert isinstance(config, gate.MemoryConfig)
+            reader = FixedSystemReader(evidence)
+            server.system_reader = reader
+            fixture.clock.advance(1)
+            request = fixture.request()
+            peer = fixture.connect(request)
+            self.assertEqual(peer.replies(), [])
+            reader.latest = replace(evidence, read_at=fixture.clock.now())
+            os.eventfd_write(server.reading_events, 1)
+            self.assertEqual(peer.replies(), [])
+            self.assertEqual(len(server.deferred_requests), 1)
+            self.assertNotIn(request.episode, server.ledger)
+            fixture.clock.advance(1)
+            reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            os.eventfd_write(server.reading_events, 1)
+            replies = peer.replies()
+            self.assertTrue(replies)
+            self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies))
+
+    def test_waiting_cadence_wakes_a_reader_in_its_running_delay(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, gate.MemoryConfig)
+            plan = service.SystemReadingPlan(replace(config,
+                running_pass_seconds=5, waiting_pass_seconds=1), (), (), False)
+            with mock.patch.object(threading.Thread, "start"):
+                reader = service.OperatingSystemReader(plan, initial, fixture.readings,
+                    fixture.proc, fixture.clock, server.reading_events)
+            started: list[float] = []
+
+            def delay(seconds: float) -> bool:
+                self.assertEqual(seconds, 5)
+                reader.update(replace(plan, waiting=True))
+                fixture.clock.advance(1 if reader.requested.is_set() else seconds)
+                return reader.requested.is_set()
+
+            def read(*_args: object) -> service.SystemEvidence:
+                started.append(fixture.clock.monotonic())
+                reader.stopped.set()
+                return initial
+
+            with mock.patch.object(reader.requested, "wait", side_effect=delay), mock.patch.object(
+                    service, "read_system", side_effect=read):
+                reader.thread.run()
+            self.assertEqual(started, [1])
+
+    def test_raw_reader_does_not_apply_reservation_policy(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(need=8 * GIB)
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, 8 * GIB)
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, gate.MemoryConfig)
+            record = fixture.server.reservations[request.episode]
+            plan = service.SystemReadingPlan(config, (record,), (), False)
+            with mock.patch.object(gate, "reservation_memory", side_effect=AssertionError("reservation policy")), mock.patch.object(
+                    gate, "step_promise", side_effect=AssertionError("reservation promise")), mock.patch.object(
+                    gate, "test_phase_history", side_effect=AssertionError("test-phase policy")):
+                reading = service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            memory = reading.reservations[request.episode].memory
+            assert isinstance(memory, gate.MeasuredMemory)
+            self.assertEqual(memory.promise, gate.NoPromise())
+            self.assertEqual(memory.observed_peak, 0)
+            self.assertEqual(reading.started_monotonic, fixture.clock.monotonic())
+            self.assertEqual(service.reservation_charge(reading.reservations[request.episode],
+                service.reservation_row(record), fixture.clock.now(), config.policy),
+                gate.reservation_memory(Path(record.path), service.reservation_row(record),
+                    datetime.fromtimestamp(fixture.clock.now()), fixture.proc.processes(), fixture.proc.path, config.policy))
+
+    def test_persist_matches_full_encoding_after_each_durable_change(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+
+            def assert_full_state() -> None:
+                expected = service.ServiceState(server.reservations, server.places, server.ledger,
+                    server.spacing, server.override, server.priority, server.build_history_generation,
+                    server.run_places, server.caller_versions, server.lifecycle_outbox)
+                self.assertEqual((fixture.state_dir / "state.json").read_text(), wire.encode_record(expected))
+
+            assert_full_state()
+            request = fixture.request()
+            grant = only_admitted(server.handle_request(request))
+            assert_full_state()
+            _ = server.handle_request(wire.WidthRequest("cached-width", grant.reservation, 3))
+            assert_full_state()
+            record = server.reservations[request.episode]
+            record.queue_waiter["session_name"] = "changed nested value"
+            server.persist()
+            assert_full_state()
+            _ = server.handle_request(wire.TokenWaitRequest("cached-token", grant.reservation))
+            assert_full_state()
+            fixture.allow_next_start()
+            next_request = fixture.request()
+            next_grant = only_admitted(server.handle_request(next_request))
+            _ = server.handle_request(wire.ReleaseRequest("cached-release", next_grant.reservation, 0))
+            assert_full_state()
+            _ = server.handle_request(wire.PriorityClearRequest("cached-priority", "fixture"))
+            assert_full_state()
+
+    def test_unchanged_persist_does_not_encode_durable_records_again(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = fixture.server.handle_request(fixture.request())
+            ledger = tuple(fixture.server.ledger.values())
+            encode = wire.encode_record
+            seen: list[object] = []
+
+            def observe(value: object) -> str:
+                seen.append(value)
+                return encode(value)
+
+            with mock.patch.object(wire, "encode_record", side_effect=observe):
+                fixture.server.persist()
+            self.assertFalse(seen)
+            self.assertEqual(tuple(fixture.server.ledger.values()), ledger)
 
 
 class RunnerAuthorizationTests(unittest.TestCase):
@@ -664,6 +1152,63 @@ class OutageClaimTests(unittest.TestCase):
 
 
 class ProgressProfileServiceTests(unittest.TestCase):
+    def test_configured_rank_sets_the_remaining_memory_need(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            write_memory_config(fixture.root / "build_admission.conf", progress_profile_rank="2")
+            owner = fixture.proc.spawn(used=GIB)
+            sidecar = fixture.scope(owner, current=GIB, anonymous=GIB)
+            request = replace(fixture.request(owner=owner, step="build", need=10 * GIB), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            row = service.reservation_row(fixture.server.reservations[request.episode])
+            key = gate.reservation_profile_key(row, fixture.server.host)
+            for index, need in enumerate((9 * GIB, 3 * GIB, 6 * GIB)):
+                for done in range(0, 100, 5):
+                    fixture.server.progress_history.observe(f"previous-{index}", key,
+                        progress.ProgressCounter("build:1", done, 100), need, fixture.clock.now())
+                fixture.server.progress_history.finish(f"previous-{index}", fixture.clock.now(), fixture.clock.now() - 1)
+            progress.publish_counter(sidecar, progress.ProgressCounter("build:1", 50, 100))
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            room = reply.reading.explanation.room
+            assert isinstance(room, records.MemoryRoom)
+            hold, = room.runs
+            self.assertEqual(hold.memory.need, 6 * GIB)
+            self.assertEqual(hold.bytes, 5 * GIB)
+            fixture.release(grant)
+
+    def test_saved_highest_bin_names_the_scope_processes_and_reading_source(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            owner = fixture.proc.spawn(used=GIB // 4)
+            helper = fixture.proc.spawn(used=11 * GIB // 4)
+            helper_proc = fixture.proc.path / str(helper.pid)
+            _ = (helper_proc / "cmdline").write_bytes(b"rustc-outlier\0--private-fixture\0")
+            _ = (helper_proc / "comm").write_text("rustc-outlier\n")
+            sidecar = fixture.scope(owner, members=(owner.pid, helper.pid), current=4 * GIB, anonymous=3 * GIB)
+            scope = Path(sidecar.read_text().strip())
+            request = replace(fixture.request(owner=owner, step="merge-gate", need=4 * GIB), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 20, 100))
+            _ = fixture.run_pass()
+            _ = (scope / "cgroup.procs").write_text(f"{owner.pid}\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
+            progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 80, 100))
+            _ = fixture.run_pass()
+            fixture.release(grant)
+            path, = fixture.server.progress_history.root.glob("*/*.json")
+            record = progress.read_profile_record(path)
+            assert isinstance(record, progress.RecordedProfile)
+            self.assertEqual(record.profile.phases[0].bins[4], 3 * GIB)
+            self.assertEqual(record.profile.phases[0].bins[16], GIB)
+            self.assertEqual(record.reading_source, progress.ScopeReading(scope))
+            peak = record.peak_processes
+            assert isinstance(peak, progress.PeakProcesses)
+            self.assertEqual((peak.phase, peak.bin, peak.anonymous_bytes), ("suites:1", 4, 3 * GIB))
+            self.assertEqual({process.pid for process in peak.processes}, {owner.pid, helper.pid})
+            helper_sample, = (process for process in peak.processes if process.pid == helper.pid)
+            self.assertEqual(helper_sample.command, ("rustc-outlier", "--private-fixture"))
+            self.assertEqual(helper_sample.rss_anon, 11 * GIB // 4)
+
     def test_a_version_four_snapshot_is_rejected_until_a_new_pass_publishes_current_evidence(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             _ = fixture.run_pass()
@@ -873,6 +1418,249 @@ class ReadingAlertTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIsInstance(fixture.server.reading_hold, service.NoReadingHold)
                 self.assertIsInstance(fixture.server.reading_alert_delivery, service.NoReadingAlertDelivery)
+
+
+class CloudAdmissionTests(unittest.TestCase):
+    def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes", "safety_gib"):
+            with self.subTest(key=key), AdmissionFixture() as fixture:
+                config_path = fixture.root / "build_admission.conf"
+                write_memory_config(config_path, cloud_gate_slots="1", cloud_gate_stale_pushes="3")
+                sidecar = fixture.root / "cloud.cgroup"
+                _ = sidecar.write_text("")
+                request = replace(self.cloud_request(fixture), sidecar=str(sidecar))
+                grant = only_admitted(fixture.server.handle_request(request))
+                cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 0, fixture.clock.now() - 15))
+                waiting = self.cloud_request(fixture)
+                self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+                read_configuration = gate.read_admission_configuration
+
+                def change_after_check() -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
+                    configuration = read_configuration()
+                    write_memory_config(config_path, **{key: "invalid"})
+                    return configuration
+
+                with mock.patch.object(gate, "read_admission_configuration", side_effect=change_after_check):
+                    fixture.server.next_pass = fixture.clock.monotonic()
+                    fixture.server.run_once(0)
+                self.assertIsInstance(fixture.server.configuration, gate.UsableAdmissionConfiguration)
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply) and isinstance(reply.reading, wire.CloudQueueRead)
+                self.assertEqual(reply.reading.cloud_slots, 1)
+                self.assertEqual(reply.reading.cloud_gate_stale_pushes, 3)
+                self.assertIn(waiting.episode, fixture.server.waiters)
+                model = queue_view.QueueModel(reply.reading, {}, gate.NoWaiter(), head_facts.PaceUnavailable(),
+                    ZoneInfo("UTC"), queue_view.HostLoadUnavailable(), gate.NoWaiter())
+                with mock.patch.object(queue_view, "cloud_push_interval", return_value=queue_view.CloudPushInterval(5)):
+                    text = plain(queue_view.render_view(model, 140))
+                self.assertIn("no update for", text)
+                fixture.server.next_pass = fixture.clock.monotonic()
+                fixture.server.run_once(0)
+                self.assertIsInstance(fixture.server.configuration, gate.UnusableAdmissionConfiguration)
+                refused, = fixture.connect(wire.ViewRequest()).replies()
+                self.assertIsInstance(refused, wire.Refused)
+                assert isinstance(refused, wire.Refused)
+                self.assertIn(key, refused.reason)
+                self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
+                fixture.release(grant)
+                self.assertFalse(fixture.server.reservations)
+
+    def test_view_and_mine_keep_version_one_readings_plain_with_a_cloud_gate(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            sent: list[str] = []
+
+            def capture(line: str) -> str:
+                sent.append(line)
+                return line
+
+            with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                for version in (2, 1, 2, 1):
+                    for kind, request in (("view", wire.ViewRequest()), ("mine", wire.MineRequest("cloud-session"))):
+                        with self.subTest(version=version, kind=kind):
+                            line = wire.encode_record({"v": version, "type": kind, "data": request}) + "\n"
+                            reply, = fixture.connect(line).replies()
+                            assert isinstance(reply, (wire.ViewReply, wire.MineReply))
+                            message = cast(dict[str, object], json.loads(sent[-1]))
+                            self.assertEqual(message["v"], version)
+                            if version == 1:
+                                self.assertIs(type(reply.reading), records.QueueRead)
+                                data = cast(dict[str, object], message["data"])
+                                old_reading = wire.parse_record(json.dumps(data["reading"]), records.QueueRead)
+                                self.assertEqual(old_reading, reply.reading)
+                            else:
+                                self.assertIsInstance(reply.reading, wire.CloudQueueRead)
+                                assert isinstance(reply.reading, wire.CloudQueueRead)
+                                self.assertEqual(len(reply.reading.cloud), 1)
+
+    def test_bad_cloud_settings_hold_admission_and_keep_the_service_available(self) -> None:
+        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes"):
+            for value in ("bad", "0"):
+                with self.subTest(key=key, value=value), AdmissionFixture() as fixture:
+                    grant = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+                    config = fixture.root / "build_admission.conf"
+                    write_memory_config(config, **{key: value})
+                    fixture.server.next_pass = fixture.clock.monotonic()
+                    fixture.server.run_once(0)
+                    self.assertIsInstance(fixture.server.configuration, gate.UnusableAdmissionConfiguration)
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    assert isinstance(reply, wire.Refused)
+                    self.assertIn(key, reply.reason)
+                    fixture.release(grant)
+                    self.assertFalse(fixture.server.reservations)
+                    write_memory_config(config, **{key: "9" if key == "cloud_gate_slots" else "3"})
+                    fixture.server.run_once(0)
+                    self.assertIsInstance(fixture.server.configuration, gate.UsableAdmissionConfiguration)
+                    self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+
+    def reading(self, fixture: AdmissionFixture) -> gate.QueueRead:
+        reply, = fixture.server.handle_request(wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        return reply.reading
+
+    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "merge-gate",
+                      run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
+        return replace(fixture.request(need=40 * GIB, step=step, run=run), place=wire.CloudPlace("aws"))
+
+    def test_cloud_starts_with_full_local_memory_and_charges_zero(self) -> None:
+        for step in ("merge-gate", "targeted-test"):
+            with self.subTest(step=step), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                _ = fixture.run_pass()
+                before = self.reading(fixture)
+                request = self.cloud_request(fixture, step=step)
+                grant = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(grant.need, 0)
+                self.assertEqual(fixture.server.reservations[request.episode].need, 0)
+                after = self.reading(fixture)
+                self.assertEqual(after.view.promised, before.view.promised)
+                self.assertEqual(after.explanation.room, before.explanation.room)
+
+    def test_cloud_module_progress_updates_without_a_memory_charge(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        with AdmissionFixture() as fixture:
+            request = self.cloud_request(fixture)
+            sidecar = fixture.root / "cloud.cgroup"
+            _ = sidecar.write_text("")
+            request = replace(request, sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            before = self.reading(fixture)
+            for done, state in ((3, "running"), (12, "uploading")):
+                current = cloud_progress.CloudProgress(
+                    cast(cloud_progress.CloudState, state), 32, 1, fixture.clock.now())
+                cloud_progress.publish(sidecar, current)
+                counter = progress.ProgressCounter("modules", done, 12)
+                progress.publish_counter(sidecar, counter)
+                _ = fixture.run_pass()
+                reading = self.reading(fixture)
+                assert isinstance(reading, wire.CloudQueueRead)
+                row, = reading.cloud
+                self.assertEqual(row.progress, current)
+                self.assertEqual(row.counter, counter)
+                self.assertEqual(reading.explanation.room, before.explanation.room)
+                self.assertEqual(fixture.server.reservations[request.episode].need, 0)
+            fixture.release(grant)
+
+    def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            requests = [self.cloud_request(fixture) for _ in range(11)]
+            grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
+            for request in requests[9:]:
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.Wait)
+                self.assertIn("cloud slot", reply.text)
+                self.assertIn("9 of 9", reply.text)
+            self.assertEqual(len(fixture.server.reservations), 9)
+            fixture.release(grants[0])
+            _ = fixture.run_pass()
+            self.assertIn(requests[9].episode, fixture.server.reservations)
+            self.assertNotIn(requests[10].episode, fixture.server.reservations)
+            self.assertEqual(len(fixture.server.reservations), 9)
+            fixture.release(grants[1])
+            _ = fixture.run_pass()
+            self.assertIn(requests[10].episode, fixture.server.reservations)
+
+    def test_cloud_slot_limit_reads_configuration_at_use(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, cloud_gate_slots="1")
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            waiting = self.cloud_request(fixture)
+            reply, = fixture.server.handle_request(waiting)
+            assert isinstance(reply, wire.Wait)
+            self.assertIn("1 of 1", reply.text)
+            write_memory_config(config, cloud_gate_slots="2")
+            _ = fixture.run_pass()
+            self.assertIn(waiting.episode, fixture.server.reservations)
+            self.assertEqual(len(fixture.server.reservations), 2)
+
+    def test_dead_route_releases_the_cloud_slot_while_its_child_lives(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            route = fixture.run_owner()
+            running = self.cloud_request(fixture, run=route)
+            _ = only_admitted(fixture.server.handle_request(running))
+            waiting = self.cloud_request(fixture)
+            reply, = fixture.server.handle_request(waiting)
+            self.assertIsInstance(reply, wire.Wait)
+            fixture.end_run(route)
+            _ = fixture.run_pass()
+            self.assertNotIn(running.episode, fixture.server.reservations)
+            self.assertIn(waiting.episode, fixture.server.reservations)
+            self.assertEqual(fixture.proc.owner_start(running.owner.pid), service.LiveOwnerIdentity(running.owner.start_time))
+
+    def test_dead_cloud_owner_releases_its_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            running = self.cloud_request(fixture)
+            _ = only_admitted(fixture.server.handle_request(running))
+            waiting = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            fixture.end_owner(running.owner)
+            _ = fixture.run_pass()
+            self.assertNotIn(running.episode, fixture.server.reservations)
+            self.assertIn(waiting.episode, fixture.server.reservations)
+
+    def test_waiting_cloud_gate_does_not_block_a_local_step(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", cloud_gate_slots="1")
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            cloud_waiter = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(cloud_waiter)[0], wire.Wait)
+            local = fixture.request(need=GIB)
+            grant = only_admitted(fixture.server.handle_request(local))
+            self.assertEqual(grant.need, GIB)
+            self.assertIn(cloud_waiter.episode, fixture.server.waiters)
+
+    def test_local_memory_wait_does_not_block_a_cloud_gate(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            local = fixture.request(need=GIB)
+            self.assertIsInstance(fixture.server.handle_request(local)[0], wire.Wait)
+            cloud = self.cloud_request(fixture)
+            grant = only_admitted(fixture.server.handle_request(cloud))
+            self.assertEqual(grant.need, 0)
+            self.assertIn(local.episode, fixture.server.waiters)
+
+    def test_fallback_releases_cloud_and_waits_for_local_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            cloud = self.cloud_request(fixture)
+            grant = only_admitted(fixture.server.handle_request(cloud))
+            fixture.release(grant)
+            local = fixture.request(need=4 * GIB, step="merge-gate")
+            reply, = fixture.server.handle_request(local)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertFalse(fixture.server.reservations)
+            self.assertIn(local.episode, fixture.server.waiters)
 
 
 class RoomAndSlotTests(unittest.TestCase):
@@ -2695,10 +3483,46 @@ class ServiceTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertEqual(len(fixture.server.reservations), 1)
 
-    def test_version_two_client_gets_explicit_refusal_and_socket_is_private(self) -> None:
+    def test_unparsed_request_refusals_decode_with_both_protocol_versions(self) -> None:
+        source = subprocess.run(["git", "show", "7ab78b74e:scripts/build_queue/admission_protocol.py"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
+        legacy = ModuleType("admission_protocol_version_one")
+        with mock.patch.dict(sys.modules, {legacy.__name__: legacy}):
+            exec(compile(source, "admission_protocol_version_one.py", "exec"), legacy.__dict__)
+            decode_legacy = cast(Callable[[str], object], getattr(legacy, "parse_reply"))
+            for version in (1, 2):
+                for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
+                    with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
+                        fixture.configure(request_max_bytes=512)
+                        _ = fixture.run_pass()
+                        prefix = f'{{"v":{version},'
+                        if kind.startswith("oversize"):
+                            line = prefix + '"data":"'
+                            tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
+                            limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
+                            line += "x" * (limit + 1 - len(line) - len(tail)) + tail
+                        else:
+                            line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
+                        sent: list[str] = []
+
+                        def capture(line: str) -> str:
+                            sent.append(line)
+                            return line
+
+                        with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                            peer = fixture.connect(line)
+                            if kind == "fragmented":
+                                self.assertEqual(peer.replies(), [])
+                                peer.socket.sendall(b'"type":"view","data": }\n')
+                            reply, = peer.replies()
+                        self.assertIsInstance(reply, wire.Refused)
+                        self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
+                        self.assertEqual(wire.parse_reply(sent[-1]), reply)
+
+    def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
-            peer = fixture.connect('{"v":2,"type":"view","data":{}}\n')
-            self.assertEqual(peer.replies(), [wire.Refused("client version 2, service supports 1..1")])
+            peer = fixture.connect('{"v":3,"type":"view","data":{}}\n')
+            self.assertEqual(peer.replies(), [wire.Refused("client version 3, service supports 1..2")])
             self.assertEqual(stat.S_IMODE(fixture.socket_path.stat().st_mode), 0o600)
 
     def test_aged_launch_alone_does_not_create_a_reservation(self) -> None:
@@ -4389,8 +5213,8 @@ class RunPlaceTests(unittest.TestCase):
                 queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
             rendered = plain(queue_view.render_view(model, 100))
             row, = [line for line in rendered.splitlines()
-                    if line.split()[:1] == ["1"] and line.split()[3:4] == ["check"]]
-            self.assertEqual(row.split()[4], "0", rendered)
+                    if line.split()[:1] == ["1"] and line.split()[3:5] == ["project", "check"]]
+            self.assertEqual(row.split()[5], "0", rendered)
             settings_path = fixture.root / "aws_target.conf"
             _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
                                      + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
@@ -4406,6 +5230,46 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_slow_requests_log_wall_cpu_and_kind_but_fast_requests_do_not(self) -> None:
+        for slow_configuration in (False, True):
+            with self.subTest(slow_configuration=slow_configuration), AdmissionFixture() as fixture:
+                write_memory_config(fixture.root / "build_admission.conf", request_slow_seconds="0.25")
+                durations = iter((0.5, 0.1))
+                read = conf.read
+
+                def measured(request: wire.Request, connection: service.Connection | service.NoConnection) -> list[wire.Reply]:
+                    del request, connection
+                    if not slow_configuration:
+                        fixture.clock.advance(next(durations))
+                    return [wire.BuildHistoryReply(0)]
+
+                def configuration(stem: str) -> conf.ConfigRead:
+                    if slow_configuration:
+                        fixture.clock.advance(next(durations))
+                    return read(stem)
+
+                output = io.StringIO()
+                with mock.patch.object(fixture.server, "_handle_request", side_effect=measured), \
+                        mock.patch.object(conf, "read", side_effect=configuration), \
+                        mock.patch.object(time, "process_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
+                        redirect_stderr(output):
+                    for _ in range(2):
+                        self.assertEqual(fixture.server.handle_request(wire.BuildHistoryRequest()), [wire.BuildHistoryReply(0)])
+                self.assertEqual(output.getvalue(), "admission request BuildHistoryRequest: wall=0.500s cpu=0.125s\n")
+
+    def test_bad_request_timing_limit_logs_once_and_keeps_requests_and_cleanup_available(self) -> None:
+        with AdmissionFixture() as fixture:
+            grant = only_admitted(fixture.server.handle_request(fixture.request()))
+            write_memory_config(fixture.root / "build_admission.conf", request_slow_seconds="invalid")
+            output = io.StringIO()
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
+                    redirect_stderr(output):
+                for _ in range(2):
+                    self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
+                fixture.release(grant)
+            self.assertEqual(output.getvalue().count("request_slow_seconds"), 1)
+            self.assertFalse(fixture.server.reservations)
+
 
     def test_ledger_grants_restore_replay_and_release_without_usable_configuration(self) -> None:
         with AdmissionFixture() as fixture:
@@ -4430,7 +5294,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 fixture.allow_next_start()
             self.assertEqual(only_admitted(fixture.server.handle_request(saved_request)), saved_grant)
             self.assertEqual(fixture.server.ledger["absent"].reply, wire.Ok())
-            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+            with mock.patch.object(fixture.server, "_log_request_timing"), \
+                    mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
                 for grant in (expected, saved_grant):
                     self.assertEqual(fixture.server.handle_request(
                         wire.ReleaseRequest(f"release-{grant.reservation}", grant.reservation, 0)), [wire.Ok()])
@@ -4665,14 +5530,14 @@ class AdmissionConfigurationTests(unittest.TestCase):
             self.assertEqual(grant.need, request.profile.peak.bytes)
             self.assertEqual(len(fixture.server.reservations), 1)
 
-    def test_one_config_read_supplies_a_complete_service_pass(self) -> None:
+    def test_memory_and_cloud_config_reads_supply_a_complete_service_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
             _ = fixture.server.handle_request(fixture.request())
             with mock.patch.object(conf, "read", wraps=conf.read) as reader:
                 _ = fixture.server.run_pass()
-            reader.assert_called_once_with("build_admission")
+            self.assertEqual(reader.call_args_list, [mock.call("build_admission"), mock.call("build_admission")])
 
     def test_unusable_config_restart_replays_one_existing_reservation(self) -> None:
         with AdmissionFixture() as fixture:
@@ -4772,7 +5637,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
             granted = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(granted, 7 * GIB)
             write_memory_config(fixture.root / "build_admission.conf", replay_retention_seconds="invalid")
-            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+            with mock.patch.object(fixture.server, "_log_request_timing"), \
+                    mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release-bad-config", granted.reservation, 137)), [wire.Ok()])
                 fixture.server.persist()
             self.assertNotIn(request.episode, fixture.server.reservations)

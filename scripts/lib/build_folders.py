@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Name temporary build folders and preserve their caller's lifetime."""
 from __future__ import annotations
 try:
@@ -16,7 +16,6 @@ import signal
 import stat
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Literal, cast, override
@@ -161,17 +160,20 @@ class BuildFolderSpec:
 def _settings() -> ConfigRead:
     from scripts.lib import conf
 
-    if "CONF_DIR" in os.environ and not conf.path("build_folders").exists():
-        return conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
-    return conf.read("build_folders")
+    return conf.read_or_repository("build_folders")
+
+
+def repository_key_for(name: str, identity: str) -> str:
+    """Append the configured identity hash to a readable repository name."""
+    from hashlib import sha256
+
+    return f"{name}-{sha256(os.fsencode(identity)).hexdigest()[:_settings().whole('names.repository_key_length')]}"
 
 
 def repository_key(repository: Path) -> str:
     """Distinguish repositories with equal basenames using their canonical paths."""
-    from hashlib import sha256
-
     canonical = repository.resolve()
-    return f"{canonical.name}-{sha256(os.fsencode(canonical)).hexdigest()[:_settings().whole("names.repository_key_length")]}"
+    return repository_key_for(canonical.name, str(canonical))
 
 
 def build_folder_path(spec: BuildFolderSpec) -> Path:
@@ -295,18 +297,16 @@ OWNER_MARKER = ".build-folder-owner.json"
 
 def run_build(owner: str, name: str, command: Sequence[str]) -> int:
     """Keep the folder until the command and its descendants stop."""
-    import ctypes
     import json
     import subprocess
+    from scripts.lib.descendants import adopt_descendants
     from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
     if sys.platform != "linux":
         raise ValueError("run requires Linux descendant adoption")
-    # Linux subreapers adopt orphaned descendants, including children that create another session.
-    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
-        raise OSError(ctypes.get_errno(), "cannot adopt command descendants")
+    _ = adopt_descendants()
     settings = _settings()
     root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
     spec = BuildFolderSpec(kind="temporary", parent=root, repository=repository_key(Path.cwd()),
@@ -445,5 +445,4 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     raise SystemExit(main(sys.argv[1:]))

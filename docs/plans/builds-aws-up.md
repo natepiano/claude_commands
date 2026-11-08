@@ -52,13 +52,32 @@ Each stage checks the live state first. It acts only when the state is not compl
 8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and plain `rustc`, `cargo nextest` and `cargo mend` versions on both hosts.
 9. **Idle stop.** Confirm the box stops itself within `idle_stop_minutes` plus a margin, through EC2.
 10. **Activation.** Turn on routing to AWS from state outside the repository, then start `aws-target.service`. The registry rows land in the tracked config by a reviewed commit, with the user's approval of each value.
-11. **Routing proof.** Run the in-repository `scripts/aws_target/proof_crate` through the normal pinned queue. Confirm `target=aws` in its record.
+11. **Routing proof.** Write the crate from `scripts/aws_target/routing_proof.py` into a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run. Run it through the normal pinned queue. Confirm `target=aws` in its record.
+
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
 
 ## Phases
 
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
 3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+4. **Gate trial evidence.** Done 2026-11-07 at dac70bfcf. All 18,630 tests pass on each size. Median test time: 16 vCPU 491 s, 32 vCPU 299 s, 64 vCPU 303 s. The cheapest size within the 420 s target is 32 vCPU, at about $0.04 a gate. 64 vCPU is no faster: the slowest modules set a floor near 300 s. Request to ready takes about 52 s; teardown takes about 27 s. AWS refused one box at 8 running Spot boxes (an instance-count limit).
+5. **Cloud gate route.** Merge gates and targeted tests both run on 32-vCPU Spot boxes. Up to 9 run at once; later gates wait in the build queue. When no 32-vCPU Spot box is free in any zone, the gate uses 16 vCPU. Spot only, no on-demand. Watch the $20 daily cap. User, 2026-11-07. natedev runs gates only when AWS is down or the cap is reached (director call; the user may change it). Nine at once needs a higher Spot instance-count limit: the user asks AWS. Design: docs/plans/merge-gate-instances.md, with these user changes. One `deploy.py up` adds the scoped grants, gate bucket, launch template and expiry function.
+6. **Queue tracking and progress.** The build queue holds each cloud gate as an entry that takes no natedev memory and holds one cloud slot. The box pushes its log every 5 s. The queue shows modules done of the total, in the HTML page and in `/build:queue`. The queue unit owns the displays; this unit supplies the data. User, 2026-11-07.
+7. **Prepared gate image.** A saved image holds the tools, so a box skips the 48 s setup. The image depends only on the package list and the nixpkgs revision. A changed input builds a new image; a code change never does. Names: the feature is the cloud gate (user, 2026-11-07: "cloud gate - i like it"). The machines, their image and their NixOS setup are `cloud-claude-gate` (user, 2026-11-07: "the machines should be called cloud-claude-gate"). The trial then measures setup again. User, 2026-11-07.
+8. **Capacity record.** Record slots in use, queue waits, capacity refusals, 16-vCPU fallbacks and Spot interruptions. The record decides two things later: whether to ask AWS for more Spot capacity, and whether Spot stays. User, 2026-11-07: stay on Spot; measure first.
+
+Order: the route comes first, because the user wants gates on these boxes as soon as possible (2026-11-07). The image saves only 48 s, so it follows.
+
+Rule for phases 5 to 8: every setting (sizes, slot count, log push interval, fallback order) is in config, never in code. User, 2026-11-07.
 
 ## Removal status
 

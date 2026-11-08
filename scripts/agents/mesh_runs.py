@@ -67,7 +67,6 @@ from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 from uuid import NAMESPACE_URL, uuid5
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh, mesh_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.direct import assign_gate
@@ -75,7 +74,7 @@ from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import repeat_guard
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.production import staff, session_staff, worker_admission
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
@@ -97,7 +96,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
                   + "crashed before it reported. Start the run again if you still need its result.")
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
-SEND_SCRIPT = codex_mesh.SEND_SCRIPT
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
 # places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
@@ -175,7 +173,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         from scripts.herdr import worker_panes
         parent = membership.parent_of(native_member)
         if parent is not None:
-            run = worker_panes.worker_run(parent)
+            run = worker_panes.worker_run(native_member, record=membership)
             if unit_runs.worker_transport(run) == "herdr":
                 return PaneCaller(str(run), native_member.name, native_member.id)
     thread_id = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
@@ -235,11 +233,24 @@ def _read_record(path: Path) -> RunRecord:
 
 
 def seat_name(session_dir: str, name: str) -> str:
-    """The roster's name for the worker `--to` names. A worker may call itself by its role, the last
-    part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
-    no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
-    such as a reviewer that registers after its run starts, stays as given."""
-    roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
+    """Resolve a pane slot through its pass, or a mesh role through its roster."""
+    run = Path(session_dir)
+    if unit_runs.worker_transport(run) == "herdr":
+        membership = staff.local_snapshot()
+        owner = worker_admission.parent(membership, run=run)
+        state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        passes = state.get("pass")
+        current = cast(dict[str, object], passes).get(name) if isinstance(passes, dict) else None
+        member = None
+        if isinstance(current, dict):
+            dispatch = cast(dict[str, object], current)
+            if dispatch.get("status") == "active":
+                name = str(dispatch.get("worker_name", "")) or name
+                member = membership.by_id(staff.StaffId(str(dispatch.get("worker_id", ""))))
+        if member is None:
+            member = worker_admission.find_worker(membership, owner.id, name)
+        return member.name if member is not None and member.kind == "worker" and member.reports_to(owner.id) else name
+    roster = worker_lifecycle.read_worker_state(run / codex_mesh.ROSTER_FILE)
     if name in roster:
         return name
     matches = [seat for seat in roster if seat.endswith(f"-{name}")]
@@ -509,8 +520,8 @@ def send_to_director(session_id: str, summary: str, text: str) -> Literal["sent"
     """One send.py call to a Claude session; tests replace this."""
     try:
         sent = subprocess.run(
-            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "mesh-runs",
-             "--summary", summary, "--text", text],
+            session_send.send_argv("--to", f"session:{session_id}", "--from", "mesh-runs",
+                                   "--summary", summary, "--text", text),
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:

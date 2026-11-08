@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib import test_hang_guard
 from scripts.lib.test_models_registry import ExactRows, registry_text
 from scripts.production import staff, unit_config
@@ -11,14 +13,11 @@ import shutil
 import subprocess
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -57,8 +56,8 @@ Path(log).write_text('stub agent log\\n')
 if os.environ.get('TEST_WORKER_STARTED'):
     Path(os.environ['TEST_WORKER_STARTED']).touch()
 if os.environ.get('STUB_REVIEW_FINISH_FILE'):
-    sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
-    from wait_for_test_state import wait_for_file
+    with open(Path(os.environ['TEST_WAIT_HELPER_DIR']).parent / 'lib/package_root.py') as package_root: exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(Path(os.environ['STUB_REVIEW_FINISH_FILE']))
 if os.environ.get('STUB_REVIEW_EDIT'):
     Path(os.environ['STUB_REVIEW_EDIT']).write_text('changed by reviewer\\n')
@@ -117,7 +116,7 @@ class ReviewLauncherFixture(LauncherFixture):
             member = unit_membership("fixture", "fixture")
             return staff.ensure("unit", name=member.name, parent=member.parent,
                                 runtime_id=member.current_session,
-                                worktree=staff.PresentWorktree("natedev", self.working_dir)).current_session
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.working_dir)).current_session
 
     @override
     def prepare_fixture(self) -> None:
@@ -171,7 +170,7 @@ class ReviewLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
-        for name in ("conf.py", "conf.sh", "session_paths.py", "boot_identity.py"):
+        for name in ("conf.py", "conf.sh", "session_paths.py", "boot_identity.py", "package_root.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
                          self.root / "scripts/production/fast_track.py")

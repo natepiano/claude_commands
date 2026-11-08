@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise Mac test commands and their real process coordination boundaries."""
 
 from __future__ import annotations
@@ -23,33 +23,21 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
-else:
-    from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.mac_test import mac_test
 from scripts.lib import conf
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase
-    from ..production.cli_fixture import invoke_cli
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+    from scripts.production.cli_fixture import invoke_cli
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
     from scripts.production.cli_fixture import invoke_cli
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 
@@ -717,6 +705,23 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             ),
         )
         return cast(str, values["variable"])
+
+    def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        settings = self.root / "aws_target.conf"
+        values = conf.read(settings).values()
+        self.assertTrue(all(key not in values for key in (
+            "alert_seconds", "push_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s",
+        )))
+        result = self.command("block", "--target", "aws", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        block = cast(dict[str, object], json.loads(
+            (self.root / ".local/state/build-targets/aws/block.json").read_text(),
+        ))
+        self.assertEqual(block["state"], "active")
+        self.assertEqual(block["holder"], "alice")
+        self.assertEqual(block["for"], "rendering")
+        self.assertEqual(block["ci"], "not_configured")
+        self.assertEqual(self.gh_calls(""), 0)
 
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)
@@ -1479,8 +1484,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         source = """
 import sys
 from datetime import datetime, timedelta, timezone
-sys.path.insert(0, sys.argv[1])
-import mac_test
+from scripts.mac_test import mac_test
 
 class Clock(datetime):
     tick: int = 0
@@ -1499,7 +1503,7 @@ for arguments in (
     sys.argv = ["mac_test.py", *arguments]
     assert mac_test.main() == 0
 """
-        result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
+        result = subprocess.run([str(SCRIPT.parents[2] / "scripts/lib/py"), "-c", source, str(SCRIPT.parent)],
                                 env=self.environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                 pass_fds=(self.writer_write_fd,))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

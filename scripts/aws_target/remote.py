@@ -22,7 +22,6 @@ from typing import cast, final
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.aws_target import ledger
 from scripts.aws_target.config import read_control_settings, service_loop
 from scripts.lib import conf

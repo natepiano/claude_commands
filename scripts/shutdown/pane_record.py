@@ -35,11 +35,6 @@ from typing import TYPE_CHECKING, Literal, cast
 if TYPE_CHECKING:
     from scripts.production import staff
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "herdr"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.herdr import herdr, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity
@@ -375,21 +370,28 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
         if isinstance(pid, bool) or not isinstance(pid, int):
             print(f"{pane_id}: no {kind} process id")
             continue
-        try:
-            environment = _process_environment(pid)
-        except (OSError, ValueError) as error:
-            print(f"{pane_id}: cannot read the environment of {pid}: {error}")
-            continue
-        config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-        session_id = (client.codex_client_session(pane_id) if kind == "codex"
-                      else _conversation_of(config_dir, pid))
+        if kind == "codex":
+            try:
+                observed = herdr.native_process(pid, "codex")
+            except (OSError, ValueError):
+                print(f"{pane_id}: no conversation id for {pid}")
+                continue
+            session_id, started, environment = observed.identity.id, observed.started, observed.environment
+        else:
+            try:
+                environment = _process_environment(pid)
+            except (OSError, ValueError) as error:
+                print(f"{pane_id}: cannot read the environment of {pid}: {error}")
+                continue
+            config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+            session_id = _conversation_of(config_dir, pid)
+            started = sessions.process_start(pid)
         if not session_id:
             print(f"{pane_id}: no conversation id for {pid}")
             continue
         cwd = found[0].get("cwd")
         entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments, kind=kind)
         entry["pid"] = pid
-        started = sessions.process_start(pid)
         if not started:
             print(f"{pane_id}: process start is unavailable for {pid}")
             continue

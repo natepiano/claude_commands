@@ -57,7 +57,6 @@ from scripts.buildlog import record
 from scripts.buildlog import store
 from scripts.buildlog import treekey
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 DEFERRED = 75

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Scratch folders that belong to a task, and go when the task ends.
 
 Agents made loose folders in /tmp and ~/rust (repo copies, repros, test trees) and nothing removed
@@ -63,7 +63,6 @@ import os
 import re
 import secrets
 import shutil
-import string
 import subprocess
 import sys
 import tempfile
@@ -76,7 +75,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
@@ -91,7 +89,6 @@ HOLDS_ENV = "SCRATCH_HOLDS"
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-SUFFIX_CHARACTERS = string.ascii_lowercase + string.digits
 BUSY = ".claude-busy"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
@@ -175,14 +172,15 @@ def exclude_copy_metadata(path: Path) -> None:
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
-                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "") -> None:
+                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "",
+                  repository_identity: str = "") -> None:
     scratch_settings = conf.read("scratch")
     if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
             source_commit=source_commit, copy_commit=copy_commit, target_mode=target_mode, seed_source=seed_source,
-            borrows_from=borrows_from,
+            borrows_from=borrows_from, repository_identity=repository_identity,
             maker=maker(), created=time.time(), renewed=time.time())
         if isinstance(record, copy_record.Registered):
             fields["created"] = record.fields.get("created", fields["created"])
@@ -486,7 +484,8 @@ def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = Use
 
 
 def random_suffix(scratch_settings: conf.ConfigRead) -> str:
-    return "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
+    length = scratch_settings.whole("suffix_length")
+    return secrets.token_hex(length)[:length]
 
 
 def until_task(moment: float, *,
@@ -608,7 +607,7 @@ def target(task: str, word: str, visible: bool, *,
     suffix = random_suffix(scratch_settings)
     name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
     slug = f"{match['kind']}-{name.replace('/', '-')}"
-    return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=scratch_settings.whole("suffix_length"),
+    return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=len(suffix),
                                             purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
 
 
@@ -631,14 +630,16 @@ def task_or_default(task: str, now: float, *,
 
 
 def write_record(path: Path, task: str, now: float, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
     _ = update_record(path, lambda record: fields_for_task(
         {**(record.fields if isinstance(record, copy_record.Registered) else {}),
-         "maker": maker(), "created": now, "renewed": now}, task), scratch_settings=scratch_settings)
+         "maker": maker(), "created": now, "renewed": now, "throwaway": throwaway}, task), scratch_settings=scratch_settings)
 
 
 def new(task: str = "", word: str = "", visible: bool = False, now: float | None = None, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -648,7 +649,7 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path = target(task, word, visible, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir()
-    write_record(path, task, moment, scratch_settings=scratch_settings)
+    write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
     return path
 
 
@@ -744,6 +745,12 @@ def task_of(path: Path, *,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     record = copy_record.read_record(path / copy_record.RECORD)
     return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
+
+
+def is_throwaway(path: Path) -> bool:
+    """Identify a folder that code creates without edits from a person."""
+    record = task_of(path)
+    return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
 def pending_copy_paths(base: Path) -> Iterator[Path]:
@@ -913,7 +920,11 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
     for path in candidates:
         record = task_of(path, scratch_settings=scratch_settings) if not path.is_symlink() else copy_record.NotRegistered()
         if isinstance(record, copy_record.Registered):
-            found.append(Folder(path, record.task, folder_record(path).stat().st_mtime))
+            try:
+                modified = folder_record(path).stat().st_mtime
+            except FileNotFoundError:
+                continue
+            found.append(Folder(path, record.task, modified))
     return found
 
 
@@ -1088,7 +1099,13 @@ def remove_marked(path: Path, delete: Callable[[Path], None], *,
         if isinstance(pending, copy_record.UnreadableRecord) and copy:
             raise ScratchError(pending.reason)
         if isinstance(pending, copy_record.NotRegistered) and (copy or isinstance(copy_record.read_record(path / copy_record.RECORD), copy_record.Registered)):
-            _ = update_record(path, removing, removal=True, scratch_settings=scratch_settings)
+            pending = update_record(path, removing, removal=True, scratch_settings=scratch_settings)
+        if isinstance(pending, copy_record.Registered):
+            trust_folder = pending.fields.get("claude_trust_folder")
+            if isinstance(trust_folder, str):
+                from scripts.accounts import accounts
+
+                accounts.set_claude_folder_trust(Path(trust_folder), trusted=False)
         remove_with_cargo_output(path, delete)
         removal_mark(path).unlink(missing_ok=True)
 

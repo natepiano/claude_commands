@@ -17,7 +17,8 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
   - `scripts/production/merge_gate.py` — the merge gate: finds test modules, runs them under a memory cap, keeps the passed-tree ledger (`PassedTreeLedger`)
   - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py` — its fixture and tests
   - `docs/as-built/merge-gate-and-test-speed.md` — the gate's as-built
-- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only --full`, from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo . --full`, from the worktree root.
 - **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - Tests use fixtures; they never read live state (`~/.claude` main, `/tmp/claude`, `~/.cargo/bin`).
@@ -558,7 +559,7 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 **Gotchas:**
 - A test that reaches a unit-location reader writes the staff rows it needs. No reader treats a missing staff file as an empty record.
 - `resume_unit` imports the bare `unit_lookup` module and `add_unit` imports the package copy. A test patches each copy that its callee uses.
-- The phase test list does not cover every reader caller. The gate for a reader change is `merge_gate.py --tests-only --full`.
+- The phase test list does not cover every reader caller. The gate for a reader change is `full_test.py --checkout <tree> --full`.
 
 **Ruled out:** a fallback reader for a missing staff file; a walk up from a missing Plan folder to a parent checkout.
 
@@ -1127,6 +1128,19 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Red
 **Depends on:** 3t, 3u, 3v (records stage of the rename track).
 
 **As built:** the change review cell, the phase note `unit:`, the board cache and the proposal `unit:` field hold staff ids, and `change_routing` routes an open row from its staff id. `change_review.py migrate-owners` moved 222 rows on natedev. The Mac run waits on the user's Mac step. After its final read shows staff ids in all open rows, delete the `by_id` condition and `migrate_owners`.
+
+The read-only acceptance checks also retain these requirements:
+
+1. Name each excluded reader and its owning phase in the checkpoint notice.
+2. Include the dispatch readers in that search: `bump_gate`, `dailies_input`, `live_units`, `showrunners`, `staff_sources`, `unit_lookup`, `unit_table`, and `worker_admission`.
+3. Use different timer and row documents to prove that each changed reader takes the row's document.
+4. Keep `test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere`, lookup tests, requested-checkpoint tests, and partial-report tests.
+5. Distinguish `ProposalsUnavailable` and `LedgerUnavailable` from confirmed absence.
+6. Verify the director and branch folders with `targeted_test.py` and `add_unit.py --check`.
+7. Verify `resume_unit.py sdlc guild-process-unit --dry-run`.
+
+The search may retain read-only `session_labels.py`, `production_units.WRAPPED` imports, and Units scope reads owned by Phase 4b.
+Only reads change.
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: done
 

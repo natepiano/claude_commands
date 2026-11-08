@@ -151,7 +151,7 @@ N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on 
 
 ### Unit reports
 
-A unit run has no notifier instance (user, 2026-10-19): `/unit:report` runs only when someone asks. All 12 `worker-*` instances had been `ENABLED=0` since 2026-10-12 22:04 EDT and were removed. `prepare_session.sh` creates none and `end_session.sh` removes none. A Codex unit's poll timeout composes no report; it only gives `<EarlyReviewArm/>` a point to run.
+A unit run has no notifier instance (user, 2026-10-19). `/unit:report` runs only when someone asks. All 12 `worker-*` instances had been `ENABLED=0` since 2026-10-12 22:04 EDT. They were removed. `prepare_session.sh` creates none. `end_session.sh` removes none. A Codex unit's poll timeout composes no report. It lets `<EarlyReviewArm/>` run, as defined in `docs/direct/early_review.md`.
 
 ### Changing the interval
 

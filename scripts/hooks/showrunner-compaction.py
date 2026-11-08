@@ -13,13 +13,9 @@ except FileNotFoundError:
 
 import json
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
-PRODUCTION = Path(__file__).resolve().parent.parent / "production"
-sys.path.insert(0, str(PRODUCTION))
 from scripts.production import showrunners  # noqa: E402
 
 

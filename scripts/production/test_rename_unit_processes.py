@@ -1,19 +1,20 @@
 """Check process ownership without the deleted rename shutdown step."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
-import sys
 import tempfile
+import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, final, override
+from typing import NamedTuple, cast, final, override
 from unittest import mock
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import retire_unit
+from scripts.shutdown import shutdown
 from scripts.production import unit_lookup
 from scripts.production import unit_move
 from scripts.production import staff_sources
@@ -23,13 +24,14 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
-if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
-else:
-    from unit_staff_test_support import PARENTS, isolated_parents
+from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeProcess(NamedTuple):
@@ -80,7 +82,7 @@ class RunProcessTests(StaffTestCase):
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
-        _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
+        _ = self.enterContext(mock.patch.object(shutdown, "retirement_command_line", self.arguments))
         from scripts.agents import mesh_run_process
         _ = self.enterContext(mock.patch.object(mesh_run_process, "process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
@@ -92,14 +94,14 @@ class RunProcessTests(StaffTestCase):
     def run_folder(self, name: str, worktree: Path) -> Path:
         worktree.mkdir(parents=True, exist_ok=True)
         folder = self.root / "runs" / name
-        (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
+        (folder / shutdown.DETACHED_RUNS).mkdir(parents=True)
         parent = recorded_showrunner("demo", self.root / "demo-production.md")
         member = fixture_unit_location(parent, worktree.name, worktree)
         _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
-        path = folder / retire_unit.DETACHED_RUNS / f"{label}.json"
+        path = folder / shutdown.DETACHED_RUNS / f"{label}.json"
         parent = worker_admission.parent(staff.local_snapshot(), run=folder)
         member = fixture_worker(folder.name + "-" + label, parent.id, backend=staff.CodexBackend(self.root / "codex"))
         _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}))
@@ -110,7 +112,7 @@ class RunProcessTests(StaffTestCase):
         return path
 
     def watcher(self, folder: Path) -> list[str]:
-        return ["sh", "-c", WATCHER, str(retire_unit.MESH.resolve()), "900", "51101", str(folder.resolve()),
+        return ["sh", "-c", WATCHER, str(shutdown.MESH.resolve()), "900", "51101", str(folder.resolve()),
                 "python3", "300"]
 
     def no_units(self, _production_name: str) -> dict[str, object]:
@@ -137,8 +139,8 @@ class RunProcessTests(StaffTestCase):
 
     def test_run_ownership_passes_one_settings_read_to_process_arguments(self) -> None:
         with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
-              mock.patch.object(retire_unit, "command_line", wraps=self.arguments) as arguments):
-            found = retire_unit.run_processes(self.unit_folder, [101, 102])
+              mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments):
+            found = shutdown.retirement_run_processes(self.unit_folder, [101, 102])
         self.assertEqual(set(found), {101, 102})
         reads.assert_called_once_with("production")
         settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
@@ -153,7 +155,7 @@ class RunProcessTests(StaffTestCase):
                     arguments[0], arguments[4] = shell, "555"
                     self.processes[203] = FakeProcess(self.unit_folder, 203, arguments)
                     self.processes[204] = FakeProcess(self.unit_folder, 203, ["sleep", "300"])
-                    found = retire_unit.run_processes(self.unit_folder, [203, 204])
+                    found = shutdown.retirement_run_processes(self.unit_folder, [203, 204])
                     self.assertEqual(set(found), {203, 204})
                     for name in found.values():
                         self.assertIn("app-server watcher 203 of dead server 555", name)
@@ -166,7 +168,7 @@ class RunProcessTests(StaffTestCase):
         for folder, expected in cases:
             with self.subTest(folder=folder):
                 self.processes[203] = FakeProcess(self.unit_folder, 203, self.watcher(folder))
-                self.assertEqual(set(retire_unit.run_processes(self.unit_folder, [203])), expected)
+                self.assertEqual(set(shutdown.retirement_run_processes(self.unit_folder, [203])), expected)
         self.assertEqual(self.signalled, [])
 
     def test_dead_server_watcher_requires_the_mesh_entry_point_and_valid_server_pid(self) -> None:
@@ -177,7 +179,7 @@ class RunProcessTests(StaffTestCase):
                 arguments[4] = "555"
                 arguments[index] = value
                 self.processes[203] = FakeProcess(self.unit_folder, 203, arguments)
-                self.assertEqual(retire_unit.run_processes(self.unit_folder, [203]), {})
+                self.assertEqual(shutdown.retirement_run_processes(self.unit_folder, [203]), {})
         self.assertEqual(self.signalled, [])
 
 

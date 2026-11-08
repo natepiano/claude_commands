@@ -21,11 +21,10 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
+from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -33,11 +32,9 @@ SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
-SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or session_send.SEND_SCRIPT)
 PARENT_FILE = "parent"
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.user_zone import user_zone_name  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
@@ -530,8 +527,8 @@ class NoticeDelivery:
 def send_to_address(address: str, key: str, text: str, *, recipient: str,
                     sender: str = "showrunners") -> NoticeDelivery:
     """Send to a known session address with the same report as production notices."""
-    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", sender, "--key", key,
-                           "--text", text], capture_output=True, text=True, check=False)
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", sender, "--key", key,
+                           "--text", text, send_script=SEND), capture_output=True, text=True, check=False)
     if sent.returncode != 0:
         return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
                               failed=(recipient,))
@@ -603,7 +600,7 @@ def main(argv: list[str]) -> int:
                     print(f"{runner['name']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
                           + f"\t{runner['doc']}")
             elif action == "tree":
-                lines = cast(Callable[[list[Showrunner]], list[str]], import_module("showrunner_tree").tree_lines)(runners)
+                lines = cast(Callable[[list[Showrunner]], list[str]], import_module('scripts.production.showrunner_tree').tree_lines)(runners)
                 for line in lines:
                     print(line)
             else:
@@ -616,10 +613,10 @@ def main(argv: list[str]) -> int:
                 print(found)
             return runners.exit_code
         elif action in ("parent", "children", "root"):
-            return cast(Callable[[str, str], int], import_module("showrunner_tree").main)(
+            return cast(Callable[[str, str], int], import_module('scripts.production.showrunner_tree').main)(
                 action, cast(str, args.production_name))
         elif action in ("attach", "detach"):
-            return cast(Callable[[str, str, str], int], import_module("showrunner_parent").main)(
+            return cast(Callable[[str, str, str], int], import_module('scripts.production.showrunner_parent').main)(
                 action, cast(str, args.child), (cast(str | None, args.parent) or "") if action == "attach" else "")
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)

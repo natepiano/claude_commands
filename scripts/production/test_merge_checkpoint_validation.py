@@ -11,8 +11,7 @@ from unittest import mock
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
 from scripts.production.production_doc import read_new_production
 
@@ -121,9 +120,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         with mock.patch.dict(os.environ, self.env):
-            producer = next(row.id for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+            member = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+            producer = member.id
+            assert isinstance(member.parent, staff.ReportsTo)
+            production = member.parent.id
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {producer} \| {producer} \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {production} \| {producer} \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -188,7 +190,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         original_notify = merge_checkpoint.notify_style
 
         def malformed_notification(checkout: Path, branch: str, tip: str) -> bool:
-            with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
+            with mock.patch("scripts.production.merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
                 return original_notify(checkout, branch, tip)
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import unittest
 import fcntl
 
@@ -32,7 +34,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = fixture_member("showrunner", name="unrelated")
-        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
+        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -269,7 +271,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
 
     def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
-        # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
+        # agents retire, add_unit and promote_showrunner leave their doc commit to the next merge push.
         self.write(self.checkout / "local.txt", "retired\n")
         local = self.commit(self.checkout, "production(fixture): retire alpha")
         result = self.run_gate()
@@ -340,7 +342,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
+        original = review.read_bytes()
         producer = self.review_producer(doc)
+        member = staff.snapshot().by_id(producer)
+        assert member is not None and isinstance(member.parent, staff.ReportsTo)
+        production = member.parent.id
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: none — the gate script")
@@ -352,11 +358,21 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {producer} | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {production} | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        for explicit_checkout in (True, False):
+            with self.subTest(promote_only=True, explicit_checkout=explicit_checkout):
+                _ = review.write_bytes(original)
+                promoted = self.run_promote_only("--production", "fixture-showrunner",
+                                                 explicit_checkout=explicit_checkout)
+                self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+                promoted_rows = change_review.pending(review)
+                self.assertEqual([row["Change"] for row in promoted_rows], ["old", "The grid fades gently"])
+                self.assertEqual(promoted_rows[-1]["Producer"], producer)
+                self.assertEqual(promoted_rows[-1]["Production"], production)
 
     def test_a_change_row_uses_the_user_date_when_utc_has_the_next_date(self) -> None:
         review, doc = self.review_list()
@@ -527,7 +543,8 @@ class MergeGateProducerTests(ProducerFixture):
         _ = self.merge()
         merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.id)
+        assert isinstance(self.unit.parent, staff.ReportsTo)
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.parent.id)
 
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         _ = self.merge()

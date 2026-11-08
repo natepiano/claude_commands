@@ -5,9 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
-import sys
 import unittest
-from unittest import mock
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -47,7 +45,7 @@ from pathlib import Path
 import sys
 if sys.argv[1] == "acquire":
     records = Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json")
-    sys.path.insert(0, str(Path.home() / ".claude"))
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.test_verify_step_state import read_step_row
     if any(read_step_row(path.stem)["runs_on"]["kind"] == "natedev_only" for path in records):
         (Path(os.environ["TEST_RUNNER_STATE"]) / "local-token-wait").touch()
@@ -97,7 +95,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
                 + 'raise SystemExit(runner_status)'))
         else:
             self.take_peer_token()
-        arguments = ("lint", "--workspace" if after_mac else "sample", "--no-cache")
+        arguments = ("lint", *(("sample",) if not after_mac else ()), "--no-cache")
         if after_mac:
             arguments += ("--check",)
         process = self.start_verify(*arguments)
@@ -139,7 +137,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
 
     def test_local_fmt_takes_the_token_after_a_memory_wait_leaves_for_the_mac(self) -> None:
         _ = self.prepare_memory_lint()
-        process = self.start_verify("lint", "--workspace", "--check", "--no-cache")
+        process = self.start_verify("lint", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
@@ -157,8 +155,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
         self.assertFalse((self.board / "locks/cargo.d").exists())
 
     def test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready(self) -> None:
-        with mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[1] / "mac_test"), *sys.path]):
-            from scripts.mac_test import mac_test
+        from scripts.mac_test import mac_test
         meminfo = self.prepare_memory_lint()
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir(parents=True, exist_ok=True)
@@ -172,10 +169,13 @@ exec bash "$TEST_REAL_BOARD" "$@"
         _ = probe.write_text(
             "import os, subprocess, sys\nfrom pathlib import Path\n"
             + "result = subprocess.run([sys.executable, os.environ['TEST_REAL_FREE_NOW'], *sys.argv[1:]], check=False)\n"
-            + "Path(os.environ['TEST_BLOCK_PROBE']).write_text(str(result.returncode))\n"
+            + "observed = Path(os.environ['TEST_BLOCK_PROBE'])\n"
+            + "pending = observed.with_suffix('.pending')\n"
+            + "pending.write_text(str(result.returncode))\n"
+            + "pending.replace(observed)\n"
             + "raise SystemExit(result.returncode)\n")
         observed = self.runner_state / "block-probe"
-        process = self.start_verify("lint", "--workspace", "--check", "--no-cache", extra={
+        process = self.start_verify("lint", "--check", "--no-cache", extra={
             "VERIFY_MAC_TEST_SCRIPT": str(probe),
             "TEST_REAL_FREE_NOW": str(Path(mac_test.__file__)), "TEST_BLOCK_PROBE": str(observed),
         })
@@ -213,6 +213,7 @@ hold_before_mend_check() {
             ;;
     esac
 }
+set -o functrace
 trap hold_before_mend_check DEBUG
 ''')
         self.write_executable(self.runner, RUNNER_STUB.replace(
@@ -220,7 +221,7 @@ trap hold_before_mend_check DEBUG
             'for hold in Path(os.environ["BUILD_HOLD_DIR"]).iterdir():\n'
             + '    hold.unlink()\n'
             + 'raise SystemExit(runner_status)'))
-        result = self.verify("lint", "--workspace", "--check", "--no-cache", extra={
+        result = self.verify("lint", "--check", "--no-cache", extra={
             "BUILD_TARGETS_SCRIPT": str(targets), "BASH_ENV": str(shell),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",

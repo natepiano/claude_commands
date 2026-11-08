@@ -8,16 +8,13 @@ from pathlib import Path
 from decimal import Decimal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
+from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger
-else:
-    from scripts.aws_target import ledger
+from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -50,6 +47,29 @@ class CompletedMemoryHook(TypedDict):
     attempts: int
 
 
+ADMISSION_BEFORE_RETRY = r'''
+import os
+from pathlib import Path
+import sys
+
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_queue import admission_client
+from scripts.build_queue.system_clock import SystemClock
+
+
+class AdmissionBeforeRetryClock(SystemClock):
+    """Keep admission before the first retry deadline during a result check."""
+
+    def monotonic(self) -> float:
+        return 0.0
+
+
+admission_client.CLOCK = AdmissionBeforeRetryClock()
+raise SystemExit(admission_client.main(sys.argv[2:]))
+'''
+
+
 OBSERVE_MEMORY_HOOK = r'''
 import json
 import os
@@ -58,13 +78,13 @@ import sys
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_client
 from scripts.lib.atomic_file import write_text_atomic
 
 root = Path(os.environ["TEST_RUNNER_STATE"])
 leave = admission_client._leave_queue
-sequence = 0
+sequence = len(tuple(root.glob("memory-hook-[0-9]*")))
 
 def attempts():
     events = root / "ssh-events.jsonl"
@@ -82,8 +102,9 @@ def observe():
     clock = os.environ.get("TEST_ROUTING_CLOCK", "")
     event = {"left": left, "clock": Path(clock).read_text() if clock else "", "attempts": attempts()}
     write_text_atomic(root / ("memory-hook-" + str(sequence)), json.dumps(event))
-    with (root / "memory-hook-ack").open() as acknowledgment:
-        assert acknowledgment.read() == "continue", "the test did not acknowledge the hook"
+    if not (root / "memory-hook-settled").exists():
+        with (root / "memory-hook-ack").open() as acknowledgment:
+            assert acknowledgment.read(len("continue")) == "continue", "the test did not acknowledge the hook"
     return left
 
 with mock.patch.object(admission_client, "_leave_queue", side_effect=observe):
@@ -98,17 +119,13 @@ import os
 from pathlib import Path
 import subprocess
 import shlex
-import sys
 import time
 from contextlib import nullcontext, redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
-for name in ("mac_test", "build_targets", "build_hold", "buildlog", "lint", "lib"):
-    sys.path.insert(0, str(source / "scripts" / name))
-import offload
-import mac_test
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.mac_test import offload, mac_test
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -161,12 +178,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
-    wire = "free_gib=1000\nhost=aws-build\nrustc=rustc fixture\nnextest=nextest fixture\n"
+    wire = "free_gib=1000\nhost=aws-build\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
     if mode == "disk":
         wire = wire.replace("free_gib=1000", "free_gib=0")
     if mode == "version-mismatch":
-        wire = wire.replace("rustc=rustc fixture", "rustc=rustc other")
+        wire = wire.replace("nextest=nextest fixture", "nextest=nextest other")
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()
@@ -195,7 +212,7 @@ def stream(arguments):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
     elif mode == "runner-sigterm":
-        import linux_runner
+        from scripts.mac_test import linux_runner
         from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 
         now = int(time.time())
@@ -317,6 +334,8 @@ source() {
     def setUp(self) -> None:
         super().setUp()
         self.admission = caller_admission(self, self.root, self.environment)
+        # The interval also bounds admission socket reads. Keep room for scheduling delay at high load.
+        self.admission.configure(waiting_pass_seconds=1, running_pass_seconds=0.25)
 
     def configure(self, order: str) -> None:
         _ = (self.root / "build_targets.conf").write_text(
@@ -354,10 +373,18 @@ source() {
         _ = self.hold_memory()
         self.memory_events_enabled = True
         self.memory_hook_observer = observe
-        # The hook interval exceeds real hook time. Reply timing does not release memory.
-        self.admission.configure(waiting_pass_seconds=1, running_pass_seconds=5)
         observer = self.root / "observe-memory-hook.py"
         self.write_executable(observer, OBSERVE_MEMORY_HOOK)
+        self.install_admission_client(observer)
+        os.mkfifo(self.runner_state / "memory-hook-ack")
+
+    def control_admission_clock(self) -> None:
+        """Keep local admission ahead of retry passes in result checks."""
+        script = self.root / "admission-before-retry.py"
+        self.write_executable(script, ADMISSION_BEFORE_RETRY)
+        self.install_admission_client(script)
+
+    def install_admission_client(self, script: Path) -> None:
         library = self.home / ".claude/scripts/lib"
         if library.is_symlink():
             library.unlink()
@@ -370,33 +397,39 @@ source() {
                 (library / source.name).symlink_to(source)
         self.write_executable(library / "py", '#!/bin/sh\n'
             + 'case "${1:-}" in */admission_client.py)\n'
-            + f'  exec "{REPOSITORY}/scripts/lib/py" "{observer}" "$@" ;;\nesac\n' + launcher)
-        os.mkfifo(self.runner_state / "memory-hook-ack")
+            + f'  exec "{REPOSITORY}/scripts/lib/py" "{script}" "$@" ;;\nesac\n' + launcher)
 
     @override
     def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         if not self.memory_events_enabled:
             return super().verify(*arguments, extra=extra)
-        process = self.start_verify(*arguments, extra=extra)
+        acknowledgment = os.open(self.runner_state / "memory-hook-ack", os.O_RDWR)
         try:
-            sequence = 0
-            while True:
-                sequence += 1
-                event_path = self.runner_state / f"memory-hook-{sequence}"
-                self.wait_for_path(event_path, (process,))
-                event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
-                release = self.memory_hook_observer(event)
-                if release and not event["left"]:
-                    _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
-                with (self.runner_state / "memory-hook-ack").open("w") as acknowledgment:
-                    _ = acknowledgment.write("continue")
-                if release or event["left"]:
-                    break
-            output, errors = process.communicate()
-            return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
-        except BaseException:
-            self.stop_verify(process)
-            raise
+            process = self.start_verify(*arguments, extra=extra)
+            try:
+                sequence = 0
+                while True:
+                    sequence += 1
+                    event_path = self.runner_state / f"memory-hook-{sequence}"
+                    self.wait_for_path(event_path, (process,))
+                    event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
+                    release = self.memory_hook_observer(event)
+                    if release and not event["left"]:
+                        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
+                    settled = release or event["left"]
+                    if settled:
+                        # Admission can wait after memory is free. Its later hooks do not wait for this test.
+                        (self.runner_state / "memory-hook-settled").touch()
+                    _ = os.write(acknowledgment, b"continue")
+                    if settled:
+                        break
+                output, errors = process.communicate()
+                return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
+            except BaseException:
+                self.stop_verify(process)
+                raise
+        finally:
+            os.close(acknowledgment)
 
     def target_state(self, target: str) -> Path:
         return self.home / ".local/state/build-targets" / target
@@ -412,7 +445,6 @@ source() {
 
 
 RUN_BUILD_TARGETS = r'''
-sys.path.insert(0, str(source / "scripts/build_targets"))
 status = 0
 try:
     runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")

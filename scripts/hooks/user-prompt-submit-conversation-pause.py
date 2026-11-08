@@ -33,7 +33,6 @@ class PromptPayload(TypedDict, total=False):
 
 def _record_typed_prompt() -> None:
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
         from scripts.message import escalate
 
         escalate.typed()
@@ -54,7 +53,7 @@ def _record_activity(session_id: str, source: str, prompt: str) -> None:
     The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
     """
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
         if not conversation_pause.is_showrunner_or_unit_director(session_id):
             return
@@ -90,7 +89,7 @@ def main() -> None:
     _ = signal.signal(signal.SIGALRM, budget_spent)
     _ = signal.alarm(budget)
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
         source = conversation_pause.prompt_source(
             prompt,
@@ -100,14 +99,13 @@ def main() -> None:
         # Classify before matching the declared wait. A timer or unrelated
         # message does not supply the answer. Read the marker directly so long
         # waits survive active_run's liveness timeout.
-        from direct_run import marker_path
+        from scripts.hooks.direct_run import marker_path
 
         try:
             run_text = marker_path(session_id).read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             run_text = ""
         if run_text:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.direct.progress_history import finish_turn_wait
 
             finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
@@ -120,13 +118,6 @@ def main() -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt)
-        return_question = conversation_pause.is_return_question(prompt)
-        if (source in {conversation_pause.PromptSource.SCHEDULED,
-                       conversation_pause.PromptSource.NOTICE}
-                and not return_question):
-            return
-        if not return_question and not conversation_pause.pauses(source):
-            return
         reply = conversation_pause.message_arrived(
             session_id, source, prompt, conversation_pause.now_epoch())
         if reply is conversation_pause.NoReply.NOTHING:

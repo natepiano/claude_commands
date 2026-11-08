@@ -33,7 +33,7 @@ if command == os.environ.get("TEST_BROKEN_CHECK"):
         print("not a target table")
         raise SystemExit(0)
     if mode == "tabbed-settings":
-        print("mac_allowed")
+        print("any_target")
         print("mac\\teligible\\t-\\t/tmp/mac\\tsettings.conf\\tmacos")
         raise SystemExit(0)
     if mode == "held":
@@ -41,7 +41,7 @@ if command == os.environ.get("TEST_BROKEN_CHECK"):
     if mode == "error":
         raise SystemExit(12)
 if command == "eligible":
-    print("mac_allowed" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
+    print("any_target" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
     print("natedev\\teligible\\t-\\t-\\t-")
     if os.environ.get("TEST_ELIGIBLE_MAC"):
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
@@ -104,9 +104,11 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         self.admission.server.line_filter = self.failure_line
 
     def restore_client(self) -> None:
-        _ = self.memory.write_text("import sys\n" +
-            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n" +
-            "from scripts.build_queue.admission_client import main\nraise SystemExit(main())\n")
+        shim = str(Path(__file__).resolve().parents[1] / "lib/py")
+        _ = self.memory.write_text(
+            f"import os, sys\nos.execv({shim!r}, [{shim!r}, '-c', "
+            + "\"from scripts.build_queue.admission_client import main; raise SystemExit(main())\", *sys.argv[1:]])\n"
+        )
 
     def failure_line(self, line: str) -> str:
         mode = self.fixture.environment.get("TEST_MEMORY_FAILURE", "")

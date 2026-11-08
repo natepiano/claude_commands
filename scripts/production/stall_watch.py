@@ -32,25 +32,20 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
 from scripts.lib import conf as tunables
+from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
 from scripts.production import showrunners, staff, session_staff
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-import context_usage  # noqa: E402
+from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
-import rca  # noqa: E402
+from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
 from scripts.herdr import herdr  # noqa: E402
@@ -61,7 +56,7 @@ if TYPE_CHECKING:
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
-SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
@@ -720,8 +715,7 @@ def finish_cancellations(requests: list[PromptCancellation]) -> None:
 
 
 def retire_key(path: Path, key: str) -> Delivery:
-    command = push_texts.user_retire_argv(SENDER, key)
-    return Delivery(path, "retire", [sys.executable, str(SEND), *command[2:]])
+    return Delivery(path, "retire", session_send.send_argv(*push_texts.user_retire_argv(SENDER, key)[2:], send_script=SEND))
 
 
 def end_prompt(watch: WatchedUnit) -> Delivery | None:
@@ -1041,8 +1035,9 @@ def prompt_alert(watch: WatchedUnit, pane: str, since: float, zone: ZoneInfo,
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
     # end_prompt() retires the alert when its prompt is gone.
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=watch.prompt_key, self_clearing=True)
-    return Delivery(watch.prompt_path, "alert", [sys.executable, str(SEND), *command[2:]], report)
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=watch.prompt_key, self_clearing=True,
+                                       send_script=SEND)
+    return Delivery(watch.prompt_path, "alert", command, report)
 
 
 def prompt_owner(watch: WatchedUnit, socket: str, pane: str, prompt: PromptWait,
@@ -1078,8 +1073,8 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
-    return Delivery(path, kind, [sys.executable, str(SEND), "--to", f"uds:{socket}", "--from", "stall-watch",
-                                 "--key", key, "--text", text])
+    return Delivery(path, kind, session_send.send_argv("--to", f"uds:{socket}", "--from", "stall-watch",
+                                 "--key", key, "--text", text, send_script=SEND))
 
 
 def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,

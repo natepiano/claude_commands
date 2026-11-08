@@ -488,6 +488,10 @@ def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBra
     return _move_folder(unit, destination, branch=branch)
 
 
+def _push_moved_branch(checkout: Path, branch: str) -> None:
+    _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
+
+
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Stop live rows, move the worktree and branch, and resume those rows."""
     destination = destination.expanduser().resolve()
@@ -546,8 +550,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         live = observe().copy()
         for member in members:
             if member.id not in live:
-                print(f"info: {member.name}: stopped; shutdown.py restart --only {member.id}")
+                print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         if move_complete:
+            if isinstance(branch, str):
+                _push_moved_branch(folder, branch)
             staff.folder_move_path(unit).unlink(missing_ok=True)
             return True
         if isinstance(pending, NoPendingMove):
@@ -559,7 +565,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if member.id not in reported:
                 reason = str(error).splitlines()
                 detail = reason[0] if reason else "restart is incomplete"
-                print(f"unit_move: anomaly: {member.name}: {detail}; shutdown.py restart --only {member.id}", file=sys.stderr)
+                print(f"unit_move: anomaly: {member.name}: {detail}; agents restart --only {member.id}", file=sys.stderr)
                 reported.add(member.id)
 
         panes = client.panes() if live else []
@@ -590,6 +596,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
+            if isinstance(branch, str):
+                _push_moved_branch(folder, branch)
         finally:
             if not old.exists() and destination.exists():
                 folder = destination

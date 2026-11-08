@@ -25,29 +25,17 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from scripts.message.sessions import addressed, live_sessions  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.lib import unit_runs
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.build_hold import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_queue import admission_service
-    from ..buildlog import store
-    from ..message import session_send
-else:
-    from scripts.build_queue import admission_service
-    from scripts.buildlog import store
-    from scripts.message import session_send
+from scripts.buildlog import store
+from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -279,6 +267,8 @@ def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult
 
 
 def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
+    from scripts.message.sessions import live_sessions
+
     def unblock(holder: str) -> MacHoldResult:
         arguments = ["unblock", "--holder", holder]
         return run_mac_hold(arguments, target)
@@ -573,6 +563,8 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
 
 def admitted_processes() -> frozenset[ProcessIdentity]:
     """Read durable grants, which precede replies and the next decision pass."""
+    from scripts.build_queue import admission_service
+
     try:
         state = admission_service.read_state(store.root() / "admission")
     except (OSError, ValueError) as error:
@@ -596,7 +588,7 @@ class HoldEnforcer(Protocol):
 def hold_enforcer() -> HoldEnforcer:
     # The enforcer uses these audit types; load it after this module is ready.
     import importlib
-    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+    return cast(HoldEnforcer, cast(object, importlib.import_module('scripts.build_hold.hold_enforcer')))
 
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
@@ -698,6 +690,8 @@ def holder_of(given: str | None) -> HolderIdentity:
     given, so a rename between hold and release loses nothing. A holder that is no live Claude
     session keeps `given` as its key.
     """
+    from scripts.message.sessions import addressed, live_sessions
+
     records = live_sessions()
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -712,6 +706,8 @@ def holder_of(given: str | None) -> HolderIdentity:
 def held_key(directory: Path, given: str | None) -> str:
     """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
     kept by session id is found by the name given, the session's name now, and each name it once had."""
+    from scripts.message.sessions import live_sessions
+
     identity = holder_of(given)
     key, name = identity.key, identity.name
     none: list[str] = []
@@ -732,6 +728,8 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
+    from scripts.message.sessions import live_sessions
+
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
         content = path.read_text().strip()
@@ -1236,6 +1234,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
+    from scripts.message.sessions import live_sessions
+
     with release_lock():
         # A receipt for a former name must never shadow a live session-id hold.
         if given is None and resume:
@@ -1768,7 +1768,7 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module('scripts.build_targets.build_targets'), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
@@ -1801,6 +1801,6 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    # The enforcer must use this CLI's domain types, not a second module instance.
-    _ = sys.modules.setdefault("build_hold", sys.modules[__name__])
+    # The enforcer and this CLI must use the same domain types.
+    _ = sys.modules.setdefault("scripts.build_hold.build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

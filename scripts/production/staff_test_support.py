@@ -34,6 +34,24 @@ _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
 
 
+@contextmanager
+def foreign_hostname() -> Generator[None]:
+    """Use one foreign hostname in the test and its Python children."""
+    with tempfile.TemporaryDirectory() as directory:
+        startup = Path(directory) / "sitecustomize.py"
+        _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
+        pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
+        from scripts.production import production_lifecycle, update_registration
+        from scripts.shutdown import shutdown
+
+        with (mock.patch.object(shutdown, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(socket, "gethostname", return_value="gate-fixture"),
+              mock.patch.dict(os.environ, {"PYTHONPATH": pythonpath})):
+            yield
+
+
 def fixture_account_home(home: Path) -> Path:
     """Keep fixture sessions outside the login user's real account folders."""
     for candidate, login in ((Path(os.path.abspath(home)), _LOGIN_HOME), (home.resolve(), _LOGIN_HOME.resolve())):
@@ -392,7 +410,7 @@ def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> s
     from scripts.production import unit_names
 
     row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
-    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
+    return staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), location), expected=row.worktree)
 
 
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
@@ -400,7 +418,7 @@ def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
     """Record private unit locations and configuration through the shared fixture writers."""
     _ = recorded_showrunner(showrunner, doc)
     row = unit_membership(showrunner, unit)
-    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+    row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
@@ -450,7 +468,9 @@ def source_environment(source: Path) -> dict[str, str]:
 
 
 OWNER_CLI = """import os, runpy, sys
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+from pathlib import Path
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
@@ -531,7 +551,8 @@ def isolated_source_readers() -> Generator[None]:
 # canned response, so remote reads, writes, and error mapping must all agree.
 FAKE_SSH = """import json, os, runpy, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import source_environment
 arguments = sys.argv[1:]
@@ -558,7 +579,6 @@ os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
 source = Path(os.environ['STAFF_TEST_OWNER_SOURCE'])
 os.environ.update(source_environment(source))
 sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 from scripts.production import staff_sources
@@ -651,9 +671,8 @@ class StaffTestCase(unittest.TestCase):
             _ = contexts.enter_context(mock.patch(
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
-            _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.local_machine", return_value=machine,
-            ))
+            for module in {remote, sys.modules.get("remote", remote)}:
+                _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
             _ = contexts.enter_context(isolated_source_readers())
             if machine == "mac":
                 _ = os.environ.pop("STAFF_FILE", None)
@@ -782,7 +801,7 @@ class StaffTestCase(unittest.TestCase):
         production_membership(production_name, *units)
         for unit in units:
             row = unit_membership(production_name, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
@@ -807,9 +826,9 @@ class StaffTestCase(unittest.TestCase):
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
         write_text_atomic(doc, "# Production\n")
-        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
+        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
-                              worktree=staff.PresentWorktree("natedev", folder))
+                              worktree=staff.PresentWorktree(remote.local_machine(), folder))
         worker = fixture_worker("reader", unit.id)
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))
@@ -865,17 +884,26 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
-        """A unit run with actual state, roster, server and director records."""
+    def worker_run(self, production_name: str, unit: str, director: str, *,
+                   passes: tuple[dict[str, object], ...] = (), transport: Literal["mesh", "herdr"] = "mesh",
+                   director_run: bool = False) -> Path:
+        """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
             "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
+            "pass": {str(passed["worker_name"]): passed for passed in passes},
         })
         write_text_atomic(run / "director", director + "\n")
+        write_text_atomic(run / "worker_transport", transport + "\n")
         self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if transport == "mesh":
+            self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if director_run:
+            from scripts.lib import unit_runs
+
+            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
         return run
 
     @contextmanager

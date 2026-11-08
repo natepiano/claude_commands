@@ -12,6 +12,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 import sqlite3
 import statistics
@@ -32,8 +33,6 @@ TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
 from scripts.lib import conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
-from scripts.production.gate_modules import discover_test_modules, test_module_name
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 def query(connection: sqlite3.Connection, sql: str,
@@ -133,6 +132,9 @@ def mebibytes(value: float) -> str:
 
 
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
+    from scripts.production.gate_modules import discover_test_modules, test_module_name
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     modules = {(suite, test_module_name(repo, suite, path))
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
@@ -164,7 +166,7 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             histories.append(history)
     unmeasured = [f"{folder}/{filename}"
                   for folder, filename in sorted(modules - {history[0].key for history in histories})]
-    ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
+    ranked = sorted(((statistics.median(attempt.cpu_s for attempt in history), history)
                      for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
     for rank, (median, history) in enumerate(ranked, 1):
@@ -179,13 +181,13 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             tests = kept_tests(connection, last)
             if tests:
                 slowest = f"{tests[0].test} {seconds(tests[0].duration_s)} s"
-        output.append([str(rank), last.name, seconds(median), seconds(last.wall_s),
-                       seconds(statistics.median(attempt.cpu_s for attempt in history)),
+        output.append([str(rank), last.name, seconds(median),
+                       seconds(statistics.median(attempt.wall_s for attempt in history)), seconds(last.wall_s),
                        tests_run, slowest, str(len(history))])
-    print_table(["rank", "suite/module", "median s", "last s", "median CPU s", "tests run",
+    print_table(["rank", "suite/module", "median CPU s", "median s", "last s", "tests run",
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
-        print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+        print(f"{len(output)} modules; sum of median CPU {seconds(sum(item[0] for item in ranked))} s")
     if unmeasured:
         print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 
@@ -277,6 +279,8 @@ def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> 
 
 
 def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     folder, filename = name.split("/", 1)
     attempts = [ModuleAttempt.from_row(row) for row in query(connection, MODULE_ATTEMPTS_QUERY + """
         WHERE m.host = ? AND m.suite = ? AND m.module = ?
@@ -378,7 +382,7 @@ class ReportRequestArguments(argparse.Namespace):
 def arguments(argv: list[str]) -> ReportRequestArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    top_parser = subcommands.add_parser("top", help="rank repository tests or gate modules by median time")
+    top_parser = subcommands.add_parser("top", help="rank gate modules by median CPU or nextest tests by median time")
     _ = top_parser.add_argument("--limit", type=positive, default=20)
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
@@ -402,15 +406,52 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
 
 
 def open_report_index() -> sqlite3.Connection:
-    """Update the index and check the report tables before returning the connection."""
-    _ = index.update()
-    connection = index.read_only()
+    """Read a complete index and build one only when none qualifies."""
+    path = index.complete_gate_index_in(store.root())
+    if isinstance(path, index.NoCompleteGateIndex):
+        _ = index.update()
+        path = index.index_path()
+    connection = sqlite3.connect(index.read_only_path_uri(path), uri=True,
+                                 timeout=index.BUSY_TIMEOUT_MS / 1000)
+    _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
     except BaseException:
         connection.close()
         raise
     return connection
+
+
+def rows_as_of(connection: sqlite3.Connection) -> None:
+    """Show the time of the last row change in the user's zone."""
+    completed = cast(tuple[str] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is not None:
+        zone = user_zone()
+        moment = datetime.fromtimestamp(float(completed[0]), zone)
+        stamp = moment.strftime("%H:%M %Z" if moment.date() == datetime.now(zone).date() else "%m-%d %H:%M %Z")
+        print(f"rows as of {stamp}", file=sys.stderr)
+
+
+def refresh_after_report() -> None:
+    """Refresh in a detached child after the report releases its output."""
+    _ = sys.stdout.flush()
+    _ = sys.stderr.flush()
+    if os.fork():
+        return
+    status = 1
+    try:
+        _ = os.setsid()
+        descriptor = os.open(os.devnull, os.O_RDWR)
+        for target in (0, 1, 2):
+            _ = os.dup2(descriptor, target)
+        if descriptor > 2:
+            os.close(descriptor)
+        _ = index.update()
+        status = 0
+    finally:
+        os._exit(status)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -423,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test times unavailable: {error}; run `buildlog reindex`", file=sys.stderr)
         return 1
     with closing(connection):
+        connection.execute("BEGIN").close()
         host = store.host_name()
         match request.command:
             case "top":
@@ -446,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
                 module(connection, host, request.subject, request.runs)
             case "test":
                 test(connection, host, request.subject, request.runs)
+        rows_as_of(connection)
+    refresh_after_report()
     return 0
 
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read checkpoint trailers and write change review rows.
 
 A visible trailer has three fields and an optional fourth field: after <step>.
@@ -26,7 +26,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Collection, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -237,7 +237,8 @@ def common_git_directory(repo: Path) -> Path:
     return (repo / directory).resolve()
 
 
-def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -> list[str]:
+def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]], *,
+                        record: staff.StaffSnapshot | None = None) -> list[str]:
     """Origin branches whose readable productions in this repository already write review rows."""
     try:
         common = common_git_directory(repo)
@@ -249,7 +250,7 @@ def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -
     for doc in docs:
         try:
             lines = doc.read_text(encoding="utf-8").splitlines()
-            if list_path(doc) is None:
+            if list_path(doc, record=record) is None:
                 continue
             where = Path(production_field(lines, "Repository")).expanduser()
             if common_git_directory(where) != common:
@@ -616,8 +617,10 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     row_producers = [change.producer if isinstance(change, PublicationChange)
                      else producers[index] if producers else UnknownProducer() for index, change in enumerate(changes)]
 
-    identities = [str(producer) if isinstance(producer, str) else row_production(owner, record)
-                  for owner, producer in zip(row_owners, row_producers)]
+    identities = [str(unit_lookup.doc_owner(owner, record).id)
+                  if isinstance(change, PublicationChange)
+                  else str(producer) if isinstance(producer, str) else row_production(owner, record)
+                  for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
 
     def write(lines: list[str]) -> list[str]:
@@ -922,6 +925,9 @@ class UnknownProducer:
     """The change has no known staff producer."""
 
 
+UNKNOWN_PRODUCER = UnknownProducer()
+
+
 @dataclass(frozen=True)
 class UnitSource:
     """The production document and branch worktree of a unit."""
@@ -949,37 +955,66 @@ def _branch_snapshot() -> staff.StaffSnapshot:
 
 def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
     """Resolve branch names and aliases from the unit staff rows of each document."""
-    found: dict[str, UnitSource] = {}
-    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
-    resolver = session_staff.RowResolver(record)
-    machine = remote.local_machine()
+    return _branches_from_units(_document_units(docs, record), record)
+
+
+def _document_units(docs: Iterable[Path], record: staff.StaffSnapshot) -> list[tuple[Path, staff.StaffRow]]:
+    """Collect each document's units and report unreadable staff records."""
+    pairs: list[tuple[Path, staff.StaffRow]] = []
     for doc in docs:
         try:
             rows = unit_lookup.doc_units(doc, record)
         except staff.StaffUnreadable as error:
             print(f"change review: {error}", file=sys.stderr)
             continue
-        for row in rows:
-            tree = row.worktree
-            worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
-                        else MissingUnitWorktree())
-            source = UnitSource(doc, worktree, row.name, row.id)
-            branch = resolver.unit_branch(row)
-            if isinstance(branch, session_staff.Branch):
-                _ = found.setdefault(branch.name, source)
-            try:
-                config = resolver.unit_config(row)
-            except unit_config.ConfigRefused as error:
-                print(f"change review: {source.name}: {error}", file=sys.stderr)
-                config = unit_config.ConfigMissing(str(error))
-            plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
-                    and isinstance(config.plan, unit_config.PlanFile) else "")
-            aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
+        pairs.extend((doc, row) for row in rows)
+    return pairs
+
+
+def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
+                         record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve exact branches before aliases, in the supplied unit order."""
+    found: dict[str, UnitSource] = {}
+    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
+    resolver = session_staff.RowResolver(record)
+    machine = remote.local_machine()
+    for doc, row in pairs:
+        tree = row.worktree
+        worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                    else MissingUnitWorktree())
+        source = UnitSource(doc, worktree, row.name, row.id)
+        branch = resolver.unit_branch(row)
+        if isinstance(branch, session_staff.Branch):
+            _ = found.setdefault(branch.name, source)
+        try:
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            print(f"change review: {source.name}: {error}", file=sys.stderr)
+            config = unit_config.ConfigMissing(str(error))
+        plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
+                and isinstance(config.plan, unit_config.PlanFile) else "")
+        aliases.append((source, (plan, plan.removesuffix("-plan"), source.name,
+                                 worktree.name if isinstance(worktree, Path) else "")))
     for source, names in aliases:
         for name in names:
             if name:
                 _ = found.setdefault(name, source)
     return found
+
+
+def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve live units before retired units, with scoped units first in each group."""
+    pairs = _document_units(_publication_docs(production, record), record)
+    scoped = {pair[1].id for pair in pairs}
+    machine = remote.local_machine()
+    resolver = session_staff.RowResolver(record)
+    for row in record.find(kind="unit"):
+        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
+            continue
+        doc = resolver.production_doc(row)
+        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
+    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
+    return _branches_from_units(pairs, record)
 
 
 def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
@@ -1022,34 +1057,45 @@ def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId |
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
 
 
+def unit_producer(unit: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer of one unit across the staff record."""
+    try:
+        return unit_lookup.unit_row(unit, staff.snapshot()).id
+    except staff.StaffUnreadable:
+        return UNKNOWN_PRODUCER
+
+
 def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
     """Resolve child production documents with the held staff snapshot."""
     return scope_docs(production, below=True, record=record)
 
 
 def publication_changes(commits: list[Commit], production: Path, *,
-                        record: staff.StaffSnapshot | None = None
-                        ) -> list[PublicationChange]:
+                        record: staff.StaffSnapshot | None = None,
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
     record = staff.snapshot() if record is None else record
-    branches = _unit_branches(_publication_docs(production, record), record)
+    branches = _publication_branches(production, record)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     for commit, item in _checkpoint_entries(commits):
         match = _CHECKPOINT.match(commit.subject)
         source = branches.get(match["branch"]) if match is not None else None
-        producer = producer_for(source, record, machine) if source is not None else UnknownProducer()
+        producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
+        if isinstance(known_producer, str) and (source is None or source.producer == known_producer):
+            producer = known_producer
         name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
         changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
     return changes
 
 
-def merge_commits(repo: Path, merge: str) -> list[Commit]:
+def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
+    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}",
+                   *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     for record in records.split("\x1e")[1:]:
         sha, message = record.split("\x1f", 1)
@@ -1468,6 +1514,14 @@ def _words(name: str, value: str) -> str:
 
 
 @dataclass(frozen=True)
+class KnownMergeProducer:
+    """The unit identity supplied by the checkpoint request for one merge."""
+
+    merge: str
+    producer: staff.StaffId
+
+
+@dataclass(frozen=True)
 class ReadinessScan:
     """Scan published merges for changes that need no further step."""
 
@@ -1481,9 +1535,26 @@ class CompletedStep:
 _READINESS_SCAN = ReadinessScan()
 
 
+def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list[str]:
+    """Exclude foreign history before each branch imports this merge."""
+    merge = _git(repo, "rev-parse", merge).strip()
+    excluded: set[str] = set()
+    for ref in refs:
+        path = [line.split() for line in _git(
+            repo, "rev-list", "--ancestry-path", "--parents", f"{merge}..{ref}").splitlines()]
+        if not path:
+            if _git(repo, "rev-parse", ref).strip() != merge:
+                excluded.add(ref)
+            continue
+        descendants = {merge, *(commit[0] for commit in path)}
+        excluded.update(parent for commit in path for parent in commit[1:] if parent not in descendants)
+    return sorted(excluded)
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
-               selection: ReadinessScan | CompletedStep = _READINESS_SCAN) -> list[str]:
+               selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+               known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -1498,18 +1569,24 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         return []
     if isinstance(selection, CompletedStep):
         _require_main(repo, selection.merged)
-        merges = [selection.merged]
+        merges = _git(repo, "log", "-1", "--format=%H%x09%s", selection.merged, "--").splitlines()
     else:
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
-                      "--format=%H", f"origin/{merge_branch}", "--").splitlines()
+                      "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
     record = staff.snapshot() if record is None else record
-    foreign = foreign_units(production, record=record)
+    scoped = set(_publication_docs(production, record))
+    outside_docs = [row.doc.path for row in record.find(kind="showrunner")
+                    if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path not in scoped]
+    outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
     rows: list[str] = []
     matched_step = False
-    for merge in merges:
+    for entry in merges:
+        merge, subject = entry.split("\t", 1)
+        if not subject.endswith(f" into {merge_branch}"):
+            continue
         if not on_main(repo, merge):
             continue
-        commits = [commit for commit in merge_commits(repo, merge) if not _named_in(commit, foreign)]
+        commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
         routed: dict[tuple[Path, Path], list[PublicationChange]] = {}
         merge_changes: dict[Path, list[PublicationChange]] = {}
@@ -1527,7 +1604,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             print(f"{short}: after {readiness.step}; run {command}")
             noted.add(readiness.step)
 
-        for change in publication_changes(commits, production, record=record):
+        producer = (known_producer.producer
+                    if isinstance(known_producer, KnownMergeProducer) and known_producer.merge == merge
+                    else UNKNOWN_PRODUCER)
+        for change in publication_changes(commits, production, record=record, known_producer=producer):
             readiness = change.item.readiness
             if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
                 matched_step = True
@@ -1550,31 +1630,6 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
-
-
-def _named_in(commit: Commit, names: Collection[str]) -> bool:
-    """Whether the commit is a checkpoint named for one of `names`."""
-    found = _CHECKPOINT.match(commit.subject)
-    return found is not None and found["branch"] in names
-
-
-def foreign_units(production: Path, *,
-                  record: staff.StaffSnapshot | None = None
-                  ) -> set[str]:
-    """The checkpoint names of the units of every production outside the tree of `production`'s root.
-
-    Return an empty set when the productions cannot be read.
-    """
-    from scripts.production import showrunners
-    try:
-        record = staff.snapshot() if record is None else record
-        docs_by_name = showrunners.timer_docs()
-        root = showrunner_of(production, record=record)
-        top = docs_by_name.get(root, production)
-        return {name for name, source in _unit_branches(docs_by_name.values(), record).items()
-                if source.production not in set(_publication_docs(top, record))}
-    except (OSError, ValueError, Refusal):
-        return set()
 
 
 def _changes(text: str) -> list[dict[str, str]]:

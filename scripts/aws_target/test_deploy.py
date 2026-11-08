@@ -24,13 +24,12 @@ from typing import ClassVar, cast, override
 from unittest import mock
 from urllib.request import Request
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_trial, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
-from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet
+from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
 from scripts.buildlog import sync
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -193,6 +192,14 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
     reply({})
+elif operation == 'create-image':
+    reply({'ImageId': 'ami-cache'})
+elif operation in ('deregister-image', 'delete-snapshot'):
+    reply({})
+elif operation == 'describe-snapshots':
+    reply({'Snapshots': [{'SnapshotId': 'snap-cache'}]})
+elif operation == 'describe-images' and '--owners' in args and args[args.index('--owners') + 1] == 'self':
+    reply({'Images': [{'ImageId': 'ami-cache', 'State': 'available', 'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': 'snap-cache'}}]}]})
 elif operation == 'describe-images':
     reply({'Images': [{'ImageId': 'ami-fixture', 'OwnerId': '123456789012', 'Architecture': 'x86_64',
                        'State': 'available', 'Name': 'nixos-26.05-x86_64', 'RootDeviceName': '/dev/xvda'}]})
@@ -242,6 +249,11 @@ elif operation == 'stop-instances':
     reply({'StoppingInstances': [{'InstanceId': 'i-fixture', 'CurrentState': {'Name': 'stopped'}}]})
 elif operation == 'start-instances':
     assert args[args.index('--instance-ids') + 1] == state['outputs']['InstanceId']
+    capacity = root / 'capacity-refusals'
+    if capacity.exists() and int(capacity.read_text()) > 0:
+        capacity.write_text(str(int(capacity.read_text()) - 1))
+        print('InsufficientInstanceCapacity: no Spot capacity', file=sys.stderr)
+        sys.exit(1)
     state['instance_state'] = 'pending'
     state_path.write_text(json.dumps(state))
     if os.environ.get('BOX_FIXTURE'):
@@ -389,6 +401,8 @@ class DeploymentTests(CostFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             'PATH': f'{bin_path}{os.pathsep}{os.environ["PATH"]}', 'DEPLOY_FIXTURE': str(self.root),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials),
+            'BOX_REAL_GIT': shutil.which('git') or 'git',
+            'SCRATCH_ROOT': str(self.root / 'scratch'), 'SCRATCH_HOLDS': str(self.root / 'holds.json'),
         })))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)
@@ -604,6 +618,71 @@ sys.exit(7)
         self.set_clock(self.now + 1)
         _ = subject.prepare()
         return subject
+
+    def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
+        subject = self.update_fixture()
+        self.set_clock(self.now + 1)
+        _ = (self.root / 'cloud_gate.conf').write_bytes(
+            (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        commands: list[list[str]] = []
+        outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
+                   'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            commands.append(args)
+            operation = args[args.index('--region') + 3]
+            reply: dict[str, object] = {}
+            if operation == 'describe-stacks':
+                reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
+                    ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail')]}]}
+            elif operation == 'describe-route-tables':
+                reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
+                    {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
+            elif operation == 'describe-subnets':
+                reply = {'Subnets': [{'SubnetId': 'fixture-' + zone, 'AvailabilityZone': zone, 'State': 'available'}
+                                    for zone in ('a', 'b')]}
+            elif operation == 'get-caller-identity':
+                reply = {'Account': 'fixture-account'}
+            elif operation == 'describe-change-set':
+                reply = {'Status': 'CREATE_COMPLETE', 'Changes': [{'ResourceChange': {'LogicalResourceId': change}}]}
+            elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
+                raise AssertionError(operation)
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+        _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
+            'build-admin', 'us-east-1', 1, execute=execute)))
+        _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
+        _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        return subject, commands
+
+    def test_gate_deployment_preserves_rust_parameters_and_records_scoped_resources(self) -> None:
+        subject, commands = self.gate_fixture()
+        before = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
+        self.assertTrue(subject.gate_up(approve_resources=True))
+        arguments = next(args for args in commands if 'create-change-set' in args)
+        parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
+        by_name = {ledger.text(row, 'ParameterKey'): row for row in parameters}
+        for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
+            self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
+        self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
+        self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
+        self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
+        saved = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual(saved['artifact_prefix'], 'artifacts/fixture-role:')
+        self.assertEqual(saved['revision'], 'fixture-revision')
+        self.assertEqual([row['zone'] for row in ledger.rows(saved, 'subnets')], ['a', 'b'])
+        after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
+        self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
+        self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gate_deployment_rejects_a_change_to_a_rust_resource(self) -> None:
+        subject, commands = self.gate_fixture('Instance')
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'Rust resource'):
+            _ = subject.gate_up(approve_resources=True)
+        self.assertFalse(any('execute-change-set' in args for args in commands))
+        self.assertTrue(any('delete-change-set' in args for args in commands))
+        self.assertFalse((self.state / 'gate-deployment.json').exists())
 
     def test_live_update_without_fingerprint_preserves_first_boot_and_saves_fingerprint(self) -> None:
         subject = self.update_fixture()
@@ -972,6 +1051,41 @@ sys.exit(7)
             _ = subject.prepare()
         self.assertEqual(len(self.commands('create-change-set')), before)
 
+    def test_parameters_choose_only_an_available_saved_image(self) -> None:
+        subject = self.deployment()
+        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
+        _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
+        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-cache')
+        with mock.patch.object(box, 'saved_image', return_value={}):
+            self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
+        with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
+            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings, self.state)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_image_stage_runs_between_checks_and_idle_stop(self) -> None:
+        stages = [stage.name for stage in self.deployment()._box_stages()]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(stages[stages.index('checks'):stages.index('idle-stop') + 1], ['checks', 'image', 'idle-stop'])
+
+    def test_update_preserves_ami_only_with_a_live_instance(self) -> None:
+        subject = self.update_fixture()
+        prepared = subject.prepare()
+        for live in ({'InstanceId': 'i-fixture'}, {}):
+            with mock.patch.object(subject, '_stack', return_value=live):
+                subject._update_stack(aws_config.read_deployment_settings(self.settings, self.state), prepared.parameters, compute=False)  # pyright: ignore[reportPrivateUsage]
+            args = cast(list[str], self.commands('create-change-set')[-1]['args'])
+            values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
+            ami = next(row for row in values if row['ParameterKey'] == 'AmiId')
+            self.assertEqual(ami, {'ParameterKey': 'AmiId', **({'UsePreviousValue': True} if live else {'ParameterValue': 'ami-fixture'})})
+
+    def test_down_keeps_and_reports_the_saved_image(self) -> None:
+        _ = self.removal_fixture()
+        path = self.state / 'image.json'
+        _ = path.write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM, 'idle_stop_system': SYSTEM}))
+        before = path.read_bytes()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertIn('down: image kept: ami-cache; next up starts from it', output)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_new_stack_gets_current_bootstrap(self) -> None:
         subject = self.deployment()
         prepared = subject.prepare()
@@ -1276,6 +1390,10 @@ else: raise AssertionError(args)
         devices['devices'] = [*existing, {'id': 'new-device', 'nodeId': 'node-box',
                                          'hostname': name, 'tags': ['tag:build-aws']}]
 
+    def start_box_after_tick(self, start: Callable[[], object]) -> object:
+        self.set_clock(self.now + 1)
+        return start()
+
     def down_output(self) -> tuple[bool, str]:
         output = StringIO()
         with redirect_stdout(output):
@@ -1287,7 +1405,7 @@ else: raise AssertionError(args)
         ledger.rows(devices, 'devices')[0]['nodeId'] = 'node-box'
         self.set_clock(self.now + 1)
         fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
         _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
         _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
             'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
@@ -1302,7 +1420,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -1390,6 +1508,7 @@ else: raise AssertionError(args)
         with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
             self.assertTrue(self.deployment().down())
         self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('admin.gpg, and the box image', output.getvalue())
         self.assertIn('--approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
@@ -1403,9 +1522,12 @@ else: raise AssertionError(args)
         charges = self.state / 'charges/day.json'
         charges.parent.mkdir(exist_ok=True)
         _ = charges.write_text('retained charge evidence')
-        success, output = self.down_output()
+        with mock.patch.object(box, 'close_routing', wraps=box.close_routing) as close:
+            success, output = self.down_output()
+        close.assert_called_once_with(self.settings)
         self.assertTrue(success, output)
         self.assertIn('data volume; the /home build cache is lost', output)
+        self.assertNotIn('down: image kept:', output)
         self.assertIn('retained Budget', output)
         self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other'])
         self.assertEqual(admin_secrets.read_profiles(self.credentials).sections(), ['unrelated'])
@@ -1461,16 +1583,56 @@ else: raise AssertionError(args)
         devices = self.removal_fixture()
         self.assertIn('devices', devices)
         before = len(self.commands())
-        with mock.patch.object(mac_test, 'live_claims', return_value=('live claim',)):
-            success, output = self.down_output()
+        claim = write_aws_claim(self.state, kept=False)
+        success, output = self.down_output()
         self.assertFalse(success)
         self.assertIn('AWS claims remain live', output)
         self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
         self.assertFalse((self.root / 'controller-enabled').exists())
         self.assertEqual([cast(list[str], row['args'])[5] for row in self.commands()[before:]],
                          ['get-caller-identity', 'describe-stacks'])
+        self.assertTrue(claim.exists())
+        claim.unlink()
         success, output = self.down_output()
         self.assertTrue(success, output)
+
+    def test_down_preserves_a_kept_claim_and_completes(self) -> None:
+        _ = self.removal_fixture()
+        path = write_aws_claim(self.state, kept=True)
+        original = path.read_bytes()
+        with mock.patch.object(box, 'running_claims', wraps=box.running_claims) as claims:
+            success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual(claims.call_count, 2)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_down_ignores_a_reservation_and_preserves_its_file(self) -> None:
+        _ = self.removal_fixture()
+        path = write_aws_claim(self.state, kept=False, remote=False)
+        original = path.read_bytes()
+        with mock.patch.object(box, 'running_claims', wraps=box.running_claims) as claims:
+            success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual(claims.call_count, 2)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_down_refuses_a_running_claim_before_device_removal(self) -> None:
+        devices = self.removal_fixture()
+        read_claims = box.running_claims
+        calls = 0
+        def claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                _ = write_aws_claim(self.state, kept=False)
+            return read_claims(paths)
+        with mock.patch.object(box, 'running_claims', side_effect=claims):
+            success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('tailscale-device: refused: AWS claims remain live', output)
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(ledger.rows(devices, 'devices')), 2)
+        self.assertTrue((self.state / 'claims/job.json').exists())
 
     def test_up_after_down_recreates_foundation_compute_and_scaler_key(self) -> None:
         devices = self.removal_fixture()
@@ -1478,7 +1640,7 @@ else: raise AssertionError(args)
         self.assertTrue(success, output)
         before = len(self.commands())
         fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
         _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
         _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
             'system': '/nix/store/old', 'desired': SYSTEM, 'ec2': 'stopped'}))
@@ -1488,7 +1650,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -1497,7 +1659,7 @@ else: raise AssertionError(args)
         self.assertTrue(success, output)
         results = remote.read_record(self.state / 'up.json')
         self.assertEqual(list(results), sorted(('price', 'bootstrap', 'stacks', 'scaler-key', 'tailscale-policy', 'box-join',
-                                              'box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')))
+                                              'box-configuration', 'checks', 'image', 'idle-stop', 'activation', 'routing-proof')))
         self.assertTrue(all(ledger.mapping(row)['status'] == 'done' for name, row in results.items() if name != 'price'), output)
         later = [cast(list[str], row['args']) for row in self.commands()[before:]]
         self.assertEqual(sum('EnableCompute=false' in args for args in later), 1)
@@ -1633,7 +1795,7 @@ else: raise AssertionError(args)
         self.set_clock(self.now + 1)
         before = len(self.commands('deploy'))
         fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
         _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
         _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': True, 'active': True,
             'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
@@ -1643,7 +1805,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -2029,6 +2191,7 @@ else: raise AssertionError(args)
         subject = self.deployment()
         _ = subject.prepare()
         _ = subject.apply(approve_resources=True)
+        _ = box.close_routing(self.settings)
         self.set_clock(self.now + 1)
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
@@ -2037,6 +2200,7 @@ else: raise AssertionError(args)
         self.assertEqual(cast(dict[str, object], starts[0]['decision'])['purpose'], 'deployment')
         self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertFalse((self.state / 'admission.json').exists())
+        self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
         self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'pending')
 
     def test_setup_restart_uses_prepared_parameters_without_the_private_address_file(self) -> None:
@@ -2046,6 +2210,48 @@ else: raise AssertionError(args)
         self.notification_file.unlink()
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
         self.assertEqual(len(self.commands('start-instances')), 1)
+
+    def test_box_start_waits_for_spot_capacity_until_accepted(self) -> None:
+        waits: list[float] = []
+
+        def pause(seconds: float) -> None:
+            waits.append(seconds)
+            self.set_clock(self.now + int(seconds))
+
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
+                                    pause=pause, notify=lambda _event: True)
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        started = self.now
+        _ = (self.root / 'capacity-refusals').write_text('2')
+        accepted = {'InstanceId': 'i-fixture', 'State': 'pending'}
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(subject._start_box(), accepted)  # pyright: ignore[reportPrivateUsage]
+        delay = read_control_settings(self.settings).capacity_backoff_s
+        self.assertEqual(len(self.commands('start-instances')), 3)
+        self.assertEqual((self.root / 'capacity-refusals').read_text(), '0')
+        self.assertEqual(waits, [delay] * 2)
+        self.assertEqual(self.now, started + int(delay) * 2)
+        self.assertEqual(remote.read_record(self.bundle / 'preflight.json')['at'], self.now)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.'] * 2)
+
+    def test_box_start_raises_other_aws_errors_without_waiting(self) -> None:
+        pause = mock.Mock()
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
+                                    pause=pause, notify=lambda _event: True)
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        error = aws_target.AwsUnavailable('UnauthorizedOperation: start refused')
+        output = StringIO()
+        with (mock.patch.object(subject, 'setup_start', side_effect=error) as start,
+              redirect_stdout(output), self.assertRaises(aws_target.AwsUnavailable) as failure):
+            _ = subject._start_box()  # pyright: ignore[reportPrivateUsage]
+        self.assertIs(failure.exception, error)
+        start.assert_called_once_with(approve_resources=True)
+        pause.assert_not_called()
+        self.assertEqual(output.getvalue(), '')
 
     def test_setup_restart_refuses_a_changed_limit_before_any_resource_request(self) -> None:
         subject = self.deployment()

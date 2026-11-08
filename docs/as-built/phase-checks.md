@@ -22,6 +22,11 @@ Clippy judges first.
 A passing judgment skips repairs.
 A failed judgment starts up to three `cargo clippy --fix` and fmt passes, followed by a final judgment.
 Every clippy run in this path uses `--keep-going`.
+`invoke_clippy_fix` removes `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` from cargo's environment on Linux and macOS.
+It sets `--jobs` from `clippy_fix_jobs` in `config/lint.conf`.
+The valid range is 1..9999. Missing or invalid values use 8; invalid values print one warning.
+Plain `invoke_clippy` keeps the shared build pool.
+Fix steps keep memory admission, lint gating and build log records, including the `--fix` argument.
 The director runs workspace rustdoc through `verify.sh doc` after staging, immediately before the checkpoint commit.
 The checkpoint requires its pass record for the exact tree.
 [Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines the pass rules.
@@ -33,7 +38,10 @@ The checkpoint requires its pass record for the exact tree.
 - `docs/direct/launch_implementation.md` — the launcher's `phase_reservation.py claim` saves the repository's full `HEAD` id to `${PHASE_DIR}/phase_baseline` and `git status --short` to `${PHASE_DIR}/progress_baseline_status` on the first launch, before the worker opens; a git failure stops the launch. Later launches, including repairs and reopened phases, keep both baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 - `docs/direct/dual_review.md` — `<ReviewPromptContract/>` owns the style assignment's completion and retry rules, baseline and artifact paths. It assigns a reviewer until the phase result returns, including after cancellation. The director reads the findings ledger and reported result.
 - `docs/direct/write_prompt_contract.md` — item 2 keeps implementation, fix and test workers from loading the guide; reviewer prompts follow `<ReviewPromptContract/>`. Item 6 supplies the repair rules.
-- `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).
+- `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract and runs it at ExecutionSteps step 6, within `<DualReview/>`.
+- `docs/direct/verification.md` — VerificationContract names `verify.sh lint` as the phase lint checks under `<PhaseChecks/>`.
+- `docs/direct/repair_rounds.md` — holds `<FixDispatch/>`.
+- `docs/direct/final_gate_commit.md` — holds `<FinalGate/>` and the RunSummary `**Style review:**` line, which records each phase's reviewed range and result.
 - `scripts/lint/style_review.py` and `config/review/style.md` — the shared input/report runner and its one read-only assignment template.
 - `scripts/direct/verify.sh` — the `lint`, `doc` and `final` arms. There is no `fmt` arm.
 - `config/lint.conf` and `scripts/lint/lint_config.sh` — the on/off switches.

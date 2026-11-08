@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import TypedDict, cast
 from unittest import mock
 
 from scripts.direct import verify_ssh_targets_test_support as support
-from scripts.direct.verify_ssh_targets_test_support import REPOSITORY, VerifySshTargetsFixture
+from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class MacWaitRegistration(TypedDict):
@@ -33,8 +32,7 @@ import sys
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
-sys.path.insert(0, str(source / "scripts/buildlog"))
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.buildlog import mac_idle
 from scripts.direct import step_record
 
@@ -144,8 +142,7 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "aws",
                                          "BUILDLOG_PINNED_TARGET": "aws"}), \
              mock.patch.object(store, "host_name", return_value="aws-build"), \
-             mock.patch.object(os, "getcwd", return_value=str(self.root)), \
-             mock.patch.object(sys, "path", [str(REPOSITORY / "scripts/buildlog"), *sys.path]):
+             mock.patch.object(os, "getcwd", return_value=str(self.root)):
             record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog/aws-build").glob("*.jsonl")
@@ -169,8 +166,8 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/aws-build.nix\n")
         for mode, reason, detail in (
             ("disk", "disk", "not running on the aws (disk)"),
-            ("version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
-             + "move the box pins in nixos hosts/aws-build.nix", "rustc box=rustc other"),
+            ("version-mismatch", "aws version mismatch: nextest box=nextest other natedev=nextest fixture; "
+             + "move the box pins in nixos hosts/aws-build.nix", "nextest box=nextest other"),
             ("runtime-version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
              + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix",
              "nextest box=nextest other"),
@@ -186,6 +183,30 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(self.admission.history(), [])
                 self.assertEqual(self.attempts()[-1]["reason"], reason)
+
+    def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
+        from scripts.mac_test import offload
+
+        self.configure("natedev,aws")
+        state = self.target_state("aws")
+        _ = (state / "box-tools.json").write_text(json.dumps({"versions": {"rustc": "rustc other"}}))
+        reason = ("aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+                  "move the box pins in nixos hosts/aws-build.nix")
+        with mock.patch.object(offload, "state_directory", return_value=state):
+            path = offload.linux_version_decline_path("aws", self.root.name)
+            self.assertFalse(path.exists())
+            result = self.verify("test", "sample", "--target", "aws")
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("target aws refused: " + reason, result.stderr)
+            self.assertIn("rustc box=rustc other natedev=rustc fixture", result.stdout + result.stderr)
+            recorded_at = float(path.read_text())
+            self.assertTrue(offload.linux_version_declined_recently("aws", self.root.name, 60, recorded_at + 1))
+            self.assertFalse(offload.linux_version_declined_recently("aws", "other-repository", 60, recorded_at + 1))
+        self.assertEqual(self.attempts()[-1]["reason"], reason)
+        self.assertNotIn("probe", self.ssh_events()[-1]["actions"])
+        self.assertNotIn("run", self.ssh_events()[-1]["actions"])
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.admission.history(), [])
 
     def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
         self.assert_pinned_wait_keeps_its_live_record("test")
@@ -205,8 +226,7 @@ import os
 from pathlib import Path
 records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))
 assert len(records) == 1
-import sys
-sys.path.insert(0, str(Path.home() / ".claude"))
+with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.test_verify_step_state import read_step_row
 row = read_step_row(records[0].stem)
 Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))
@@ -220,11 +240,13 @@ Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write
         self.assertEqual(self.admission.history(), [])
         self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
 
-    def test_pinned_target_rejects_unknown_and_local_target_names(self) -> None:
-        for name in ("unknown", "natedev"):
-            with self.subTest(target=name):
-                result = self.verify("test", "sample", "--target", name)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("unknown SSH target: " + name, result.stderr)
+    def test_pinned_target_rejects_unknown_names_and_accepts_natedev(self) -> None:
+        result = self.verify("test", "sample", "--target", "unknown")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown SSH target: unknown", result.stderr)
         self.assertEqual(self.ssh_events(), [])
         self.assertEqual(self.local_runs(), [])
+        result = self.verify("test", "sample", "--target", "natedev")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.ssh_events(), [])
+        self.assertEqual(len(self.local_runs()), 1)

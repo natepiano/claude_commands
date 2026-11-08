@@ -25,9 +25,8 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import promote, request_from
-import merge_checkpoint
+from scripts.production.merge_checkpoint import promote, request_from
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production.production_doc import Production
 
@@ -176,7 +175,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         (self.state / "slow-delivery").touch()
         command = (
             "import sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, sys.argv[1])\nimport merge_checkpoint as checkpoint\n"
+            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import merge_checkpoint as checkpoint\n'
             "path = Path(sys.argv[2])\ncheckpoint.send_result(path, checkpoint.read_record(path))\n"
         )
         output = self.enterContext((self.state / "slow-delivery.log").open("w"))
@@ -703,7 +702,7 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("merge_checkpoint.datetime", wraps=datetime, now=now):
+        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)

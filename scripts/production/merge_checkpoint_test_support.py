@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 from scripts.lint.memory_test_support import config_environment
@@ -24,11 +26,9 @@ from unittest import mock
 from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
@@ -143,7 +143,8 @@ if name == "basedpyright":
 
 BUMP_TEST_STUB = STUB + '''
 import subprocess
-sys.path.insert(0, __TEST_REPOSITORY__)
+with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
 from scripts.herdr.herdr import NATIVE_ID_MARKS
@@ -176,14 +177,20 @@ if (state / "gate-red").exists() and "-E" not in args:
 BUMP_SEND_STUB = STUB + '''
 import uuid
 if (state / "slow-delivery").exists():
-    sys.path.insert(0, __TEST_REPOSITORY__)
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     (state / "delivery-started").touch()
     wait_for_file(state / "delivery-release")
-if (state / "stop-before-showrunner-notice").exists() and "showrunner" in args[args.index("--to") + 1]:
-    import signal
-    os.kill(os.getppid(), signal.SIGKILL)
-    raise SystemExit(1)
+if (state / "stop-before-showrunner-notice").exists():
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.production import staff
+    recipient = staff.local_snapshot().by_current_session(args[args.index("--to") + 1].removeprefix("session:"))
+    if recipient is not None and recipient.kind == "showrunner":
+        import signal
+        os.kill(os.getppid(), signal.SIGKILL)
+        raise SystemExit(1)
 retry = state / "send-fail-once"
 if retry.exists():
     retry.unlink()
@@ -316,6 +323,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
         self.write(self.checkout, "README.md", "base\n")
+        self.write(self.checkout, "Cargo.toml", "[workspace]\n")
         self.write(self.checkout, ".gitignore", "production.log\n.unit.toml\n")
         self.write(self.checkout, "src/alpha.txt", "alpha base\n")
         self.write(self.checkout, "src/beta.txt", "beta base\n")
@@ -349,10 +357,10 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = fixture_member("showrunner", name="example")
         self.production_doc()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(remote.local_machine(), self.doc))
             for name, folder in (("alpha", self.unit), ("beta", self.other)):
                 _ = fixture_member("unit", name=name, parent=owner.id,
-                                   worktree=staff.PresentWorktree("natedev", folder))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), folder))
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -744,7 +752,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             relationship = fixture_member("showrunner", name=parent).id if parent else staff.StaffRoot()
             _ = fixture_member("showrunner", name="example-style", parent=relationship,
-                               doc=staff.LiveDoc("natedev", doc))
+                               doc=staff.LiveDoc(remote.local_machine(), doc))
         self.env["MERGE_CHECKPOINT_SHOWRUNNERS"] = str(registry)
         self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
         return doc

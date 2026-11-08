@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from scripts.accounts import accounts, moves, refusal_watch
+from scripts.agents.worker_lifecycle import WorkerStateUnreadable
 from scripts.accounts.accounts import SessionMoveOutcome
 from scripts.herdr import herdr, worker_panes
 from scripts.direct import progress_history
@@ -135,12 +136,24 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
 
 
 def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
-    role = worker_panes.dispatch_role(move.row)
-    if isinstance(role, worker_panes.WorkerRoleUnavailable):
-        return accounts.SessionMoveRefused(move.row.id, role.reason)
     state = _observe(move)
     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {state.reason}")
+    active = progress_history.active_dispatch(move.row.id, move.run)
+    if isinstance(active, progress_history.ActiveDispatchUnavailable):
+        return accounts.SessionMoveRefused(move.row.id, f"anomaly: {' '.join(active.reason.splitlines())}")
+    if isinstance(active, progress_history.NoActiveDispatch):
+        if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+            closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name),
+                                        run=worker_panes.DispatchRun(move.run), lock=hold)
+            if isinstance(closed, worker_panes.Kept):
+                return accounts.SessionMoveRefused(move.row.id, closed.blocker)
+            if isinstance(closed, worker_panes.UncertainWorker):
+                return accounts.SessionMoveRefused(move.row.id, f"anomaly: {closed.reason}")
+        return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
+    role = worker_panes.dispatch_role(move.row)
+    if isinstance(role, worker_panes.WorkerRoleUnavailable):
+        return accounts.SessionMoveRefused(move.row.id, role.reason)
     if isinstance(state, worker_panes.OpenWorker):
         running = stop_resume.running_on_account(str(move.row.current_session), state.pane, kind=move.family)
         if not isinstance(running, stop_results.ClaudeUp):
@@ -157,7 +170,10 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
 
 def run_for_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> Path:
     parent = record.parent_of(row)
-    return worker_panes.worker_run(parent) if parent is not None else Path()
+    try:
+        return worker_panes.worker_run(row, record=record) if parent is not None else Path()
+    except WorkerStateUnreadable as error:
+        raise ValueError(f"anomaly: {error}") from error
 
 
 def move_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str, why: str, run: Path) -> SessionMoveOutcome:

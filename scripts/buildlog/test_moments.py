@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build-moment comparisons over fixture logs and fixture progress history."""
 
 from __future__ import annotations
+
+from scripts.production.staff_test_support import foreign_hostname
 
 import json
 import os
@@ -25,6 +27,10 @@ from scripts.buildlog.test_memory_window import write_lint_config
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
 END = START + timedelta(days=2)
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 def build(record_id: str, seconds: float, **fields: object) -> Record:
@@ -52,7 +58,7 @@ def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.Comple
     database = index.index_path()
     before = database.read_bytes()
     result = subprocess.run(
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("cli.py")), *args],
+        memory_fixtures.configured_host_cli(Path(__file__).with_name("cli.py"), *args),
         env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
     )
     test.assertEqual(result.returncode, 0, result.stderr)
@@ -514,7 +520,7 @@ class MemoryMomentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
-        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
+        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", side_effect=memory_fixtures.configured_local_host)))
 
     def memory_cells(self, lines: list[str]) -> dict[str, dict[str, str]]:
         start = next(number for number, line in enumerate(lines) if line.startswith("| Memory "))
@@ -567,7 +573,8 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-from scripts.buildlog import index, memory, moments, report
+from scripts.buildlog import index, memory, moments, report, record, store
+store.host_name = lambda: record.local_step_identity().hosts[0]
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)

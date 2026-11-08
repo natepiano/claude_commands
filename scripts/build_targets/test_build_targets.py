@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import subprocess
+import tempfile
 import time
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -57,10 +58,13 @@ def pacific_zone() -> Generator[None, None, None]:
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
-    def test_clean_target_import_loads_mac_test_once(self) -> None:
+    def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        environment.update({"HOME": directory, "BUILDLOG_DIR": directory})
         result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
             "import sys; from scripts.build_targets import build_targets; "
+            + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
             + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
             + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
             + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
@@ -563,13 +567,13 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
         output, errors = self.floor_answer(60, offload.CommandOutput(0, "", ""))
-        self.assertEqual(output.splitlines()[0], "mac_allowed")
+        self.assertEqual(output.splitlines()[0], "any_target")
         self.assertIn("mac\teligible\t-", output)
         self.assertEqual(errors, "")
 
     def test_floor_sweep_shortfall_keeps_the_disk_route(self) -> None:
         output, _ = self.floor_answer(59, offload.CommandOutput(0, "", ""))
-        self.assertEqual(output.splitlines()[0], "natedev_only disk")
+        self.assertEqual(output.splitlines()[0], "any_target")
         self.assertIn("mac\texcluded\tdisk", output)
 
     def test_floor_sweep_failure_keeps_the_disk_route_and_names_the_cause(self) -> None:
@@ -577,7 +581,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                               (offload.COMMAND_TIMED_OUT, "timed out")):
             with self.subTest(cause=cause):
                 output, errors = self.floor_answer(200, result)
-                self.assertEqual(output.splitlines()[0], "natedev_only disk")
+                self.assertEqual(output.splitlines()[0], "any_target")
                 self.assertIn("mac\texcluded\tdisk", output)
                 self.assertIn(cause, errors)
 
@@ -589,7 +593,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         self.assertEqual(self.kind_output("check"),
-                         "mac_allowed\nnatedev\teligible\t-\t-\t-\n"
+                         "any_target\nnatedev\teligible\t-\t-\t-\n"
                          + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\teligible\t-\t{self.settings}\tmacos\n")
         self.assertEqual(self.kind_output("build"),
                          "natedev_only makes natedev artifacts\nnatedev\teligible\t-\t-\t-\n"
@@ -598,16 +602,16 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_local_only_configuration_keeps_artifact_and_gate_reasons(self) -> None:
         _ = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        for kind, reason in (("build", "makes natedev artifacts"), ("example", "makes natedev artifacts"),
+        for kind, reason in (("build", "makes natedev artifacts"),
                              ("final", "full gate runs on natedev")):
             with self.subTest(kind=kind):
                 self.assertEqual(self.kind_output(kind), f"natedev_only {reason}\nnatedev\teligible\t-\t-\t-\n")
 
     def test_kind_answers_allow_portable_judgments_and_keep_artifacts_local(self) -> None:
-        for kind in ("check", "doc", "lint", "test"):
+        for kind in ("check", "doc", "lint", "test", "example"):
             with self.subTest(kind=kind):
-                self.assertEqual(self.kind_answer(kind, "portable"), "mac_allowed\n")
-        for kind in ("build", "example"):
+                self.assertEqual(self.kind_answer(kind, "portable"), "any_target\n")
+        for kind in ("build",):
             with self.subTest(kind=kind):
                 self.assertEqual(self.kind_answer(kind), "natedev_only makes natedev artifacts\n")
         self.assertEqual(self.kind_answer("final"), "natedev_only full gate runs on natedev\n")
@@ -616,16 +620,16 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
         for kind in ("check", "doc", "lint"):
             with self.subTest(kind=kind):
-                self.assertEqual(self.kind_answer(kind, "portable"), "natedev_only linux_only\n")
-        self.assertEqual(self.kind_answer("test", "portable"), "mac_allowed\n")
-        self.assertEqual(self.kind_answer("test", "linux-part"), "natedev_only linux_only\n")
+                self.assertEqual(self.kind_answer(kind, "portable"), "any_target\n")
+        self.assertEqual(self.kind_answer("test", "portable"), "any_target\n")
+        self.assertEqual(self.kind_answer("test", "linux-part"), "any_target\n")
 
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
-        self.assertEqual(self.kind_answer("check", free_gib=59), "natedev_only disk\n")
+        self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")
         offload.write_backoff(time.time() + 60)
-        self.assertEqual(self.kind_answer("doc"), "mac_allowed\n")
+        self.assertEqual(self.kind_answer("doc"), "any_target\n")
         _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
-        self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
+        self.assertEqual(self.kind_answer("lint"), "any_target\n")
 
     def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
@@ -635,7 +639,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             with self.subTest(reason=reason), mock.patch.object(
                 build_targets, "ssh_target_eligibility", return_value=targets.ExcludedTarget(target, reason),
             ):
-                decision = "natedev_only disk" if reason == "disk" else "mac_allowed"
+                decision = "any_target"
                 self.assertEqual(self.kind_output("test", "portable"),
                                  decision + "\nmac\texcluded\t" + reason + f"\t{self.settings}\tmacos\n"
                                  + "natedev\teligible\t-\t-\t-\n")
@@ -657,7 +661,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 with (self.subTest(targets=[(target.name, reason) for target, reason in ordered]),
                       mock.patch.object(build_targets, "read_targets", return_value=tuple(target for target, _ in ordered)),
                       mock.patch.object(build_targets, "ssh_target_eligibility", side_effect=list(results.values()))):
-                    self.assertEqual(self.kind_answer("test", "portable"), "natedev_only disk\n")
+                    self.assertEqual(self.kind_answer("test", "portable"), "any_target\n")
 
     def test_unresolved_probe_excludes_target_as_busy(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
@@ -674,7 +678,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_unreadable_workspace_cannot_be_sent_to_the_mac(self) -> None:
         _ = (self.root / "Cargo.toml").write_text("[")
-        self.assertEqual(self.kind_answer("doc"), "natedev_only repo\n")
+        self.assertEqual(self.kind_answer("doc"), "any_target\n")
 
 
 class WaitLocalTests(IsolatedBuildTargetTest):

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Prepare local evidence and deploy resources only through an explicit user command."""
 from __future__ import annotations
 try:
@@ -26,7 +26,6 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
@@ -106,12 +105,14 @@ def fingerprint(settings: DeploymentSettings, parameters: dict[str, str], templa
 class Deployment:
     def __init__(self, settings_path: Path, directory: Path, output: Path, *,
                  execute: AwsExecutor = execute_command, clock: Callable[[], float] = time.time,
+                 pause: Callable[[float], None] = time.sleep,
                  notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event) -> None:
         self.settings_path = settings_path
         self.directory = directory
         self.output = output
         self.execute = execute
         self.clock = clock
+        self.pause = pause
         self.notify = notify
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
@@ -187,6 +188,9 @@ class Deployment:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
         parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification, deployment_id)
+        image = box.saved_image(self._api(settings), self.directory)
+        if image.get('State') == 'available':
+            parameters['AmiId'] = ledger.text(image, 'ImageId')
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -536,10 +540,14 @@ class Deployment:
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key == 'Bootstrap' and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
             for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
         ]
+        if (self.directory / 'gate-deployment.json').exists():
+            template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
+            values.extend({'ParameterKey': key, 'UsePreviousValue': True}
+                          for key in ledger.mapping(template['Parameters']) if key.startswith('Gate') or key == 'EnableGates')
         name = 'update-' + uuid4().hex
         started = self.clock()
         change: dict[str, object] = {}
@@ -908,6 +916,7 @@ class Deployment:
             UpStage('box-join', setup.join_present, setup.join),
             UpStage('box-configuration', setup.configuration_present, setup.configure),
             UpStage('checks', setup.checks_present, setup.checks),
+            UpStage('image', setup.image_present, setup.image),
             UpStage('idle-stop', setup.idle_stop_present, setup.idle_stop),
             UpStage('activation', setup.activation_present, setup.activate),
             UpStage('routing-proof', setup.routing_proof_present, setup.routing_proof),
@@ -961,6 +970,102 @@ class Deployment:
                     return False
         return True
 
+    def gate_up(self, *, approve_resources: bool = False) -> bool:
+        """Add the gate resources and preserve every Rust parameter."""
+        from scripts.aws_target import cloud_gate, gate_trial
+        self._authorize(approve_resources)
+        with control_lock(self.directory / 'gate-up'):
+            settings = read_deployment_settings(self.settings_path, self.directory)
+            api = self._api(settings)
+            saved = deployment_record(self.directory)
+            stack_id = ledger.text(saved, 'stack_id')
+            _ = self._stack(settings)
+            stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
+                                       service='cloudformation'), 'Stacks')[0]
+            subnets = gate_subnets(api, settings.vpc_id)
+            revision = gate_trial.host_nixpkgs_revision()
+            account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
+            partition = stack_id.split(':')[1]
+            prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
+            values = cloud_gate.settings()
+            parameters = {
+                'EnableGates': 'true', 'GateImage': settings.ami_id,
+                'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets),
+                'GateInstanceTypes': ','.join(values.words('instance_types')),
+                'GateRootGiB': str(values.whole('root_gib')),
+                'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
+                'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
+                'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
+                'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
+                'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
+            }
+            book = ledger.CostLedger(self.directory)
+            inventory = book.read_snapshot().inventories
+            resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
+            book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
+                ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment'))
+            changes: list[dict[str, object]] = [
+                {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
+                for row in ledger.rows(stack, 'Parameters') if ledger.text(row, 'ParameterKey') not in parameters]
+            changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
+            self.output.mkdir(parents=True, exist_ok=True)
+            template = self.output / 'gate-template.json'
+            write_bytes_atomic(template, TEMPLATE.read_bytes())
+            name = 'gate-' + uuid4().hex
+            executed = False
+            try:
+                print('cloud-gate: preparing the stack change (about 1 minute)', flush=True)
+                _ = api.call('create-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                             '--change-set-type', 'UPDATE', '--template-body', 'file://' + str(template),
+                             '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(changes),
+                             service='cloudformation')
+                try:
+                    _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
+                                 '--change-set-name', name, service='cloudformation')
+                except AwsUnavailable:
+                    pass
+                change = api.call('describe-change-set', '--stack-name', stack_id,
+                                  '--change-set-name', name, service='cloudformation')
+                reason = str(change.get('StatusReason', '')).lower()
+                empty = change.get('Status') == 'FAILED' and any(text in reason for text in (
+                    "didn't contain changes", 'no updates are to be performed', 'no changes'))
+                if not empty:
+                    if change.get('Status') != 'CREATE_COMPLETE':
+                        raise DeploymentRefused(f"The gate change set is {change.get('Status')}: {change.get('StatusReason', 'no reason given')}")
+                    for item in ledger.rows(change, 'Changes'):
+                        resource = ledger.mapping(item['ResourceChange'])
+                        if not ledger.text(resource, 'LogicalResourceId').startswith('Gate'):
+                            raise DeploymentRefused('The gate change set changes a Rust resource')
+                        print(f"cloud-gate: {resource.get('Action', 'Change')} {ledger.text(resource, 'LogicalResourceId')}", flush=True)
+                    _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                                 service='cloudformation')
+                    executed = True
+                    print('cloud-gate: applying the change (several minutes)', flush=True)
+                    try:
+                        _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+                    except AwsUnavailable:
+                        events = ledger.rows(api.call('describe-stack-events', '--stack-name', stack_id,
+                                                      '--max-items', '60', service='cloudformation'), 'StackEvents')
+                        for event in reversed(events):
+                            if str(event.get('ResourceStatus', '')).endswith('_FAILED'):
+                                failure = event.get('ResourceStatusReason', 'no reason given')
+                                print(f"cloud-gate: {event.get('LogicalResourceId')} {event.get('ResourceStatus')}: {failure}", flush=True)
+                        raise
+            finally:
+                if not executed:
+                    _ = self._discard_change_set(api, stack_id, name)
+            outputs = self._stack(settings)
+            manifest: dict[str, object] = {
+                'deployment_id': ledger.text(saved, 'deployment_id'), 'region': settings.region,
+                'image': settings.ami_id, 'revision': revision, 'subnets': subnets,
+                'bucket': outputs['GateBucket'], 'template': outputs['GateLaunchTemplate'],
+                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'],
+                'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
+            }
+            cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
+            print('cloud-gate: deployed')
+        return True
+
     def down(self, *, approve_destroy: bool = False) -> bool:
         if not approve_destroy:
             print(teardown.DRY_RUN)
@@ -979,9 +1084,42 @@ class Deployment:
         state = self._api(settings).observe(instance, int(self.clock())).state
         if state in ('running', 'pending'):
             return state
-        _ = self.price()
-        _ = self.prepare()
-        return self.setup_start(approve_resources=True)
+        while True:
+            _ = self.price()
+            _ = self.prepare()
+            try:
+                return self.setup_start(approve_resources=True)
+            except AwsUnavailable as error:
+                if 'InsufficientInstanceCapacity' not in str(error):
+                    raise
+                delay = read_control_settings(self.settings_path).capacity_backoff_s
+                print(f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.')
+                self.pause(delay)
+
+
+def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
+    """Choose one public subnet in each available zone."""
+    tables = ledger.rows(api.call('describe-route-tables', '--filters', 'Name=vpc-id,Values=' + vpc), 'RouteTables')
+    main: dict[str, object] = {}
+    assigned: dict[str, dict[str, object]] = {}
+    for table in tables:
+        for association in ledger.rows(table, 'Associations'):
+            if association.get('Main') is True:
+                main = table
+            if association.get('SubnetId'):
+                assigned[ledger.text(association, 'SubnetId')] = table
+    zones: dict[str, dict[str, object]] = {}
+    reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + vpc)
+    for subnet in sorted(ledger.rows(reply, 'Subnets'), key=lambda row: ledger.text(row, 'SubnetId')):
+        table = assigned.get(ledger.text(subnet, 'SubnetId'), main)
+        public = any(route.get('DestinationCidrBlock') == '0.0.0.0/0' and route.get('State') == 'active'
+                     and str(route.get('GatewayId', '')).startswith('igw-') for route in ledger.rows(table, 'Routes'))
+        if public and subnet.get('State') == 'available':
+            zone = ledger.text(subnet, 'AvailabilityZone')
+            _ = zones.setdefault(zone, {'zone': zone, 'id': ledger.text(subnet, 'SubnetId')})
+    if not zones:
+        raise DeploymentRefused('The gate VPC has no available public subnet')
+    return [zones[zone] for zone in sorted(zones)]
 
 
 def remote_configuration(path: Path) -> str:
@@ -1041,6 +1179,7 @@ class DeploymentArguments(argparse.Namespace):
     def __init__(self) -> None:
         super().__init__()
         self.command: str = ''
+        self.workload: str = 'rust'
         self.settings: Path = conf.path('aws_target')
         self.directory: Path = target_config.ssh_target_state_directory('aws')
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
@@ -1049,8 +1188,12 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['gate-trial']:
+        from scripts.aws_target import gate_trial
+        return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -1062,7 +1205,8 @@ def main() -> int:
         if args.command == 'secrets':
             admin_secrets.configure(args.settings)
         elif args.command == 'up':
-            return 0 if deploy.up(approve_resources=args.approve_resources) else 1
+            action = deploy.gate_up if args.workload == 'merge-gates' else deploy.up
+            return 0 if action(approve_resources=args.approve_resources) else 1
         elif args.command == 'down':
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'price':

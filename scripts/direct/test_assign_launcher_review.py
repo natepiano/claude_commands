@@ -32,7 +32,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         member = fixture_worker("recovering", staff.StaffId(os.environ["CODEX_THREAD_ID"]),
                                 runtime_id=fixture_runtime_id("recovery-without-dispatch"))
         self.write_pool_roster({member.name: {"staff_id": member.id, "status": "failed"}})
-        result = self.launch("review", "--operation", "resume-account-move", "--to", member.name)
+        result = self.launch("review", "--operation", "resume-account-move", "--to", member.name, execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("resume refused: worker has no recorded dispatch", result.stderr)
         self.assertEqual(self.turn_starts, 0)
@@ -43,7 +43,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             return self.launch("review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
                                "--model", "gpt-6-astra", "--effort", "xhigh",
                                "--summary", str(self.session_dir / "astra-review.txt"),
-                               "--log", str(self.session_dir / "astra-turn.log"))
+                               "--log", str(self.session_dir / "astra-turn.log"), execution=launcher_fixture.InProcessAssignment())
 
     def test_a_managed_astra_review_publishes_and_holds_one_read_only_reviewer(self) -> None:
         original = self.server.respond
@@ -372,7 +372,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
 
     def test_a_review_launcher_follow_uses_the_current_review_row_instead_of_history(self) -> None:
         self.commit_project()
-        self.review_launcher("--new-worker", "project-review", "1")
+        _ = self.successful("review", "--new-worker", "project-review", "--lens", "contract", "--pass", "1",
+                            execution=launcher_fixture.InProcessAssignment())
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(record["turn_model"], "gpt-kept-sol")
         identity_path = self.identity_path(name)
@@ -383,7 +384,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         workers.release_allocation(self.session_dir, name, reservation)
         self.assertTrue(self.assignment_records()[name].get("unit_ledger"))
         _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
-        self.review_launcher("--to", name, "2")
+        _ = self.successful("review", "--to", name, "--lens", "contract", "--pass", "2",
+                            execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(self.assignment_records()[name]["turn_model"], "gpt-other-sol")
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(turn["model"], "gpt-other-sol")
@@ -397,6 +399,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
         self.panes.command_case.agent.final = "Verdict: clear."

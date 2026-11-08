@@ -28,11 +28,8 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -429,8 +426,8 @@ def fast_check(repo: Path, paths: list[str], config: FastTrackLimits) -> None:
             root = temporary / str(number)
             root.mkdir()
             isolated = merge_gate.test_module_environment(root, environment)
-            check_command([sys.executable, "-m", "unittest", "discover", "-s", str(module.parent),
-                           "-p", module.name], repo, isolated, deadline, empty_suite=True)
+            check_command([str(repo / "scripts/lib/py"), "-m", "unittest",
+                           ".".join(module.with_suffix("").parts)], repo, isolated, deadline, empty_suite=True)
             for marker in (root / "build-tool-calls.jsonl", root / "live-memory-reads.jsonl"):
                 if marker.exists() and marker.stat().st_size:
                     raise Refused(f"fast check tripwire: {marker.read_text()}")
@@ -685,7 +682,7 @@ def promote(production: str, repo: Path, commit: str, unit: str) -> None:
         promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The pull helper needs a local main ref at the published commit.
-            with copies.standing(unit, repo, copies.CommittedSource(commit)) as source:
+            with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as source:
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
@@ -702,7 +699,7 @@ def push_patch(repo: Path, production: str, unit: str, why: str, paths: list[str
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
         fetch_main(repo, settings_read)
-        with copies.standing(unit, repo, copies.CommittedSource("origin/main")) as copy:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
             _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
             for key in ("user.name", "user.email"):
                 value = git(repo, "config", "--get", key).strip()

@@ -4,13 +4,41 @@
 
 `verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold they keep their local path. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path, platform) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
+`test`, `check`, `doc`, `example`, and lint judgments use the first eligible target from their first step.
+The default target order is Mac, natedev, AWS.
+`step_routing_rule` selects the policy before target admission.
+Tree-writing steps always run on natedev.
+`build` and `final` run on natedev unless a flag pins them.
+Every command accepts `--target <name>`, `--mac "<reason>"`, and `--local "<reason>"`.
+A pin applies to movable steps and waits for that target.
+A pinned final runs both steps on the target and keeps the clean-tree check.
+It saves no pass because a saved pass describes this machine.
+An unpinned final keeps its local compiler identity and saved-pass checks.
+A remote build uses the `build` verb and prints `binary: <target>:<path>`.
+A lint can leave its first mend memory wait for a free Mac.
+`build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
+Its first line is `any_target` or `natedev_only <reason>`.
+Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
+A named test package uses its package rule.
+A workspace test refuses Mac offload when any member is `linux_only`.
+Check, lint, and doc require every workspace member to permit macOS.
+This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
+An unreadable member keeps the step on natedev.
+Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
+Unpinned build keeps `makes natedev artifacts`; unpinned final keeps `full gate runs on natedev`.
+Calls without `--kind` keep the test-target table.
+The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the call's route state.
+The call guard, hold enforcer, and idle watch read that record.
 
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
 
-Mac-allowed lint, check, and doc use the same availability checks and target reservations as tests during a natedev Cargo token wait. A free eligible Mac permits immediate routing. An idle alert marker does not control admission. Blocks, live repository claims, and retry delays still apply. Tree repair steps remain local.
+Lint judgments, check, and doc use the same availability checks and target reservations as tests.
+A free eligible target permits immediate routing, including during a natedev Cargo token wait.
+An idle alert marker does not control admission.
+Blocks, live repository claims, and retry delays still apply.
+Tree repair steps remain local.
 
-Lint during a hold keeps local `cargo fmt` and `taplo fmt`, then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. Compile rewrite loops do not run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac or a `linux_only.<repo>` exclusion keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## How it works
 
@@ -21,7 +49,13 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`, then runs `mend-chec
 - **Claim files and scopes.** `claims/<repo>.json` holds one repository's claim; `run.json` holds a claim whose worktree is in no repository. `claim_scope(worktree)` names the repository through `offload.repository_identity` (`sweep.repo_name`, the folder holding the shared repository directory), else `WHOLE_MAC`: `ClaimScope = RepositoryScope(name) | WholeMacScope`, and `claim_path(paths, scope)` maps it to its file. `scopes_overlap` is true when either side is the whole Mac or both name the same repository. `read_claims(paths) -> tuple[HeldClaim(scope, path, record), ...]` reads every file, oldest `since` first; a `claims/<repo>.json` scope comes from its file name, a `run.json` scope from its worktree, so a machine-wide `run.json` from an older install covers the repository its worktree is in, or every repository when that worktree is in none. A file it cannot read raises `ClaimStateUnreadable(path)`, a `StateReadError`. `live_claims` removes each claim whose owner ended and returns the rest.
 - Each claim file is `{pid, proc_start, what, worktree, since}` for `ProcessBoundClaim`, with `remote_host` added for `RemoteJobClaim`, and two optional keys on either: `holder_session` and `idle_since`. `read_run` accepts a record without them. `RunRecord` is their union. A process-bound claim is live only while `/proc/<pid>/stat` field 22 equals `proc_start`; a remote claim stays after that process dies because work may remain on its host. `run_is_kept` identifies those leftovers.
 - `claim --pid PID --what TEXT [--worktree PATH] [--wait SECONDS] [--remote HOST]` claims for the scope of `--worktree` (default the current directory) and exits 0 `claimed`, 10 `blocked by <holder>: <for>`, 11 `busy: <what> since <HH:MM>` for the oldest live claim whose scope overlaps (or `busy: leftovers of ...` for a kept claim), 12 `state unreadable: <path>` (`block.json`, `run.json`, `claims/<repo>.json` or the `claims` folder), and 1 for a pid that is not running. `claim_once` decides one attempt under `state.lock`: takeover, then block, then overlap, then a new file. A remote takeover applies only to a kept claim of the same scope; it replaces that claim's controller pid, keeps its job and host, prints `leftovers: <host>` and exits 13; the runner must check those leftovers before releasing it. `release --pid PID` removes every claim file whose `pid` matches, reading each file alone, so a damaged file of another repository cannot keep this owner's claim. `status` shows a kept claim as `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`; after confirming the remote job ended, that pid permits a hand release. `release --pid` for a claim that is already gone exits 0. `status` prints one `running:` line per live claim, oldest first, and `free` when there is none. `claim` records `holder_session`: `build_hold.owning_session()` (the unit director first, then `CLAUDE_CODE_SESSION_ID`), else nothing; a takeover keeps the stored value. Both `status` lines end `, idle since <HH:MM>` while `idle_since` is set.
-- `free-now --settings FILE [--repo-root DIR]` answers, from local records alone (no lock, no ssh, no `gh`), whether a claim for `DIR`'s repository (default the current directory) could start now: `off`, `backoff`, `blocked`, `state`, `busy` (a live claim overlaps that scope) or `free`, exit 0 only for `free`. Another repository's claim leaves it `free`. The holder's own block lets it read on to `busy` or `free`. `verify.sh` passes its top level as `--repo-root`.
+- `free-now --settings FILE [--repo-root DIR]` reads local records without a lock or remote command.
+  It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
+  It exits 0 only for `free`.
+  A live claim blocks only its repository.
+  A failed target probe blocks every repository.
+  A version decline blocks only its repository.
+  `verify.sh` passes its repository root with `--repo-root`.
 - `block --holder NAME --for TEXT [--hours N] [--showrunner NAME]` records the session from `build_hold.owning_session()`. A pending or active block admits that session's own claims; a block with no recorded session refuses every caller. A block lasts `block_hours`, at most `block_max_hours`; the holder is warned `block_warn_minutes` before it lifts by itself. A repeat block by the same holder keeps `since`. `unblock --holder NAME` lifts only the holder's own block.
 - **CI switch.** `block` turns the repository variable `ci_variable` (hana's `MACOS_CI`) off through `gh` and records a `ci` word: `off_by_this_block`, `off_before`, `not_configured`, `still_on`, `off_unconfirmed`. Unblock and expiry turn it back on only for `off_by_this_block` and `off_unconfirmed`, and list per branch the CI runs that skipped macOS meanwhile, with the `gh workflow run` line to rerun them. The report uses one paged REST list and one GraphQL request for the newest 200 runs; missing or partial job data produces a report error. A lift that cannot turn the switch back on keeps the block, messages the holder hourly and keeps trying. Expiry records that failure as `ExpiredBlockLiftFailed(gh_error_line)` on `SettleOutcome.expired_block_lift_failure` (otherwise `NO_EXPIRED_BLOCK_LIFT_FAILURE`), apart from `ci_problem`; while it lasts `status` prints `The block is past its time limit but could not lift: CI's Mac switch could not be turned back on (<gh line>). Run github-warmup, then unblock.`, and `block` names the same `gh` line. A new `ci` word goes into `CiSwitch`, `decoded_ci`, `ci_needs_restore` and `ci_may_still_be_on`.
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
@@ -52,7 +86,7 @@ The views read the saved file and local configuration.
 They make no SSH or recipient lookup calls.
 
 The check counts live steps that can use a Mac.
-It accepts `MacAllowed` and `SshAllowed` records with Mac targets.
+It accepts `AnyTarget` records with Mac targets.
 The step must have state `waiting_hold` or `waiting_mac`.
 The check validates the owner PID and process start time.
 It preserves P10 admission reads and excludes permanent local declines.
@@ -212,20 +246,33 @@ An interruption marker reports the instance generation.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 
-`test <package> --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
+`test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 
 `--env NAME` and `--fetch <folder>` require `--mac`. These flags can appear anywhere after the verb.
-Verify removes them before constructing Cargo arguments, cache keys and call records.
+Verify removes these flags before constructing Cargo arguments and call records.
+Test verdict keys include each `--env` value. Build keys exclude these values.
 Variable names must be valid and exported by the caller. Empty values are allowed.
 Verify saves the caller's values before assigning its own variables. A pipe transfers the values to Python without placing them on argv.
 The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `RUSTDOCFLAGS` at the verify interface.
 It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
 The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
 One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
+Each test uses the terminal values from `VERIFY_TEST_FIXED_ENV` in `config/direct.conf`.
+The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+The rule includes local tests and the test step of `final`.
+Test keys hold configured fixed values, instead of the caller's terminal values.
+
+`VERIFY_RESULT_ENV_NAMES` and `VERIFY_RESULT_ENV_PREFIXES` select other exported values for test verdict and tree content keys.
+Unset and empty values differ. These new inputs leave build keys and other command keys unchanged.
+A remote nextest run clears each selected name the call did not set, then applies the call's values.
+Mac and SSH nextest runs receive these values and `RUST_LOG`, `RUST_BACKTRACE`, and `RUST_LIB_BACKTRACE`.
+The same rule applies to unpinned runs, `--mac`, `--target`, and copy runs.
+Other remote verbs receive no new values.
+
 A Mac-only call reuses only a Mac pass. Forwarding or fetch disables cache reads and writes.
 If tests pass but fetch fails, the call exits 2 and retains the Mac pass evidence.
 A test failure retains the runner's status. No forwarded name, value or folder is added to the build log.
@@ -356,3 +403,36 @@ Both routes use the staged copy and keep the existing target directory.
 The source index remains unchanged.
 A pass record still requires the original staged tree identity after the step.
 The token boundary, local repair rule, and step records remain in verify.sh.
+
+### Failed probes and recovery
+
+A failed reach writes `failed_probe` in the target state folder.
+The record has no expiry time.
+A successful `probe_mac` removes it.
+An unresolved startup or an interrupted target keeps the record unchanged.
+
+A tool version mismatch writes `version-decline-<repository>` in the same folder.
+This record stops only that repository.
+Only a matching run removes it, on Linux or macOS.
+A mismatch writes no target backoff.
+
+`free-now` answers `bad` when either record stops an otherwise free target.
+The answers `off`, `backoff`, `blocked`, `state` and `busy` keep their order.
+A waiting step cannot reserve a bad target.
+The first routing pass can use `reserve --new-step`.
+A pinned step starts no recovery probe and takes no reservation during eligibility.
+Its normal run probes the target and clears a successful target mark.
+
+Each step's first eligibility read can start one detached recovery probe per target.
+The probe takes the normal claim, copies tracked scripts, copies the repository tree, and probes the target.
+It releases the claim after the probe or a stop signal.
+It keeps repository version records unchanged.
+A busy claim skips recovery.
+A second step does not duplicate a running recovery probe.
+The step routes without waiting for recovery.
+Repeated reads from a waiting step start no recovery probe.
+
+Target status reports a failed probe as unreachable.
+The reach error shows only the last nonempty stderr line.
+A fixed target returns when the next new step probes it.
+Existing waits keep their place on natedev until then.

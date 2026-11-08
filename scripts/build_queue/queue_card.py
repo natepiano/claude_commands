@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from scripts.build_queue import head_facts, queue_evidence
+from scripts.buildlog import store
+from scripts.build_queue import head_facts, queue_evidence, queue_lines
+from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
 from scripts.build_queue.queue_view import (QueueModel, behind_place, eligible_head_position, check_line, check_lines, clock, estimate_minutes,
-    has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
+    cloud_lines, cloud_matches, cloud_rows, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
 from scripts.lint import memory_admit as gate
 
 
@@ -46,7 +48,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         if card:
             add()
         add((Span(f"#{position} of {len(waiting)} · {queue_evidence.step_pid_text(step)} · ", bold=True), *name_spans(step, model.labels),
-             Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
+             Span(f" · {queue_lines.step_text(step, model.names)} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
         add()
@@ -86,7 +88,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} {queue_evidence.step_pid_text(ahead)} · "), Span("↑  " if is_moved(model, place) else "   "),
-                     *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
+                     *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead, model.names)}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
             joined = 1 + sum(other.since < step.since for other in waiting)
@@ -139,13 +141,18 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         add(priority)
     add("Running:")
     running_steps = page_running_steps(model)
+    machine = store.host_name() if running_steps else ""
     for running in running_steps:
         selected = running in selected_running
-        if (isinstance(running.step.measured, gate.UnownedSliceMemory)
+        if (not selected and isinstance(running.step.measured, gate.UnownedSliceMemory)
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
-        add(prefix + queue_evidence.running_text(running, explanation, model.labels, model.zone))
+        text = queue_evidence.running_text(running, explanation, model.labels, model.zone, names=model.names)
+        if not isinstance(running.step.measured, (gate.CompilerServiceMemory, gate.UnownedSliceMemory)):
+            pid, separator, detail = text.partition(" · ")
+            text = pid + separator + machine + separator + detail
+        add(prefix + text)
     if not running_steps:
         add("None.")
     add(f"Total current use: {queue_evidence.gib(explanation.totals.measured)}")
@@ -155,11 +162,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     if isinstance(head, gate.TokenWaitersOnly):
         add("All waiting steps are waiting for the cargo token.")
-        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
         return lines
     add()
     if not head_card:
-        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {head.waiter.step}; "
+        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {queue_lines.step_text(head.waiter, model.names)}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
@@ -167,11 +174,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     add(queue_evidence.need_details(head.need_source))
     if isinstance(model.facts, head_facts.HeadFacts):
         facts = model.facts
-        add(head_facts.bump_text(facts, model.zone))
-        for text in head_facts.bump_lines(facts, model.zone, model.labels):
+        add(head_facts.bump_text(facts, model.zone, names=model.names))
+        for text in head_facts.bump_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
         add("Order rule: " + head_facts.order_rule(facts))
-        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels):
+        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
     else:
         add("Order history: unavailable")
@@ -188,7 +195,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             + f"oldest waiting {age(followers.oldest_since, explanation.now)} min")
     else:
         add("Followers: none")
-    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
     return lines
 
 
@@ -203,7 +210,8 @@ def page_running_steps(model: QueueModel) -> list[gate.ExplainedRunningStep]:
 
 
 def render_card(model: QueueModel, matches: Sequence[int], columns: int,
-                selected_running: Sequence[gate.ExplainedRunningStep] = ()) -> list[Line]:
+                selected_running: Sequence[gate.ExplainedRunningStep] = (),
+                selected_cloud: tuple[wire.CloudRow, ...] = ()) -> list[Line]:
     head = model.reading.explanation.head
     head_card = isinstance(head, gate.HeadExplanation) and any(
         same_waiter(model.reading.view.waiting[position - 1], head.waiter) for position in matches)
@@ -211,6 +219,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int,
     if lines:
         lines.append(())
     lines.extend(_recorded_evidence(model, head_card, columns, selected_running))
+    cloud = cloud_lines(model, columns, selected_cloud) if selected_cloud else []
+    if cloud:
+        lines.extend([(), *cloud])
     return lines
 
 
@@ -218,6 +229,9 @@ def render_selection(model: QueueModel, selector: str, columns: int) -> list[Lin
     matches = select_waiters(model, selector)
     running_matches = [running for running in page_running_steps(model)
         if running_matches_selector(running.step, selector, model.labels)]
-    if not matches and not running_matches:
+    cloud = tuple(row for row in cloud_rows(model) if cloud_matches(row, selector, model.cloud_labels))
+    if cloud and not matches and not running_matches:
+        return cloud_lines(model, columns, cloud)
+    if not matches and not running_matches and not cloud:
         return wrap((Span(f"No waiting or running step matches {selector}."),), columns)
-    return render_card(model, matches, columns, running_matches)
+    return render_card(model, matches, columns, running_matches, cloud)

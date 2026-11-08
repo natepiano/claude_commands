@@ -6,6 +6,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
@@ -30,7 +31,8 @@ from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -41,9 +43,8 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the real claim CLI; its copy signals still cross the process boundary."""
-    with mock.patch.object(sys, "path", [str(VERIFY.parent.parent / "mac_test"), *sys.path]):
-        from scripts.mac_test import mac_test
-        return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
+    from scripts.mac_test import mac_test
+    return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
 
 
 def stub_build_tool_path(directory: Path) -> str:
@@ -271,7 +272,7 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
     (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "cargo-release")
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
@@ -382,7 +383,7 @@ if "--copy" in arguments:
     (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
     os.replace(root / "copy-started.tmp", root / "copy-started")
     if os.environ.get("TEST_COPY_WAIT") == "1":
-        sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+        with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "copy-release")
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
@@ -418,7 +419,7 @@ if os.environ.get("TEST_RUNNER_BUSY_UNTIL") and not Path(os.environ["TEST_RUNNER
     raise SystemExit(75)
 if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
     (root / "retry-running").write_text("running\n")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "continue-retry")
 
@@ -475,7 +476,7 @@ import runpy
 import sys
 import time
 
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2]))
+with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 
 command = sys.argv[1]
@@ -486,7 +487,6 @@ if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not
     with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
         output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
     write_text_atomic(root / "local-wait-added", "added\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).parent))
 status = 0
 try:
     runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
@@ -586,7 +586,7 @@ if sys.argv[1:2] == ["call"]:
              "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
     with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
         output.write(json.dumps(event) + "\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
+with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 
@@ -822,6 +822,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
+        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
@@ -848,7 +849,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "register_mac_wait",
-            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "ssh_reserve_hook",
+            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "remote_step_kind", "ssh_reserve_hook",
             "try_reserved_target", "check_mac_only_result", "mac_only_refuse",
             "route_test", "check_routing_hold")
         functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",
@@ -884,7 +885,7 @@ MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_VERB_ARGS=() MAC_FINISH_CALL=1 MAC_PASSE
 MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 PINNED_TARGET="" STEP_FORCE_MAC=0
-STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=mac_allowed
+STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
 VERDICT_KEY="" VERDICT_TREE_KEY="" CALL_NOTED=0
@@ -1161,13 +1162,8 @@ exit 99
                     descriptors.append(os.pidfd_open(process.pid))
                 except ProcessLookupError:
                     pass
-            with local_release_waiter(directory or self.root, self.root / "tmp") as events:
-                if isinstance(events, LocalReleaseEvents):
-                    add_watch = events.add_watch
-                    def watch_modifications(fd: int, path: bytes, mask: int) -> int:
-                        return add_watch(fd, path, mask | 0x2)
-
-                    events.add_watch = watch_modifications
+            with local_release_waiter(directory or self.root, self.root / "tmp",
+                                      RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 while True:
                     events.arm()
                     if condition():

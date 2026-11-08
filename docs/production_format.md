@@ -91,9 +91,10 @@ The showrunner staff row gives its path. The row's `name` is the production name
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
   timer unless asked)
-- **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
-  besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
-  first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
+- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+  in addition to the changed packages' tests.
+  Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
+  Text after the first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
   `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
   checkout: a package name, a directory or an unset variable is refused before the merge
   starts
@@ -166,14 +167,14 @@ A showrunner rename with a document move preserves staged document bytes separat
 Recovery restores the staged destination entry before removing the source index entry.
 It completes the pending move without staging the working edits.
 
-Run `/showrunner:retire_unit <unit>` from the showrunner session to remove its worktree and branch.
+Run `/agents retire NAME` to remove the unit worktree and branch.
 Uncommitted work or an unmerged checkpoint prevents removal.
 Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
 It releases holds, reservations, and Mac claims.
 It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
 Only an existing run pinned to `mesh` uses the retained worker-end path.
-`--dry-run` lists the work without changes.
-`/showrunner:resume_unit <unit>` restores the worktree from the merge branch and resumes the director and its retained workers.
+`/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
+The showrunner asks the user yes or no before it runs `--retired`.
 
 A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
 skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same

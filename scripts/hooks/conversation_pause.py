@@ -22,19 +22,16 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
-    from ..lib import script_prompts, unit_runs
-    from ..message.relay_identity import message_sender_name
+    from scripts.lib import script_prompts, unit_runs
+    from scripts.message.relay_identity import message_sender_name
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import script_prompts
-    import unit_runs
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    from relay_identity import message_sender_name
+    from scripts.lib import script_prompts
+    from scripts.lib import unit_runs
+    from scripts.message.relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -262,9 +259,7 @@ def sessions_command() -> list[str]:
 
 def send_command() -> list[str]:
     override = os.environ.get("CONVERSATION_PAUSE_SEND")
-    if override:
-        return [override]
-    return [sys.executable, str(Path(__file__).resolve().parent.parent / "message" / "send.py")]
+    return [override] if override else session_send.send_argv()
 
 
 def first_error_line(message: str) -> str:
@@ -807,9 +802,31 @@ def _keep_context() -> str:
     )
 
 
+class DirectorTurn(Enum):
+    ACTIVE = "active"
+    HOLD = "hold"
+
+
+def director_turn(session_id: str) -> DirectorTurn:
+    """Read the staff hold before a director starts another turn."""
+    from scripts.production import staff
+
+    try:
+        row = staff.snapshot().by_current_session(session_id)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"anomaly: staff hold: {error}", file=sys.stderr)
+        return DirectorTurn.ACTIVE
+    return (DirectorTurn.HOLD if row is not None and
+            isinstance(row.paused, staff.Paused) else DirectorTurn.ACTIVE)
+
+
 def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
+    if director_turn(session_id) is DirectorTurn.HOLD:
+        return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
+    if not return_question and not pauses(source):
+        return NoReply.NOTHING
     with record_lock():
         current = _record(session_id)
         if return_question:
@@ -1010,7 +1027,7 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     scheduled_root = state_root() / "scheduled-prompts"
     try:

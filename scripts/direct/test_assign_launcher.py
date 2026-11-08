@@ -14,7 +14,8 @@ from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import assign, progress_history
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
+from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, InProcessAssignment, LauncherScript, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr
 from scripts.lint import style_review
@@ -269,6 +270,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         self.assertEqual((other / state.name).read_bytes(), before)
 
     def test_a_herdr_exit_that_keeps_a_worker_keeps_the_run(self) -> None:
+        self.commit_project()
         _ = (self.session_dir / "worker_transport").write_text("herdr\n")
         calls = self.failing_worker(7)
         self.assert_run_active(self.launch(), 7)
@@ -283,6 +285,7 @@ class FailedLaunchRunTests(AssignLauncherFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_a_retry_without_a_run_starts_a_new_run_after_launch_failure(self) -> None:
+        self.commit_project()
         calls = self.failing_worker()
         self.assert_run_ended(self.launch())
         director = staff.runtime_id()
@@ -471,6 +474,15 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
 
 @final
+class HerdrClaimFixture(AssignClaudeLauncherFixture):
+    """Use the shared claim fixture with the active launcher environment."""
+
+    @override
+    def environment(self) -> dict[str, str]:
+        return os.environ.copy()
+
+
+@final
 class AssignLauncherTests(AssignLauncherFixture):
     def test_claude_worker_returns_through_start_and_then_follows_its_codex_thread(self) -> None:
         self.commit_project()
@@ -630,6 +642,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertTrue(edited)
 
     def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
+        self.commit_project()
         _ = (self.session_dir / "worker_transport").write_text("herdr\n")
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         prompt = self.prompt.read_bytes()
@@ -641,6 +654,60 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
         self.assertEqual(self.prompt.read_bytes(), prompt)
         self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
+    def herdr_claim_launch(self, claim_status: str, role: str = "implement") -> subprocess.CompletedProcess[str]:
+        self.commit_project()
+        self.record("start-phase", "--phase-id", "3", "--phase-title", "Claim before assignment")
+        write_text_atomic(self.prompt, "Phase 3 — Claim before assignment\nImplement the assigned change.\n")
+        write_text_atomic(self.session_dir / "worker_transport", "herdr\n")
+        write_text_atomic(self.session_dir / "mesh_events.txt", "")
+        environment, calls = HerdrClaimFixture().claim_fixture(self.session_dir, claim_status)
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        with patch.dict(os.environ, environment):
+            self.instrument_launcher("\n".join((
+                "from pathlib import Path",
+                "from scripts.direct import assign",
+                "from scripts.lib.atomic_file import write_text_atomic",
+                "run_command = assign.subprocess.run",
+                "def observe(command, *arguments, **options):",
+                "    if len(command) > 2 and Path(command[1]).name == 'worker.py' and command[2] == 'assign':",
+                f"        events = Path({str(self.session_dir / 'mesh_events.txt')!r})",
+                "        write_text_atomic(events, events.read_text() + 'assign\\n')",
+                *((f"        baseline = Path({str(self.session_dir / 'phases/3/phase_baseline')!r})",
+                   f"        write_text_atomic(Path({str(self.session_dir / 'baseline-at-worker-assign')!r}), baseline.read_text())")
+                  if role != "review" else ()),
+                "    return run_command(command, *arguments, **options)",
+                "assign.subprocess.run = observe",
+            )))
+            result = self.launch(role, "--phase", "3")
+        if role != "review":
+            self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
+        return result
+
+    def test_herdr_assignment_claims_the_phase_before_the_worker_assignment(self) -> None:
+        result = self.herdr_claim_launch("clear")
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["claim", "assign"])
+        head = subprocess.run(["git", "-C", str(self.project), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout
+        self.assertEqual((self.session_dir / "phases/3/phase_baseline").read_text(), head)
+        self.assertEqual((self.session_dir / "baseline-at-worker-assign").read_text(), head)
+
+    def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
+        result = self.herdr_claim_launch("blocked")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        log = self.session_dir / "phases/3/impl_agent.log"
+        self.assertEqual(result.stderr,
+                         f"ERROR: phase 3 could not claim its files before its worker opens; see {log}.\n")
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["claim"])
+        self.assertEqual((self.session_dir / "phases/3/impl_status").read_text(), "error\n")
+        self.assertIn("launcher: phase 3 could not claim its files; its worker did not open",
+                      (self.session_dir / "board.log").read_text())
+
+    def test_herdr_review_assigns_the_worker_without_a_phase_claim(self) -> None:
+        result = self.herdr_claim_launch("blocked", "review")
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((self.session_dir / "mesh_events.txt").read_text().splitlines(), ["assign"])
 
     def finding_command(self, verb: str, *options: str, phase: str = "7") -> str:
         result = invoke_findings([verb, "--session-dir", str(self.session_dir), "--phase", phase, *options],
@@ -663,7 +730,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.start_repair("8")
         other = self.repair_state("8")
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
-            _ = self.successful("fix")
+            _ = self.successful("fix", execution=InProcessAssignment())
         repaired = self.repair_state()
         self.assertEqual(repaired["rounds"][-1]["outcome"], "landed")
         self.assertEqual(repaired["findings"][0]["state"], "fixed_pending_review")
@@ -674,7 +741,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.start_repair()
         self.outcomes = ["failed"]
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
-            result = self.launch("fix")
+            result = self.launch("fix", execution=InProcessAssignment())
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         repaired = self.repair_state()
         self.assertEqual(repaired["rounds"][-1]["outcome"], "abandoned")
@@ -685,13 +752,13 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_a_fix_with_round_resolution_disabled_keeps_the_round_in_flight(self) -> None:
         self.start_repair()
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
-            _ = self.successful("fix")
+            _ = self.successful("fix", execution=InProcessAssignment())
         self.assertEqual(self.repair_state()["in_flight"], ["F001"])
 
     def test_an_implementation_dispatch_does_not_resolve_a_repair_round(self) -> None:
         self.start_repair()
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
-            _ = self.successful()
+            _ = self.successful(execution=InProcessAssignment())
         self.assertEqual(self.repair_state()["in_flight"], ["F001"])
 
     def run_resolution_commands(self, stderr: str) -> subprocess.CompletedProcess[str]:
@@ -771,7 +838,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(status.read_text(), "error\n")
 
     def test_each_pass_records_the_staff_id_from_the_worker_roster(self) -> None:
-        _ = self.successful()
+        _ = self.successful(execution=InProcessAssignment())
         name, worker = next(iter(self.assignment_records().items()))
         passes = [event for event in self.events() if event.get("event_type") == "pass_started"]
         self.assertEqual([event["worker_id"] for event in passes], [worker["staff_id"]])
@@ -795,7 +862,7 @@ class AssignLauncherTests(AssignLauncherFixture):
 
     def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
         from scripts.production import staff
-        _ = self.successful()
+        _ = self.successful(execution=InProcessAssignment())
         self.assertIn("As your last act, write your summary to",
                       (self.session_dir / "phases/7/dispatch_1_prompt.txt").read_text())
         name = next(iter(self.assignment_records()))
@@ -804,7 +871,7 @@ class AssignLauncherTests(AssignLauncherFixture):
 
     def test_assignment_dispatch_uses_the_backend_thread_as_the_published_worker_id(self) -> None:
         from scripts.production import staff
-        _ = self.successful()
+        _ = self.successful(execution=InProcessAssignment())
         records = self.assignment_records()
         self.assertEqual(len(records), 1)
         name, record = next(iter(records.items()))
@@ -826,7 +893,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(record.read_text(), "{broken")
 
     def test_rerun_review_dispatch_keeps_its_lens_and_read_only_thread(self) -> None:
-        _ = self.successful("review", "--lens", "rerun", "--pass", "1")
+        _ = self.successful("review", "--lens", "rerun", "--pass", "1", execution=InProcessAssignment())
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         self.assertTrue((self.session_dir / "phases/7/project-review_status_rerun_1").exists())
@@ -834,7 +901,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_recorder_ad_hoc_phase_dispatches_into_adhoc_directory(self) -> None:
         self.record("start-phase", "--phase-id", "ad hoc", "--phase-title", "Ad hoc review")
         self.write_phase_prompt("ad hoc", "Ad hoc review")
-        _ = self.successful("review", "--phase", "ad hoc")
+        _ = self.successful("review", "--phase", "ad hoc", execution=InProcessAssignment())
         phase = self.session_dir / "phases/adhoc"
         self.assertEqual((phase / "project-review_status_1").read_text(), "done\n")
         self.assertTrue((phase / "dispatch_1_prompt.txt").is_file())
@@ -846,7 +913,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_unsafe_phase_ids_are_refused_before_opening_a_thread(self) -> None:
         for phase in (".", "..", "../escape", "nested/phase", "other phase"):
             with self.subTest(phase=phase):
-                result = self.launch("review", "--phase", phase)
+                result = self.launch("review", "--phase", phase, execution=InProcessAssignment())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("invalid phase id:", result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
@@ -854,7 +921,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
             with self.subTest(options=options):
-                result = self.run_launcher(["bash", str(ASSIGN), *options])
+                result = invoke_assignment(options, os.environ.copy())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("usage", (result.stdout + result.stderr).lower())
         self.assertEqual(self.methods("thread/start"), [])
@@ -862,15 +929,15 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_future_roles_are_refused_before_any_thread_is_opened(self) -> None:
         for role in ("research", "propose"):
             with self.subTest(role=role):
-                result = self.launch(role)
+                result = self.launch(role, execution=InProcessAssignment())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_writer_paths_are_required_and_review_paths_are_refused(self) -> None:
         for role in ("implement", "test", "fix"):
             with self.subTest(role=role):
-                self.assertEqual(self.launch(role, paths=False).returncode, 2)
-        self.assertEqual(self.launch("review", "--paths", str(self.paths)).returncode, 2)
+                self.assertEqual(self.launch(role, paths=False, execution=InProcessAssignment()).returncode, 2)
+        self.assertEqual(self.launch("review", "--paths", str(self.paths), execution=InProcessAssignment()).returncode, 2)
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_unsafe_empty_and_escaping_paths_refuse_before_claim(self) -> None:
@@ -880,7 +947,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         for path in ("", "../secret", "/tmp/secret", "src/../secret", "linked/secret"):
             with self.subTest(path=path):
                 _ = self.paths.write_text(path + "\n")
-                result = self.launch()
+                result = self.launch(execution=InProcessAssignment())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 if path:
                     self.assertIn(path, result.stdout + result.stderr)
@@ -910,7 +977,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(self.reservations[-1].get("allocation_owner_pid"), launcher_pid)
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
-        _ = self.successful("review", "--lens", "contract", "--pass", "1")
+        _ = self.successful("review", "--lens", "contract", "--pass", "1", execution=InProcessAssignment())
         name = next(iter(self.assignment_records()))
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
@@ -954,12 +1021,12 @@ class AssignLauncherTests(AssignLauncherFixture):
 
         self.server.respond = style_reply
         phase = self.session_dir / "phases/7"
-        _ = self.successful("review", "--lens", "contract", "--style-since", "HEAD")
+        _ = self.successful("review", "--lens", "contract", "--style-since", "HEAD", execution=InProcessAssignment())
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "owed")
         name, record = next(iter(self.assignment_records().items()))
         before = prepared[0].read_bytes()
         _ = (self.project / "new.rs").write_text("fn second() {}\n")
-        _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
+        _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD", execution=InProcessAssignment())
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "complete")
         self.assertIn("Style review: Findings", (phase / "phase_style_review.md").read_text())
         self.assertIn("fixture finding", (phase / "project-review_summary_2.txt").read_text())
@@ -973,7 +1040,7 @@ class AssignLauncherTests(AssignLauncherFixture):
 
     def test_style_preparation_failure_through_assign_keeps_code_review_running(self) -> None:
         self.prepare_style_project()
-        _ = self.successful("review", "--style-since", "missing-baseline")
+        _ = self.successful("review", "--style-since", "missing-baseline", execution=InProcessAssignment())
         phase = self.session_dir / "phases/7"
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "owed")
         self.assertIn("invalid baseline", (phase / "phase_style_review.md").read_text())
@@ -988,7 +1055,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         end = style_review.git(self.project, "rev-parse", "HEAD").stdout.decode().strip()
         _ = (self.project / "included.txt").write_text("outside the range\n")
         _ = (self.project / "untracked.rs").write_text("fn outside() {}\n")
-        _ = self.successful("review", "--style-since", baseline, "--style-until", end)
+        _ = self.successful("review", "--style-since", baseline, "--style-until", end, execution=InProcessAssignment())
         phase = self.session_dir / "phases/7"
         state = read_object(phase / "style_review_state.json")
         directory = Path(str(state["input_directory"]))
@@ -1048,13 +1115,13 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(marker.read_text(), str(self.session_dir))
 
     def test_fix_requires_a_cause_and_a_wrong_phase_prompt_never_claims_the_worker(self) -> None:
-        refused = self.launch("fix")
+        refused = self.launch("fix", execution=InProcessAssignment())
         self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
         self.assertEqual(self.turn_starts, 0)
-        _ = self.successful("fix", "--fix-cause", "repair failed acceptance gate")
+        _ = self.successful("fix", "--fix-cause", "repair failed acceptance gate", execution=InProcessAssignment())
         self.assertTrue(any(event.get("pass_kind") == "fix" for event in self.events()))
         _ = self.prompt.write_text("Phase 6 — Another phase\nDo the wrong work.\n")
-        result = self.launch()
+        result = self.launch(execution=InProcessAssignment())
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
 
