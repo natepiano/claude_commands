@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import test_codex_mesh as mesh_fixture  # noqa: E402
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402

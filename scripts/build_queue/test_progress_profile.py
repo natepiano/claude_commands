@@ -8,8 +8,151 @@ from unittest.mock import patch
 
 
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.lib import conf
 
 GIB = 1 << 30
+
+# These records preserve the two gate outliers from 2026-11-07.
+BAD_GATE_RECORDS: tuple[tuple[str, str], ...] = (
+    ('1113174-59791205-1794084730975817216.json',
+        '{"measurement":"attributed_anonymous","record":{"kind":"RecordedProfile","profile":{"kind":"ProgressProfile","phases":[{"kind":"PhaseProfile","phase":"suites:1","bins":[1497841664,1413365760,1918402560,18596134912,1029701632,761946112,916357120,965931008,969994240,994250752,651124736,180883456,180883456,1229758464,137351168,123850752,82882560,94289920,75440128,60465152]}]},"at":1794086888.881132}}'),
+    ('1844752-60085669-1794087676089650432.json',
+        '{"measurement":"attributed_anonymous","record":{"kind":"RecordedProfile","profile":{"kind":"ProgressProfile","phases":[{"kind":"PhaseProfile","phase":"suites:1","bins":[1657450496,1565593600,1434177536,1321656320,2641358848,17153081344,962326528,1150939136,1150939136,955875328,955875328,708452352,686346240,{"kind":"UnmeasuredBin"},686346240,430080000,427921408,{"kind":"UnmeasuredBin"},427921408,{"kind":"UnmeasuredBin"}]}]},"at":1794088680.5554764}}'),
+)
+
+
+
+class ProfileRankTests(unittest.TestCase):
+    @staticmethod
+    def runs() -> tuple[progress.ProgressProfile, ...]:
+        return tuple(progress.ProgressProfile((progress.PhaseProfile("build:1", values * 5),))
+            for values in ((9 * GIB, GIB, 5 * GIB, 2 * GIB),
+                           (3 * GIB, 8 * GIB, GIB, 4 * GIB),
+                           (6 * GIB, 4 * GIB, 7 * GIB, 3 * GIB)))
+
+    def test_rank_two_uses_the_second_highest_run_in_each_bin(self) -> None:
+        merged = progress.merge_profiles(self.runs(), rank=2)
+        assert isinstance(merged, progress.ProgressProfile)
+        self.assertEqual(merged.phases[0].bins, (6 * GIB, 4 * GIB, 5 * GIB, 3 * GIB) * 5)
+
+    def test_rank_one_keeps_the_highest_run_in_each_bin(self) -> None:
+        merged = progress.merge_profiles(self.runs(), rank=1)
+        assert isinstance(merged, progress.ProgressProfile)
+        self.assertEqual(merged.phases[0].bins, (9 * GIB, 8 * GIB, 7 * GIB, 4 * GIB) * 5)
+
+    def test_rank_two_with_one_run_keeps_that_run(self) -> None:
+        run = self.runs()[0]
+        self.assertEqual(progress.merge_profiles((run,), rank=2), run)
+
+    def test_sparse_bins_use_the_lowest_available_run_below_the_rank(self) -> None:
+        missing = progress.UnmeasuredBin()
+        first = progress.ProgressProfile((progress.PhaseProfile("build:1", (GIB, missing) * 10),))
+        second = progress.ProgressProfile((progress.PhaseProfile("build:1", (3 * GIB, 2 * GIB) * 10),))
+        merged = progress.merge_profiles((first, second), rank=3)
+        assert isinstance(merged, progress.ProgressProfile)
+        self.assertEqual(merged.phases[0].bins, (GIB, 2 * GIB) * 10)
+
+    def test_old_records_without_source_or_process_evidence_still_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            name, raw = BAD_GATE_RECORDS[0]
+            path = Path(temporary) / name
+            _ = path.write_text(raw)
+            record = progress.read_profile_record(path)
+            assert isinstance(record, progress.RecordedProfile)
+            self.assertIsInstance(record.reading_source, progress.ReadingSourceNotRecorded)
+            self.assertIsInstance(record.peak_processes, progress.PeakProcessesNotRecorded)
+            self.assertEqual(record.at, 1794086888.881132)
+            self.assertEqual(record.profile.phases[0].bins[3], 18596134912)
+
+    def test_a_configuration_change_rebuilds_the_cached_rank(self) -> None:
+        with AdmissionFixture() as fixture:
+            root = fixture.root / "private-profiles"
+            directory = root / "build"
+            directory.mkdir(parents=True)
+            for index, profile in enumerate(self.runs()):
+                progress.save_profile(directory / f"run-{index}.json", profile, 100)
+            history = progress.ProfileHistory(root)
+            config = fixture.root / "build_admission.conf"
+            for rank in (2, 1, 2):
+                with self.subTest(rank=rank):
+                    write_memory_config(config, progress_profile_rank=str(rank))
+                    self.assertEqual(history.matching("build", 90), progress.merge_profiles(self.runs(), rank=rank))
+
+    def test_saved_records_preserve_the_source_and_the_highest_bin_processes(self) -> None:
+        with AdmissionFixture() as fixture:
+            root = fixture.root / "private-profiles"
+            history = progress.ProfileHistory(root)
+            source = progress.ScopeReading(fixture.root / "private.scope")
+            first = (progress.ProfileProcess(101, ("rustc", "--private-first"), GIB),)
+            highest = (progress.ProfileProcess(202, ("rustc", "--private-highest"), 3 * GIB),)
+            for done, need, processes in ((10, GIB, first), (20, 3 * GIB, highest), (80, 2 * GIB, first)):
+                history.observe("episode", "build", progress.ProgressCounter("build:1", done, 100), need, 100,
+                    reading_source=source, read_processes=lambda processes=processes: processes)
+            history.finish("episode", 101, 90)
+            path, = root.glob("*/*.json")
+            record = progress.read_profile_record(path)
+            assert isinstance(record, progress.RecordedProfile)
+            self.assertEqual(record.reading_source, source)
+            self.assertEqual(record.peak_processes, progress.PeakProcesses("build:1", 4, 3 * GIB, highest))
+
+    def test_restart_preserves_the_saved_highest_bin_evidence(self) -> None:
+        with AdmissionFixture() as fixture:
+            root = fixture.root / "private-profiles"
+            source = progress.ProcessTreeReading((101,))
+            processes = (progress.ProfileProcess(101, ("private-build",), 3 * GIB),)
+            progress.ProfileHistory(root).observe("episode", "build", progress.ProgressCounter("build:1", 20, 100),
+                3 * GIB, 100, reading_source=source, read_processes=lambda: processes)
+            restarted = progress.ProfileHistory(root)
+            restarted.observe("episode", "build", progress.ProgressCounter("build:1", 80, 100), GIB, 101)
+            restarted.finish("episode", 102, 90)
+            path, = root.glob("*/*.json")
+            record = progress.read_profile_record(path)
+            assert isinstance(record, progress.RecordedProfile)
+            self.assertEqual(record.reading_source, source)
+            self.assertEqual(record.peak_processes, progress.PeakProcesses("build:1", 4, 3 * GIB, processes))
+
+    def test_invalid_progress_profile_ranks_fail_the_configuration_check(self) -> None:
+        with AdmissionFixture() as fixture:
+            path = fixture.root / "build_admission.conf"
+            conf.check(path, "progress_profile_rank", "1")
+            conf.check(path, "progress_profile_rank", "2")
+            for value in ("0", "-1", "text"):
+                with self.subTest(value=value), self.assertRaises(conf.Unusable):
+                    conf.check(path, "progress_profile_rank", value)
+
+    def test_two_saved_gate_outliers_do_not_set_the_rank_two_need(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profiles: list[progress.ProgressProfile] = []
+            for name, raw in BAD_GATE_RECORDS:
+                path = root / name
+                _ = path.write_text(raw)
+                record = progress.read_profile_record(path)
+                assert isinstance(record, progress.RecordedProfile)
+                profiles.append(record.profile)
+            for index, need in enumerate((8 * GIB // 10, GIB, 12 * GIB // 10)):
+                ordinary = progress.ProgressProfile((progress.PhaseProfile("suites:1", (need,) * 20),))
+                path = root / f"ordinary-{index}.json"
+                progress.save_profile(path, ordinary, 1794089000)
+                record = progress.read_profile_record(path)
+                assert isinstance(record, progress.RecordedProfile)
+                profiles.append(record.profile)
+            highest = progress.merge_profiles(profiles, rank=1)
+            ranked = progress.merge_profiles(profiles, rank=2)
+            largest_ranked_need = 0
+            largest_highest_need = 0
+            for done in range(0, 100, 5):
+                counter = progress.ProgressCounter("suites:1", done, 100)
+                rank_two = progress.window_peak(ranked, counter, 20)
+                rank_one = progress.window_peak(highest, counter, 20)
+                assert isinstance(rank_two, progress.WindowPeak)
+                assert isinstance(rank_one, progress.WindowPeak)
+                largest_ranked_need = max(largest_ranked_need, rank_two.bytes)
+                largest_highest_need = max(largest_highest_need, rank_one.bytes)
+            self.assertLess(largest_ranked_need, 3 * GIB)
+            self.assertGreater(largest_highest_need, 15 * GIB)
 
 
 class ProgressCounterTests(unittest.TestCase):
