@@ -1782,45 +1782,25 @@ A target that goes away during a floor pass counts as done. The pass finishes wi
 - A probe of a secondary filesystem: on natedev it is always the home folder.
 
 ### Phase 79 — The folder audit names a maker only on proof, and it skips the Codex daemon folder  · status: done
-**Depends on:** none. Merge `origin/builds` first.
 
-**Approved:** builds showrunner, 2026-11-07 ("Phase 79 scope approved. Start now."). The send.py freeze on `folder_audit.py` is over (natedev, 2026-11-07).
+#### As-built
 
-#### Work Order
+The folder audit names a session as a folder's maker only when one of that session's own commands makes that exact folder. A folder with no proven maker prints `maker unknown` in its `loose:` line and gets no message. The audit keeps `/tmp/codex-daemon-<uid>`.
 
-**Goal:** the folder audit tells a session that it made a folder only when that session's own command made it. Otherwise the audit says "owner unknown" and sends no message. The audit skips `/tmp/codex-daemon-<uid>`.
-
-**Measured (builds and sdlc, 2026-11-07):**
-1. The audit told sdlc that it made `/tmp/audit-p4-patch-check-*`, `/tmp/buildlog-prephase-lint-test-*` and `/tmp/y-state-split-*`. sdlc made none of them.
-2. The audit told builds that it made `/tmp/opencascade-rs-d12c6e`. That folder is from 2026-10-12, and builds did not make it.
-3. The audit told models that it made `/tmp/codex-daemon-1000`. The Codex CLI makes that folder. It holds the listen sockets of running codex processes.
-4. `makers()` names the earliest-started session whose command text names the path. A command that only reads, lists or enters the folder (`ls`, `cd`, `du`, `rg`) counts the same as the command that made it.
-5. `/tmp/y-state-split-*` holds unsaved git work. Nobody deletes it until its real owner is found.
-
-**Spec:**
-1. Measure the cause first. For each of the four folders in Measured 1 and 2, find the transcript and the command that `makers()` matched. Use read-only commands only. Put the cause, one line for each folder, in your summary.
-2. A session is a folder's maker only when one of its own commands makes that folder.
-   Use the scratch guard's command parser (`commands()` and `targets()` in `scripts/hooks/pre-tool-use-scratch-guard.py`) to find what a command makes. Resolve each target against the `cwd` of that transcript line.
-   Add no second command parser. If the audit cannot import the guard's parser cleanly, move the parser into one shared module that both files import.
-3. A folder with no proven maker prints `maker unknown` in its `loose:` line and gets no message. Keep the current output for a folder with a proven maker.
-4. Add `codex-daemon-` to the audit's kept names, so `/tmp/codex-daemon-<uid>` is never a loose folder.
-5. Delete nothing. Never run `folder_audit.py` or `audit()` against the real /tmp or ~/rust: an armed run removes folders. Step 1 may call `makers()` on the real transcripts, because it only reads them. Tests use temporary folders and fixture transcripts.
-6. Update the folder audit paragraph in `docs/as-built/build-memory-admission.md`: the proof rule, `maker unknown`, and the kept Codex daemon folder.
+- The guard (`scripts/hooks/pre-tool-use-scratch-guard.py`) owns `creation_targets(text, cwd)`. It yields frozen `CreationTarget(path, repository_copy)` records. It skips environment words, follows `cd` (a bare `cd` goes to `~`), stops at a failed `cd`, and yields nothing for `make_a_worktree`. `loose_folders()` and the audit both use it.
+- `folder_audit.makers()` selects transcript lines with ripgrep on each folder name, parses each line as JSON, and needs an absolute `cwd`. It reads commands from `input`, `tool_input` and `tool_use` content. A target proves a folder only on exact path equality. The earliest-started transcript wins.
+- `KEPT_PREFIXES` adds `codex-daemon-` to the system temp prefixes.
 
 **Files:**
 - `scripts/lint/folder_audit.py` — the maker proof and the kept daemon folder.
-- `scripts/lint/test_folder_audit.py` — maker proof tests and the kept daemon folder test.
-- `scripts/hooks/pre-tool-use-scratch-guard.py` — only if the parser moves to a shared module.
-- `scripts/hooks/test_scratch_guard.py` — only if the parser moves.
-- `docs/as-built/build-memory-admission.md` — the folder audit paragraph.
+- `scripts/hooks/pre-tool-use-scratch-guard.py` — the shared creation walk.
+- `scripts/lint/test_folder_audit.py` — the maker proof test (child targets and an implicit clone destination), the `maker unknown` test, and the kept daemon folder test.
+- `docs/as-built/build-memory-admission.md` — the folder audit paragraph and the Mac socket rule.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `scripts/lint/folder_audit.py`, `scripts/hooks/pre-tool-use-scratch-guard.py` and any new shared parser module, and `docs/as-built/build-memory-admission.md`.
-- `test` owns `scripts/lint/test_folder_audit.py` and `scripts/hooks/test_scratch_guard.py`.
+**Gotchas:**
+- A folder's name in message text (a `send.py --text` report, a cleanup message) is not proof. Each of the 6 real folders with a wrong maker came from such text.
+- `mktemp` targets resolve to the template path with its `X`s, so a folder made by `mktemp -d` has no proven maker.
+- Never run `folder_audit.py` or `audit()` against the real `/tmp` or `~/rust` in a test: an armed run removes folders.
 
-**Acceptance gate:**
-- Change `test_the_earliest_started_session_that_names_a_folder_is_its_maker` to the proof rule: a session that only lists or enters a folder is not its maker, and the earliest session whose command makes it is.
-- A test shows that a folder that no command makes has no maker, prints `maker unknown` and gets no message.
-- A test shows that `/tmp/codex-daemon-1000` is not a loose folder.
-- `scripts/lint/test_folder_audit.py`, `scripts/hooks/test_scratch_guard.py` and `scripts/lint/test_tmp_sweep.py` pass.
-- Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+**Ruled out:**
+- Exit-status reasoning (`false && mkdir x`, `(cd x); mkdir y`): the static parser cannot know an exit status, and the earliest-session rule limits the risk.

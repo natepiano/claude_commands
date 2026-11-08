@@ -87,6 +87,12 @@
   - Preserve same-shape build rules, compile selection, the single history decode and bounded evidence queries.
   - Preserve historical `buildlog` decoding and unknown source text through semantic source types.
   - Revealed by: Phase 19; the showrunner defined "small" as under 5% of estimates.
+- [ ] **The folder audit names the maker of a folder made by mktemp**
+  - Target: `scripts/lint/folder_audit.py` `makers()` and the guard's `creation_targets()`.
+  - Today a `mktemp -d` target resolves to its template path with `X`s, so the folder prints `maker unknown`.
+  - Prove the folder by a template match (same parent, same fixed part, same count of random characters) or by pairing the command with its tool result path.
+  - Keep the exact-path proof rule for every other command. Add no second command parser.
+  - Revealed by: Phase 79; the builds showrunner placed it in next items on 2026-11-07.
 
 ## Dropped
 
