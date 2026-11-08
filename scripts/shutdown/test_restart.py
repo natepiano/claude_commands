@@ -8,17 +8,20 @@ import math
 import json
 import os
 import signal
+import shlex
+import shutil
+import socketserver
 import sys
 import tempfile
 import time
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, RLock, Thread
 from pathlib import Path
 from typing import Literal, cast, override
 from dataclasses import replace
-from unittest.mock import Mock, call, patch
+from unittest.mock import call, patch
 
 from scripts.shutdown import inventory
 from scripts.herdr import herdr, pane_launch
@@ -33,11 +36,13 @@ from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.staff_test_support import fixture_member
+from scripts.herdr.fake_herdr import herdr_listener
+from scripts.direct import progress_history
 from scripts.shutdown.test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
-STOP_UNIT_WORKERS = stop_resume.stop_unit_workers
 
 
 class RestartTestCase(ShutdownTestCase):
@@ -448,6 +453,251 @@ class RecordedResumeTests(RestartTestCase):
                     self.assertNotIn("--name", arguments)
 
 
+class MixedRestartTests(ShutdownTestCase):
+    maxDiff: int | None = None
+
+    def test_mixed_restart_and_stop_share_all_full_reads(self) -> None:
+        self.run_commands(("restart", "stop"), frozenset())
+
+    def test_failed_worker_stop_keeps_the_live_process_pending(self) -> None:
+        self.run_commands(("restart",), frozenset({991104}))
+
+    def test_count_fixture_selects_linux_readers_on_macos(self) -> None:
+        inherited = (sys.platform, herdr._PLATFORM)  # pyright: ignore[reportPrivateUsage]
+        self.addCleanup(lambda: self.assertEqual((sys.platform, herdr._PLATFORM), inherited))  # pyright: ignore[reportPrivateUsage]
+        with patch.object(herdr, "_PLATFORM", "darwin"), patch.object(sys, "platform", "darwin"):
+            self.run_commands(("stop",), frozenset())
+
+    def run_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
+        with patch.object(herdr, "_PLATFORM", "linux"), patch.object(sys, "platform", "linux"):
+            self.linux_commands(commands, surviving)
+
+    def linux_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
+        self.assertEqual(herdr._PLATFORM, "linux")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(sys.platform, "linux")
+        from scripts.herdr import worker_panes
+        from scripts.agents import codex_mesh
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
+        environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),
+            "HERDR_PROC": str(root / "proc"), "HERDR_PANE_RECORD_DIR": str(root / "panes"),
+            "CLAUDE_CONFIG_DIR": str(root / ".claude2"), "CODEX_HOME": str(root / ".codex1"),
+            "ROSTER_RUN_ROOT": str(root / "runs"), "UNIT_RUN_DIR": str(root / "runs/pane"),
+            "CONF_DIR": str(root / "conf"), "SHUTDOWN_PROOF_WORKSPACE": "w1",
+            "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
+            "AGENTS_CALLER_FAMILY": "", "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+            write_text_atomic(root / "conf" / source.name, source.read_text())
+        write_text_atomic(root / "conf/models.conf",
+            Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
+        directory = staff.PresentWorktree(remote.local_machine(), root)
+        doc = root / "production.md"
+        write_text_atomic(doc, "# Fixture\n")
+        show = fixture_member("showrunner", name="mixed-show", doc=staff.LiveDoc(remote.local_machine(), doc))
+        (root / "mesh").mkdir()
+        mesh = fixture_member("unit", name="mixed-mesh", parent=show.id,
+            worktree=staff.PresentWorktree(remote.local_machine(), root / "mesh"))
+        seat = fixture_member("worker", name="mixed-seat", parent=mesh.id)
+        owner = fixture_member("unit", name="mixed-pane", parent=show.id, worktree=directory)
+        workers = [fixture_member("worker", name=name, parent=owner.id,
+            backend=staff.CodexBackend(root / ".codex1")) for name in ("impl", "review")]
+        rows = [show, mesh, seat, owner, *workers]
+        run = root / "runs/pane"
+        mesh_run = root / "runs/mesh"
+        write_text_atomic(mesh_run / "worker_transport", "mesh\n")
+        write_text_atomic(mesh_run / "progress_history_state.json", json.dumps({"owner_staff_id": mesh.id,
+            "main_agent": {"session_id": mesh.current_session}, "pass": {}, "events": []}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": owner.id,
+            "phase": {"id": "work", "instance_id": "active", "status": "active", "started_at": 1},
+            "main_agent": {"session_id": owner.current_session, "family": "claude"},
+            "history_file": str(run / "history.jsonl"), "pass": {}, "events": []}))
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve behavior.\n")
+        for row in workers:
+            _ = progress_history.begin_dispatch(run, slot=row.name, phase="work", role="impl", worker_name=row.name,
+                worker_id=row.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+        panes: dict[str, dict[str, object]] = {f"w1:p{n}": {"pane_id": f"w1:p{n}", "terminal_id": f"term-{n}", "workspace_id": "w1",
+            "tab_id": "w1:t3" if n >= 3 else f"w1:t{n}", "label": row.name, "agent_status": "idle"}
+            for n, row in enumerate(rows) if n != 2}
+        live: dict[str, int] = {}
+        shell_env: dict[str, dict[str, str]] = {}
+        requests: list[str] = []
+        signals: list[int] = []
+        launches: list[str] = []
+        lock = RLock()
+        proc = root / "proc"
+
+        def process(pid: int, parent: int, argv: list[str], marks: dict[str, str]) -> None:
+            folder = proc / str(pid)
+            write_text_atomic(folder / "stat", f"{pid} (fixture) S {parent} {pid} 0 0 {pid} " + "0 " * 13 + "1\n")
+            write_text_atomic(folder / "cmdline", "\0".join(argv) + "\0")
+            write_text_atomic(folder / "environ", "\0".join(f"{key}={value}" for key, value in marks.items()) + "\0")
+            write_text_atomic(folder / "task" / str(pid) / "children", "")
+            if not (folder / "cwd").exists():
+                (folder / "cwd").symlink_to(root)
+
+        def start(pane: str, argv: list[str]) -> None:
+            index = int(pane.removeprefix("w1:p"))
+            row = rows[index]
+            pid, shell = 991100 + index, 991000 + index
+            if (proc / str(pid)).exists():
+                pid += 100
+            marks = {**environment, **shell_env.get(pane, {}), "HERDR_SESSION": "agents", "HERDR_PANE_ID": pane}
+            process(pid, shell, argv, marks)
+            write_text_atomic(proc / str(shell) / "task" / str(shell) / "children", str(pid))
+            record: sessions.SessionRecord = {"pid": pid, "procStart": "1", "sessionId": row.current_session,
+                "name": row.name, "updatedAt": int(time.time()), "messagingSocketPath": "", "tmux": "", "formerNames": []}
+            if argv[0] == "claude":
+                for folder in (sessions.sessions_dir(), Path(marks["CLAUDE_CONFIG_DIR"]) / "sessions"):
+                    write_text_atomic(folder / f"{pid}.json", json.dumps(record))
+            else:
+                rollout = root / ".codex1/sessions" / f"rollout-{row.current_session}.jsonl"
+                write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": row.current_session}}) + "\n")
+                descriptors = proc / str(pid) / "fd"
+                descriptors.mkdir(exist_ok=True)
+                (descriptors / "3").symlink_to(rollout)
+            live[pane] = pid
+            panes[pane]["agent_session"] = {"kind": "id", "value": row.current_session}
+
+        def info(pane: str) -> dict[str, object]:
+            shell = 991000 + int(pane.removeprefix("w1:p"))
+            pid = live.get(pane, shell)
+            argv = (proc / str(pid) / "cmdline").read_text().strip("\0").split("\0")
+            return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv, "cwd": str(root / "mesh" if pane == "w1:p1" else root)}]}}
+
+        def reply(request: dict[str, object]) -> dict[str, object]:
+            method = str(request.get("method", ""))
+            requests.append(method)
+            params = cast(dict[str, object], request.get("params", {}))
+            if method == "pane.process_info":
+                return info(str(params["pane_id"]))
+            if method == "layout.export":
+                return {"layout": {"root": {"type": "pane", "pane_id": "w1:p3"}}}
+            arguments = cast(list[str], request.get("argv", []))[2:]
+            action = arguments[:2]
+            if action == ["status", "server"]:
+                return {"running": True}
+            if action == ["pane", "list"]:
+                return {"panes": list(panes.values())}
+            if action == ["pane", "process-info"]:
+                return info(arguments[-1])
+            if action == ["agent", "list"]:
+                return {"agents": [{"pane_id": pane, "agent_status": "idle", "agent": "fixture"} for pane in live]}
+            if action == ["workspace", "list"]:
+                return {"workspaces": [{"workspace_id": "w1", "label": show.name}]}
+            if action == ["tab", "list"]:
+                return {"tabs": [{"tab_id": f"w1:t{n}", "workspace_id": "w1", "label": row.name}
+                    for n, row in enumerate(rows[:4]) if n != 2]}
+            if action == ["pane", "run"]:
+                tokens = shlex.split(shlex.split(arguments[3])[1])
+                shell_env[arguments[2]] = dict(value.split("=", 1) for value in tokens[tokens.index("export") + 1:])
+            elif action == ["agent", "start"]:
+                pane = arguments[arguments.index("--pane") + 1]
+                kind = arguments[arguments.index("--kind") + 1]
+                launches.append(pane)
+                start(pane, [kind, *arguments[arguments.index("--") + 1:]])
+            elif action == ["pane", "read"]:
+                return {"text": ""}
+            return {}
+
+        class Handler(socketserver.StreamRequestHandler):
+            @override
+            def handle(self) -> None:
+                request = cast(dict[str, object], json.loads(self.rfile.readline()))
+                with lock:
+                    response = reply(request)
+                _ = self.wfile.write((json.dumps({"result": response}) + "\n").encode())
+
+        endpoint = root / "config/herdr/sessions/agents/herdr.sock"
+        endpoint.parent.mkdir(parents=True)
+        server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        cli = root / "herdr"
+        write_text_atomic(cli, f"#!{sys.executable}\n" +
+            "import json, socket, sys\n" + f"with socket.socket(socket.AF_UNIX) as stream:\n    stream.connect({str(endpoint)!r})\n" +
+            "    stream.sendall((json.dumps({'argv': sys.argv[1:]}) + '\\n').encode())\n" +
+            "    response = stream.makefile().readline()\n" +
+            "    print('status: running' if sys.argv[-2:] == ['status', 'server'] else response, end='\\n')\n", new_file_mode=0o700)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": str(cli)})))
+        _ = cast(object, self.enterContext(patch.multiple(unit_runs, RUN_ROOT=root / "runs", FORMER_RUN_ROOT=root / "former", ASTRA_RUN_ROOT=root / "astra")))
+        def role_account(role: str) -> accounts.AccountSelection:
+            return (accounts.CodexWorkersAccount("codex1", root / ".codex1") if role == "workers" else
+                    accounts.NamedAccount("claude2", root / ".claude2"))
+        _ = self.enterContext(patch.object(accounts, "role_account", side_effect=role_account))
+        process(990999, 1, ["herdr", "server"], {})
+        herdr_listener(proc, 990999, "agents", os.environ)
+        for pane in panes:
+            process(991000 + int(pane.removeprefix("w1:p")), 990999, ["zsh"], {})
+        read_bytes, kill = Path.read_bytes, os.kill
+        def proc_bytes(path: Path) -> bytes:
+            return read_bytes(proc / path.relative_to("/proc")) if str(path).startswith("/proc/991") else read_bytes(path)
+        def signal_process(pid: int, number: int) -> None:
+            if not 990999 <= pid < 991300:
+                return kill(pid, number)
+            if not (proc / str(pid)).exists():
+                raise ProcessLookupError(pid)
+            if number:
+                signals.append(pid)
+                pane = next(pane for pane, current in live.items() if current == pid)
+                del live[pane]
+                _ = panes[pane].pop("agent_session", None)
+                write_text_atomic(proc / str(991000 + int(pane.removeprefix("w1:p"))) / "task" /
+                    str(991000 + int(pane.removeprefix("w1:p"))) / "children", "")
+                if pid in surviving:
+                    stat = proc / str(pid) / "stat"
+                    write_text_atomic(stat, stat.read_text().replace("S " + str(991000 + int(pane[-1])), "S 1", 1))
+                    raise PermissionError("TEST worker stop is unconfirmed")
+                shutil.rmtree(proc / str(pid))
+        _ = self.enterContext(patch.object(Path, "read_bytes", proc_bytes))
+        _ = self.enterContext(patch.object(os, "kill", side_effect=signal_process))
+        for command in commands:
+            for pid in tuple(live.values()):
+                signal_process(pid, signal.SIGTERM)
+            requests.clear()
+            signals.clear()
+            launches.clear()
+            for pane in panes:
+                start(pane, ["codex" if int(pane[-1]) >= 4 else "claude", "--resume", str(rows[int(pane[-1])].current_session)])
+            with (patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as searches,
+                  patch.object(herdr, "codex_conversations", wraps=herdr.codex_conversations) as scans,
+                  patch.object(herdr, "_scan_herdr_processes", wraps=herdr._scan_herdr_processes) as processes,  # pyright: ignore[reportPrivateUsage]
+                  patch.object(codex_mesh, "_pause_roster") as pause,
+                  patch.object(worker_panes, "start_or_resume", wraps=worker_panes.start_or_resume) as starts,
+                  patch.object(pane_record, "seed", wraps=pane_record.seed) as seeds,
+                  patch.object(herdr.Herdr, "order_tabs", autospec=True, side_effect=herdr.Herdr.order_tabs) as orders,
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(shutdown.main([command, "--all"]), 0, errors.getvalue())
+            if surviving:
+                self.assertNotIn("w1:p4", launches, errors.getvalue())
+                self.assertTrue((proc / "991104/stat").exists())
+                self.assertNotIn("w1:p4", live)
+                self.assertEqual(shutdown_record.read(), [str(workers[0].id)])
+                self.assertEqual(sum("impl:" in line and "target process still runs" in line
+                    for line in errors.getvalue().splitlines()), 1, errors.getvalue())
+                self.assertIn("w1:p5", launches)
+                continue
+            self.assertEqual(errors.getvalue(), "", output.getvalue())
+            # Stop uses direct pane reads. Restart also classifies tabs for ordering.
+            self.assertEqual((searches.call_count, scans.call_count, processes.call_count),
+                             (1, 1, int(command == "restart")), command)
+            pause.assert_called_once()
+            self.assertCountEqual(signals, [991100 + index for index in (0, 1, 3, 4, 5)])
+            self.assertEqual(len(launches), 5 if command == "restart" else 0)
+            self.assertEqual(len(live), 5 if command == "restart" else 0)
+            self.assertGreater(seeds.call_count, 0)
+            self.assertIn("pane.process_info", requests)
+            self.assertEqual(starts.call_count, 2 if command == "restart" else 0)
+            self.assertEqual(bool(orders.call_count), command == "restart")
+
+
 class RestartTests(RestartTestCase):
     root: Path = Path()
     rows: tuple[staff.StaffRow, ...] = ()
@@ -606,101 +856,6 @@ class RestartTests(RestartTestCase):
         launch.assert_called_once()
         self.assertEqual(scans.call_count, 1)
         self.assertIn(f"{row.name}: restarted", output.getvalue())
-
-    def test_mixed_restart_and_stop_share_all_full_reads(self) -> None:
-        from scripts.agents import codex_mesh
-        from scripts.herdr import worker_panes
-        base = self.rows[0]
-        self.rows = tuple(replace(base, id=staff.StaffId(f"mixed-{n}"), name=f"mixed-{n}",
-            current_session=staff.StaffId(f"mixed-session-{n}"), kind=kind)
-            for n, kind in enumerate(("showrunner", "unit", "worker", "agent", "worker", "worker")))
-        self.rows = (self.rows[0], replace(self.rows[1], parent=staff.ReportsTo(self.rows[0].id)),
-            replace(self.rows[2], parent=staff.ReportsTo(self.rows[1].id)), self.rows[3],
-            *(replace(row, parent=staff.ReportsTo(self.rows[3].id)) for row in self.rows[4:]))
-        record = staff.StaffSnapshot(self.rows)
-        saved = self.rows[3]
-        run = self.root / "mesh-run"
-        write_text_atomic(run / "worker_transport", "mesh\n")
-        runs = {str(self.rows[1].current_session): [str(run)]}
-        panes: list[herdr.PaneIdentity] = [{"pane_id": f"w1:p{n}", "workspace_id": "w1",
-            "session_id": row.current_session, "terminal_id": f"terminal-{n}"}
-            for n, row in enumerate(self.rows) if n != 2]
-
-        def scan() -> herdr.CodexConversations:
-            _ = herdr.herdr_processes()
-            return herdr.CodexConversations({str(row.current_session): (990100 + n,)
-                for n, row in enumerate(self.rows) if n >= 4 and row.current_session in self.running}, ())
-
-        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            for n, row in enumerate(self.rows[:4]):
-                if row.current_session == identity and identity in self.running:
-                    return sessions.LiveSessionProcess(990100 + n)
-            return sessions.SessionNotLive()
-
-        def process(pid: int, _started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return (sessions.LiveSessionProcess(pid) if self.rows[pid - 990100].current_session in self.running
-                    else sessions.SessionNotLive())
-
-        def signal_process(pid: int, _number: int) -> None:
-            row = self.rows[pid - 990100]
-            self.running.discard(str(row.current_session))
-            self.stops.append(str(row.id))
-
-        def launch_arguments(identity: str, name: str) -> tuple[str, dict[str, str], list[str]]:
-            return (("codex", {}, ["resume", identity]) if name in {row.name for row in self.rows[4:]}
-                    else ("claude", {}, ["--resume", identity, "--name", name]))
-
-        def start(_session: str, _pane: str, _kind: str, _arguments: list[str],
-                  _opening: herdr.NoOpeningPrompt, _timeout: int, *, agent: str) -> herdr.PromptSubmissionNotRequired:
-            self.running.add(str(next(row.current_session for row in self.rows if row.name == agent)))
-            return herdr.PromptSubmissionNotRequired()
-
-        def workers(parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
-            return [worker_panes.OpenWorker(row, f"w1:p{n}", f"terminal-{n}", herdr.AgentStatus.IDLE)
-                if row.current_session in self.running else worker_panes.StoppedWorker(row, f"w1:p{n}", f"terminal-{n}")
-                for n, row in enumerate(self.rows[4:], 4) if row.parent == staff.ReportsTo(parent)]
-
-        for command in ("restart", "stop"):
-            with self.subTest(command=command):
-                self.running = {str(self.rows[n].current_session) for n in (0, 1, 4, 5)}
-                self.stops.clear()
-                shutdown_record.save([str(saved.id)])
-                with ExitStack() as operations:
-                    searches = cast(Mock, operations.enter_context(patch.object(unit_runs, "held_by_session", return_value=runs)))
-                    processes = cast(Mock, operations.enter_context(patch.object(herdr, "_scan_herdr_processes", return_value=[])))
-                    scans = cast(Mock, operations.enter_context(patch.object(herdr, "codex_conversations", side_effect=scan)))
-                    pause = cast(Mock, operations.enter_context(patch.object(codex_mesh, "_pause_roster")))
-                    launches = cast(Mock, operations.enter_context(patch.object(herdr, "start_agent", side_effect=start)))
-                    for scope in (
-                        patch.object(staff, "initial_snapshot", return_value=record),
-                        patch.object(staff, "snapshot", return_value=record),
-                        patch.object(sessions, "session_liveness", side_effect=liveness),
-                        patch.object(sessions, "process_liveness", side_effect=process),
-                        patch.object(herdr, "check_target", return_value=True),
-                        patch.object(herdr, "check_native_target", return_value=True),
-                        patch.object(herdr.Herdr, "panes", return_value=panes),
-                        patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell()),
-                        patch.object(herdr, "_tab_staff", return_value=record),
-                        patch.object(worker_panes, "observe", side_effect=workers),
-                        patch.object(worker_panes, "agent_inventory", return_value=[]),
-                        patch.object(stop_resume, "stop_unit_workers", STOP_UNIT_WORKERS),
-                        patch.object(stop_resume, "stop", STOP_SESSION),
-                        patch.object(stop_resume, "_record_launches"),
-                        patch.object(stop_resume, "_retire_prompt"),
-                        patch.object(stop_resume, "_signal_process", side_effect=signal_process),
-                        patch.object(restart, "session_launch", side_effect=launch_arguments),
-                        patch.object(herdr, "launch_prepared_agent", LAUNCH_PREPARED_AGENT),
-                        patch.object(herdr, "open_tab", return_value="w1:p9"),
-                        patch.object(herdr.Herdr, "run_in_pane"),
-                    ):
-                        _ = operations.enter_context(scope)
-                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-                        self.assertEqual(shutdown.main([command, "--all"]), 0, errors.getvalue())
-                self.assertEqual(errors.getvalue(), "")
-                self.assertEqual((searches.call_count, scans.call_count, processes.call_count), (1, 1, 1))
-                pause.assert_called_once()
-                self.assertCountEqual(self.stops, [str(self.rows[n].id) for n in (0, 1, 4, 5)])
-                self.assertEqual(launches.call_count, 5 if command == "restart" else 0)
 
     def test_unclear_identity_after_stop_keeps_the_running_target_pending(self) -> None:
         row = self.rows[0]
@@ -2013,8 +2168,10 @@ class RestartTests(RestartTestCase):
         resumed: set[staff.StaffId] = set()
 
         def restore(_parent: staff.StaffId, *, record: staff.StaffSnapshot,
-                    runs: dict[str, list[str]]) -> worker.ExitCode:
+                    runs: dict[str, list[str]],
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> worker.ExitCode:
             _ = record, runs
+            self.assertIsInstance(codex, herdr.CodexConversations)
             if not resumed:
                 resumed.add(children[0].id)
                 raise OSError("interrupted after first worker")

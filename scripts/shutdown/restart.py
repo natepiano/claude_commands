@@ -16,10 +16,10 @@ from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, TypedDict, cast
 from importlib import import_module
 
 from scripts.herdr import herdr
@@ -33,6 +33,12 @@ from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopF
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
+
+class StopReadArguments(TypedDict, total=False):
+    """Forward shared observations only when the caller supplies them."""
+
+    codex: herdr.CodexConversations | None
+    runs: dict[str, list[str]] | None
 
 
 @dataclass(frozen=True)
@@ -71,12 +77,15 @@ class WorkerPanes(Protocol):
     def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
     def observe_parents(self, parents: list[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[WorkerRow]]: ...
-    def worker_run(self, parent: staff.StaffRow) -> Path: ...
+    def worker_run(self, parent: staff.StaffRow, *,
+                   record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+                   scanned: dict[str, list[str]] | None = None) -> Path: ...
 
 
 class WorkerRestore(Protocol):
     def restore(self, parent: staff.StaffId, *, record: staff.StaffSnapshot | None = None,
-                runs: dict[str, list[str]] | None = None) -> int: ...
+                runs: dict[str, list[str]] | None = None,
+                codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> int: ...
 
 
 class AgentsCommand(Protocol):
@@ -140,12 +149,8 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
             return False
-        if runs is not None:
-            result = stop_resume.stop(str(row.current_session), deadline=deadline, codex=codex, runs=runs)
-        elif codex is not None:
-            result = stop_resume.stop(str(row.current_session), deadline=deadline, codex=codex)
-        else:
-            result = stop_resume.stop(str(row.current_session), deadline=deadline)
+        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+        result = stop_resume.stop(str(row.current_session), deadline=deadline, **shared)
         if isinstance(result, (Stopped, NotRunning)):
             return True
         _anomaly(row, result.reason if isinstance(result, StopFailed) else "session not found")
@@ -201,10 +206,7 @@ def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartOb
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
     pane_owners: set[staff.StaffId] = set()
     for row in owners:
-        held = unit_runs.held(str(row.current_session), os.environ.get("ROSTER_RUN_ROOT"),
-                              scanned=runs, record=record)
-        directory = (Path(held[0]) if held else Path(unit_runs.environ("RUN_DIR"))
-                     if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / row.id)
+        directory = worker_panes.worker_run(row, record=record, scanned=runs)
         if unit_runs.worker_transport(directory) != "mesh":
             pane_owners.add(row.id)
     return RestartObservations(_codex_conversations(client), runs, frozenset(pane_owners))
@@ -217,7 +219,7 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
             ) and (pane_workers(row) if observed is None else row.id in observed.pane_owners):
         result = (worker.restore(row.id) if observed is None else
-                  worker.restore(row.id, record=record, runs=observed.runs))
+                  worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
         if result != 0:
             raise OSError("worker restore is incomplete")
 
@@ -626,12 +628,17 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     selected_sessions = {str(row.current_session) for row in selected} if stop_all else set[str]()
     pre_stop_codex = observed.codex
     unconfirmed: set[staff.StaffId] = set()
-    def stop_holder(holder: staff.StaffRow) -> bool:
+    unconfirmed_workers: set[staff.StaffId] = set()
+    def stop_holder(holder: staff.StaffRow) -> tuple[bool, tuple[staff.StaffId, ...]]:
         with staff.row_operation(str(holder.id)):
             shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+            workers: tuple[staff.StaffId, ...] = ()
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                _ = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
-            return stop_row(holder, client, codex=observed.codex, runs=observed.runs)
+                unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
+                if unresolved and holder.id in observed.pane_owners:
+                    workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
+                                    if child.id in selected_ids)
+            return stop_row(holder, client, codex=observed.codex, runs=observed.runs), workers
 
     if stop_all and holders:
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
@@ -639,16 +646,33 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                        for holder in tuple(holders.values())]
             for holder, future in futures:
                 try:
-                    if not future.result():
+                    stopped, workers = future.result()
+                    unconfirmed_workers.update(workers)
+                    if not stopped:
                         unconfirmed.add(holder.id)
                 except staff.StaffRefused as error:
                     _ = holders.pop(holder.id)
                     _anomaly(holder, error)
                 except errors as error:
                     unconfirmed.add(holder.id)
+                    if holder.id in observed.pane_owners:
+                        unconfirmed_workers.update(child.id for child in record.find(kind="worker", parent=holder.id)
+                                                   if child.id in selected_ids)
                     _anomaly(holder, error)
     if after_stop == AfterStop.KEEP_STOPPED:
         return 0
+    blocked_workers: set[staff.StaffId] = set()
+    for child in record.rows:
+        if child.id not in unconfirmed_workers:
+            continue
+        try:
+            fresh = _after_unconfirmed_stop(child, pre_stop_codex)
+        except errors as error:
+            fresh = herdr.UnknownConversation(str(error))
+        if not isinstance(fresh, herdr.StoppedConversation):
+            blocked_workers.add(child.id)
+            selected_sessions.discard(str(child.current_session))
+            _anomaly(child, "target process still runs; worker kept pending" if isinstance(fresh, herdr.LiveConversation) else fresh.reason)
     observed = RestartObservations(herdr.CodexConversations(
         {identity: pids for identity, pids in observed.codex.live.items() if identity not in selected_sessions},
         observed.codex.unknown), observed.runs, observed.pane_owners)
@@ -663,6 +687,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     def start_holder(holder: staff.StaffRow, focus: bool) -> None:
         with staff.row_operation(str(holder.id)):
             current_record = staff.initial_snapshot()
+            current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             current = current_record.by_id(holder.id)
             if current is None:
                 raise ValueError("staff row no longer exists")
@@ -691,7 +716,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 members = members_by_holder[holder.id]
                 try:
                     future.result()
-                    started.extend(members)
+                    started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
+                    pending.extend(member for member in members if staff.StaffId(member) in blocked_workers)
                 except ClaudeTrustWriteFailed:
                     pending.extend(members)
                     exit_code = 1

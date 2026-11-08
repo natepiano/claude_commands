@@ -256,13 +256,15 @@ class WorkerCommandTests(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def test_restore_reuses_given_runs_for_two_workers(self) -> None:
-        _ = self.opened("impl")
-        _ = self.opened("review", "review")
+        for state in (self.opened("impl"), self.opened("review", "review")):
+            _ = progress_history.begin_dispatch(self.run_dir, slot=state.row.name, phase="8", role="impl",
+                worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="impl", lens="")
+            _ = self.fixture.world.stop(state.row, self.fixture.world)
         record = staff.snapshot()
         runs = {str(self.fixture.parent.current_session): [str(self.run_dir)]}
         with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
-              patch.object(progress_history, "active_dispatch",
-                  return_value=progress_history.ActiveDispatch("dispatch", ("assign.sh",))) as active,
+              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO())):
             self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)

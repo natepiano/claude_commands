@@ -584,25 +584,24 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
-            runs: dict[str, list[str]] | None = None) -> ExitCode:
+            runs: dict[str, list[str]] | None = None,
+            codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> ExitCode:
     record = staff.snapshot() if record is None else record
-    holder = record.by_id(parent)
+    holder = next(row for row in record.rows if row.id == parent)
     changed = False
     outcome = ExitCode.OK
-    observed = _read_workers(next(row for row in record.rows if row.id == parent), record, scanned=runs)
+    observed = _read_workers(holder, record, scanned=runs)
     if isinstance(observed, MeshWorkerRows):
-        print(f"{holder.name if holder is not None else parent}: workers unchanged")
+        print(f"{holder.name}: workers unchanged")
         return ExitCode.OK
-    run = (observed.runs[0] if observed.runs else Path(unit_runs.environ("RUN_DIR"))
-           if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent)
+    runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
+    run = worker_panes.worker_run(holder, record=record, scanned=runs)
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                if holder is None:
-                    continue
                 active = progress_history.active_dispatch(state.row.id, run)
                 if isinstance(active, progress_history.ActiveDispatchUnavailable):
                     print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
@@ -612,7 +611,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     continue
                 if not isinstance(state, worker_panes.OpenWorker):
                     role = worker_panes.dispatch_role(state.row)
-                    result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role, runs=runs, codex=codex)
                     code = startup_result(WorkerName.parse(state.row.name), result)
                     if code != ExitCode.OK:
                         outcome = code
@@ -625,7 +624,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
-        print(f"{holder.name if holder is not None else parent}: workers {'restored' if changed else 'unchanged'}")
+        print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")
     return outcome
 
 

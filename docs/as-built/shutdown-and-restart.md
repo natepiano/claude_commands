@@ -244,3 +244,10 @@ The write uses the repository trust key, or the folder itself outside a reposito
 A failed write prints one anomaly with the folder, account file, and error.
 The launch then returns its failure result without a process start.
 A composer with a draft waits until the deadline without changes to the draft.
+
+Worker restore shares the command's run index and Codex snapshot through stopped-worker startup.
+Restore and stop use `worker_panes.worker_run` for the same run selection and fallback.
+
+An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
+Live or unknown evidence leaves the worker pending.
+The worker check uses the same function as the Codex row check.
