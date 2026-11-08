@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli
@@ -52,6 +53,9 @@ class FakeGateAws:
         error = ''
         if operation == 'get-cost-and-usage':
             reply = {'ResultsByTime': [{'Total': {'UnblendedCost': {'Amount': '0', 'Unit': 'USD'}}}]}
+        elif operation == 'export-credentials':
+            assert service == 'configure'
+            reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret', 'SessionToken': 'fixture-token'}
         elif operation == 'put-object':
             if self.upload_timeout:
                 raise subprocess.TimeoutExpired('aws s3api put-object', 30)
@@ -112,7 +116,6 @@ class CloudGateTests(CostFixture):
         cloud_gate.save(self.folder / 'request.json', self.request)
         self.deployment = {'deployment_id': 'fixture', 'bucket': 'fixture-bucket', 'template': 'fixture-template',
             'version': '1', 'security_group': 'fixture-group', 'revision': 'fixture-revision',
-            'artifact_prefix': 'artifacts/fixture-role:',
             'subnets': [{'id': 'fixture-a', 'zone': 'a'}, {'id': 'fixture-b', 'zone': 'b'}]}
         self.fake.result = self.result()
 
@@ -253,7 +256,17 @@ class CloudGateTests(CostFixture):
         encoded = ledger.text(self.fake.launches[0], 'UserData')
         import base64
         data = base64.b64decode(encoded).decode()
-        self.assertIn('export AWS_DEFAULT_REGION=fixture-region', data)
+        links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
+        for key in ('guest', 'request', 'source', 'log', 'result', 'boot_error'):
+            parsed = urlsplit(ledger.text(links, key))
+            query = parse_qs(parsed.query)
+            self.assertEqual(parsed.scheme, 'https')
+            self.assertEqual(query['X-Amz-Expires'], ['1200'])
+            self.assertEqual(query['X-Amz-Security-Token'], ['fixture-token'])
+            self.assertTrue(query['X-Amz-Credential'][0].startswith('fixture-access/'))
+        self.assertEqual(urlsplit(ledger.text(links, 'log')).path, '/artifacts/attempt/gate.log')
+        self.assertNotIn('fixture-secret', data)
+        self.assertNotIn('s3://', data)
         self.assertLess(len(encoded), 25600)
         self.assertNotIn('test_module_0000.py', data)
         self.assertIn('requests/attempt.guest.py', data)
