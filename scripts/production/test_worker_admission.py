@@ -193,6 +193,16 @@ class WorkerAdmissionTests(StaffTestCase):
 
 
 class FamilyHandoffTests(StaffTestCase):
+    def test_claude_transcript_entries_ignore_api_request_blobs(self) -> None:
+        for kind, expected in (("api-request-blob", ""), ("user", "user:\nThe request"),
+                               ("assistant", "assistant:\nThe request")):
+            with self.subTest(kind=kind):
+                self.assertEqual(worker_admission.transcript_entry({
+                    "type": kind,
+                    "message": {"role": "assistant" if kind == "assistant" else "user",
+                                "content": [{"type": "text", "text": "The request"}]},
+                }, set()), expected)
+
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
                malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
                                                 tuple[list[str], list[str], list[str]]]:

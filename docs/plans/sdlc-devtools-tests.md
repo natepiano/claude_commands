@@ -1513,3 +1513,33 @@ It removes `PausedSeat`, transport pins and `unit_runs.worker_transport`.
 It moves sandbox constants into `worker_panes.py`.
 It renames the detached command modules, config and record folder.
 Historical readers keep completed run rosters.
+
+### Phase 8s — A hold that names any showrunner waits  · status: done
+
+**Depends on:** none
+
+Source: sdlc [f434973f], from natedev [d924569c]. stall-watch bumped the accounts unit twice (09:55 and 10:01 EST) while its status was `— holding: waiting on sdlc's message that ...`. `holding_names_outside` found no outside party: the peer list holds only the unit's sibling units, its own showrunner's session and its production name, and the config patterns know `showrunner`, `natedev` and `*-unit`. `sdlc` is another showrunner, so it is in neither.
+
+#### Work Order
+
+**Goal:** a holding or waiting status that names any showrunner, or a sibling unit, reads as a wait on an outside party.
+
+**Spec:**
+1. In `scripts/production/stall_watch.py`, the peers given to `status_defers_bump` and `holding_names_outside` are the names of every staff row of kind `showrunner` whose worktree is not removed, plus the unit's sibling units as before, less the unit's own row. Read them from the one `staff.snapshot()` that the pass already takes. Keep the configured session and production name. A unit of another production matches as `<name>-unit` through the config pattern. Every staff name was ruled out: many unit names are common words (sdlc [22ebe0aa]).
+3. In `config/stall_watch.conf`, remove `natedev` from `external_owner_pattern` and `holding_party_pattern`, and fix the comments above them. The staff record now supplies every showrunner and unit name.
+4. Own names still win: an occurrence inside a complete own name is not outside (`names_outside` is unchanged).
+
+**Files:**
+- `scripts/production/stall_watch.py`
+- `config/stall_watch.conf`
+- `scripts/production/test_stall_watch.py`
+
+**Workers:** 1 writer. `impl` owns all three files. The change is one function's input and one config line, so a second slot has no disjoint work.
+
+**State:** none.
+
+**Test:** add one row to `test_holding_names_a_peer_or_showrunner_anywhere_in_the_line`, or to the existing test that drives a full pass with staff rows: a unit whose parent is natedev, with status `— holding: waiting on sdlc's message that ...`, where `sdlc` is a showrunner staff row and not the unit's parent, is not bumped. Run `~/.claude/scripts/lib/py -m unittest scripts.production.test_stall_watch` from the worktree root.
+
+**Lint:** `basedpyright scripts/production/stall_watch.py scripts/production/test_stall_watch.py` gives `0 errors, 0 warnings, 0 notes`.
+
+**Acceptance gate:** the new row fails before the change and passes after it; the full `test_stall_watch` module passes; `natedev` is not in `config/stall_watch.conf`.

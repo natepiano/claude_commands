@@ -232,7 +232,7 @@ A failed query raises `AdmissionUnavailable` within the query bound. Commands pr
 `mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
 `queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
 The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
-The evidence includes host RAM, optional load, run needs, anonymous use, held slots, keep-asides, room, and start spacing.
+The evidence includes host RAM, optional load, run needs, swap-backed use, held slots, keep-asides, room, and start spacing.
 It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
 A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
 Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
@@ -363,7 +363,7 @@ The pass records the holder in `AdmissionWaitSnapshot.holder`.
 An order hold names its protected waiter, including a continuation that requests extra memory.
 A room wait names the run with the largest recorded charge, including held slots.
 A held slot keeps the run's recorded unit after its reservation ends.
-The charge uses grouped anonymous use and the current keep-aside.
+The charge uses grouped swap-backed use and the current keep-aside.
 Unavailable run use retains the full keep-aside charge.
 Unregistered CI jobs never become holders.
 Pressure, unreadable host readings, start spacing, and estimate refresh report no holder.
@@ -621,7 +621,7 @@ CI RAM and unowned scopes reduce host free memory. They do not create a run prom
 The service reads that value once with the other policy values.
 `AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
 `MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
-`MemoryRoom.ci_use` stores readable CI use separately from admitted anonymous use.
+`MemoryRoom.ci_use` stores readable CI use separately from admitted swap-backed use.
 `MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
 Idle CI and unavailable CI readings add no CI keep-aside.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
@@ -632,8 +632,19 @@ The page shows CI use and the CI keep-aside inside the cap.
 The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
 The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
-Anonymous scope counters use the same measure as the history peaks.
-Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
+`AnonymousRunUse` stores resident swap-backed memory: anonymous memory plus shared memory, which includes tmpfs files.
+Scope readings use `memory.stat` `anon + shmem`.
+Process readings use `/proc/<pid>/status` `RssAnon + RssShmem`.
+`ProcessAnonymousUse` retains each process's contribution. Both keep their names because the snapshot and protocol codecs use the class name as the record kind.
+The resident working set stays `max(0, memory.current - inactive_file)` and already includes shmem.
+The reader does not add shmem to that working set again. It records swap separately.
+Missing, invalid, or negative counters return `RunUseUnavailable`.
+The shell peak sampler uses the same `anon + shmem` basis for step and test-phase peaks.
+The queue-place sampler uses this basis for scoped programs and unscoped runner programs.
+Its other unscoped program peaks retain their resident-memory basis.
+CI subtraction removes registered scope use on that same basis, including shmem.
+Nested registered scopes enter the subtraction once. Process subtraction excludes members already covered by those scopes.
+An unavailable reading keeps the full accepted need aside and makes the cap unavailable.
 The service freezes `TestPhaseNeed` and its margin when it writes a nextest reservation need.
 A width update selects history again at the recorded width.
 `test_phase_need` uses the existing history selector through `store.locked_rows`.
@@ -643,7 +654,7 @@ The config reader resolves the margin once. Each reservation retains its selecte
 `record.read_test_phase` supplies the observed test window and test peak.
 After tests start, need equals `max(test peak so far, stored test-phase need) × stored margin`.
 Without a stored need or observed test window, need remains the full step estimate.
-The existing keep-aside formula remains `max(0, need − anonymous use)`.
+The existing keep-aside formula remains `max(0, need − swap-backed use)`.
 For a 12 GiB step, 3 GiB test use, and 3 GiB history need, margin 1.2 gives 3.6 GiB need.
 That run keeps 0.6 GiB aside instead of 9 GiB.
 The queue view, card, build-why, and memory page use the keep-aside captured by the last pass.
@@ -1232,7 +1243,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
 - **Memory gate sizes.** The first need comes from `program_first_peak_gib.cargo` in `config/build_admission.conf`. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
-- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Each step retains its accepted need unless an observed test phase selects its frozen test-phase need. Anonymous use reduces its keep-aside. Simultaneous callers cannot reserve the same room.
+- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Each step retains its accepted need unless an observed test phase selects its frozen test-phase need. Swap-backed use reduces its keep-aside. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
 - **zram is invisible to slice limits.** earlyoom counts zram's virtual size as swap; `MemoryMax` counts RAM only, and compressed pages are charged to no slice.
@@ -1266,7 +1277,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - **One slice for every session build, sccache included.** Every compile reaches the sccache server, so the server's cgroup is where compiles are charged; a limit on the step scopes alone would bound nothing.
 - **CI in its own pool, a smaller slice and a lower kill order.** Shared steve slots alone did not stop kills (a CI run lost both Linux jobs after it). Its own 14-slot pool keeps CI from starving sessions and the reverse; `PIPELINE_JOB_OOMSCOREADJ` is the only setting that reaches job processes, because the runner sets every job to 500 itself. At 100 a CI job goes after a build step (500) or a session process (200) of the same size.
 - **Build steps at 500, and no `--prefer`.** The level sets the order and size decides within it. A `--prefer` for compiler names (+300) let two hung hana tests (11.4 GB, 15.5 GB) outlive 26 smaller processes, six CI compilers among them; without it, a hung 15 GB test scores about 1100 against a 2 GB CI compiler's 750, and a session's rust-analyzer at 200 stays behind every build step of similar size. The adj is set inside the step's scope, so every process the step starts inherits it.
-- **Admission after a hold release.** The 2026-10-04 incident had 21 kills after compilers grew beyond the admission readings. Each admitted step keeps its selected need. Its anonymous use reduces its keep-aside. Every local build requests memory admission after a hold release.
+- **Admission after a hold release.** The 2026-10-04 incident had 21 kills after compilers grew beyond the admission readings. Each admitted step keeps its selected need. Its swap-backed use reduces its keep-aside. Every local build requests memory admission after a hold release.
 - **A damaged record releases everyone, not no one.** Setting it aside and falling back to a broadcast cannot strand held sessions; each still passes its own memory gate.
 - **Broadcast by id.** Names can belong to two sessions, and `top_level.py` once deduped them, so one of two same-named sessions never heard the hold.
 - **A memory kill re-runs once.** The kill says nothing about the tree; a second kill stops the call so a starved machine does not loop.
@@ -1400,9 +1411,9 @@ The nixos patch must be applied and nix-darwin activated before this job runs.
 ### Free memory, head protection, and step slots
 
 `memory_room` calculates room from one captured admission pass.
-For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
+For each admitted run, kept bytes equal `max(0, selected need − swap-backed use)` plus held slot bytes.
 Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
-The cap equals our anonymous use plus CI use plus free memory minus safety. It does not limit an estimate.
+The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
 The first eligible run follows queue priority, first run arrival, and PID.
@@ -1438,7 +1449,7 @@ The column uses `scripts.buildlog.store.host_name()`, the shared short host name
 A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.
 The admission service admits each running step on its own machine. No per-row protocol field is added.
-`keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
+`keep_aside_text` explains each admitted run's need, swap-backed use, slot bytes, and kept bytes.
 `RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
 `admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.
 `HeadExplanation` retains that cause for the view and release advice.
@@ -1451,7 +1462,7 @@ Merge gates start with the p90 of their host's recorded peaks from the last 14 d
 Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need; `progress_profile_rank` applies only to progress bins.
 
-Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
+Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
 Each bin selects the Nth-highest run value from matching completed profiles.
 `progress_profile_rank=2` sets N in `config/build_admission.conf`.
 A bin with fewer than N measurements uses its lowest measured run value.
@@ -1522,8 +1533,8 @@ The cargo child sets a parent death signal before exec.
 SIGKILL of the front also kills that cargo process.
 Cargo descendants do not inherit that signal and can survive a SIGKILL of the front.
 `QueuePlace` tracks descendants and terminates surviving descendants before release.
-The runner samples anonymous use in its process tree.
-The service also samples anonymous use during each admission pass.
+The runner samples swap-backed use in its process tree.
+The service also samples swap-backed use during each admission pass.
 The service reads the runner's peak and wave files beside its sidecar.
 It copies the maximum into its own peak files before finalization.
 The service writes completed and failed peaks through the normal history path.
@@ -1545,7 +1556,7 @@ Cleanup uses the separate timing from the grant.
 
 CI memory keeps the mixed accounting rule during activation.
 Registered process trees count through their reservations.
-The CI slice reading subtracts their anonymous use.
+The CI slice reading subtracts their swap-backed use.
 The CI keep-aside remains while any busy runner has no registered tree.
 The keep-aside applies once to a mix of registered and unregistered jobs.
 `ci_memory_margin_gib` remains in configuration until the approved activation step.

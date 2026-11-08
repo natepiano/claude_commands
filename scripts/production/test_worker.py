@@ -523,6 +523,24 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.waited, [pane])
         self.assertIn(self.agent.final, self.reply.read_text())
 
+    def test_claude_done_reply_after_an_api_request_blob_completes_the_receipt(self) -> None:
+        dispatch_id = "phase-28d"
+        prompt = (f'Read the unchanged prompt file "{self.prompt}". '
+                  + f"End your final reply with DONE {dispatch_id}.")
+        reply = "The work is complete.\nDONE " + dispatch_id
+        source = self.run_dir / "claude-transcript.jsonl"
+        records = [
+            {"type": "user", "message": {"role": "user", "content": prompt}},
+            {"type": "api-request-blob", "message": {"role": "user", "content": [{
+                "type": "text", "text": json.dumps({"messages": [{"role": "user", "content": prompt}]}),
+            }]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": reply}},
+        ]
+        _ = source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        receipt = worker.transcript_receipt(worker_admission.transcript_entries(source, set()),
+                                            prompt, worker.DoneReply(dispatch_id))
+        self.assertEqual(receipt, worker.TranscriptReceipt(worker.DispatchComplete(reply), frozenset()))
+
     def test_agent_exit_after_done_still_publishes_the_reply(self) -> None:
         opened = self.opened()
         self.agent.finish_after = 1

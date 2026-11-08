@@ -426,3 +426,15 @@ From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` 
 Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
 
 As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.
+
+### Phase 10g — A merge made on a local merge-gate branch adds its change rows  · status: done
+
+**Depends on:** Phase 10d.
+
+From hana's showrunner, through sdlc, 2026-11-08 [954e2ae6]. After two main promotions, `change_review.py list-ready --repo ~/rust/hana_catalyst --production hana` added no row. It missed three Change-Review lines in b7c17741de (merged as 5c444e5b40) and one in f75b3adb07 (merged as afdb0012db). hana added them by hand as C294-C297.
+
+Cause: Phase 10d keeps only a merge whose subject ends ` into <merge branch>`. hana's merge branch is `init/catalyst`, but its merge-gate unit merges on a local branch, so every hana merge subject ends ` into tool-based-ui-merge-gate`. All 33 hana merges since 2026-11-06 fail that test.
+
+Fix: skip a merge only when its subject ends ` into <B>`, where `origin/<B>` is the merge branch of a production outside this scan (the refs `reviewed_merge_refs` already gives). Keep every other merge. The rows hana added by hand must not come again. Add no new check.
+
+As built: `list_ready` skips a merge only when its subject ends ` into <B>` for a branch `origin/<B>` in `outside_refs`. A scan of a copy of hana's list without C294-C297 adds those four rows with demo as Producer; with them, it adds none.

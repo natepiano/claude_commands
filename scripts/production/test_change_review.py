@@ -849,6 +849,20 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(self.ready()[0], 0)
         self.assertEqual(self.listing.read_bytes(), written)
 
+        with self.subTest(merge_branch="local-merge-gate"):
+            local = self.branch_unit("local", "local", "local-unit", "local.md")
+            _ = self.merge_change("Change-Review: Local | Read | Local result", branch="local-unit")
+            checkpoint = self.git("rev-parse", "HEAD^2")
+            _ = self.git("commit", "--amend", "-m", f"Merge commit '{checkpoint}' into local-merge-gate")
+            merged = self.git("rev-parse", "HEAD")
+            _ = self.git("push", "--force", "origin", "integration")
+            self.promote()
+            self.assertEqual(self.ready()[0], 0)
+            rows = change_review.pending(self.listing)[-3:]
+            self.assertEqual([row["Change"] for row in rows], ["First", "Second", "Local"])
+            self.assertEqual(rows[-1]["Merged"].split(" · ")[1], merged[:8])
+            self.assertEqual(rows[-1]["Producer"], local.id)
+
     def test_a_second_scan_of_an_unregistered_unit_adds_no_row_or_staff_note(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result\n"

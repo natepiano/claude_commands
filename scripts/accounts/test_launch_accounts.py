@@ -441,8 +441,8 @@ def session_launch(identity: str):
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
                 ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
-                ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
-                 + 'open_window claude -n "$session_name" /berth_fix'),
+                ("fixtures/window-launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /fixture\n'
+                 + 'open_window claude -n "$session_name" /fixture'),
                 ("fixtures/background.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
             with self.subTest(path=path):
                 self.assertTrue(any("no resolved account" in problem
