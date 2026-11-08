@@ -566,38 +566,25 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
 
 ### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: done
-**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 (on builds and main at f7e3cbce3, merged into this branch 2026-11-08)
 
-From the builds showrunner (not the user), 2026-11-05, defect from resources-unit: `index.add_step` does not keep the output pair unknown when the recorder left it out. After resources' Phase 66, an override row whose metadata failed gives sweep `(workspace, folder, folder)`, so `build_directory` is wrong when Cargo's build-dir differs. No natedev row has it today. Ruling: store unknown, not a made-up pair; put it in a phase after 24-25.
+#### As-built
 
-Director decision: a record with no pair is unknown for both columns, old records too. Records from before the pair and records whose metadata failed carry the same fields (`v` is 1 for both), so a fallback for one is a made-up pair for the other.
-
-#### Work Order
-
-**Goal:** A step row has a real Cargo output pair or `unknown` for both folders. The index never builds the pair from `target_dir`.
-
-**Spec:**
-- `scripts/buildlog/index.py` `add_step` (about line 862): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
-- Column text (about lines 154-155): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
-- The existing index must not keep made-up pairs. Add one to `SCHEMA_VERSION`, so that `index.update()` rebuilds every step row. A change to column text alone does not do this, because `schema_statements()` leaves out the descriptions. Report the rebuild time on the live index.
-- Readers after resources' Phases 64 and 66: `scripts/buildlog/step_outputs.py` `recorded_output_roots` returns `RecordedStepOutputs`, with one `RecordedStepOutput` for each distinct row, and `scripts/lint/sweep.py` `_recorded_mapping_rows()` skips a target-folder mismatch and takes an override row only when its newest start is after `TARGET_OVERRIDE_RECORDER_CUT`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
+A step row has the Cargo output pair from its record, or `unknown` in both folders. The index never builds the pair from `target_dir`.
+- `index.add_step` reads `target_directory` and `build_directory` only from the record. When either one is absent, it stores `store.UNKNOWN_IDENTITY` in both. `target_dir`, `target_folder` and `build_history_group` still read `target_dir`.
+- Column text: `target_directory` is "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` is "resolved Cargo intermediate root; unknown when the record has no output pair".
+- `SCHEMA_VERSION` is 35, so `index.update()` rebuilds every old step row once. Column text alone does not change the index file name, because `schema_statements()` leaves out the descriptions.
+- Readers: `step_outputs.recorded_output_roots` gives an `UnknownRecordedRoot` for an unknown pair, and `sweep.discover_cargo_outputs` skips it.
 
 **Files:**
 - `scripts/buildlog/index.py` — `add_step` and the column text.
-- `scripts/buildlog/test_index.py` — pair tests.
+- `scripts/buildlog/test_index.py` — the pair table (legacy, override, target-only and build-only rows read unknown), the reader test through `recorded_output_roots` and `discover_cargo_outputs`, and the schema-bump rebuild test.
 
-**Workers:** 1 writer — `rowcpu` owns both files.
+**Gotchas:**
+- Records from before the pair and records whose Cargo metadata failed have the same fields (`v` is 1 for both). A fallback for one is a made-up pair for the other.
+- On the live log (2026-11-08), 102,951 of 109,321 steps read unknown; the rebuild took 6.0 s.
 
-**State:** none.
-
-**Constraints from prior phases:** This phase reads only `store.UNKNOWN_IDENTITY` from `scripts/buildlog/store.py`. Phase 33 and builds' package import form (devtools 3z): every import uses the package form (`from scripts.buildlog import y`), a patch string names that form, and no module adds a `sys.path` line. Keep each `if TYPE_CHECKING:` import block as it is. Do not edit `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Resources' Phase 66 binds later work: keep both guards in `_recorded_mapping_rows()` and its cut tests unchanged.
-
-**Acceptance gate:**
-- `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
-- A test through `step_outputs.recorded_output_roots` and `sweep._recorded_mapping_rows()` on an index built by `index.update()` proves that no row adds a `(folder, folder)` pair. It has two rows with no pair: an override row whose start is after `TARGET_OVERRIDE_RECORDER_CUT`, and a plain Cargo row with an absolute `target_dir`. Without the `add_step` change, the test fails on each row.
-- A test builds an index at the old `SCHEMA_VERSION` with an inferred `(folder, folder)` pair, runs `index.update()`, and proves that the step row now reads `(unknown, unknown)`.
-- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk`, `test_step_outputs`, `scripts.lint.test_sweep` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
-- `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- A pair made from `target_dir` for old records: it is wrong when Cargo's build folder differs.
 
 ### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
 
@@ -754,3 +741,47 @@ All of `scripts/buildlog` and every outside importer of its modules use the repo
 **Ruled out:**
 - A path module for `scripts/buildlog`: the repo already has one way, and a per-folder module is a second way.
 - Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
+
+### Phase 34 — A failed merge gate module keeps its failure text  · status: todo
+**Depends on:** none
+
+From the builds showrunner (not the user), 2026-11-06: "a new item for you, next after your current phase. A failed gate must keep its failure text, so a unit can read it after the gate ends. Today finish_gate_job at merge_gate.py:697 deletes the temporary log, and the record keeps only the test name. natest could read no past failure for its flake work. Keep only the failing modules' output (bounded size, a config key for the limit), next to the gate record, and prune it with the record."
+
+Decided by the director: the text goes through the build log's one kept-log path, `record.keep_log`, under `<host>/logs/<YYYY-MM>/`. The build log prunes neither records nor logs, so no prune code exists to join; the text lasts as long as the record.
+
+From the builds showrunner (not the user), 2026-11-06: "Phase 34 design accepted. No prune code; the per-file limit bounds the growth."
+
+#### Work Order
+
+**Goal:** After a merge gate ends, a unit can read the output of each failed module attempt, also a first run that passed on its rerun. A passing module keeps no output.
+
+**Spec:**
+- `scripts/test_times/gate_record.py`: `Execution` (about line 110) gets `output: str`. `ModuleRun` gets `log: str`, the path of the kept log relative to the build log root, empty when no log is kept.
+- `write_gate_run` keeps one log for each attempt whose `status` is not 0 and whose `restart` is empty. It uses `record.keep_log(data, host, epoch, record_id)` (`scripts/buildlog/record.py` about line 602) with the record's `host`, `epoch` and a name from the record id, suite, module and attempt. It keeps only the last `GATE_FAILURE_LOG_KIB` KiB of the output, and it starts the text with one line that gives the count of bytes it cut. A failed keep is reported through `report_not_written` and does not change the gate verdict.
+- `config/test_times.conf`: new key `GATE_FAILURE_LOG_KIB`, read at use through `conf`. Start value 64; state the basis in the comment.
+- `scripts/production/merge_gate.py` `record_gate_run` (about line 936): pass `job.output` to `Execution`. `finish_gate_job` (about line 746) stays as it is, and it still removes the temporary folder.
+- `scripts/buildlog/index.py`: `GATE_MODULE_COLUMNS` (about line 212) gets `("log", "TEXT", "gzipped output of a failed attempt; empty otherwise")`. Bump `SCHEMA_VERSION` from 35 (Phase 27) to 36.
+- Docs: `docs/as-built/merge-gate-and-test-speed.md` says where the text is, how to read it (`buildlog query` for the path, then `zcat`), and that nothing prunes it.
+- Add no guard, no refusal and no check that this Work Order does not name.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `Execution.output`, `ModuleRun.log`, the kept logs.
+- `scripts/test_times/test_gate_record.py` — the new tests.
+- `config/test_times.conf` — `GATE_FAILURE_LOG_KIB`.
+- `scripts/production/merge_gate.py` — passes the output.
+- `scripts/production/test_merge_gate_test_times.py` — a real gate run with a failing module.
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_gate_index.py` — the `log` column.
+- `docs/as-built/merge-gate-and-test-speed.md` — where the text is and how to read it.
+
+**Workers:** 1 writer — `rowcpu` owns all files; the record, its caller and its index change together.
+
+**State:** one new field in new gate records. Old records have no `log` key and index as empty, by the existing `pick`.
+
+**Constraints from prior phases:** Phase 33 and builds' package import form: every import uses the package form (`from scripts.buildlog import y`), a patch string names that form, and no module adds a `sys.path` line. Keep each `if TYPE_CHECKING:` import block as it is. Phase 27: a step row's `target_directory` and `build_directory` are a real pair or `unknown` for both; do not change that. Line references were checked against the tree on 2026-11-08; recheck them after a builds merge. A test makes the project it needs in a tempdir at run time.
+
+**Acceptance gate:**
+- A test runs a gate with one module that fails and one that passes, and reads the failing module's traceback back from the path in its record. The passing module's `log` is empty.
+- A test with a module that fails once and passes on its rerun finds the first attempt's traceback through that attempt's row.
+- A test with output above the limit keeps the end of the output, at most the limit plus the first line, and names the cut bytes. A changed config value changes the kept size with no code change.
+- `buildlog query` returns the `log` path from `gate_modules` on an index that `index.update()` rebuilt.
+- The caller suites of the changed files pass with no assertion weakened. `basedpyright` on the changed files: 0 errors, 0 warnings, 0 notes.

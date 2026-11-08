@@ -8,9 +8,9 @@
 - **Source phase:** 6 (phase review).
 
 ## Other script folders import from the repo root, one phase per folder
-- **Starts when:** Phases 26 and 27 are done. From the builds showrunner (not the user), 2026-11-06: "F020: next (one phase per folder, after Phases 26/27; each phase names its folder owner in also-touches)."
-- **Target:** per-folder `sys.path` lines above repo-root imports: `scripts/build_hold/build_hold.py:28,30,34,36`, `hold_applies.py:9`; `scripts/build_targets/build_targets.py:26`, `target_config.py:14`, `test_targets.py:20`, `test_build_targets.py:20`; `scripts/mac_test/mirror_root.py:9`, `mac_test.py:27-29,35`, `test_mac_test.py:31,34,39`; `scripts/notify/silence.py:45`, `review.py:33`; `scripts/shutdown/inventory.py:19-23`. Line numbers are from the Phase 33 review; check them first.
-- **Need:** these folders keep their own path lines and have a mix of `noqa: E402` forms. Phase 33 kept these lines because they are outside `scripts/buildlog`. The modules `sessions`, `unit_runs`, `user_zone` and `cargo_manifest` still have bare importers (98 files by grep, 2026-11-06, siblings included). From the builds showrunner (not the user), 2026-11-06: "add-on 1: next. Fold it into the F020 per-folder phases (one owner switches all callers of each module; name each folder owner in also-touches). After Phases 26 and 27."
+- **Starts when:** Phase 26 is done (Phase 27 is done). From the builds showrunner (not the user), 2026-11-06: "F020: next (one phase per folder, after Phases 26/27; each phase names its folder owner in also-touches)."
+- **Target:** the `sys.path` lines that sdlc's devtools 3z converter left in these folders (grep, 2026-11-08): `scripts/build_hold/hold_applies.py:13`, `test_hold_applies.py:17`, `test_target_hold.py:15`; `scripts/build_targets/targets.py:23`, `working_set.py:25`, `test_ssh_eligibility.py:26`; `scripts/mac_test/audit.py:20-23`, `loopback_proof.py:20,27,40-41`, `test_audit.py:17`, `test_target_state.py:25`. Lines inside code strings that a test or the Linux runner sends to another process are not targets. Check the lines first.
+- **Need:** these modules still change `sys.path`, so a module can load under two names. `scripts/notify` and `scripts/shutdown` have no such line now, and no file imports `sessions`, `unit_runs`, `user_zone` or `cargo_manifest` by a bare name (grep, 2026-11-08). From the builds showrunner (not the user), 2026-11-06: "add-on 1: next. Fold it into the F020 per-folder phases (one owner switches all callers of each module; name each folder owner in also-touches). After Phases 26 and 27."
 - **Completion:** each folder uses `from scripts.x import y` and keeps a repo-root path line only in a module that runs by path. Each phase's notice names the folder owner in also-touches. No module loads under two names.
 - **Source phase:** 33 (simplify F019, F020, F021).
 
@@ -20,3 +20,10 @@
 - **Need:** add `target_directory` (absolute) to the launch result. The buildlog side is done: `record.transcript_target_folder` (`scripts/buildlog/record.py:120`) uses an absolute `target_directory` first, else `binary_path` with `profile`. Launches without either record `unresolved`.
 - **Completion:** A bevy_brp launch result contains an absolute `target_directory` in its metadata, and the indexed launch records that exact value.
 - **Source phase:** 11 (simplify item 24).
+
+## One full rebuild of the test-time index has a measured memory cost
+- **Starts when:** Phase 34 is done. From the builds showrunner (not the user), 2026-11-06: "add a next item to your plan. Measure the memory of one full rebuild of the test-time index (scripts/buildlog/index.py) at live scale (about 2.2 GB). Use a private disk root. Record peak RSS, page size, spill settings and report latency during spill. Source: natest Phase 71 measured only an ordinary refresh. Start it after P34."
+- **Target:** `scripts/buildlog/index.py` (the full rebuild).
+- **Need:** natest Phase 71 measured only an ordinary refresh, so the memory cost of a full rebuild at live scale is not known.
+- **Completion:** one full rebuild at about 2.2 GB runs on a private disk root. The result records peak RSS, page size, spill settings and report latency during spill.
+- **Source phase:** natest Phase 71.
