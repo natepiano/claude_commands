@@ -1885,3 +1885,13 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - earlyoom stopped hana `b2f5eb9641`'s gate nextest at 11:19:14, 11:19:28 and 11:19:51 UTC on 2026-11-08, with about 1.2 GiB available and no free swap. hana's nextest stayed inside its claim (8.6 GiB anonymous peak against 12.1 GiB).
 - A herdr merge gate that ran at the same time had a 4 GiB claim and a 26.4 GiB anonymous peak. Its first attempts of `test_verify_mac_memory_handoff.py` (27.0 GiB) and `test_verify_mac_local_release.py` (9.4 GiB) ran away; their retries passed at about 250 MiB. The builds slice also held up to 27 GiB of shmem that no reservation counts.
 - Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.
+
+### Phase 84 — Admission counts tmpfs memory in the builds slice  · status: done
+**Approved:** builds showrunner, 2026-11-08 ("Phase 84: admission counts tmpfs memory ... Add the slice's memory.stat shmem to the used memory that admission reads, with a test row that fails without it.").
+
+#### As-built
+- Memory admission counts swap-backed memory as used memory. `slice_working_set()` in `scripts/lint/memory_admit.py` reads `memory.stat` `anon + shmem`; `process_memory` reads `/proc/<pid>/status` `RssAnon + RssShmem`. A missing or negative field makes the reading unavailable ("swap-backed memory unavailable").
+- `buildlog_sample_anon` in `scripts/lint/invoke.sh` records `anon + shmem` for the peak, the phase peak and the near-peak, so a step's measured need has the same basis.
+- A registered CI scope's reading enters the cap once: `unowned_slice_memory` and the service's unowned path subtract each registered scope's whole reading and leave its pids out of the process subtraction (`owned_scope_roots`).
+- `AnonymousRunUse` and `ProcessAnonymousUse` (`scripts/build_queue/admission_records.py`) keep their names: `snapshot_codec` uses the class name as the record kind, so a rename breaks saved snapshots and protocol replies. `sum_anonymous_use` is now `sum_swap_backed_use`.
+- Rows: 1 GiB anon + 27 GiB shmem reads 28 GiB; CI shmem counted once; a process with RssShmem. `docs/as-built/build-memory-admission.md` states the basis.

@@ -111,7 +111,7 @@ def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
                             if isinstance(run.use, gate.RunUseUnavailable))
         calculation = "Cap unavailable"
         if missing:
-            calculation += f": anonymous use unavailable for {missing}"
+            calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
     ci = f" (CI keep-aside {gib(room.ci_keep_aside.bytes)})" if room.ci_keep_aside.bytes > 0 else ""
     text = (f"{calculation} "
@@ -132,8 +132,9 @@ def room_check_text(check: gate.RoomCheck) -> str:
 
 
 def keep_aside_text(run: gate.RunKeepAside) -> str:
-    use = gib(run.memory.use.bytes) if isinstance(run.memory.use, gate.AnonymousRunUse) else "unavailable: " + run.memory.use.reason
-    return (f"need {gib(run.memory.need)}; anonymous use {use}; held slot {gib(run.memory.held)}; "
+    use = (f"anonymous use {gib(run.memory.use.bytes)}" if isinstance(run.memory.use, gate.AnonymousRunUse)
+           else f"swap-backed use unavailable: {run.memory.use.reason}")
+    return (f"need {gib(run.memory.need)}; {use}; held slot {gib(run.memory.held)}; "
             f"kept aside {gib(run.bytes)}")
 
 
