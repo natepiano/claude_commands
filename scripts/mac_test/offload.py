@@ -1105,6 +1105,23 @@ def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
 
 
+@dataclass(frozen=True)
+class FailedProbe:
+    """The target's last completed probe failed."""
+
+
+@dataclass(frozen=True)
+class NoFailedProbe:
+    """The target has no failed probe record."""
+
+
+FailedProbeState = FailedProbe | NoFailedProbe
+
+
+def read_failed_probe(target: str = "mac") -> FailedProbeState:
+    return FailedProbe() if (state_directory(target) / "failed_probe").exists() else NoFailedProbe()
+
+
 def read_backoff(now: float, target: str = "mac") -> BackoffState:
     path = backoff_path(target)
     try:
@@ -1357,6 +1374,12 @@ def linux_version_decline_path(target: str, repository_name: str) -> Path:
     return state_directory(target) / f"version-decline-{repository_name}"
 
 
+def write_version_decline(target: str, repository_name: str) -> None:
+    path = linux_version_decline_path(target, repository_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(str(time.time()), encoding="utf-8")
+
+
 def linux_version_declined_recently(target: str, repository_name: str, hold_s: float, now: float) -> bool:
     """Read whether this repository has a decline within the hold duration."""
     try:
@@ -1417,7 +1440,19 @@ def probe_mac(
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
+    *, record_version_decline: bool = True,
 ) -> ProbeResult:
+    mark = state_directory(target) / "failed_probe"
+
+    def failed() -> UnavailableProbe:
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        _ = mark.write_text("failed\n", encoding="utf-8")
+        return UNAVAILABLE_PROBE
+
+    def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
+        mark.unlink(missing_ok=True)
+        return probe
+
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform)
     if linux:
         from scripts.mac_test import linux_runner
@@ -1426,7 +1461,7 @@ def probe_mac(
         if isinstance(probe_reachability(controller, config), UnreachableHost):
             print(f"mac_test: could not reach {target}: SSH reachability check failed",
                   file=sys.stderr, flush=True)
-            return UNAVAILABLE_PROBE
+            return failed()
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
         script = probe_script(repository, target, slot)
@@ -1448,16 +1483,17 @@ def probe_mac(
     elif isinstance(result, CommandCouldNotStart):
         reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
     elif result.status != 0:
-        reason = " ".join(result.stderr.split()) or f"SSH probe exited with status {result.status}"
+        reason = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                      f"SSH probe exited with status {result.status}")
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if not linux:
-                return probe
+                return succeeded(probe)
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
             if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
-                return probe
+                return succeeded(probe)
             from scripts.mac_test import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
                       {"nextest": expected["nextest"], "mend": expected["mend"]},
@@ -1465,12 +1501,14 @@ def probe_mac(
                       if not isinstance(expected, UnavailableToolParity) else "")
             if detail:
                 print(detail, file=sys.stderr, flush=True)
+                if record_version_decline:
+                    write_version_decline(target, repository.name)
                 return UnavailableProbe(detail)
             print(f"mac_test: {target} is not ready: public tools or tracked scripts differ", file=sys.stderr)
-            return UNAVAILABLE_PROBE
+            return failed()
         reason = "the probe answer could not be read"
     print(f"mac_test: could not reach the {'Mac' if target in ('', 'mac') else target}: {reason}", file=sys.stderr, flush=True)
-    return UNAVAILABLE_PROBE
+    return failed()
 
 
 @dataclass(frozen=True)
@@ -2099,12 +2137,15 @@ def claimed_run(
             if isinstance(remote_status, InterruptedTargetStatus):
                 return InterruptedTargetRun(remote_status.generation, elapsed_seconds(started))
             if isinstance(remote_status, ToolVersionMismatch):
+                write_version_decline(request.target, repository.name)
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
             if linux and isinstance(remote_status, UnresolvedSlotStartup):
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
                       else "runner sent no final status")
             return LostMacRun(elapsed_seconds(started), detail)
+        if not linux:
+            linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
@@ -2268,8 +2309,7 @@ def run_offload(
         detail = recorded_linux_version_mismatch(controller, config, request.target)
         decline_path = linux_version_decline_path(request.target, repository.name)
         if detail:
-            decline_path.parent.mkdir(parents=True, exist_ok=True)
-            _ = decline_path.write_text(str(time.time()))
+            write_version_decline(request.target, repository.name)
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):

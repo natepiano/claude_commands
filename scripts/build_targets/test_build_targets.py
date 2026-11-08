@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import subprocess
+import tempfile
 import time
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -57,10 +58,13 @@ def pacific_zone() -> Generator[None, None, None]:
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
-    def test_clean_target_import_loads_mac_test_once(self) -> None:
+    def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        environment.update({"HOME": directory, "BUILDLOG_DIR": directory})
         result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
             "import sys; from scripts.build_targets import build_targets; "
+            + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
             + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
             + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
             + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,

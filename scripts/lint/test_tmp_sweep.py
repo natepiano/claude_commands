@@ -49,6 +49,20 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
+class ImportTests(unittest.TestCase):
+    def test_tmp_sweep_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.production.session_staff", "scripts.production.staff")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.lint import tmp_sweep; "
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 def write(path: Path, text: str = "x" * 4096) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text(text)
@@ -97,6 +111,7 @@ class TmpSweepCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(base)}))
         _ = (base / "staff.json").write_text('{"schema": 2, "rows": []}')
         self.enterContext(isolated_staff_file(base / "staff.json", {"CODEX_HOME": str(base / "codex")}))
         self.tmp = base / "claude"

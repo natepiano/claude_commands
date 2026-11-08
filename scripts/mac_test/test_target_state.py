@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from ..build_hold import build_hold
     from ..buildlog import record, store
     from ..lib import conf
+    from ..message import sessions
     from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
     from scripts.mac_test import mac_test, offload
@@ -41,6 +42,7 @@ else:
     from scripts.buildlog import record
     from scripts.buildlog import store
     from scripts.lib import conf
+    from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
@@ -120,7 +122,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
-        _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
+        _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "send_message", return_value=True))

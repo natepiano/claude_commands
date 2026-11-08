@@ -16,8 +16,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
 from scripts.production import staff, unit_move, unit_names
@@ -57,10 +55,16 @@ class DocBranchMove:
 
 
 @dataclass(frozen=True)
+class UnitBranchMove:
+    old_branch: str
+    branch: str
+
+
+@dataclass(frozen=True)
 class RenamePlan:
     member: staff.StaffRow
     name: str
-    move: KeepDocBranch | DocBranchMove
+    move: KeepDocBranch | DocBranchMove | UnitBranchMove
 
 
 def _member(old: str, new: str, record: staff.StaffSnapshot) -> staff.StaffRow:
@@ -109,20 +113,40 @@ def _saved_move(fields: dict[str, object]) -> DocBranchMove:
                          staged_blob)
 
 
+def _check_branch(checkout: Path, target: str) -> str:
+    _ = unit_move.git(checkout, "check-ref-format", "--branch", target)
+    branch = unit_move.git(checkout, "branch", "--show-current")
+    if not branch:
+        raise RenameRefused(f"{checkout}: the checkout has no current branch")
+    if branch != target and unit_move.branch_tip(checkout, target):
+        raise RenameRefused(f"branch already exists: {target}")
+    return branch
+
+
 def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> RenamePlan:
     """Read the row and any explicit move without changing files."""
-    if bool(to_doc) != bool(to_branch):
-        raise RenameRefused("--to-doc and --to-branch are required together")
     record = staff.snapshot()
     row = _member(old, new, record)
-    if row.kind != "showrunner" and (row.kind != "unit" or to_doc):
+    if row.kind not in {"showrunner", "unit"}:
         raise staff.StaffRefused(f"{old}: the staff row is a {row.kind}, not a showrunner")
     if row.kind == "unit":
+        if to_doc:
+            raise RenameRefused("--to-doc is only for showrunners; the staff row is a unit, not a showrunner")
         name = unit_names.name(new)
-        if (row.name != name and not isinstance(row.worktree, staff.WorktreeUnfilled)
+        if ((row.name != name or to_branch) and not isinstance(row.worktree, staff.WorktreeUnfilled)
                 and row.worktree.machine != remote.local_machine()):
             raise ValueError(f"{old}: run rename on {row.worktree.machine}")
+        if to_branch:
+            if isinstance(row.worktree, staff.WorktreeUnfilled):
+                raise RenameRefused(f"{old}: no unit worktree")
+            checkout = row.worktree.path.expanduser().resolve()
+            pending = unit_move.pending_move(row.id)
+            if not checkout.exists() and isinstance(pending, (unit_move.FolderMove, unit_move.PendingRename)):
+                checkout = pending.destination
+            return RenamePlan(row, name, UnitBranchMove(_check_branch(checkout, to_branch), to_branch))
         return RenamePlan(row, name, KeepDocBranch())
+    if bool(to_doc) != bool(to_branch):
+        raise RenameRefused("--to-doc and --to-branch are required together")
     staff.validate_name(row.kind, new)
     if any(other.id != row.id and other.name == new
            for other in record.find(kind="showrunner")):
@@ -152,14 +176,9 @@ def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> Rename
             raise RenameRefused(f"{journal}: another document move is incomplete")
     checkout = Path(unit_move.git(doc.path.parent, "rev-parse", "--show-toplevel"))
     _ = destination.relative_to(checkout)
-    _ = unit_move.git(checkout, "check-ref-format", "--branch", to_branch)
-    branch = unit_move.git(checkout, "branch", "--show-current")
-    if not branch:
-        raise RenameRefused(f"{checkout}: the checkout has no current branch")
+    branch = _check_branch(checkout, to_branch)
     if doc.path != destination and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
-    if branch != to_branch and unit_move.branch_tip(checkout, to_branch):
-        raise RenameRefused(f"branch already exists: {to_branch}")
     if doc.path == destination and branch == to_branch:
         return RenamePlan(row, new, KeepDocBranch())
     entry = unit_move.git(checkout, "ls-files", "-s", "--", str(doc.path.relative_to(checkout)))
@@ -227,13 +246,11 @@ def _move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
 
 
 def _move_branch(move: DocBranchMove) -> bool:
-    branch = unit_move.git(move.checkout, "branch", "--show-current")
+    branch = _check_branch(move.checkout, move.branch)
     if branch == move.branch:
         return False
     if branch != move.old_branch:
         raise RenameRefused(f"{move.checkout}: the current branch changed during the move")
-    if unit_move.branch_tip(move.checkout, move.branch):
-        raise RenameRefused(f"branch already exists: {move.branch}")
     _ = unit_move.git(move.checkout, "branch", "-m", move.branch)
     return True
 
@@ -290,6 +307,8 @@ def _describe(request: RenamePlan) -> list[str]:
         lines.extend([f"Journal the move at {production_journal(request.member.id)}",
                       f"Move document {request.move.source} -> {request.move.destination}; then set the staff document",
                       f"Rename branch {request.move.old_branch} -> {request.move.branch}"])
+    elif isinstance(request.move, UnitBranchMove):
+        lines.append(f"Rename branch {request.move.old_branch} -> {request.move.branch}")
     return lines
 
 
@@ -335,8 +354,14 @@ def _apply_unit(request: RenamePlan) -> RenamePlan:
         if (row := staff.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
+        branch_move = isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch
         pending = unit_move.pending_move(row.id)
-        if isinstance(pending, unit_move.FolderMove) and changed:
+        if (isinstance(request.move, UnitBranchMove)
+                and isinstance(pending, (unit_move.FolderMove, unit_move.PendingRename))
+                and pending.branch != request.move.branch):
+            pending_branch = pending.branch if isinstance(pending.branch, str) else pending.branch.value
+            raise ValueError(f"{row.name}: finish the pending move to branch {pending_branch}")
+        if isinstance(pending, unit_move.FolderMove) and (changed or branch_move):
             if not unit_move.move_folder(row.id, pending.destination, branch=pending.branch):
                 print("unchanged")
                 return request
@@ -346,18 +371,19 @@ def _apply_unit(request: RenamePlan) -> RenamePlan:
         movement = pending
         if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
             raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
-        if isinstance(pending, unit_move.NoPendingMove) and changed:
+        if isinstance(pending, unit_move.NoPendingMove) and (changed or branch_move):
             if isinstance(row.worktree, staff.WorktreeUnfilled):
                 print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
             else:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name)
+                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
                 destination = folder.with_name(target) if target is not None else folder
                 checkout = folder if folder.exists() else destination
                 branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
-                renamed_branch = unit_names.swap_stem(branch, row.name, request.name)
+                renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
+                                  unit_names.swap_stem(branch, row.name, request.name))
                 if target is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if renamed_branch is None:

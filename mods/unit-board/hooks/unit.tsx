@@ -1,7 +1,7 @@
 import type { RenderElement } from 'claude-code';
 import type { PaneElements } from './board';
 import type { Tone } from './geometry';
-import type { BoardData, BoardPhase, BoardUnit } from '../types/board';
+import type { BoardData, BoardPhase, BoardUnit, WorkerRun } from '../types/board';
 import { cellWidth, duration, fitText, runsOf, signedMinutes, stripCells, wrappedLines } from './geometry';
 import { etaText, finishText, gateText, RulerView } from './board';
 
@@ -31,6 +31,22 @@ function earlierIds(phases: readonly BoardPhase[]): string {
 
 function padCells(text: string, width: number): string {
   return text + ' '.repeat(Math.max(0, width - cellWidth(text)));
+}
+
+function runText(run: WorkerRun, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - run.started_at) / 60);
+  const age = minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`;
+  const growth = run.growth;
+  let rates: string;
+  if (growth.kind === 'finished') rates = `exit ${growth.exit_code}`;
+  else if (growth.kind === 'first_reading') rates = 'cpu …  log …';
+  else {
+    const bytes = growth.log_bytes_per_minute;
+    const log = bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB`
+      : bytes >= 1_000 ? `${(bytes / 1_000).toFixed(1)} KB` : `${Math.round(bytes)} B`;
+    rates = `cpu ${Math.round(growth.cpu_percent)}%  log +${log}/min`;
+  }
+  return `${run.label}  ${age}  ${rates}  ${run.last_line}`;
 }
 
 export function UnitView(elements: PaneElements, columns: number, bodyRows: number, data: BoardData, unit: BoardUnit, now: number, back: () => void) {
@@ -91,7 +107,7 @@ export function UnitView(elements: PaneElements, columns: number, bodyRows: numb
       });
     }
     const workers: UnitRow[] = unit.workers.length ? [row(<Text bold>Workers</Text>, 'heading'), ...unit.workers.map(worker => row(
-      <Text wrap="truncate-end"><Text>{padCells(worker.slot, slotWidth)}</Text><Text bold>{padCells(worker.role || worker.slot, roleWidth)}</Text>{fact(padCells(worker.state, stateWidth), worker.state === 'running' ? 'suggestion' : worker.state === 'paused' ? 'warning' : 'default')}{worker.doing}</Text>, 'worker'))] : [];
+      <Text wrap="truncate-end"><Text>{padCells(worker.slot, slotWidth)}</Text><Text bold>{padCells(worker.role || worker.slot, roleWidth)}</Text>{fact(padCells(worker.state, stateWidth), ['working', 'waiting on run', 'running'].includes(worker.state) ? 'suggestion' : worker.state === 'run gone' ? 'error' : ['result queued', 'paused'].includes(worker.state) ? 'warning' : 'default')}{worker.run ? fitText(runText(worker.run, now), Math.max(0, columns - slotWidth - roleWidth - stateWidth)) : worker.doing}</Text>, 'worker'))] : [];
     const record = [row(<Text bold>Phase record</Text>, 'heading')];
     if (!unit.phases.length) record.push(row(<Text color="inactive">no phases recorded</Text>, 'phase'));
     if (hiddenFuture.size) record.push(row(<Text color="inactive" wrap="truncate-end">+{hiddenFuture.size} later</Text>, 'fold'));
