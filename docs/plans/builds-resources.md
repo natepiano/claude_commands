@@ -1887,31 +1887,11 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.
 
 ### Phase 84 — Admission counts tmpfs memory in the builds slice  · status: done
-**Depends on:** none. Merge `origin/builds` first.
-
 **Approved:** builds showrunner, 2026-11-08 ("Phase 84: admission counts tmpfs memory ... Add the slice's memory.stat shmem to the used memory that admission reads, with a test row that fails without it.").
 
-#### Work Order
-
-**Goal:** memory admission counts the builds slice's shared memory (tmpfs, `memory.stat` `shmem`) as used memory, so it holds work back when tmpfs files fill the slice.
-
-**Measured (Phase 83 report, 2026-11-08):** at 11:19 UTC the builds slice held up to 27.5 GiB of shmem next to 15.4 GiB of anonymous memory, with a 44 GiB limit. earlyoom then killed hana's gate nextest. The slice reader `slice_working_set()` in `scripts/lint/memory_admit.py` reads `anon` from `memory.stat` as the run use, and no reservation accounts for shmem.
-
-**Spec:**
-1. Find each place where admission reads the slice's used memory from `anon` only. Add the slice's `memory.stat` `shmem` to that used memory. Do not count shmem twice where a reading (for example `memory.current` less `inactive_file`) already holds it.
-2. A missing or unreadable `shmem` field gives the same unavailable result that a missing `anon` field gives now.
-3. Add a row to the existing slice-reader test that fails without the change: a slice with large shmem and small anon reads as the sum.
-4. Update the as-built doc for the changed reading.
-
-**Files:**
-- `scripts/lint/memory_admit.py` — the slice reading.
-- `scripts/lint/test_memory_admit.py` — the test row.
-- `docs/as-built/build-memory-admission.md` — the changed reading.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `scripts/lint/memory_admit.py` and the as-built doc, and runs the final suites.
-- `test` owns `scripts/lint/test_memory_admit.py`.
-
-**Acceptance gate:**
-- The new test row fails without the change and passes with it.
-- `scripts/lint/test_memory_admit.py` passes. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+#### As-built
+- Memory admission counts swap-backed memory as used memory. `slice_working_set()` in `scripts/lint/memory_admit.py` reads `memory.stat` `anon + shmem`; `process_memory` reads `/proc/<pid>/status` `RssAnon + RssShmem`. A missing or negative field makes the reading unavailable ("swap-backed memory unavailable").
+- `buildlog_sample_anon` in `scripts/lint/invoke.sh` records `anon + shmem` for the peak, the phase peak and the near-peak, so a step's measured need has the same basis.
+- A registered CI scope's reading enters the cap once: `unowned_slice_memory` and the service's unowned path subtract each registered scope's whole reading and leave its pids out of the process subtraction (`owned_scope_roots`).
+- `AnonymousRunUse` and `ProcessAnonymousUse` (`scripts/build_queue/admission_records.py`) keep their names: `snapshot_codec` uses the class name as the record kind, so a rename breaks saved snapshots and protocol replies. `sum_anonymous_use` is now `sum_swap_backed_use`.
+- Rows: 1 GiB anon + 27 GiB shmem reads 28 GiB; CI shmem counted once; a process with RssShmem. `docs/as-built/build-memory-admission.md` states the basis.
