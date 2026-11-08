@@ -369,8 +369,11 @@ The ledger stores fixed staff references, access policy, ownership, and events.
 Staff supplies current names, parents, worktrees, and backend identities.
 A rename or transfer preserves those fixed references.
 `rename.py` changes the unit row and repairs its session and display names.
-An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
-See [unit rename](unit-rename.md) for explicit worktree moves.
+A changed unit name changes matching folder and branch suffixes.
+`--to-branch <name>` sets an explicit branch.
+Every unit branch change pushes the target to origin before sessions resume.
+Equal old and new unit names keep the folder and staff name.
+See [production rename](production-rename.md) for unit branch moves.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
