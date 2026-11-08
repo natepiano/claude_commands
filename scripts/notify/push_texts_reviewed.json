@@ -1170,36 +1170,26 @@
       "time": "2026-10-23T09:50:57.721466-04:00"
     }
   },
-  "vault.stopped": {
-    "branch": {
+  "sweep.disk_floor": {
+    "available": {
       "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:21.935422-04:00"
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:44.139656-05:00"
     },
-    "command": {
+    "insufficient": {
       "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:54.834725-04:00"
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:55.296319-05:00"
     },
-    "diverged": {
+    "protected": {
       "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:29.417975-04:00"
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:33:00.403543-05:00"
     },
-    "tracked_changes": {
+    "unavailable": {
       "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:15.140122-04:00"
-    },
-    "unreachable": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:47.624690-04:00"
-    },
-    "untracked": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:38.396991-04:00"
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:50.001653-05:00"
     }
   }
 }

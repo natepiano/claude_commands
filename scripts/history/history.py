@@ -39,7 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.intervals import union_seconds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -662,22 +662,11 @@ def _elapsed_union(rows: list[StageRow]) -> float:
     Summing stage seconds counts parallel agents twice: 45 of 48 runs overlap
     another run, and the sum reads 1.7x the clock time the work occupied.
     """
-    spans = sorted(
+    return union_seconds(
         (row["started_at"], row["started_at"] + row["seconds"])
         for row in rows
         if row["started_at"] > 0
     )
-    if not spans:
-        return 0.0
-    union = 0.0
-    start, end = spans[0]
-    for begin, finish in spans[1:]:
-        if begin > end:
-            union += end - start
-            start, end = begin, finish
-        elif finish > end:
-            end = finish
-    return union + (end - start)
 
 
 def _warn(tally: dict[str, int]) -> None:

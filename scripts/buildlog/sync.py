@@ -25,12 +25,9 @@ from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import store
 
-import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 from scripts.build_targets.target_config import SshTarget, read_targets
 from scripts.lib import conf
 

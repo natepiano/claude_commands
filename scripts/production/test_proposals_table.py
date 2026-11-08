@@ -12,9 +12,7 @@ from typing import final, override
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import issues
 from scripts.production import proposals_folder

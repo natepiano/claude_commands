@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
@@ -19,7 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import fields
 import io
 from pathlib import Path
-from typing import cast, final, override
+from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
@@ -766,7 +765,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.sync_fixture()
         result = self.command(separate_stderr=True)
         self.assert_declined(result, "unreachable")
-        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: ssh: connection refused host mac is unavailable\n")
+        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: host mac is unavailable\n")
         self.assertEqual(self.events_for("rsync"), [])
         self.assertTrue((self.state_directory / "unreachable_until").exists())
 

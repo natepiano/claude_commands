@@ -7,16 +7,13 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Generator, Sequence
-from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast, override
+from typing import ParamSpec, TypeVar, cast, override
 from unittest import mock
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def write_idle_config(directory: Path, overrides: str = "") -> Path:
@@ -31,7 +28,7 @@ def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> 
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "alert.json"
     _ = path.write_text(json.dumps({
-        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600,
+        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600, "changed": now - 600,
         "waiting": 7, "cause": "blocked", "holder": "research", "detail": "P15 F11 L0 run",
         "until": 0, "messaged": True, "pushed": False,
     }))
@@ -86,14 +83,9 @@ class NotificationGuardedTestCase(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=guarded_transport(subprocess.Popen)))
 
 
-if TYPE_CHECKING:
-    from ..message import send, sessions
-    from ..lib import process_start
-    from ..production import staff
-else:
-    from scripts.message import send, sessions
-    from scripts.lib import process_start
-    from scripts.production import staff
+from scripts.message import send, sessions
+from scripts.lib import process_start
+from scripts.production import staff
 
 
 def no_checkpoint() -> None:

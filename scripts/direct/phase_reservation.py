@@ -61,14 +61,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import recorder_state  # noqa: E402
 
 PHASES_DIR = "phases"
@@ -739,6 +736,9 @@ def missing_record_phases(phases: list[OpenPhase], scopes: list[str], root: Path
 
 
 def _repair_refused(session_dir: Path, phase: str, root: Path, reason: str) -> int:
+    if _string(read_state(phase_directory(session_dir, phase)).get("kind")) in HOLDS_RESERVATION:
+        print(f"phase reservation: {reason}; record unchanged", file=sys.stderr)
+        return 2
     print(f"phase reservation: {reason}; open the phase again:", file=sys.stderr)
     script = str(Path(__file__).resolve())
     arguments = ["--session-dir", str(session_dir), "--phase", phase]
@@ -767,7 +767,8 @@ def _repair_command(args: argparse.Namespace) -> int:
         return 2
     state = read_state(directory)
     recorded = _recorded(state)
-    if recorded and lifecycle(root, recorded) == ACTIVE:
+    recorded_status = lifecycle(root, recorded) if recorded else ""
+    if recorded and recorded_status == ACTIVE:
         print(f"phase reservation: Active, reservation {recorded} is active on the board; record unchanged")
         return 0
     if _string(state.get("kind")) == PENDING:
@@ -779,7 +780,21 @@ def _repair_command(args: argparse.Namespace) -> int:
     if mapped is None and session_id and all(each.directory == directory for each in open_phases(session_dir)):
         source = session_id
         mapped = session_reservation(root, source)
-    if mapped is None or lifecycle(root, mapped[0]) != ACTIVE:
+    mapped_status = lifecycle(root, mapped[0]) if mapped is not None else ""
+    if mapped is not None and not mapped_status:
+        return _repair_refused(session_dir, phase, root, "mapped reservation board is unreadable")
+    if mapped is None or mapped_status != ACTIVE:
+        if recorded and recorded_status in CHECKPOINT_RELEASED:
+            line = (f"{datetime.now(timezone.utc).isoformat()} phase={phase} reservation_id={recorded} "
+                    + f"board_status={recorded_status} state={AWAITING_FIRST_TOUCH}")
+            with (directory / REPAIRS_FILE).open("a", encoding="utf-8") as log:
+                _ = log.write(line + "\n")
+            if _post_repair(session_dir, line, record_changed=False):
+                return 1
+            _write_state(directory, {"kind": AWAITING_FIRST_TOUCH, "phase": phase})
+            print(shlex.join(["python3", str(Path(__file__).resolve()), "claim", "--session-dir", str(session_dir),
+                              "--phase", phase, "--repo", str(root)]))
+            return 0
         return _repair_refused(session_dir, phase, root, "no live mapped reservation")
     try:
         baseline = (directory / BASELINE_FILE).read_text(encoding="utf-8").strip()
@@ -798,7 +813,7 @@ def _repair_command(args: argparse.Namespace) -> int:
     return _post_repair(session_dir, line)
 
 
-def _post_repair(session_dir: Path, line: str) -> int:
+def _post_repair(session_dir: Path, line: str, *, record_changed: bool = True) -> int:
     try:
         result = subprocess.run(["bash", str(Path(__file__).with_name("board.sh")), "post", str(session_dir),
                                  "director", "status", line], check=False, stdin=subprocess.DEVNULL,
@@ -809,7 +824,8 @@ def _post_repair(session_dir: Path, line: str) -> int:
         if result.returncode == 0:
             return 0
         detail = result.stderr.strip() or f"exit {result.returncode}"
-    print(f"phase reservation: record repaired and logged, but board post failed: {detail}", file=sys.stderr)
+    state = "record repaired and logged, but board post failed" if record_changed else "board post failed; record unchanged"
+    print(f"phase reservation: {state}: {detail}", file=sys.stderr)
     return 1
 
 
@@ -889,7 +905,12 @@ def _claim_command(args: argparse.Namespace) -> int:
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
-    root = repository_root(Path(cast(str, args.repo)))
+    requested = Path(cast(str, args.repo))
+    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+        recorded = phase_worktree(directory).root
+        if recorded.is_dir():
+            requested = recorded
+    root = repository_root(requested)
     if root is None:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0

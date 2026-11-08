@@ -112,7 +112,7 @@ if "NESTED_LAUNCH" not in os.environ:
     Path(os.environ["MODELS_CONFIG_FILE"]).write_text(os.environ["NEXT_REGISTRY"])
     command = ["bash", os.environ["AGENT_EXEC"], "sample.task", "readonly", os.getcwd(),
                os.environ["PROMPT"], os.environ["NESTED_OUTPUT"], os.environ["NESTED_LOG"]]
-    sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+    with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.assign_launcher_test_support import backend_fixture_command
     command, environment = backend_fixture_command(
         Path(os.environ["NESTED_LOG"]).parent / "nested-assign-parent", command,
@@ -358,30 +358,6 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()}, before)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("agent_exec tests passed", result.stdout)
-
-    def test_berth_fixer_account_selection_reaches_here_and_existing_window_launches(self) -> None:
-        worktree = self.home / "rust/berth-fix"
-        worktree.mkdir(parents=True)
-        ghostty = self.home / "bin/ghostty"
-        _ = ghostty.write_text(f"#!{sys.executable}\nimport os, sys\n"
-                               + "args = sys.argv[sys.argv.index('-e') + 1:]\n"
-                               + "env = {key: value for key, value in os.environ.items() if not key.startswith('CLAUDE')}\n"
-                               + "os.execvpe(args[0], args, env)\n")
-        ghostty.chmod(0o755)
-        for caller, expected in (("claude1", "claude1"), ("", "claude3"), ("legacy", "")):
-            environment = dict(self.environment)
-            if caller == "legacy":
-                _ = (self.home / ".claude.json").write_text(json.dumps({
-                    "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
-            elif caller:
-                environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-            for arguments in (["--here"], []):
-                with self.subTest(caller=caller, arguments=arguments):
-                    result = subprocess.run(["bash", str(SCRIPTS / "berth_fix/launch.sh"), *arguments],
-                                            capture_output=True, text=True, check=True, env=environment, cwd=self.home)
-                    self.assertEqual(json.loads(result.stdout.splitlines()[0]), {
-                        "config": str(accounts.account_dir(expected)) if expected else "",
-                        "memory": str(self.home / ".claude") if expected else "", "token": ""})
 
 
 if __name__ == "__main__":

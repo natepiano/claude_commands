@@ -13,7 +13,7 @@
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog sync pause <why>         pause Mac contact while hourly keeps running
   buildlog sync resume              resume Mac contact
-  buildlog vault                    fast-forward the Mac's hanadocs vault
+  buildlog vault                    sync the Mac's hanadocs vault
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
@@ -42,6 +42,7 @@ import time
 from datetime import date
 from pathlib import Path
 from typing import cast
+
 
 # Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
 SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
@@ -179,7 +180,8 @@ def schema() -> int:
 
 def day_report(args: list[str]) -> int:
     from scripts.buildlog import index
-    from scripts.buildlog import launches, report
+    from scripts.buildlog import launches
+    from scripts.buildlog import report
 
     day = args[0] if args else date.today().isoformat()
     try:
@@ -232,7 +234,8 @@ def hourly() -> int:
     from scripts.buildlog import index
     from scripts.buildlog import rust_release
     from scripts.buildlog import store
-    from scripts.buildlog import sync, vault_pull
+    from scripts.buildlog import sync
+    from scripts.buildlog import vault_pull
 
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
@@ -253,7 +256,6 @@ def hourly() -> int:
 
 def run_in_user_zone() -> None:
     """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     from scripts.lib.user_zone import user_zone_name
 
     os.environ["TZ"] = user_zone_name()
@@ -357,7 +359,8 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     if command == "sample":
-        from scripts.buildlog import sample, mac_idle
+        from scripts.buildlog import sample
+        from scripts.buildlog import mac_idle
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)

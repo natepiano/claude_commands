@@ -161,7 +161,6 @@ import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, __REPOSITORY__)
 from scripts.message import session_send
 from scripts.message import session_send_test_support
 
@@ -262,14 +261,15 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS"):
         _ = env.pop(key, None)
     env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
-                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1"})
-    args = ["discover", "-s", str(folder), "-p", "test_fixture.py"]
+                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": os.pathsep.join((str(root), str(folder)))})
+    args = [f"{name}.test_fixture"]
     standard = subprocess.run(
-        [sys.executable, "-m", "unittest", *args], cwd=root, env=env,
+        [str(RUNNER.parents[1] / "lib/py"), "-m", "unittest", *args], cwd=root, env=env,
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
     timed = subprocess.run(
-        [sys.executable, str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
+        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
         env={**env, "TEST_TIMES_OUT": str(output), "CHECK_REMOVED": "1"},
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
@@ -298,9 +298,9 @@ class ModuleRunnerTests(unittest.TestCase):
         env = {**os.environ, "TEST_TIMES_OUT": str(cls.discovery_output),
                "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1"}
-        _ = env.pop("PYTHONPATH", None)
+        env["PYTHONPATH"] = os.pathsep.join((str(root), str(folder)))
         cls.discovery_result = subprocess.run(
-            [sys.executable, str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
+            [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -310,7 +310,7 @@ class ModuleRunnerTests(unittest.TestCase):
             config = root / "config"
             config.mkdir()
             _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
-            source = SENDER_REQUEST.replace("__REPOSITORY__", repr(str(RUNNER.parents[2])))
+            source = SENDER_REQUEST
             return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
 
     def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
@@ -476,6 +476,31 @@ class FixtureCPU(unittest.TestCase):
                 self.assertEqual(fixture.timed.stdout, fixture.standard.stdout)
                 self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts" / "fixture"
+            folder.mkdir(parents=True)
+            _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
+            _ = (folder / "test_package_name.py").write_text(
+                "import sys, unittest\n"
+                + "from scripts.fixture import sibling\n"
+                + "class PackageImport(unittest.TestCase):\n"
+                + "    def test_package_name(self):\n"
+                + "        self.assertEqual(__name__, 'scripts.fixture.test_package_name')\n"
+                + "        self.assertNotIn('test_package_name', sys.modules)\n"
+                + "        self.assertEqual(sibling.VALUE, 42)\n", encoding="utf-8")
+            output = root / "times.json"
+            environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
+                           "TEST_TIMES_OUT": str(output)}
+            for working_directory in (root, folder, Path("/home")):
+                with self.subTest(case="package name", cwd=working_directory):
+                    result = subprocess.run(
+                        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_package_name.py"],
+                        cwd=working_directory, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual([row["test"] for row in read_times(output)["tests"]],
+                                     ["PackageImport.test_package_name"])
 
     def test_each_parent_has_one_outcome_with_error_precedence(self) -> None:
         rows = self.outcomes.times["tests"]
@@ -527,9 +552,9 @@ class FixtureCPU(unittest.TestCase):
             output.mkdir()
             env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            _ = env.pop("PYTHONPATH", None)
+            env["PYTHONPATH"] = str(root)
             result = subprocess.run(
-                [sys.executable, str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
+                [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -554,6 +579,7 @@ class InheritedSignal(unittest.TestCase):
                        "BUILDLOG_DIR": str(root / "buildlog")}
         for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
             _ = environment.pop(name, None)
+        environment["PYTHONPATH"] = str(root)
         launcher = ("import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
                     "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])")
         for arguments, status in (([], 2), ([str(root), "test_signal.py"], 0)):
@@ -575,7 +601,8 @@ class InheritedSignal(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1"})
         for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
             _ = environment.pop(name, None)
-        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_orphan.py"],
+        environment["PYTHONPATH"] = str(root)
+        process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)
         processes.track(process)

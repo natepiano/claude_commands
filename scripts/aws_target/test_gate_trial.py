@@ -81,6 +81,7 @@ class FakeAws:
         self.observed_states: list[str] = []
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
+        self.handler_thread: int = threading.get_ident()
         self.signal_handled: Callable[[], None] | None = None
         self.missing_log: bool = False
         self.query_timeout: bool = False
@@ -104,7 +105,7 @@ class FakeAws:
             with self.lock:
                 number, self.signal_number = self.signal_number, 0
             if number:
-                os.kill(os.getpid(), number)
+                signal.pthread_kill(self.handler_thread, number)
                 if self.signal_handled is not None:
                     self.signal_handled()
         if 'get-object' in args and self.before_result is not None:
@@ -397,8 +398,8 @@ class GateTrialTests(unittest.TestCase):
                 prices = trial.Prices(**command.attempts[0].prices)
                 lifetime = 30 * 60
                 uploads = lifetime // 15 * boots
-                self.assertEqual(command.puts, 1 + 2 * boots + uploads)
-                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (4 + uploads)
+                self.assertEqual(command.puts, 2 + 2 * boots + uploads)
+                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (5 + uploads)
                             + prices.get * (lifetime * 2 / command.option('poll_pause_s') + 100))
                 self.assertAlmostEqual(command.projection(prices, step), expected)
                 self.assertIn('while sleep 15; do', self.fake.payloads[-1])
@@ -500,6 +501,7 @@ class GateTrialTests(unittest.TestCase):
         self.assertLess(command.spent + command.s3_cost, 0.45)
 
     def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
+        main_thread = threading.get_ident()
         for number in trial.TRIAL_SIGNALS:
             with self.subTest(number=number):
                 self.fake = FakeAws(self.clock)
@@ -507,7 +509,8 @@ class GateTrialTests(unittest.TestCase):
                 def result(key: str) -> None:
                     _ = barrier.wait()
                     if key.startswith('8-'):
-                        os.kill(os.getpid(), number)
+                        # Wake the Python handler's thread instead of an unrelated helper thread.
+                        signal.pthread_kill(main_thread, number)
                     command = self.command
                     assert command is not None
                     with command.changed:
@@ -639,8 +642,9 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium', 'basedpyright'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
+        self.assertNotIn('#basedpyright', data)
         self.assertNotIn('#google-chrome', data)
         self.assertNotIn('#nodejs', data)
         self.assertNotIn('uv tool install', data)
@@ -651,14 +655,19 @@ class GateTrialTests(unittest.TestCase):
         for shell in ('bash', 'zsh'):
             link = f'ln -sf "$(command -v {shell})" /bin/{shell}'
             self.assertIn(link, data)
-            self.assertLess(data.index(link), data.index('exec python3 /var/lib/gate-trial/guest.py'))
+            self.assertLess(data.index(link), data.index('exec python3 "$box_dir/guest.py"'))
         self.assertIn('. /etc/profile', data)
         self.assertNotIn('systemctl', data)
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
-        self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
-        self.assertIn('machine=merge_gate.WholeMachine(timings)', data)
-        self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
+        self.assertIn('export PATH=$PATH:/run/current-system/sw/bin', data)
+        self.assertEqual(self.fake.bundles[-1].decode(), trial.GUEST)
+        self.assertIn('guest.py?X-Amz-', data)
+        self.assertIn('-o "$box_dir/guest.py"', data)
+        self.assertNotIn('base64 -d', data)
+        self.assertNotIn(trial.GUEST, data)
+        self.assertIn('machine=merge_gate.WholeMachine(timings)', trial.GUEST)
+        self.assertLess(data.index('trap boot_failed EXIT'), data.index('push_logs &'))
         self.assertNotIn('admission_service.py', data)
         self.assertNotIn('governor_gib', data)
         self.assertNotIn('RERUN_LIMIT', data)
@@ -1027,12 +1036,12 @@ class GuestTests(unittest.TestCase):
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
         url = prefix + 'a' * (400 - len(prefix))
         links = {'step': 'size', 'commit': 'a' * 40,
-                 **dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
+                 **dict.fromkeys(('source', 'guest', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
         data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         self.assertLessEqual(len(data.encode()), 16384)
 
     def tool_session(self) -> str:
-        links: dict[str, str] = dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
+        links: dict[str, str] = dict.fromkeys(('source', 'guest', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
         links['step'] = 'size'
         data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         return shlex.split(data[data.index('nix --extra-experimental-features'):])[-1]
@@ -1104,8 +1113,9 @@ class GuestTests(unittest.TestCase):
             mount = tools / 'mount'
             _ = mount.write_text('#!/bin/sh\ncp -a "$2"/. "$3"/\n')
             mount.chmod(0o700)
-            setup = self.tool_session().split('chown -R', 1)[0]
-            setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('/run/gate-trial-bin', str(root / 'profile'))
+            session = self.tool_session()
+            setup = session[session.index('ln -sf'):].split('chown -R', 1)[0]
+            setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('$box_dir/tool-profile', str(root / 'profile'))
             setup = setup.replace('/bin/bash', str(root / 'bash')).replace('/bin/zsh', str(root / 'zsh'))
             _ = subprocess.run(['bash', '-ec', setup], check=True, capture_output=True, text=True, timeout=10,
                 env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
@@ -1115,7 +1125,7 @@ class GuestTests(unittest.TestCase):
             self.assertEqual((system / 'python3').resolve(), Path(sys.executable).resolve())
             self.assertEqual((system / 'google-chrome').resolve(), (tools / 'chromium').resolve())
             session = self.tool_session()
-            self.assertLess(session.index('/run/gate-trial-bin/google-chrome'), session.index('mount --bind'))
+            self.assertLess(session.index('$box_dir/tool-profile/google-chrome'), session.index('mount --bind'))
 
     def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
         for present in (True, False):
@@ -1183,6 +1193,7 @@ class GuestTests(unittest.TestCase):
             shim = repo / 'scripts' / 'lib' / 'py'
             shim.parent.mkdir()
             shim.symlink_to(Path(__file__).resolve().parents[1] / 'lib' / 'py')
+            (shim.parent / 'package_root.py').symlink_to(Path(__file__).resolve().parents[1] / 'lib/package_root.py')
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result',
                      'module_seconds': 'https://fixture.invalid/module_seconds'}

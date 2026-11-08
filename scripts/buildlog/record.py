@@ -1200,8 +1200,7 @@ class AttemptResult:
 
 def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     """Read the latest repository slot results from host month files."""
-    if not TYPE_CHECKING:
-        from scripts.aws_target.config import MeasurementUnavailable
+    from scripts.aws_target.config import MeasurementUnavailable
 
     latest: dict[tuple[str, int], AttemptResult] = {}
     for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
@@ -1436,5 +1435,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    _ = sys.modules.setdefault("record", sys.modules[__name__])
+    _ = sys.modules.setdefault("scripts.buildlog.record", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

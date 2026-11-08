@@ -30,7 +30,7 @@ from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-from scripts.production import rename
+from scripts.shutdown import shutdown
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
@@ -39,7 +39,7 @@ from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-SCRIPT = Path(__file__).with_name("rename.py")
+SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
 
 
@@ -367,7 +367,6 @@ def interrupted_move(command, *args, **kwargs):
     return original_run(command, *args, **kwargs)
 subprocess.run = interrupted_move
 sys.argv = sys.argv[1:]
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
 
@@ -413,12 +412,12 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
 
         def main() -> int:
             if wrapper:
-                with mock.patch.object(sys, "argv", ["-c", str(rename.__file__), *arguments]):
+                with mock.patch.object(sys, "argv", ["-c", str(shutdown.__file__), *arguments]):
                     exec(compile(wrapper, "<rename failure injection>", "exec"), {"__name__": "__main__"})
                 return 0
-            return rename.main(arguments)
+            return shutdown.main(arguments)
 
-        return invoke_cli(rename, main, arguments, environment, cwd)
+        return invoke_cli(shutdown, main, arguments, environment, cwd)
 
 
 @contextmanager
@@ -631,13 +630,13 @@ class ProductionRenameFixture(StaffTestCase):
             "## Production rules", "", "History mentions old and stays unchanged.", "",
         ])
 
-    def run_rename(self, action: str, destination: str = NEW, *,
+    def run_rename(self, destination: str = NEW, *,
                    source: str = OLD) -> subprocess.CompletedProcess[str]:
         if process_boundary_for_case(self):
-            return subprocess.run([sys.executable, str(SCRIPT), action, source, destination],
+            return subprocess.run([sys.executable, str(SCRIPT), "rename", source, destination],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        return self.run_command(action, source, destination)
+        return self.run_command(source, destination)
 
     def assert_success(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -647,4 +646,4 @@ class ProductionRenameFixture(StaffTestCase):
                 for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
 
     def run_command(self, *arguments: str, wrapper: str = "", **environment: str) -> subprocess.CompletedProcess[str]:
-        return run_rename(list(arguments), {**self.env, **environment}, self.checkout, wrapper)
+        return run_rename(["rename", *arguments], {**self.env, **environment}, self.checkout, wrapper)
