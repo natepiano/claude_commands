@@ -203,12 +203,23 @@ class GateWorker:
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
 
     def reconcile(self) -> None:
-        """Close reservations after the expiry function confirms termination."""
+        """Resolve expired launches and observe known gate instances."""
         for reservation in self.book.read_snapshot().gate_reservations:
             if isinstance(reservation.state, ledger.GateRunning):
                 instance = reservation.state.instance_id
                 if self.api.observe(instance, int(self.clock())).state == 'terminated':
                     self.book.resolve_gate(reservation.attempt, ledger.GateTerminated(int(self.clock()), instance))
+            elif isinstance(reservation.state, ledger.GateLaunchPending) and reservation.expires <= int(self.clock()):
+                reply = self.api.call('describe-instances', '--filters', 'Name=tag:GateAttempt,Values=' + reservation.attempt)
+                instances = [instance for group in ledger.rows(reply, 'Reservations')
+                             for instance in ledger.rows(group, 'Instances')]
+                if not instances:
+                    self.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(self.clock())))
+                else:
+                    instance = ledger.text(instances[0], 'InstanceId')
+                    terminated = ledger.text(ledger.mapping(instances[0]['State']), 'Name') == 'terminated'
+                    self.book.resolve_gate(reservation.attempt,
+                        ledger.GateTerminated(int(self.clock()), instance) if terminated else ledger.GateRunning(instance))
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
                       result: Literal['launched', 'refused'], reason: str = '') -> None:
