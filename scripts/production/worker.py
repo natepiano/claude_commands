@@ -338,13 +338,15 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
                 return _delivery_failure(error)
             if isinstance(settled, herdr.ObservedAgentState):
                 current = replace(current, status=settled.status)
-        if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-            print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
-            return ExitCode.BUSY
-        try:
-            _agent_command(client, current, "prompt", line)
-        except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
-            return _delivery_failure(error)
+        receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
+        if isinstance(receipt, DispatchNotSubmitted):
+            if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+                print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
+                return ExitCode.BUSY
+            try:
+                _agent_command(client, current, "prompt", line)
+            except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+                return _delivery_failure(error)
     last_wait_was_quiet = False
     while True:
         record = staff.snapshot()
@@ -594,6 +596,8 @@ def restore(parent: StaffId) -> ExitCode:
         return ExitCode.OK
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
+            if isinstance(state, worker_panes.OpenWorker):
+                continue
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 outcome = ExitCode.UNCERTAIN
                 continue

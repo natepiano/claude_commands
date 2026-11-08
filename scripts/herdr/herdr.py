@@ -1903,16 +1903,6 @@ class Herdr:
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
 
-    def codex_client_session(self, pane: str) -> str:
-        """Read the current thread from the staff row named by the client's tab."""
-        try:
-            reference = self.pane_tab(pane)[2]["name"]
-            record = staff.initial_snapshot()
-        except (OSError, ValueError, HerdrFailure):
-            return ""
-        owner = record.by_member_reference(reference) or record.by_path(reference)
-        return owner.current_session if owner is not None else ""
-
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
@@ -1921,9 +1911,6 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        row = self.pane_row(pane)
-        reported = pane_session(row) if not isinstance(row, NoPane) and codex_without_session(info) else ""
-        thread = "" if reported else self.codex_client_session(pane)
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
@@ -1933,11 +1920,8 @@ class Herdr:
             pid = process.get("pid")
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
                 raise ValueError("Codex launch has no process id")
-            if thread:
-                session_id, started, environment = thread, _process_birth(pid), process_environment(pid)
-            else:
-                observed = native_process(pid, "codex", reported) if reported else native_process(pid, "codex")
-                session_id, started, environment = observed.identity.id, observed.started, observed.environment
+            observed = native_process(pid, "codex")
+            session_id, started, environment = observed.identity.id, observed.started, observed.environment
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
@@ -2445,6 +2429,19 @@ class Herdr:
         if isinstance(proof, SubmitStarts):
             arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
         _ = self.run(*arguments)
+
+    def quit_agent(self, pane: str, terminal: str, target: str, timeout: float) -> None:
+        """Quit the selected conversation and wait for its shell."""
+        deadline = time.monotonic() + timeout
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
+            raise HerdrFailure(f"{pane}: terminal changed before quit")
+        self.prompt(pane, "/quit", target=target)
+        while not isinstance(self.pane_activity(pane), PaneAtShell):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HerdrFailure(f"{pane}: agent did not return to its shell")
+            time.sleep(min(0.1, remaining))
 
     def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
@@ -3485,7 +3482,7 @@ def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProces
             try:
                 resume = codex_resume_thread(pid)
             except ValueError:
-                if not reported:
+                if not reported or _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH:
                     raise
                 identity = PaneSessionReport(reported)
             else:

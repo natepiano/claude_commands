@@ -889,7 +889,12 @@ def _claim_command(args: argparse.Namespace) -> int:
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
-    root = repository_root(Path(cast(str, args.repo)))
+    requested = Path(cast(str, args.repo))
+    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+        recorded = phase_worktree(directory).root
+        if recorded.is_dir():
+            requested = recorded
+    root = repository_root(requested)
     if root is None:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0

@@ -239,6 +239,33 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), original + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? first.txt\n")
 
+    def test_claim_uses_the_phase_copy_when_the_launch_folder_lacks_its_baseline(self) -> None:
+        phase_copy = self.first.parent / "phase-copy"
+        for command in (
+            ["git", "clone", "-q", str(self.first), str(phase_copy)],
+            ["git", "-C", str(phase_copy), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "-q", "--allow-empty", "-m", "phase copy baseline"],
+        ):
+            self.assertEqual(subprocess.run(command, check=True, capture_output=True,
+                                            timeout=TEST_HANG_GUARD_SECS).returncode, 0)
+        baseline = phase_reservation.commit_id(phase_copy, "HEAD")
+        with self.assertRaisesRegex(phase_reservation.StateRefused, "names no single commit"):
+            _ = phase_reservation.commit_id(self.first, baseline)
+        for phase, home in (("1", self.first), ("2", phase_copy)):
+            with self.subTest(home=home):
+                row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+                self.assertEqual(staff.set_worktree(row.id, staff.PresentWorktree("natedev", home),
+                                                   expected=row.worktree).worktree, staff.PresentWorktree("natedev", home))
+                self.assertEqual(self.claim(phase, phase_copy), (0, ""))
+                directory = phase_reservation.phase_directory(self.session, phase)
+                before = {name: (directory / name).read_bytes() for name in
+                          (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+                self.assertEqual(self.claim(phase, self.first), (0, ""))
+                self.assertEqual(phase_reservation.phase_worktree(directory), phase_reservation.KnownPhaseWorktree(phase_copy))
+                self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
+                self.assertEqual(phase_reservation.commit_id(
+                    phase_copy, (directory / phase_reservation.BASELINE_FILE).read_text().strip()), baseline)
+
     def test_claim_refuses_a_kept_baseline_missing_from_a_replacement_checkout(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.second), (0, ""))

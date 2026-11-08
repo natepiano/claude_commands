@@ -234,11 +234,24 @@ def _read_record(path: Path) -> RunRecord:
 
 
 def seat_name(session_dir: str, name: str) -> str:
-    """The roster's name for the worker `--to` names. A worker may call itself by its role, the last
-    part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
-    no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
-    such as a reviewer that registers after its run starts, stays as given."""
-    roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
+    """Resolve a pane slot through its pass, or a mesh role through its roster."""
+    run = Path(session_dir)
+    if unit_runs.worker_transport(run) == "herdr":
+        membership = staff.local_snapshot()
+        owner = worker_admission.parent(membership, run=run)
+        state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        passes = state.get("pass")
+        current = cast(dict[str, object], passes).get(name) if isinstance(passes, dict) else None
+        member = None
+        if isinstance(current, dict):
+            dispatch = cast(dict[str, object], current)
+            if dispatch.get("status") == "active":
+                name = str(dispatch.get("worker_name", "")) or name
+                member = membership.by_id(staff.StaffId(str(dispatch.get("worker_id", ""))))
+        if member is None:
+            member = worker_admission.find_worker(membership, owner.id, name)
+        return member.name if member is not None and member.kind == "worker" and member.reports_to(owner.id) else name
+    roster = worker_lifecycle.read_worker_state(run / codex_mesh.ROSTER_FILE)
     if name in roster:
         return name
     matches = [seat for seat in roster if seat.endswith(f"-{name}")]

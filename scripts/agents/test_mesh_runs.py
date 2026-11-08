@@ -27,6 +27,7 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_run_process, mesh_runs
 from scripts.buildlog import treekey
+from scripts.direct import progress_history
 from scripts.astra import design_roles
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -57,6 +58,23 @@ class DirectorNotice(NamedTuple):
     session_id: str
     summary: str
     text: str
+
+
+def private_supervisor(test: unittest.TestCase, path: Path) -> int:
+    """Keep a private supervisor alive until the test closes its input."""
+    guard = LauncherHangGuard("detached supervisor startup and cleanup")
+    stand_in = subprocess.Popen([sys.executable, "-c",
+                                 "import sys; print('ready', flush=True); sys.stdin.read()",
+                                 "mesh_runs.py", "supervise", str(path)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    test.addCleanup(lambda: stand_in.wait(timeout=guard.remaining()))
+    test.addCleanup(stand_in.kill)
+    assert stand_in.stdin is not None and stand_in.stdout is not None
+    test.addCleanup(stand_in.stdin.close)
+    test.addCleanup(stand_in.stdout.close)
+    test.assertTrue(select.select([stand_in.stdout], [], [], guard.remaining())[0], "supervisor did not start")
+    test.assertEqual(stand_in.stdout.readline(), "ready\n")
+    return stand_in.pid
 
 
 class MeshRunsTests(unittest.TestCase):
@@ -283,20 +301,7 @@ class MeshRunsTests(unittest.TestCase):
         command line names mesh_runs.py supervise and the record, unless pid names another process."""
         path = self.record(command)
         if not pid:
-            guard = LauncherHangGuard("detached supervisor startup and cleanup")
-            stand_in = subprocess.Popen([sys.executable, "-c",
-                                         "import sys; print('ready', flush=True); sys.stdin.read()",
-                                         "mesh_runs.py", "supervise", str(path)],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            self.addCleanup(lambda: stand_in.wait(timeout=guard.remaining()))
-            self.addCleanup(stand_in.kill)
-            assert stand_in.stdin is not None and stand_in.stdout is not None
-            self.addCleanup(stand_in.stdin.close)
-            self.addCleanup(stand_in.stdout.close)
-            # Wait for Python to start before the test reads the child's command line.
-            self.assertTrue(select.select([stand_in.stdout], [], [], guard.remaining())[0], "supervisor did not start")
-            self.assertEqual(stand_in.stdout.readline(), "ready\n")
-            pid = stand_in.pid
+            pid = private_supervisor(self, path)
         self.update_record(path, tree_key="key-1", pid=pid)
         return path
 
@@ -1115,6 +1120,50 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual((caller.session_dir, caller.name, caller.staff_id), (str(self.run_dir), row.name, row.id))
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
                     self.assertIsInstance(mesh_runs.caller_from_environment({variable: row.id}), mesh_runs.NotMeshWorker)
+
+    def test_run_started_for_a_pane_slot_stays_live_and_delivers_to_its_worker(self) -> None:
+        self.fixture.world.add(self.fixture.worker("test", family="codex"), "w1:p3", family="codex")
+        for name, pane in (("detached-command-owner", "w1:p1"), ("test2", "w1:p2")):
+            with self.subTest(name=name):
+                row = self.fixture.worker(name, family="codex")
+                self.fixture.world.add(row, pane, family="codex")
+                prompt = self.fixture.root / "assignment.txt"
+                write_text_atomic(prompt, "Run the private command.")
+                write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({
+                    "owner_staff_id": self.fixture.parent.id,
+                    "history_file": str(self.fixture.root / "history.jsonl"),
+                    "phase": {"id": "40", "instance_id": "private-phase", "status": "active"},
+                }))
+                dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="test", phase="40", role="test",
+                    worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
+                    kind="test", lens="")
+                runs = self.run_dir / codex_mesh.DETACHED_RUNS_DIR
+                before = set(runs.glob("*.json"))
+                input_count = len(self.inputs)
+                output = io.StringIO()
+                with (patch.object(treekey, "tree_key", return_value="private-tree"),
+                      patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)),
+                      contextlib.redirect_stdout(output)):
+                    code = mesh_runs.main(["start", "--session-dir", str(self.run_dir), "--to", "test", "--", "true"])
+                self.assertEqual(code, 0, output.getvalue())
+                path, = set(runs.glob("*.json")) - before
+                record = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+                self.assertEqual((record["worker"], record["staff_id"]), (row.name, row.id))
+                record["pid"] = private_supervisor(self, path)
+                write_text_atomic(path, json.dumps(record))
+                self.assertEqual(mesh_runs.live_runs(runs, row.name), [record])
+                self.assertEqual(mesh_runs.worker_runs(runs, row.name), [record])
+                self.assertEqual(mesh_runs.live_runs(runs, "test"), [])
+                write_text_atomic(Path(record["log"]), "Private command completed.\n")
+                self.assertIn("sent", mesh_runs.deliver(record, 0))
+                self.assertEqual(len(self.inputs), input_count + 1)
+                self.assertEqual(self.inputs[-1][0], pane)
+                self.assertIn(f"Detached run: {record['run_id']}", self.inputs[-1][1])
+                self.assertEqual(self.notices, [])
+                active = progress_history.active_dispatch(row.id, self.run_dir)
+                self.assertIsInstance(active, progress_history.ActiveDispatch)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                self.assertEqual(active.instance_id, dispatch_id)
 
     def test_native_caller_ignores_inherited_session_and_run(self) -> None:
         row = self.fixture.worker(family="claude")
