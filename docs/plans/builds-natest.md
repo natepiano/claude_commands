@@ -1883,40 +1883,18 @@ A find with no code change; the builds showrunner closed it so on 2026-11-08. At
 ### Phase 93 — The build queue shows a merge gate as "merge gate", with no hyphen  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner, 2026-11-08, follow-up to change row C1227. The queue table's step column and a card heading still show `merge-gate`, because `config/build_steps.conf` gives a shown name only to `targeted-test`.
-
-**Goal:** The queue table's step column, the cloud rows and every card heading show a merge gate as `merge gate`, so every step name in the queue view is plain words.
-
-**Spec:**
-1. `config/build_steps.conf` `[names]` has the new key `names.merge-gate=merge gate` (the director made this edit already). Keep it.
-2. Update the build queue tests that expect `merge-gate` in rendered table rows or card headings to expect `merge gate`. The recorded step stays `merge-gate`: request fixtures, queue records and `wire.Identity` values do not change.
-3. Some tests split a table row on whitespace, and a two-word step breaks that split (`['run', 'builds', 'queue-unit', 'merge']`). Read those cells by column, as the targeted test rows already must, or compare the whole row.
-4. Cloud rows and cloud cards show the step through `StepNames.shown` too (`queue_view.py` near line 386 writes `field(identity.step)`). Update the cloud goldens and tests.
-5. Keep the golden files: update `unit_override_card.txt` and `unit_override_view.txt` and keep the tests that read them. Test expectations read step names through `read_step_names()`, never a hard-coded mapping.
-6. Golden rows and headings change only in the step text and its column width.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+The build queue shows each step by its configured name. `config/build_steps.conf` `[names]` maps `merge-gate` to "merge gate" and `targeted-test` to "targeted test". The queue table, the cards and the cloud rows show names through `StepNames.shown`; recorded step ids and keys stay raw.
 
 **Files:**
-- `scripts/build_queue/test_queue_view.py`
-- `scripts/build_queue/test_queue_card.py`
-- `scripts/build_queue/test_build_queue.py`
-- `scripts/build_queue/queue_view.py`
-- `scripts/build_queue/queue_card.py`
-- `scripts/build_queue/golden/`
+- `config/build_steps.conf` — `[names]`: the shown name of each step id
+- `scripts/build_queue/queue_view.py` — cloud row text shows `model.names.shown(identity.step)`
+- `scripts/build_queue/test_queue_view.py`, `test_queue_card.py`, `test_build_queue.py` — read names through `read_step_names()`, never a mapping in the test
+- `scripts/build_queue/golden/` — cloud and unit-override card and view files show the configured names
 
-**Workers:** 1 writer; three small test files with one cause do not split
-- `impl` — `test_queue_view.py`, `test_queue_card.py`, `test_build_queue.py`, `queue_view.py`, `queue_card.py`, `golden/`
-
-**Constraints from prior phases:**
-- Phase 57: `StepNames.shown` gives a step's table and heading name; `StepNames.prose` gives its sentence name. Readers use the current values in `config/build_steps.conf`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- With the new key, these modules pass: `test_queue_card`, `test_queue_view`, `test_build_queue`, `test_queue_lines`, `test_queue_evidence`, `test_head_facts`, `test_queue_place`. Before the edit, 8 failures and 1 error.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- A shown name can hold a space. Row tests read table cells by header column, not by a whitespace split.
 
 ### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: todo
 **Depends on:** none
@@ -1945,16 +1923,19 @@ A find with no code change; the builds showrunner closed it so on 2026-11-08. At
 - `scripts/production/test_merge_gate_suites_resources.py`
 - `scripts/production/test_merge_gate_suites_reruns.py`
 - `scripts/production/merge_gate_test_support.py`
+- `scripts/production/test_merge_gate_suites_admission.py`
+- `scripts/production/test_merge_gate_test_times.py`
 
 **Workers:** 1 writer; the stop, its rerun and its tests share one runner loop and one fixture
-- `impl` — `merge_gate.py`, `merge_gate.conf`, `config/README.md`, the as-built doc, both test files, hub: `merge_gate_test_support.py`
+- `impl` — `merge_gate.py`, `merge_gate.conf`, `config/README.md`, the as-built doc, the four test files, hub: `merge_gate_test_support.py`
 
 **Constraints from prior phases:**
 - Phase 92: gate `TMPDIR` is `/dev/shm`; `finish_gate_job` kills a module's process group and removes its `TMPDIR` when the module ends.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Keep the existing rules: the `WholeMachine` mode bypasses the memory governor, and a module that trips the tripwire gets no rerun. A memory stop with a tripwire tells sdlc "the gate fails".
 
 **Acceptance gate:**
 - The new rows fail without the change and pass with it.
-- `test_merge_gate_suites_resources`, `test_merge_gate_suites_reruns` and every other `test_merge_gate*` module pass.
+- `test_merge_gate_suites_resources`, `test_merge_gate_suites_reruns`, every other `test_merge_gate*` module and `test_targeted_test` pass.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
