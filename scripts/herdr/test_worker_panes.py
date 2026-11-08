@@ -475,6 +475,15 @@ class WorkerPaneTests(StaffTestCase):
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
+    def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
+        name = self.parent.name + "-astra-reviewer"
+        opened = self.start(name, "astra-reviewer")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.assertEqual(self.world.agent_names, [name])
+        self.assertEqual(self.world.locations[opened.pane]["label"], name)
+        self.assertEqual(opened.row.name, name)
+
     def test_each_parent_uses_its_name_for_the_server_agent_and_keeps_the_worker_name(self) -> None:
         first = self.start("impl")
         self.assertIsInstance(first, worker_panes.OpenWorker)
@@ -671,19 +680,26 @@ class WorkerPaneTests(StaffTestCase):
         return dispatch
 
     def test_canceled_orphaned_pass_allows_an_idle_worker_to_close(self) -> None:
-        row = self.worker("impl")
-        self.world.add(row, "w1:p1")
-        run = self.run_state()
-        prompt = run / "prompt.md"
-        write_text_atomic(prompt, "Preserve the source behavior.\n")
-        _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
-            worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
-        self.record_command("finish-pass", "--status", "canceled", "--orphaned-launcher", at=3)
-        before = self.staff_state()
-        result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
-        self.assertIsInstance(result, worker_panes.Closed)
-        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
-        self.assertEqual(self.staff_state(), before)
+        cases = (("canceled", "idle"), ("canceled", "done"), ("interrupted", "idle"), ("interrupted", "done"))
+        expected: list[tuple[str, str]] = []
+        for index, (status, agent_status) in enumerate(cases, start=1):
+            with self.subTest(status=status, agent_status=agent_status):
+                row = self.worker(f"impl-{index}")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane)
+                self.world.locations[pane]["agent_status"] = agent_status
+                run = self.run_state()
+                prompt = run / "prompt.md"
+                write_text_atomic(prompt, "Preserve the source behavior.\n")
+                _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
+                    worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
+                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
+                before = self.staff_state()
+                result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+                self.assertIsInstance(result, worker_panes.Closed)
+                expected.append((pane, "terminal-" + pane))
+                self.assertEqual(self.world.closed, expected)
+                self.assertEqual(self.staff_state(), before)
 
     def test_unbound_idle_worker_can_close_and_end_its_own_labelled_pane(self) -> None:
         from scripts.production import worker

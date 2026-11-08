@@ -1130,7 +1130,7 @@ land a phase sooner. Each design check covers every view of the change at once
 Stop a local session with `agents stop SESSION`.
 Resume it with `agents resume SESSION --why "reason"`.
 Worker stops retain their panes at the shell and keep their conversations for restore.
-Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
+Move sessions with `agents move SESSION_OR_GROUP claudeN --why "reason"`.
 Worker account moves resume each conversation in its existing pane on the target account.
 Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
 See `commands/agents.md` and `docs/accounts.md`.

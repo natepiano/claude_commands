@@ -42,9 +42,18 @@ The route returns the existing `GateRun` and exit behavior.
 The build queue enforces nine cloud slots and shows remote progress.
 
 The route selects targeted modules on natedev.
-It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
+The box clones the public HTTPS URL from `clone_url` in `cloud_gate.conf`.
+The route bundles only commits outside natedev's `origin/main`.
+It bundles HEAD and the current branch ref with `--not refs/remotes/origin/main`.
+It uploads no bundle when HEAD is already on `origin/main`.
+The request records the exact tested commit, tree, and natedev `origin/main` hash.
+The box fetches the optional bundle and sets `origin/main` to the recorded hash.
 The guest verifies the tree and runs only the supplied paths from that checkout.
 The trial and route share `scripts/aws_target/gate_box.py`.
+The boot script downloads the guest program before Python starts.
+Production also downloads the request that contains the module list.
+User data contains the download links instead of the program or module paths.
+Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
 An explicit type request and the nightly checker remain local.
 
@@ -53,13 +62,22 @@ Both sizes use one-time Spot with termination on interruption and shutdown.
 Termination deletes the root volume.
 A guest deadline and an independent expiry Lambda bound normal attempt lifetimes.
 The route confirms termination before it releases unused cost reservation.
-An uncertain reply retains the saved launch token, arguments, and reservation across restart.
+A launch timeout permits local fallback and releases the cost reservation when no instance identity is known.
 
-Local fallback requires AWS failure, an absent image or stack, a shared spending cap, or capacity refusal at both sizes.
-A remote failure remains red. A dead instance without a final result also remains red.
+Every cloud setup or infrastructure failure permits local fallback.
+This includes upload errors, timeouts, missing results, invalid results, and instance failures.
+Capacity refusals first exhaust the configured sizes and zones.
+The route releases the cost reservation and cloud slot before local admission.
+Only a real remote test failure remains red.
+A dead instance without a final test result permits local fallback.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once under the real remote host.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
+The AWS state folder retains `cloud-gate-launches.jsonl`.
+Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
+Local fallback prints `Cloud gate uses natedev: <reason>`.
+These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.
 It checks the existing $20 daily cap, $400 monthly cap, and safety reserve under one cost lock.
@@ -79,7 +97,7 @@ The existing Rust foundation stack must exist first.
 The command adds the gate bucket, role, profile, security group, launch template, scaler policy, expiry Lambda, schedule, and log group.
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
-It saves the image, template version, public subnets, nixpkgs revision, and artifact role prefix locally.
+It saves the image, template version, public subnets, and nixpkgs revision locally.
 This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 
 | Scaler grant | Scope |
@@ -90,11 +108,11 @@ This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 | `ec2:TerminateInstances` | This deployment's gate ownership and workload tags. |
 | `ec2:DescribeInstances` | Regional describe scope. |
 | `ce:GetCostAndUsage` | Combined cost query; AWS requires wildcard resource scope. |
-| `s3:PutObject` | Gate source and request prefixes. |
-| `s3:GetObject` | Gate artifact prefix. |
+| `s3:PutObject` | Gate source, request, and artifact prefixes. |
+| `s3:GetObject` | Gate artifact, source, and request prefixes. |
 
 The guest reads source and request objects.
-Its writes use only `artifacts/${aws:userid}/*`, which contains its role and instance identity.
+The scaler signs box uploads under `artifacts/<attempt>/`; the guest role has no S3 grants.
 The expiry role terminates only gate-tagged instances and writes only its function logs.
 The gate bucket blocks public access, requires HTTPS, encrypts objects, and removes old artifacts.
 

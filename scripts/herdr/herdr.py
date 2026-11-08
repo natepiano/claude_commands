@@ -2531,6 +2531,19 @@ class Herdr:
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         self._send_keys(pane, *keys)
 
+    def answer_question(self, pane: str, text: str, *, target: str) -> None:
+        """Answer a Codex question through the selected session's input box."""
+        if not target:
+            raise HerdrFailure(f"{pane}: would send keys without a named target session")
+        for index, key in enumerate(("shift+left", "enter", "enter")):
+            expected = "" if index == 0 else text
+            if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
+                                pane_info=self.pane_row(pane), client=self):
+                raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+            self._send_keys(pane, key)
+            if index == 0:
+                _ = self.run("pane", "send-text", pane, text)
+
     def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
 

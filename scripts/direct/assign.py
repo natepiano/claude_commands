@@ -937,7 +937,8 @@ def execute_durable(args: Arguments, env: dict[str, str]) -> int:
     if not prompt.is_file() or not args.session_dir or not args.phase:
         refuse("durable dispatch requires --prompt, --session-dir, and --phase")
     result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
-        slot=name.value, phase=args.phase, kind="astra", reply=Path(args.summary), policy=policy,
+        slot=name.value, phase=args.phase, kind="astra",
+        reply=Path(args.summary) if args.summary else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
     if result:
         return result

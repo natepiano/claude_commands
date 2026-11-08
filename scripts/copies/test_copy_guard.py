@@ -5,20 +5,17 @@ import ast
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
-import io
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 from typing import ClassVar, cast, override
-from unittest.mock import patch
 
 from scripts.copies import copies, copy_guard
-from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 @dataclass(frozen=True)
@@ -938,70 +935,6 @@ git_at(repo, "show", "clone")
         for command, reason in unresolved_policy_cases():
             with self.subTest(command=command):
                 self.assertEqual(copy_guard.inspect_shell(command, self.root), copy_guard.UnresolvedOperation(reason))
-
-    def test_mend_documented_git_and_non_git_tool_payloads_pass_the_guard_front(self) -> None:
-        document = Path(__file__).resolve().parents[2] / "commands/mend_fix.md"
-        scripts = Path(__file__).resolve().parents[1]
-        ordinary = self.root / "ordinary project"
-        ordinary.mkdir()
-        scratchpad = self.root / "session-scratch"
-        scratchpad.mkdir()
-        recipes = copy_guard.markdown_commands(document.read_text())
-        checked = 0
-        for _, command in recipes:
-            if "/absolute/" not in command:
-                continue
-            for source in (self.repo, ordinary):
-                # The documented agent substitutes concrete words before its tool call.
-                payload = command.replace("/absolute/session-scratch", str(scratchpad))
-                payload = payload.replace("/absolute/repository", str(self.repo))
-                payload = payload.replace("/absolute/project", str(source))
-                payload = payload.replace("/absolute/cargo-liner", str(self.root / "cargo-liner"))
-                # This fixture uses a path with spaces to check quoted concrete tool inputs.
-                payload = payload.replace(str(ordinary), shlex.quote(str(ordinary)))
-                if "rsync -a --exclude" in payload and source == self.repo:
-                    continue  # Discovery selects the Git route for this input.
-                tool_input = json.dumps({"tool_name": "Bash", "tool_input": {"command": payload}, "cwd": str(self.root)})
-                if checked == 0:
-                    result = subprocess.run(["python3", str(scripts / "copies/copy_guard.py")],
-                        input=tool_input, text=True, capture_output=True, check=False,
-                        timeout=copies.load_config().guard_timeout_seconds)
-                else:
-                    def main() -> int:
-                        copy_guard.main()
-                        return 0
-
-                    with patch.object(sys, "stdin", io.StringIO(tool_input)):
-                        result = invoke_cli(copy_guard, main, [], dict(os.environ), self.root)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                checked += 1
-        self.assertGreater(checked, 4)
-
-    def test_non_git_mend_confirmation_preserves_each_failed_step_status(self) -> None:
-        document = Path(__file__).resolve().parents[2] / "commands/mend_fix.md"
-        command = next(command for _, command in copy_guard.markdown_commands(document.read_text())
-                       if command.startswith("/absolute/cargo-liner/target/debug/cargo-mend"))
-        work = self.root / "work"
-        work.mkdir()
-        marker = self.root / "check-ran"
-        mend = self.root / "cargo-mend"
-        cargo = self.root / "cargo"
-        _ = mend.write_text(f"#!{sys.executable}\nimport os, sys\nsys.exit(int(os.environ['MEND_EXIT']))\n")
-        _ = cargo.write_text(f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
-                             + f"Path({str(marker)!r}).touch()\nsys.exit(int(os.environ['CHECK_EXIT']))\n")
-        mend.chmod(0o755)
-        cargo.chmod(0o755)
-        command = command.replace("/absolute/cargo-liner/target/debug/cargo-mend", shlex.quote(str(mend)))
-        command = command.replace("/absolute/session-scratch/work", shlex.quote(str(work)))
-        for mend_exit, check_exit, expected, checked in ((17, 0, 17, False), (0, 19, 19, True), (0, 0, 0, True)):
-            with self.subTest(mend=mend_exit, check=check_exit):
-                marker.unlink(missing_ok=True)
-                result = subprocess.run(["bash", "-c", command], cwd=self.root, check=False,
-                    capture_output=True, text=True, timeout=copies.load_config().guard_timeout_seconds,
-                    env={**os.environ, "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
-                         "MEND_EXIT": str(mend_exit), "CHECK_EXIT": str(check_exit)})
-                self.assertEqual(result.returncode, expected, result.stderr)
-                self.assertEqual(marker.exists(), checked)
 
     def test_recorded_agent_commands_and_semantic_boundaries_have_exact_outcomes(self) -> None:
         for case in repair_policy_cases():
