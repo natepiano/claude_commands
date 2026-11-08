@@ -7,23 +7,16 @@ try:
 except FileNotFoundError:
     pass
 
+
+import json
+import time
+from calendar import monthrange
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from calendar import monthrange
-import json
-from typing import cast
-import time
-from typing import TYPE_CHECKING
 from pathlib import Path
-import sys
+from typing import TYPE_CHECKING, cast
 
-
-SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(SCRIPTS / directory))
-from scripts.build_hold import build_hold
-from scripts.mac_test import mac_test, offload
 from scripts.build_targets.target_config import (
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
@@ -34,12 +27,11 @@ from scripts.build_targets.target_config import (
     is_aws_target,
 )
 
+
 if TYPE_CHECKING:
-    from ..aws_target import ledger as cost_ledger, measurement
-    from ..buildlog import record
-else:
     from scripts.aws_target import ledger as cost_ledger, measurement
     from scripts.buildlog import record
+    from scripts.mac_test import mac_test
 
 
 @dataclass(frozen=True)
@@ -211,6 +203,10 @@ class AwsStatusRow:
 
 def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
     """Read local controller, ledger, claim, and result evidence without probes or writes."""
+    from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.buildlog import record
+    from scripts.mac_test import mac_test
+
     try:
         paths = mac_test.state_paths(target.name)
         snapshot = measurement.read_status_measurement(target.settings, paths.directory, int(time.time()))
@@ -263,6 +259,8 @@ def target_eligibility(
     repo_root: Path, package: str, routing: Routing
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Keep configured order while excluding Mac targets the test cannot use."""
+    from scripts.mac_test import offload
+
     results: list[EligibleTarget | ExcludedTarget] = []
     repository = offload.repository_identity(repo_root)
     for target in read_targets():
@@ -285,10 +283,13 @@ def target_eligibility(
 
 
 def utc_now() -> datetime:
+
     return datetime.now(timezone.utc)
 
 
 def running_job(claim: mac_test.HeldClaim) -> RunningJob:
+    from scripts.mac_test import mac_test
+
     record = claim.record
     since = mac_test.aware_timestamp(record["since"], claim.path, "since")
     session_id = record.get("holder_session", "")
@@ -299,20 +300,33 @@ def running_job(claim: mac_test.HeldClaim) -> RunningJob:
     return RunningJob(record["what"], since, IdleSince(idle), holder)
 
 
-def target_state(target: Target) -> TargetState:
-    """Read state without probing a host or changing coordination files."""
+def local_hold_state() -> TargetState:
+    """Read the local hold without importing remote claim readers."""
+    from scripts.build_hold import build_hold
+
     try:
-        if isinstance(target, LocalTarget):
-            holds = build_hold.natedev_holds(build_hold.holder_directory())
-            if not holds.in_force:
-                return Free()
-            holder = holds.in_force[0]
-            end = (
-                ReleaseEstimated(holder.release.at)
-                if isinstance(holder.release, build_hold.KnownReleaseEta)
-                else UntilReleased()
-            )
-            return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+        holds = build_hold.natedev_holds(build_hold.holder_directory())
+        if not holds.in_force:
+            return Free()
+        holder = holds.in_force[0]
+        end = (
+            ReleaseEstimated(holder.release.at)
+            if isinstance(holder.release, build_hold.KnownReleaseEta)
+            else UntilReleased()
+        )
+        return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+    except build_hold.ReleaseRecordReadError as error:
+        return StateUnreadable(build_hold.release_record_error_line(error))
+    except (OSError, UnicodeError, ConfigError) as error:
+        return StateUnreadable(str(error))
+
+
+def ssh_target_state(target: SshTarget) -> TargetState:
+    """Read remote claim records without probing the target."""
+    from scripts.build_hold import build_hold
+    from scripts.mac_test import mac_test, offload
+
+    try:
         paths = mac_test.state_paths(target.name)
         claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
@@ -339,3 +353,10 @@ def target_state(target: Target) -> TargetState:
         return StateUnreadable(build_hold.release_record_error_line(error))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))
+
+
+def target_state(target: Target) -> TargetState:
+    """Read state without probing a host or changing coordination files."""
+    if isinstance(target, LocalTarget):
+        return local_hold_state()
+    return ssh_target_state(target)
