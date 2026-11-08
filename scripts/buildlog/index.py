@@ -715,6 +715,8 @@ def open_for_update(path: Path) -> sqlite3.Connection:
             _ = connection.execute(statement)
     spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
     connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
+    # SQLite reads the flag through 8 bits; ON enables spill and keeps the threshold.
+    connection.execute("PRAGMA cache_spill = ON").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 

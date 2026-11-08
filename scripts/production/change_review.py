@@ -1582,7 +1582,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     matched_step = False
     for entry in merges:
         merge, subject = entry.split("\t", 1)
-        if not subject.endswith(f" into {merge_branch}"):
+        if any(subject.endswith(f" into {ref.removeprefix('origin/')}") for ref in outside_refs):
             continue
         if not on_main(repo, merge):
             continue

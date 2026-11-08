@@ -769,3 +769,56 @@ A failed merge gate attempt keeps the end of its output in the build log, for lo
 
 **Ruled out:**
 - Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).
+
+### Phase 35 — One full rebuild of the build log index has a measured memory cost  · status: done
+
+#### As-built
+
+Measurement only; no code changed. Two full rebuilds ran on private copies of the live JSONL (443 files, 1.16 GiB, about 276,000 records; a 3.0 GB index with 4096-byte pages).
+- SQLite 3.51.2 reads `PRAGMA cache_spill = N` as a boolean through 8 bits. `INDEX_SPILL_PAGES=65536` gives 0, so `open_for_update` turns spill off. 65535 stays on; `PRAGMA cache_spill = ON` after the size keeps 65536 in effect.
+- Spill off (as shipped): peak RSS 3.75 GiB, 132.7 s wall, 102 CPU s. Six readers waited 9.4–10.9 s at commit and read the new index.
+- Spill on (trial wrapper only): peak RSS 1.34 GiB, 252.7 s wall, 110 CPU s, under a higher load. The first spill came at 11.5 s. Readers started near the first spill, the middle and the end waited until commit (43.6–245.8 s) and read the new index.
+
+**Files:**
+- `config/buildlog.conf` — the `INDEX_SPILL_PAGES` basis gives both runs; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — "Calibration and gotchas": the full-rebuild entry.
+
+**Gotchas:**
+- CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off; neither run measured the 30 s direct SQL timeout.
+- A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
+
+### Phase 36 — A full rebuild of the build log index uses about a third of the memory · status: done
+**Depends on:** Phase 35
+
+From the builds showrunner (not the user), 2026-11-08: "Add-on ruling: current. Make it Phase 36 and start now. The config already intends a spill at 65536 pages, so this fixes a wrong result, and memory is natedev's scarcest resource. The value stays 65536. In the as-built, state the reader cost during a spilled update in one line. Measure one rebuild with spill on at a quiet load, if one comes, so the wall time is clean."
+
+#### Work Order
+
+**Goal:** `INDEX_SPILL_PAGES` takes effect: an index update spills at 65536 changed pages, so a full rebuild no longer holds every dirty page in memory (Phase 35: 3.75 GiB with spill off, 1.34 GiB with spill on).
+
+**Spec:**
+- `scripts/buildlog/index.py` `open_for_update`: after `PRAGMA cache_spill = {spill_pages}`, run `PRAGMA cache_spill = ON`. SQLite sets the spill flag from N read as a boolean through 8 bits (65536 gives off); `ON` sets the flag and keeps the size. One short comment states that SQLite fact.
+- A test in `scripts/buildlog/test_index.py`: a connection from `open_for_update` on a private root reports `PRAGMA cache_spill` equal to `INDEX_SPILL_PAGES` read from `config/buildlog.conf`. The test fails on the current code (it reads 0).
+- Measure one full rebuild with the new code, as in Phase 35: a private disk root with a copy of the live JSONL, no index file, `BUILDLOG_DIR` set, `/run/current-system/sw/bin/time -v`, through `mesh_runs.py start`. Record peak RSS, wall and CPU seconds, the first spill time, and the one-minute load at start and end. Start it when the one-minute load is 50 or less, comparable to Phase 35's spill-off run (48.4). If the load is above 50 at that point, run it anyway and report the load; do not wait in a loop.
+- During that rebuild, after the first spill, time one direct read through `index.read_only()` (no CLI, no update) and one `complete_gate_index_in` call on the same root. Record the wall time, the result or the error text.
+- `config/buildlog.conf`: rewrite the `INDEX_SPILL_PAGES` basis comment for spill in effect: the threshold, the measured full-rebuild peak RSS and wall time. The value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md`, "Calibration and gotchas": update the Phase 35 entry so it says spill is in effect; add the new figures, and one line on the reader cost during a spilled update.
+- Delete the private root after the run.
+
+**Files:**
+- `scripts/buildlog/index.py` — `open_for_update`.
+- `scripts/buildlog/test_index.py` — the spill test.
+- `config/buildlog.conf` — the basis comment.
+- `docs/as-built/buildlog-memory-stalls.md` — the calibration entry.
+
+**Workers:** 1 writer — `rowcpu` writes the code, the test, the measurement and both docs.
+
+**State:** none. The private root is deleted after the run.
+
+**Constraints from prior phases:** Phase 35: SQLite 3.51.2; 4096-byte pages; `cache_size=-2000`; rollback journal. CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off. A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08). Never write the live build log, the live index or the live progress history.
+
+**Acceptance gate:**
+- The new test passes, and fails with the `ON` line removed.
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` and `test_gate_index.py` pass.
+- `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py` reports 0 errors, 0 warnings, 0 notes.
+- The summary gives the rebuild figures, the load, and the direct reader results; the conf comment and the as-built entry state the same figures.

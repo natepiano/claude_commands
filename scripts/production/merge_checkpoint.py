@@ -35,7 +35,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.production import change_review
 from scripts.worktree import worktrees
-from scripts.lib import scratch
+from scripts.lib import main_publish, scratch
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -903,7 +903,7 @@ def remote_path(path: PurePosixPath) -> str:
     return shlex.quote(text)
 
 
-def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulled | main_publish.MacPullPending:
     settings_read = conf.read('merge_checkpoint')
     try:
         tries = settings_read.whole("MAC_PULL_TRIES")
@@ -912,12 +912,18 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
-    for attempt in range(tries):
+    attempt = 0
+    while True:
         result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
         match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
         if result.returncode == 0 and match is not None and int(match.group(1)) == 0:
-            return
-        if attempt + 1 == tries:
+            main_publish.clear_pull_only()
+            return main_publish.MacPulled()
+        attempt += 1
+        if attempt == tries:
+            if result.returncode == 255 and match is None:
+                main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result))
+                return main_publish.MacPullPending()
             raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
                        "the showrunner will repair the Mac pull and rerun this checkpoint")
         time.sleep(retry_seconds)
@@ -975,7 +981,10 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
     if isinstance(promotion.mac, production_doc.MacCheckout):
         mac = promotion.mac.path
         source = promotion.checkouts[0] if promotion.checkouts else source
-        pull_mac_checkout(mac, source)
+        outcome = pull_mac_checkout(mac, source)
+        if isinstance(outcome, main_publish.MacPullPending):
+            report("promote", "ok", f"mac unreachable, pull pending: {mac}")
+            return
         report("promote", "ok", f"mac {mac} main pulled")
         send_queued_zone()
         into(mac, "main", "sessions on mac run the installed commands from it",

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -27,6 +27,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.production import merge_gate
 from scripts.lib import conf
+from scripts.lint.memory_test_support import config_environment
 
 
 def trial_config() -> str:
@@ -80,8 +81,7 @@ class FakeAws:
         self.observed_states: list[str] = []
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
-        self.handler_thread: int = threading.get_ident()
-        self.signal_handled: Callable[[], None] | None = None
+        self.signal_waiters: int = 1
         self.missing_log: bool = False
         self.query_timeout: bool = False
         self.zone_prices: dict[str, float] = {}
@@ -100,13 +100,6 @@ class FakeAws:
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
-        if 'get-object' in args:
-            with self.lock:
-                number, self.signal_number = self.signal_number, 0
-            if number:
-                signal.pthread_kill(self.handler_thread, number)
-                if self.signal_handled is not None:
-                    self.signal_handled()
         if 'get-object' in args and self.before_result is not None:
             key = args[args.index('--key') + 1]
             if not key.endswith('/log'):
@@ -293,6 +286,7 @@ class GateTrialTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for command in (['git', 'init', '-q', str(self.repo)],
@@ -315,15 +309,35 @@ class GateTrialTests(unittest.TestCase):
         command = trial.GateTrial(AwsCli('fixture', 'us-east-1', 1, self.fake), settings, self.root / 'state',
             trial.SigningKey('fixture-access', 'fixture-secret'), clock=self.clock.read, pause=self.clock.advance)
         self.command = command
-        def signal_handled() -> None:
+        main_thread = threading.get_ident()
+        number = self.fake.signal_number
+        waiting: set[str] = set()
+        sent = False
+        wait = command.changed.wait
+        def result(key: str) -> None:
             with command.changed:
+                waiting.add(key)
+                command.changed.notify_all()
                 self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
-        self.fake.signal_handled = signal_handled
+        def deliver_signal(timeout: float | None = None) -> bool:
+            nonlocal sent
+            if threading.get_ident() == main_thread and len(waiting) == self.fake.signal_waiters and not sent:
+                # Deliver the signal after the requested worker reads block, from the scheduler thread.
+                sent = True
+                self.fake.signal_number = 0
+                signal.raise_signal(number)
+                return True
+            return wait(timeout)
         output = StringIO()
         try:
             with (redirect_stdout(output), mock.patch.dict(os.environ, {'MERGE_GATE_STATE_DIR': str(self.root / 'measures')}),
-                  mock.patch.object(trial, 'NIXOS_LOCK', self.root / 'flake.lock')):
+                  mock.patch.object(trial, 'NIXOS_LOCK', self.root / 'flake.lock'), ExitStack() as hooks):
+                if number:
+                    _ = cast(object, hooks.enter_context(mock.patch.object(self.fake, 'before_result', new=result)))
+                    _ = cast(object, hooks.enter_context(mock.patch.object(command.changed, 'wait', side_effect=deliver_signal)))
                 _ = command.run(self.repo, step, sizes, runs, reserve, vcpus)
+                if number:
+                    self.assertTrue(sent)
         finally:
             self.output = output.getvalue()
         return command
@@ -500,21 +514,11 @@ class GateTrialTests(unittest.TestCase):
         self.assertLess(command.spent + command.s3_cost, 0.45)
 
     def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
-        main_thread = threading.get_ident()
         for number in trial.TRIAL_SIGNALS:
             with self.subTest(number=number):
                 self.fake = FakeAws(self.clock)
-                barrier = threading.Barrier(2, timeout=10)
-                def result(key: str) -> None:
-                    _ = barrier.wait()
-                    if key.startswith('8-'):
-                        # Wake the Python handler's thread instead of an unrelated helper thread.
-                        signal.pthread_kill(main_thread, number)
-                    command = self.command
-                    assert command is not None
-                    with command.changed:
-                        self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
-                self.fake.before_result = result
+                self.fake.signal_number = number
+                self.fake.signal_waiters = 2
                 command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
                 self.assertEqual(self.fake.launches, 2)
                 self.assertTrue(command.interrupted)
@@ -631,6 +635,22 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('authorize-security-group-ingress', self.operations())
         self.assertNotIn('iam', [service for service, _, _ in self.fake.calls])
 
+    def test_fixture_uses_repository_packages_when_live_config_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            live = home / '.claude/config'
+            live.mkdir(parents=True)
+            _ = (live / 'cloud_gate.conf').write_text('packages=live-only-package\n')
+            environment = {key: value for key, value in os.environ.items() if key != 'CONF_DIR'}
+            environment['HOME'] = str(home)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(conf.read_or_repository('cloud_gate').words('packages'), ('live-only-package',))
+                case = GateTrialTests('test_user_data_schedules_shutdown_first_and_contains_only_url_credentials')
+                result = unittest.TestResult()
+                _ = case.run(result)
+                self.assertTrue(result.wasSuccessful(), str(result.errors + result.failures))
+                self.assertEqual(result.testsRun, 1)
+
     def test_user_data_schedules_shutdown_first_and_contains_only_url_credentials(self) -> None:
         _ = self.run_trial()
         data = self.fake.payloads[0]
@@ -641,11 +661,10 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium', 'nodejs'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
         self.assertNotIn('#basedpyright', data)
         self.assertNotIn('#google-chrome', data)
-        self.assertNotIn('#nodejs', data)
         self.assertNotIn('uv tool install', data)
         self.assertNotIn('nodejs_wheel', data)
         self.assertNotIn('NIXPKGS_ALLOW_UNFREE', data)
@@ -1031,6 +1050,11 @@ class GateTrialTests(unittest.TestCase):
 
 @final
 class GuestTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
+
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
         url = prefix + 'a' * (400 - len(prefix))
@@ -1239,7 +1263,7 @@ class GuestTests(unittest.TestCase):
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
             with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
-                                                 'GATE_BOX_DIR': str(root)}),
+                                                 'GATE_BOX_DIR': str(root), 'box_dir': str(root)}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(Path, 'home', return_value=root),
                   mock.patch('subprocess.run', side_effect=transport),
@@ -1291,6 +1315,7 @@ class GuestTests(unittest.TestCase):
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)
+                self.assertNotIn('box_dir', environment)
             self.assertFalse((root / 'types-args').exists())
             content = uploads[links['log']].decode()
             self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-15'))
