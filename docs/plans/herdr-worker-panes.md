@@ -3332,6 +3332,50 @@ Live check on 2026-11-07 17:00 EST: both sends printed `SENT: codex:01a18dbb-…
 
 **Gotchas:** roster test fakes omit live Claude rows, so a staff fallback change needs a full `test_send` run, not selected tests.
 
+### Phase 39 — A message reaches morty when herdr reports no session · status: done
+
+**Depends on:** Phase 37 (on main at e1d8b73ed). It runs before Phase 38 (sdlc [44518c43], 2026-11-07: this goes before the close fix).
+
+Defect (sdlc, 2026-11-07 19:17 EST, on main): `send.py --to morty` answers `QUEUED: no live Claude or Codex session answers to morty (01a18dbb-…)`, and `--to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` answers `FAILED: no live Codex daemon has thread … loaded`. Cause: `herdr agent list` gives morty's pane w2C:p1 no `agent_session` key, so `_herdr_codex_panes` (`scripts/message/roster.py`) gives the entry `NoCodexThread` and `CannotReceiveMessages`. The pane's Codex process holds its rollout open: `Herdr("agents").native_pane_process("w2C:p1", "codex", …)` returns `RolloutThread(01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a)` (director, 21:45 EST). Delivery already accepts that thread: `check_target` reads the same identity through `_pane_sessions`. The user's acceptance (via morty): send.py delivers to this existing thread, by name and by explicit address, with no restart.
+
+#### Work Order
+
+**Goal:** a herdr Codex pane with no `agent_session` report gets its thread from its own Codex process, so `send.py` reaches it.
+
+**Spec:**
+
+1. In `_herdr_codex_panes`, when the agent's `agent_session` is `NoReportedAgentSession`, read `herdr.Herdr(<session>).native_pane_process(<pane>, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity`. This is the identity that `check_target` proves before it types keys. Use it as the entry's `CodexThread`; the entry is then `Messageable("codex:<thread>")` with its pane, as for a reported session.
+2. A reported `agent_session` still wins; do not read the process for it.
+3. When that read raises `HerdrFailure` or `ValueError`, the entry stays `NoCodexThread` and `CannotReceiveMessages`, as today.
+4. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:**
+- `scripts/message/roster.py`
+- `scripts/message/test_roster.py`
+- `scripts/message/test_send.py`
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: a herdr Codex pane with no `agent_session` whose `native_pane_process` gives `RolloutThread(T)` gives a roster entry with thread T, messageable at `codex:T`, with its pane.
+- A unit test: the same pane whose process read raises `HerdrFailure` stays `CannotReceiveMessages`.
+- A unit test in `test_send.py`: a staff row with `current_session` T resolves to `CodexPaneRecipient` for that pane, and `--to codex:T` resolves to the same.
+- The changed modules pass in full (`test_roster`, `test_send`); basedpyright reads 0/0/0; the full gate passes.
+- Live check by the director after the checkpoint: `send.py --to morty` and `send.py --to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` each print `SENT`, and the text shows in morty's pane. One ping each.
+
+### Phase 40 — A pane worker can always be closed, followed and kept small · status: todo
+
+**Depends on:** Phase 38 (both edit `scripts/herdr/worker_panes.py`). sdlc [7d853264], [528b717c], [6ed41bd7], [ecec2e86], 2026-11-07: one phase for the pane close items, after the morty fix. The Work Order is written at the phase start. Items:
+
+1. `worker_panes.py close` accepts an idle worker whose last pass is canceled as orphaned (`finish-pass --status canceled --orphaned-launcher`). Today it exits 7, `launcher has not recorded a completed pass` (demo review2; queue impl, impl2, test, test2).
+2. A worker stuck as `UncertainWorker` with `labelled recovery pane runs other work` can be closed and ended (queue probe28 at w11:p1F; demo review2). Lead (cargo-liner handler, sdlc [933ae902]): a new worker row is bound to the wrong Codex thread, an older thread with the same `01a1b` prefix, after `legacy launch publication is unavailable: Codex launch identity is unavailable`. Fix the binding first. Check that no test wrote a live staff row (the wrong thread's cwd is `~/scratch/herdrcheck/zz-move-p10-3255236`). Related (cargo-liner [b6d41d82]): a launch under a name with an old row opened a new thread and the row kept the old thread.
+3. `worker_panes.py close --interrupt <name>`: stop the current turn, wait for idle, close the pane. The working manual path: `/quit` in the pane, then `worker.py restore <name>`.
+4. A pane worker's Codex launch sets the auto-compact limit from config, near 200k tokens, well above the post-compaction floor (about 100k). Report the value and the measured floor to sdlc. Cost measure (natedev via sdlc [82aaadcb], 2026-11-07): since Phase 35, pane workers compact near the full 500k window; a fix worker ran 61 requests between 250k and 343k tokens. Measure quota per request at a 200k limit and at full-window compaction, put the cheaper point in config, and send sdlc both numbers with the hash.
+5. A delivered prompt always has a follower: `assign.sh` typed the prompt, then exited 6 (busy) with no launcher attached (cargo-liner handler, run `/tmp/claude/unit/21496649-0876-4315-8701-05f8943b788f`, phase 68, worker `cargo-liner-handler-expand-impl`, 18:44:36 and 19:24:17 EST). Before case 2, `--role fix` exited 2 with `role change blocked by active work: active dispatch has another role` while `worker.py list` showed the worker done.
+6. A live detached run keeps the launcher attached (cargo-liner tile, runs `20261107T193609-3804348-dc60` and `20261107T194606-779825-6036` under `/tmp/claude/unit/02717738-2a97-4a2f-b362-e4add2f2dd8e/mesh_runs/`). The test worker's run records name the slot `test`, not the worker name, so the launcher sees no live run and exits 3, and delivery reports `worker retired`.
+7. `worker.py restore` touches only stopped workers: it restarted the busy `cargo-liner-handler-expand-impl` in the middle of a repair.
+8. The launch claim reads `phase_baseline` in the repository where the phase works, not only `--cwd` (cargo-liner tile [a55f755d]: a phase in a separate git copy fails with `names no single commit`).
+
 ### Phase 38 — One worker's assign reads only its own pane and row · status: todo
 
 **Depends on:** Phase 37 (it runs right after the Phase 37 checkpoint, before Phase 29; sdlc [b9d4c514], 2026-11-07).
@@ -3346,16 +3390,24 @@ Defect (builds for natest, 2026-11-07 16:40 and 16:47 EST): `assign.sh` for nate
 
 1. Find each path by which another session's unreadable pane, or a closed sibling row, makes the assigned worker's result `UNCERTAIN` (8). Quote the log line and the source line for each.
 2. Fix it where the evidence is gathered: the assign reads and judges only the selected worker's row and its pane. The evidence of other rows and other panes does not change the selected worker's state or the assign exit code.
-3. `worker.py list` and `restore` keep their per-row states; a sibling's uncertain state stays on that sibling's line.
-4. Add no check, refusal, validation, retry or wait that this list does not name.
+3. Edit `scripts/direct/assign.py` only where an exit-8 path lives. `worker.py list` and `restore` keep their per-row states; a sibling's uncertain state stays on that sibling's line.
+4. The launch race (herdr-unit Phase 39 assign, 2026-11-07 21:44 EST; sdlc [5165f173]): a resumed worker's first assign in a new pane exited 8 with `launch proof is incomplete: pid <pid>: current Codex rollout or process changed`, while Codex was still opening its rollout. A rerun a minute later read the same thread. Find where the launch proof reads the rollout and fix it there, so a rollout that opens during launch does not make the worker uncertain.
+5. Add no check, refusal, validation, retry or wait that this list does not name.
 
-**Files:** `scripts/herdr/worker_panes.py`, `scripts/production/worker.py`, `scripts/direct/assign.py` (only where an exit-8 path lives), and their tests.
+**Files:**
+- `scripts/herdr/worker_panes.py`
+- `scripts/production/worker.py`
+- `scripts/direct/assign.py`
+- `scripts/herdr/test_worker_panes.py`
+- `scripts/production/test_worker.py`
+- `scripts/direct/test_assign_claude_panes.py`
 
 **Workers:** `1 writer`.
 
 **Acceptance gate:**
 - A unit test: the selected worker's pane is open and working; another session's pane gives `agent argv is unavailable` and `pane_not_found`, and closed sibling rows have no pane. The assign does not exit 8.
 - A unit test: the selected worker's own pane evidence is unknown; the assign still exits 8.
+- A unit test: the selected worker's rollout opens during launch; the assign does not exit 8.
 - The changed modules pass; basedpyright reads 0/0/0; the full gate passes.
 
 ### Phase 32 — A launch keeps the caller's Codex home  · status: done
