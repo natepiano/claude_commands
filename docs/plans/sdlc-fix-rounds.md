@@ -404,7 +404,7 @@ The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not na
 
 Add no new check.
 
-### Phase 10e — Two test rules in the direct contract  · status: todo
+### Phase 10e — Two test rules in the direct contract  · status: done
 **Depends on:** Phase 10c (it moves FixDispatch)
 
 From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's words: "do rules 1 and 2"). The suite grew from 263 tests (Oct 1) to 18,879 (Nov 7), with one narrow test for each review finding.
@@ -413,3 +413,5 @@ From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's wo
 2. Write or keep a rare-case test (an edge case, a refusal, malformed input, a failure path) only when its defect would show the user a wrong result, damage saved state (a file, Git, a ledger, staff, a config), or lose work (a commit, an edit, a message, a worker result). Every main-path test stays.
 
 Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
+
+As built: both rules are in `docs/direct/write_prompt_contract.md` item 6, which implementation, fix and test prompts carry verbatim. FixDispatch, the main-read closure check and `<ClosureReview/>` ask for coverage under item 6, not one new regression test for each finding. The test worker paragraph points to item 6.
