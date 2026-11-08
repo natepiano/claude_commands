@@ -1,0 +1,4 @@
+# Built-in attributes that do not introduce local bindings. Unknown attributes refuse.
+inert_attributes = ["doc", "allow", "warn", "deny", "expect", "forbid", "must_use", "inline", "cold", "repr", "non_exhaustive", "default", "cfg", "test", "track_caller"]
+# Standard expression macros; local macro definitions/imports still make their origin unproved.
+std_macros = ["println", "eprintln", "print", "eprint", "format", "format_args", "write", "writeln", "vec", "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "panic", "unreachable", "todo", "unimplemented", "matches", "concat", "stringify", "env", "option_env"]

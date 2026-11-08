@@ -141,7 +141,7 @@ def main(args: list[str]) -> int:
         initial = cast(dict[str, object], json.loads(rest[0]))
         finish(script, initial, int(rest[1]), rest[2])
         return 0
-    print("verify.sh: usage: final-pass [<tree>]", file=sys.stderr)
+    print("verify.sh: usage: final --saved [--tree <tree>]", file=sys.stderr)
     return 2
 
 

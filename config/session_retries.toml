@@ -1,0 +1,4 @@
+# Registry reads include the initial read. Claude Code rewrites a record in place,
+# so a reader can see a half-written file; four reads 100 ms apart cover that write.
+registry_reads = 4
+registry_delay_seconds = 0.1

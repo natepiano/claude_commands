@@ -2,6 +2,14 @@
 
 The study covers the **15 phases with the most repair rounds** among the 1,867 phases started in the 60 days to 2026-10-20 (mixed records removed): **260 repair rounds and 271 hours of fix time**. These figures describe those 15 phases, not all phases. In them, failed fixes account for **36% of rounds and 49% of time**; specification gaps account for **17% and 19%**; mechanical work accounts for **15% and 11%**. These rounded figures come from [Totals](#totals); the three mixed records are excluded. Medians and phase/time shares in the round report use reviewed phases only; unreviewed phases remain in its rows and totals.
 
+## Milestones
+
+Compare fix rounds and review cost before and after each milestone with `~/.claude/scripts/lib/py ~/.claude/scripts/history/history.py compare --on <time>`.
+
+| Time | Main commit | Change |
+| --- | --- | --- |
+| 2026-11-02T12:26:32-05:00 | 23f0c2a9b (merge 6a02af4ae) | Each phase's first broad review also runs a read-only four-agent /simplify lens. The user approved it: "hopefully fixes go down as we simplify code over time - it's a milestone not to forget". |
+
 ## Method and selection
 
 Measured on 2026-10-20. The frozen selection command was:

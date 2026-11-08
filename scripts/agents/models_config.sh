@@ -1,0 +1,1326 @@
+#!/usr/bin/env bash
+# Shared agent registry and resolver.
+#
+# ~/.claude/config/models.conf maps each function to a family, each subtask to
+# an agent and optional effort, and each family to its valid agent catalog.
+# Consumers resolve task names through agents_resolve or agent_exec.
+
+# Bash only, and it has to say so rather than limp along. Sourced into zsh this
+# file fails two ways at once: zsh leaves BASH_REMATCH unset, so every section
+# lookup below matches nothing and returns empty answers with no error; and zsh
+# expands aliases while parsing a sourced file, so an interactive alias named
+# after a keyword the read loops use -- `continue` is aliased in this setup --
+# turns each loop iteration into a spawned command and the lookup hangs outright.
+# Every consumer is a bash script, so refusing costs nothing and a wrong answer
+# from a registry lookup is worse than no answer.
+if [ -n "${ZSH_VERSION:-}" ]; then
+    printf '%s\n' "models_config.sh: bash only; sourced into zsh it returns empty rows and can hang." >&2
+    printf '%s\n' "  use: bash -c 'source ~/.claude/scripts/agents/models_config.sh; <call>'" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+MODELS_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
+CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
+CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
+CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
+
+# Resolve the signed-in workers account rather than an inherited CODEX_HOME.
+agents_workers_home() {
+    "$MODELS_CONFIG_DIR/../lib/py" - "$MODELS_CONFIG_DIR/../.." <<'PY'
+import sys
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.whoami.agent_accounts import workers_home
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+PY
+}
+
+# The parser supplies the exact editor text and normalized lookup values.
+models_registry_text() {
+    if [[ "${MODELS_REGISTRY_BASE+x}" == x ]]; then
+        printf '%s' "$MODELS_REGISTRY_BASE"
+    else
+        _models_registry_read models_registry_text
+    fi
+}
+
+models_launch_configuration() {
+    _models_registry_parse --launch || return 1
+    export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE
+}
+
+models_registry_edit() {
+    if [[ "${_models_edit_active:-0}" == 1 ]]; then
+        "$@"
+        return $?
+    fi
+    local _models_edit_active=1
+    _models_registry_scope --edit "$@"
+}
+
+_models_registry_scope() {
+    local mode="$1"
+    shift
+    local _models_table_file MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_BASE MODELS_CONFIG_FILE="${MODELS_CONFIG_FILE:-}"
+    local -a _models_table_sections=() _models_table_keys=() _models_table_values=()
+    _models_registry_parse "$mode" || return 1
+    "$@"
+}
+
+# All editors use the same atomic row replay and publication path. The caller's
+# local snapshot identifies its changes without reverting a concurrent editor.
+models_registry_store() {
+    local registry="$1" description="${2:-update registry}" result=0 assignments
+    local extra=()
+    [[ "${3:-}" != additive-catalog ]] || extra+=(--additive-catalog)
+    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" store \
+        --registry "$MODELS_CONFIG_FILE" --after "$registry" \
+        --before <(printf '%s' "$MODELS_REGISTRY_BASE") --description "$description" \
+        "${extra[@]}")" || result=$?
+    rm -f "$registry"
+    [[ "$result" == 0 ]] || return "$result"
+    eval "$assignments"
+    _models_table_file="$MODELS_CONFIG_FILE"
+}
+
+models_agent_environment() {
+    unset MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_EDIT_BASE STAFF_OPERATION_FD
+}
+
+# With an output variable, trim in this shell. Without one, keep the printed API.
+models_config_trim() {
+    local agents_trim_value="$1"
+    agents_trim_value="${agents_trim_value#"${agents_trim_value%%[![:space:]]*}"}"
+    agents_trim_value="${agents_trim_value%"${agents_trim_value##*[![:space:]]}"}"
+    if [[ $# -gt 1 ]]; then
+        printf -v "$2" '%s' "$agents_trim_value"
+    else
+        printf '%s' "$agents_trim_value"
+    fi
+}
+
+# Nested readers share their caller's operation table.
+_models_registry_read() {
+    if [[ -n "${_models_table_file:-}" && "$_models_table_file" == "${MODELS_CONFIG_FILE:-}" ]]; then
+        "$@"
+        return $?
+    fi
+    _models_registry_scope --launch "$@"
+}
+
+_models_registry_parse() {
+    local assignments argument
+    local -a registry=()
+    if [[ -n "${MODELS_CONFIG_FILE:-}" ]]; then
+        registry=(--registry "$MODELS_CONFIG_FILE")
+        for argument in "$@"; do
+            case "$argument" in --registry|--registry=*) registry=(); break ;; esac
+        done
+    fi
+    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell "${registry[@]}" "$@")" || return 1
+    eval "$assignments"
+    _models_table_file="$MODELS_CONFIG_FILE"
+}
+
+_models_config_has_section() {
+    _models_registry_read _models_table_has_section "$@"
+}
+
+_models_table_has_section() {
+    local want_section="$1" index
+    for index in "${!_models_table_sections[@]}"; do
+        if [[ "${_models_table_sections[index]}" == "$want_section" \
+            && -z "${_models_table_keys[index]}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_models_config_section_values() {
+    _models_registry_read _models_table_section_values "$@"
+}
+
+_models_table_section_values() {
+    local want_section="$1" index
+    for index in "${!_models_table_sections[@]}"; do
+        [[ "${_models_table_sections[index]}" == "$want_section" ]] || continue
+        [[ -n "${_models_table_keys[index]}" ]] || continue
+        printf '%s=%s\n' "${_models_table_keys[index]}" "${_models_table_values[index]}"
+    done
+    return 0
+}
+
+_agents_section_keys_inline() {
+    _models_registry_read _agents_section_keys_inline_from_table "$@"
+}
+
+_agents_section_keys_inline_from_table() {
+    local section="$1" line key first=1
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$key"
+            first=0
+        else
+            printf ', %s' "$key"
+        fi
+    done < <(_models_config_section_values "$section")
+}
+
+_models_registry_get() {
+    _models_registry_read _models_table_get "$@"
+}
+
+_models_table_get() {
+    local section="$1" key="$2" index
+    for index in "${!_models_table_sections[@]}"; do
+        [[ "${_models_table_sections[index]}" == "$section" ]] || continue
+        [[ "${_models_table_keys[index]}" == "$key" ]] || continue
+        printf '%s' "${_models_table_values[index]}"
+        return 0
+    done
+    return 0
+}
+
+_models_registry_has_key() {
+    _models_registry_read _models_table_has_key "$@"
+}
+
+_models_table_has_key() {
+    local section="$1" key="$2" index
+    for index in "${!_models_table_sections[@]}"; do
+        [[ "${_models_table_sections[index]}" == "$section" ]] || continue
+        [[ "${_models_table_keys[index]}" == "$key" ]] && return 0
+    done
+    return 1
+}
+
+_agents_function_families_inline() {
+    _models_registry_read _agents_function_families_inline_from_table "$@"
+}
+
+_agents_function_families_inline_from_table() {
+    local function="$1" family first=1
+    for family in codex claude; do
+        _models_config_has_section "$function.$family" || continue
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
+# Print the sole family of a function with exactly one configured set.
+_agents_pinned_family() {
+    _models_registry_read _agents_pinned_family_from_table "$@"
+}
+
+_agents_pinned_family_from_table() {
+    local function="$1" family found=""
+    for family in codex claude; do
+        _models_config_has_section "$function.$family" || continue
+        [[ -n "$found" ]] && return 0
+        found="$family"
+    done
+    [[ -z "$found" ]] || printf '%s' "$found"
+}
+
+_agents_pinned_error() {
+    local function="$1" family="$2"
+    echo "ERROR: '$function' runs only on $family: [$function.$family] is its only set." >&2
+}
+
+# Every family whose catalog lists <agent>, inline for error text. Agent names
+# are disjoint across families, so exactly one match names a row's family and
+# two means the catalogs collided and the caller must refuse rather than pick.
+_agents_agent_families_inline() {
+    _models_registry_read _agents_agent_families_inline_from_table "$@"
+}
+
+_agents_agent_families_inline_from_table() {
+    local agent="$1" family first=1
+    for family in codex claude; do
+        if ! _models_registry_has_key "$family.agents" "$agent" \
+            && ! _models_registry_has_key "$family.families" "$agent"; then
+            continue
+        fi
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
+# Every family with an agent catalog, inline for error text.
+_agents_families_inline() {
+    _models_registry_read _agents_families_inline_from_table "$@"
+}
+
+_agents_families_inline_from_table() {
+    local family first=1
+    for family in codex claude; do
+        _models_config_has_section "$family.agents" || continue
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
+# `caller` in [assignments] means the function runs on the family of the agent
+# invoking it, not on a fixed one. ask_a_friend uses it: a friend of the caller's
+# own kind is the only friend that can talk back -- claude reaches claude by
+# SendMessage, codex reaches codex through codex_mesh.py, and a codex friend has
+# no route to a claude caller. A function assigned `caller` has no family switch.
+AGENTS_CALLER_ASSIGNMENT="caller"
+
+# The family of the agent running this shell. codex exports CODEX_THREAD_ID into
+# every shell it spawns and claude exports CLAUDE_CODE_SESSION_ID; codex wins when
+# both are present because a codex process launched from a claude session
+# inherits claude's variable and is still codex. AGENTS_CALLER_FAMILY overrides
+# detection, for tests and for a launcher that already knows. Empty when nothing
+# is detectable.
+_agents_caller_family() {
+    if [[ -n "${AGENTS_CALLER_FAMILY:-}" ]]; then
+        printf '%s' "$AGENTS_CALLER_FAMILY"
+    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        printf '%s' codex
+    elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+        printf '%s' claude
+    fi
+}
+
+# An assignment value as the family it means right now: `caller` becomes the
+# running agent's family (or empty), anything else is already a family.
+_agents_concrete_family() {
+    local raw="$1"
+    if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        _agents_caller_family
+    else
+        printf '%s' "$raw"
+    fi
+}
+
+_agents_caller_error() {
+    local context="$1"
+    echo "ERROR: [$context] is assigned '$AGENTS_CALLER_ASSIGNMENT': it runs on the calling agent's family, and no calling agent is detectable here." >&2
+    echo "       Run it from a codex or claude session, or set AGENTS_CALLER_FAMILY=<codex|claude>." >&2
+}
+
+# The assignment a task resolves through today: an exact-task override if one
+# exists, otherwise the function's. Raw -- may be `caller`.
+_agents_active_family() {
+    _models_registry_read _agents_active_family_from_table "$@"
+}
+
+_agents_active_family_from_table() {
+    local function="$1" subtask="$2" family
+    family="$(_models_registry_get assignments "$function.$subtask")"
+    if [[ -z "$family" ]]; then
+        family="$(_models_registry_get assignments "$function")"
+    fi
+    printf '%s' "$family"
+}
+
+# The concrete family a task runs on right now; empty for an undetectable caller.
+_agents_live_family() {
+    _models_registry_read _agents_live_family_from_table "$@"
+}
+
+_agents_live_family_from_table() {
+    _agents_concrete_family "$(_agents_active_family "$1" "$2")"
+}
+
+_agents_effort_allowed() {
+    local allowed="$1" effort="$2" item
+    local old_ifs="$IFS"
+    IFS=','
+    for item in $allowed; do
+        models_config_trim "$item" item
+        if [[ "$item" == "$effort" ]]; then
+            IFS="$old_ifs"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+# Resolve visible model-family versions with known effort rows. Numeric ties
+# use slug order, independent of cache order; a full slug needs no cache.
+_agents_model_slug() {
+    _models_registry_read _agents_model_slug_from_table "$@"
+}
+
+_agents_model_slug_from_table() {
+    local family="$1" word="$2" model cache_text
+    if ! _models_registry_has_key "$family.families" "$word"; then
+        printf '%s' "$word"
+        return 0
+    fi
+    if [[ "$family" != "codex" ]]; then
+        _models_registry_get "$family.families" "$word"
+        return 0
+    fi
+    cache_text="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/codex_models_cache.py" \
+        "$CODEX_MODELS_CACHE_FILE")" || return 1
+    if model="$(jq -er --arg family "$word" \
+        --arg catalog "$(_models_config_section_values codex.agents)" '
+        ($catalog | split("\n") | map(split("=")[0])) as $known_slugs
+        |
+        [.models[]
+            | select(.visibility == "list")
+            | .slug | select(type == "string") | . as $slug
+            | select($known_slugs | index($slug))
+            | capture("^gpt-(?<version>[0-9]+(?:\\.[0-9]+)*)-(?<family>[a-z][a-z0-9_-]*)$")
+            | select(.family == $family)
+            | . + {slug: $slug, version_numbers: (.version | split(".") | map(tonumber))}]
+        | max_by([.version_numbers, .slug])
+        | select(. != null)
+        | .slug
+    ' <<< "$cache_text" 2>/dev/null)" && [[ -n "$model" ]]; then
+        printf '%s' "$model"
+        return 0
+    fi
+    echo "no Codex model for '$word' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug" >&2
+    return 1
+}
+
+_agents_validate_pair() {
+    _models_registry_read _agents_validate_pair_from_table "$@"
+}
+
+_agents_validate_pair_from_table() {
+    local context="$1" family="$2" pair="$3"
+    local word model effort allowed_efforts allowed_agents
+
+    word="${pair%%:*}"
+    model="$(_agents_model_slug "$family" "$word")" || return 1
+    effort=""
+    if [[ "$pair" == *:* ]]; then
+        effort="${pair#*:}"
+        if [[ -z "$effort" ]]; then
+            echo "ERROR: [$context] effort must not be empty after ':'." >&2
+            return 1
+        fi
+    fi
+
+    if ! _models_registry_has_key "$family.agents" "$model"; then
+        allowed_agents="$(_agents_section_keys_inline "$family.agents")"
+        echo "ERROR: [$context] agent '$model' is not allowed for family '$family'." >&2
+        echo "       Allowed agents in $MODELS_CONFIG_FILE [$family.agents]: $allowed_agents" >&2
+        return 1
+    fi
+    allowed_efforts="$(_models_registry_get "$family.agents" "$model")"
+    if [[ -n "$effort" ]] && ! _agents_effort_allowed "$allowed_efforts" "$effort"; then
+        echo "ERROR: [$context] effort '$effort' is not allowed for agent '$model'." >&2
+        echo "       Allowed efforts in $MODELS_CONFIG_FILE [$family.agents] $model: $allowed_efforts" >&2
+        return 1
+    fi
+
+    AGENT_MODEL="$model"
+    AGENT_WORD="$word"
+    AGENT_EFFORT="$effort"
+}
+
+agents_resolve() {
+    _models_registry_read _agents_resolve_from_table "$@"
+}
+
+agents_resolve_claude_launcher() {
+    agents_resolve "$1" || return $?
+    if [[ "$AGENT_FAMILY" != claude ]]; then
+        printf '%s: Codex workers must use assign.sh.\n' "$2" >&2
+        return 2
+    fi
+}
+
+_agents_resolve_from_table() {
+    local task="$1" function subtask family pair section configured allowed_families
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
+    if [[ -z "$function" || -z "$subtask" || "$task" == "$function" || "$subtask" == *.* ]]; then
+        echo "ERROR: task '$task' must have exactly two segments: <function>.<subtask>." >&2
+        return 1
+    fi
+
+    family="$(_models_registry_get assignments "$task")"
+    if [[ -z "$family" ]]; then
+        family="$(_models_registry_get assignments "$function")"
+    fi
+    if [[ -z "$family" ]]; then
+        configured="$(_agents_section_keys_inline assignments)"
+        echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $MODELS_CONFIG_FILE: $configured" >&2
+        return 1
+    fi
+    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        family="$(_agents_caller_family)"
+        if [[ -z "$family" ]]; then
+            _agents_caller_error "$task"
+            return 1
+        fi
+    fi
+    _agents_resolve_in_family "$task" "$family"
+}
+
+# The part of resolution that follows family selection: section, row, pair.
+_agents_resolve_in_family() {
+    _models_registry_read _agents_resolve_in_family_from_table "$@"
+}
+
+_agents_resolve_in_family_from_table() {
+    local task="$1" family="$2" function subtask section pair configured allowed_families
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
+    section="$function.$family"
+    if ! _models_config_has_section "$section"; then
+        allowed_families="$(_agents_function_families_inline "$function")"
+        echo "ERROR: [$task] missing set section [$section] in $MODELS_CONFIG_FILE." >&2
+        echo "       Allowed families with a configured set: $allowed_families" >&2
+        return 1
+    fi
+    pair="$(_models_registry_get "$section" "$subtask")"
+    if [[ -z "$pair" ]]; then
+        configured="$(_agents_section_keys_inline "$section")"
+        echo "ERROR: [$task] missing sub-task '$subtask' in [$section]." >&2
+        echo "       Allowed sub-tasks: $configured" >&2
+        return 1
+    fi
+
+    AGENT_FAMILY="$family"
+    _agents_validate_pair "$task" "$family" "$pair" || return 1
+    _agents_resolve_service_tier "$task" "$family"
+}
+
+# The speed tier is a codex setting, read from the function's options section as
+# `codex_service_tier`, so a claude agent never carries one: Claude's fast mode
+# bills extra usage. An absent key leaves it empty, and the launch then inherits
+# `service_tier` from ~/.codex/config.toml. Codex drops a tier it does not
+# recognise without a word and runs at standard speed, so an unknown value is
+# refused here instead.
+# A row's own `codex_service_tier.<subtask>` beats the function's key.
+# `pace` hands the choice to ~/.claude/scripts/whoami/codex_pacer.py, which the
+# agent-sessions timer runs every two minutes: each launch takes the tier it last
+# wrote, and default once that is over ten minutes old or missing (the Mac has no
+# pacer, so there `pace` is default).
+_agents_stored_service_tier() {
+    _models_registry_read _agents_stored_service_tier_from_table "$@"
+}
+
+_agents_stored_service_tier_from_table() {
+    local function="$1" subtask="$2" tier
+    tier="$(_models_registry_get "$function.options" "codex_service_tier.$subtask")"
+    [[ -n "$tier" ]] || tier="$(_models_registry_get "$function.options" codex_service_tier)"
+    printf '%s' "$tier"
+}
+
+_agents_resolve_service_tier() {
+    _models_registry_read _agents_resolve_service_tier_from_table "$@"
+}
+
+_agents_resolve_service_tier_from_table() {
+    local task="$1" family="$2" function tier
+
+    AGENT_SERVICE_TIER=""
+    AGENT_SERVICE_TIER_PACED=""
+    [[ "$family" == "codex" ]] || return 0
+    function="${task%%.*}"
+    tier="$(_agents_stored_service_tier "$function" "${task#*.}")"
+    case "$tier" in
+        ''|fast|flex|default) AGENT_SERVICE_TIER="$tier" ;;
+        pace)
+            AGENT_SERVICE_TIER="$(_agents_pace_tier)"
+            AGENT_SERVICE_TIER_PACED="yes"
+            ;;
+        *)
+            echo "ERROR: [$task] codex_service_tier '$tier' in [$function.options] is not a codex service tier." >&2
+            echo "       Allowed values: fast, flex, default, pace" >&2
+            return 1
+            ;;
+    esac
+}
+
+# The pacer's current decision, fast or default; default when it is stale or absent.
+_agents_pace_tier() {
+    local tier=""
+    if [[ -n "$(find "$CODEX_PACER_TIER_FILE" -mmin -10 2>/dev/null)" ]]; then
+        read -r tier < "$CODEX_PACER_TIER_FILE" || true
+    fi
+    case "$tier" in
+        fast) printf 'fast' ;;
+        *) printf 'default' ;;
+    esac
+}
+
+# The top-level `service_tier` in ~/.codex/config.toml: what a codex row with no
+# registry tier runs at. Empty when the Codex config sets none.
+_agents_codex_config_tier() {
+    local line
+    [[ -f "$CODEX_CONFIG_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        models_config_trim "${line%%#*}" line
+        [[ "$line" == \[* ]] && return 0
+        if [[ "$line" =~ ^service_tier[[:space:]]*=[[:space:]]*\"?([^\"]*)\"?$ ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$CODEX_CONFIG_FILE"
+}
+
+# A running Codex turn uses only the registry. An empty setting means default.
+# A task without a row uses only the function's setting.
+agents_turn_service_tier() {
+    _models_registry_read _agents_turn_service_tier_from_table "$@"
+}
+
+_agents_turn_service_tier_from_table() {
+    local task="${1:-delegate}"
+    [[ "$task" == *.* ]] || task="$task."
+    _agents_resolve_service_tier "$task" codex || return
+    printf '%s' "${AGENT_SERVICE_TIER:-default}"
+}
+
+# A row's tier as /default_models shows it: `-` for claude, which never takes one; the
+# registry tier for codex, `pace(<its current decision>)`, or
+# `inherit(<config.toml tier>)` when there is none.
+_agents_tier_display() {
+    local family="$1" tier="$2"
+    if [[ "$family" != "codex" ]]; then
+        printf '%s' '-'
+    elif [[ "$tier" == "pace" ]]; then
+        printf 'pace(%s)' "$(_agents_pace_tier)"
+    elif [[ -n "$tier" ]]; then
+        printf '%s' "$tier"
+    else
+        tier="$(_agents_codex_config_tier)"
+        printf 'inherit%s' "${tier:+($tier)}"
+    fi
+}
+
+_agents_print_resolved() {
+    _models_registry_read _agents_print_resolved_from_table "$@"
+}
+
+_agents_print_resolved_from_table() {
+    local tier="$AGENT_SERVICE_TIER" word_field=""
+    if _models_registry_has_key "$AGENT_FAMILY.families" "$AGENT_WORD"; then
+        word_field=" word=$AGENT_WORD"
+    fi
+    [[ -n "${AGENT_SERVICE_TIER_PACED:-}" ]] && tier="pace"
+    printf 'task=%s family=%s agent=%s effort=%s tier=%s%s\n' \
+        "$1" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" \
+        "$(_agents_tier_display "$AGENT_FAMILY" "$tier")" "$word_field"
+}
+
+agents_resolve_print() {
+    _models_registry_read _agents_resolve_print_from_table "$@"
+}
+
+_agents_resolve_print_from_table() {
+    local task="$1"
+    agents_resolve "$task" || return 1
+    _agents_print_resolved "$task"
+}
+
+_agents_resolve_print_in_family() {
+    _models_registry_read _agents_resolve_print_in_family_from_table "$@"
+}
+
+_agents_resolve_print_in_family_from_table() {
+    local task="$1" family="$2"
+    AGENT_FAMILY="$family"
+    _agents_resolve_in_family "$task" "$family" || return 1
+    _agents_print_resolved "$task"
+}
+
+# Print one function's rows in one family, skipping sub-tasks an exact-task
+# assignment override shadows (those print once, from their own key).
+_agents_list_function_rows() {
+    _models_registry_read _agents_list_function_rows_from_table "$@"
+}
+
+_agents_list_function_rows_from_table() {
+    local function="$1" family="$2" line subtask
+    while IFS= read -r line; do
+        subtask="${line%%=*}"
+        if [[ -n "$(_models_registry_get assignments "$function.$subtask")" ]]; then
+            continue
+        fi
+        _agents_resolve_print_in_family "$function.$subtask" "$family" || return 1
+    done < <(_models_config_section_values "$function.$family")
+}
+
+agents_list_assignments() {
+    _models_registry_read _agents_list_assignments_from_table "$@"
+}
+
+_agents_list_assignments_from_table() {
+    local filter="${1:-}" assignment key family live matched=0
+    while IFS= read -r assignment; do
+        key="${assignment%%=*}"
+        models_config_trim "${assignment#*=}" family
+        if [[ -n "$filter" && "$key" != "$filter" && "$key" != "$filter".* ]]; then
+            continue
+        fi
+        matched=1
+        if [[ "$key" == *.* ]]; then
+            agents_resolve_print "$key" || return 1
+            continue
+        fi
+        if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+            # A caller function has no single answer from outside a session:
+            # show the family that would run from here, or both when nothing
+            # says which.
+            live="$(_agents_caller_family)"
+            if [[ -n "$live" ]]; then
+                _agents_list_function_rows "$key" "$live" || return 1
+                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
+            else
+                for live in codex claude; do
+                    _models_config_has_section "$key.$live" || continue
+                    _agents_list_function_rows "$key" "$live" || return 1
+                done
+                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
+            fi
+            continue
+        fi
+        _agents_list_function_rows "$key" "$family" || return 1
+    done < <(_models_config_section_values assignments)
+    if [[ -n "$filter" && "$matched" -eq 0 ]]; then
+        echo "ERROR: no [assignments] entry for '$filter'." >&2
+        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+}
+
+# Print every family's rows for one function, then a comment naming the
+# active family (plus any per-subtask assignment overrides).
+agents_list_function() {
+    _models_registry_read _agents_list_function_from_table "$@"
+}
+
+_agents_list_function_from_table() {
+    local function="$1" active family line key subtask pair model effort overrides=""
+    local row_active live tier word_field resolved_model
+
+    active="$(_models_registry_get assignments "$function")"
+    if [[ -z "$active" ]]; then
+        echo "ERROR: no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+    for family in codex claude; do
+        _models_config_has_section "$function.$family" || continue
+        while IFS= read -r line; do
+            subtask="${line%%=*}"
+            models_config_trim "${line#*=}" pair
+            model="${pair%%:*}"
+            word_field=""
+            if _models_registry_has_key "$family.families" "$model"; then
+                word_field=" word=$model"
+                if resolved_model="$(_agents_model_slug "$family" "$model" 2>&1)"; then
+                    model="$resolved_model"
+                else
+                    model="$model (unresolved: $resolved_model)"
+                fi
+            fi
+            effort=""
+            [[ "$pair" == *:* ]] && effort="${pair#*:}"
+            if [[ "$(_agents_live_family "$function" "$subtask")" == "$family" ]]; then
+                row_active="yes"
+            else
+                row_active="no"
+            fi
+            tier=""
+            [[ "$family" == "codex" ]] && tier="$(_agents_stored_service_tier "$function" "$subtask")"
+            tier="$(_agents_tier_display "$family" "$tier")"
+            printf 'task=%s family=%s agent=%s effort=%s active=%s tier=%s%s\n' \
+                "$function.$subtask" "$family" "$model" "$effort" "$row_active" "$tier" "$word_field"
+        done < <(_models_config_section_values "$function.$family")
+    done
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        [[ "$key" == "$function".* ]] || continue
+        models_config_trim "${line#*=}" pair
+        overrides="$overrides, ${key#"$function".}=$pair"
+    done < <(_models_config_section_values assignments)
+    if [[ "$active" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        live="$(_agents_caller_family)"
+        if [[ -n "$live" ]]; then
+            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
+        else
+            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
+        fi
+    fi
+    if [[ -n "$overrides" ]]; then
+        echo "# current family: $active (overrides:${overrides#,})"
+    else
+        echo "# current family: $active"
+    fi
+}
+
+agents_set_assignment() { models_registry_edit _agents_set_assignment "$@"; }
+
+_agents_set_assignment() {
+    local function="$1" family="$2" section line subtask pair tmp_file allowed_families current pinned
+
+    if [[ -z "$function" || "$function" == *.* ]]; then
+        echo "ERROR: assignment function must be one segment; got '$function'." >&2
+        return 1
+    fi
+    current="$(_models_registry_get assignments "$function")"
+    if [[ "$current" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        echo "ERROR: '$function' is assigned '$AGENTS_CALLER_ASSIGNMENT': it always runs on the calling agent's family and has no switch." >&2
+        echo "       Edit its rows instead: default_models.sh $function.<subtask> <agent>[:<effort>]" >&2
+        return 1
+    fi
+    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        echo "ERROR: '$AGENTS_CALLER_ASSIGNMENT' is not a switch target; it is written by hand in $MODELS_CONFIG_FILE [assignments]." >&2
+        return 1
+    fi
+    pinned="$(_agents_pinned_family "$function")"
+    if [[ -n "$pinned" && "$family" != "$pinned" ]]; then
+        _agents_pinned_error "$function" "$pinned"
+        return 1
+    fi
+    section="$function.$family"
+    if ! _models_config_has_section "$section"; then
+        allowed_families="$(_agents_function_families_inline "$function")"
+        echo "ERROR: cannot assign '$function' to '$family': missing [$section]." >&2
+        echo "       Allowed families with a configured set: $allowed_families" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        subtask="${line%%=*}"
+        pair="${line#*=}"
+        if ! _agents_validate_pair "$function.$subtask" "$family" "$pair"; then
+            echo "ERROR: assignment rejected because [$section] row '$subtask' is invalid." >&2
+            return 1
+        fi
+    done < <(_models_config_section_values "$section")
+
+    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    if ! awk -v fn="$function" -v fam="$family" '
+        /^\[assignments\]/ { in_section = 1; print; next }
+        /^\[/ { in_section = 0; print; next }
+        in_section && index($0, fn "=") == 1 {
+            print fn "=" fam
+            found = 1
+            next
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' <(models_registry_text) > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: no [assignments] entry for '$function'; $MODELS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    models_registry_store "$tmp_file" "set $function assignment to $family" || return $?
+}
+
+# Switch every [assignments] entry — functions and any exact-task overrides —
+# to one family. Validated wholesale first, so a switch that would leave any
+# task unresolvable is rejected before a single line is written.
+agents_set_all_assignments() { models_registry_edit _agents_set_all_assignments "$@"; }
+
+_agents_set_all_assignments() {
+    local family="$1" line key fn subtask section row pinned seen="" tmp_file
+    AGENT_KEPT_FUNCTIONS=""
+
+    if [[ -z "$family" ]] || ! _models_config_has_section "$family.agents"; then
+        echo "ERROR: unknown family '$family'." >&2
+        echo "       Configured families in $MODELS_CONFIG_FILE: $(_agents_families_inline)" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        # A caller function is not switched, so it is not validated against the
+        # target either; it already resolves through whichever family asks.
+        models_config_trim "${line#*=}" row
+        [[ "$row" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
+        fn="${key%%.*}"
+        pinned="$(_agents_pinned_family "$fn")"
+        if [[ -n "$pinned" ]]; then
+            case " $AGENT_KEPT_FUNCTIONS " in
+                *" $fn "*) ;;
+                *) AGENT_KEPT_FUNCTIONS="${AGENT_KEPT_FUNCTIONS:+$AGENT_KEPT_FUNCTIONS }$fn" ;;
+            esac
+            continue
+        fi
+        section="$fn.$family"
+        if ! _models_config_has_section "$section"; then
+            echo "ERROR: cannot assign '$fn' to '$family': missing [$section]." >&2
+            echo "       Allowed families with a configured set: $(_agents_function_families_inline "$fn")" >&2
+            return 1
+        fi
+        if [[ "$key" == *.* ]]; then
+            subtask="${key#*.}"
+            if ! _models_registry_has_key "$section" "$subtask"; then
+                echo "ERROR: cannot assign '$key' to '$family': [$section] has no row '$subtask'." >&2
+                echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$section")" >&2
+                return 1
+            fi
+        fi
+        case " $seen " in
+            *" $section "*) continue ;;
+        esac
+        seen="$seen $section"
+        while IFS= read -r row; do
+            if ! _agents_validate_pair "$fn.${row%%=*}" "$family" "${row#*=}"; then
+                echo "ERROR: switch rejected because [$section] row '${row%%=*}' is invalid." >&2
+                return 1
+            fi
+        done < <(_models_config_section_values "$section")
+    done < <(_models_config_section_values assignments)
+
+    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    if ! awk -v fam="$family" -v caller="$AGENTS_CALLER_ASSIGNMENT" \
+        -v kept=" $AGENT_KEPT_FUNCTIONS " '
+        /^\[/ {
+            in_section = ($0 == "[assignments]")
+            print
+            next
+        }
+        in_section {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals) {
+                value = substr(before_comment, equals + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                found = 1
+                if (value == caller) { print; next }
+                key = substr(before_comment, 1, equals - 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                sub(/\..*/, "", key)
+                if (index(kept, " " key " ") > 0) { print; next }
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                print substr(before_comment, 1, equals) fam spacing comment
+                next
+            }
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' <(models_registry_text) > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: [assignments] has no entries; $MODELS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    models_registry_store "$tmp_file" "set all assignments to $family" || return $?
+}
+
+# Put every function -- or just <function> -- on one agent, keeping each row's
+# effort. The agent names its own family, as in agents_set_row. Each fixed
+# assignment in scope, exact-task overrides included, switches to that family,
+# and every row of each [<function>.<family>] set takes the agent. A `caller`
+# function keeps its assignment, but its set for that family takes the agent
+# too: that set is live whenever an agent of that family asks. Validated
+# wholesale first -- a missing set, an override with no row, or a kept effort
+# the agent's catalog lacks rejects the change with the file untouched -- then
+# one awk pass writes it. Sets AGENT_SWEEP_FAMILY.
+agents_set_model() { models_registry_edit _agents_set_model "$@"; }
+
+_agents_set_model() {
+    local agent="$1" only="${2:-}" family line key value fn section row pair pinned
+    local sections="" matched=0 tmp_file
+    AGENT_KEPT_FUNCTIONS=""
+
+    if [[ -z "$agent" || "$agent" == *:* ]]; then
+        echo "ERROR: name the agent alone; each row keeps its own effort. Got '$agent'." >&2
+        return 1
+    fi
+    family="$(_agents_agent_families_inline "$agent")"
+    if [[ -z "$family" ]]; then
+        echo "ERROR: unknown agent '$agent'." >&2
+        echo "       Allowed agents in $MODELS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $MODELS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        return 1
+    fi
+    if [[ "$family" == *,* ]]; then
+        echo "ERROR: agent '$agent' is listed by more than one family ($family)." >&2
+        echo "       Remove the duplicate in $MODELS_CONFIG_FILE so an agent names exactly one family." >&2
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        models_config_trim "${line#*=}" value
+        fn="${key%%.*}"
+        [[ -n "$only" && "$fn" != "$only" ]] && continue
+        matched=1
+        pinned="$(_agents_pinned_family "$fn")"
+        if [[ -n "$pinned" ]]; then
+            if [[ -z "$only" ]]; then
+                case " $AGENT_KEPT_FUNCTIONS " in
+                    *" $fn "*) ;;
+                    *) AGENT_KEPT_FUNCTIONS="${AGENT_KEPT_FUNCTIONS:+$AGENT_KEPT_FUNCTIONS }$fn" ;;
+                esac
+                continue
+            fi
+            if [[ "$family" != "$pinned" ]]; then
+                _agents_pinned_error "$fn" "$pinned"
+                return 1
+            fi
+        fi
+        section="$fn.$family"
+        if ! _models_config_has_section "$section"; then
+            # A caller function with no set for this family has nothing to write.
+            [[ "$value" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
+            echo "ERROR: cannot assign '$fn' to '$agent': missing [$section]." >&2
+            echo "       Allowed families with a configured set: $(_agents_function_families_inline "$fn")" >&2
+            return 1
+        fi
+        if [[ "$key" == *.* ]] && ! _models_registry_has_key "$section" "${key#*.}"; then
+            echo "ERROR: cannot assign '$key' to '$agent': [$section] has no row '${key#*.}'." >&2
+            echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$section")" >&2
+            return 1
+        fi
+        case " $sections " in
+            *" $section "*) continue ;;
+        esac
+        sections="$sections $section"
+        while IFS= read -r row; do
+            models_config_trim "${row#*=}" pair
+            if ! _agents_validate_pair "$fn.${row%%=*}" "$family" "$agent${pair#"${pair%%:*}"}"; then
+                echo "ERROR: change rejected because [$section] row '${row%%=*}' keeps an effort '$agent' does not allow." >&2
+                return 1
+            fi
+        done < <(_models_config_section_values "$section")
+    done < <(_models_config_section_values assignments)
+    if [[ -n "$only" && "$matched" -eq 0 ]]; then
+        echo "ERROR: no [assignments] entry for '$only'." >&2
+        echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+
+    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    if ! NEW_AGENT="$agent" awk -v fam="$family" -v only="$only" \
+        -v caller="$AGENTS_CALLER_ASSIGNMENT" -v secs="$sections " \
+        -v kept=" $AGENT_KEPT_FUNCTIONS " '
+        /^\[/ {
+            name = substr($0, 2, length($0) - 2)
+            in_assign = ($0 == "[assignments]")
+            in_rows = !in_assign && index(secs, " " name " ") > 0
+            print
+            next
+        }
+        in_assign || in_rows {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals) {
+                value = substr(before_comment, equals + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                if (in_rows) {
+                    colon = index(value, ":")
+                    print substr(before_comment, 1, equals) ENVIRON["NEW_AGENT"] \
+                        (colon ? substr(value, colon) : "") spacing comment
+                    next
+                }
+                fn = substr(before_comment, 1, equals - 1)
+                sub(/\..*/, "", fn)
+                if (index(kept, " " fn " ") > 0) { print; next }
+                if ((only == "" || fn == only) && value != caller) {
+                    print substr(before_comment, 1, equals) fam spacing comment
+                    next
+                }
+            }
+        }
+        { print }
+    ' <(models_registry_text) > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: rewrite failed; $MODELS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    models_registry_store "$tmp_file" "set ${only:-all functions} model to $agent" || return $?
+    AGENT_SWEEP_FAMILY="$family"
+}
+
+# Edit one row. The agent names its own family, so the row written is the one
+# the agent could only ever have meant — never the merely-active one. Sets
+# AGENT_ROW_FAMILY (where it landed), AGENT_ROW_ASSIGNMENT (the raw assignment,
+# `caller` included), AGENT_ROW_ACTIVE_FAMILY (what the task resolves through
+# today; empty for an undetectable caller), and AGENT_ROW_ACTIVE (yes when the
+# row's family is the one resolving today).
+agents_set_row() { models_registry_edit _agents_set_row "$@"; }
+
+_agents_set_row() {
+    local task="$1" pair="$2" function subtask family families active
+    local section tmp_file configured pinned
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
+    if [[ -z "$function" || -z "$subtask" || "$task" == "$function" || "$subtask" == *.* ]]; then
+        echo "ERROR: task '$task' must have exactly two segments: <function>.<subtask>." >&2
+        return 1
+    fi
+
+    active="$(_agents_active_family "$function" "$subtask")"
+    if [[ -z "$active" ]]; then
+        configured="$(_agents_section_keys_inline assignments)"
+        echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $MODELS_CONFIG_FILE: $configured" >&2
+        return 1
+    fi
+
+    families="$(_agents_agent_families_inline "${pair%%:*}")"
+    if [[ -z "$families" ]]; then
+        echo "ERROR: [$task] unknown agent '${pair%%:*}'." >&2
+        echo "       Allowed agents in $MODELS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $MODELS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        return 1
+    fi
+    if [[ "$families" == *,* ]]; then
+        echo "ERROR: [$task] agent '${pair%%:*}' is listed by more than one family ($families)." >&2
+        echo "       Remove the duplicate in $MODELS_CONFIG_FILE so an agent names exactly one family." >&2
+        return 1
+    fi
+    family="$families"
+    pinned="$(_agents_pinned_family "$function")"
+    if [[ -n "$pinned" && "$family" != "$pinned" ]]; then
+        _agents_pinned_error "$function" "$pinned"
+        return 1
+    fi
+
+    section="$function.$family"
+    if ! _models_config_has_section "$section"; then
+        echo "ERROR: [$task] '${pair%%:*}' is a $family agent, but there is no [$section]." >&2
+        echo "       Families with a configured set for '$function': $(_agents_function_families_inline "$function")" >&2
+        return 1
+    fi
+    if ! _models_registry_has_key "$section" "$subtask"; then
+        configured="$(_agents_section_keys_inline "$section")"
+        echo "ERROR: [$task] missing sub-task '$subtask' in [$section]." >&2
+        echo "       Allowed sub-tasks: $configured" >&2
+        return 1
+    fi
+    _agents_validate_pair "$task" "$family" "$pair" || return 1
+
+    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    if ! NEW_PAIR="$pair" awk -v sec="$section" -v row="$subtask" '
+        /^\[/ {
+            in_section = ($0 == "[" sec "]")
+            print
+            next
+        }
+        in_section {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals && substr(before_comment, 1, equals - 1) == row) {
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                print substr(before_comment, 1, equals) ENVIRON["NEW_PAIR"] spacing comment
+                found = 1
+                next
+            }
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' <(models_registry_text) > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: no [$section] row '$subtask'; $MODELS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    models_registry_store "$tmp_file" "set $task to $pair" || return $?
+
+    AGENT_ROW_FAMILY="$family"
+    AGENT_ROW_ASSIGNMENT="$active"
+    AGENT_ROW_ACTIVE_FAMILY="$(_agents_concrete_family "$active")"
+    if [[ "$family" == "$AGENT_ROW_ACTIVE_FAMILY" ]]; then
+        AGENT_ROW_ACTIVE="yes"
+    else
+        AGENT_ROW_ACTIVE="no"
+    fi
+}
+
+# Set the codex speed tier for every function, for <function>, or for one
+# <function>.<subtask> row; `inherit` deletes the key at that level. A row key
+# beats its function's key, so a function or every-function write also deletes
+# the row keys beneath it: every codex row in scope then runs the named tier.
+# Only functions with a codex set are written. A function running claude keeps
+# the key dormant until it switches. A new [<function>.options] goes after the
+# function's last row, and a section left empty by `inherit` goes with it, so a
+# set and its inherit round-trip byte for byte. Sets AGENT_TIER_FUNCTIONS, the
+# functions in scope.
+agents_set_service_tier() { models_registry_edit _agents_set_service_tier "$@"; }
+
+_agents_set_service_tier() {
+    local tier="$1" scope="${2:-}" function subtask="" line fn fns="" value="" tmp_file
+
+    case "$tier" in
+        fast|flex|default|pace) value="$tier" ;;
+        inherit) ;;
+        *)
+            echo "ERROR: '$tier' is not a codex service tier." >&2
+            echo "       Allowed: fast, flex, default, pace, or inherit to follow ~/.codex/config.toml" >&2
+            return 1
+            ;;
+    esac
+    if [[ -z "$scope" ]]; then
+        while IFS= read -r line; do
+            fn="${line%%=*}"
+            fn="${fn%%.*}"
+            case " $fns " in
+                *" $fn "*) continue ;;
+            esac
+            _models_config_has_section "$fn.codex" && fns="$fns $fn"
+        done < <(_models_config_section_values assignments)
+        if [[ -z "$fns" ]]; then
+            echo "ERROR: no function in [assignments] has a codex set; nothing takes a codex tier." >&2
+            return 1
+        fi
+    else
+        function="${scope%%.*}"
+        [[ "$scope" == *.* ]] && subtask="${scope#*.}"
+        if [[ -z "$function" || "$subtask" == *.* || ( "$scope" == *. ) ]]; then
+            echo "ERROR: '$scope' must be <function> or <function>.<subtask>." >&2
+            return 1
+        fi
+        if [[ -z "$(_models_registry_get assignments "$function")" ]]; then
+            echo "ERROR: no [assignments] entry for '$function'." >&2
+            echo "       Configured assignments in $MODELS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+            return 1
+        fi
+        if ! _models_config_has_section "$function.codex"; then
+            echo "ERROR: '$function' has no [$function.codex], and the tier is a codex setting." >&2
+            return 1
+        fi
+        if [[ -n "$subtask" ]] && ! _models_registry_has_key "$function.codex" "$subtask"; then
+            echo "ERROR: [$scope] missing sub-task '$subtask' in [$function.codex]." >&2
+            echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$function.codex")" >&2
+            return 1
+        fi
+        fns=" $function"
+    fi
+
+    tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+    if ! TIER_FNS="$fns" TIER_ROW="$subtask" TIER_VALUE="$value" awk '
+        function key_of(line,    hash, equals, key) {
+            hash = index(line, "#")
+            if (hash) line = substr(line, 1, hash - 1)
+            equals = index(line, "=")
+            if (!equals) return ""
+            key = substr(line, 1, equals - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            return key
+        }
+        BEGIN {
+            fns = ENVIRON["TIER_FNS"] " "
+            row = ENVIRON["TIER_ROW"]
+            value = ENVIRON["TIER_VALUE"]
+            target = "codex_service_tier" (row == "" ? "" : "." row)
+            prefix = "codex_service_tier."
+        }
+        # Pass 1: find each function'\''s options header, its tier keys, and
+        # the last row of its sections.
+        NR == FNR {
+            if (/^\[/) {
+                sec = substr($0, 2, index($0, "]") - 2)
+                fn = index(sec, ".") ? substr(sec, 1, index(sec, ".") - 1) : ""
+                mine = fn != "" && index(fns, " " fn " ") > 0
+                opts = mine && sec == fn ".options"
+                if (opts) header[fn] = FNR
+                next
+            }
+            if (/^[[:space:]]*$/) { blank[FNR] = 1; next }
+            if (!mine) next
+            key = key_of($0)
+            # A comment is never dropped, so only another line keeps a section.
+            if (key == "") { if (opts && !/^[[:space:]]*#/) other[fn] = 1; next }
+            if (!opts) { last_row[fn] = FNR; next }
+            if (key == target) {
+                has_target[fn] = 1
+                if (value == "") drop[FNR] = 1; else replace[FNR] = 1
+            } else if (row == "" && index(key, prefix) == 1) {
+                drop[FNR] = 1
+            } else {
+                other[fn] = 1
+                anchor[fn] = FNR
+            }
+            next
+        }
+        # Pass 2 opens by planning each function: insert the key, or drop a
+        # section inherit leaves empty along with the blank line above it.
+        FNR == 1 {
+            count = split(fns, list, " ")
+            for (i = 1; i <= count; i++) {
+                fn = list[i]
+                if (value == "") {
+                    if ((fn in header) && !(fn in other)) {
+                        drop[header[fn]] = 1
+                        if ((header[fn] - 1) in blank) drop[header[fn] - 1] = 1
+                    }
+                } else if (fn in has_target) {
+                    continue
+                } else if (fn in header) {
+                    insert[(fn in anchor) ? anchor[fn] : header[fn]] = target "=" value
+                } else if (fn in last_row) {
+                    insert[last_row[fn]] = "\n[" fn ".options]\n" target "=" value
+                } else {
+                    tail = tail "\n[" fn ".options]\n" target "=" value "\n"
+                }
+            }
+        }
+        FNR in drop { next }
+        FNR in replace {
+            hash = index($0, "#")
+            before_comment = hash ? substr($0, 1, hash - 1) : $0
+            match(before_comment, /[[:space:]]*$/)
+            spacing = substr(before_comment, RSTART)
+            print substr(before_comment, 1, index(before_comment, "=")) value spacing \
+                (hash ? substr($0, hash) : "")
+            next
+        }
+        { print }
+        FNR in insert { print insert[FNR] }
+        END { printf "%s", tail }
+    ' <(models_registry_text) <(models_registry_text) > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: rewrite failed; $MODELS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    models_registry_store "$tmp_file" "set ${scope:-all functions} service tier to $tier" || return $?
+    AGENT_TIER_FUNCTIONS="${fns# }"
+}
+
+agents_codex_args() {
+    printf '%s %s' '-m' "$AGENT_MODEL"
+    if [[ -n "$AGENT_EFFORT" ]]; then
+        printf ' %s %s' '-c' "model_reasoning_effort=\"$AGENT_EFFORT\""
+    fi
+    if [[ -n "${AGENT_SERVICE_TIER:-}" ]]; then
+        printf ' %s %s' '-c' "service_tier=\"$AGENT_SERVICE_TIER\""
+    fi
+    printf '\n'
+}
+
+agents_claude_args() {
+    printf '%s %s' '--model' "$AGENT_MODEL"
+    if [[ -n "$AGENT_EFFORT" ]]; then
+        printf ' %s %s' '--effort' "$AGENT_EFFORT"
+    fi
+    printf '\n'
+}

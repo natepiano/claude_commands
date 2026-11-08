@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import unittest
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenFifoTests(VerifyTokenWaitFixture):
@@ -33,7 +34,14 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
             self.assertFalse((board / "locks" / "cargo.d").exists(), "the newer call took the token")
             self.end_group(older.pid)
             _ = older.wait(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(call.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
+            try:
+                status = call.wait(timeout=TEST_HANG_GUARD_SECS)
+            except FixtureHang as error:
+                raise FixtureHang(
+                    f"{error}\nCall output:\n{output.read_text(errors='replace')}"
+                    + f"\nQueue files: {sorted(path.name for path in waiters.iterdir())}"
+                ) from error
+            self.assertEqual(status, 0, output.read_text())
         finally:
             if older.stdin is not None:
                 older.stdin.close()

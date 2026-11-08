@@ -7,6 +7,7 @@ import io
 import fcntl
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -17,27 +18,38 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-if TYPE_CHECKING:
-    from ..lib.process_start_test_support import write_stat
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib.process_start_test_support import write_stat
+from scripts.build_hold import build_hold
+from scripts.build_hold import hold_enforcer
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord
 
-import build_hold
-import unit_runs
-from sessions import SessionRecord
-
-from build_hold_test_support import (
+from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
-    HoldEventRecord, SCRIPT, TEST_HANG_GUARD_SECS,
-    invoke_hold, recorded_hold_events, write_holder,
+    HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
+from scripts.direct import step_record
+from scripts.build_queue import admission_protocol, admission_service
+from scripts.build_queue.admission_test_support import only_admitted
+from scripts.lib import test_hang_guard
+
+
+class ImportTests(unittest.TestCase):
+    def test_clean_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.build_queue.admission_service", "scripts.message.sessions")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.build_hold import build_hold; "
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
@@ -299,8 +311,13 @@ class RenameHolderTests(IsolatedBuildHoldTest):
 
 class QuietTests(IsolatedBuildHoldTest):
     def write_process_stat(self, process: build_hold.Process, utime: int, stime: int, started: int = 1) -> Path:
-        return write_stat(self.scratch / "proc", process.pid, command=f"{process.command} worker)",
-                          state="R", utime=utime, stime=stime, start_ticks=started)
+        path = self.scratch / "proc" / str(process.pid) / "stat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["0"] * 20
+        fields[0] = "R"
+        fields[11], fields[12], fields[19] = str(utime), str(stime), str(started)
+        _ = path.write_text(f"{process.pid} ({process.command} worker)) " + " ".join(fields) + "\n")
+        return path
 
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
         user = "natepiano"
@@ -472,7 +489,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
-            "BUILD_TARGETS_CONFIG": str(SCRIPT.parent.parent.parent / "config/build_targets.conf"),
+            "CONF_DIR": str(Path(SCRIPT.parent.parent.parent / "config/build_targets.conf").parent),
         }))
 
     def run_with_mac_stand_in(
@@ -480,9 +497,12 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     ) -> tuple[int, str, str, list[list[str]]]:
         calls: list[list[str]] = []
         expected_script = SCRIPT.resolve().parent.parent / "mac_test/mac_test.py"
+        run = subprocess.run
 
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
+            if argv[:1] == ["git"]:
+                return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertEqual(argv[:2], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
             calls.append(argv[2:])
@@ -517,7 +537,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"])
         self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -528,7 +548,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 status, output, errors, calls = self.run_with_mac_stand_in(
                     ["release", "--target", "mac", "--holder", "alice"], exit_code=exit_code)
                 self.assertEqual(status, exit_code, errors)
-                self.assertEqual(calls, [["unblock", "--holder", "alice"]])
+                self.assertEqual(calls, [["unblock", "--holder", "alice", "--target", "mac"]])
                 self.assertEqual(output, "Mac stand-in result\n")
                 self.assertEqual(errors, "Mac stand-in detail\n")
                 self.assert_no_natedev_record()
@@ -537,7 +557,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"], exit_code=9)
         self.assertEqual(status, 9, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -565,13 +585,13 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, _, errors, calls = self.run_with_mac_stand_in(
                         ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks"]])
+                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks", "--target", "mac"]])
                     self.session("current-name", "first-name", "middle-name")
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"],
-                                             ["unblock", "--holder", "first-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"],
+                                             ["unblock", "--holder", "first-name", "--target", "mac"]])
                     self.assertEqual(output, "Mac stand-in result\n")
                     self.assertEqual(errors, "Mac stand-in detail\n")
                     self.assertFalse((self.scratch / "stand-in-block-holder").exists())
@@ -583,7 +603,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"]])
                     self.assertEqual(output, "blocked by someone-else\n")
                     self.assertEqual(errors, "")
                     self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
@@ -613,30 +633,35 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     [*arguments, "--target", "missing", "--holder", "alice"])
                 self.assertEqual(status, 2)
                 self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev"])
+                                 ["unknown target missing; configured targets: mac, natedev, aws"])
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
     def test_unknown_target_with_an_unreadable_config_names_the_reason(self) -> None:
-        missing = self.scratch / "missing-targets.conf"
-        incomplete = self.scratch / "incomplete-targets.conf"
+        missing = self.scratch / "missing" / "build_targets.conf"
+        missing.parent.mkdir()
+        incomplete = self.scratch / "incomplete" / "build_targets.conf"
+        incomplete.parent.mkdir()
         _ = incomplete.write_text("targets=mac\n", encoding="utf-8")
-        invalid_utf8 = self.scratch / "invalid-utf8-targets.conf"
+        invalid_utf8 = self.scratch / "invalid-utf8" / "build_targets.conf"
+        invalid_utf8.parent.mkdir()
         _ = invalid_utf8.write_bytes(b"\xff")
         for config, reason in (
-            (missing, f"targets: expected distinct target names in {missing}"),
+            (missing, f"{missing}: keys: [Errno 2] No such file or directory: {str(missing)!r}"),
             (incomplete, "kind.mac: expected local or ssh, got ''"),
-            (invalid_utf8, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+            (invalid_utf8, f"{invalid_utf8}: keys: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
         ):
             for arguments in (["hold", "--for", "renderer checks"], ["release"]):
                 with self.subTest(config=config.name, action=arguments[0]), mock.patch.dict(
-                    os.environ, {"BUILD_TARGETS_CONFIG": str(config)},
+                    os.environ, {"CONF_DIR": str(Path(config).parent)},
                 ), mock.patch.object(build_hold, "holder_of") as holder_lookup:
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         [*arguments, "--target", "missing", "--holder", "alice"])
                     self.assertEqual(status, 2)
-                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}\n")
-                    self.assertEqual(errors, "")
+                    history_fault = config in (missing, invalid_utf8)
+                    suffix = "; no usable committed file" if history_fault else ""
+                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}{suffix}\n")
+                    self.assertEqual(errors, f"warning: {reason}\n" if history_fault else "")
                     holder_lookup.assert_not_called()
                     self.assertEqual(calls, [])
                     self.assert_no_natedev_record()
@@ -1002,7 +1027,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
         held = self.run_cli(folder, "hold", "--holder", "holder", "--for", "the focused test")
         self.assertEqual(held.returncode, 0, held.stderr)
         received = subprocess.run(
-            ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             env={**os.environ, "CLAUDE_CODE_SESSION_ID": "received-session"},
         )
         self.assertEqual(received.returncode, 10, received.stderr)
@@ -1020,7 +1045,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 return subprocess.run(
                     ["bash", "-c", 'python3 "$1" wait && printf "%s\\n" "$2" >> "$3"',
                      "wait-and-build", str(SCRIPT), phase, str(events)],
-                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
 
             free = attempt("no hold")
@@ -1342,7 +1367,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                    env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
@@ -2010,13 +2035,13 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(sent, ["one", "two", "two", "three"])
 
     def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
-        import build_targets
+        from scripts.build_targets import build_targets
         self.begin()
         cycle = self.cycle()
         cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
         cycle["release_started_at"] = self.now.isoformat()
         build_hold.save_cycle(cycle)
-        config = self.scratch / "targets.conf"
+        config = self.scratch / "build_targets.conf"
         _ = config.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         events: list[str] = []
 
@@ -2026,7 +2051,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             (self.scratch / "holders/holder").unlink()
             events.append("file removed")
 
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
              mock.patch.object(build_hold, "socket_for") as lookup, \
              mock.patch.object(build_targets, "wait_clock", return_value=self.now), \
              mock.patch.object(build_targets, "wait_sleep", side_effect=remove_on_wait), \
@@ -2217,7 +2242,8 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                 environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:
         directory = self.proc / str(pid)
         directory.mkdir(exist_ok=True)
-        _ = write_stat(directory.parent, pid, command=command, ppid=parent, start_ticks=start or pid * 10)
+        fields = ["S", str(parent), *(["0"] * 17), str(start or pid * 10), "0"]
+        _ = (directory / "stat").write_text(f"{pid} ({command}) " + " ".join(fields))
         _ = (directory / "comm").write_text(command + "\n")
         _ = (directory / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in (argv or (command, "test"))) + b"\0")
         _ = (directory / "environ").write_bytes(b"\0".join(f"{key}={value}".encode()
@@ -2227,17 +2253,131 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         return directory
 
     def admission(self, pid: int, start: str) -> None:
-        ledger = self.log / "admission"
-        ledger.mkdir(parents=True, exist_ok=True)
-        _ = (ledger / f"{pid}.reservation").write_text(json.dumps({"pid": pid, "start_time": start}))
+        fixture = self.admission_fixture
+        with fixture.loop_turn():
+            owner = fixture.fixture_owner(pid, start)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
 
     def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
-        return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force, self.log)
+        return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force)
 
     def rows(self) -> list[dict[str, object]]:
         self.reap_recorders()
         return [cast(dict[str, object], json.loads(line)) for path in self.log.glob("*/hold-builds-*.jsonl")
                 for line in path.read_text().splitlines()]
+
+    def gate_job(self, argv: tuple[str, ...]) -> None:
+        _ = self.process(10, argv[0], argv=argv, environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(20, "module-worker", parent=10)
+        _ = self.process(30, "cargo-nextest", parent=20, argv=("cargo-nextest", "nextest", "run"))
+        _ = self.process(40, "test-helper", parent=30)
+
+    def enforce_builds(self) -> tuple[list[tuple[int, int]], tuple[hold_enforcer.BuildDecision, ...]]:
+        table = hold_enforcer.read_processes(self.proc, os.getuid(), self.scratch / "cgroup")
+        holders = build_hold.natedev_holds(self.holders).in_force
+        decisions = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+        signals: list[tuple[int, int]] = []
+        stopper = hold_enforcer.StopBuildsAndTests(
+            self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)),
+        )
+        for decision in decisions:
+            if isinstance(decision, hold_enforcer.WouldStopBuild):
+                stopper.stop(decision, table, holders, 999)
+        return signals, decisions
+
+    def assert_gate_job_stopped(self) -> None:
+        signals, decisions = self.enforce_builds()
+        self.assertEqual(signals, [(20, signal.SIGTERM), (30, signal.SIGTERM), (40, signal.SIGTERM)])
+        gate, build = decisions
+        self.assertIsInstance(gate, hold_enforcer.AllowedBuild)
+        self.assertEqual(gate.process.identity.pid, 10)
+        self.assertIsInstance(build, hold_enforcer.WouldStopBuild)
+        if isinstance(build, hold_enforcer.WouldStopBuild):
+            self.assertEqual(build.stop_root.identity.pid, 20)
+        self.assertEqual([row["pid"] for row in self.rows()], [30])
+
+    def test_merge_gate_stops_the_job_root_and_descendants_without_stopping_the_gate(self) -> None:
+        self.gate_job(("python3", "/scripts/production/merge_gate.py", "--tests-only"))
+        self.assert_gate_job_stopped()
+
+    def test_verify_stops_the_job_root_and_descendants_without_stopping_the_gate(self) -> None:
+        self.gate_job(("bash", "/scripts/direct/verify.sh", "test"))
+        self.assert_gate_job_stopped()
+
+    def test_without_a_waiting_gate_only_the_build_and_its_descendants_stop(self) -> None:
+        _ = self.process(20, "module-worker", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(30, "cargo-nextest", parent=20)
+        _ = self.process(40, "test-helper", parent=30)
+        signals, decisions = self.enforce_builds()
+        self.assertEqual(signals, [(30, signal.SIGTERM), (40, signal.SIGTERM)])
+        build, = decisions
+        self.assertIsInstance(build, hold_enforcer.WouldStopBuild)
+        if isinstance(build, hold_enforcer.WouldStopBuild):
+            self.assertEqual(build.stop_root, build.process)
+        self.assertEqual([row["pid"] for row in self.rows()], [30])
+
+    def test_two_build_processes_in_one_gate_job_produce_one_stop(self) -> None:
+        self.gate_job(("python3", "/scripts/production/merge_gate.py", "--tests-only"))
+        _ = self.process(50, "cargo", parent=20, argv=("cargo", "check"))
+        signals, decisions = self.enforce_builds()
+        self.assertEqual(signals[0], (20, signal.SIGTERM))
+        self.assertCountEqual(signals, [(pid, signal.SIGTERM) for pid in (20, 30, 40, 50)])
+        self.assertEqual([decision.stop_root.identity.pid for decision in decisions
+                          if isinstance(decision, hold_enforcer.WouldStopBuild)], [20, 20])
+        self.assertEqual([row["pid"] for row in self.rows()], [30])
+
+    def test_process_without_kept_ancestors_is_kept_through_its_step_controller(self) -> None:
+        for keep_controller in (True, False):
+            with self.subTest(keep_controller=keep_controller):
+                _ = self.process(80, "module-worker")
+                _ = self.process(90, "coordinator", parent=80)
+                _ = self.process(10, "sleep", argv=("sleep", "1"),
+                                 environment={"BUILDLOG_CALL_ID": "kept-step"})
+                _ = self.process(20, "cargo", parent=10, argv=("cargo", "nextest", "run"))
+                with mock.patch.dict(os.environ, {
+                    "VERIFY_PROC_ROOT": str(self.proc), "VERIFY_STEPS_DIR": str(self.scratch / "steps"),
+                }):
+                    step_record.write(step_record.StepRecord(
+                        "kept-step", 90, "900", self.scratch, "test", step_record.WorkspacePackages(),
+                        step_record.NatedevOnly("fixture"), step_record.StepState.ON_NATEDEV,
+                        "2026-10-28T12:00:00+00:00",
+                    ))
+                    table = hold_enforcer.read_processes(self.proc, os.getuid(), self.scratch / "cgroup")
+                    self.assertEqual(build_hold.audit_ancestors(table[10], table), ())
+                    self.assertEqual([ancestor.identity.pid for ancestor in
+                                      build_hold.audit_ancestors(table[20], table)], [10])
+                    self.assertNotIn("BUILDLOG_CALL_ID", table[20].environment)
+                    holders = build_hold.natedev_holds(self.holders).in_force
+                    before = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    self.assertEqual([decision.process.identity.pid for decision in before], [10, 20])
+                    for decision in before:
+                        self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
+                    kept_pid = 90 if keep_controller else 80
+                    _ = build_hold.start_hold(
+                        self.holders, build_hold.HolderIdentity("holder", "holder"),
+                        "app test", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                        (build_hold.ProcessIdentity(kept_pid, str(kept_pid * 10)),),
+                    )
+                    holders = build_hold.natedev_holds(self.holders).in_force
+                    kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    self.assertEqual([decision.process.identity.pid for decision in kept], [10, 20])
+                    for decision in kept:
+                        self.assertIsInstance(decision, hold_enforcer.KeptBuild)
+                    signals: list[tuple[int, int]] = []
+                    stopper = hold_enforcer.StopBuildsAndTests(
+                        self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)),
+                        clock=lambda: 3,
+                    )
+                    for decision in before:
+                        if isinstance(decision, hold_enforcer.WouldStopBuild):
+                            stopper.stop(decision, table, holders, 999)
+                    for pid in (10, 20):
+                        stopper.terminating[table[pid].identity] = 0
+                    stopper.kill_survivors(table, holders, 999)
+                    self.assertEqual(signals, [])
+                    self.assertEqual(stopper.terminating, {})
+                    self.assertEqual(self.rows(), [])
+                _ = write_holder(self.holders, "holder", "2026-10-28T12:00:00+00:00", "app test")
 
     def test_each_class_and_cargo_nextest_compiler_group(self) -> None:
         _ = self.process(10, "cargo-tile-real", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
@@ -2294,11 +2434,42 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def test_reused_pid_does_not_match_admission_or_new_parent(self) -> None:
         _ = self.process(10, "claude", start=400, environment={"CLAUDE_CODE_SESSION_ID": "new-parent"})
-        _ = self.process(20, "cargo", parent=10, start=200)
-        self.admission(20, "199")
-        build, = self.builds()
+        with self.admission_fixture.loop_turn():
+            _ = self.process(20, "cargo", parent=10, start=199)
+            self.admission(20, "199")
+            _ = self.process(20, "cargo", parent=10, start=200)
+            build, = self.builds()
         self.assertEqual(build.classification, "no_session")
         self.assertEqual(build.owner, build_hold.NoOwningSession())
+
+    def test_durable_grant_is_admitted_before_the_next_service_pass(self) -> None:
+        fixture = self.admission_fixture
+        with fixture.loop_turn():
+            _ = self.process(20, "bash", argv=("bash", "/scripts/direct/verify.sh"))
+            self.admission(20, "200")
+            _ = self.process(21, "cargo", parent=20, environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+            view, = fixture.server.handle_request(admission_protocol.ViewRequest())
+            self.assertIsInstance(view, admission_protocol.ViewReply)
+            if isinstance(view, admission_protocol.ViewReply):
+                self.assertEqual(view.reading.explanation.decided_from.reservations, ())
+            build, = self.builds()
+        self.assertEqual(build.process.identity.pid, 21)
+        self.assertEqual(build.classification, "admitted")
+
+    def test_pid_reused_during_admission_read_is_discarded(self) -> None:
+        with self.admission_fixture.loop_turn():
+            _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+            self.admission(20, "200")
+            read_state = admission_service.read_state
+
+            def read(directory: Path) -> admission_service.ServiceState:
+                state = read_state(directory)
+                _ = self.process(20, "cargo", start=201)
+                return state
+
+            with mock.patch.object(admission_service, "read_state", side_effect=read):
+                self.assertEqual(self.builds(), ())
+            self.assertEqual(build_hold.process_start_time(20, self.proc), "201")
 
     def test_pid_reused_during_environment_read_is_discarded(self) -> None:
         directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "old"})
@@ -2307,7 +2478,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         def read(path: Path) -> bytes:
             data = read_bytes(path)
             if path == directory / "environ":
-                _ = write_stat(directory.parent, 10, command="cargo", start_ticks=101)
+                _ = (directory / "stat").write_text("10 (cargo) S 1 " + "0 " * 17 + "101 0")
             return data
 
         with mock.patch.object(Path, "read_bytes", read):
@@ -2373,13 +2544,32 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
         (self.holders / "holder").unlink()
-        for action in ("hold", "status", "audit"):
+        for action, entry in (("hold", "import"), ("status", "import"),
+                              ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "hold":
                 args.extend(["--holder", "holder", "--for", "app test"])
             output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(build_hold.main(args), 0)
+            if entry == "__main__":
+                program = """import runpy, sys
+from unittest import mock
+path = sys.argv.pop(1)
+def exit_code(status):
+    module = sys.modules["__main__"]
+    assert module.hold_enforcer().build_hold is module, "the enforcer loads a second module"
+    assert "build_hold" not in sys.modules, "the CLI registers a bare alias"
+    assert status == 0, status
+with mock.patch("sys.exit", side_effect=exit_code):
+    runpy.run_path(path, run_name="__main__")
+"""
+                with self.subTest(entry=entry):
+                    result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program, str(SCRIPT), *args],
+                                            capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                _ = output.write(result.stdout)
+            else:
+                with redirect_stdout(output):
+                    self.assertEqual(build_hold.main(args), 0)
             self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
             if action == "audit":
                 self.assertNotIn("unowned", output.getvalue())

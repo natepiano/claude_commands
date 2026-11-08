@@ -1,5 +1,5 @@
 ---
-description: Discover branches and merge them with linear history — rebase the current branch, integrate another, or fall back to a --no-ff merge.
+description: Find and merge branches.
 ---
 
 I'll discover available branches and help you safely merge changes.
@@ -75,7 +75,7 @@ Run `git rebase ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`.
 Run `bash ~/.claude/scripts/merge_branch/rebase_source.sh ${SOURCE_BRANCH} ${current_branch} ${source_worktree}` with `dangerouslyDisableSandbox: true`.
 
 - If `status` is `"success"`, continue to STEP 5.
-- If `status` is `"conflict"`, the source worktree is paused mid-rebase. Report the message and the `conflicted_files` list to the user, then STOP. The user resolves conflicts in `${source_worktree}` (their editor, normal `<<<<<<<` markers), runs `git add <files> && git rebase --continue` (or `git rebase --abort`), and re-invokes `/merge_branch`.
+- If `status` is `"conflict"`, the source worktree is paused mid-rebase. Report the message and the `conflicted_files` list to the user, then STOP. The user resolves conflicts in `${source_worktree}` (their editor, normal conflict markers), runs `git add <files> && git rebase --continue` (or `git rebase --abort`), and re-invokes `/merge_branch`.
 - If `status` is `"error"`, report the message and STOP.
 
 **STEP 5: Merge**

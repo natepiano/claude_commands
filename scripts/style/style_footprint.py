@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Conservatively separate mechanical style diffs from findings needing review."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from bisect import bisect_left
@@ -22,7 +26,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
-from candidate_generators import boilerplate_allows, mask_source
+from scripts.style.candidate_generators import boilerplate_allows, mask_source
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9A-Fa-f_]+\}|\\x[0-9A-Fa-f]{2}|\\.|[^'\\\n])' ''',
@@ -110,6 +114,15 @@ class FileChange:
 class Finding:
     label: WholeDiff | MappedFinding
     changes: tuple[FileChange, ...]
+
+
+@dataclass(frozen=True)
+class ApprovedDocumentationSite:
+    """An approved finding's exact source line at the comparison base, supplied by the ticket gate."""
+
+    path: str
+    line: int
+    text: str
 
 
 class FindingOwnershipInput(TypedDict, total=False):
@@ -481,17 +494,27 @@ def public_glob(source: str) -> bool:
     return False
 
 
-def documented_text(source: str) -> tuple[str, ...]:
+class DocumentationKind(Enum):
+    INNER = "inner"
+    OUTER = "outer"
+
+
+@dataclass(frozen=True)
+class DocumentationComment:
+    line: int
+    text: str
+    kind: DocumentationKind
+
+
+def documentation_comments(source: str) -> tuple[DocumentationComment, ...]:
     """Read complete doc comments, including interior lines outside diff prefixes."""
-    comments: list[str] = []
+    comments: list[DocumentationComment] = []
     cursor = 0
     while cursor < len(source):
         start = cursor
         if source.startswith("//", cursor):
             end = source.find("\n", cursor)
             cursor = len(source) if end < 0 else end
-            if source.startswith(("///", "//!"), start):
-                comments.append(source[start:cursor])
         elif source.startswith("/*", cursor):
             depth = 1
             cursor += 2
@@ -504,8 +527,6 @@ def documented_text(source: str) -> tuple[str, ...]:
                     cursor += 2
                 else:
                     cursor += 1
-            if source.startswith(("/**", "/*!"), start):
-                comments.append(source[start:cursor])
         else:
             raw = RAW_STRING.match(source, cursor)
             quoted = QUOTED_LITERAL.match(source, cursor)
@@ -517,7 +538,53 @@ def documented_text(source: str) -> tuple[str, ...]:
                 cursor = quoted.end()
             else:
                 cursor += 1
+        if source.startswith(("///", "//!", "/**", "/*!"), start):
+            kind = DocumentationKind.INNER if source[start + 2] == "!" else DocumentationKind.OUTER
+            comments.append(DocumentationComment(source.count("\n", 0, start) + 1, source[start:cursor], kind))
     return tuple(comments)
+
+
+def documented_text(source: str) -> tuple[str, ...]:
+    return tuple(comment.text for comment in documentation_comments(source))
+
+
+@dataclass(frozen=True)
+class DocumentationLine:
+    line: int
+    text: str
+    kind: DocumentationKind
+
+
+def documentation_lines(source: str) -> tuple[DocumentationLine, ...]:
+    return tuple(DocumentationLine(comment.line + offset, text, comment.kind)
+                 for comment in documentation_comments(source)
+                 for offset, text in enumerate(comment.text.splitlines(keepends=True)))
+
+
+def unapproved_documentation_changed(change: FileChange, sites: tuple[ApprovedDocumentationSite, ...]) -> bool:
+    """Pair doc lines by kind and order within each hunk; only approved pairs are exempt."""
+    lines = change.before.splitlines()
+    before, after = documentation_lines(change.before), documentation_lines(change.after)
+    doc_lines = {part.line for part in before}
+    approved = {site.line for site in sites if site.path == change.old_path and site.line in doc_lines
+                and 1 <= site.line <= len(lines) and lines[site.line - 1] == site.text}
+    if not approved:
+        return documented_text(change.before) != documented_text(change.after)
+    exempt_old: set[int] = set()
+    exempt_new: set[int] = set()
+    for hunk in change.hunks:
+        for kind in DocumentationKind:
+            removed = tuple(part for part in before if part.kind == kind
+                            and hunk.old_start <= part.line < hunk.old_start + hunk.old_count)
+            added = tuple(part for part in after if part.kind == kind
+                          and hunk.new_start <= part.line < hunk.new_start + len(hunk.added))
+            for index, part in enumerate(removed):
+                if part.line in approved:
+                    exempt_old.add(part.line)
+                    if index < len(added):
+                        exempt_new.add(added[index].line)
+    return (tuple(part.text for part in before if part.line not in exempt_old)
+            != tuple(part.text for part in after if part.line not in exempt_new))
 
 
 def attribute_spans(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
@@ -3766,8 +3833,9 @@ def path_sites(text: MoveText, name: str,
     return tuple(result)
 
 
-def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
-    return judge_changes(finding.changes, before, prove_item_moves(finding.changes, before))
+def judge(finding: Finding, before: RevisionTree,
+          approved_documentation: tuple[ApprovedDocumentationSite, ...] = ()) -> Mechanical | Review:
+    return judge_changes(finding.changes, before, prove_item_moves(finding.changes, before), approved_documentation)
 
 
 def moved_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozenset[str]:
@@ -4002,7 +4070,8 @@ def serialized_name_on(text: str, changed: set[int]) -> bool:
 
 
 def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
-                  moves: ItemMoves | NoItemMoves) -> Mechanical | Review:
+                  moves: ItemMoves | NoItemMoves,
+                  approved_documentation: tuple[ApprovedDocumentationSite, ...] = ()) -> Mechanical | Review:
     reasons: list[str] = []
     # A proven item move is mechanical at any size: the checks judge only what is left once its spans are taken out.
     if isinstance(moves, ItemMoves):
@@ -4035,7 +4104,7 @@ def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
             reasons.append("check 6: condition, literal or control flow flagged")
         if changes_macro_invocation(semantic_change):
             reasons.append("check 6: macro invocation requires review")
-        if documented_text(change.before) != documented_text(change.after) or changes_serialized_name(change):
+        if unapproved_documentation_changed(change, approved_documentation) or changes_serialized_name(change):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")
         old_tokens = without_trailing_commas(without_derives(normalized))
         new_tokens = without_trailing_commas(without_derives(
@@ -4094,11 +4163,15 @@ def main(argv: list[str] | None = None) -> int:
     _ = after.add_argument("--head")
     _ = after.add_argument("--worktree", action="store_true")
     _ = check.add_argument("--finding-map", type=Path)
+    _ = check.add_argument("--approved-documentation-site", nargs=3, action="append", default=[],
+                           metavar=("PATH", "LINE", "TEXT"), help="approved source site supplied by the ticket gate")
     arguments = parser.parse_args(argv)
     repo = cast(Path, arguments.repo)
     base = cast(str, arguments.base)
     finding_map = cast(Path | None, arguments.finding_map)
     try:
+        approved_documentation = tuple(ApprovedDocumentationSite(path, int(line), text) for path, line, text in
+                                       cast(list[list[str]], arguments.approved_documentation_site))
         head = worktree_commit(repo) if cast(bool, arguments.worktree) else git(
             repo, "rev-parse", "--verify", f"{cast(str, arguments.head)}^{{commit}}",
         ).strip()
@@ -4108,7 +4181,7 @@ def main(argv: list[str] | None = None) -> int:
         before = RevisionTree(repo, base)
         needs_review = False
         for finding in findings:
-            decision = judge(finding, before)
+            decision = judge(finding, before, approved_documentation)
             prefix = f"{finding.label.finding_id}: " if isinstance(finding.label, MappedFinding) else ""
             if isinstance(decision, Review):
                 needs_review = True

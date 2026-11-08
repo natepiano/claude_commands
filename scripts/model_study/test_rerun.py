@@ -16,12 +16,12 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-import model_study
-import report as study_report
-from compare import ComparisonReport, compare
-from phases import PhaseReport, phases
-from test_report import comparison_fixture, director, extract_fixture, phase_fixture
-from test_turns import TranscriptRecord, assistant, user, write_transcript
+from scripts.model_study import model_study
+from scripts.model_study import report as study_report
+from scripts.model_study.compare import ComparisonReport, compare
+from scripts.model_study.phases import PhaseReport, phases
+from scripts.model_study.test_report import comparison_fixture, director, extract_fixture, phase_fixture
+from scripts.model_study.test_turns import TranscriptRecord, assistant, user, write_transcript
 
 
 FIRST = "2026-10-06T19:00:00-07:00"
@@ -590,7 +590,7 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(status, 0)
             lines = short.splitlines()
             self.assertLessEqual(len(lines), 60)
-            self.assertTrue(lines[0].startswith("From model-study-unit: INTERIM director model study"))
+            self.assertTrue(lines[0].startswith("From model-study: INTERIM director model study"))
             verdict_at = lines.index("Verdict:")
             measures = lines[1:verdict_at]
             shown = [line.split(":", 1)[0] for line in measures if line.startswith("director_")]

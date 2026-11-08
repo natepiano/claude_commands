@@ -1,5 +1,5 @@
 ---
-description: Create a style rule with complete metadata, global or local, and ask the user for each field the rule does not settle
+description: Create a global or local style rule.
 ---
 
 **Arguments**: `$ARGUMENTS` — `[global | local [<member>]] <name> [<rule text or a path to a draft>]`

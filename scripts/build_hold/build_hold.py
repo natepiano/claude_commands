@@ -2,6 +2,10 @@
 """One holder file per session; decide when builds are quiet and may resume."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -21,25 +25,17 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-if TYPE_CHECKING:
-    from ..lib import process_start
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
+from scripts.lib import unit_runs
+from scripts.build_hold import override_guard
+from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import addressed, live_sessions  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from process_failure import failure_detail
-from user_zone import user_zone
-import unit_runs
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import ConfigError, read_targets
+from scripts.buildlog import store
+from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -223,6 +219,11 @@ class MacHoldTarget:
 
 
 @dataclass(frozen=True)
+class ConfiguredSshHoldTarget:
+    name: str
+
+
+@dataclass(frozen=True)
 class UnknownHoldTarget:
     name: str
     configured: tuple[str, ...]
@@ -234,7 +235,7 @@ class UncheckedHoldTarget:
     reason: str
 
 
-HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
+HoldTarget = NatedevHoldTarget | MacHoldTarget | ConfiguredSshHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
 
 
 def parse_hold_target(name: str) -> HoldTarget:
@@ -244,8 +245,11 @@ def parse_hold_target(name: str) -> HoldTarget:
         return MacHoldTarget()
     try:
         configured = read_targets()
-    except (ConfigError, UnicodeError) as error:
+    except (ConfigError, OSError, UnicodeError) as error:
         return UncheckedHoldTarget(name, str(error))
+    for target in configured:
+        if target.name == name and isinstance(target, SshTarget):
+            return ConfiguredSshHoldTarget(name)
     return UnknownHoldTarget(name, tuple(target.name for target in configured))
 
 
@@ -256,14 +260,20 @@ class MacHoldResult:
     stderr: str
 
 
-def run_mac_hold(arguments: Sequence[str]) -> MacHoldResult:
+def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult:
     script = Path(__file__).resolve().parent.parent / "mac_test" / "mac_test.py"
-    result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), *arguments, "--target", target], capture_output=True, text=True)
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
-def release_mac_hold(identity: HolderIdentity, given: str) -> MacHoldResult:
-    result = run_mac_hold(["unblock", "--holder", identity.name])
+def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
+    from scripts.message.sessions import live_sessions
+
+    def unblock(holder: str) -> MacHoldResult:
+        arguments = ["unblock", "--holder", holder]
+        return run_mac_hold(arguments, target)
+
+    result = unblock(identity.name)
     prefix = "blocked by "
     line = result.stdout.rstrip("\n")
     if result.status != 1 or not line.startswith(prefix):
@@ -273,7 +283,7 @@ def release_mac_hold(identity: HolderIdentity, given: str) -> MacHoldResult:
     former = next((record["formerNames"] for record in live_sessions()
                    if record["sessionId"] == identity.key), no_former_names)
     if holder != identity.name and holder in (identity.name, given, *former):
-        return run_mac_hold(["unblock", "--holder", holder])
+        return unblock(holder)
     return result
 
 
@@ -374,6 +384,16 @@ def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession
     return OwningSession(session_id) if session_id else NoOwningSession()
 
 
+def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        fields = (proc_root / str(pid) / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+        return fields[19] if fields[0] != "Z" else ""
+    except (OSError, IndexError):
+        return ""
+
+
 @dataclass(frozen=True)
 class ProcessIdentity:
     pid: int
@@ -445,13 +465,13 @@ def read_audit_processes(
             continue
         pid = int(directory.name)
         try:
-            stat = process_start.read_stat(pid, proc_root)
-            if isinstance(stat, process_start.ProcessGone) or stat.state in ("Z", "X", "x"):
+            stat = (directory / "stat").read_text(errors="replace").rsplit(")", 1)[1].split()
+            start = stat[19]
+            if stat[0] == "Z" or not start.isdecimal():
                 continue
-            start = stat.start.text
-            parent_pid = stat.ppid
+            parent_pid = int(stat[1])
             command = (directory / "comm").read_text(errors="replace").strip()
-            uid, tty_nr = directory.stat().st_uid, stat.tty_nr
+            uid, tty_nr = directory.stat().st_uid, int(stat[4])
         except (OSError, ValueError, IndexError):
             continue
         try:
@@ -493,9 +513,7 @@ def read_audit_processes(
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass
-        if process_start.check_owner(pid, process_start.parse_start(process.identity.start_time), proc_root) in (
-            process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED
-        ):
+        if process_start_time(pid, proc_root) != process.identity.start_time:
             del processes[pid]
             continue
         processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
@@ -543,21 +561,16 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
     return NoOwningSession()
 
 
-def admitted_processes(buildlog_root: Path) -> frozenset[ProcessIdentity]:
-    """Read memory gate reservations without pruning or changing the ledger."""
-    admitted: set[ProcessIdentity] = set()
-    for path in (buildlog_root / "admission").glob("*.reservation"):
-        try:
-            value = cast(object, json.loads(path.read_text()))
-            if not isinstance(value, dict):
-                continue
-            row = cast(dict[str, object], value)
-            pid, start = row.get("pid"), row.get("start_time")
-            if isinstance(pid, int) and isinstance(start, str) and start.isdecimal():
-                admitted.add(ProcessIdentity(pid, start))
-        except (OSError, ValueError):
-            continue
-    return frozenset(admitted)
+def admitted_processes() -> frozenset[ProcessIdentity]:
+    """Read durable grants, which precede replies and the next decision pass."""
+    from scripts.build_queue import admission_service
+
+    try:
+        state = admission_service.read_state(store.root() / "admission")
+    except (OSError, ValueError) as error:
+        raise OSError(f"admission state unavailable: {error}") from error
+    return frozenset(ProcessIdentity(record.owner.pid, record.owner.start_time)
+                     for record in state.reservations.values())
 
 
 def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
@@ -575,12 +588,12 @@ class HoldEnforcer(Protocol):
 def hold_enforcer() -> HoldEnforcer:
     # The enforcer uses these audit types; load it after this module is ready.
     import importlib
-    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+    return cast(HoldEnforcer, cast(object, importlib.import_module('scripts.build_hold.hold_enforcer')))
 
 
-def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path) -> tuple[AuditedBuild, ...]:
+def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = admitted_processes(buildlog_root)
+    admitted = admitted_processes()
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -595,7 +608,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
             roots.append(process)
     for process in sorted(roots, key=lambda item: item.identity.pid):
         ancestors = audit_ancestors(process, processes)
-        if any(process_start.check_owner(item.identity.pid, process_start.parse_start(item.identity.start_time), proc_root) is not process_start.OwnerCheck.ALIVE
+        if any(process_start_time(item.identity.pid, proc_root) != item.identity.start_time
                for item in (process, *ancestors)):
             continue
         owner = audit_owner(process, ancestors)
@@ -609,7 +622,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
         else:
             classification = "no_session"
         live_children = tuple(sorted((child for child in children.get(process.identity.pid, [])
-                                      if process_start.check_owner(child.pid, process_start.parse_start(child.start_time), proc_root) is process_start.OwnerCheck.ALIVE),
+                                      if process_start_time(child.pid, proc_root) == child.start_time),
                                      key=lambda item: item.pid))
         builds.append(AuditedBuild(process, owner, classification, live_children))
     return tuple(builds)
@@ -636,8 +649,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
     except ReleaseRecordReadError:
         state = read_holders(directory)
         holders = state.holders if isinstance(state, ActiveHolders) else ()
-    buildlog_root = Path(os.environ.get("BUILDLOG_DIR") or Path.home() / ".local/state/buildlog")
-    builds = audit_builds(proc_root, holders, buildlog_root)
+    builds = audit_builds(proc_root, holders)
     for build in builds:
         if build.classification in {"holder", "admitted"}:
             continue
@@ -678,6 +690,8 @@ def holder_of(given: str | None) -> HolderIdentity:
     given, so a rename between hold and release loses nothing. A holder that is no live Claude
     session keeps `given` as its key.
     """
+    from scripts.message.sessions import addressed, live_sessions
+
     records = live_sessions()
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -692,6 +706,8 @@ def holder_of(given: str | None) -> HolderIdentity:
 def held_key(directory: Path, given: str | None) -> str:
     """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
     kept by session id is found by the name given, the session's name now, and each name it once had."""
+    from scripts.message.sessions import live_sessions
+
     identity = holder_of(given)
     key, name = identity.key, identity.name
     none: list[str] = []
@@ -712,6 +728,8 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
+    from scripts.message.sessions import live_sessions
+
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
         content = path.read_text().strip()
@@ -893,7 +911,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 def start_hold_recorder(event: NatedevHoldEvent) -> None:
     until = event.holder.release.at.isoformat() if isinstance(event.holder.release, KnownReleaseEta) else ""
-    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
                "hold-event", event.kind, "natedev", event.holder.key, event.holder.name, event.holder.purpose,
                event.at.astimezone(timezone.utc).isoformat(), until]
     start_recorder(command)
@@ -1216,6 +1234,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
+    from scripts.message.sessions import live_sessions
+
     with release_lock():
         # A receipt for a former name must never shadow a live session-id hold.
         if given is None and resume:
@@ -1394,7 +1414,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
         if attempt:
             time.sleep(LOOKUP_RETRY_S)
         try:
-            result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
+            result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
         except OSError as error:
             reason = str(error)
             continue
@@ -1408,10 +1428,9 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    script = Path(__file__).resolve().parent.parent / "message" / "send.py"
     notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
     try:
-        result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
+        result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:
@@ -1423,7 +1442,7 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
 
 def send_release_broadcast() -> None:
     script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
-    result = subprocess.run([sys.executable, str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
                             capture_output=True, text=True)
     if result.returncode:
         raise OSError(f"release broadcast: {failure_detail(result)}")
@@ -1576,9 +1595,9 @@ def read_process_cpu_times(processes: Sequence[Process], proc_root: Path) -> dic
     readings: dict[int, ProcessCpuTime] = {}
     for process in processes:
         try:
-            stat = process_start.read_stat(process.pid, proc_root)
-            if not isinstance(stat, process_start.ProcessGone):
-                readings[process.pid] = ProcessCpuTime(stat.utime + stat.stime, stat.start.ticks)
+            # comm can contain spaces and closing parentheses; the remaining fields start at 3.
+            fields = (proc_root / str(process.pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            readings[process.pid] = ProcessCpuTime(int(fields[11]) + int(fields[12]), int(fields[19]))
         except (OSError, ValueError, IndexError):
             continue
     return readings
@@ -1634,6 +1653,8 @@ def wait_for_quiet(
 
 def main(arguments: list[str]) -> int:
     override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
+    if arguments[:1] in (["hold"], ["release"]) and len(arguments) >= 3 and arguments[-2] == "target":
+        arguments = [*arguments[:-2], "--target", arguments[-1]]
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")
@@ -1668,7 +1689,8 @@ def main(arguments: list[str]) -> int:
             if isinstance(target, UncheckedHoldTarget):
                 print(f"unknown target {target.name}; the target config cannot be read: {target.reason}")
                 return 2
-            if isinstance(target, MacHoldTarget):
+            if isinstance(target, (MacHoldTarget, ConfiguredSshHoldTarget)):
+                target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
                 refused: list[str] = []
                 if action == "hold":
                     if cast(list[int], options.keep):
@@ -1680,23 +1702,26 @@ def main(arguments: list[str]) -> int:
                 elif cast(bool, options.resume):
                     refused.append("--resume")
                 if refused:
-                    print(f"{refused[0]} is not supported with --target mac")
+                    print(f"{refused[0]} is not supported with --target {target_name}")
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
                 if action == "hold":
-                    return print_mac_hold_result(run_mac_hold(
-                        ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]))
-                return print_mac_hold_result(release_mac_hold(identity, cast(str | None, options.holder) or identity.name))
+                    command = ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]
+                    result = run_mac_hold(command, target_name)
+                else:
+                    given = cast(str | None, options.holder) or identity.name
+                    result = release_mac_hold(identity, given, target_name)
+                return print_mac_hold_result(result)
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
             keep: list[ProcessIdentity] = []
             proc_root = cast(Path, options.proc_root)
             for pid in cast(list[int], options.keep):
-                start = process_start.process_start(pid, proc_root)
-                if isinstance(start, process_start.ProcessGone):
+                start = process_start_time(pid, proc_root)
+                if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
-                keep.append(ProcessIdentity(pid, start.text))
+                keep.append(ProcessIdentity(pid, start))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
                              datetime.now(timezone.utc), keep))
             hold_enforcer().start()
@@ -1743,7 +1768,7 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module('scripts.build_targets.build_targets'), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
@@ -1776,6 +1801,6 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    # The enforcer must use this CLI's domain types, not a second module instance.
-    _ = sys.modules.setdefault("build_hold", sys.modules[__name__])
+    # The enforcer and this CLI must use the same domain types.
+    _ = sys.modules.setdefault("scripts.build_hold.build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

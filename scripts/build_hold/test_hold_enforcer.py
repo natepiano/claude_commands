@@ -16,33 +16,17 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
-import sys
+from scripts.build_hold import build_hold, hold_enforcer
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-if TYPE_CHECKING:
-    from ..lib import process_start
-    from ..lib.process_start_test_support import write_stat
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-    from scripts.lib.process_start_test_support import write_stat
-
-import build_hold
-import hold_enforcer
-
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    import step_record
+from scripts.direct import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
@@ -98,7 +82,9 @@ class HoldEnforcerTests(unittest.TestCase):
                 environment: Mapping[str, str] = EMPTY_PROCESS_ENVIRONMENT, executable: str = "") -> Path:
         directory = self.proc / str(pid)
         directory.mkdir(exist_ok=True)
-        _ = write_stat(directory.parent, pid, command=command, ppid=parent, tty_nr=tty, start_ticks=start)
+        fields = ["0"] * 20
+        fields[0], fields[1], fields[4], fields[19] = "S", str(parent), str(tty), str(start)
+        _ = (directory / "stat").write_text(f"{pid} ({command}) " + " ".join(fields))
         _ = (directory / "comm").write_text(command + "\n")
         _ = (directory / "cmdline").write_bytes(b"\0".join(argument.encode() for argument in (argv or (command,))) + b"\0")
         values = dict(environment)
@@ -126,26 +112,9 @@ class HoldEnforcerTests(unittest.TestCase):
 
     def write_step(self, call_id: str, state: step_record.StepState, pid: int) -> None:
         step_record.write(step_record.StepRecord(
-            call_id, pid, cast(process_start.ProcessStart, process_start.process_start(pid, self.proc)).text, self.root, "check", None,
-            step_record.MacAllowed(), state, "2026-10-28T12:00:00+00:00",
+            call_id, pid, step_record.process_start(pid), self.root, "check", step_record.WorkspacePackages(),
+            step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
-
-    def test_signals_require_a_matching_owner_and_keep_unknown_identity(self) -> None:
-        identity = build_hold.ProcessIdentity(77, "123")
-        sent: list[tuple[int, int]] = []
-        stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=lambda pid, signum: sent.append((pid, signum)))
-        stat = write_stat(self.proc, 77, start_ticks=123)
-        read_stat = process_start.read_stat
-        with mock.patch.object(process_start, "read_stat", side_effect=process_start.ProcessReadError("denied")):
-            self.assertFalse(stopper.signal_if_current(identity, signal.SIGTERM))
-        _ = write_stat(self.proc, 77, start_ticks=456)
-        self.assertFalse(stopper.signal_if_current(identity, signal.SIGTERM))
-        stat.unlink()
-        self.assertFalse(stopper.signal_if_current(identity, signal.SIGTERM))
-        _ = write_stat(self.proc, 77, start_ticks=123)
-        with mock.patch.object(process_start, "read_stat", wraps=read_stat):
-            self.assertTrue(stopper.signal_if_current(identity, signal.SIGTERM))
-        self.assertEqual(sent, [(77, signal.SIGTERM)])
 
     def test_verify_controller_survives_every_live_state_while_local_compile_child_stops(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other")
@@ -449,8 +418,7 @@ class HoldEnforcerTests(unittest.TestCase):
         detailed: set[tuple[int, str]] = set()
 
         def read(path: Path) -> bytes:
-            if path.name != "stat":
-                detailed.add((int(path.parent.name), path.name))
+            detailed.add((int(path.parent.name), path.name))
             return read_bytes(path)
 
         with mock.patch.object(Path, "read_bytes", read):

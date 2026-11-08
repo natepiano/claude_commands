@@ -1,7 +1,7 @@
 """Tests for git_filters_retire: a retired clean filter leaves no stale index entry and no driver."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import registry_text
+from scripts.lib.test_models_registry import registry_text
 
 import os
 import shutil
@@ -10,9 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import final, override
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 TABLE = Path(__file__).with_name("git_filters_table.sh")
 BASH = shutil.which("bash") or "/bin/bash"

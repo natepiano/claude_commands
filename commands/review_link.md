@@ -1,5 +1,5 @@
 ---
-description: Make clickable review links for files on this machine, including Markdown reports and drafts.
+description: Create file links for user review.
 ---
 
 **Arguments:** $ARGUMENTS (files; infer them from the conversation when clear).

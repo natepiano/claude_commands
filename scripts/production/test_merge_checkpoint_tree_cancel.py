@@ -12,16 +12,21 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-import merge_checkpoint
-import test_merge_checkpoint as checkpoint_fixture
-from production_units import Production
+from scripts.production import merge_checkpoint
+from scripts.production import test_merge_checkpoint as checkpoint_fixture
+from scripts.production.production_doc import ProductionDocument
+from scripts.production.merge_checkpoint_test_support import configure_test_environment
+
+
+def setUpModule() -> None:
+    configure_test_environment()
 
 
 class CheckpointTreeCancelTests(unittest.TestCase):
     def assert_checkpoint_cancellation(self, statuses: tuple[int, ...]) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            production = Production(root / "production.md", "fixture", "merge", root,
+            production = ProductionDocument(root / "production.md", "fixture", "merge", root,
                                     root / "production.log", ZoneInfo("UTC"))
             command = ["verify.sh", "test", "sample"]
             results = [subprocess.CompletedProcess(command, status,
@@ -29,7 +34,8 @@ class CheckpointTreeCancelTests(unittest.TestCase):
                         + "would be stale. Resubmit the test when your edits are done.\n"
                         if status == 77 else "a test failed\n", "") for status in statuses]
             output = StringIO()
-            with (patch.object(merge_checkpoint, "test_steps", return_value=[("package sample", command)]),
+            step = merge_checkpoint.CheckpointTestStep("package sample", command, root)
+            with (patch.object(merge_checkpoint, "test_steps", return_value=[step]),
                   patch.object(merge_checkpoint, "run_test_command", side_effect=results) as run,
                   patch.object(merge_checkpoint, "undo_unpushed_merge") as undo,
                   redirect_stdout(output)):

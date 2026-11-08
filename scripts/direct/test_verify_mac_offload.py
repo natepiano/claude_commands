@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import unittest
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, CARGO_STUB as CARGO_STUB, RUSTC_STUB as RUSTC_STUB, CallRecord as CallRecord
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, CARGO_STUB as CARGO_STUB, RUSTC_STUB as RUSTC_STUB, CallRecord as CallRecord
 
 
 @final
 class VerifyMacOptionValidationTests(VerifyMacOffloadFixture):
     def test_local_flag_requires_a_non_option_reason_before_any_work(self) -> None:
         expected = (
-            'verify.sh: --local needs a reason: --local "<why this test cannot pass on '
-            'macOS>". Leave it off to run on the Mac.\n'
+            'verify.sh: --local needs a reason: --local "<why this command must run on '
+            'natedev>". Leave it off to run on the Mac.\n'
         )
         cases = (
             ("test", "sample", "--local"),

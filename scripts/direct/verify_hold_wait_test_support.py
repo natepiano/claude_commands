@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_pressure_reading
+
+from scripts.build_queue.admission_test_support import caller_admission
+
 import json
 import os
 import select
@@ -15,18 +19,20 @@ import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import (
-    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, replace_library_launcher,
-)
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -37,8 +43,6 @@ INVOKE = VERIFY.parent.parent / "lint" / "invoke.sh"
 
 CYCLE_ID = "c" * 32
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 VERIFY_WAITING = "; waiting (tests that can run on the Mac"
 
@@ -60,108 +64,6 @@ class StepObservation(TypedDict):
 
 class CallWithHoldWait(CallRecord):
     hold_wait_s: float
-
-
-@dataclass(frozen=True)
-class PausedWaitPublication:
-    """A real recorder child stopped at one selected publication boundary."""
-
-    interpreter: Path
-    resume: Path
-
-    def continue_child(self) -> None:
-        with self.resume.open("w") as output:
-            _ = output.write("continue\n")
-
-
-def pause_wait_publication(
-    root: Path, boundary: Literal["before-event", "after-event", "before-lock", "before-file"],
-) -> PausedWaitPublication:
-    """Wrap the real recorder, with one FIFO stop rather than timing a race.
-
-    Only the first wait start is stopped. Other recorder and interpreter calls
-    keep their normal entry point, including recovery in a second verify shell.
-    """
-    control = root / "publication-stop"
-    control.mkdir()
-    resume = control / "resume"
-    os.mkfifo(resume)
-    armed = control / "armed"
-    armed.touch()
-    interpreter = control / "interpreter"
-    repository = VERIFY.parents[2]
-    _ = interpreter.write_text(f'''#!{sys.executable}
-import fcntl
-import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, {str(repository)!r})
-from scripts.direct import progress_history
-
-armed = Path({str(armed)!r})
-def pause():
-    try:
-        armed.unlink()
-    except FileNotFoundError:
-        return
-    print("wait publication paused: {boundary}", file=sys.stderr, flush=True)
-    with Path({str(resume)!r}).open() as input:
-        input.readline()
-
-arguments = sys.argv[1:]
-turn = arguments and arguments[0] in ("--record-turn-wait", "--observe-turn-wait")
-recorder = arguments and arguments[0].endswith("/progress_history.py")
-if turn or recorder:
-    append = progress_history._append_event
-    def observed_append(state, event):
-        selected = event.get("event_type") == "wait_started"
-        if selected and {boundary!r} == "before-event":
-            pause()
-        append(state, event)
-        if selected and {boundary!r} == "after-event":
-            pause()
-    progress_history._append_event = observed_append
-    publish = progress_history._publish_wait_file
-    def observed_publication(publication, wait_id):
-        if {boundary!r} == "before-file" and arguments[0] != "--observe-turn-wait":
-            pause()
-        publish(publication, wait_id)
-    progress_history._publish_wait_file = observed_publication
-    if arguments[0] == "--observe-turn-wait":
-        flock = fcntl.flock
-        announced = False
-        def observe_admission(descriptor, operation):
-            global announced
-            if not announced and operation == fcntl.LOCK_EX and os.readlink("/proc/self/fd/" + str(descriptor)).endswith("/.progress_history.lock"):
-                announced = True
-                try:
-                    flock(descriptor, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print("turn wait lock: blocked", file=sys.stderr, flush=True)
-                else:
-                    print("turn wait lock: acquired", file=sys.stderr, flush=True)
-                    return
-            return flock(descriptor, operation)
-        fcntl.flock = observe_admission
-    if {boundary!r} == "before-lock" and not turn and "start-wait" in arguments:
-        flock = fcntl.flock
-        def observed_lock(descriptor, operation):
-            published = "--wait-file" not in arguments or Path(arguments[arguments.index("--wait-file") + 1]).exists()
-            if published and operation == fcntl.LOCK_EX and os.readlink("/proc/self/fd/" + str(descriptor)).endswith("/.progress_history.lock"):
-                pause()
-            return flock(descriptor, operation)
-        fcntl.flock = observed_lock
-    if turn:
-        progress_history.record_turn_wait(Path(arguments[1]), arguments[2], arguments[3])
-    else:
-        sys.argv = arguments
-        progress_history.main()
-else:
-    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
-''')
-    interpreter.chmod(0o755)
-    return PausedWaitPublication(interpreter, resume)
 
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
@@ -200,7 +102,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
 
     def release() -> None:
         try:
-            with local_release_waiter(root, root) as events:
+            with local_release_waiter(root, root, RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while True:
                     # Watch all existing descendants before checking; watching
@@ -209,7 +111,10 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                     if isinstance(events, LocalReleaseEvents):
                         for directory in root.rglob("*"):
                             if directory.is_dir() and not directory.is_symlink():
-                                _ = events.add_watch(events.descriptor, os.fsencode(directory), 0x00000FCA)
+                                try:
+                                    _ = inotify.add_watch(events.descriptor, directory, events.mask)
+                                except FileNotFoundError:
+                                    continue
                     if stop.is_set():
                         return
                     if path.exists() and any(root.glob("**/verify-hold.*/waiter")):
@@ -256,11 +161,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # The committed Mac fixture exposes setUp(), not a seed builder. Own
-        # the copying here so this suite needs only that public lifecycle.
+        # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.setUp()
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.build_fixture()
         cls.fixture_root = builder.root
         seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
         cls.fixture_seed = Path(seed_directory) / "seed"
@@ -268,11 +173,20 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         # Version discovery is the lib/py suite's boundary. Preserve every
         # requested script and its real process, without a probe before each.
         library = builder.home / ".claude/scripts/lib"
-        replace_library_launcher(library, '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        source = library.resolve()
+        library.unlink()
+        library.mkdir()
+        for entry in source.iterdir():
+            if entry.name != "py":
+                (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
-            "BUILDLOG_BUILD_BUDGET_GIB": "64",
+            "ROSTER_RUN_ROOT": str(builder.root / "unit"),
+            "UNIT_RUN_ROOT": str(builder.root / "unit"),
+            "SCRATCH_ROOT": str(builder.root / "scratch"),
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -290,6 +204,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -325,7 +240,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
         pressure = root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
@@ -342,6 +257,37 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "",
             "BUILDLOG_HOLD_WAITER_FILE": "",
         })
+
+    def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
+        """Call the real hold checks, command launcher, and call recorder."""
+        script = self.fixture.root / "unblocked-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+                              "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
+            + '''
+PY=$CLAUDE_PYTHON
+CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
+TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify BUILDLOG_SYNC=1
+export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds" BUILDLOG_HOLD_WAIT_S=0
+BUILDLOG_MAC="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+status=0
+if [[ "$CMD" == check ]]; then
+    run_once cargo check || status=$?
+else
+    run_once cargo nextest run || status=$?
+fi
+note_event ran 0 0 0 0 "$status"
+exit "$status"
+''')
+        return subprocess.run(["bash", str(script), str(INVOKE), command], cwd=self.fixture.root,
+            env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
     def hold(self, key: str = "hana") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
@@ -369,6 +315,34 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
+
+    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+        """Keep the real admission client waiting behind a private memory limit."""
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            _ = admission.occupy_host()
+            admission.free(0)
+        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
+            'lint_config_enabled() {\n'
+            + '    [[ "$1" == clippy ]] || return 1\n'
+            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
+            + '}\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        self.fixture.environment.update({
+            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
+            "LINT_SKIP_SWEEP": "1",
+        })
+        process = self.start("lint", "sample")
+        self.wait_for_call(process, "waiting for memory since")
+        return process
+
+    def memory_queue_pids(self) -> set[int]:
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
+
+    def wait_for_owned_exit(self, timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
@@ -408,7 +382,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
-    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = self.fixture.root / "hold-targets.py"
         _ = targets.write_text(f'''import os
 import runpy
@@ -417,26 +391,27 @@ import tempfile
 
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-")
-    if {runs_on!r} == "mac_allowed":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+    print("natedev\\teligible\\t-\\t-\\t-")
+    if {runs_on!r} == "any_target":
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
-    sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
 ''')
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
 
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
+        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": "thread-impl",
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.fixture.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Hold"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
              "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
@@ -444,168 +419,13 @@ else:
         ):
             result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}}))
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
-
-    def pause_publication(self, boundary: Literal["before-event", "after-event", "before-lock", "before-file"]) -> PausedWaitPublication:
-        control = pause_wait_publication(self.fixture.root, boundary)
-        self.fixture.environment["CLAUDE_PYTHON"] = str(control.interpreter)
-        return control
-
-    def publish_marker_during_cleanup(self, directory: Path, wait_id: str) -> Path:
-        """Publish after the real recovery scan, just before folder retirement."""
-        marker = directory / "phase-wait.late.hold"
-        armed = self.fixture.root / "cleanup-publication-armed"
-        armed.touch()
-        interpreter = self.fixture.root / "late-recovery-publication"
-        self.fixture.write_executable(interpreter, f'''import os, sys
-from pathlib import Path
-sys.path.insert(0, {str(VERIFY.parents[2])!r})
-from scripts.direct import progress_history
-arguments = sys.argv[1:]
-if len(arguments) > 1 and arguments[0].endswith("/progress_history.py") and arguments[1] == "recover-wait-folder":
-    rename = os.rename
-    def publish_before_rename(source, target, *args, **kwargs):
-        armed = Path({str(armed)!r})
-        if Path(source) == Path({str(directory)!r}) and armed.exists():
-            armed.unlink()
-            progress_history._publish_wait_file(progress_history.WaitIdFile(Path({str(marker)!r})), {wait_id!r})
-        return rename(source, target, *args, **kwargs)
-    os.rename = publish_before_rename
-    sys.argv = arguments
-    progress_history.main()
-else:
-    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
-''')
-        self.fixture.environment["CLAUDE_PYTHON"] = str(interpreter)
-        return marker
-
-    @contextmanager
-    def after_wait_owner_deleted(self, directory: Path, action: Callable[[], None]) -> Generator[None, None, None]:
-        """Interrupt the real recursive delete after its snapshot and owner unlink."""
-        identity = directory.stat()
-        unlink = os.unlink
-        invoked = False
-
-        def after_unlink(path: str, *, dir_fd: int | None = None) -> None:
-            nonlocal invoked
-            unlink(path, dir_fd=dir_fd)
-            if invoked or path != "owner.json" or dir_fd is None:
-                return
-            parent = os.fstat(dir_fd)
-            if (parent.st_dev, parent.st_ino) == (identity.st_dev, identity.st_ino):
-                invoked = True
-                action()
-
-        with mock.patch.object(os, "unlink", after_unlink):
-            yield
-        self.assertTrue(invoked, "Recovery never reached deletion after its folder snapshot")
-
-    def remove_wait_after_recovery_scan(self, marker: Path, wait_id: str) -> Path:
-        """Finish an id, then remove its marker after recovery lists it."""
-        removed = self.fixture.root / "wait-removed-by-scanner"
-        interpreter = self.fixture.root / "remove-before-wait-read"
-        self.fixture.write_executable(interpreter, f'''import os, sys
-from pathlib import Path
-sys.path.insert(0, {str(VERIFY.parents[2])!r})
-from scripts.direct import progress_history
-arguments = sys.argv[1:]
-if len(arguments) > 1 and arguments[0].endswith("/progress_history.py") and arguments[1] == "recover-wait-folder":
-    sys.argv = [arguments[0], "finish-wait", "--session-dir", os.environ["UNIT_RUN_DIR"], "--wait-id", {wait_id!r}]
-    progress_history.main()
-    read_text = Path.read_text
-    def remove_before_read(path, *args, **kwargs):
-        if path == Path({str(marker)!r}) and path.exists():
-            path.unlink()
-            Path({str(removed)!r}).write_text("removed")
-        return read_text(path, *args, **kwargs)
-    Path.read_text = remove_before_read
-    sys.argv = arguments
-    progress_history.main()
-else:
-    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
-''')
-        self.fixture.environment["CLAUDE_PYTHON"] = str(interpreter)
-        return removed
-
-    def saved_publication_file(self) -> Path:
-        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        files = list((session / "verify_waits").glob("*/verify-hold.*/phase-wait.*"))
-        self.assertEqual(len(files), 1, f"One recoverable wait file must exist before the event append: {files}")
-        return files[0]
-
-    def wait_events(self, history: Path) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-
-    @contextmanager
-    def unavailable_wait_history(self, history: Path) -> Generator[None, None, None]:
-        saved = history.read_bytes()
-        history.unlink()
-        history.mkdir()
-        try:
-            yield
-        finally:
-            history.rmdir()
-            _ = history.write_bytes(saved)
-
-    def recover_saved_wait_after_failed_read(self, marker: Path, history: Path, wait_id: str) -> None:
-        result = self.fixture.verify("test", "sample", "--no-cache", "--local", "retry readable history",
-                                     "--filter", "smoke")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(marker.exists())
-        finishes = [row for row in self.wait_events(history)
-                    if row.get("wait_id") == wait_id and row["event_type"] == "wait_finished"]
-        self.assertEqual(len(finishes), 1)
-
-    def waits_report(self) -> dict[str, object]:
-        result = invoke_recorder(["waits", "--session-dir", self.fixture.environment["UNIT_RUN_DIR"]],
-                                 self.fixture.environment, self.fixture.root)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return cast(dict[str, object], json.loads(result.stdout))
-
-    def recover_publication(self) -> None:
-        rerun = self.start("test", "sample", "--no-cache", "--local", "recover publication", "--filter", "smoke")
-        self.wait_for_call(rerun)
-        grant_call(self.cycle_file)
-        code, output = self.finish(rerun)
-        self.assertEqual(code, 0, output)
-
-    def assert_stopped_publication_recovers(self, boundary: Literal["before-event", "after-event"]) -> None:
-        history = self.record_phase()
-        _ = self.pause_publication(boundary)
-        self.hold()
-        first = self.start("test", "sample", "--no-cache", "--local", "stop publication", "--filter", "smoke")
-        self.wait_for_call(first, f"wait publication paused: {boundary}")
-        marker = self.saved_publication_file()
-        wait_id = marker.read_text().strip()
-        self.assertTrue(wait_id)
-        before = [row for row in self.wait_events(history) if row.get("wait_id") == wait_id]
-        self.assertEqual(len(before), int(boundary == "after-event"))
-        self.stop_process(first)
-        self.recover_publication()
-        self.assertFalse(marker.exists())
-        events = [row for row in self.wait_events(history) if row.get("wait_id") == wait_id]
-        report = self.waits_report()
-        intervals = [row for row in cast(list[dict[str, object]], report["waits"]) if row["wait_id"] == wait_id]
-        if boundary == "after-event":
-            self.assertEqual([row["event_type"] for row in events], ["wait_started", "wait_finished"])
-            self.assertEqual(len(intervals), 1)
-            self.assertEqual(cast(dict[str, object], intervals[0]["wait_end"])["state"], "Finished")
-        else:
-            self.assertEqual([row["event_type"] for row in events], ["wait_abandoned"])
-            self.assertEqual(intervals, [])
-            abandoned = [row for row in cast(list[dict[str, object]], report["abandoned"]) if row["wait_id"] == wait_id]
-            self.assertEqual(len(abandoned), 1)
-            self.assertEqual(cast(dict[str, object], abandoned[0]["wait_end"])["state"], "NeverStarted")
-        self.assertFalse(any(cast(dict[str, object], row["wait_end"])["state"] == "Open"
-                             for row in cast(list[dict[str, object]], report["waits"])))
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
         history = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}, worker_name: {"thread_id": "thread-test"}}))
+        record_wait_workers(self.fixture.root, session, self.fixture.environment,
+                            {"fixture-impl": "thread-impl", worker_name: "thread-test"})
         for arguments in (
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
@@ -614,7 +434,7 @@ else:
         ):
             result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment["CODEX_THREAD_ID"] = "thread-test"
+        self.fixture.environment["CODEX_THREAD_ID"] = fixture_runtime_id("thread-test")
         self.hold()
         process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
         self.wait_for_call(process)
@@ -628,7 +448,7 @@ else:
         for wait in (started, finished):
             self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
                               wait["worker_name"], wait["owner_session"]),
-                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, "thread-test"))
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, fixture_runtime_id("thread-test")))
 
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"
@@ -676,6 +496,9 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         observer = self.fixture.root / "python-observer"
         self.fixture.write_executable(observer, '''import json, os, sys
 from pathlib import Path
+if os.environ.get("TEST_PYTHON_STARTS"):
+    with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
+        output.write(json.dumps(sys.argv[1:]) + chr(10))
 if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
     with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
         output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert: the one way any session reaches their phone.
 
-  pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
+  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
 2 emergency: it repeats every RETRY_S seconds until the user taps Acknowledge,
-for at most EXPIRE_S. Deleting it on the phone does not stop it. Which events
-get which priority is each caller's policy. An emergency push with --key carries
-the Pushover tag push_tag(KEY); `cancel` stops every emergency push with that tag.
+for at most EXPIRE_S. Deleting it on the phone does not stop it.
+A decision uses priority 1 only before an explicit deadline within the configured decision window.
+Other decisions use priority 0. Release checks the deadline again.
+An emergency push with --key carries the Pushover tag push_tag(KEY).
+`cancel` stops every emergency push with that tag.
 It prints "pushover: cancelled N" or "pushover: nothing to cancel" and exits 0;
 it exits 1 when Pushover refused it or could not be reached, 2 on usage or keys missing.
 
@@ -16,22 +18,26 @@ The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
-Every posted push ends with two lines, after the review: "Sent by: <sender>" and, last,
-"Template: <text id>", or "Template: none (free text)" for a push with no --text-id. The
-sender is the source; "send.py in hana" shows as "hana". A long body is cut so the two lines
-always fit. A push with no sender is refused and nothing is posted.
+Every posted push ends with one line after review: "Sent by: <sender> · Template: <text id>",
+or "Sent by: <sender> · Template: none (free text)" for a legacy kept push. The
+sender is the source; "send.py in hana" shows as "hana". A long body is cut so that last line
+always fits. A push with no sender is refused and nothing is posted.
 
 While the user's silence is on (silence.py), a push below priority 2 is kept,
 not posted: it prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later. A kept push with the same --key from the same
 --source replaces the older kept one.
 
-Messages without --action or --no-action are refused before sending. Exit 0
+New pushes require a registered template before review, credentials, claims, or posting. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
 usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent after failed review. Registry and emergency pushes still send.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -46,10 +52,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-import review
-import push_texts
-import silence
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
+from scripts.notify import review
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.notify import silence
+from scripts.notify import decision_priority
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
@@ -68,7 +76,7 @@ SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
-USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
+USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 
 
@@ -86,6 +94,7 @@ class Reply(TypedDict, total=False):
 
 
 class ReviewedPushRecord(review.MessageRecord):
+    reviewed: NotRequired[bool]
     held: NotRequired[bool]
     text_id: NotRequired[str]
     failed_rules: NotRequired[list[str]]
@@ -96,6 +105,9 @@ class ReviewedPushRecord(review.MessageRecord):
 
 
 class PushLogRecord(TypedDict):
+    key: NotRequired[str]
+    template: NotRequired[str]
+    reference: NotRequired[push_reference.PushReference]
     time: str
     source: str
     priority: str
@@ -168,18 +180,25 @@ def sender_name(source: str) -> str:
     return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
 
 
-def log(source: str, priority: str, title: str, message: str, outcome: str) -> None:
+def log(source: str, priority: str, title: str, message: str, outcome: str, *,
+        key: str = "", template: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE) -> None:
     entry: PushLogRecord = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
              "source": source, "priority": priority, "title": title, "message": message, "outcome": outcome}
+    if key or template or reference["kind"] != "none":
+        entry["key"] = key
+        entry["template"] = template
+        entry["reference"] = reference
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as out:
             _ = out.write(json.dumps(entry) + "\n")
     except OSError as error:
-        print(f"pushover: could not write log: {error}", file=sys.stderr)
+        print(f"pushover: could not write log: {error}; record: {json.dumps(entry)}", file=sys.stderr)
 
 
 class Arguments(TypedDict):
+    reference: push_reference.PushReference
+    need: str
     priority: str
     source: str | None
     key: str
@@ -191,11 +210,15 @@ class Arguments(TypedDict):
     text_id: str
     session: NotificationSession
     header: bool
+    due: str
 
 
 def parse(argv: list[str]) -> Arguments | None:
     """Parse options without exiting, so callers get send()'s usage status."""
     priority = "0"
+    question = forwarded_reference = ""
+    remote_forward = False
+    due = ""
     source: str | None = None
     action: str | None = None
     no_action = False
@@ -206,6 +229,12 @@ def parse(argv: list[str]) -> Arguments | None:
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
         option = argv[index]
+        if option == "--ssh-forwarded-reference":
+            if "SSH_CONNECTION" not in os.environ:
+                return None
+            remote_forward = True
+            index += 1
+            continue
         if option == "--answerable":
             answerable = True
             index += 1
@@ -214,13 +243,19 @@ def parse(argv: list[str]) -> Arguments | None:
             no_action = True
             index += 1
             continue
-        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value") or index + 1 >= len(argv):
+        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value", "--due", "--question", "--push-reference") or index + 1 >= len(argv):
             return None
         value = argv[index + 1]
         if option == "--priority":
             if value not in PRIORITIES:
                 return None
             priority = value
+        elif option == "--question":
+            question = value
+        elif option == "--push-reference":
+            forwarded_reference = value
+        elif option == "--due":
+            due = value
         elif option == "--source":
             if not value.strip():
                 return None
@@ -237,8 +272,20 @@ def parse(argv: list[str]) -> Arguments | None:
         else:
             action = value
         index += 2
+    try:
+        _ = decision_priority.read_due(due)
+    except ValueError:
+        return None
+    try:
+        reference = push_reference.admission_reference(text_id, question, forwarded_reference, remote_forward=remote_forward)
+    except (OSError, ValueError) as error:
+        print(f"pushover: {error}", file=sys.stderr)
+        return None
+    if not push_key and reference["kind"] == "question":
+        push_key = "question:" + reference["path"]
     session: NotificationSession = NO_SESSION_LINE
     header = True
+    need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
         try:
@@ -248,7 +295,9 @@ def parse(argv: list[str]) -> Arguments | None:
         if positionals or action is not None or no_action:
             return None
         source = source or rendered.sender
-        priority = "2" if priority == "2" else {"note": "0", "decision": "1", "blocked": "2"}[rendered.need]
+        need = "blocked" if priority == "2" else rendered.need
+        if due and need != "decision":
+            return None
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
         positionals = [rendered.title, rendered.body]
@@ -256,11 +305,18 @@ def parse(argv: list[str]) -> Arguments | None:
         header = rendered.header
     elif values:
         return None
-    if len(positionals) != 2 or not all(value.strip() for value in positionals):
+    try:
+        priority = decision_priority.priority(need, due)
+    except ValueError:
+        return None
+    if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
     return {
+        "reference": reference,
+        "need": need,
+        "due": due,
         "session": session,
         "priority": priority,
         "source": source,
@@ -295,9 +351,15 @@ def refuse(source: str, priority: str, title: str, message: str, reason: str) ->
 
 
 def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    if "--text-id" not in argv:
+        print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
+        return 2
     arguments = parse(argv)
     if arguments is None:
         print(USAGE, file=sys.stderr)
+        return 2
+    if not arguments["text_id"]:
+        print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
         return 2
     priority = arguments["priority"]
     source = arguments["source"] if arguments["source"] is not None else parent_source()
@@ -314,14 +376,15 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
                       f"--action may hold at most {action_limit} characters")
     if len(first_line(action, arguments["session"])) + 1 > MESSAGE_MAX:
         return refuse(source, priority, title, message, "Session and action exceed the message limit")
-    match refused_at(action, int(priority)):
+    action_priority = {"blocked": 2, "decision": 1, "note": 0}[arguments["need"]]
+    match refused_at(action, action_priority):
         case ActionRefused(reason):
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
     draft = review.Draft(source, priority, title, action,
                          trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
-                         arguments["answerable"], arguments["session"])
+                         arguments["answerable"], arguments["session"], arguments["due"], arguments["reference"])
     header, key = arguments["header"], arguments["key"]
     registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
     claimed = False
@@ -347,7 +410,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         version = draft
         detail = "review: off"
     else:
-        outcome = review.review(draft, revision=claimed)
+        outcome = (review.review(draft, revision=claimed, text_id=arguments["text_id"]) if registered_text
+                   else review.review(draft, revision=claimed))
         # For registered texts that are not agent-written, review is a logged check only.
         version = draft if registered_text else review.best_version(draft, outcome)
         if isinstance(outcome, review.Unreviewed):
@@ -357,10 +421,11 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if isinstance(outcome, review.Questions):
         outcome = review.Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
     rejected = isinstance(outcome, (review.Failed, review.Withheld))
-    send_anyway = rejected and (priority == "2" or registered_text)
+    template_required = not registered_text and isinstance(outcome, (review.Failed, review.Withheld)) and any(rule.startswith("use-registered-template:") for rule in outcome.failed_rules)
+    send_anyway = rejected and not template_required and (priority == "2" or registered_text)
     if send_anyway:
         detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
-    record: ReviewedPushRecord = {**review.message_record(version)}
+    record: ReviewedPushRecord = {**review.message_record(version), "reviewed": not isinstance(outcome, review.Unreviewed)}
     if arguments["text_id"]:
         record["text_id"] = arguments["text_id"]
     if rejected:
@@ -427,10 +492,15 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
     """
     source, priority, title = draft.source, draft.priority, draft.title
+    if not key and draft.reference["kind"] == "question":
+        key = "question:" + draft.reference["path"]
+    need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
+    priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
     if priority != "2":
         kept = silence.keep({"source": source, "priority": priority, "title": title,
-                             "message": message, "detail": detail, "key": key, "text_id": text_id},
+                             "message": message, "detail": detail, "key": key, "text_id": text_id,
+                             "due": draft.due, "need": need, "reference": draft.reference},
                             deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
@@ -440,22 +510,46 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
-    """Post a push kept during silence, exactly as it was kept."""
+    """Drop settled requests and retired alerts before posting kept pushes."""
+    reference = push.get("reference", push_reference.NO_REFERENCE)
+    reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if reference["kind"] == "question":
+        try:
+            opening = push_reference.read_question(Path(reference["path"]))
+        except (OSError, ValueError) as error:
+            log(push["source"], push["priority"], push["title"], push["message"],
+                f"anomaly: question record {reference['path']}: {error}",
+                key=push["key"], template=push["text_id"], reference=reference)
+        else:
+            if opening.status == "closed":
+                reason = "question closed"
+            elif opening.since != reference["since"]:
+                reason = "question reopened"
+    elif reference["kind"] == "review_watch":
+        from scripts.production import review_regime
+        if review_regime.acknowledged():
+            reason = "report acknowledged"
+    if reason:
+        log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
+            key=push["key"], template=push["text_id"], reference=reference)
+        return push_reference.KeptPushDropped()
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
-    return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
+    need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
+    priority = decision_priority.priority(need, push.get("due", ""))
+    return post_message(push["source"], priority, push["title"], push["message"], keys_file, post, detail,
                         push["key"], push["text_id"])
 
 
 def post_message(source: str, priority: str, title: str, message: str,
                  keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
-    """Every push to the phone goes out here, with its "Sent by" and "Template" lines last."""
+    """Every push to the phone goes out here, with its sender and template on one last line."""
     suffix = f", {detail}" if detail else ""
     sender = sender_name(source)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    footer = f"\n\nSent by: {sender}\nTemplate: {text_id or FREE_TEXT}"
+    footer = f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
     message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:

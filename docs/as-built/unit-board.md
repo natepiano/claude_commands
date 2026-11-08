@@ -2,7 +2,13 @@
 
 ## What it is
 
-A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, `/accounts-board` shows the accounts table that `accounts.py` reports from stored readings, with no login addresses, and `/build:queue` shows the free/taken budget and one waiting row per step with a size bar and the head’s window state. `/unit:report` prints a short report (phase, stage, one ETA line, the summary table, workers, summary sentences), and adds the recorder's round table only when asked with `tables`.
+The mod in `mods/unit-board/` draws three panes on demand.
+`/showrunner:unit_board` shows the production, its child productions, or one unit.
+It shows phases, ETAs, gates, finish times, and workers.
+`/showrunner:accounts` shows stored account readings without login addresses.
+`/build:queue` shows the memory cap, room, running steps, and waiting steps.
+The recorder keeps each phase's stated ETA and predicts later phases from it.
+`/unit:report` prints a short report; `tables` adds the recorder's round table.
 
 ## How it works
 
@@ -13,11 +19,11 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                                                               │
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
-            progress_history.py progress           board_json.py --cwd <cwd> --session <id>
-            (short report / --tables)              writes <slug>.json, prints {files, watch}
+            progress_history.py progress           board_json.py --session <id>
+            (short report / --tables)              writes <staff-id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
-                                       mod: /accounts-board ── runs accounts.py status --json --stored
+                                       mod: /showrunner:accounts ── runs accounts.py status --json --stored
                                        mod: /build:queue ── runs build_queue.py --json
 ```
 
@@ -49,19 +55,24 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ### The board generator
 
 ```
-~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--cwd <path> [--session <id>] | --production <slug>)
+~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <showrunner name>)
 ```
 
-[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. It logs nothing.
+[`board_json.py`](../../scripts/direct/board_json.py) reads the staff file to resolve each production. It writes each board atomically to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<showrunner-staff-id>.json`. It prints one line: `{"files": [...], "watch": [...]}`. The plugin reads these returned paths directly. A rename, transfer, or session replacement preserves the cache path. An unresolved production returns `"files": []` and exits 0. An unreadable staff file also prints its cause to stderr.
 
-- Resolve (`showrunners.registered_showrunners()`): a `--session <id>` whose update timer `showrunners.production_of` finds gives the registered production with that doc (paths compared resolved); failing that, `--cwd` inside a showrunner checkout gives that production. Either is followed by each production in `showrunners.descendants_of(slug)` (nearest level first), each only when registered. `--production <slug>` gives the same list. Any other session and `--cwd`, a unit worktree included, gives no files.
-- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
-- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
-- `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
+- `board_json.resolve` reads one staff snapshot for all boards. It finds the session with `record.by_current_session`, then follows staff parents to the first showrunner. Unit and worker sessions see that production and its descendant productions, nearest level first. `--production <showrunner name>` selects the same subtree by staff name and takes precedence over `--session`. The resolver reads document paths from showrunner staff rows and zones through `showrunners.timer_for`. It excludes showrunners without timer registrations. A session without a staff row or a showrunner ancestor produces no files.
+- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<staff id>` for every registered showrunner: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<showrunner name>/` before the update timer, so the dir exists before any attach.
+- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts).
+  [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it.
+  The top level holds `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`, and `live`.
+  `live` is true when a worker is `working` or `waiting on run`.
+  Every time uses `BoardTime {at: epoch s, text}` in the production's zone.
+  The text uses `HH:MM` today and `ddd DD Mon HH:MM` on other days.
+- `BoardUnit`: `key` (the staff name), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
-  - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
-  - the open activity label (`unit_table_cells.open_step`);
+  - An unlanded `finding_batch_dispatched` in the open phase appears as `Repair round <dispatched batches>`. This label shows dispatch records for audit. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
+  - the open activity label (`display_cells.open_step`);
   - `Phase <id> running` while a phase is open (`Ticket <id> running` on a standing plan);
   - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
 
@@ -69,18 +80,53 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `state` comes from `unit_run.local_run`, which reads each run file only up to its `run_started` line (every run file holds one, on line 1) and skips lines without `"run_started"` before parsing.
 - The record is built from the found run's own plan (`project_plan_doc`, else `plan_doc` resolved against the worktree), falling back to the Plan cell's plan.
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
-  - A run on another plan than its production row (tool-based-ui `demo`) shows its real phase.
+  - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
+  `recorded_turn_settings` supplies the accepted model and effort.
+  `done` displays as `idle`; `ended` stays unchanged.
+  The reader displays raw role and family values when the records contain them.
+  Missing values display as empty fields.
+  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
   - Slots drop the worktree's mesh prefix.
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
+- Pane workers also use [`worker_runs.py`](../../scripts/direct/worker_runs.py) to read detached runs from their run folder.
+  It matches each worker by staff id and selects its newest run by `started_at`.
+  A working pane has state `working`.
+  An idle pane with a live run has state `waiting on run`.
+  A successful process snapshot confirms `run gone` when a running record has no process.
+  A failed snapshot keeps `waiting on run` and `live: true` so the next tick retries.
+  That run shows `first_reading` growth and saves no new reading.
+  A finished run with delivery starting `queued` has state `result queued` until that worker starts another pass.
+  Both `queued for ...` and `queued: ...` deliveries use this state.
+  Other workers keep their pane state.
+  Only these three run states carry `run {label, started_at, growth, last_line}`.
+  `growth` has kind `first_reading`, `measured`, or `finished`.
+  Measured growth holds `cpu_percent` and `log_bytes_per_minute`.
+  Finished growth holds `exit_code`.
+  The reader takes at most one `ps -A -o pid=,ppid=,time=` snapshot for all shown runs.
+  It takes no snapshot when no shown run has status `running`.
+  CPU seconds include the run process and all its descendants.
+  On Linux, each tree member includes its own CPU and the CPU of children it reaped, from `/proc/<pid>/stat`.
+  Stat reads cover only the running run's tree; an unavailable stat file uses that pid's `ps` CPU time.
+  On systems without `/proc`, including macOS, CPU totals use `ps` and can miss children that exit between snapshots.
+  The last line comes from at most 4096 log bytes and contains no ANSI escape sequences.
+- `run_readings.json` sits beside the board files, outside the watched run folders.
+  Each running reading holds `run_id`, `at`, `cpu_seconds`, and `log_bytes`.
+  The next reading measures CPU percent of one core and log bytes per minute.
+  The writer merges readings under the exclusive `run_readings.lock` beside the readings file.
+  The lock stays in place when atomic publication replaces the readings file.
+  A build preserves readings from other boards.
+  It removes only readings for runs it saw as finished and readings older than ten minutes.
+  An idle build never deletes another board's fresh readings.
+  A build with no readings creates no readings file.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
 - `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
 ### The mod
 
-`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`.
+`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`. Claude Code 2.1.316 and later reads the mod in place from `~/.claude/mods/unit-board`, because `nate-local` is a local folder marketplace and lists the mod by a relative path. `claude plugin list` shows `Read from: ~/.claude/mods/unit-board`. A promoted change takes effect at the next session start or `/reload-plugins`, and no copy exists in `~/.claude/plugins/cache`. A session started on an older Claude Code loads a copy from that cache instead. Restart such a session on the current Claude Code.
 
 | File | Role |
 | --- | --- |
@@ -103,23 +149,46 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 **Commands.**
 
-- `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd> --session <$.session.id()>` (the open pane keeps both, so every refresh passes them), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` Pressing a unit name on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
+- `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--session <$.session.id()>` (the open pane keeps the session id for each refresh), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `This session is not on the staff list.`; it replies `Unit board opened.` Pressing a unit name on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
 - A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
-- `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
-- `/build:queue [<position|session|folder>]` is intercepted by `command.run` without a model turn. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json", "--columns", <last bodyColumns>, "--you", <session id>, <optional selector>]` and replies `Build queue opened.`. The width starts at 100. A pane-width change requests one forced refresh; the shared busy guard joins repeated requests. A selector opens the matching step cards and survives the 10 s refresh and reload. `close` replies `Build queue closed.`. Bump retains its existing refusal handling and refreshes an open pane. Bump is off; nothing can move a waiting step.
-- `queue_lines.py` defines `Span {text, tone, bold, background, until?}`, terminal-cell widths, padding, clipping, hanging-indent wrap, text output and `QueueLines {columns, as_of, lines}` JSON. Tone names include blue `suggestion`. JSON omits fields at their `Span` defaults: `tone` and `background` `default`, `bold` false, and no `until`. The pane accepts missing fields as those defaults; older explicit fields remain valid. An `until` span contains only the countdown text and its epoch deadline; the pane computes `max(0, until − now)` on every draw. One `$.clock.every(1000, …)` timer invalidates the drawing while a countdown is active, without a script run; it stops on expiry, a view without a countdown, failure or close. The 10 s script refresh stays.
-- `build_queue.py` reads admission with the lock-free, bounded `queue_read()`, then resolves labels through one file-only `unit_labels_for` lookup. The no-selector view skips bump/token history and pace reads. It draws a budget bar from admission’s charged total and budget, then aligned waiting rows with showrunner, unit (without its showrunner prefix), step, minutes and need bars at one cell per GiB. Plain output uses `░` for free budget and `█` for taken; colour uses green and blue with an eighth-block boundary. Name columns grow above 60 cells, shrink together when needed, then clip at the edge. `--you` carries `$.session.id()`; inline falls back to the calling session environment. Matching rows have a blue `▸`. Row 1 ends with `↑` for backfill, `↑ ≤N.N` for positive strict-window room or `⊘` when no room remains, a recorded window countdown when known, and red host-hold words. The view has no running rows, moves or start estimates.
-- Selector cards retain their order, checks and history behavior. An older fitting step fails the queue-order check with `behind #<k>, an older step that fits`, or `behind an older step that fits` when it is absent from the reading. `queue_view.render_view` and `queue_card.render_card` share a model and admission check formatter. Every waiting step's card shows its recorded budget and free checks from admission. Failed runs and malformed JSON show only `Build queue could not be read.`. Times use the user’s zone; `as_of` is the admission reading’s epoch.
-- `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh. A colon command keeps its name in `commands/build/queue.md`; its body still runs the script without the mod. Sessions started before these hooks need `/reload-plugins`.
+- `/showrunner:accounts [close]` opens pane `accounts`, titled `Accounts`, without a model turn.
+  It resolves the user zone and stores `loading`.
+  Each open and refresh runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]`.
+  It replies `Accounts opened.`; `close` replies `Accounts closed.`.
+- `/build:queue [<position|session|folder>]` is intercepted by `command.run` without a model turn. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json", "--columns", <last bodyColumns>, "--you", <session id>, <optional selector>]` and replies `Build queue opened.`. The width starts at 100. A pane-width change requests one forced refresh; the shared busy guard joins repeated requests. A selector shows the full queue, one blank line, and the matching cards on one page. `mine` uses the same layout. The selection survives the 10 s refresh and reload. `close` replies `Build queue closed.`. Bump retains its existing refusal handling and refreshes an open pane. Bump is off; nothing can move a waiting step.
+- `queue_lines.py` defines `Span {text, tone, bold, background, until?}`, terminal-cell widths, padding, clipping, hanging-indent wrap, text output and `QueueLines {columns, as_of, lines}` JSON. Tone names include blue `suggestion`. JSON omits fields at their `Span` defaults: `tone` and `background` `default`, `bold` false, and no `until`. The pane accepts missing fields as those defaults; older explicit fields remain valid. An `until` span contains only the countdown text and its epoch deadline; the pane computes `max(0, until − now)` on every draw. One `$.clock.every(1000, …)` timer invalidates the drawing while a countdown is active, without a script run; it stops on expiry, a page without a countdown, or close. The 10 s script refresh stays.
+- `build_queue.py` reads one captured admission pass through the bounded `queue_read()` query.
+  `unit_labels_for` supplies the labels through one file read.
+  The memory bar shows the cap, anonymous use, keep-aside, room, safety, and other programs.
+  Running rows show each run and its held slot.
+  Waiting rows show the showrunner, unit, step, waiting minutes, pid, and need.
+  Every process row shows its captured `pid N`, or `pid —` when no pid was recorded.
+  The pid column takes space from the row bar while names keep their allocated widths.
+  The first eligible row has an `↑` marker and a recorded hold cause.
+  Head protection keeps its full need available before a younger run starts.
+  Held slots give the same run priority for its next step.
+  New starts use the recorded start-spacing deadline.
+  Service rows retain RAM and swap amounts through marked continuation lines.
+  `--you` selects the session through `$.session.id()`.
+  A blue `▸` marks matching rows.
+- Selector cards share the queue model and the admission check formatter.
+  Each card shows the captured room check, start basis, head cause, and run keep-aside.
+  The evidence uses the same pass as the queue view.
+  A failed refresh retains the last successful view.
+  A failed first query shows only `Build queue could not be read.`.
+  Times use the user’s zone; `as_of` is the admission reading’s epoch.
+- `session.start` restores refresh timers for open panes. Command files supply the colon names; mod hooks open the panes without a model turn. Without the mod, `/showrunner:accounts` names the required plugin. `/build:queue` runs its script. Run `/reload-plugins` in sessions that need the updated hooks.
 
 **State.** Plugin state `unit-board` holds the board and accounts records, each keyed by pane id; a missing entry is a closed pane.
 
 - `panes`: `PaneState<BoardData>` = `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`. `data` is a `BoardSnapshot {files, watch, loadedAt, boards}`.
-- `accountsPanes`: `AccountsPaneState<StoredAccountsStatus>` = `loading` | `accounts {data, zone, now}` | `failed {reason}`. `now` (seconds) is set on each load, and each unchanged 10 s tick sets a fresh `now` with no process run.
+- `accountsPanes` uses `AccountsPaneState<StoredAccountsStatus>`: `loading`, `accounts {data, zone, now}`, or `failed {reason}`.
+  Each load sets `now` in seconds.
+  A tick updates local liveness when the generator reports session inputs.
 
 - `queuePanes`: `QueuePaneState` = `loading {selection}` | `queue {data: QueueLines, selection}` | `failed {reason, selection}`. `QueueSelection` is `{kind: 'view'} | {kind: 'card', selector: string}`. The one load boundary converts older saved string selectors to cards, and null or missing selectors to views; refresh and reload retain the named selection. `QueueOpening` reuses that selection type beside its `saved` case. Width stays in module-level `queueColumns` and `QueueWidthRefresh`. It belongs to the same `unit-board` state namespace, under its own pane id.
 
-Timers stay module-level and are never persisted. The board retains `OpenPane {timer, cwd, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`). Accounts and queue use the same `tablePane` helper in `register.tsx`: open/loading, one reader at a time, a 10 s timer, fixed failure reason, reload and close. Each instance keeps its own context, watched paths and lifecycle counter. Close invalidates pending work and zone lookups; a forced refresh during a read is coalesced into one following read. Paths and board selection survive a failed refresh.
+Timers stay module-level and are never persisted. The board retains `OpenPane {timer, session, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`). Accounts and queue use the same `tablePane` helper in `register.tsx`: open/loading, one reader at a time, a 10 s timer, fixed failure reason, reload and close. Each instance keeps its own context, watched paths and lifecycle counter. Close invalidates pending work and zone lookups; a forced refresh during a read is coalesced into one following read. Paths and board selection survive a failed refresh.
 
 **Refresh on change.** The board and accounts panes share:
 
@@ -130,9 +199,22 @@ refreshIfChanged<T>(files: RefreshFiles, paths: readonly RefreshPaths[],
 type RefreshPaths =
   | { kind: 'board'; board: string; sources: string[] }       // sources vs the board file's mtime
   | { kind: 'discovery'; sources: string[]; loadedAt: number } // sources vs the load time
+  | { kind: 'liveness' } // refresh live counts and worker runs each tick
 ```
 
-It stats each source; one newer than its reference (or a failed stat) runs the generator once and stores the result. `isOpen` is checked before every stat, before the generator and before the set. The board ticks on a `$.clock.every(10_000)` timer and on `turn.complete`; an unchanged board tick only moves `now`, so `in 2h 16m`/`late …` and the detail ruler's now mark advance without a process. The accounts pane ticks on its own 10 s timer, with a `busy` guard, and ignores `turn.complete`. `loadAccounts` watches `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json` and `~/.local/state/accounts/role_map_cache.json` as one `discovery` path; a missing input is watched through its nearest existing parent directory. `ui.close` (any origin) cancels the pane's timer and drops its state. The build queue has live process-memory readings, so its shared-helper policy runs `--json` once every 10 s while open, independently of file changes and `turn.complete`.
+A source newer than its reference, or a failed stat, triggers one generator run.
+`isOpen` guards each stat, generator call, and state write.
+The production board refreshes every ten seconds and on `turn.complete`.
+An unchanged production board with `live: false` advances its display clock without a process.
+When any board has `live: true`, `snapshotPaths` adds `liveness` and each tick rebuilds the board.
+The accounts pane uses a separate ten-second timer and a busy guard.
+It ignores `turn.complete`.
+`loadAccounts` watches saved usage, groups, worker selection, and the role-map cache.
+It also watches reported `session_inputs`, including the peer-count cache.
+A missing file uses its nearest existing parent as a discovery source.
+A `liveness` refresh policy requests current local counts on each open-pane tick.
+`ui.close` cancels that pane's timer and removes its state.
+The build queue reads process memory every ten seconds while open.
 
 **Views.** Views draw the `as_of` snapshot and never recompute an ETA (`in …`/`late …` is display arithmetic on recorded times). Colours are theme keys only. Facts draw in the default colour; `inactive` is the only grey, for labels (`workers`, `as of`), separators and history. There is no `subtle` and no `dimColor`: the user found the dim grey hard to read.
 
@@ -157,7 +239,13 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - ETA with overdue, gate and finish, then the ruler;
   - the trail as `HH:MM said HH:MM → …`, then the strip;
   - `This phase` steps, each label fitted to one row with two spaces before its time;
-  - one row per worker, with slot, role and state padded to the widest entry;
+  - Each worker row pads its slot, role, and state to the widest entry.
+    A run row then shows the label, age, CPU percent, log growth, and last log line.
+    The pane truncates the row at its width.
+    The first reading shows `cpu …` and `log …`.
+    A finished run shows its exit code.
+    `working` and `waiting on run` use `suggestion`; `run gone` uses `error`; `result queued` uses `warning`.
+    A row without a run keeps its existing fields.
   - the phase record, newest first.
 
   It keeps within `bodyRows`:
@@ -165,7 +253,32 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three into `+N later`.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
-- Accounts: `AccountsView(elements, columns, status, zone, now)` uses the pane's `bodyColumns`; every drawn line is at most `columns` cells, with no `…`. It draws the table shared with the cargo-handler accounts table (handler-enh builds that side to the same spec; send any change to handler-enh too). Columns, in order: a mark with no header, `account`, `role`, `left`, `resets`, `credits`, `enabled`, `in use`, `read`, under a bold lower case header row; every column is always shown. Each column is as wide as its widest cell or header (`cellWidth`), with 2 spaces between columns and no padding after the last. The mark `●` is `success` when `read_ok`, `error` when not or when the field is missing: it is the only access signal. `account` is bold; `role` joins roles with `, `; `left` is `60%` or `—`, `error` under 10 %, `warning` under 25 %, the only quota color; `resets` is a short time; `credits` is `13,446` or `unlimited`; `enabled` is `yes` when `use_credits`; `in use` is `yes` (in `warning`) when `credits_in_use`; `read` is the age of the reading (`45s`, `12m`, `2h`, `3d`, floored). Other missing cells are blank. `account`, `role`, `enabled` and `in use` are left-aligned; `left`, `resets`, `credits` and `read` are right-aligned, so `%` signs line up. Accounts sort by label (`localeCompare`, `sensitivity: 'base'`). The form is picked once for the whole list: the table when it fits; else a two-row table (row 1 the mark, `account`, `role`, `left`; row 2, indented 2, the other columns; a two-row header in the same shape); else a narrow form with no header (`● <label>  <roles>`, then the facts with their words joined by ` · `, a break only between facts). Times are short, in the resolved zone: same day `14:00`, within six days `Sat 14:00`, else `24 Oct`. Problems follow after a blank line: `Problems` in bold, then `• <text>` in `warning`, wrapped with indent 2. `accounts.py status --json` sends each problem without the text table's `* ` mark, and sends `read_ok` (a stored reading whose latest read outcome is `OK` or `HELD`) and `credits_in_use` (`on_credits == "yes"`). There is no Login column. `accountDisplay` maps the wire shape into `AccountReading<T>` and `CreditBalance`.
+- Accounts: `AccountsView(elements, columns, status, zone, now)` uses the pane's width.
+  The columns are the access mark, `account`, `left`, `role`, `busy`, `idle`, `paused`, `exited`, `total`, `resets`, `credits`, and `enabled`.
+  The table omits the `read` and `in use` columns.
+  Account labels are bold, and numbers align to the right.
+  Each role has a separate row with its own counts.
+  The first row shows all account values.
+  Later rows show only the role and its counts.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
+  A totals row sums the known activity counts.
+  Units and showrunners without live sessions count as exited on their selected role account.
+  Workers count only while live; their paused and exited counts stay zero.
+  Paused stays zero until agents status supplies that state.
+  The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
+  Low allowance uses error below 10 percent and warning below 25 percent.
+  Tables use the widest cell or header, with two spaces between columns.
+  A wide table uses one row per role.
+  Narrower panes split the columns or use labeled facts.
+  The labeled facts repeat no account values for later roles.
+  The narrow form breaks between complete facts and keeps each drawn line within the pane.
+  Times use the resolved user zone.
+  Problems follow the table as wrapped warning bullets.
+  `accountDisplay` maps the wire contract into `AccountReading<T>` and `CreditBalance`.
+  The [account design](accounts.md#status-counts-and-notes) defines count attribution, peer availability, and stored reads.
+
 - `resolveUserZone(calls, isActive): Promise<ZoneLookup>` follows [`scripts/lib/user_zone.py`](../../scripts/lib/user_zone.py): `USER_ZONE`, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; it returns `{kind: 'cancelled'}` once the lifecycle moves on.
 
 ### The short report
@@ -184,7 +297,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, board and accounts refresh through `$.fs.stat` of existing files; the queue runs its reader every 10 s for live measurements.
 - **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator, `accounts.py` and `build_queue.py` are one-shot runs.
 - **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and `accounts.py status --json` has no login field, so no login address reaches the mod.
-- **A failed accounts or queue run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
+- **A failed queue refresh keeps the last successful page.** A failed first query shows a fixed reason. Accounts failures show a fixed reason. No failure displays process output.
 - **User-facing times use the user zone.** Python writes them with `astimezone(user_zone())`; the mod resolves the zone in `scripts/lib/user_zone.py`'s order; board times use the production's registered zone. `scripts/lib/test_user_zone` scans every script.
 - **The ETA is the latest stated promise**, never the schedule end an overdue phase is advanced to. `eta.at`, `first` and `trail` hold promises only; `schedule_end` is never a trail entry; the ruler's ETA mark is `eta.at`.
 - **Readers place an ETA by `eta_phase_id`**, never `phase_id`, which names the phase active when it was recorded.
@@ -201,7 +314,11 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Ruler horizon: 10 % beyond the later of the promise and now; board ruler width is `bodyColumns - 4`, unit `bodyColumns - 2`, minimum 8.
 - `doing` is cut to 80 characters, after the `launcher: ` prefix and the summary or findings path are removed.
 - `local_run` stops at the `run_started` line: parsing every line of every run file once per unit took 35 s for three productions, past the mod's 30 s process limit. Reading to that line brings it to about 4.5 s.
-- The dot and the percent are `error` under 10 % and `warning` under 25 %; at 25 % or more the dot is `success` and the percent the default colour; `no reading` has an `inactive` dot (`leftTone`). ` in use` is `warning`. `inactive` is used only for the words `resets`, `credits`, `read` and the separators; labels, roles, numbers and times are the default colour. No account text is `subtle`, which made the table hard to read.
+- The access dot uses `read_ok`; it does not use the quota colour.
+  The percent uses error below 10 percent and warning below 25 percent.
+  Other quota values use the default colour.
+  Missing quota shows a dash.
+  The table has no `read` or `in use` column.
 - `HH:MM` for `--time`, `--earliest`, `--latest` means today only; a later-day ETA needs the full date.
 - A phase record's `first_eta` comes from `_instance_eta_events`, so a checkpoint-notice ETA recorded before the phase starts counts as its first.
 - `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps` and `stage`; both follow `OpenPhase.instance_id`.
@@ -210,7 +327,8 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - A failed stat counts as a change: a `failed` board pane retries each tick while a source stays newer than the board file, and recovers on the next good run.
 - A close during a pending `session.start` load or zone lookup must not restart the accounts timer; the lifecycle counter guards it.
 - The mod runs the generator, `accounts.py` and `build_queue.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
-- `accounts.py status` with no flags can print login addresses in its problem notes. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
+- The accounts view uses numbered labels and requests no login column.
+  Stored reads do not wait for the detached counts fetch.
 - A fresh checkout's `tsc` reports `TS2688` for `claude-code`, `claude-code-tools` and `claude-code-mcp` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
@@ -221,7 +339,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 
 From the repository root, run `command claude plugin test mods/unit-board` for the whole mod suite and `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` for the mod type check. The ignored `.claude-plugin/types/` declarations from a loaded session are required by `tsc`; the test command alone did not generate them in this checkout.
 
-The queue reader checks cover `test_build_queue`, `test_head_facts`, `test_queue_view` and `test_queue_card`; their shared file fixture produces golden renders at 80, 100 and 140 columns and the first and fourth step cards. A live pane check requires the installed code and `/reload-plugins`: compare its rows and head explanation with the script at the same time.
+The queue reader checks cover `test_build_queue`, `test_head_facts`, `test_queue_view` and `test_queue_card`; their shared file fixture produces golden renders at 80, 100 and 140 columns and the first and fourth cards below the full queue view. A live pane check requires the installed code and `/reload-plugins`: compare its rows and head explanation with the script at the same time.
 
 ## Why
 
@@ -231,15 +349,20 @@ The ETA shown is the latest promise because a passed promise advanced to now wou
 
 The mod draws and Python computes. The chain, gates and history live in `phase_table`, which is stdlib Python under `unittest` and basedpyright; a generator that writes one JSON file keeps a single source of predictions, a typed contract tested on both sides, and a view layer with no logic to drift. `state` comes from the unit's own newest run, and `local_run` reads each file only to its `run_started` line so the board opens inside the process limit. Other production watchers share one `unit_lookup.read_run_states()` snapshot per tick, reading each file's first line and each worktree's newest record's last JSON object; `run_state` is the wrapper for a single lookup. `build_run` keeps a unit's record on the board after its plan turns into an as-built doc and loses its phase headings.
 
-The panes open only on demand because the user asked for it, and a closed pane costs nothing for the same reason a background watcher was ruled out: no session should pay for a view nobody is looking at. While open, stat-based refresh is cheap: the sources are files the run already writes, so an unchanged tick is a handful of stats and a redraw, and the generator runs only after something changed. The `discovery` paths exist so a production or input that appears later still triggers a refresh without a scan.
+Panes open on demand, so a closed pane runs no view refresh.
+The production board uses file changes to trigger its generator when `live` is false.
+When `live` is true, the existing 10 s tick uses the `liveness` refresh path to rebuild the board.
+Discovery paths detect a new production or input.
+The accounts pane also refreshes local liveness each tick when its generator reports session inputs.
+The build queue refreshes process memory each tick.
 
-The accounts view draws `accounts.py`'s stored status straight to the screen. It first showed login addresses; the user removed the Login column (2026-10-19) to give the table room, so the mod no longer asks for logins at all. It reads stored values (`--stored`) rather than probing accounts, and reruns only when one of its four input files changes, so an open pane spends no quota and no network.
+The accounts view uses `accounts.py status --json --stored` to read saved usage without account probes.
+It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
+When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
+The stored read uses an existing peer-count cache without waiting for its refresh.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
+Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
-The accounts view became account lines (phase 18) because the user could not read it: the fixed table was about 88 columns wide and ignored the pane width, so in a docked pane each row wrapped through its columns. The lines follow the phase 17 board style. One shape for every account, aligned columns and whole facts make the list easy to scan at any width.
-
-The user then asked for column headers and alignment in columns (phase 19): the account lines put each fact at a different column, because short times and credit parts have different widths. The table came back with a header row, right-aligned times and numbers, and two-row and narrow forms so it still fits a docked pane. The JSON problems lost the text table's `* ` mark, which the pane drew after its own bullet.
-
-The user then asked that `/accounts-board` and the cargo-handler accounts table show the same thing (phase 20). The column set was settled with cargo-liner's showrunner: the green/red mark the user liked became an access mark from `read_ok`, `left` replaced `weekly left`, and `enabled` and `in use` became columns. Both views read the same `accounts.py` JSON, so they cannot disagree.
 
 The terminal report leaves out the round table because it answers questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
 
@@ -247,4 +370,4 @@ A standing plan shows its ticket and a merged count, not `Phase N/total`, becaus
 
 The board lists units by name and keeps each one to three short lines because the user found it hard to read (2026-10-19): units were sorted by state, most text was dim grey, and titles and worker lists were cut off. Three design reviewers agreed on the rest: colour carries meaning (the dot is health, red is only for late), every fact is in readable text, worker names move to the detail view in favour of counts by state, and the ruler, whose labels repeated the same now time on every unit, moves to the detail view. `Phase <id>` drops `/<of>` because a plan that grew read `Phase 32/31`; the total is beside the bar instead.
 
-The board finds its production from the session id before the working directory, because a showrunner session need not run inside its production's checkout: the natedev showrunner runs in `/etc/nixos` with its doc under `~/.claude`. The update timer is addressed to the session id, so `showrunners.production_of` answers exactly.
+The board uses staff for placement so a unit or worker sees its direct showrunner’s board from any folder. The newest pane launch supplies only the staff id; the staff row and its parent edges decide the board’s root and subtree.

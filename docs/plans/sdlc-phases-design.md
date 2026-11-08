@@ -300,7 +300,7 @@ sizes. Doc lead time can start before the window; churn starts at the first run.
 - **reported** — Daemon-family and lint-rewrite attempts logs also concern repair attempts. Their causes and round rules belong to fix-rounds-unit. Source: `M/MEMORY.md` entries for `attempts-daemon-family-escape.md`, `attempts-lint-rewrite-flags.md`.
 - **reported** — A general per-turn usage metric is reported to take longer than its report limit, so it can block a useful overhead check. The usage-ledger owner must build that optimization. Source: `docs/plans/build-followups-usage-ledger-next.md`, custom metric item.
 - **reported** — An orphan app-server can survive when its own watcher is missing. The saved add-on proposes a periodic sweep; it does not belong to this phase-map implementation. Source: `docs/plans/build-followups-usage-ledger-next.md`, periodic app-server sweep item.
-- **reported** — Shared modules imported by two names require type-identity workarounds across consumers. Narrow phase checks can miss those consumers. Source: `docs/plans/build-followups-two-accounts-next.md`, shared whoami imports item; `M/shared-module-full-gate.md`.
+- **reported** — Shared modules imported by two names require type-identity workarounds across consumers. Narrow phase checks can miss those consumers. Source: [account design](../as-built/accounts.md), shared whoami modules; `M/shared-module-full-gate.md`.
 - **reported** — A rule scope or date-only edit makes old style results stale and causes another full check. Style owns the saved change; the process map must not count those repeated checks as new implementation. Source: `docs/plans/build-followups-style-next.md`, rule scope item.
 - **reported** — A declined style decision needs a hand edit before it can receive a new answer. Style owns the command that the saved add-on requests. Source: `docs/plans/build-followups-style-next.md`, declined decision item.
 - **reported** — A grandparent's expanded dailies can omit the child style production's line. The saved add-on shows a status gap across document and production levels; showrunner tooling owns it. Source: `docs/plans/build-followups-style-next.md`, grandchild style production item.
@@ -474,7 +474,7 @@ missing evidence as `None`, zero, or a success. It affects the director and
 doc checker. Build: 16–24 work hours; risk: another formatter becomes a second
 source of truth. It must keep no store and must link every fact to its owner.
 
-All duty checks refer to `origin/sdlc-roles:docs/plans/sdlc-roles-design.md`,
+All duty checks refer to `docs/plans/sdlc-roles-design.md`,
 Duty matrix D05, D10–D15, D17, and D27–D28. No candidate moves those duties.
 Any later proposal to give compose, acceptance, design, review, or checkpoint
 to another role belongs to roles-unit and goes through the showrunner.

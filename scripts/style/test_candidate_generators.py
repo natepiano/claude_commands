@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
-import candidate_generators
+from scripts.style import candidate_generators
 
 
 @final

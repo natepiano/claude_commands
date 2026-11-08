@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 import base64
 import json
@@ -14,17 +13,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import cast, override
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.note_file import note_name
 from scripts.accounts import accounts, role_map
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
-import whoami
+from scripts.whoami import usage_store
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,
@@ -86,6 +86,45 @@ class CodexHomesTests(unittest.TestCase):
         self.assertFalse(agent_accounts.codex_home_matches_label(other, "codex2"))
         self.assertFalse(agent_accounts.codex_home_matches_label(current, "codex1"))
 
+    def test_default_login_omits_its_empty_numbered_home_and_signed_out_problem(self) -> None:
+        numbered = self.select_workers("codex2")
+        default = self.home / ".codex"
+        _ = numbered.rename(default)
+        numbered.mkdir()
+        self.assertEqual(agent_accounts.codex_homes(numbered), [default])
+        self.assertEqual(agent_accounts.codex_account_home("codex2").home, default)
+        statuses = accounts.codex_statuses(default)
+        self.assertEqual([(row.home, row.label, row.role, row.problems) for row in statuses],
+                         [(default, "codex2", "workers", ())])
+        _ = (numbered / "auth.json").write_text("{}")
+        self.assertIn(numbered, agent_accounts.codex_homes(default))
+
+    def test_empty_numbered_home_cannot_replace_the_default_logins_good_usage_with_an_error(self) -> None:
+        numbered = self.select_workers("codex2")
+        default = self.home / ".codex"
+        _ = numbered.rename(default)
+        numbered.mkdir()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        good = Report("Codex", email="selected@example.invalid", source=CodexHomeSource(default),
+            quotas=[agent_accounts.Quota("Weekly", 13, now + timedelta(days=7))],
+            credit_balance="2272", usage_read_outcome=agent_accounts.UsageReadOutcome.OK)
+        usage_store.save([Report("Codex", email=good.email, source=CodexHomeSource(numbered),
+            quotas=good.quotas)], now - timedelta(minutes=5))
+
+        async def read_home(home: Path) -> Report:
+            return good if home == default else Report("Codex", source=CodexHomeSource(home), problem="Not logged in")
+
+        with (patch.object(agent_accounts, "claude_on_disk", return_value=Report("Claude")),
+              patch.object(agent_accounts, "codex_live", side_effect=read_home) as reads):
+            reports = asyncio.run(agent_accounts.live_reports(self.legacy_selection(), default))
+        usage_store.save(reports, now)
+        _ = reads.assert_awaited_once_with(default)
+        held = usage_store.load()[usage_store.key("Codex", good.email or "")]
+        self.assertEqual(usage_store.latest_read_outcome(held), agent_accounts.UsageReadOutcome.OK)
+        assert "weekly" in held
+        self.assertEqual(held["weekly"]["left"], 87)
+        self.assertEqual(held["weekly"]["at"], now.isoformat())
+
     def test_credit_setting_reads_on_off_and_defaults_to_on(self) -> None:
         path = self.home / "codex1.md"
         for field, expected in (("use_credits: off\n", agent_accounts.CreditsOff),
@@ -139,7 +178,7 @@ class CodexHomesTests(unittest.TestCase):
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
 
     def test_shared_user_zone_uses_production_or_the_users_zone_setting(self) -> None:
-        runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
+        runner = showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="Asia/Tokyo", doc="")
         with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
@@ -466,6 +505,19 @@ class CodexHomesTests(unittest.TestCase):
         with self.assertRaises(agent_accounts.CodexServerClosed):
             asyncio.run(request())
 
+    def test_server_close_reads_the_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config.write_text(config.read_text().replace("codex_close_timeout_seconds=3", "codex_close_timeout_seconds=7"))
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = None
+        server = agent_accounts.CodexServer(process)
+        with patch.object(asyncio, "wait_for", wraps=asyncio.wait_for) as wait:
+            asyncio.run(server.close())
+        cast(MagicMock, process.terminate).assert_called_once_with()
+        cast(AsyncMock, process.wait).assert_awaited_once_with()
+        self.assertEqual(wait.call_args.kwargs["timeout"], 7)
+        cast(MagicMock, process.kill).assert_not_called()
+
     def test_home_preparation_stops_at_its_limit_with_the_home_and_reason(self) -> None:
         home = self.home / ".codex1"
         process = MagicMock(spec=asyncio.subprocess.Process)
@@ -500,9 +552,9 @@ class CodexHomesTests(unittest.TestCase):
             report = asyncio.run(agent_accounts.codex_live(home))
         self.assertIsNotNone(report.problem)
         self.assertIn("~/.codex1", report.problem or "")
-        self.assertIn('/showrunner:accounts setup codex1', report.problem or "")
+        self.assertIn('~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1', report.problem or "")
         self.assertEqual(report.codex_startup, agent_accounts.CodexStartupFailure(
-            home, '/showrunner:accounts setup codex1'))
+            home, '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1'))
 
 
 if __name__ == "__main__":

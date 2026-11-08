@@ -4,23 +4,21 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import re
 import subprocess
 import tempfile
 from typing import final
 import unittest
 
-from scripts.direct.verify_lint_scope_test_support import SCRIPTS, TEST_HANG_GUARD_SECS, VERIFY
+from scripts.direct.verify_lint_scope_test_support import SCRIPTS, VERIFY
+from scripts.lib.shell_test_support import shell_function
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class InvokeOutputTests(unittest.TestCase):
     def function_body(self, name: str) -> str:
         source = (SCRIPTS / "lint" / "invoke.sh").read_text(encoding="utf-8")
-        match = re.search(rf"^{name}\(\) [{{(]\n.*?^[}})]$", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(match, name)
-        assert match is not None
-        return match.group()
+        return shell_function(source, name)
 
     def shell(self, script: str, root: Path) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ, HOME=str(root), TMPDIR=str(root))
@@ -37,6 +35,7 @@ buildlog_step_compiles() { return 1; }
 buildlog_begin() { :; }
 buildlog_exec() { "$@"; }
 buildlog_finish_memory() { :; }
+nextest_share_end() { :; }
 buildlog_end() { :; }
 sweep_after_step() { :; }
 '''
@@ -56,7 +55,9 @@ sweep_after_step() { :; }
             tee.chmod(0o755)
             for status in (0, 47):
                 with self.subTest(status=status):
-                    script = self.command_stubs() + self.function_body("run_once")
+                    script = self.command_stubs() + "\n".join(self.function_body(name) for name in (
+                        "buildlog_retry_unstarted_step", "without_progress_frames", "buildlog_exec_with_progress",
+                        "run_step_attempt", "run_once"))
                     script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
@@ -64,7 +65,7 @@ sweep_after_step() { :; }
     def test_clippy_fix_preserves_extra_lints_and_run_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            script = "set -euo pipefail\n"
+            script = "set -euo pipefail\nCLIPPY_FIX_JOBS=8\n"
             script += self.function_body("invoke_clippy") + "\n"
             script += self.function_body("invoke_clippy_fix") + r'''
 lint_config_enabled() { return 0; }
@@ -74,7 +75,8 @@ invoke_clippy_fix -p sample --lib -- -A clippy::type_complexity
             result = self.shell(script, root)
             self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
             self.assertEqual(result.stdout.splitlines(), [
-                "cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+                "env", "-u", "CARGO_MAKEFLAGS", "-u", "MAKEFLAGS", "-u", "MFLAGS",
+                "cargo", "clippy", "--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
                 "-p", "sample", "--lib", "--", "-D", "warnings", "-A", "clippy::type_complexity",
             ])
 

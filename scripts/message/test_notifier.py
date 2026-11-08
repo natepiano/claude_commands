@@ -5,23 +5,22 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
-import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
 NOW = 1_700_000_123
@@ -31,6 +30,9 @@ MINUTE = NOW - NOW % 60
 class NotifierTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
+        self.owned: OwnedTestProcesses = OwnedTestProcesses()
+        self.launch_pids: Path = Path()
+        self.blocked_pids: Path = Path()
         self.root: Path = Path()
         self.state_dir: Path = Path()
         self.sessions_dir: Path = Path()
@@ -43,6 +45,14 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"__ETC_ZSHENV_SOURCED": "1"})))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.owned = OwnedTestProcesses()
+        self.addCleanup(self.owned.finish)
+        self.launch_pids = self.root / "launch-pids"
+        self.owned.group_markers.append(self.launch_pids)
+        self.blocked_pids = self.root / "blocked-pids"
+        self.owned.markers.append(self.blocked_pids)
         self.state_dir = self.root / "state"
         self.sessions_dir = self.root / "sessions"
         self.sessions_dir.mkdir()
@@ -53,14 +63,28 @@ class NotifierTests(unittest.TestCase):
         launcher_dir = self.root / "launcher-bin"
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
+        monitor = """import os
+import subprocess
+import sys
+from pathlib import Path
+code = 127
+try:
+    code = subprocess.run(sys.argv[2:], check=False).returncode
+finally:
+    Path(sys.argv[1], 'run-exit-' + str(os.getpid())).write_text(str(code))
+"""
         _ = launcher.write_text(
             "\n".join((
                 "#!/usr/bin/env python3",
-                "import subprocess",
+                "import subprocess, os",
+                "from pathlib import Path",
                 "import sys",
-                "subprocess.Popen(sys.argv[sys.argv.index('--') + 1:], "
+                "# The caller installs the inherited ownership marker before launch.",
+                f"monitor = {monitor!r}",
+                f"child = subprocess.Popen([sys.executable, '-c', monitor, {str(self.root)!r}, *sys.argv[sys.argv.index('--') + 1:]], "
                 + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
                 + "stderr=subprocess.DEVNULL, start_new_session=True)",
+                f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
             )) + "\n"
         )
         launcher.chmod(0o755)
@@ -69,6 +93,50 @@ class NotifierTests(unittest.TestCase):
         self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
+
+    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
+            owner = staff.ensure("showrunner", name="demo", runtime_id=fixture_runtime_id("timer-first"))
+            current = staff.native_id(fixture_runtime_id("timer-after-clear"))
+            _ = staff.update_current_session(owner.current_session, current)
+            self.record(current)
+            _ = self.successful("new", "example", "--to", "session:" + owner.id,
+                                "--every", "2", "--command", "the scheduled prompt")
+            configuration = self.state_dir / "example" / "conf"
+            before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+            _ = self.successful("fire", "example")
+            arguments = self.send_args.read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+            self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
+            self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+            retained = staff.by_id(owner.id)
+            assert retained is not None
+            self.assertEqual(retained.current_session, current)
+
+    def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
+        pending = self.root / "repeat-outbox"
+        pending.mkdir()
+        launched = self.root / "drain.argv"
+        launcher = self.launcher_dir / "systemd-run"
+        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        config = self.root / "selected.conf"
+        with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
+                                         "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
+            _ = self.successful("tick")
+            _ = self.successful("tick")
+        arguments = cast(list[str], json.loads(launched.read_text()))
+        self.assertIn("--no-block", arguments)
+        self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
+        self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
+        self.assertIn("XDG_STATE_HOME=" + str(self.root / "xdg"), arguments)
+        self.assertEqual(arguments[-2:], [str(self.fake_send), "repeat-notices"])
+        self.assertIn("notices", arguments)
+        self.assertTrue(any(value.endswith("/repeat_guard.py") for value in arguments))
+        self.assertFalse(self.send_args.exists(), "the tick ran the drain synchronously")
 
     def record(self, session_id: str, path: Path | None = None, updated: int = 1) -> None:
         record = {
@@ -79,9 +147,11 @@ class NotifierTests(unittest.TestCase):
         _ = (self.sessions_dir / "live.json").write_text(json.dumps(record))
 
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["zsh", str(SCRIPT), *args],
-            env={
+        owned = OwnedTestProcesses()
+        command = ["zsh", str(SCRIPT), *args]
+        child = subprocess.Popen(
+            command,
+            env=self.owned.environment({
                 **os.environ,
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
@@ -90,9 +160,15 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_ARGS": str(self.send_args),
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
-            },
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            }),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
+        owned.track(child, group=True)
+        try:
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(command, child.wait(), output, errors)
+        finally:
+            owned.finish()
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
         result = self.run_cli(*args, now=now, send_rc=send_rc)
@@ -115,15 +191,20 @@ class NotifierTests(unittest.TestCase):
         path = self.state_dir / "example" / "fire.log"
         return path.read_text().splitlines() if path.exists() else []
 
-    def wait_for_text(self, path: Path, expected: str) -> str:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while time.monotonic() < deadline:
-            if path.exists():
-                contents = path.read_text()
-                if expected in contents:
-                    return contents
-            time.sleep(0.02)
-        self.fail(f"{path} did not contain {expected!r} before the deadline")
+    def wait_for_text(self, path: Path, expected: str, *, observe_launch: bool = False) -> str:
+        def ready() -> bool:
+            if path.exists() and expected in path.read_text():
+                return True
+            if observe_launch:
+                self.assertTrue(self.launch_pids.exists(), "the fake launcher did not start a child")
+                pid = self.launch_pids.read_text().splitlines()[-1]
+                status = self.root / ("run-exit-" + pid)
+                self.assertFalse(status.exists(), f"child {pid} exited before {path}: "
+                                 + (status.read_text() if status.exists() else ""))
+            return False
+
+        wait_until(ready, path.parent)
+        return path.read_text()
 
     def fail_mv_to(self, filename: str) -> Path:
         real_mv = shutil.which("mv")
@@ -314,7 +395,7 @@ class NotifierTests(unittest.TestCase):
         check = self.root / "slow-check"
         blocked = self.root / "check-blocked"
         os.mkfifo(blocked)
-        _ = check.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
+        _ = check.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$$\" >> {self.blocked_pids}\nexec /bin/cat < {blocked}\n")
         check.chmod(0o755)
         _ = self.new("--check", str(check), "--timeout", "1")
         result = self.run_cli("tick", now=MINUTE + 120)
@@ -361,7 +442,7 @@ class NotifierTests(unittest.TestCase):
         fake_mkdir.chmod(0o755)
         result = subprocess.run(
             ["zsh", str(SCRIPT), "tick"],
-            env={
+            env=self.owned.environment({
                 **os.environ,
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
@@ -370,7 +451,7 @@ class NotifierTests(unittest.TestCase):
                 "NOTIFIER_NOW_EPOCH": str(NOW),
                 "FAKE_SEND_ARGS": str(self.send_args),
                 "FAKE_SEND_RC": "0",
-            },
+            }),
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -468,13 +549,26 @@ class NotifierTests(unittest.TestCase):
         slow = self.root / "slow-run"
         blocked = self.root / "run-blocked"
         os.mkfifo(blocked)
-        _ = slow.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
+        _ = slow.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$$\" >> {self.blocked_pids}\nexec /bin/cat < {blocked}\n")
         slow.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
         _ = self.successful("tick", now=MINUTE + 120)
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
         self.assertTrue(any("timeout" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
+
+    def test_run_marker_wait_reports_an_exited_child(self) -> None:
+        job = self.root / "job"
+        _ = job.write_text("#!/bin/sh\nexit 9\n")
+        job.chmod(0o755)
+        _ = self.successful("new", "example", "--every", "1", "--run", str(job))
+        _ = self.successful("tick", now=MINUTE + 60)
+        with self.assertRaisesRegex(AssertionError, "exited before"):
+            _ = self.wait_for_text(self.root / "missing-marker", "started", observe_launch=True)
+
+    def test_run_marker_wait_reports_a_missing_child(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "did not start a child"):
+            _ = self.wait_for_text(self.root / "missing-marker", "started", observe_launch=True)
 
     def test_run_only_job_survives_tick_process_group_exit_and_logs_failure(self) -> None:
         started = self.root / "started"
@@ -488,25 +582,25 @@ class NotifierTests(unittest.TestCase):
         _ = self.successful("new", "example", "--every", "1", "--run", str(job))
         tick = subprocess.Popen(
             ["zsh", str(SCRIPT), "tick"],
-            env={
+            env=self.owned.environment({
                 **os.environ,
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
                 "NOTIFIER_NOW_EPOCH": str(MINUTE + 60),
-            },
+            }),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
+        self.owned.track(tick, group=True)
         try:
             _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)
-            _ = self.wait_for_text(started, "started")
+            _ = self.wait_for_text(started, "started", observe_launch=True)
             self.assertFalse(finished.exists())
         finally:
-            try:
-                os.killpg(tick.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if tick.poll() is None:
+                tick.kill()
+            _ = tick.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
@@ -560,15 +654,7 @@ elif action == "remove":
         launch_state = self.root / "launchctl-state"
         launch_state.mkdir()
 
-        def stop_fake_job() -> None:
-            pid_file = launch_state / "pid"
-            if pid_file.exists():
-                try:
-                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-        self.addCleanup(stop_fake_job)
+        self.owned.group_markers.append(launch_state / "pid")
         return launch_state
 
     def tick_mac_run_only(self, launch_state: Path, runs: Path, kickstart_rc: int = 0) -> Path:

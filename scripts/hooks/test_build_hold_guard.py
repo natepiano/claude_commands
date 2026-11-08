@@ -9,22 +9,15 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
-
-if TYPE_CHECKING:
-    from ..lib.process_start_test_support import write_stat
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib.process_start_test_support import write_stat
 
 from scripts.build_hold.test_hold_applies import REFUSAL
 from scripts.hooks.build_hold_guard_test_support import TemporaryGuardTest, hold_applies, invoke_hook
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 MERGE_GATE_COMMANDS = (
@@ -39,7 +32,7 @@ MERGE_GATE_COMMANDS = (
     "bash -lc 'python3 merge_gate.py --tests-only'",
     "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
 )
-MERGE_GATE_REFUSAL = REFUSAL + " The merge gate waits for the hold to end. Run it after the release."
+MERGE_GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):
@@ -133,7 +126,9 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         os.environ["BUILDLOG_CALL_ID"] = "verify-call"
         proc = self.root / "proc" / "10"
         proc.mkdir(parents=True)
-        _ = write_stat(proc.parent, 10, command="verify.sh", start_ticks=11000)
+        fields = ["0"] * 20
+        fields[0], fields[19] = "S", "11000"
+        _ = (proc / "stat").write_text("10 (verify.sh) " + " ".join(fields))
         os.environ["VERIFY_PROC_ROOT"] = str(proc.parent)
         for state in ("missing", "waiting_hold", "waiting_mac", "on_mac", "on_natedev", "unreadable"):
             record = directory / "verify-call.json"
@@ -143,7 +138,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                 _ = record.write_text(json.dumps({
                     "v": 1, "call_id": "verify-call", "pid": 10, "proc_start": "11000",
                     "repo": str(self.root), "kind": "check", "package": None,
-                    "runs_on": {"kind": "mac_allowed"}, "state": state,
+                    "eligible_targets": ["mac", "natedev"], "runs_on": {"kind": "any_target", "mac_targets": ["mac"]}, "state": state,
                     "updated": "2026-10-28T12:00:00+00:00",
                 }))
             for verb in ("check", "lint", "build", "doc", "clippy", "test", "example", "final"):

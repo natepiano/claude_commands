@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import socket
 import subprocess
@@ -11,7 +10,8 @@ import sys
 import unittest
 from typing import cast, final
 
-from scripts.usage.collect_test_support import MacCollectorFixture, REPOSITORY, TEST_HANG_GUARD_SECS
+from scripts.usage.collect_test_support import MacCollectorFixture, REPOSITORY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -83,10 +83,11 @@ class MacCollectTests(MacCollectorFixture):
             "Path(sys.argv[1]).write_text('finished')"
         )
         remote_command = shlex.join((sys.executable, "-c", writer, str(finished))) + '; printf "\\nrc=%s\\n" "$?"'
+        _, environment = self.collector_invocation(db=self.db_path, mac_pass="fixture")
         result = subprocess.run(
             [str(self.root / "bin/ssh"), remote_command],
             input=b"fixture request", capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False,
-            env={**os.environ, "USAGE_TEST_SSH_CONFIG": str(config)},
+            env=environment,
         )
         self.assertEqual(result.stderr, b"", result.stderr.decode(errors="replace"))
         self.assertEqual(result.returncode, 0)

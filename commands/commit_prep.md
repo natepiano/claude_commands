@@ -1,5 +1,5 @@
 ---
-description: Analyze staged and unstaged changes and present a complete commit message for a single approve-or-abandon decision; runs clippy only when the `clippy` token is passed.
+description: Draft a commit message for approval.
 ---
 
 **IMPORTANT** don't commit the changes that you will examine. Just do the following:

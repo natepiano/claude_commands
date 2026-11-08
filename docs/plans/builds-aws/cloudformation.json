@@ -1,0 +1,1763 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Guarded persistent Spot build target with retained encrypted data.",
+  "Parameters": {
+    "InstanceType": {
+      "Type": "String",
+      "AllowedValues": [
+        "m7a.4xlarge"
+      ]
+    },
+    "AmiId": {
+      "Type": "AWS::EC2::Image::Id"
+    },
+    "AvailabilityZone": {
+      "Type": "AWS::EC2::AvailabilityZone::Name"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "SubnetId": {
+      "Type": "AWS::EC2::Subnet::Id"
+    },
+    "NotificationEmail": {
+      "Type": "String"
+    },
+    "RootDeviceName": {
+      "Type": "String"
+    },
+    "RootVolumeGiB": {
+      "Type": "Number"
+    },
+    "DataVolumeGiB": {
+      "Type": "Number",
+      "AllowedValues": [
+        500
+      ]
+    },
+    "DataVolumeIops": {
+      "Type": "Number",
+      "AllowedValues": [
+        6000
+      ]
+    },
+    "DataVolumeThroughput": {
+      "Type": "Number",
+      "AllowedValues": [
+        500
+      ]
+    },
+    "SpotMaxPrice": {
+      "Type": "String"
+    },
+    "MonthlyLimitUsd": {
+      "Type": "Number",
+      "MaxValue": 400
+    },
+    "NoticeLowPercent": {
+      "Type": "Number"
+    },
+    "NoticeHighPercent": {
+      "Type": "Number"
+    },
+    "StopPercent": {
+      "Type": "Number"
+    },
+    "CostTagKey": {
+      "Type": "String"
+    },
+    "CostTagValue": {
+      "Type": "String"
+    },
+    "Bootstrap": {
+      "Type": "String"
+    },
+    "ScalerUserName": {
+      "Type": "String"
+    },
+    "EnableCompute": {
+      "Type": "String",
+      "AllowedValues": [
+        "false",
+        "true"
+      ],
+      "Default": "false"
+    },
+    "ExistingDataVolumeId": {
+      "Type": "String",
+      "Default": ""
+    },
+    "DeploymentId": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{32}"
+    },
+    "BudgetName": {
+      "Type": "String",
+      "Default": ""
+    },
+    "EnableGates": {
+      "Type": "String",
+      "AllowedValues": [
+        "false",
+        "true"
+      ],
+      "Default": "false"
+    },
+    "GateImage": {
+      "Type": "String",
+      "Default": ""
+    },
+    "GateSubnets": {
+      "Type": "CommaDelimitedList",
+      "Default": ""
+    },
+    "GateInstanceTypes": {
+      "Type": "CommaDelimitedList",
+      "Default": ""
+    },
+    "GateRootGiB": {
+      "Type": "Number",
+      "Default": 40
+    },
+    "GateSpotMaxPrice": {
+      "Type": "String",
+      "Default": ""
+    },
+    "GateArtifactDays": {
+      "Type": "Number",
+      "Default": 7
+    },
+    "GateExpiryMinutes": {
+      "Type": "Number",
+      "Default": 1
+    },
+    "GateExpiryTimeout": {
+      "Type": "Number",
+      "Default": 30
+    },
+    "GateExpiryMemory": {
+      "Type": "Number",
+      "Default": 128
+    },
+    "GateLogDays": {
+      "Type": "Number",
+      "Default": 7,
+      "AllowedValues": [
+        1,
+        3,
+        5,
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        150,
+        180,
+        365
+      ]
+    }
+  },
+  "Conditions": {
+    "Compute": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableCompute"
+        },
+        "true"
+      ]
+    },
+    "ReuseData": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "ExistingDataVolumeId"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "NewData": {
+      "Fn::And": [
+        {
+          "Condition": "Compute"
+        },
+        {
+          "Fn::Not": [
+            {
+              "Condition": "ReuseData"
+            }
+          ]
+        }
+      ]
+    },
+    "PreserveBudgetName": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "BudgetName"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "Gates": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableGates"
+        },
+        "true"
+      ]
+    },
+    "GateEveryMinute": {
+      "Fn::Equals": [
+        {
+          "Ref": "GateExpiryMinutes"
+        },
+        1
+      ]
+    }
+  },
+  "Resources": {
+    "ScalerUser": {
+      "Type": "AWS::IAM::User",
+      "Properties": {
+        "UserName": {
+          "Ref": "ScalerUserName"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ]
+      }
+    },
+    "BudgetBlockPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Action": [
+                "ec2:StartInstances",
+                "ec2:RunInstances"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "BudgetRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "budgets.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:budgets::${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ApplyBudgetBlock",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:AttachUserPolicy",
+                    "iam:DetachUserPolicy"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ScalerUser",
+                      "Arn"
+                    ]
+                  },
+                  "Condition": {
+                    "ArnEquals": {
+                      "iam:PolicyARN": {
+                        "Ref": "BudgetBlockPolicy"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "MonthlyBudget": {
+      "Type": "AWS::Budgets::Budget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Budget": {
+          "BudgetName": {
+            "Fn::If": [
+              "PreserveBudgetName",
+              {
+                "Ref": "BudgetName"
+              },
+              {
+                "Fn::Sub": "${AWS::StackName}-monthly-${DeploymentId}"
+              }
+            ]
+          },
+          "BudgetType": "COST",
+          "TimeUnit": "MONTHLY",
+          "BudgetLimit": {
+            "Amount": {
+              "Ref": "MonthlyLimitUsd"
+            },
+            "Unit": "USD"
+          },
+          "CostFilters": {
+            "TagKeyValue": [
+              {
+                "Fn::Join": [
+                  "$",
+                  [
+                    {
+                      "Ref": "CostTagKey"
+                    },
+                    {
+                      "Ref": "CostTagValue"
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        "NotificationsWithSubscribers": [
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "NoticeLowPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "NoticeHighPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "ThresholdType": "PERCENTAGE",
+              "Threshold": {
+                "Ref": "StopPercent"
+              }
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "BudgetEnforcement": {
+      "Type": "AWS::Budgets::BudgetsAction",
+      "Properties": {
+        "BudgetName": {
+          "Ref": "MonthlyBudget"
+        },
+        "ActionType": "APPLY_IAM_POLICY",
+        "ApprovalModel": "AUTOMATIC",
+        "NotificationType": "ACTUAL",
+        "ActionThreshold": {
+          "Type": "PERCENTAGE",
+          "Value": {
+            "Ref": "StopPercent"
+          }
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "BudgetRole",
+            "Arn"
+          ]
+        },
+        "Definition": {
+          "IamActionDefinition": {
+            "PolicyArn": {
+              "Ref": "BudgetBlockPolicy"
+            },
+            "Users": [
+              {
+                "Ref": "ScalerUser"
+              }
+            ]
+          }
+        },
+        "Subscribers": [
+          {
+            "Type": "EMAIL",
+            "Address": {
+              "Ref": "NotificationEmail"
+            }
+          }
+        ]
+      }
+    },
+    "InstanceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          }
+        ]
+      }
+    },
+    "InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "InstanceRole"
+          }
+        ]
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Tailscale UDP only; no inbound TCP",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "udp",
+            "FromPort": 41641,
+            "ToPort": 41641,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Condition": "Compute",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "Properties": {
+        "TagSpecifications": [
+          {
+            "ResourceType": "launch-template",
+            "Tags": [
+              {
+                "Key": {
+                  "Ref": "CostTagKey"
+                },
+                "Value": {
+                  "Ref": "CostTagValue"
+                }
+              }
+            ]
+          }
+        ],
+        "LaunchTemplateData": {
+          "ImageId": {
+            "Ref": "AmiId"
+          },
+          "InstanceType": {
+            "Ref": "InstanceType"
+          },
+          "InstanceInitiatedShutdownBehavior": "stop",
+          "IamInstanceProfile": {
+            "Name": {
+              "Ref": "InstanceProfile"
+            }
+          },
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled",
+            "HttpPutResponseHopLimit": 1
+          },
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "SpotInstanceType": "persistent",
+              "InstanceInterruptionBehavior": "stop",
+              "MaxPrice": {
+                "Ref": "SpotMaxPrice"
+              }
+            }
+          },
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": {
+                "Ref": "RootDeviceName"
+              },
+              "Ebs": {
+                "Encrypted": true,
+                "VolumeType": "gp3",
+                "VolumeSize": {
+                  "Ref": "RootVolumeGiB"
+                },
+                "DeleteOnTermination": true
+              }
+            }
+          ],
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "AssociatePublicIpAddress": true,
+              "SubnetId": {
+                "Ref": "SubnetId"
+              },
+              "Groups": [
+                {
+                  "Ref": "SecurityGroup"
+                }
+              ]
+            }
+          ],
+          "TagSpecifications": [
+            {
+              "ResourceType": "instance",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            },
+            {
+              "ResourceType": "volume",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            },
+            {
+              "ResourceType": "spot-instances-request",
+              "Tags": [
+                {
+                  "Key": {
+                    "Ref": "CostTagKey"
+                  },
+                  "Value": {
+                    "Ref": "CostTagValue"
+                  }
+                }
+              ]
+            }
+          ],
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Join": [
+                "",
+                [
+                  "#!/bin/bash\nset -euo pipefail\nexport AWS_BUILD_DATA_VOLUME_ID=",
+                  {
+                    "Fn::If": [
+                      "ReuseData",
+                      {
+                        "Ref": "ExistingDataVolumeId"
+                      },
+                      {
+                        "Ref": "DataVolume"
+                      }
+                    ]
+                  },
+                  "\nprintf %s ",
+                  {
+                    "Ref": "Bootstrap"
+                  },
+                  " | base64 --decode | gzip --decompress | bash\n"
+                ]
+              ]
+            }
+          }
+        }
+      }
+    },
+    "Instance": {
+      "Type": "AWS::EC2::Instance",
+      "Condition": "Compute",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "Properties": {
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "LaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "LaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        }
+      }
+    },
+    "DataVolume": {
+      "Type": "AWS::EC2::Volume",
+      "Condition": "NewData",
+      "DependsOn": [
+        "BudgetEnforcement"
+      ],
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "AvailabilityZone": {
+          "Ref": "AvailabilityZone"
+        },
+        "Encrypted": true,
+        "VolumeType": "gp3",
+        "Size": {
+          "Ref": "DataVolumeGiB"
+        },
+        "Iops": {
+          "Ref": "DataVolumeIops"
+        },
+        "Throughput": {
+          "Ref": "DataVolumeThroughput"
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "DeploymentId",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          }
+        ]
+      }
+    },
+    "DataAttachment": {
+      "Type": "AWS::EC2::VolumeAttachment",
+      "Condition": "Compute",
+      "Properties": {
+        "InstanceId": {
+          "Ref": "Instance"
+        },
+        "VolumeId": {
+          "Fn::If": [
+            "ReuseData",
+            {
+              "Ref": "ExistingDataVolumeId"
+            },
+            {
+              "Ref": "DataVolume"
+            }
+          ]
+        },
+        "Device": "/dev/sdf"
+      }
+    },
+    "ScalerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Compute",
+      "Properties": {
+        "PolicyName": "BuildScaler",
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:StartInstances",
+                "ec2:StopInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:DescribeSpotInstanceRequests"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ce:GetCostAndUsage"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "StopRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Compute",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          }
+        ],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "budgets.amazonaws.com",
+                  "ssm.amazonaws.com"
+                ]
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "BudgetStop": {
+      "Type": "AWS::Budgets::BudgetsAction",
+      "Condition": "Compute",
+      "Properties": {
+        "BudgetName": {
+          "Ref": "MonthlyBudget"
+        },
+        "ActionType": "RUN_SSM_DOCUMENTS",
+        "ApprovalModel": "AUTOMATIC",
+        "NotificationType": "ACTUAL",
+        "ActionThreshold": {
+          "Type": "PERCENTAGE",
+          "Value": {
+            "Ref": "StopPercent"
+          }
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "StopRole",
+            "Arn"
+          ]
+        },
+        "Definition": {
+          "SsmActionDefinition": {
+            "Subtype": "STOP_EC2_INSTANCES",
+            "Region": {
+              "Ref": "AWS::Region"
+            },
+            "InstanceIds": [
+              {
+                "Ref": "Instance"
+              }
+            ]
+          }
+        },
+        "Subscribers": [
+          {
+            "Type": "EMAIL",
+            "Address": {
+              "Ref": "NotificationEmail"
+            }
+          }
+        ]
+      },
+      "DependsOn": [
+        "StopPolicy"
+      ]
+    },
+    "StopPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Compute",
+      "Properties": {
+        "PolicyName": "StopOneInstance",
+        "Roles": [
+          {
+            "Ref": "StopRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:StopInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceStatus"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ssm:StartAutomationExecution"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "iam:PassRole"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "StopRole",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "ssm.amazonaws.com"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GateBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Condition": "Gates",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "GateArtifacts",
+              "Status": "Enabled",
+              "ExpirationInDays": {
+                "Ref": "GateArtifactDays"
+              },
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "BucketName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Condition": "Gates",
+      "Properties": {
+        "Bucket": {
+          "Ref": "GateBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "GateBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GateRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Gates",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "GateObjects",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "${GateBucket.Arn}/source/*"
+                    },
+                    {
+                      "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${GateBucket.Arn}/artifacts/${!aws:userid}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Condition": "Gates",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "GateRole"
+          }
+        ],
+        "InstanceProfileName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Condition": "Gates",
+      "Properties": {
+        "GroupDescription": "Outbound gate object and package transfers",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "GroupName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Condition": "Gates",
+      "Properties": {
+        "LaunchTemplateData": {
+          "ImageId": {
+            "Ref": "GateImage"
+          },
+          "IamInstanceProfile": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "GateProfile",
+                "Arn"
+              ]
+            }
+          },
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "SpotInstanceType": "one-time",
+              "InstanceInterruptionBehavior": "terminate",
+              "MaxPrice": {
+                "Ref": "GateSpotMaxPrice"
+              }
+            }
+          },
+          "InstanceInitiatedShutdownBehavior": "terminate",
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled"
+          },
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": {
+                "Ref": "RootDeviceName"
+              },
+              "Ebs": {
+                "VolumeSize": {
+                  "Ref": "GateRootGiB"
+                },
+                "VolumeType": "gp3",
+                "Encrypted": true,
+                "DeleteOnTermination": true
+              }
+            }
+          ]
+        },
+        "TagSpecifications": [
+          {
+            "ResourceType": "launch-template",
+            "Tags": [
+              {
+                "Key": {
+                  "Ref": "CostTagKey"
+                },
+                "Value": {
+                  "Ref": "CostTagValue"
+                }
+              },
+              {
+                "Key": "GateDeployment",
+                "Value": {
+                  "Ref": "DeploymentId"
+                }
+              },
+              {
+                "Key": "Workload",
+                "Value": "cloud-claude-gate"
+              },
+              {
+                "Key": "Name",
+                "Value": "cloud-claude-gate"
+              }
+            ]
+          }
+        ],
+        "LaunchTemplateName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateScalerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Gates",
+      "Properties": {
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyName": "CloudGateScaler",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${GateSecurityGroup}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Ref": "GateSubnets"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate",
+                  "ec2:InstanceType": {
+                    "Ref": "GateInstanceTypes"
+                  },
+                  "ec2:InstanceMarketType": "spot"
+                },
+                "Null": {
+                  "aws:RequestTag/GateAttempt": "false",
+                  "aws:RequestTag/ExpiresAt": "false"
+                },
+                "ArnEquals": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  },
+                  "ec2:InstanceProfile": {
+                    "Fn::GetAtt": [
+                      "GateProfile",
+                      "Arn"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
+                },
+                "Null": {
+                  "aws:RequestTag/GateAttempt": "false",
+                  "aws:RequestTag/ExpiresAt": "false"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  },
+                  "ec2:Subnet": {
+                    "Ref": "GateSubnets"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:CreateTags"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                }
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "ec2:CreateAction": "RunInstances",
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "iam:PassRole"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "GateRole",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "ec2.amazonaws.com"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:TerminateInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "ec2:ResourceTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "ec2:ResourceTag/Workload": "cloud-claude-gate"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ce:GetCostAndUsage"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/source/*"
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject"
+              ],
+              "Resource": {
+                "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GateExpiryRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Gates",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "GateExpiry",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:DescribeInstances"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:TerminateInstances"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "ec2:ResourceTag/GateDeployment": {
+                        "Ref": "DeploymentId"
+                      },
+                      "ec2:ResourceTag/Workload": "cloud-claude-gate"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry:*"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      }
+    },
+    "GateExpiryFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Condition": "Gates",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Runtime": "python3.13",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "GateExpiryRole",
+            "Arn"
+          ]
+        },
+        "Timeout": {
+          "Ref": "GateExpiryTimeout"
+        },
+        "MemorySize": {
+          "Ref": "GateExpiryMemory"
+        },
+        "Environment": {
+          "Variables": {
+            "DEPLOYMENT": {
+              "Ref": "DeploymentId"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "import os, time, boto3\n\ndef handler(event, context):\n    ec2 = boto3.client('ec2')\n    filters = [{'Name': 'tag:GateDeployment', 'Values': [os.environ['DEPLOYMENT']]},\n               {'Name': 'tag:Workload', 'Values': ['cloud-claude-gate']},\n               {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]\n    for page in ec2.get_paginator('describe_instances').paginate(Filters=filters):\n        for group in page['Reservations']:\n            for instance in group['Instances']:\n                tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}\n                try:\n                    expired = int(tags['ExpiresAt']) <= time.time()\n                except (KeyError, ValueError):\n                    expired = False\n                if expired:\n                    ec2.terminate_instances(InstanceIds=[instance['InstanceId']])\n"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      },
+      "DependsOn": "GateExpiryLog"
+    },
+    "GateExpiryLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Condition": "Gates",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "RetentionInDays": {
+          "Ref": "GateLogDays"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      }
+    },
+    "GateExpirySchedule": {
+      "Type": "AWS::Events::Rule",
+      "Condition": "Gates",
+      "Properties": {
+        "ScheduleExpression": {
+          "Fn::If": [
+            "GateEveryMinute",
+            "rate(1 minute)",
+            {
+              "Fn::Sub": "rate(${GateExpiryMinutes} minutes)"
+            }
+          ]
+        },
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "GateExpiryFunction",
+                "Arn"
+              ]
+            },
+            "Id": "GateExpiry"
+          }
+        ],
+        "Name": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        }
+      }
+    },
+    "GateExpiryPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "Gates",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "GateExpiryFunction"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "GateExpirySchedule",
+            "Arn"
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "BudgetName": {
+      "Value": {
+        "Ref": "MonthlyBudget"
+      }
+    },
+    "ComputeEnabled": {
+      "Value": {
+        "Ref": "EnableCompute"
+      }
+    },
+    "ExistingDataInput": {
+      "Value": {
+        "Ref": "ExistingDataVolumeId"
+      }
+    },
+    "InstanceId": {
+      "Condition": "Compute",
+      "Value": {
+        "Ref": "Instance"
+      }
+    },
+    "DataVolumeId": {
+      "Condition": "Compute",
+      "Value": {
+        "Fn::If": [
+          "ReuseData",
+          {
+            "Ref": "ExistingDataVolumeId"
+          },
+          {
+            "Ref": "DataVolume"
+          }
+        ]
+      }
+    },
+    "ScalerUserName": {
+      "Value": {
+        "Ref": "ScalerUser"
+      }
+    },
+    "GateBucket": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateBucket"
+      }
+    },
+    "GateLaunchTemplate": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateLaunchTemplate"
+      }
+    },
+    "GateLaunchVersion": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateLaunchTemplate",
+          "LatestVersionNumber"
+        ]
+      }
+    },
+    "GateSecurityGroup": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateSecurityGroup"
+      }
+    },
+    "GateRoleId": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateRole",
+          "RoleId"
+        ]
+      }
+    }
+  }
+}

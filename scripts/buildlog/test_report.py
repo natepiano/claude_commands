@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for report.py: a section per kind split by caller, then one summary row per kind."""
 
 from __future__ import annotations
@@ -18,22 +18,30 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest import mock
+from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 
-import disk
-import ci
-import index
-import mac_outcome
-import report
-import holds
-from user_zone import user_zone
-import rust_release
-import sync
-from record import TARGET_DIR_UNSET
-from test_holds import timed_hold_events, write_holder, write_mac_block
-from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
-from test_record_rerun import refresh_machine_health
+from scripts.buildlog import disk, ci
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import moments, report, holds, health
+from scripts.buildlog.cgroup_test_support import GIB, slice_reading
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog import rust_release, sync
+from scripts.buildlog import store
+from scripts.buildlog.record import TARGET_DIR_UNSET
+from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_mac_block
+from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from scripts.lib import test_hang_guard
+from scripts.buildlog.test_record_rerun import refresh_machine_health
+from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
 
 HISTORY_STAMP = "2026-09-30T12:00:00Z"
+
+
+def table_cells(heading: str, rows: list[str]) -> list[dict[str, str]]:
+    headers = [cell.strip() for cell in heading.strip("|").split("|")]
+    return [dict(zip(headers, [cell.strip() for cell in line.strip("|").split("|")], strict=True))
+            for line in rows]
 
 
 def cargo_build(record_id: str, **fields: object) -> Record:
@@ -64,8 +72,7 @@ class MeasuredCliRun:
 
 def probe_cli() -> None:
     """Instrument the real CLI entry point, including its preparation work."""
-    import cli
-    import launches
+    from scripts.buildlog import cli, launches
 
     statements: list[str] = []
     instruction_batches = 0
@@ -104,10 +111,10 @@ def probe_cli() -> None:
 def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
     # Importing test_index installs its own paths; restore this fixture afterwards.
     result = subprocess.run(
-        [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
-        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
-        capture_output=True, text=True, check=False, timeout=120,
+        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2]), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
+        capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:
         raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
@@ -125,8 +132,10 @@ def setUpModule() -> None:
 class ReportSpeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
+        _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -146,7 +155,7 @@ class ReportSpeedTests(unittest.TestCase):
                 )))
                 _ = index.update()
                 result = subprocess.run(
-                    [sys.executable, "scripts/buildlog/cli.py", "report"],
+                    configured_host_cli(Path("scripts/buildlog/cli.py"), "report"),
                     cwd=Path(__file__).resolve().parents[2],
                     env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
                          "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
@@ -250,13 +259,39 @@ class ReportTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
+
+    def test_recorder_health_action_matches_unfinished_records_errors_or_both(self) -> None:
+        day = "2026-10-02"
+        at = datetime(2026, 10, 2, 16, tzinfo=UTC).timestamp()
+        for machine, location in ((health.Machine.NATEDEV, "natedev"), (health.Machine.MAC, "the Mac")):
+            for unfinished, errors in ((2, 0), (0, 3), (2, 3)):
+                with self.subTest(machine=machine, unfinished=unfinished, errors=errors):
+                    snapshot = health.FreshRecorderHealth(health.RecorderHealthSnapshot(
+                        machine, at, unfinished, (at,) * errors))
+                    with mock.patch.object(health, "read_snapshots", return_value=[snapshot]):
+                        lines = report.recorder_health_lines(day)
+                    self.assertEqual(len(lines), 1)
+                    line = lines[0]
+                    self.assertIn(f"{unfinished} records the recorder has not finished", line)
+                    self.assertIn(f"{errors} recorder errors", line)
+                    if unfinished:
+                        self.assertIn(f"run buildlog launches on {location}", line)
+                    else:
+                        self.assertNotIn("run buildlog launches", line)
+                    if errors:
+                        self.assertIn("see ", line)
+                        self.assertIn(f"errors.log on {location}", line)
+                    else:
+                        self.assertNotIn("see ", line)
+                        self.assertNotIn("errors.log", line)
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,7 +362,7 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         start = lines.index("### Test builds (temporary)")
         next_section = next(line for line in lines[start + 1:] if line.startswith("### "))
-        self.assertEqual(next_section, "### Power profile")
+        self.assertEqual(next_section, "### Before and after")
 
     def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
         self.write(
@@ -463,10 +498,7 @@ class ReportTests(unittest.TestCase):
         lines = self.mac_tests_lines(day)
         heading = next(line for line in lines if line.startswith("| Package |"))
         row = next(line for line in lines if line.startswith(f"| {package} |"))
-        return dict(zip(
-            [cell.strip() for cell in heading.strip("|").split("|")],
-            [cell.strip() for cell in row.strip("|").split("|")], strict=True,
-        ))
+        return self.table_cells(heading, [row])[0]
 
     def test_held_target_waits_keep_fractional_seconds_and_unknown_rows(self) -> None:
         self.write(
@@ -2390,6 +2422,215 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | clippy | 30.0 s | 2 |", section)
         self.assertIn("| verify.sh (agents) | clippy | 5.0 s | 2 |", section)
 
+    def usage_sample(self, at: str, held: int, *, cpu: int = 0, identity: int = 42,
+                     boot: str = "boot-a", free: int = 30 * GIB, tokens: int = 17) -> Record:
+        return sample(at, boot_id=boot,
+                      slices={"builds": slice_reading(held, cpu=cpu, identity=identity),
+                              "ci": slice_reading(40 * GIB, cpu=cpu * 100, identity=99)},
+                      filesystem={"state": "measured", "total": 100 * GIB, "used": 60 * GIB,
+                                  "free": free, "device": "254:0", "device_name": "dm-0"},
+                      jobserver={"builds": {"state": "measured", "free_pool_tokens": tokens},
+                                 "ci": {"state": "unavailable"}})
+
+    def write_usage(self, *records: Record) -> None:
+        self.write(self.root / "natedev/samples-2026-10.jsonl", *records)
+
+    def usage_cells(self, text: str) -> list[dict[str, str]]:
+        table = [line for line in text.splitlines() if line.startswith("|")]
+        self.assertGreaterEqual(len(table), 3)
+        return self.table_cells(table[0], table[2:])
+
+    def table_cells(self, heading: str, rows: list[str]) -> list[dict[str, str]]:
+        return table_cells(heading, rows)
+
+    def usage_text(self, day: str) -> str:
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="natedev"):
+            return report.usage_hours(connection, day)
+
+    def test_pressure_interval_counts_only_in_the_day_it_ends(self) -> None:
+        self.write_usage(
+            sample("2026-10-01T23:59:00Z", stall_some_us=10_000_000, stall_full_us=2_000_000,
+                   cpu_stall_some_us=10_000_000),
+            sample("2026-10-02T00:01:00Z", stall_some_us=12_000_000, stall_full_us=3_000_000,
+                   cpu_stall_some_us=40_000_000))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC", "TZ": "UTC"}):
+            time.tzset()
+            try:
+                before = report.memory_pressure_section(connection, "2026-10-01", 0)
+                after = report.memory_pressure_section(connection, "2026-10-02", 0)
+                cpu_before = report.cpu_disk_pressure_section(connection, "2026-10-01")
+                cpu_after = report.cpu_disk_pressure_section(connection, "2026-10-02")
+            finally:
+                self.addCleanup(time.tzset)
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in before))
+        self.assertTrue(any("some 2.0 s" in line and "full 1.0 s" in line for line in after))
+        self.assertIn("CPU and IO samples: none.", cpu_before)
+        self.assertTrue(any("CPU some 25.0%" in line for line in cpu_after))
+
+    def test_held_components_average_their_own_readings_without_current(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 8 * GIB)
+        second = self.usage_sample("2026-10-02T13:00:00Z", 24 * GIB)
+        cast(Record, cast(Record, second["slices"])["builds"])["current_bytes"] = "unavailable"
+        self.write_usage(first, second)
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 8.0 GiB", line)
+        self.assertIn("`anon` 4.0 GiB", line)
+        self.assertIn("`file` 8.0 GiB", line)
+        self.assertIn("`inactive_file` 4.0 GiB", line)
+
+    def test_usage_on_mac_selects_natedev_samples_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000))
+        self.write(self.root / "mac/samples-2026-10.jsonl",
+                   sample("2026-10-02T12:00:00Z", host="mac", slices={"builds": slice_reading(40 * GIB)}))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="mac"), \
+             mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            row = next(row for row in self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+                       if "12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+
+    def test_sample_without_snapshot_keeps_memory_disk_tokens_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000,
+                                           free=25 * GIB, tokens=9))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM memory_snapshots").fetchone(), (0,))
+            line = report.memory_held_line(connection, "2026-10-02")
+            rows = self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+        row = next(row for row in rows if "12:00" in row["Hour"])
+        self.assertIn("average 16.0 GiB", line)
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+        self.assertEqual(row["Lowest free disk GiB"], "25.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "13.0 (2)")
+
+    def test_usage_window_edges_filter_and_bucket_the_same_instant(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-01T23:59:59.999999Z", 40 * GIB),
+                         self.usage_sample("2026-10-02T00:00:00Z", 8 * GIB),
+                         self.usage_sample("2026-10-02T23:59:59.999999Z", 12 * GIB),
+                         self.usage_sample("2026-10-03T00:00:00Z", 40 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            rows = self.usage_cells(self.usage_text("2026-10-02"))
+        measured = [row for row in rows if row["Samples"] != "0"]
+        self.assertEqual([(row["Hour"], row["Average GiB held"]) for row in measured],
+                         [("2026-10-02 00:00 +0000", "8.0 (1)"), ("2026-10-02 23:00 +0000", "12.0 (1)")])
+
+    def test_memory_held_averages_current_charge_without_peaks_children_or_swap(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                   sample("2026-10-02T12:02:00Z", builds_anon_bytes=100 * GIB))
+        self.write(self.root / "natedev/2026-10.jsonl", step("peak", peak_mem_bytes=1000 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            lines = self.render("2026-10-02").splitlines()
+        line = next(line for line in lines if line.startswith("Build memory held ("))
+        self.assertEqual(line, "Build memory held (60 s samples, last 24 h): average 16.0 GiB "
+                         + "(`anon` 4.0 GiB, `file` 8.0 GiB, of which `inactive_file` 4.0 GiB) "
+                         + "of the 44.0 GiB cap; busiest hour 12:00 at 16.0 GiB.")
+
+    def test_memory_held_weights_samples_instead_of_hour_means(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                         self.usage_sample("2026-10-02T13:00:00Z", 4 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 12.0 GiB", line)
+        self.assertIn("busiest hour 12:00 at 16.0 GiB", line)
+
+    def test_memory_held_old_rows_and_missing_current_are_not_zero_readings(self) -> None:
+        self.write_usage(
+                   sample(STAMP, builds_anon_bytes=8 * GIB),
+                   sample("2026-10-02T12:01:00Z", slices={"builds": {"state": "present", "peak_bytes": 44 * GIB}}))
+        self.assertIn("Build memory held: no readings yet.", self.render("2026-10-02"))
+
+    def test_usage_hours_counts_missing_components_separately_and_keeps_cap(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB, tokens=10)
+        second = self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, tokens=20)
+        builds = cast(Record, cast(Record, second["slices"])["builds"])
+        del cast(Record, builds["stat"])["anon"]
+        second["jobserver"] = {"builds": {"state": "unavailable"}, "ci": {"state": "unavailable"}}
+        self.write_usage(first, second)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Processes GiB"], "3.0 (1)")
+        self.assertEqual(row["File cache GiB"], "8.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "10.0 (1)")
+        self.assertEqual(row["Samples"], "2")
+
+    def test_usage_hours_separates_repeated_local_hours_by_utc_offset(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-11-01T05:30:00Z", 12 * GIB),
+                   self.usage_sample("2026-11-01T06:30:00Z", 20 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            text = self.usage_text("2026-11-01")
+        rows = [line for line in text.splitlines() if "2026-11-01 01:00" in line]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any("-04:00" in row or "-0400" in row for row in rows))
+        self.assertTrue(any("-05:00" in row or "-0500" in row for row in rows))
+        self.assertTrue(any("12.0" in row for row in rows))
+        self.assertTrue(any("20.0" in row for row in rows))
+
+    def test_usage_hours_splits_cpu_and_top_device_traffic_at_hour_edge(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:59:30Z", 12 * GIB, cpu=0),
+                   self.usage_sample("2026-10-02T13:00:30Z", 12 * GIB, cpu=120_000_000,
+                                     free=25 * GIB, tokens=9))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        rows = [row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"] or "2026-10-02 13:00" in row["Hour"]]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+            self.assertEqual(row["Builds read bytes"], "60000000.00 (1)")
+            self.assertEqual(row["Builds written bytes"], "120000000.00 (1)")
+        self.assertEqual(rows[1]["Lowest free disk GiB"], "25.0 (1)")
+
+    def test_usage_hours_unknown_intervals_never_become_zero_cpu(self) -> None:
+        cases = (("same instant", 0, "boot-a", 42, 200), ("reset", 60, "boot-a", 42, 50), ("boot", 60, "boot-b", 42, 200),
+                 ("cgroup", 60, "boot-a", 43, 200),
+                 ("gap", report.MAX_SAMPLE_GAP_S + 1, "boot-a", 42, 200))
+        for name, elapsed, boot, identity, counter in cases:
+            with self.subTest(case=name):
+                start = datetime(2026, 10, 2, 12, tzinfo=UTC)
+                self.write_usage(
+                           self.usage_sample(start.isoformat(), 12 * GIB, cpu=100),
+                           self.usage_sample((start + timedelta(seconds=elapsed)).isoformat(), 12 * GIB,
+                                             cpu=counter, identity=identity, boot=boot))
+                with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+                    text = self.usage_text("2026-10-02")
+                row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+                self.assertEqual(row["Builds CPU cores"], "— (0)")
+                self.assertEqual(row["Builds read bytes"], "— (0)")
+                self.assertEqual(row["Builds written bytes"], "— (0)")
+
+    def test_memory_held_rolling_window_ends_now_and_dated_window_ends_local_day(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-01T11:59:59Z", 40 * GIB),
+                   self.usage_sample("2026-10-01T12:00:01Z", 8 * GIB),
+                   self.usage_sample("2026-10-02T11:59:59Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:00:01Z", 40 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            with mock.patch.object(report, "datetime", wraps=datetime,
+                                   now=mock.Mock(return_value=datetime(2026, 10, 2, 12, tzinfo=UTC))):
+                line = report.memory_held_line(connection)
+            dated = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 10.0 GiB", line)
+        self.assertIn("average 26.0 GiB", dated)
+
     def test_cpu_disk_pressure_follows_memory_and_reports_two_hosts(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=10_000_000, io_stall_some_us=1_000_000,
@@ -2412,14 +2653,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 1.0 min sampled)", section)
         self.assertIn("mac: CPU some 10.0%, full 5.0%; IO some 0.0%, full 0.0%; CPU idle 80.0%, iowait 10.0% (of 2.0 min sampled)", section)
 
-    def test_cpu_disk_pressure_counts_reboot_counters_from_zero(self) -> None:
+    def test_cpu_disk_pressure_does_not_count_across_a_reboot(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=99_000_000, io_stall_some_us=9_000_000,
                           cpu_idle_ticks=9000, cpu_iowait_ticks=900, cpu_total_ticks=10000),
                    sample("2026-10-02T12:01:00.000Z", boot_id="new-boot", cpu_stall_some_us=30_000_000,
                           io_stall_some_us=6_000_000, cpu_idle_ticks=200, cpu_iowait_ticks=20, cpu_total_ticks=1000))
         section = self.section_lines(self.render(), "### CPU and disk pressure")
-        self.assertIn("natedev: CPU some 50.0%, full —; IO some 10.0%, full —; CPU idle 20.0%, iowait 2.0% (of 1.0 min sampled)", section)
+        self.assertIn("CPU and IO samples: none.", section)
 
     def test_cpu_disk_pressure_long_gap_is_not_sampled_time(self) -> None:
         start = datetime.fromisoformat(STAMP)
@@ -2487,7 +2728,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertTrue(any("Source:" in line and "60 s" in line and "step" in line and "stall" in line for line in section))
         self.assertTrue(any("8.0 GiB" in line and "7.0 GiB" in line for line in section))
-        self.assertTrue(any("3.5 s" in line and "1.5 s" in line for line in section))
+        self.assertTrue(any("3.0 s" in line and "1.4 s" in line for line in section))
         self.assertTrue(any("peak builds 4.0 GiB, peak CI 5.0 GiB (process memory)" in line for line in section))
         self.assertIn("memory waits: none", section)
 
@@ -2501,7 +2742,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertFalse(any(line.startswith("|") for line in section))
         self.assertTrue(any("4.0 GiB" in line and "2.0 GiB" in line for line in section))
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_compares_adjacent_samples_per_host(self) -> None:
         self.write(
@@ -2524,7 +2765,7 @@ class ReportTests(unittest.TestCase):
             sample(STAMP, stall_some_us=12_000_000, stall_full_us=3_000_000),
         )
         section = self.memory_section()
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
@@ -2754,8 +2995,8 @@ class ReportTests(unittest.TestCase):
         }
         self.write(self.root / "natedev" / "2026-10.jsonl", step("one"))
 
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
-            with mock.patch("sync.sync_time", return_value="12:14 EDT"):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
+            with mock.patch("scripts.buildlog.sync.sync_time", return_value="12:14 EDT"):
                 lines = self.render().splitlines()
 
         self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary: successes"))
@@ -2794,12 +3035,28 @@ class ReportTests(unittest.TestCase):
             "free": 2**30,
             "floor": None,
         }
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
             lines = self.render().splitlines()
 
         self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary"))
         self.assertIn("| free | 1.0 GiB |", lines)
         self.assertNotIn("free (floor", "\n".join(lines))
+
+    def test_disk_section_names_each_filesystem_once(self) -> None:
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00", "host": "natedev", "rows": [],
+            "used": 10 * (2**30), "free": (2**30), "floor": None,
+            "filesystems": [
+                {"path": "/", "device": "1:1", "device_name": "root", "used": 10 * (2**30), "free": (2**30)},
+                {"path": "/build", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+                {"path": "/alias", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+            ],
+        }
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
+            text = "\n".join(report.disk_section())
+        self.assertIn("/build (2:1, build) free | 3.0 GiB", text)
+        self.assertIn("/ (1:1, root) free | 1.0 GiB", text)
+        self.assertNotIn("/alias", text)
 
     def test_disk_section_clamps_other_when_rows_exceed_used(self) -> None:
         unit = 2**30
@@ -2811,7 +3068,7 @@ class ReportTests(unittest.TestCase):
             "free": unit,
             "floor": None,
         }
-        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=snapshot):
             lines = report.disk_section()
 
         self.assertIn("| other | 0.0 GiB |", lines)
@@ -2844,7 +3101,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| /tmp | 1.0 GiB |", old_lines)
 
     def test_no_disk_section_without_snapshot(self) -> None:
-        with mock.patch("report.disk.read_snapshot", return_value=None):
+        with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=None):
             lines = self.render().splitlines()
 
         self.assertFalse(any(line.startswith("### Disk:") for line in lines))
@@ -2859,10 +3116,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(sync.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
 
     def test_nearest_rank_matches_p95_boundaries_and_single_value(self) -> None:
-        self.assertEqual(report.nearest_rank(list(range(1, 21)), 95), 19)
-        self.assertEqual(report.nearest_rank(list(range(1, 22)), 95), 20)
-        self.assertEqual(report.nearest_rank([37], 95), 37)
-        self.assertEqual(report.nearest_rank([360, 720, 1080, 1440], 75), 1080)
+        self.assertEqual(moments.nearest_rank(list(range(1, 21)), 95), 19)
+        self.assertEqual(moments.nearest_rank(list(range(1, 22)), 95), 20)
+        self.assertEqual(moments.nearest_rank([37], 95), 37)
+        self.assertEqual(moments.nearest_rank([360, 720, 1080, 1440], 75), 1080)
 
     def test_ci_freshness_for_today_and_a_past_day(self) -> None:
         now = datetime.now(UTC)
@@ -2920,9 +3177,11 @@ class ReportTests(unittest.TestCase):
         _ = (self.root / "sync_paused.json").write_text(json.dumps({
             "since": "2026-10-06T11:00:00Z", "why": "Mac hold",
         }))
-        note = report.mac_note()
-        self.assertTrue(note.startswith("Mac: sync paused since "))
-        self.assertIn("(Mac hold). Mac rows as of the ", note)
+        lines = report.peer_sync_lines()
+        mac = [line for line in lines if line.startswith("mac (")]
+        self.assertEqual(len(mac), 1)
+        self.assertIn("sync globally paused (Mac hold); run buildlog sync resume", mac[0])
+        self.assertIn("last successful exchange", mac[0])
 
     def test_every_step_kind_and_summary_places_p95_after_average(self) -> None:
         kinds = ("check", "clippy", "doc", "nextest", "mend", "fmt")
@@ -2985,6 +3244,10 @@ class PowerProfileTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.addCleanup(time.tzset)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        # These fixtures exercise build/profile comparisons. Memory moments
+        # have independent fixtures and must not change the profile assertions.
+        _ = cast(object, self.enterContext(mock.patch.object(moments, "MOMENTS", tuple(
+            event for event in moments.MOMENTS if isinstance(event, moments.BuildMoment)))))
         time.tzset()
 
     def write(self, *records: Record) -> None:
@@ -3004,7 +3267,8 @@ class PowerProfileTests(unittest.TestCase):
 
     def rows(self, lines: list[str]) -> list[list[str]]:
         return [[cell.strip() for cell in line.strip("|").split("|")]
-                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")]
+                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")
+                and len(line.strip("|").split("|")) == 8]
 
     def profiled(self, at: str, profile: str = "performance", since: str | None = None) -> Record:
         return sample(at, power_profile=profile, power_profile_since=since)
@@ -3102,12 +3366,15 @@ class PowerProfileTests(unittest.TestCase):
                  caller="verify", crates_compiled=1),
         )
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile",
+        self.assertEqual([line for line in lines if line and (
+            line.startswith(("### ", "Profile now:", "Before ", "No step ran")))], [
+            "### Before and after",
             "Profile now: performance, since 2026-10-13 12:00:00 UTC.",
             "Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):",
             "No step ran with the same kind, caller and rebuild class on both sides.",
         ])
+        self.assertEqual(self.rows(lines), [])
+        self.assertFalse(any(line.startswith("Source: natedev steps that passed") for line in lines))
 
     def test_p50_uses_nearest_rank_rather_than_interpolated_median(self) -> None:
         records = [self.profiled("2026-10-13T12:00:00.000Z")]
@@ -3175,9 +3442,10 @@ class PowerProfileTests(unittest.TestCase):
         self.write(self.profiled("2026-10-06T00:01:00.000Z", since=since),
                    self.profiled("2026-10-13T12:00:00.000Z", since="2026-10-13T11:00:00.000Z"))
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
+        self.assertEqual([line for line in lines if line and line.startswith(("### ", "Profile now:", "Before "))], [
+            "### Before and after", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
         ])
+        self.assertEqual(self.rows(lines), [])
 
     def test_no_profiled_natedev_sample_omits_section(self) -> None:
         self.write(sample(STAMP), sample("2026-10-13T12:00:00.000Z", host="macbook", power_profile="balanced"))

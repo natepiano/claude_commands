@@ -18,6 +18,8 @@ from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from scripts.accounts import role_map
+from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
 
 
 class NextMoveError(ValueError):
@@ -62,6 +64,11 @@ class GroupPositionOutOfRange(NextMoveError):
         self.requested = requested
         self.size = size
         super().__init__(f"next: {group} has {size} entries; position {requested.value} is out of range")
+
+
+def _check_group_position(group: NextMoveGroup, position: GroupPosition, size: int, *, insert: bool = False) -> None:
+    if position.value > size + int(insert):
+        raise GroupPositionOutOfRange(group, position, size)
 
 
 APPEND_TO_GROUP = AppendToGroup()
@@ -142,11 +149,14 @@ def account_pace(label: str, now: datetime) -> PaceEstimate | NoUsablePace:
     return PaceEstimate(rate * 3600)
 
 
-def resolve_hold(mode: HoldMode, label: str, now: datetime) -> ResolvedHold:
+def resolve_hold(mode: HoldMode, label: str, now: datetime, *,
+                 account_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> ResolvedHold:
     if isinstance(mode, FixedHold):
         return ResolvedHold(mode.minutes, mode)
+    if isinstance(account_config, UseConfiguredValue):
+        account_config = conf.read("accounts")
     pace = account_pace(label, now)
-    minutes = math.ceil(30 / pace.points_per_hour) if isinstance(pace, PaceEstimate) else 40
+    minutes = math.ceil(account_config.whole("half_point_pace_minutes") / pace.points_per_hour) if isinstance(pace, PaceEstimate) else account_config.whole("hold_default_minutes")
     return ResolvedHold(minutes, pace)
 
 
@@ -159,6 +169,13 @@ def parse_hold_mode(text: str) -> HoldMode:
         raise NextMoveError("next: hold must be half-point or nonnegative minutes") from error
 
 
+def _check_move_input(percent: float, added_at: datetime) -> None:
+    if isinstance(percent, bool) or not 0 <= percent <= 100 or not math.isfinite(percent):
+        raise NextMoveError("next: percent must be from 0 to 100")
+    if added_at.utcoffset() is None:
+        raise NextMoveError("next: added_at needs a zone")
+
+
 @dataclass(frozen=True, init=False)
 class ClaudeGroupMove:
     id: str
@@ -167,15 +184,18 @@ class ClaudeGroupMove:
     hold_mode: HoldMode
     to: str
     added_at: datetime
+    fallback_targets: tuple[str, ...]
 
     def __init__(self, id: str, group: Literal["units", "showrunners"], at_percent: float,
-                 hold_mode: HoldMode | float, to: str, added_at: datetime) -> None:
+                 hold_mode: HoldMode | float, to: str, added_at: datetime,
+                 fallback_targets: tuple[str, ...] = ()) -> None:
         object.__setattr__(self, "id", id)
         object.__setattr__(self, "group", group)
         object.__setattr__(self, "at_percent", at_percent)
         object.__setattr__(self, "hold_mode", hold_mode if isinstance(hold_mode, (FixedHold, HalfPointHold)) else FixedHold(hold_mode))
         object.__setattr__(self, "to", to)
         object.__setattr__(self, "added_at", added_at)
+        object.__setattr__(self, "fallback_targets", fallback_targets)
         self.__post_init__()
 
     @property
@@ -187,13 +207,9 @@ class ClaudeGroupMove:
     def __post_init__(self) -> None:
         if not self.id or self.group not in ("units", "showrunners"):
             raise NextMoveError("next: expected an id and units or showrunners")
-        if isinstance(self.at_percent, bool) or not 0 <= self.at_percent <= 100 or not math.isfinite(self.at_percent):
-            raise NextMoveError("next: percent must be from 0 to 100")
-        if not re.fullmatch(r"claude[1-9][0-9]*", self.to):
+        _check_move_input(self.at_percent, self.added_at)
+        if any(not re.fullmatch(r"claude[1-9][0-9]*", target) for target in (self.to, *self.fallback_targets)):
             raise NextMoveError("next: target must be a numbered Claude account")
-        if self.added_at.utcoffset() is None:
-            raise NextMoveError("next: added_at needs a zone")
-
 
 
 @dataclass(frozen=True)
@@ -240,10 +256,7 @@ class WorkersMove:
     def __post_init__(self) -> None:
         if not self.id:
             raise NextMoveError("next: expected an id")
-        if isinstance(self.at_percent, bool) or not 0 <= self.at_percent <= 100 or not math.isfinite(self.at_percent):
-            raise NextMoveError("next: percent must be from 0 to 100")
-        if self.added_at.utcoffset() is None:
-            raise NextMoveError("next: added_at needs a zone")
+        _check_move_input(self.at_percent, self.added_at)
 
 
 NextMove = ClaudeGroupMove | WorkersMove
@@ -265,6 +278,7 @@ def next_moves_file() -> Path:
 def encode_next_moves(entries: tuple[NextMove, ...]) -> str:
     return json.dumps([dict(id=entry.id, group=entry.group, at_percent=entry.at_percent,
                             **(encode_hold_mode(entry.hold_mode) if isinstance(entry, ClaudeGroupMove) else {}),
+                            **({"else": entry.fallback_targets} if isinstance(entry, ClaudeGroupMove) and entry.fallback_targets else {}),
                             to=target_label(entry), added_at=entry.added_at.isoformat()) for entry in entries])
 
 
@@ -294,8 +308,14 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
                     or not isinstance(percent, (int, float)) or isinstance(percent, bool)
                     or not isinstance(hold, (int, float)) or isinstance(hold, bool)):
                 raise NextMoveError("next: invalid entry fields")
+            fallbacks = fields.get("else", [])
+            if not isinstance(fallbacks, list) or any(not isinstance(label, str) for label in cast(list[object], fallbacks)):
+                raise NextMoveError("next: else must be a list of Claude accounts")
+            fallback_targets = tuple(cast(list[str], fallbacks))
             entry: NextMove
             if group == "workers":
+                if fallback_targets:
+                    raise NextMoveError("next: workers entries cannot use --else")
                 if hold != 0 or mode != "fixed":
                     raise NextMoveError("next: workers entries cannot hold minutes")
                 destination = (WorkersToClaude() if target == "claude" else
@@ -305,7 +325,7 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             else:
                 entry = ClaudeGroupMove(name, group, float(percent),
                                         HalfPointHold() if mode == "half-point" else FixedHold(float(hold)),
-                                        target, datetime.fromisoformat(added))
+                                        target, datetime.fromisoformat(added), fallback_targets)
             if entry.id in ids:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
@@ -328,11 +348,15 @@ def read_next_moves() -> tuple[NextMove, ...]:
         raise NextMoveError(f"next: cannot read log: {error}") from error
 
 
+def _check_log_host() -> None:
+    if not role_map.is_role_map_host():
+        raise NextMoveError("next: log writes belong on natedev")
+
+
 @contextmanager
 def next_moves_lock() -> Generator[None]:
     """Serialize local edits and the engine's selection/consumption pass."""
-    if not role_map.is_role_map_host():
-        raise NextMoveError("next: log writes belong on natedev")
+    _check_log_host()
     path = next_moves_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
@@ -342,8 +366,7 @@ def next_moves_lock() -> Generator[None]:
 
 def write_next_moves(entries: tuple[NextMove, ...]) -> None:
     """Replace the local log; the caller holds next_moves_lock."""
-    if not role_map.is_role_map_host():
-        raise NextMoveError("next: log writes belong on natedev")
+    _check_log_host()
     path = next_moves_file()
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".next-")
     try:
@@ -365,8 +388,7 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
             indices = [index for index, saved in enumerate(entries) if saved.group == entry.group]
             if isinstance(insertion, InsertAt):
                 position = insertion.position
-                if position.value > len(indices) + 1:
-                    raise GroupPositionOutOfRange(entry.group, position, len(indices))
+                _check_group_position(entry.group, position, len(indices), insert=True)
                 index = (indices[position.value - 1] if position.value <= len(indices)
                          else indices[-1] + 1 if indices else len(entries))
             else:
@@ -378,11 +400,12 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
 
 
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
-                  hold_minutes: float | HoldMode = 0, *, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
+                  hold_minutes: float | HoldMode = 0, *, fallback_targets: tuple[str, ...] = (),
+                  insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
     # All text-to-domain conversions use the same boundary as file and remote reads.
     entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
         **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
-        to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
     if not role_map.is_role_map_host():
         try:
             arguments = ("next-write", encode_next_moves((entry,)))
@@ -414,8 +437,7 @@ def remove_next_move(group: NextMoveGroup, position: GroupPosition) -> None:
         with watcher.editing_next_moves() as edit:
             entries = read_next_moves()
             group_entries = [entry for entry in entries if entry.group == group]
-            if position.value > len(group_entries):
-                raise GroupPositionOutOfRange(group, position, len(group_entries))
+            _check_group_position(group, position, len(group_entries))
             removed = group_entries[position.value - 1]
             edit.commit(tuple(entry for entry in entries if entry.id != removed.id))
     except OSError as error:
@@ -437,8 +459,7 @@ def move_next_move(group: NextMoveGroup, source: GroupPosition, destination: Gro
             entries = read_next_moves()
             group_entries = [entry for entry in entries if entry.group == group]
             for position in (source, destination):
-                if position.value > len(group_entries):
-                    raise GroupPositionOutOfRange(group, position, len(group_entries))
+                _check_group_position(group, position, len(group_entries))
             if source == destination:
                 return
             entry = group_entries.pop(source.value - 1)
@@ -485,7 +506,8 @@ def _render_next_move(entry: NextMove, position: GroupPosition,
             estimate = (f"{duration.minutes:g} min default: no pace history" if isinstance(duration.source, NoUsablePace)
                         else f"≈{duration.minutes:g} min")
             hold = f", hold half a point ({estimate})"
-    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{hold}"
+    fallback = "".join(f", else {target}" for target in entry.fallback_targets) if isinstance(entry, ClaudeGroupMove) else ""
+    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{fallback}{hold}"
 
 
 def render_next_moves(entries: tuple[NextMove, ...]) -> str:
@@ -552,8 +574,7 @@ def update_next_move_hold(group: NextMoveGroup, position: GroupPosition, mode: H
         with watcher.editing_next_moves() as edit:
             entries = read_next_moves()
             group_entries = [entry for entry in entries if entry.group == group]
-            if position.value > len(group_entries):
-                raise GroupPositionOutOfRange(group, position, len(group_entries))
+            _check_group_position(group, position, len(group_entries))
             entry = group_entries[position.value - 1]
             if isinstance(expected, ExpectedNextMove) and (entry.at_percent != expected.percent or target_label(entry) != expected.target):
                 raise NextMoveError(f"next: {group} {position.value} is now at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}; nothing changed")

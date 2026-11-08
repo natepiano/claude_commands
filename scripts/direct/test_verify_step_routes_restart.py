@@ -14,7 +14,10 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         original = (self.fixture.bin_directory / "cargo").read_text()
         stub = original.replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if arguments[:1] == ["check"]:
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "compiling-state").write_text(record["state"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("new hold")
     raise SystemExit(143)
@@ -31,7 +34,6 @@ if arguments[:1] == ["check"]:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         (holders / "other").unlink()
         cargo = self.fixture.bin_directory / "cargo"
-        self.fixture.environment["TEST_PROCESS_REPOSITORY"] = str(Path(__file__).resolve().parents[2])
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if arguments[:1] == ["check"]:
     import socket
@@ -39,12 +41,7 @@ if arguments[:1] == ["check"]:
     if not first.exists():
         first.write_text("stopped")
         proc = Path("/proc")
-        sys.path.insert(0, os.environ["TEST_PROCESS_REPOSITORY"])
-        from scripts.lib import process_start
-        stat = process_start.read_stat(os.getpid())
-        if isinstance(stat, process_start.ProcessGone):
-            raise SystemExit("the test process ended before its stop record")
-        start = stat.start.text
+        start = (proc / str(os.getpid()) / "stat").read_text().rsplit(")", 1)[1].split()[19]
         log = Path(os.environ["BUILDLOG_DIR"]) / socket.gethostname().split(".")[0]
         log.mkdir(parents=True, exist_ok=True)
         (log / "hold-builds-test.jsonl").write_text(json.dumps(dict(

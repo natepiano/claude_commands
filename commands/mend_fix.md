@@ -1,5 +1,5 @@
 ---
-description: Reproduce a cargo-mend failure on an external project in a throwaway /tmp copy, diagnose and fix cargo-mend, install after the fix is confirmed, and clean up only after the user verifies
+description: Reproduce and fix a cargo-mend failure.
 ---
 
 # Mend Fix
@@ -17,27 +17,40 @@ cargo-mend source lives at `~/rust/cargo-liner/crates/cargo-mend`, a member of t
 - If `$SRC` is a workspace member with `path = "../…"` dependencies that reach outside it, use the workspace root as `$SRC` instead — a copy that can't resolve its path deps won't reproduce anything.
 - Don't ask what the failure is or which flags to use — go straight to `--fix-all` in STEP 3.
 
-**STEP 2 — Copy to /tmp**
+**STEP 2 — Select the reproduction**
+- Resolve the repository and the session scratch folder.
+- Replace `/absolute/project`, `/absolute/repository`, `/absolute/session-scratch`, and `relative/project` before each command.
+- Keep discovery and execution in separate commands.
+- First discover whether the selected project is in Git (a nonzero exit selects the non-git route):
 ```bash
-DEST=/tmp/mend-repro-$(basename "$SRC")
-rm -rf "$DEST" && mkdir -p "$DEST"
-rsync -a --exclude 'target/' --exclude '.git' "$SRC"/ "$DEST"/pristine/
-rsync -a "$DEST"/pristine/ "$DEST"/work/
-(cd "$DEST"/work && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm base)
+git -C /absolute/project rev-parse --show-toplevel
 ```
-- The `git init` is required: `--fix-all` runs `--fix-compiler`, which shells out to `cargo fix`, which refuses to touch a directory with no VCS (`no VCS found for this package`). Without it the run fails for a reason that has nothing to do with the bug.
-- `$DEST/pristine` is never run against. `$DEST/work` is the run target.
-- To reset `work` after a `--fix` run mutated it, keeping its build cache:
-  `rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/`
-- **Never** run cargo-mend against `$SRC` itself, and especially never with a `--fix` flag.
-- If the failure turns out to depend on git state, re-copy without the `.git` exclude.
+- Git route: use that repository root; calculate the selected workspace's relative path separately. Each attempt uses `copies.py run`, resets sources and keeps its build cache.
+- Non-git route only: prepare an immutable pristine directory and a working reproduction under the scratchpad. `git init` lets mend's `cargo fix` run; it creates no repository copy:
+```bash
+mkdir -p /absolute/session-scratch/pristine /absolute/session-scratch/work
+rsync -a --exclude 'target/' --exclude '.git' /absolute/project/ /absolute/session-scratch/pristine/
+rsync -a /absolute/session-scratch/pristine/ /absolute/session-scratch/work/
+git -C /absolute/session-scratch/work init -q .
+git -C /absolute/session-scratch/work add -A
+git -C /absolute/session-scratch/work -c user.email=t@t -c user.name=t commit -qm base
+```
+- Reset a non-git attempt from pristine with `rsync -a --delete --exclude 'target/' --exclude '.git' /absolute/session-scratch/pristine/ /absolute/session-scratch/work/`, after substituting the concrete scratchpad. Never apply fix flags to the original project.
 
 **STEP 3 — Reproduce with the installed binary**
+- Issue exactly the selected route, with concrete substitutions from STEP 2.
+Git route:
 ```bash
-cargo mend --fix-all "$DEST/work" > "$DEST"/repro.log 2>&1; echo "EXIT=$?" >> "$DEST"/repro.log
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- cargo mend --fix-all '{tree}/relative/project' > /absolute/session-scratch/repro.log 2>&1
+echo "EXIT=$?" >> /absolute/session-scratch/repro.log
+```
+Non-git route:
+```bash
+cargo mend --fix-all /absolute/session-scratch/work > /absolute/session-scratch/repro.log 2>&1
+echo "EXIT=$?" >> /absolute/session-scratch/repro.log
 ```
 - Background it (`run_in_background: true`) — the first run does a full cold `cargo check` of the target project, minutes for anything bevy-sized — and yield the turn.
-- Expect `EXIT=2` and the rollback line. The compiler errors in that log are what to diagnose; they come from mend's own post-fix re-check, so a later plain `cargo check` of `work` can still pass (the fixes were rolled back). Don't read that as "it builds fine".
+- Expect `EXIT=2` and the rollback line. The compiler errors in that log are what to diagnose; they come from mend's own post-fix re-check, so a later plain `cargo check` of the reset checkout can still pass (the fixes were rolled back). Don't read that as "it builds fine".
 - Record the installed version with `cargo mend --build-info` so the repro is pinned to a known binary.
 - If the target's build scripts wrap a macOS framework, the sandbox will fail with `sandbox-exec: sandbox_apply: Operation not permitted`; re-run with `dangerouslyDisableSandbox: true`. That is a sandbox failure, not a cargo-mend bug.
 - If it does **not** reproduce, try `--fix`, `--fix-pub-use`, and `--fix-compiler` individually before reporting back — the breakage may be confined to one fix pass.
@@ -49,19 +62,22 @@ cargo mend --fix-all "$DEST/work" > "$DEST"/repro.log 2>&1; echo "EXIT=$?" >> "$
 - If two attempts fail to resolve it, start an attempts log in the cargo-mend memory directory and log every approach, reasoning, and result before the next attempt — telling the user each time an entry is added.
 
 **STEP 5 — Fix**
-- Run `/rust_style` immediately before editing Rust.
+- This session has no style reviewer; follow `/rust_style` before editing Rust.
 - Make the fix. Add or extend a regression test under `tests/` when the bug is expressible there.
 - `cargo build && cargo +nightly fmt` (background the build).
 
 **STEP 6 — Confirm the fix**
-- Build the dev binary with the stable toolchain and run it against the copy:
+- Build the dev binary with `cargo +stable build` (`RUSTC_BOOTSTRAP=1` comes from `.cargo/config.toml`). Reset the selected reproduction and run the corresponding concrete command below. Replace `/absolute/cargo-liner` with its real path too.
+Git route:
 ```bash
-cargo +stable build            # RUSTC_BOOTSTRAP=1 comes from .cargo/config.toml
-rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/   # fresh sources, keep build cache
-./target/debug/cargo-mend --fix-all "$DEST/work"
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo /absolute/repository --commit HEAD --apply-uncommitted /absolute/repository -- sh -c '/absolute/cargo-liner/target/debug/cargo-mend --fix-all "{tree}/relative/project" && cd "{tree}/relative/project" && cargo check --workspace --all-targets'
+```
+Non-git route:
+```bash
+/absolute/cargo-liner/target/debug/cargo-mend --fix-all /absolute/session-scratch/work && cd /absolute/session-scratch/work && cargo check --workspace --all-targets
 ```
   `+stable` matters — a nightly-built binary fails against stable projects with `E0514`, which reads like a fresh bug.
-- The fix is confirmed only when mend exits 0 **and** the rewritten copy compiles: `cargo check --workspace --all-targets` in `$DEST/work` after the fix run.
+- The fix is confirmed only when mend exits 0 **and** the rewritten copy compiles: `cargo check --workspace --all-targets` in the same reproduction after the fix run.
 - Run `cargo nextest run` (background it).
 - Report the before/after to the user: the original compiler errors, and what the run does now.
 
@@ -78,6 +94,6 @@ RUSTC_BOOTSTRAP=1 cargo +stable install --path ~/rust/cargo-liner/crates/cargo-m
 
 **STEP 9 — Clean up after the user confirms**
 - On confirmation: `rm -rf "$DEST"` and say it's gone.
-- If the user reports it still fails, go back to STEP 3 with their new output — the copy is still there for exactly this.
+- If the user reports it still fails, go back to STEP 3 with their new output — reset the selected reproduction before the next attempt.
 
 </ExecutionSteps>

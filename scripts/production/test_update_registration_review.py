@@ -14,28 +14,29 @@ from typing import cast
 from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
-import showrunner_tree
+from scripts.production.cli_fixture import production_paths
+from scripts.production import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
     def test_new_object_question_requires_full_text_but_log_remains_a_parser(self) -> None:
+        pending = self.question_instance() / "pending_reviewed.json"
         state = self.question_state([{"text": "Choose layout"}])
         parsed = registration.judgment_state(state, "log")
         self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
         with self.assertRaisesRegex(registration.RegistrationFailure, "a new question needs its full text"):
             _ = self.run_questions(state)
         self.assertFalse(self.outstanding().exists())
-        self.assertFalse((self.state / "notifier/showrunner-example/pending_reviewed.json").exists())
+        self.assertFalse(pending.exists())
 
     def test_held_question_batch_writes_no_records_and_rerun_accepts_reviewed_text(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"Existing reminder"}]')
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "text": "Earlier"}) + "\n")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        _ = self.question_instance()
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text(json.dumps({"items": [{"kind": "reviewed", "text": "Earlier", "reviewed": "Earlier question?"}]}))
         before = [path.read_bytes() for path in (outstanding, history, pending)]
         full = "Build 42 failed.\nRetry (recommended) or stop?"
@@ -53,9 +54,10 @@ class RegistrationTests(RegistrationFixture):
                 review.QuestionAccepted(accepted), review.QuestionAccepted("Use stable (recommended) or nightly?")]):
             output = self.run_questions(state)
         self.assertIn("reviewed question: " + accepted, output)
-        rows = cast(list[dict[str, str]], json.loads(outstanding.read_text()))
-        self.assertEqual(rows[0]["question"], full)
-        self.assertEqual(rows[0]["reviewed"], accepted)
+        rows = self.open_rows()
+        question = next(row for row in rows if row["text"] == "Retry build")
+        self.assertEqual(question["question"], full)
+        self.assertEqual(question["reviewed"], accepted)
         lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual(lines[1]["reviewed"], accepted)
 
@@ -64,8 +66,7 @@ class RegistrationTests(RegistrationFixture):
         _ = outstanding.write_text("[]")
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text("")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        pending.parent.mkdir(parents=True)
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text('{"items":[]}')
         paths = (outstanding, history, pending)
         before = [path.read_bytes() for path in paths]
@@ -118,24 +119,30 @@ class RegistrationTests(RegistrationFixture):
         state = self.question_state([{"text": "Retry build", "after": "2099-01-01T08:00"}, "Choose compiler", "Reminder"])
         with mock.patch.object(review, "review_question", side_effect=AssertionError("reminder reviewed")):
             _ = self.run_questions(state)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual(rows[0]["reviewed"], full)
-        self.assertEqual(rows[0]["question"], full)
-        self.assertEqual(rows[1]["question"], unavailable)
-        self.assertEqual(rows[1]["review_unavailable"], "timeout")
-        self.assertNotIn("reviewed", rows[1])
+        rows = self.open_rows()
+        reviewed = next(row for row in rows if row["text"] == "Retry build")
+        unreviewed = next(row for row in rows if row["text"] == "Choose compiler")
+        self.assertEqual(reviewed["reviewed"], full)
+        self.assertEqual(reviewed["question"], full)
+        self.assertEqual(unreviewed["question"], unavailable)
+        self.assertEqual(unreviewed["review_unavailable"], "timeout")
+        self.assertNotIn("reviewed", unreviewed)
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunner_tree, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
-            registration.open_items(read_production(self.doc))
+            registration.open_items(read_production("example"))
         self.assertIn(full, output.getvalue())
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
-        with mock.patch.dict(os.environ, self.env):
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
             _ = self.run_questions(self.question_state([]))
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
 
     def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
         question = "Retry build 42?"
@@ -143,7 +150,7 @@ class RegistrationTests(RegistrationFixture):
         real_review = review.review_question
         for body in ("", " \n\t"):
             with self.subTest(body=body):
-                self.outstanding().unlink(missing_ok=True)
+                self.write_open_for("example")
                 decisions: list[review.VerdictRecord] = [
                     review.VerdictRecord(verdict="rewrite", title="", action=None, body=body, questions=[],
                         failed_rules=[{"rule": "reader-starts-cold", "quote": question}]),
@@ -168,7 +175,7 @@ class RegistrationTests(RegistrationFixture):
                       mock.patch.object(review, "review_question", side_effect=question_review)):
                     output = self.run_questions(state)
                 self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
-                rows = dailies_render.read_outstanding(self.outstanding())
+                rows = self.read_items()
                 self.assertEqual(len(rows), 1)
                 self.assertIsInstance(rows[0], dailies_render.ReviewUnavailableOutstandingQuestion)
                 row = rows[0]
@@ -183,7 +190,7 @@ class RegistrationTests(RegistrationFixture):
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
             output = self.run_questions(state)
         self.assertIn("reviewed question: " + question, output)
-        rows = dailies_render.read_outstanding(self.outstanding())
+        rows = self.read_items()
         self.assertIsInstance(rows[0], dailies_render.ReviewedOutstandingQuestion)
         self.assertFalse((self.state / "notifier/showrunner-example").exists())
         self.assertEqual(showrunners.registered_showrunners(self.state / "notifier"), [])
@@ -198,10 +205,11 @@ class RegistrationTests(RegistrationFixture):
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(first)) as reviewer:
             _ = self.run_questions(state)
         reviewer.assert_called_once_with(review.QuestionKey("example", "Retry build"), first)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual([row["text"] for row in rows], ["Retry build", "Reminder"])
-        self.assertEqual(rows[0]["question"], first)
-        self.assertNotIn("after", rows[0])
+        rows = self.open_rows()
+        self.assertCountEqual([row["text"] for row in rows], ["Retry build", "Reminder"])
+        question = next(row for row in rows if row["text"] == "Retry build")
+        self.assertEqual(question["question"], first)
+        self.assertNotIn("after", question)
         history = [cast(dict[str, str], json.loads(line))
                    for line in self.outstanding().with_suffix(".history.jsonl").read_text().splitlines()]
         self.assertEqual([row["text"] for row in history], ["Retry build", "Reminder"])

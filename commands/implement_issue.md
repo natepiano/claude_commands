@@ -1,5 +1,5 @@
 ---
-description: Take the top-ranked open Hanadocs issue and design it with the user one decision at a time, ending in a design doc.
+description: Design the top Hanadocs issue.
 ---
 
 # Implement Issue

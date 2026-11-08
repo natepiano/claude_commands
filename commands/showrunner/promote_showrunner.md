@@ -1,11 +1,11 @@
 ---
-description: Turn one of this production's running units into the showrunner of its own production, still reporting to this one.
-argument-hint: "<unit> <production doc> [check]"
+description: Promote a unit to child showrunner.
+argument-hint: "<unit> <showrunner name> --doc <path> [check]"
 ---
 
 # Promote showrunner
 
-**Usage:** `/showrunner:promote_showrunner <unit> <production doc>`, or with
+**Usage:** `/showrunner:promote_showrunner <unit> <showrunner name> --doc <path>`, or with
 `check` to see whether it would go ahead.
 
 Run this in the showrunner session of a running production. The unit keeps its
@@ -17,12 +17,13 @@ the time)". The other direction, a session becoming a unit, is
 `/showrunner:promote_unit`.
 
 First the unit writes the new production's doc in the production format and
-commits it. This command writes no doc.
+commits it. Pass its path with the required `--doc` option.
+Use the same path for a rerun. This command writes no doc.
 
 Run, with the sandbox off:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/promote_showrunner.py" <unit> --production <PRODUCTION_DOC> --model <your model id> --effort <your effort level> [--check]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/promote_showrunner.py" <unit> --production <showrunner name> --doc <path> --model <your model id> --effort <your effort level> [--check]
 ```
 
 Pass your own model id and effort level, as for `/showrunner:add_showrunner`.
@@ -43,16 +44,14 @@ What it does:
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
    Claude is gone, then ends its session on its host, herdr. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.
-3. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
+3. **Promotes** its staff row to the showrunner row of the new production doc.
+4. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
    same session in the unit's worktree: in its own herdr session named for the
    new production, with no unit mark, on the unit's own account, attached to your production.
-4. **Retires** the unit's Units row in your doc, `(retired <date>: promoted to
-   showrunner of <slug>)`, and commits it in your checkout. Its branch stays as
-   it is; the new production merges to the branch its own doc names.
+   Its branch stays as it is; the new production merges to the branch its own doc names.
 
 The last line says whether the account changed: `moved from <unit account> to
 the showrunner account`, or `same account, no move`. If the restart fails after
 the stop, the output gives the one command that brings the session back as the
-unit it was, and the Units row is unchanged. If the session opens but its
-prompt is not proven to have run, the Units row is retired all the same, and
+unit it was. If the session opens but its prompt is not proven to have run,
 the output names the prompt to type into it.

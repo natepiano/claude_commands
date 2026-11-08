@@ -7,11 +7,11 @@ in full.
 completes.
 
 <LaunchImplementation>
-1. Once per phase, create `${PHASE_DIR}` if it is missing (ad hoc work uses
-   `${SESSION_DIR}/phases/adhoc`), then save `git rev-parse HEAD` to
-   `${PHASE_DIR}/phase_baseline` and `git status --short` to
-   `${PHASE_DIR}/progress_baseline_status` before dispatch. Stop if either
-   fails; fixes retain both baselines.
+1. The launcher's `phase_reservation.py claim` writes `${PHASE_DIR}/phase_baseline`
+   (the repository's full `HEAD` id) and `${PHASE_DIR}/progress_baseline_status`
+   (`git status --short`) at the phase's first launch, before the worker opens.
+   A git failure stops the launch. Later launches, including fixes and reopened
+   phases, keep both first baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
    finished phase's record is still active, run `progress_history.py finish-phase
    --session-dir "${SESSION_DIR}" --status completed` first. A phase opened
@@ -21,7 +21,7 @@ completes.
    "${PHASE_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. `~/.claude/config/agents.conf` owns worker family/model/effort, one row
+3. `~/.claude/config/models.conf` owns worker family/model/effort, one row
    per kind. On a worker's first phase, its kind is its opening role from the Work
    Order's `Workers:` field: `impl` for the `impl` slot, and for `test` whatever
    its Workers line opens it as — `test` under the default opening. On later
@@ -34,59 +34,50 @@ completes.
    yourself and say so in the dispatch update. Opening and follow-up prompts
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
-5. Apply <LongLivedWorkers/>. For Codex, run
-   `python3 ~/.claude/scripts/agents/codex_mesh.py list --session-dir
-   "${SESSION_DIR}"`. Launch both in one message, `impl` first, each under
-   <ToolingContract/>. When the slot has an open worker, pass its full roster name
-   with `--to`; the phase prompt is its follow-up message. Omit `--to` only for
-   a slot with no reusable thread; the first use and any replacement after an
-   end, overflow failure, or retirement therefore receive an opening prompt
-   without `--to`. Later phases normally run:
+5. Apply <LongLivedWorkers/> and launch both workers together, `impl` first, under <ToolingContract/>.
+   For `herdr`, inspect `worker.py list`.
+   Omit `--to` for automatic selection, or pass a retained worker's short name.
+   The worker command reuses idle or stopped workers and retains their native conversations.
+   It refuses selection when all suitable workers are busy.
+
+   For an existing `mesh` pin, run `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py list --session-dir "${SESSION_DIR}"`.
+   Pass the full registered name with `--to` when the slot has a reusable thread.
+   Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
+
+   Both transports use these commands; replace each name with its selected transport's name:
 
    ```sh
-   implement.sh --to "<full impl worker name>" --phase "<phase id>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/implementation_prompt.md" impl \
-     "<responsibility>" impl "<activity>" 0 impl
-   implement.sh --to "<full test worker name>" --phase "<phase id>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/test_prompt.md" test \
-     "<responsibility>" test "<activity>" 0 test
+   bash ~/.claude/scripts/direct/assign.sh --role implement --to "<impl worker name>" \
+     --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
+     --prompt "${PHASE_DIR}/implementation_prompt.md" --paths "${PHASE_DIR}/implementation_paths.txt" &
+   bash ~/.claude/scripts/direct/assign.sh --role test --to "<test worker name>" \
+     --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
+     --prompt "${PHASE_DIR}/test_prompt.md" --paths "${PHASE_DIR}/test_paths.txt" &
    ```
 
-   Every launch, a slot's first included, carries `--phase "<phase id>"`: the
-   pass is stamped with that phase and the launcher writes its status, summary
-   and log to `${PHASE_DIR}`, so a phase running beside another never reads
-   that one's files.
-
-   A worker assigned another role swaps both role words and nothing else — the
-   open `test` worker continuing as a writer is
-   `implement.sh --to "<full test worker name>" --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" "${PHASE_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
-   Responsibility follows <ProgressContract/>. **Both workers carry a pass
-   kind**, so a team phase records two passes and stops being attributed to one
-   agent. The kind is the work the worker was assigned and nothing more — it names,
-   it never triggers, so a worker never misreports its work to avoid a side effect.
-   **Task and kind are the same word** on every worker: the fourth argument selects
-   the agent and the sixth records the pass, and both say what this worker is
-   doing. The vocabulary is `impl`, `test`, `fix`, `review` — nothing else
-   resolves, in `agents.conf` or in the ledger.
+   Set each `--role` from the Work Order's assignment.
+   Each launch carries `--phase "<phase id>"` and keeps its artifacts under `${PHASE_DIR}`.
+   Keep the returned dispatch handles and artifact paths.
+   Each worker records its assigned role as its pass kind.
+   Responsibility follows <ProgressContract/>.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
-7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is
-   done only when both are terminal. `implemented` on `impl` loads
-   `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
-   for what it completed and for findings it posted. If `impl` errors, apply <WorkerLaunchFailure/>
-   first — a worker that died in seconds is resolved there, not reported. A
-   genuine error then cancels any early-launched
-   reviewer per <EarlyReviewArm/>, applies <RetainPhaseReservation/>,
-   reports `impl_agent_impl.log`, records
-   `finish-run --status error`, runs `end_session.sh`, and stops; multi-phase
-   runs also emit <RunSummary/>.
-8. `implemented` is the worker's claim, not a passed gate. Read
-   `${IMPL_SUMMARY}` for a verification line it left running, unread, or
-   unmentioned — "still running", "I'll report once it completes", a listed
-   command with no stated result. When one is there, run that command yourself
-   under <VerificationContract/> before <DualReview/> and review against its real
-   output. A failing gate the worker never read is a finding like any other,
-   not a reason to reject the phase.
+7. On completion, read each dispatch's returned status and summary paths.
+   Complete the phase only after both workers finish.
+   Load the implementation summary into `${IMPL_SUMMARY}` and read the other worker's summary.
+   For an existing mesh pin, these are `impl_status_<slot>` and `impl_summary_<slot>.txt` under `${PHASE_DIR}`.
+   Apply <WorkerLaunchFailure/> before reporting a launch error.
+   `assign.py` ends a run when its only worker command fails and no pass completed.
+   Each recorder slot counts as one worker. A Claude launch must add a `pass_started` event for its slot.
+   The director must hold only that run. A launcher signal does not trigger this path.
+   For herdr, only exit 2 qualifies. Exits 3 through 8 retain the run.
+   The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
+   It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
+   For other genuine errors, cancel early review under <EarlyReviewArm/> and apply <RetainPhaseReservation/>.
+   Report the dispatch log, record `finish-run --status error`, and run `end_session.sh`.
+   Stop and emit <RunSummary/> for a multi-phase run.
+8. A successful dispatch records worker completion; it does not pass the phase gate.
+   Read `${IMPL_SUMMARY}` for commands with running, unread, or absent results.
+   Run each such command under <VerificationContract/> before <DualReview/>.
+   Review the actual output. Record each failure as a finding.
 </LaunchImplementation>

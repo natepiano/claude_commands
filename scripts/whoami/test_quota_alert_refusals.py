@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import os
 import unittest
 from datetime import timedelta
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.accounts import refusals
 from scripts.whoami.quota_alert_test_support import Notes, REFUSAL_ACTION, REGISTRY as REGISTRY
@@ -42,7 +42,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         log = self.alert([self.note("codex1.md", "active", "1")], self.now)
         self.assertEqual([line for line in log if "switch" in line], [])
         self.assertEqual(self.assignments(),
-                         {"direct": "codex", "cli": "claude", "module_review": "codex", "ask_a_friend": "caller"})
+                         {"direct": "codex", "cli": "claude", "design_roles": "codex", "ask_a_friend": "caller"})
         self.assertEqual(self.sent, [])
         self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))

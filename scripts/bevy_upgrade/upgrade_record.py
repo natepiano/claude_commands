@@ -5,18 +5,18 @@ import fcntl
 import json
 import os
 import re
-import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
-from pins import Pin, Pins
-from upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
+from scripts.bevy_upgrade.pins import Pin, Pins
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.bevy_upgrade.upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
 
 if TYPE_CHECKING:
-    from production_units import Production
+    from scripts.production.production_doc import Production
 
 
 class Answer(TypedDict):
@@ -87,7 +87,7 @@ class Announced(TypedDict):
 
 
 class Record(TypedDict):
-    slug: str
+    staff_id: str
     production: str
     checkout: str
     target: str
@@ -110,14 +110,14 @@ def state_dir() -> Path:
     return Path(os.environ.get("BEVY_UPGRADE_STATE_DIR") or Path.home() / ".local/state/bevy-upgrade")
 
 
-def record_path(slug: str) -> Path:
-    return state_dir() / f"{slug}.json"
+def record_path(staff_id: str) -> Path:
+    return state_dir() / f"{staff_id}.json"
 
 
 @contextmanager
-def locked(slug: str) -> Generator[None, None, None]:
+def locked(staff_id: str) -> Generator[None, None, None]:
     """Hold one exclusive lock for the caller's entire read-modify-write."""
-    path = state_dir() / f"{slug}.lock"
+    path = state_dir() / f"{staff_id}.lock"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         stream = path.open("a")
@@ -213,9 +213,9 @@ def _github_fields(entry: dict[str, object]) -> None:
             raise ValueError("item state must be open, closed or merged")
 
 
-def _validate(value: object) -> Record:
+def validate(value: object) -> Record:
     data = _object(value, "record")
-    _strings(data, "slug", "production", "checkout", "target", "started", "pins_read")
+    _strings(data, "staff_id", "production", "checkout", "target", "started", "pins_read")
     if "closed" not in data or (data["closed"] is not None and not isinstance(data["closed"], str)):
         raise ValueError("closed must be a timestamp or null")
     for key in ("started", "pins_read", "closed"):
@@ -257,12 +257,12 @@ def _validate(value: object) -> Record:
     return cast(Record, value)
 
 
-def load(slug: str) -> Record | None:
+def load(staff_id: str) -> Record | None:
     """None means this production has never started a watch."""
-    path = record_path(slug)
+    path = record_path(staff_id)
     try:
         raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        return _validate(raw)
+        return validate(raw)
     except FileNotFoundError:
         return None
     except (OSError, ValueError, UnicodeError) as error:
@@ -271,44 +271,35 @@ def load(slug: str) -> Record | None:
 
 def save(record: Record) -> None:
     """Atomically replace the file; the caller holds locked for any preceding read."""
-    path = record_path(record["slug"])
-    temporary: Path | None = None  # No temporary file exists until NamedTemporaryFile opens it.
+    path = record_path(record["staff_id"])
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.stem}.", suffix=".tmp", delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(record, stream, indent=2, ensure_ascii=False)
-            _ = stream.write("\n")
-        _ = temporary.replace(path)
+        write_text_atomic(path, json.dumps(record, indent=2, ensure_ascii=False) + "\n")
     except (OSError, ValueError, TypeError) as error:
         raise RecordFailure(f"{path}: {error}") from error
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def _utc(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat()
 
 
-def start(production: Production, target: str, pins: Pins, now: datetime) -> Record:
+def start(production: Production, target: str, pins: Pins, now: datetime, *, staff_id: str = "") -> Record:
     """Begin or refresh a watch; the caller holds locked through start and save."""
     if re.fullmatch(r"\d+\.\d+", target) is None:
         raise RecordFailure("target must be major.minor, such as 0.20")
-    current = load(production.slug)
+    identity = staff_id or production.owner.id
+    current = load(identity)
     if current is not None and current["closed"] is None:
         if current["target"] != target:
             raise RecordFailure(f"a watch for {current['target']} is open; stop it first")
         return apply_pins(current, pins, now)
     if current is not None:
-        path = record_path(production.slug)
-        archive = path.with_name(f"{production.slug}.{current['target']}.closed.json")
+        path = record_path(identity)
+        archive = path.with_name(f"{identity}.{current['target']}.closed.json")
         try:
             _ = path.replace(archive)
         except OSError as error:
             raise RecordFailure(f"{path}: {error}") from error
-    return apply_pins(Record(slug=production.slug, production=str(production.doc),
+    return apply_pins(Record(staff_id=identity, production=production.name,
                              checkout=str(production.checkout), target=target, started=_utc(now),
                              closed=None, bevy=[], pins_read=_utc(now), dependencies={},
                              target_bevy=TargetUnread(status="unread"), target_error="", checked=None,

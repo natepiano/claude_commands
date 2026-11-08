@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Sync pauses and Mac command status stay within a temporary state root."""
 
 from __future__ import annotations
@@ -12,25 +12,24 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
+from functools import partial
 from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import ci
-import cli
-import index
-import health
-import record
-import rust_release
-import store
-import sync
-from test_index import point_root_at
+from scripts.buildlog import ci, cli
+from scripts.buildlog import index
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import rust_release
+from scripts.buildlog import store
+from scripts.buildlog import sync, vault_pull
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
@@ -46,8 +45,12 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, "BUILDLOG_PEER": "test-mac"}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(Path(temporary)),
+            "HOME": temporary, "BUILDLOG_PEER": "test-mac",
+        }))
         self.commands = []
         self.responses = []
         _ = self.enterContext(mock.patch.object(subprocess, "run", new=self.fake_run))
@@ -122,6 +125,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("natedev")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/Mac/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         # Whole subtrees include launch-only and sample-only hosts and nested
         # saved logs; no monthly-file discovery or extension filter is involved.
@@ -148,6 +152,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("Mac")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/natedev/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         self.assertEqual(filters[-1], "--exclude=*")
 
@@ -253,7 +258,7 @@ class SyncTests(unittest.TestCase):
         def run_ssh(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             self.commands.append(args)
             worker.start()
-            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(waiting.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
             self.assertFalse(returned.is_set())
             return subprocess.CompletedProcess(args, 255, stdout="", stderr="unreachable")
 
@@ -262,7 +267,7 @@ class SyncTests(unittest.TestCase):
             mock.patch.object(sync, "print", record_line, create=True),
         ):
             self.assertEqual(sync.sync(), 0)
-            worker.join(TEST_HANG_GUARD_SECS)
+            worker.join(test_hang_guard.TEST_HANG_GUARD_SECS)
 
         self.assertFalse(worker.is_alive())
         self.assertTrue(returned.is_set())
@@ -310,6 +315,34 @@ class SyncTests(unittest.TestCase):
         release.assert_called_once_with()
         self.assertEqual(self.commands, [])
 
+    def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
+        jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
+                (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
+                (rust_release, "check_release", "rust release"), (index, "update", "index"))
+        expected = [name for _, _, name in jobs]
+        for failed in expected:
+            for raises in (False, True):
+                with self.subTest(failed=failed, raises=raises):
+                    calls: list[str] = []
+
+                    def job(name: str) -> int:
+                        calls.append(name)
+                        if name == failed:
+                            if raises:
+                                raise OSError(f"{name} unavailable")
+                            return 1
+                        return 0
+
+                    with ExitStack() as patches:
+                        for module, attribute, name in jobs:
+                            _ = patches.enter_context(mock.patch.object(
+                                module, attribute, side_effect=partial(job, name)))
+                        with redirect_stdout(StringIO()):
+                            result = cli.hourly()
+                    self.assertEqual(calls, expected)
+                    # index.update returns a row count, unlike the job exit statuses.
+                    self.assertEqual(result, 0 if failed == "index" and not raises else 1)
+
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []
 
@@ -332,10 +365,7 @@ class SyncTests(unittest.TestCase):
         if spec is None or spec.loader is None:
             self.fail(f"could not load {module_path}")
         module = importlib.util.module_from_spec(spec)
-        with (
-            mock.patch.object(sys, "path", [str(module_path.parent), *sys.path]),
-            mock.patch.dict(sys.modules, {spec.name: module}),
-        ):
+        with mock.patch.dict(sys.modules, {spec.name: module}):
             spec.loader.exec_module(module)
 
         mac_timeout = cast(int, getattr(module, "MAC_SSH_TIMEOUT_SECONDS"))

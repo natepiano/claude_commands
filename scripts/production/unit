@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$HOME/.claude/scripts/lib/py" -B -c '
+import runpy
+import sys
+from pathlib import Path
+entry = Path(sys.argv.pop(1)).resolve().with_name("unit_command.py")
+runpy.run_path(str(entry), run_name="__main__")
+' "$0" "$@"

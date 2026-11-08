@@ -16,21 +16,21 @@ from contextlib import ExitStack, closing, contextmanager, redirect_stderr
 from enum import Enum
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import launches
-import record
-import report
-import store
-from test_index import Record, encode, point_root_at, step
-from test_launches import CLI, result_line
+from scripts.buildlog import index
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, encode, point_root_at, step
+from scripts.buildlog.test_launches import CLI, result_line
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
-if TYPE_CHECKING:
-    from ..hana_shot import hana_shot
-else:
-    from scripts.hana_shot import hana_shot
+from scripts.hana_shot import hana_shot
+from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
 class RecordingStopped(BaseException):
@@ -66,6 +66,7 @@ class LaunchRecordingTests(unittest.TestCase):
         )
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(base / "config"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),
@@ -139,7 +140,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def launch_without_process(self, port: int) -> hana_shot.LaunchState:
         with self.fake_launch_process(port):
-            launched = hana_shot.launch(port, str(self.worktree), str(self.binary))
+            launched = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
         return launched[0]
 
     def test_hana_launch_records_one_start_with_no_admission(self) -> None:
@@ -269,15 +270,15 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def test_importing_hana_shot_leaves_the_import_path_and_record_name_unchanged(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-c", "\n".join((
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "\n".join((
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",
-                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'record' in sys.modules}))",
+                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules}))",
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         imports = cast(Record, json.loads(result.stdout))
@@ -299,7 +300,7 @@ class LaunchRecordingTests(unittest.TestCase):
             try:
                 sys.setprofile(interrupt_recording)
                 with self.assertRaises(hana_shot.ExitSignal) as caught:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
@@ -376,16 +377,16 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
 
     def test_stop_after_pending_write_recovers_one_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.AFTER_PENDING_WRITE)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.AFTER_PENDING_WRITE)
 
     def test_stop_after_publication_recovers_without_repeating_the_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.AFTER_PUBLICATION)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.AFTER_PUBLICATION)
 
     def test_stop_before_pending_delete_recovers_without_repeating_the_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.BEFORE_PENDING_DELETE)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.BEFORE_PENDING_DELETE)
 
     def test_failed_first_publication_keeps_the_launch_for_collection(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.FAILED_FIRST_PUBLICATION)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.FAILED_FIRST_PUBLICATION)
 
     def test_failed_publication_survives_shutdown_and_collects_both_starts_once(self) -> None:
         publish = record.write_launch_line
@@ -401,13 +402,13 @@ class LaunchRecordingTests(unittest.TestCase):
         with mock.patch.object(record, "write_launch_line", side_effect=fail_first_publication):
             for port in (15816, 15817):
                 with self.fake_launch_process(port) as process:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
                     self.assertTrue(hana_shot.launch_state_path(port).exists())
                     hana_shot.shutdown(port, process)
                     self.assertEqual(process.poll(), 0)
                     self.assertFalse(hana_shot.launch_state_path(port).exists())
 
-        pending = record.pending_launches_root()
+        pending = record.pending_launch_root()
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(len(list(pending.glob("*"))), 1)
         self.assertEqual(launches.collect().added, 1)
@@ -508,7 +509,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
         first = subprocess.run(
             [sys.executable, str(CLI), "report", "2026-10-17"], env=environment,
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -524,7 +525,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
         repeated = subprocess.run(
             [sys.executable, str(CLI), "report", "2026-10-17"], env=environment,
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertIn("(0 new", repeated.stderr)

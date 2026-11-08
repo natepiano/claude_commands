@@ -2,16 +2,91 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import json
 import os
+import subprocess
 from typing import cast
 import unittest
-from offload_test_commands import SELECTOR_STUB, write_shell
-from offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
-from offload_cleanup_test_support import SeededCleanupFixture
+from unittest import mock
+from scripts.mac_test import offload
+from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
+    def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
+        self.config["leftover_timeout_s"] = "10"
+        self.sync_config()
+        self.fixture["run_cleanup_line"] = ""
+        self.sync_fixture()
+        stream = offload.ProcessController.stream_mac_run
+
+        def change_settings(controller: offload.ProcessController,
+                            arguments: Sequence[str]) -> offload.RemoteRunStatus:
+            answer = stream(controller, arguments)
+            self.config["leftover_timeout_s"] = value
+            self.sync_config()
+            return answer
+
+        with mock.patch.object(offload.ProcessController, "stream_mac_run", change_settings):
+            return self.command(separate_stderr=True)
+
+    def test_completed_run_reads_the_cleanup_timeout_after_execution(self) -> None:
+        with mock.patch.object(offload, "check_leftovers", wraps=offload.check_leftovers) as cleanup:
+            result = self.command_with_changed_cleanup_timeout("23")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_wire("passed", "")
+        self.assertEqual(cleanup.call_count, 1)
+        connection = cast(offload.SshConnectionSettings, cleanup.call_args.args[0])
+        self.assertEqual(connection.leftover_timeout_s, 23)
+        self.assertEqual(len(self.leftover_events()), 1)
+        self.assertFalse(self.claim_file.exists())
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_completed_run_keeps_the_claim_when_the_cleanup_timeout_becomes_unusable(self) -> None:
+        result = self.command_with_changed_cleanup_timeout("broken")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_wire("passed", "")
+        self.assertTrue(self.claim_file.exists())
+        self.assertEqual(self.remote_claim()["remote_host"], "mac")
+        self.assertEqual(self.leftover_events(), [])
+        self.assertIn("leftover_timeout_s", result.stderr)
+        self.assertIn("stays busy", result.stderr)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+        connection = offload.SshConnectionSettings("current-host", 7, 19)
+        repository = offload.KnownRepository("hana")
+        response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
+        with mock.patch.object(subprocess, "run", return_value=response) as run:
+            result = offload.check_leftovers(connection, "retained-host", repository)
+        self.assertEqual(result, offload.LeftoversEnded())
+        arguments = cast(list[str], run.call_args.args[0])
+        self.assertEqual(arguments[-2], "retained-host")
+        self.assertNotIn("current-host", arguments)
+        self.assertIn("ConnectTimeout=7", arguments)
+        self.assertEqual(arguments[-1], offload.leftover_check_script(repository))
+        self.assertEqual(run.call_args.kwargs["timeout"], 19)
+
+    def test_connection_reader_ignores_execution_values_and_reads_changes_at_use(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+        self.config["free_floor_gib"] = "broken"
+        self.config["host"] = "first-host"
+        self.config["connect_timeout_s"] = "7"
+        self.config["leftover_timeout_s"] = "19"
+        self.sync_config()
+        self.assertEqual(offload.read_connection_settings(self.config_path),
+                         offload.SshConnectionSettings("first-host", 7, 19))
+        self.config["host"] = "second-host"
+        self.config["connect_timeout_s"] = "8"
+        self.config["leftover_timeout_s"] = "21"
+        self.sync_config()
+        self.assertEqual(offload.read_connection_settings(self.config_path),
+                         offload.SshConnectionSettings("second-host", 8, 21))
+
     def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
         self.fixture["run_cleanup_line"] = ""
         self.fixture["run_ssh_status"] = 255
@@ -45,7 +120,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
-            "mac_test: the link to the Mac dropped; running on natedev instead\n",
+            "mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n",
             result.stdout,
         )
         wire = self.wire_result()
@@ -73,7 +148,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 result = self.command_with_cleanup_clock(separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 self.assert_wire("lost", "")
-                self.assertIn("mac_test: the link to the Mac dropped; running on natedev instead\n", result.stdout)
+                self.assertIn("mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n", result.stdout)
                 self.assert_leftover_diagnostic(result.stderr, outcome)
                 self.assert_claim_is_kept()
                 self.assertEqual(len(self.leftover_events()), 1)

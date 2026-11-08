@@ -1,5 +1,5 @@
 ---
-description: Show how often tests finish on the Mac when it is usable.
+description: Report Mac test completion rates.
 ---
 
 Run `~/.claude/scripts/buildlog/buildlog mac-report` and show its output unchanged.

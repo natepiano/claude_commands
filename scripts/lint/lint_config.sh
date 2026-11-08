@@ -16,8 +16,8 @@
 #   lint_config.sh export             LINT_OP_<NAME>=on|off lines
 #   lint_config.sh enabled <op>       exit 0 if on, 1 if off (no output)
 #
-# A missing config file means every check is on. The sweep_budget_gib keys in
-# the same file are sizes, not switches: sweep.py reads them, this file does not.
+# A missing config file enables every check.
+# Numeric settings set limits and adjustments, not check states.
 
 LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 
@@ -25,7 +25,7 @@ LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 # the config that is not listed here is rejected as unknown.
 LINT_CONFIG_OPS=(
     "mend|cargo mend check pass and its --fix pass|invoke.sh mend (lint CLI, validate_ci mend steps, verify.sh lint)"
-    "style_review|style-guide walk and banned-words scan over the caller's diff|/unit:style_review · /unit:direct main phase review"
+    "style_review|style-guide walk and banned-words scan over the caller's diff|/unit:style_review · /unit:direct reviewer worker"
     "clippy|cargo clippy|invoke.sh clippy (lint CLI, verify.sh lint)"
     "doc|cargo doc with -D warnings|standalone lint doc only; verify.sh doc ignores this switch"
     "fmt|cargo +nightly fmt|invoke.sh fmt (lint fmt, verify.sh lint)"
@@ -69,29 +69,66 @@ _lint_config_field() {
     return 1
 }
 
-_lint_config_trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
+# Set value and presence without a subshell; first key wins, as in Python's reader.
+_lint_config_raw_into() {
+    local _lint_want="$1" _lint_output="$2" _lint_presence_output="$3"
+    local _lint_line _lint_key _lint_value
+    printf -v "$_lint_output" '%s' ''
+    printf -v "$_lint_presence_output" '%s' absent
+    [[ -f "$LINT_CONFIG_FILE" && -r "$LINT_CONFIG_FILE" ]] || return 0
+    while IFS= read -r _lint_line || [[ -n "$_lint_line" ]]; do
+        _lint_line="${_lint_line%%#*}"
+        [[ "$_lint_line" != *=* ]] && continue
+        _lint_key="${_lint_line%%=*}"
+        _lint_key="${_lint_key#"${_lint_key%%[![:space:]]*}"}"
+        _lint_key="${_lint_key%"${_lint_key##*[![:space:]]}"}"
+        [[ "$_lint_key" != "$_lint_want" ]] && continue
+        _lint_value="${_lint_line#*=}"
+        _lint_value="${_lint_value#"${_lint_value%%[![:space:]]*}"}"
+        _lint_value="${_lint_value%"${_lint_value##*[![:space:]]}"}"
+        printf -v "$_lint_output" '%s' "$_lint_value"
+        printf -v "$_lint_presence_output" '%s' present
+        return 0
+    done < "$LINT_CONFIG_FILE"
+    return 0
+}
+
+# Raw value for existing stdout consumers; parsing is shared with the hot path.
+_lint_config_raw() {
+    local value presence
+    _lint_config_raw_into "$1" value presence
     printf '%s' "$value"
 }
 
-# Raw value for a key, empty when unset. Comments and section headers ignored.
-_lint_config_raw() {
-    local want="$1" line key value
-    [[ -f "$LINT_CONFIG_FILE" ]] || return 0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"
-        line="$(_lint_config_trim "$line")"
-        [[ -z "$line" ]] && continue
-        [[ "$line" == \[*\] ]] && continue
-        [[ "$line" != *=* ]] && continue
-        key="$(_lint_config_trim "${line%%=*}")"
-        [[ "$key" != "$want" ]] && continue
-        value="$(_lint_config_trim "${line#*=}")"
-        printf '%s' "$value"
-        return 0
-    done < "$LINT_CONFIG_FILE"
+# Resolve once when invoke.sh is sourced. Builtins only: no per-step process.
+lint_config_build_oom_score_adj() {
+    local _lint_adj _lint_presence
+    _lint_config_raw_into build_oom_score_adj _lint_adj _lint_presence
+    if [[ "$_lint_presence" == absent ]]; then
+        printf -v "$1" '%s' 500
+    elif [[ "$_lint_adj" =~ ^-?(0|[1-9][0-9]{0,3})$ ]] &&
+       (( _lint_adj >= -1000 && _lint_adj <= 1000 )); then
+        printf -v "$1" '%s' "$_lint_adj"
+    else
+        printf 'warning: %s: build_oom_score_adj=%s is invalid (expected integer -1000..1000) — using 500\n' \
+            "$LINT_CONFIG_FILE" "$_lint_adj" >&2
+        printf -v "$1" '%s' 500
+    fi
+}
+
+# Resolve the fix job limit with builtins only.
+lint_config_clippy_fix_jobs() {
+    local _lint_jobs _lint_presence
+    _lint_config_raw_into clippy_fix_jobs _lint_jobs _lint_presence
+    if [[ "$_lint_presence" == absent ]]; then
+        printf -v "$1" '%s' 8
+    elif [[ "$_lint_jobs" =~ ^[1-9][0-9]{0,3}$ ]]; then
+        printf -v "$1" '%s' "$_lint_jobs"
+    else
+        printf 'warning: %s: clippy_fix_jobs=%s is invalid (expected integer 1..9999) — using 8\n' \
+            "$LINT_CONFIG_FILE" "$_lint_jobs" >&2
+        printf -v "$1" '%s' 8
+    fi
 }
 
 # Resolved state for a key: on | off. Unset or malformed resolves to on, with a

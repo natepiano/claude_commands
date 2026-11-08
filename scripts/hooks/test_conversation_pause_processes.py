@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import fcntl
-from pathlib import Path
 import subprocess
 import sys
 import unittest
 from typing import ClassVar
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.hooks.conversation_pause_test_support import (
-    LIBRARY, PROMPT_HOOK, QUESTION, TEST_HANG_GUARD_SECS, ConversationPauseFixture,
+    LIBRARY, PROMPT_HOOK, QUESTION, ConversationPauseFixture,
     asked_read, cross_session,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConversationPauseProcessTests(ConversationPauseFixture):
@@ -44,7 +42,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
             result = self.run_prompt(
                 "hello",
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=TEST_HANG_GUARD_SECS,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -56,7 +53,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             result = self.run_stop(
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=TEST_HANG_GUARD_SECS,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -70,7 +66,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
                 "CONVERSATION_PAUSE_HOOK_BUDGET": "1",
                 "STOP_HOLD": "1",
             },
-            timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -84,8 +79,8 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
         _ = sessions.write_text(
             "".join((
                 "#!/usr/bin/env python3\n",
-                "import os, sys\n",
-                f"sys.path.insert(0, {str(LIBRARY.parents[2])!r})\n",
+                "import os\n",
+                f"with open({str(LIBRARY.parents[1] / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n",
                 "from scripts.direct.wait_for_test_state import wait_until\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['LOOKUP_MARKER']).touch()\n",
@@ -190,8 +185,8 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
         _ = send.write_text(
             "".join((
                 "#!/usr/bin/env python3\n",
-                "import os, sys\n",
-                f"sys.path.insert(0, {str(LIBRARY.parents[2])!r})\n",
+                "import os\n",
+                f"with open({str(LIBRARY.parents[1] / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n",
                 "from scripts.direct.wait_for_test_state import wait_until\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['SEND_MARKER']).touch()\n",

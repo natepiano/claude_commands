@@ -5,6 +5,10 @@ A running Codex agent is one live `codex_mesh.py start|follow` turn or one plain
 `codex exec`. It belongs to the nearest ancestor that is a named Claude session.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -25,14 +29,14 @@ from pathlib import Path
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import broadcast
-import process_table
-from scripts.production import showrunners
+from scripts.production import broadcast
+from scripts.message import process_table
+from scripts.production import session_staff, showrunners, staff
+from scripts.message import send_budget
 from scripts.lib.process_failure import failure_detail
-from live_units import live_unit_names
-from sessions import SessionRecord, live_sessions
+from scripts.production.live_units import live_unit_names
+from scripts.message.sessions import SessionRecord, live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
@@ -153,7 +157,30 @@ def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int,
 
 def current_counts() -> Counter[str]:
     names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
-    return agent_counts(process_table.snapshot(), names)
+    counts = agent_counts(process_table.snapshot(), names)
+    try:
+        record = staff.snapshot()
+        for row in record.find(kind="worker"):
+            if record.parent_of(row) is None:
+                print(f"codex wind-down: {row.name}: no staff member for parent {row.parent}", file=sys.stderr)
+        parents = session_staff.pane_parents(record)
+        if not parents:
+            return counts
+        from scripts.herdr import worker_panes
+
+        observed = worker_panes.observe_parents(parents, record)
+        for parent in parents:
+            for worker in observed[parent.id]:
+                if isinstance(worker, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                    state = "unknown" if isinstance(worker, worker_panes.ProcessUnknownWorker) else "incomplete"
+                    print(f"codex wind-down: {worker.row.name}: {state}: {worker.reason}", file=sys.stderr)
+                elif (isinstance(worker, worker_panes.OpenWorker)
+                      and worker.status.value in ("working", "running", "starting")
+                      and isinstance(record.backends.get(worker.row.id), staff.CodexBackend)):
+                    counts[parent.name] += 1
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"codex wind-down: {error}", file=sys.stderr)
+    return counts
 
 
 def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[str, int]:
@@ -385,9 +412,8 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                 _ = notice.write_text("sent\n", encoding="utf-8")
                 return
         machine = socket.gethostname()
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-        from push_texts import render, user_send_argv
-        import review
+        from scripts.notify.push_texts import render, user_send_argv
+        from scripts.notify import review
 
         push = render("codex.reset_ready", machine=machine)
         command = user_send_argv(push)
@@ -398,7 +424,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
             _ = notice.write_text("claim\n", encoding="utf-8")
         try:
             done = subprocess.run(command, capture_output=True, text=True, check=False,
-                                  timeout=review.user_send_seconds() + 15)
+                                  timeout=send_budget.user_seconds(review.user_send_seconds()))
             _finish_quiet_notice(observation, sent=not done.returncode)
             if done.returncode:
                 print(f"codex wind-down: reset alert failed: {failure_detail(done)}", file=sys.stderr)
@@ -409,8 +435,9 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
 
 def count(session: str) -> int:
     try:
-        runner = showrunners.named(session)
-    except ValueError as error:
+        runner = {runner["session"]: runner for runner in
+                  showrunners.require_complete(showrunners.registered_showrunners())}[session]
+    except (OSError, ValueError, KeyError) as error:
         print(error, file=sys.stderr)
         return 1
     units = live_unit_names(runner)
@@ -446,11 +473,13 @@ def instances() -> list[str]:
 def status() -> int:
     counts = current_counts()
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
-    for runner in showrunners.registered_showrunners():
-        rows.update(listed(runner["session"] or runner["slug"], live_unit_names(runner), counts))
+    discovered = showrunners.registered_showrunners()
+    for runner in discovered:
+        rows.update(listed(runner["session"] or runner["name"], live_unit_names(runner), counts))
     counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time()))
+    _ = showrunners.require_complete(discovered)
     return 0
 
 
@@ -460,13 +489,15 @@ def instance_name(session: str) -> str:
 
 def announce(sender: str, showrunner: str, unit: str) -> bool:
     """Send every showrunner and unit director its version at once and print each delivery."""
-    zones = {runner["session"]: runner["zone"] for runner in showrunners.registered_showrunners()}
+    discovered = showrunners.registered_showrunners()
+    zones = {runner["session"]: runner["zone"] for runner in discovered}
     named = {"sender": sender, "time": clock(zones.get(sender) or next(iter(zones.values()), "UTC")),
              "minutes": EVERY_MINUTES}
-    return broadcast.report(broadcast.broadcast(sender, {
+    delivered = broadcast.report(broadcast.broadcast(sender, {
         broadcast.Showrunners(): showrunner.format(**named),
         broadcast.UnitDirectors(): unit.format(**named),
     }))
+    return delivered and not discovered.lookup_failures
 
 
 def start_count(record: SessionRecord) -> bool:
@@ -489,12 +520,14 @@ def start(sender: str) -> int:
     for record in live_sessions():
         if record["name"]:
             _ = live.setdefault(record["name"], record)
-    for runner in showrunners.registered_showrunners():
+    discovered = showrunners.registered_showrunners()
+    for runner in discovered:
         if runner["session"] in live:
             counting = start_count(live[runner["session"]])
             every = every and counting
             print(f"{runner['session']}: "
                   + (f"counting every {EVERY_MINUTES} minutes" if counting else "count NOT started"))
+    _ = showrunners.require_complete(discovered)
     return 0 if every else 1
 
 
@@ -536,7 +569,7 @@ def main(arguments: list[str]) -> int:
             case _:
                 print(USAGE, file=sys.stderr)
                 return 2
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1
 

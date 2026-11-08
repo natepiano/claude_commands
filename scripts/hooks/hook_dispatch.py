@@ -25,7 +25,7 @@ With no JSON and no errors, stdout stays empty.
 
 Execution uses importlib's bytecode cache with a fresh __main__ module because
 compiling the largest hooks exceeds 2 ms. Streams (including stdin.buffer), file
-descriptors, argv, environment, cwd, import path and signal handlers are isolated.
+descriptors, argv, environment, cwd and signal handlers are isolated.
 Alarm calls inside a hook are multiplexed with its outer deadline, so a hook's
 own SIGALRM handler and shorter budget work without cancelling our timeout.
 The outer timeout in settings.json covers the largest sum of matching hook budgets
@@ -33,6 +33,10 @@ plus 30 seconds of overhead, preserving every sequential hook's full budget.
 Imported library modules remain cached, which is the intended startup saving.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import importlib.util
 import io
@@ -52,7 +56,6 @@ from pathlib import Path
 from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
-
 DISPATCH_OVERHEAD_SECONDS = 30
 
 
@@ -61,6 +64,19 @@ class HookSpec:
     filename: str
     matcher: str | None
     timeout: float = 600
+
+
+@dataclass(frozen=True)
+class CopyPolicyHook:
+    """The combined copy/scratch front, with a budget read at dispatch time."""
+
+    filename: str = "../copies/copy_guard.py"
+    matcher: str = "Bash|Write|NotebookEdit"
+
+    @property
+    def timeout(self) -> float:
+        from scripts.copies.copy_guard import hook_timeout
+        return hook_timeout()
 
 
 @dataclass(frozen=True)
@@ -84,7 +100,7 @@ PRE_TOOL_USE = (
     HookSpec("pre-tool-use-showrunner-move-guard.py", "Bash"),
     HookSpec("pre-tool-use-change-review-gate.py", "Bash"),
     HookSpec("pre-tool-use-checkpoint-doc-gate.py", "Bash"),
-    HookSpec("pre-tool-use-scratch-guard.py", "Bash|Write|NotebookEdit", 10),
+    CopyPolicyHook(),
 )
 POST_TOOL_USE = (
     HookSpec("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
@@ -92,11 +108,12 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-context-usage.py", None),
     HookSpec("post-tool-use-banned-words.py", None),
     HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
+    HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
-    HookSpec("stop-direct-continue.py", None),
     HookSpec("stop-conversation-pause.py", None),
     HookSpec("stop-assistant-prose-banned-words.py", None),
+    HookSpec("stop-context-deferral.py", None, 10),
     HookSpec("herdr_tab_title.py", None),
 )
 EVENTS = {"pre_tool_use": PRE_TOOL_USE, "post_tool_use": POST_TOOL_USE, "stop": STOP}
@@ -257,12 +274,12 @@ def _restore_handlers(handlers: dict[int, AlarmHandler]) -> None:
             continue
 
 
-def run_hook(path: Path, payload: str, timeout: float = 600) -> HookResult:
+def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 600) -> HookResult:
     """Execute a script, retaining output only if it completes within budget."""
     path = path.resolve()
     streams = sys.stdin, sys.stdout, sys.stderr
-    argv, environment, search_path = sys.argv, os.environ, sys.path
-    original_environment, original_search_path = dict(environment), list(search_path)
+    argv, environment = sys.argv, os.environ
+    original_environment = dict(environment)
     handlers = _signal_handlers()
     cwd = os.open(".", os.O_RDONLY)
     exit_code = 0
@@ -282,9 +299,8 @@ def run_hook(path: Path, payload: str, timeout: float = 600) -> HookResult:
             _ = os.dup2(stderr.fileno(), 2)
             sys.stdin, sys.stdout, sys.stderr = stdin, hook_stdout, hook_stderr
             sys.argv = [str(path)]
-            sys.path = [str(path.parent), *original_search_path]
             try:
-                with _alarm_budget(timeout):
+                with _alarm_budget(timeout() if callable(timeout) else timeout):
                     _execute(path)
             except HookTimedOut:
                 timed_out = True
@@ -307,8 +323,7 @@ def run_hook(path: Path, payload: str, timeout: float = 600) -> HookResult:
                 _try_cleanup(hook_stderr.close)
                 _try_cleanup(stdout.flush)
                 _try_cleanup(stderr.flush)
-                sys.argv, sys.path = argv, search_path
-                search_path[:] = original_search_path
+                sys.argv = argv
                 os.environ = environment
                 _try_cleanup(environment.clear)
                 _try_cleanup(lambda: environment.update(original_environment))
@@ -464,7 +479,7 @@ def main() -> NoReturn:
         tool_name = cast(ToolEventPayload, cast(object, parsed)).get("tool_name", "") if isinstance(parsed, dict) else ""
     except ValueError:
         tool_name = ""
-    results = [run_hook(HOOKS / spec.filename, payload, spec.timeout) for spec in EVENTS[event]
+    results = [run_hook(HOOKS / spec.filename, payload, lambda: spec.timeout) for spec in EVENTS[event]
                if spec.matcher is None or re.fullmatch(spec.matcher, tool_name)]
     result = combine_results(event, results)
     if result.stdout:

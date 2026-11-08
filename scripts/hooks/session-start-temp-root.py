@@ -11,6 +11,10 @@ short, so a Unix socket made in TMPDIR fits the 104-byte limit on the Mac.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -25,8 +29,12 @@ ROOT_ENV = "SESSION_TEMP_ROOT"
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
+def temp_parent() -> Path:
+    return Path(os.environ.get(ROOT_ENV) or ROOT)
+
+
 def temp_root(session_id: str) -> Path:
-    return Path(os.environ.get(ROOT_ENV) or ROOT) / session_id
+    return temp_parent() / session_id
 
 
 def export_line(path: Path) -> str:
@@ -34,6 +42,8 @@ def export_line(path: Path) -> str:
 
 
 def main() -> int:
+    from scripts.lib import build_folders
+
     try:
         raw = cast(object, json.loads(sys.stdin.read()))
     except (ValueError, UnicodeDecodeError):
@@ -42,9 +52,9 @@ def main() -> int:
     env_file = os.environ.get("CLAUDE_ENV_FILE")
     if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id) or not env_file:
         return 0
-    path = temp_root(session_id)
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            session_id, build_folders.ExplicitBuildParent(temp_parent()), mode=0o700))
         line = export_line(path)
         env = Path(env_file)
         if line not in (env.read_text(encoding="utf-8") if env.exists() else ""):

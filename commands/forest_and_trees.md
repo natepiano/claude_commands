@@ -1,5 +1,5 @@
 ---
-description: Abandon the original task and switch entirely to the larger underlying problem that surfaced during the conversation.
+description: Change the task to its larger problem.
 ---
 
 Stop. The original problem we started working on is not the real problem.

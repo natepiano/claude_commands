@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for index.py: incremental reads of the JSON lines, rebuilds, views, and `buildlog query`."""
 
 from __future__ import annotations
@@ -9,21 +9,37 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import index
-import parse
-from record import TARGET_DIR_UNSET
-from store import UNKNOWN_IDENTITY
+from scripts.buildlog import index
+from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, slice_reading
+from scripts.buildlog import parse
+from scripts.buildlog import store
+from scripts.buildlog import report
+from scripts.buildlog import record as recorder
+from scripts.buildlog import step_outputs
+from scripts.lib import test_hang_guard
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint import sweep
+from scripts.test_times.gate_record_test_support import gate_run
+from scripts.buildlog.record import TARGET_DIR_UNSET
+from scripts.buildlog.store import UNKNOWN_IDENTITY
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
+FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
+SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+# Eight workers overlap imports and limit the number of Python processes.
+ISOLATION_IMPORT_WORKERS = 8
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -38,10 +54,15 @@ COORDINATION_VARIABLES = (
 def use_test_log() -> None:
     os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
     os.environ["BUILDLOG_TRANSCRIPTS"] = str(Path(_TEST_LOG.name) / "transcripts")
-    os.environ.update({name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES})
 
 
 use_test_log()
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(
+        os.environ, {name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES},
+    ))
 
 
 def local_day(stamp: str) -> str:
@@ -178,33 +199,73 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     test.addCleanup(restore)
 
 
+def rows(sql: str, *parameters: object) -> list[tuple[object, ...]]:
+    with closing(index.read_only()) as connection:
+        return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+
+
+def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]:
+    with closing(index.read_only()) as connection:
+        connection.row_factory = sqlite3.Row
+        records = cast(list[sqlite3.Row],
+                       connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
+        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+
+
 class LogIsolationTests(unittest.TestCase):
+    def test_import_preserves_the_callers_coordination_environment(self) -> None:
+        environment = dict(os.environ)
+        for name in COORDINATION_VARIABLES:
+            _ = environment.pop(name, None)
+        result = subprocess.run(
+            [str(CLI.parents[1] / "lib/py"), "-c",
+             "import os; from scripts.buildlog import test_index; print({key: os.environ[key] "
+             + "for key in test_index.COORDINATION_VARIABLES if key in os.environ})"],
+            cwd=Path(__file__).resolve().parents[2], env=environment, capture_output=True, text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "{}")
+
     def test_each_module_uses_a_temporary_log(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
         real_root = Path.home() / ".local/state/buildlog"
-        for module in sorted(Path(__file__).parent.glob("test_*.py")):
-            with self.subTest(module=module.name):
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import importlib, store, sys; sys.path.insert(0, sys.argv[2]); "
-                        + "importlib.import_module(sys.argv[1]); print(store.root())",
-                        module.stem,
-                        str(Path(__file__).resolve().parents[2]),
-                    ],
-                    cwd=module.parent,
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
+
+        def import_module(module: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    str(CLI.parents[1] / "lib/py"),
+                    "-c",
+                    "import importlib, sys; from scripts.buildlog import store; "
+                    + "importlib.import_module(sys.argv[1]); print(store.root())",
+                    "scripts.buildlog." + module.stem,
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        modules = sorted(Path(__file__).parent.glob("test_*.py"))
+        with ThreadPoolExecutor(max_workers=ISOLATION_IMPORT_WORKERS) as pool:
+            futures = [(module, pool.submit(import_module, module)) for module in modules]
+            for module, future in futures:
+                with self.subTest(module=module.name):
+                    result = future.result()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
 
 
 def encode(record: Record) -> bytes:
     return (json.dumps(record, separators=(",", ":")) + "\n").encode()
+
+
+def configure_cleanup(test: unittest.TestCase, root: Path) -> Path:
+    config = root.parent / "config"
+    _ = write_config_fixture(config / "buildlog.conf")
+    test.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+    return config
 
 
 class IndexTests(unittest.TestCase):
@@ -219,16 +280,460 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_complete_update_time_rolls_back_with_a_failed_update(self) -> None:
+        self.write(self.host_file, step("retained"))
+        with mock.patch.object(time, "time", return_value=100.0):
+            _ = index.update()
+        self.write(self.host_file, step("retained"), step("new"))
+        with mock.patch.object(time, "time", side_effect=[150.0, RuntimeError("clock failed")]):
+            with self.assertRaisesRegex(RuntimeError, "clock failed"):
+                _ = index.update()
+        self.assertEqual(self.rows("SELECT value FROM meta WHERE key='updated_at'"), [("100.0",)])
+        self.assertEqual(self.ids(), ["retained"])
+        with mock.patch.object(time, "time", return_value=200.0):
+            _ = index.update()
+        self.assertEqual(self.rows("SELECT value FROM meta WHERE key='updated_at'"), [("200.0",)])
+        self.assertEqual(self.ids(), ["new", "retained"])
+
+    def test_reader_keeps_complete_rows_during_an_uncommitted_refresh(self) -> None:
+        self.write(self.host_file, step("retained"))
+        _ = index.update()
+        with closing(index.open_for_update(index.index_path())) as writer:
+            writer.execute("BEGIN IMMEDIATE").close()
+            writer.execute("DELETE FROM steps").close()
+            with closing(index.read_only()) as reader:
+                reader.execute("PRAGMA busy_timeout=0").close()
+                self.assertEqual(reader.execute("SELECT id FROM steps").fetchall(), [("retained",)])
+            writer.execute("ROLLBACK").close()
+
+    def test_report_uses_the_newest_complete_compatible_index_until_the_current_one_finishes(self) -> None:
+        self.write(self.host_file, step("retained"))
+        with mock.patch.object(time, "time", return_value=100.0):
+            _ = index.update()
+        original = index.index_path()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.complete_gate_index_in(self.root), original)
+            with mock.patch.object(time, "time", return_value=200.0):
+                _ = index.update()
+            newest = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.complete_gate_index_in(self.root), newest)
+            index.open_for_update(index.index_path()).close()
+            self.assertEqual(index.complete_gate_index_in(self.root), newest)
+        self.assertEqual(index.complete_gate_index_in(self.root), original)
+
+    def test_report_ignores_an_alternate_index_with_an_invalid_completion_time(self) -> None:
+        self.write(self.host_file, step("retained"))
+        _ = index.update()
+        valid = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            _ = index.update()
+            with closing(sqlite3.connect(index.index_path())) as writer, writer:
+                writer.execute("UPDATE meta SET value='invalid' WHERE key='updated_at'").close()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.complete_gate_index_in(self.root), valid)
+
+    def test_schema_files_keep_independent_rows_and_offsets(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        original_path = index.index_path()
+        with closing(sqlite3.connect(original_path)) as connection, connection:
+            _ = connection.execute("UPDATE steps SET duration_s=123 WHERE id='retained'")
+        with closing(sqlite3.connect(original_path)) as connection:
+            original_rows = [line for line in connection.iterdump() if "updated_at" not in line]
+        alternate = {"fixture_rows": ([("src", "TEXT", "source"), ("value", "TEXT", "fixture value")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            alternate_path = index.index_path()
+            self.assertNotEqual(alternate_path, original_path)
+            self.assertEqual(index.update(), 1)
+            self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(10.0,)])
+            self.assertEqual(index.update(), 0)
+        self.assertEqual(index.index_path(), original_path)
+        self.assertEqual(index.update(), 0)
+        with closing(sqlite3.connect(original_path)) as connection:
+            self.assertEqual([line for line in connection.iterdump() if "updated_at" not in line], original_rows)
+        self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(123,)])
+        self.assertTrue(alternate_path.is_file())
+
+    def test_schema_path_changes_with_columns_and_indexes(self) -> None:
+        original_path = index.index_path()
+        columns, key, description = index.TABLES["steps"]
+        without_group = [column for column in columns if column[0] != "build_history_group"]
+        without_history = tuple(statement for statement in index.COST_INDEXES
+                                if "steps_build_group_history" not in statement)
+        with mock.patch.dict(index.TABLES, {"steps": (without_group, key, description)}):
+            self.assertNotEqual(index.index_path(), original_path)
+        with mock.patch.object(index, "COST_INDEXES", without_history):
+            self.assertNotEqual(index.index_path(), original_path)
+
+    def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=30")
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        active_path = index.index_path()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.update(), 1)
+            old_path = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+            recent_path = index.index_path()
+        now = time.time()
+        old = now - 2 * 86400
+        recent = now - 23 * 3600
+        sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"old schema sidecar")
+        os.utime(old_path, (old, old))
+        os.utime(recent_path, (old, recent))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(old_path.is_file())
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        os.utime(active_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(old_path.exists())
+        for path in sidecars:
+            self.assertFalse(path.exists(), path.name)
+        self.assertTrue(recent_path.is_file())
+        os.utime(recent_path, (recent, old))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(recent_path.is_file())
+        self.assertEqual(self.ids(), ["retained"])
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(active_path.is_file())
+
+    def test_update_removes_a_fresh_legacy_index_and_its_sidecars(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        legacy = self.root / "index.sqlite"
+        paths = [legacy, *(legacy.with_name(legacy.name + suffix) for suffix in SQLITE_SIDECARS)]
+        for path in paths:
+            _ = path.write_bytes(b"legacy index")
+        self.assertEqual(index.update(), 0)
+        for path in paths:
+            self.assertFalse(path.exists(), path.name)
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_update_finishes_interrupted_index_cleanup_and_removes_orphan_sidecars(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        old = time.time() - 2 * 86400
+        unlink = Path.unlink
+        for name in ("index.sqlite", "index-" + "a" * 64 + ".sqlite"):
+            with self.subTest(name=name):
+                obsolete = self.root / name
+                paths = [obsolete, *(obsolete.with_name(name + suffix) for suffix in SQLITE_SIDECARS)]
+                for path in paths:
+                    _ = path.write_bytes(b"obsolete index")
+                    os.utime(path, (old, old))
+                removals = 0
+
+                def interrupt_cleanup(path: Path, missing_ok: bool = False) -> None:
+                    nonlocal removals
+                    if path in paths and path.exists():
+                        if removals == 1:
+                            raise PermissionError("cleanup interrupted")
+                        removals += 1
+                    unlink(path, missing_ok=missing_ok)
+
+                with mock.patch.object(Path, "unlink", interrupt_cleanup):
+                    with self.assertRaisesRegex(PermissionError, "cleanup interrupted"):
+                        _ = index.update()
+                self.assertEqual(index.update(), 0)
+                for path in paths:
+                    self.assertFalse(path.exists(), path.name)
+        orphan = self.root / ("index-" + "b" * 64 + ".sqlite-wal")
+        _ = orphan.write_bytes(b"orphan sidecar")
+        os.utime(orphan, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(orphan.exists())
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_reindex_removes_current_index_sidecars_before_rebuilding(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        sidecars = [current.with_name(current.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"stale sidecar")
+        open_for_update = index.open_for_update
+
+        def open_after_cleanup(path: Path) -> sqlite3.Connection:
+            for sidecar in sidecars:
+                self.assertFalse(sidecar.exists(), sidecar.name)
+            return open_for_update(path)
+
+        with mock.patch.object(index, "open_for_update", side_effect=open_after_cleanup):
+            self.assertEqual(index.reindex(), 1)
+        self.assertEqual(self.ids(), ["retained"])
+        self.assertEqual(index.update(), 0)
+
+    def test_update_reads_the_current_index_touch_interval_from_config_at_use(self) -> None:
+        config = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        now = time.time()
+        for minutes, age, touches in ((120, 61, False), (60, 59, False), (60, 61, True)):
+            with self.subTest(minutes=minutes, age=age):
+                _ = write_config_fixture(config / "buildlog.conf", f"INDEX_TOUCH_MINUTES={minutes}")
+                stamp = now - age * 60
+                os.utime(current, (stamp, stamp))
+                self.assertEqual(index.update(), 0)
+                if touches:
+                    self.assertGreater(current.stat().st_mtime, stamp)
+                else:
+                    self.assertEqual(current.stat().st_mtime, stamp)
+                self.assertEqual(self.ids(), ["retained"])
+
+    def test_missing_tables_rebuild_records_before_the_saved_offsets(self) -> None:
+        self.write(self.host_file, step("retained"), call("retained-call"))
+        self.assertEqual(index.update(), 2)
+        original = self.host_file.read_bytes()
+        for table in (next(iter(index.TABLES)), "files"):
+            with self.subTest(table=table):
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    _ = connection.execute(f"DROP TABLE {table}")
+                self.assertEqual(index.update(), 2)
+                self.assertEqual(self.ids(), ["retained"])
+                self.assertEqual(self.rows("SELECT id FROM calls"), [("retained-call",)])
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_update_preserves_an_old_index_during_other_schema_cleanup(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        retained_path = index.index_path()
+        old = time.time() - 40 * 86400
+        os.utime(retained_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertGreater(retained_path.stat().st_mtime, old)
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+        self.assertTrue(retained_path.is_file())
+
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
     def rows(self, sql: str, *parameters: object) -> list[tuple[object, ...]]:
-        with closing(index.read_only()) as connection:
-            return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+        return rows(sql, *parameters)
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
+
+    def test_local_success_preserves_earlier_ssh_loss_and_original_queue_time(self) -> None:
+        recorder.ssh_attempt({
+            "call_id": "fallback", "target": "aws", "repo_identity": "github.com/team/hana",
+            "queued_at": 100.0, "departed_at": 140.0, "slot": 3, "outcome": "lost",
+            "completion": "missing", "cleanup": "unconfirmed", "unresolved_count": None,
+            "evidence_at": 145.0,
+        })
+        self.write(self.host_file, call("fallback", target="natedev", status=0),
+                   step("local-pass", call_id="fallback", target="natedev", caller="verify", status=0))
+
+        _ = index.update()
+
+        self.assertEqual(self.rows("SELECT target, status FROM calls WHERE id = 'fallback'"), [("natedev", 0)])
+        query = ("SELECT call_id, target, repo_identity, queued_at, departed_at, slot, outcome, "
+                 + "completion, cleanup, unresolved_count, evidence_at FROM ssh_attempts")
+        expected = [("fallback", "aws", "github.com/team/hana", 100.0, 140.0, 3, "lost",
+                     "missing", "unconfirmed", None, 145.0)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(index.update(), 0)
+        _ = index.reindex()
+        self.assertEqual(self.rows(query), expected)
+
+    def test_confirmed_completion_does_not_imply_confirmed_cleanup(self) -> None:
+        for outcome, count in (("passed", None), ("failed", 2)):
+            recorder.ssh_attempt({
+                "call_id": outcome, "target": "aws", "repo_identity": "github.com/team/hana",
+                "queued_at": 100.0, "departed_at": 140.0, "slot": 2, "outcome": outcome,
+                "completion": "confirmed", "cleanup": "unconfirmed", "unresolved_count": count,
+                "evidence_at": 151.0,
+            })
+
+        _ = index.update()
+
+        self.assertEqual(self.rows(
+            "SELECT call_id, completion, cleanup, unresolved_count, typeof(unresolved_count), evidence_at "
+            + "FROM ssh_attempts ORDER BY call_id"),
+            [("failed", "confirmed", "unconfirmed", 2, "integer", 151.0),
+             ("passed", "confirmed", "unconfirmed", None, "null", 151.0)])
+
+    def test_each_ssh_attempt_keeps_its_target_slot_and_evidence(self) -> None:
+        for target, slot, outcome in (("mac", 1, "declined"), ("aws", 4, "passed")):
+            recorder.ssh_attempt({
+                "call_id": "one-call", "target": target, "repo_identity": "github.com/team/hana",
+                "queued_at": 100.0, "departed_at": 140.0 + slot, "slot": slot, "outcome": outcome,
+                "completion": "confirmed" if outcome == "passed" else "missing",
+                "cleanup": "confirmed", "unresolved_count": 0, "evidence_at": 150.0 + slot,
+            })
+
+        _ = index.update()
+
+        self.assertEqual(self.rows(
+            "SELECT target, queued_at, departed_at, slot, outcome, completion, cleanup, unresolved_count, evidence_at "
+            + "FROM ssh_attempts WHERE call_id = 'one-call' ORDER BY departed_at"),
+            [("mac", 100.0, 141.0, 1, "declined", "missing", "confirmed", 0, 151.0),
+             ("aws", 100.0, 144.0, 4, "passed", "confirmed", "confirmed", 0, 154.0)])
+
+    def test_legacy_calls_do_not_invent_ssh_attempt_evidence(self) -> None:
+        self.write(self.host_file, call("legacy", mac="passed_full", target="mac"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, target, mac FROM calls"), [("legacy", "mac", "passed_full")])
+        self.assertEqual(self.rows("SELECT count(*) FROM ssh_attempts"), [(0,)])
+
+    def test_mac_nextest_rows_use_the_call_repository_from_local_steps_or_ssh_attempts(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        identity = "https://github.com/example/hana"
+        facts = parse.log_facts("nextest", "        PASS [ 2.000s] hana tests::slow\n")
+        mac_file = self.root / "Mac" / "2026-10.jsonl"
+        mirrors = [step(f"mac-{name}", host="Nates-MacBook-Pro-2023", caller="verify-mac",
+                        step="nextest", call_id=f"{name}-call", repo_path=None,
+                        repo_identity=UNKNOWN_IDENTITY, **facts)
+                   for name in ("local", "ssh", "unrelated")]
+        self.write(mac_file, *mirrors)
+        self.write(self.host_file,
+                   call("local-call"), call("ssh-call"), call("unrelated-call"),
+                   step("local-evidence", call_id="local-call", repo_identity=identity))
+        recorder.ssh_attempt({
+            "call_id": "ssh-call", "target": "mac", "repo_identity": identity,
+            "queued_at": 100.0, "departed_at": 140.0, "slot": 1, "outcome": "passed",
+            "completion": "confirmed", "cleanup": "confirmed", "unresolved_count": 0,
+            "evidence_at": 150.0,
+        })
+        original = mac_file.read_bytes()
+        _ = index.update()
+        expected = [("mac-local", identity), ("mac-ssh", identity), ("mac-unrelated", UNKNOWN_IDENTITY)]
+        step_query = ("SELECT id, repo_identity FROM steps WHERE host = 'Nates-MacBook-Pro-2023'"
+                      + " ORDER BY id")
+        test_query = ("SELECT t.step_id, s.repo_identity FROM tests t JOIN steps s ON s.id = t.step_id"
+                      + " WHERE t.host = 'Nates-MacBook-Pro-2023' ORDER BY t.step_id")
+        for rebuild in (False, True):
+            with self.subTest(rebuild=rebuild):
+                if rebuild:
+                    _ = index.reindex()
+                self.assertEqual(self.rows(step_query), expected)
+                self.assertEqual(self.rows(test_query), expected)
+                self.assertEqual(index.update(), 0)
+        self.assertEqual(mac_file.read_bytes(), original)
+
+    def test_derived_repository_identity_matches_rebuild_in_either_evidence_order(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        local_identity = "https://example.org/local"
+        ssh_identity = "https://example.org/ssh"
+        local = step("evidence", call_id="served", repo_identity=local_identity)
+        ssh: Record = {"kind": "ssh_attempt", "id": "attempt", "call_id": "served",
+                       "repo_identity": ssh_identity, "at": STAMP}
+        for first, second, initial in ((ssh, local, ssh_identity), (local, ssh, local_identity)):
+            with self.subTest(first=first["kind"]):
+                mirror = step("mirror", call_id="served", host="Nates-MacBook-Pro-2023",
+                              caller="verify-mac", repo_path=None, repo_identity=UNKNOWN_IDENTITY)
+                self.write(self.host_file, call("served"), mirror, first)
+                _ = index.update()
+                self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'mirror'"),
+                                 [(initial,)])
+                store.append_line(self.host_file, second)
+                _ = index.update()
+                query = "SELECT repo_identity, identity_derived FROM steps WHERE id = 'mirror'"
+                incremental = self.rows(query)
+                self.assertEqual(incremental, [(local_identity, 1)])
+                _ = index.reindex()
+                self.assertEqual(self.rows(query), incremental)
+
+    def test_call_identity_changes_preserve_recorder_written_step_identity(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        identity = "https://example.org/recorded"
+        self.write(self.host_file, call("served", host="other-gate"),
+                   step("recorded", call_id="served", repo_identity=identity),
+                   step("unknown", call_id="served", host="other-builder", caller="verify-linux",
+                        repo_path=None, repo_identity=UNKNOWN_IDENTITY))
+        _ = index.update()
+        store.append_line(self.host_file, step("later", call_id="served", host="other-builder",
+                                              started_at="2026-10-02T12:01:00.000Z", repo_identity="https://example.org/later"))
+        _ = index.update()
+        query = "SELECT repo_identity, identity_derived FROM steps WHERE id = 'recorded'"
+        expected = [(identity, 0)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'unknown'"),
+                         [("https://example.org/later",)])
+        _ = index.reindex()
+        self.assertEqual(self.rows(query), expected)
+
+    def test_identity_resolution_skips_samples_and_steps_of_untouched_calls(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, call("served"), call("untouched"),
+                   step("evidence", call_id="served", repo_identity="https://example.org/known"),
+                   step("mirror", call_id="served", repo_identity=UNKNOWN_IDENTITY),
+                   step("other", call_id="untouched", repo_identity=UNKNOWN_IDENTITY))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as database, database:
+            _ = database.execute("UPDATE steps SET repo_identity = ?, identity_derived = 1 WHERE id IN ('mirror', 'other')",
+                                 ("https://example.org/unchanged",))
+        for entry in (sample(STAMP), {"kind": "memory_snapshot", "id": "snapshot", "host": "natedev", "at": STAMP}):
+            store.append_line(self.host_file, entry)
+            _ = index.update()
+            self.assertEqual(self.rows("SELECT id, repo_identity FROM steps WHERE identity_derived = 1 ORDER BY id"),
+                             [("mirror", "https://example.org/unchanged"), ("other", "https://example.org/unchanged")])
+        store.append_line(self.host_file, call("served"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, repo_identity FROM steps WHERE identity_derived = 1 ORDER BY id"),
+                         [("mirror", "https://example.org/known"), ("other", "https://example.org/unchanged")])
+
+    def test_update_restores_a_missing_call_index_before_reading_new_steps(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, call("served"), step("evidence", call_id="served", repo_identity="https://example.org/known"))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as database, database:
+            _ = database.execute("DROP INDEX steps_call")
+        store.append_line(self.host_file, step("mirror", call_id="served", repo_identity=UNKNOWN_IDENTITY,
+                                              tests=[{"binary": "hana", "test": "slow", "status": "passed", "duration_s": 2.0}]))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'mirror'"), [("https://example.org/known",)])
+        join = ("SELECT t.test FROM steps s JOIN tests t ON t.step_id = s.id"
+                + " WHERE s.repo_identity = ? AND s.host = ? AND s.started_at >= ?")
+        parameters = ("https://example.org/known", "natedev", STAMP)
+        self.assertEqual(self.rows(join, *parameters), [("slow",)])
+        plan = self.rows("EXPLAIN QUERY PLAN " + join, *parameters)
+        self.assertTrue(any("SEARCH t USING" in str(row[3]) and "step_id=?" in str(row[3]) for row in plan), plan)
+
+    def test_nextest_recording_reads_the_threshold_at_use_and_keeps_only_durations_above_it(self) -> None:
+        config = configure_cleanup(self, self.root)
+        lines = [
+            "        PASS [ 0.749s] hana tests::below",
+            "        PASS [ 0.750s] hana tests::boundary",
+            "        PASS [ 0.751s] hana tests::above_boundary",
+            "        PASS [ 1.250s] hana tests::higher_boundary",
+            "        PASS [ 1.251s] hana tests::above_higher_boundary",
+            "        FAIL [ 0.010s] hana tests::failed",
+            "  TRY 2 PASS [ 0.020s] hana tests::retried",
+            "        SLOW [> 0.030s] hana tests::reported_slow",
+            "        PASS [ 0.040s] hana tests::reported_slow",
+        ]
+        for threshold, expected in (
+            (0.75, {"tests::above_boundary", "tests::higher_boundary", "tests::above_higher_boundary",
+                    "tests::failed", "tests::retried", "tests::reported_slow"}),
+            (1.25, {"tests::above_higher_boundary", "tests::failed", "tests::retried", "tests::reported_slow"}),
+        ):
+            with self.subTest(threshold=threshold):
+                _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
+                tests = parse.test_results(lines)[0]
+                self.assertEqual({test["test"] for test in tests}, expected)
+                self.write(self.host_file, step("threshold", step="nextest", tests=tests))
+                _ = index.update()
+                self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))
@@ -357,17 +862,102 @@ class IndexTests(unittest.TestCase):
         decoded = [(identifier, json.loads(cast(str, names)) if names is not None else None, target_dir, repository, folder)
                    for identifier, names, target_dir, repository, folder in rows]
         self.assertEqual(decoded, [
-            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/subdirectory"),
-            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
             ("target", ["hana", "dependency", "hana"], "/shared/target", "https://example.com/hana", "/shared/target"),
-            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/unknown"),
-            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", "/r/feature"),
-            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", None),
+            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
         ])
         columns = [(column[1], column[2], column[3]) for column in self.rows("PRAGMA table_info(steps)")
                    if column[1] in ("target_dir", "repo_identity")]
         self.assertCountEqual(columns, [("target_dir", "TEXT", 1), ("repo_identity", "TEXT", 1)])
         self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_output_roots_survive_indexing_and_legacy_steps_stay_readable(self) -> None:
+        self.write(self.host_file,
+                   step("split", target_dir="/artifacts", target_directory="/artifacts",
+                        build_directory="/intermediates"),
+                   step("same", target_directory="/output", build_directory="/output"),
+                   step("legacy", target_dir="/legacy-output"),
+                   step("override", target_dir="/override-output",
+                        argv=["cargo", "build", "--target-dir", "/override-output"]),
+                   step("target-only", target_directory="/artifacts"),
+                   step("build-only", build_directory="/intermediates"),
+                   step("unknown"))
+        self.assertEqual(index.update(), 7)
+        self.assertEqual(self.rows(
+            "SELECT id, target_directory, build_directory FROM steps ORDER BY id"), [
+                ("build-only", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("legacy", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("override", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("same", "/output", "/output"),
+                ("split", "/artifacts", "/intermediates"),
+                ("target-only", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+            ])
+
+    def test_steps_without_output_pairs_do_not_add_recorded_cargo_mappings(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "lint.conf")
+        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state")}))
+        override = self.root / "override-output"
+        plain = self.root / "plain-output"
+        started = (sweep.TARGET_OVERRIDE_RECORDER_CUT + timedelta(seconds=1)).isoformat()
+        self.write(self.host_file,
+                   step("override", target_dir=str(override), started_at=started,
+                        argv=["cargo", "build", "--target-dir", str(override)]),
+                   step("plain", target_dir=str(plain), started_at=started,
+                        argv=["cargo", "build"]))
+        self.assertEqual(index.update(), 2)
+        outputs = step_outputs.recorded_output_roots(index.index_path(), "natedev")
+        assert isinstance(outputs, step_outputs.RecordedStepOutputs)
+        self.assertEqual(len(outputs.rows), 2)
+        with mock.patch.object(store, "host_name", return_value="natedev"):
+            mappings = sweep.discover_cargo_outputs([], lint_settings=conf.read("lint"))[1]
+        pairs = {(item.target_directory, item.build_directory) for item in mappings.workspaces}
+        for output in outputs.rows:
+            with self.subTest(target_folder=output.target_folder):
+                assert isinstance(output.target_folder, step_outputs.AbsoluteRecordedRoot)
+                self.assertNotIn((output.target_folder.path, output.target_folder.path), pairs)
+
+    def test_schema_bump_rebuilds_inferred_output_pairs_from_unchanged_log(self) -> None:
+        self.write(self.host_file, step("inferred", target_dir="/legacy-output"))
+        original = self.host_file.read_bytes()
+        with mock.patch.object(index, "SCHEMA_VERSION", 34):
+            self.assertEqual(index.update(), 1)
+            old_index = index.index_path()
+        with closing(sqlite3.connect(old_index)) as connection, connection:
+            connection.execute(
+                "UPDATE steps SET target_directory = target_dir, build_directory = target_dir"
+            ).close()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("SELECT target_directory, build_directory FROM steps"),
+                         [(UNKNOWN_IDENTITY, UNKNOWN_IDENTITY)])
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_test_phase_charge_bytes_rank_steps_and_preserve_null_for_older_rows(self) -> None:
+        self.write(self.host_file,
+                   step("large", test_phase_charge={"bytes": 8192}),
+                   step("small", test_phase_charge={"bytes": 1024}),
+                   step("no-charge", test_phase_charge=None),
+                   step("legacy"))
+        original = self.host_file.read_bytes()
+        self.assertEqual(index.update(), 4)
+        query = "SELECT id, test_phase_charge_bytes FROM steps ORDER BY test_phase_charge_bytes DESC, id"
+        expected = [("large", 8192), ("small", 1024), ("legacy", None), ("no-charge", None)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(index.reindex(), 4)
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_charge_column_rejects_boolean_and_text_bytes(self) -> None:
+        self.write(self.host_file,
+                   step("boolean", test_phase_charge={"bytes": True}),
+                   step("text", test_phase_charge={"bytes": "8192"}))
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows("SELECT id, test_phase_charge_bytes FROM steps ORDER BY id"),
+                         [("boolean", None), ("text", None)])
 
     def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
         self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
@@ -380,10 +970,75 @@ class IndexTests(unittest.TestCase):
         self.assertGreater(index.SCHEMA_VERSION, 23)
         self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         row = self.rows("SELECT worker, compiled_crate_names, target_dir, repo_identity, target_folder, build_base, build_items FROM steps")[0]
-        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"))
+        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None))
         self.assertIsInstance(row[5], str)
         self.assertNotEqual(json.loads(cast(str, row[6])), [])
         self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_unknown_and_none_folders_never_use_the_worktree_after_schema_rebuild(self) -> None:
+        self.write(self.host_file, step("none", target_dir="none"), step("empty", target_dir=""),
+                   step("unknown", target_dir="unknown"), step("unset", target_dir="unset"),
+                   step("absolute", target_dir="/shared/actual-target"))
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            connection.execute("CREATE TABLE steps (id TEXT)").close()
+            connection.execute(f"PRAGMA user_version = {index.SCHEMA_VERSION - 1}").close()
+            connection.commit()
+        self.assertEqual(index.update(), 5)
+        self.assertEqual(self.rows("SELECT id, target_dir, target_folder FROM steps ORDER BY id"), [
+            ("absolute", "/shared/actual-target", "/shared/actual-target"),
+            ("empty", "unknown", None), ("none", "none", None),
+            ("unknown", "unknown", None), ("unset", "unset", None),
+        ])
+
+    def test_report_history_keeps_legacy_groups_separate_from_real_folders(self) -> None:
+        cases: tuple[tuple[str, Record, Record, bool], ...] = (
+            ("legacy worktree", {"target_dir": "unset"}, {}, True),
+            ("legacy cwd", {"worktree": None}, {"worktree": None}, True),
+            ("other legacy checkout", {"worktree": "/old"}, {"worktree": "/new"}, False),
+            ("known shared folder", {"target_dir": "/shared/output", "worktree": "/old"},
+             {"target_dir": "/shared/output", "worktree": "/new"}, True),
+            ("different real folders", {"target_dir": "/old/output"}, {"target_dir": "/new/output"}, False),
+            ("legacy to known", {}, {"target_dir": "/shared/output"}, False),
+            ("known to legacy", {"target_dir": "/shared/output"}, {}, False),
+            ("explicit none", {"target_dir": "none"}, {"target_dir": "none"}, False),
+            ("unresolved to unresolved", {"target_dir": "unresolved"}, {"target_dir": "unresolved"}, False),
+            ("unresolved to legacy", {"target_dir": "unresolved"}, {}, False),
+            ("legacy to unresolved", {}, {"target_dir": "unresolved"}, False),
+        )
+        for name, previous, current, expected in cases:
+            with self.subTest(history=name):
+                self.write(self.host_file,
+                           step("previous", started_at="2026-09-01T00:00:00Z", finished_s=1.0, **previous),
+                           step("current", finished_s=1.0, **current))
+                _ = index.reindex()
+                self.assertEqual(self.rows("SELECT " + report.warm_step_clause() + " FROM steps WHERE id = 'current'"),
+                                 [(int(expected),)])
+
+    def test_history_query_limits_reads_to_its_folder_or_checkout_group(self) -> None:
+        size = 800
+        self.write(self.host_file, *[
+            step(str(number), worktree=f"/checkout/{number}",
+                 target_dir=f"/output/{number}" if number % 2 else "unknown",
+                 started_at=f"2026-09-01T00:{number // 60:02d}:{number % 60:02d}Z", finished_s=1.0)
+            for number in range(size)
+        ])
+        _ = index.reindex()
+        with closing(index.read_only()) as connection:
+            sql = "SELECT " + report.warm_step_clause() + " FROM steps"
+            plan = str(connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
+            self.assertIn("steps_build_group_history", plan)
+            self.assertIn("build_history_group=? AND build_base=? AND started_at_us<?", plan)
+            batches = 0
+
+            def count_instructions() -> int:
+                nonlocal batches
+                batches += 1
+                return 0
+
+            connection.set_progress_handler(count_instructions, 1000)
+            rows = connection.execute(sql).fetchall()
+            self.assertEqual(rows, [(0,)] * size)
+            self.assertLessEqual(batches * 1000, size * 150)
 
     def test_warm_history_lookup_has_the_folder_base_time_index(self) -> None:
         self.write(self.host_file, step("history"))
@@ -392,14 +1047,14 @@ class IndexTests(unittest.TestCase):
             [column[2] for column in self.rows(f'PRAGMA index_info("{name}")')]
             for name, in self.rows("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'steps'")
         ]
-        self.assertIn(["host", "target_folder", "build_base", "started_at_us"], indexed_columns)
+        self.assertIn(["host", "build_history_group", "build_base", "started_at_us"], indexed_columns)
         base, started_at_us = self.rows("SELECT build_base, started_at_us FROM steps")[0]
         plan = str(self.rows(
-            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND target_folder = ?"
-            + " AND build_base = ? AND started_at_us < ?",
-            "natedev", "/r/feature", base, started_at_us,
+            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND build_history_group = ?"
+            + " AND build_base = ? AND started_at_us < ? AND finished_s IS NOT NULL",
+            "natedev", "legacy:/r/feature", base, started_at_us,
         ))
-        self.assertIn("steps_build_history", plan)
+        self.assertIn("steps_build_group_history", plan)
         self.assertIn("started_at_us<?", plan)
 
     def test_indexed_start_instants_preserve_microseconds_and_normalize_offsets(self) -> None:
@@ -506,6 +1161,51 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name = 'leftover'"), [])
         self.assertEqual(self.ids(), ["s0", "s1"])
 
+    def test_legacy_schema_recovers_gate_history_before_the_saved_offset(self) -> None:
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "recovered-gate", "host": "natedev"}
+        before = step("before-gate", duration_s=12.5)
+        after = call("after-gate", wall_s=6.0)
+        source = self.host_file.relative_to(self.root).as_posix()
+        for legacy_version in (29, 30):
+            with self.subTest(legacy_version=legacy_version):
+                index.index_path().unlink(missing_ok=True)
+                self.write(self.host_file, before, run, after)
+                original = self.host_file.read_bytes()
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    index.create_schema(connection)
+                    for table in ("gate_tests", "gate_modules", "gate_suites", "gate_runs"):
+                        _ = connection.execute(f"DROP TABLE {table}")
+                    index.add_step(connection, before, source)
+                    index.add_call(connection, after, source)
+                    with self.host_file.open("rb") as handle:
+                        stored_marks = index.marks(handle, len(original))
+                    _ = connection.execute(
+                        "INSERT INTO files (path, offset, marks) VALUES (?, ?, ?)",
+                        (source, len(original), stored_marks),
+                    )
+                    _ = connection.execute(f"PRAGMA user_version = {legacy_version}")
+                    connection.commit()
+
+                self.assertEqual(index.update(), 3)
+                self.assertEqual(self.rows(
+                    "SELECT id, selection, status, modules_run, tests_run FROM gate_runs"),
+                    [("recovered-gate", "affected", 1, 1, None)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, wall_s, status FROM gate_suites"),
+                    [("recovered-gate", "scripts", 4.0, 1)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, tests_run, tests_s FROM gate_modules"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, 2, 1.5)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, test, duration_s, status FROM gate_tests ORDER BY test"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, "Example.test_fail", 0.5, "fail"),
+                     ("recovered-gate", "scripts", "test_example.py", 1, "Example.test_pass", 1.0, "pass")])
+                self.assertEqual(self.rows("SELECT id, duration_s FROM steps"), [("before-gate", 12.5)])
+                self.assertEqual(self.rows("SELECT id, wall_s FROM calls"), [("after-gate", 6.0)])
+                self.assertEqual(self.host_file.read_bytes(), original)
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
     def test_schema_five_rebuilds_with_memory_admission_columns(self) -> None:
         self.write(self.host_file, step("s0", mem_wait_s=12))
         _ = index.update()
@@ -542,6 +1242,38 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(index.update(), 0)
         self.assertEqual(self.rows("SELECT mem_wait_s FROM steps ORDER BY id"), [(7,), (None,)])
         self.assertEqual(self.rows("SELECT builds_anon_bytes, ci_anon_bytes FROM samples ORDER BY at"), [(2**30, 2 * 2**30), (None, None)])
+
+    def test_raw_sample_resources_and_scope_counters_survive_schema_rebuild(self) -> None:
+        slices = {"builds": slice_reading(12 * GIB), "ci": slice_reading(3 * GIB, identity=99)}
+        filesystem = {"state": "measured", "total": 100 * GIB, "used": 60 * GIB, "free": 30 * GIB,
+                      "device": "254:0", "device_name": "dm-0"}
+        pools = {"builds": {"state": "measured", "free_pool_tokens": 17}, "ci": {"state": "unavailable"}}
+        scope = {"cpu": CPU, "io": {"state": "unavailable"}, "identity": 42}
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP), sample("2026-10-02T12:01:00Z", slices=slices,
+                                             filesystem=filesystem, jobserver=pools, zram=ZRAM_READING))
+        self.write(self.host_file, step("resources", scope_resources=scope))
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 3)
+        self.assertEqual(self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")[0],
+                         (None, None, None, None))
+        encoded = self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")[1]
+        self.assertEqual([json.loads(cast(str, value)) for value in encoded], [slices, filesystem, pools, ZRAM_READING])
+        self.assertEqual({row[1]: row[2] for row in self.rows("PRAGMA table_info(samples)")}["zram"], "TEXT")
+        self.assertEqual(json.loads(cast(str, self.rows("SELECT scope_resources FROM steps")[0][0])), scope)
+        for legacy_version in (25, 32):
+            with self.subTest(legacy_version=legacy_version):
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    _ = connection.execute("ALTER TABLE samples DROP COLUMN zram")
+                    _ = connection.execute(f"PRAGMA user_version = {legacy_version}")
+                    connection.commit()
+                self.assertEqual(index.update(), 3)
+                self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
+                self.assertEqual(path.read_bytes(), original)
+                rows = self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")
+                self.assertEqual(rows[0], (None, None, None, None))
+                self.assertEqual([json.loads(cast(str, value)) for value in rows[1]],
+                                 [slices, filesystem, pools, ZRAM_READING])
 
     def test_cpu_io_sample_columns_preserve_old_nulls_and_new_counters(self) -> None:
         path = self.root / "natedev" / "samples-2026-10.jsonl"
@@ -580,7 +1312,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_command_lists_samples_and_stall_columns(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TABLE samples", result.stdout)
@@ -603,7 +1335,8 @@ class IndexTests(unittest.TestCase):
             [(None, None), ("performance", since)],
         )
         self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(index.SAMPLE_COLUMNS[-2:], [
+        self.assertEqual([column for column in index.SAMPLE_COLUMNS
+                          if column[0] in ("power_profile", "power_profile_since")], [
             ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
             ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
         ])
@@ -906,7 +1639,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT count(*) FROM queue_bumps"), [(1,)])
         schema = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
         self.assertIn("TABLE queue_bumps", schema.stdout)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection:
+        with closing(sqlite3.connect(index.index_path_in(self.root))) as connection:
             _ = connection.execute("PRAGMA user_version = 1")
         _ = index.update()
         self.assertEqual(self.rows("SELECT old_position FROM queue_bumps"), [(3,)])
@@ -927,7 +1660,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_describes_target_and_hold_wait(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60,
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"target\s+TEXT\s+where the call was when it ended: mac, natedev, or empty")
@@ -1028,7 +1761,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = cast(list[dict[str, object]], json.loads(result.stdout))
@@ -1042,7 +1775,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(failed.returncode, 1)
         self.assertIn("readonly", failed.stderr)

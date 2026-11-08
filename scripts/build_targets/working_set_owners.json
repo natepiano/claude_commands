@@ -123,7 +123,7 @@
       "owner": "resources-unit"
     },
     {
-      "path": "scripts/lint/config_values.py",
+      "path": "scripts/lib/conf.py",
       "owner": "verify-unit"
     },
     {
@@ -245,10 +245,6 @@
     {
       "path": "scripts/hana_shot/",
       "owner": "screenshot-unit"
-    },
-    {
-      "path": "scripts/hierarchies/",
-      "owner": "hierarchies-unit"
     },
     {
       "path": "scripts/history/",

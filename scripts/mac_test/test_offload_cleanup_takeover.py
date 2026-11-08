@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import unittest
-from offload_cleanup_test_support import TEST_HANG_GUARD_SECS
-from offload_cleanup_test_support import SeededCleanupFixture
+from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
@@ -14,7 +15,8 @@ class OffloadCommandTests(SeededCleanupFixture):
         _ = self.write_kept_claim()
         alternate = self.root / "alternate-settings.conf"
         values = {**self.config, "host": "next-mac", "connect_timeout_s": "2"}
-        _ = alternate.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
+                                 template="mac_test")
         result = self.command("--no-fail-fast", settings=alternate)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
@@ -49,11 +51,11 @@ class OffloadCommandTests(SeededCleanupFixture):
     def test_second_takeover_declines_busy_without_releasing_the_new_kept_claim(self) -> None:
         process = self.start_command(script=self.claim_stub_runner(), extra={"MAC_TEST_TAKEOVER_TWICE": "1"})
         try:
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 75, output)
         self.assert_wire("declined", "busy")
         self.assertEqual(self.wire_result().get("holder"), "leftovers")

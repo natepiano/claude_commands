@@ -1,0 +1,26 @@
+{
+  "workspace_root": "/tmp/verify workspace's $root; literal",
+  "target_directory": "/tmp/verify target's $dir; literal",
+  "workspace_members": [
+    "empty"
+  ],
+  "packages": [
+    {
+      "id": "empty",
+      "name": "empty",
+      "manifest_path": "/tmp/verify fixture/empty/Cargo.toml",
+      "features": {},
+      "targets": [
+        {
+          "name": "only-example",
+          "kind": [
+            "example"
+          ],
+          "test": false,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        }
+      ]
+    }
+  ]
+}

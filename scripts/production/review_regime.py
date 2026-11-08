@@ -159,8 +159,9 @@ def add(arguments: argparse.Namespace) -> None:
                   + f"a row exists from the merge at {existing.merged}; nothing added")
             return
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    record = cast(dict[str, object], asdict(row))
     with LEDGER.open("a") as ledger:
-        _ = ledger.write(json.dumps(asdict(row)) + "\n")
+        _ = ledger.write(json.dumps(record) + "\n")
     print(f"added {row.unit} phase {row.phase} ({row.regime}): {row.holds} holds, {row.merge_defects} merge defects, {row.hours():.1f} h" + (f"; excluded: {row.excluded}" if row.excluded else ""))
 
 

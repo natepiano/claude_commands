@@ -6,21 +6,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lint.memory_test_support import config_environment
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from test_index import Record, call, encode, point_root_at, sample, step
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
+from scripts.lib import test_hang_guard
 
 HERE = Path(__file__).parent
 CLI = HERE / "cli.py"
@@ -30,6 +26,8 @@ AT = "2026-10-04T21:00:00.000Z"
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    fixture_root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(fixture_root)))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
@@ -50,13 +48,13 @@ class MemoryRecordTests(unittest.TestCase):
 
     def run_script(self, script: Path, *args: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(script), *args],
+            [str(HERE.parent / "lib/py"), str(script), *args],
             cwd=self.base,
             env=self.env(**(extra or {})),
             capture_output=True,
             text=True,
             check=False,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[Record]:
@@ -83,8 +81,8 @@ class MemoryRecordTests(unittest.TestCase):
         service.mkdir(parents=True)
         _ = (service / "cgroup.procs").write_text("123\n")
         command = (
-            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "import sample, cli; proc = Path(sys.argv[2]); "
+            "import sys; from pathlib import Path; "
+            "from scripts.buildlog import sample, cli; proc = Path(sys.argv[1]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
             "sample.CPU_PRESSURE = proc / 'cpu_pressure'; sample.IO_PRESSURE = proc / 'io_pressure'; "
             "sample.STAT = proc / 'stat'; "
@@ -94,8 +92,8 @@ class MemoryRecordTests(unittest.TestCase):
                        BUILDLOG_ZRAM=str(self.base / "absent-zram"))
         def take_sample() -> None:
             result = subprocess.run(
-                [sys.executable, "-c", command, str(HERE), str(proc)],
-                env=env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                [str(HERE.parent / "lib/py"), "-c", command, str(proc)],
+                env=env, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Add a Claude or Codex account and wire it into everything that names accounts.
 
 `new_account.py claude claude4 [login]` or `new_account.py codex codex3 [login]`.
@@ -10,6 +10,10 @@ Everything else that lists accounts discovers them: account folders by
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fnmatch
@@ -24,8 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
+from scripts.lib import conf  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -92,7 +96,7 @@ def parse_account(tool: str, name: str) -> NewAccount:
 
 
 def notes_directory() -> Path:
-    return Path(os.environ.get("AGENT_NOTES_DIR", str(accounts.accounts_home() / "rust" / "hanadocs" / "agents")))
+    return note_file.notes_dir()
 
 
 def note_path(account: NewAccount) -> Path:
@@ -168,7 +172,7 @@ def codex_steps(account: NewAccount) -> list[Step]:
     if problems:
         return [Step(False, "\n    ".join(problems))]
     return [Step(True, f"~/.{account.name} is set up and signed in; it is a spare until "
-                 + f"/showrunner:accounts swap workers {account.label}"), alias_step(account)]
+                 + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers {account.label}"), alias_step(account)]
 
 
 def settings_entries(account: NewAccount) -> list[tuple[str, str]]:
@@ -281,7 +285,7 @@ def settings_step(account: NewAccount) -> Step:
     if not missing:
         return Step(True, f"~/.claude/settings.json covers ~/.{account.name}")
     lines = "\n".join(f"    {where}: \"{entry}\"," for where, entry in missing)
-    return Step(False, f"add to ~/.claude/settings.json (agents may not edit it):\n{lines}")
+    return Step(True, f"anomaly: add to ~/.claude/settings.json (agents may not edit it):\n{lines}")
 
 
 def _shell_module_path() -> Path:
@@ -290,8 +294,9 @@ def _shell_module_path() -> Path:
 
 
 def nixos_shell_module() -> Path | None:
+    account_config = conf.read('accounts')
     relative = _shell_module_path()
-    for repository in (Path("/etc/nixos"), accounts.accounts_home() / "nixos"):
+    for repository in (Path(account_config.text("nixos_repository_root")), Path(account_config.text("home_nixos_repository_root")).expanduser()):
         module = repository / relative
         if module.is_file():
             return module
@@ -302,14 +307,14 @@ def alias_step(account: NewAccount) -> Step:
     """The `claudeN` or `codexN` alias in this machine's shell module."""
     module = nixos_shell_module()
     if module is None:
-        return Step(False, f"no nixos shell module found to define the {account.name} alias "
+        return Step(True, f"anomaly: no nixos shell module found to define the {account.name} alias "
                     + f"(looked for {_shell_module_path()})")
     text = module.read_text(encoding="utf-8")
     if account.tool == "claude" and ALIAS_LOOP_MARKER in text:
         return Step(True, f"{account.name} alias: comes from the account note; open a new terminal")
     if re.search(rf"^\s*{account.name}\s*=", text, re.MULTILINE):
         return Step(True, f"{account.name} alias in {module} (live after a rebuild)")
-    return Step(False, f"add to shellAliases in {module}, then rebuild:\n    {account.name} = "
+    return Step(True, f"anomaly: add to shellAliases in {module}, then rebuild:\n    {account.name} = "
                 + f"\"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec {account.label}\";")
 
 

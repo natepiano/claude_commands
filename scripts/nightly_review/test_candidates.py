@@ -6,6 +6,7 @@ import contextlib
 import io
 import os
 import socket
+import shutil
 import tempfile
 import unittest
 from datetime import datetime
@@ -14,11 +15,12 @@ from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import candidates
-from candidates import Candidate, TimeGain, TokenGain, Unmeasured
+from scripts.nightly_review import candidates
+from scripts.nightly_review.candidates import Candidate, TimeGain, TokenGain, Unmeasured
 
 # Importable once candidates has put scripts/lib on the path.
-import urgency
+from scripts.lib import urgency
+from scripts.lib import conf
 
 
 def setUpModule() -> None:
@@ -68,12 +70,16 @@ class CandidatesTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        configuration = self.root / "config"
+        configuration.mkdir()
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/nightly_review.conf", configuration / "nightly_review.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.note = self.root / "nightly improvement list.md"
         with contextlib.ExitStack() as environment:
             _ = cast(object, environment.enter_context(mock.patch.dict(
                 os.environ, {"NIGHTLY_REVIEW_NOTE": str(self.note), "NEXT_STATE_DIR": str(self.root / "next")})))
             self.addCleanup(environment.pop_all().close)
-        patch = mock.patch.object(candidates, "ROOT", self.root)
+        patch = mock.patch.object(candidates, "state_root", return_value=self.root)
         _ = patch.start()
         self.addCleanup(patch.stop)
 
@@ -332,6 +338,7 @@ class CandidatesTests(unittest.TestCase):
         alternate = self.root / "alternate.md"
         with (
             mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": "~/alternate.md"}),
+            mock.patch.object(conf, "directory", return_value=self.root / "config"),
             mock.patch.object(Path, "expanduser", autospec=True, return_value=alternate) as expand_home,
         ):
             code, out, err = self.run_main([])
@@ -346,7 +353,9 @@ class CandidatesTests(unittest.TestCase):
         default = self.root / "rust" / "hanadocs" / "nightly improvement list.md"
         default.parent.mkdir(parents=True)
         for value in ("", None):
-            with self.subTest(value=value), mock.patch.dict(os.environ), mock.patch.object(Path, "home", return_value=self.root):
+            with (self.subTest(value=value),
+                  mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+                  mock.patch.object(Path, "home", return_value=self.root)):
                 if value is None:
                     del os.environ["NIGHTLY_REVIEW_NOTE"]
                 else:
@@ -416,7 +425,8 @@ class CandidatesTests(unittest.TestCase):
     def test_hostname_failure_keeps_printed_table_and_success(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         error = OSError("hostname unavailable")
-        with mock.patch.object(socket, "gethostname", side_effect=error) as hostname:
+        hostname = mock.Mock(side_effect=error)
+        with mock.patch.object(candidates, "socket", mock.Mock(gethostname=hostname)):
             code, out, err = self.run_main([])
 
         hostname.assert_called_once_with()
@@ -434,7 +444,8 @@ class CandidatesTests(unittest.TestCase):
         error = OSError("hostname unavailable")
         for expected in (line, "nothing new to record\n"):
             with self.subTest(expected=expected):
-                with mock.patch.object(socket, "gethostname", side_effect=error) as hostname:
+                hostname = mock.Mock(side_effect=error)
+                with mock.patch.object(candidates, "socket", mock.Mock(gethostname=hostname)):
                     code, out, err = self.run_main(["record", str(report)])
 
                 hostname.assert_called_once_with()
@@ -543,6 +554,55 @@ class CandidatesTests(unittest.TestCase):
         self.assertIn("usage: candidates.py", err)
         self.assertFalse(self.note.exists())
 
+
+class NightlyReviewConfigTests(unittest.TestCase):
+    def test_each_table_reads_one_width_and_the_next_table_reads_it_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "nightly_review.conf"
+            rows = [Candidate("2026-10-01", "config", "", "ABCDEFGHIJKLMN", "", "proposed")] * 3
+            with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
+                  mock.patch.object(conf, "read", wraps=conf.read) as read):
+                _ = settings.write_text("# whole: 1..\ntitle_characters=10\n")
+                self.assertEqual(candidates.table(rows).count("ABCDEFGHI…"), 3)
+                read.assert_called_once_with("nightly_review")
+                _ = settings.write_text("# whole: 1..\ntitle_characters=5\n")
+                self.assertEqual(candidates.table(rows).count("ABCD…"), 3)
+                self.assertEqual(read.call_count, 2)
+
+    def test_candidates_resolve_the_state_folder_without_loading_the_nightly_library(self) -> None:
+        import sys
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _ = (root / "nightly_review.conf").write_text("state_directory=/unused\nstate_folder=nightly-review\n")
+            with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), "XDG_STATE_HOME": str(root / "state")}),
+                  mock.patch.dict(sys.modules, {"scripts.nightly_review.nightly_review": None})):
+                self.assertEqual(candidates.state_root(), root / "state/nightly-review")
+
+    def test_candidate_cells_read_the_width_setting_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "nightly_review.conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                _ = settings.write_text("# whole: 1..\ntitle_characters=10\n")
+                self.assertEqual(candidates.escaped("A longer title", conf.read("nightly_review").whole("title_characters")), "A longer…")
+                _ = settings.write_text("# whole: 1..\ntitle_characters=5\n")
+                self.assertEqual(candidates.escaped("A longer title", conf.read("nightly_review").whole("title_characters")), "A lo…")
+
+    def test_config_keeps_the_existing_values(self) -> None:
+        from scripts.lib import conf
+
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/nightly_review.conf")
+        for key, expected in {'state_directory': '~/.local/state', 'state_folder': 'nightly-review', 'sessions_directory': '~/.claude/sessions', 'review_modes': 'config rust messages', 'note_path': '~/rust/hanadocs/nightly improvement list.md', 'primary_showrunner_name': 'natedev', 'command_path': '~/.claude/commands/nightly_review.md'}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.text(key), expected)
+        for key, expected in {'message_sample_rows': 20, 'title_characters': 90}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.whole(key), expected)
+        for key, expected in {'sample_timeout_overhead_seconds': 15.0, 'message_history_hours': 24.0}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.number(key), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

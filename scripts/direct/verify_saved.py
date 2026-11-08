@@ -15,6 +15,10 @@ Usage: verify_saved.py [--from DATE] [--to DATE] [--days N] [--workspace NAME]
 
 --no-mac keeps only this machine's calls.
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -27,8 +31,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BUILDLOG = Path.home() / ".claude/scripts/buildlog/buildlog"

@@ -17,16 +17,23 @@ NoAppliedCheck too when a folder of child modules is at either name, because a p
 from __future__ import annotations
 
 import re
+import hashlib
+import tomllib
 from collections.abc import Callable, Mapping
+from enum import Enum
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from functools import cache
+from typing import cast
+from pathlib import Path, PurePosixPath
 
-import style_footprint
+from scripts.style import finding_sites
+from scripts.style import style_footprint
+from scripts.style.candidate_generators import snake_case
+from scripts.style.declarations import ITEM_KEYWORDS, type_path
+from scripts.lib.git_blob import git_blob_id
 
 # The keywords that declare an item with a name that other names can sit under.
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
-# The keywords that declare an item directly in a module, trait or impl body.
-ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
 # The macros that make an item name from other tokens or bring in items from another file.
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 # A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
@@ -157,9 +164,6 @@ class NoAppliedCheck:
     kind: str
 
 
-AppliedCheck = AppliedInCode | RenameNotApplied | NoAppliedCheck
-
-
 @dataclass(frozen=True)
 class BindingRename:
     """One approved local name pair, located by the finding's original line and text."""
@@ -168,6 +172,11 @@ class BindingRename:
     text: str
     old: str
     new: str
+
+
+@dataclass(frozen=True)
+class NonLocalReferenceCompanion:
+    """Neither the source nor the recorded site names this pair; it grants no local edit approval."""
 
 
 @dataclass(frozen=True)
@@ -199,6 +208,31 @@ class NoBindingScope:
     """Why a finding cannot be located as exactly one local binding."""
 
     reason: str
+
+
+@dataclass(frozen=True)
+class OuterBindingBlocked(NoBindingScope):
+    """The requested name already binds an enclosing value visible at the declaration."""
+
+    name: str
+    line: int
+    text: str
+
+
+@dataclass(frozen=True)
+class NoOuterBindingBlock:
+    """No enclosing binding prevents this requested name."""
+
+
+@dataclass(frozen=True)
+class OuterBindingUnproved(NoBindingScope):
+    """The item cannot prove absence of the wanted identifier or generated bindings."""
+
+    line: int = 0
+    text: str = ""
+
+
+AppliedCheck = AppliedInCode | RenameNotApplied | NoAppliedCheck | OuterBindingBlocked | OuterBindingUnproved
 
 
 @dataclass(frozen=True)
@@ -323,43 +357,333 @@ def refactor_rename(kind: str, before: str, after: str, line: int, text: str) ->
 
 def rename_declaration(source: str, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
     """Locate syntax only. Rust-analyzer owns reference resolution and the rename edit."""
+    try:
+        scan = _BindingScan(source)
+    except style_footprint.UnreadableTokenSpans as error:
+        return NoBindingScope(str(error))
+    return scan.declaration(rename)
+
+
+def rename_admission(source: str, rename: BindingRename) -> RenameDeclaration | NonLocalReferenceCompanion | OuterBindingBlocked | OuterBindingUnproved:
+    """A local rename's policy admission, separate from locating syntax for reference proofs."""
+    try:
+        scan = _BindingScan(source)
+    except style_footprint.UnreadableTokenSpans as error:
+        return OuterBindingUnproved("target tokens unread: " + str(error), rename.line, rename.text)
+    declaration = scan.declaration_on_line(rename, rename.line)
+    if isinstance(declaration, NoBindingScope) or not (
+            0 < rename.line <= len(source.splitlines())
+            and source.splitlines()[rename.line - 1].strip() == rename.text.strip()):
+        # Stale text cannot suppress local admission. The coordinate probe only
+        # identifies the target kind; it never proves the old edit applied.
+        names = {rename.old.removeprefix("r#"), rename.new.removeprefix("r#")}
+        site_names = {token.value.removeprefix("r#") for token in style_footprint.tokens(rename.text)
+                      if token.kind == "identifier"}
+        # Reuse the file-name proof's absence guarantee for a descriptive
+        # reference companion: it owns neither identifier here. Expansion or an
+        # unread/empty source cannot establish that nonlocal classification.
+        if (scan.words and not scan.macros and not style_footprint.attribute_spans(scan.words)
+                and not style_footprint.holds_glob_use(scan.words)
+                and not names.intersection(scan.plain_words) and not names.intersection(site_names)):
+            return NonLocalReferenceCompanion()
+        coordinate = scan.declaration_on_line(rename, rename.line)
+        if isinstance(coordinate, RenameDeclaration):
+            if coordinate.scope.kind in {"field", "variant", "item"}:
+                return coordinate
+            disposition = scan.outer_binding(coordinate.scope, rename.new)
+            if isinstance(disposition, OuterBindingBlocked | OuterBindingUnproved):
+                return disposition
+        reason = (declaration.reason if isinstance(declaration, NoBindingScope) and 0 < rename.line <= len(source.splitlines())
+                  and source.splitlines()[rename.line - 1].strip() == rename.text.strip() else "finding text is absent")
+        return OuterBindingUnproved(reason, rename.line, rename.text)
+    disposition = scan.outer_binding(declaration.scope, rename.new)
+    return disposition if isinstance(disposition, OuterBindingBlocked | OuterBindingUnproved) else declaration
+
+
+class RenameAdmissionPurpose(Enum):
+    REVIEW_APPLIED_EDIT = "review applied edit"
+    EXECUTE_PENDING_EDIT = "execute pending edit"
+
+
+@dataclass(frozen=True)
+class MappedLocalRename:
+    """The unique anchored item/declaration and its completely explained token mapping."""
+
+    declaration: RenameDeclaration
+    item_identity: tuple[str, ...]
+    anchor_position: int
+    tokens: tuple[tuple[int, int], ...]
+
+
+def current_rename_admission(source: str, rename: BindingRename, original: str, *,
+                             companions: tuple[BindingRename, ...] = ()) -> RenameDeclaration | NonLocalReferenceCompanion | OuterBindingBlocked | OuterBindingUnproved:
+    """Syntax-level fixture adapter; production admission additionally requires ledger authority."""
+    result = _map_current_rename(source, rename, original, companions=companions)
+    return result.declaration if isinstance(result, MappedLocalRename) else result
+
+
+def _map_current_rename(source: str, rename: BindingRename, original: str, *,
+                             companions: tuple[BindingRename, ...] = (),
+                             purpose: RenameAdmissionPurpose = RenameAdmissionPurpose.REVIEW_APPLIED_EDIT) -> MappedLocalRename | RenameDeclaration | NonLocalReferenceCompanion | OuterBindingBlocked | OuterBindingUnproved:
+    """Inspect current bytes, undoing only aligned edits of this binding and its reads.
+
+    Original bytes locate and identify edits; they never replace the current item.
+    Any edit unexplained by the binding and its approved companions makes reversal unproved.
+    """
+    # The coordinate belongs to the recorded source. Never let an identical
+    # line elsewhere in the current file stand in for this declaration.
+    admission = rename_admission(source, rename)
+    if not original:
+        return admission
+    try:
+        scan = _BindingScan(source)
+        previous = _BindingScan(original)
+    except style_footprint.UnreadableTokenSpans:
+        return OuterBindingUnproved("target tokens unread", rename.line, rename.text)
+    old_declaration = previous.declaration_on_line(rename, rename.line)
+    if isinstance(old_declaration, NoBindingScope):
+        classified = rename_admission(original, rename)
+        if isinstance(classified, NonLocalReferenceCompanion):
+            return classified
+        return OuterBindingUnproved(old_declaration.reason, rename.line, rename.text)
+    if old_declaration.scope.kind in {"field", "variant", "item"}:
+        return old_declaration
+    old_scope = old_declaration.scope
+    old_items = finding_sites.SourceSites(original).item_reading
+    items = finding_sites.SourceSites(source).item_reading
+    if isinstance(old_items, finding_sites.UnreadableSourceItems) or isinstance(items, finding_sites.UnreadableSourceItems):
+        return OuterBindingUnproved("recorded containing item unread", rename.line, rename.text)
+    enclosing = [item for item in old_items if item.token_start <= old_scope.declaration < item.token_end]
+    if not enclosing:
+        return OuterBindingUnproved("target has no established containing item", rename.line, rename.text)
+    old_item = max(enclosing, key=lambda item: item.token_start)
+    matches = [item for item in items if item.identity == old_item.identity]
+    if len(matches) != 1 or any(sum(other.identity == item.identity for other in old_items) != 1
+                                or sum(other.identity == item.identity for other in items) != 1 for item in enclosing):
+        return OuterBindingUnproved("recorded item path is not unique in current source", rename.line, rename.text)
+    item = matches[0]
+    old_body, body = old_item.body_reading, item.body_reading
+    if isinstance(old_body, finding_sites.UnreadItemBody) or isinstance(body, finding_sites.UnreadItemBody):
+        # Local admission needs both read bodies before it can identify the rename's edits.
+        return OuterBindingUnproved("containing item body unread", rename.line, rename.text)
+    old_start, start = old_item.token_start, item.token_start
+    pairs = frozenset((pair.old, pair.new) for pair in (rename, *companions))
+
+    def align_region(a: int, b: int) -> tuple[bool, tuple[_BindingEdit, ...], dict[int, int]]:
+        before = _BindingScan(original[previous.spans[a].start:previous.spans[old_body.tokens.stop - 1].end])
+        after = _BindingScan(source[scan.spans[b].start:scan.spans[body.tokens.stop - 1].end])
+        return _binding_alignment(before, after, pairs)
+
+    aligned, edits, locations = align_region(old_start, start)
+    if not aligned and old_scope.declaration in old_body.tokens:
+        # A later signature change stays visible to policy admission. Only an
+        # exactly aligned item body may map the recorded declaration through it.
+        old_start, start = old_body.tokens.start, body.tokens.start
+        if start >= body.tokens.stop or old_start >= old_body.tokens.stop:
+            return OuterBindingUnproved("recorded declaration position is not proved", rename.line, rename.text)
+        aligned, edits, locations = align_region(old_start, start)
+    if not aligned:
+        reason = admission.reason if isinstance(admission, OuterBindingUnproved) else "current rename's own edits cannot be identified exactly"
+        return OuterBindingUnproved(reason, rename.line, rename.text)
+    mapped = locations.get(old_scope.declaration - old_start, -1)
+    scope = scan.scope_at(start + mapped) if mapped >= 0 else NoBindingScope("declaration has no current token")
+    if isinstance(scope, NoBindingScope) or scope.kind != old_scope.kind:
+        return OuterBindingUnproved("recorded declaration position is not proved", rename.line, rename.text)
+    if (purpose is RenameAdmissionPurpose.EXECUTE_PENDING_EDIT
+            and scan.words[scope.declaration].removeprefix("r#") != rename.old.removeprefix("r#")):
+        return OuterBindingUnproved("recorded declaration no longer has the old name", rename.line, rename.text)
+    declaration = RenameDeclaration(scan.spans[scope.declaration].start, scope)
+    mapped_tokens = tuple((previous.spans[old_start + old].start, scan.spans[start + new].start)
+                          for old, new in sorted(locations.items()))
+    mapping = MappedLocalRename(declaration, old_item.identity, old_declaration.offset, mapped_tokens)
+    if scan.unread_binding(scope, rename) or previous.unread_binding(old_scope, rename):
+        return OuterBindingUnproved("current rename edits have unread binding visibility", rename.line, rename.text)
+    replacements: list[tuple[int, int, str]] = []
+    for edit in edits:
+        before, after = old_start + edit.before, start + edit.after
+        if (edit.old, edit.new) != (rename.old, rename.new) or not _contains(old_scope.ranges, before):
+            continue
+        if edit.form == "capture" and before in previous.formats and after in scan.formats and _contains(scope.ranges, after):
+            # Alignment already proved each capture and every surrounding byte.
+            # Undo only this pair's capture spans, leaving companion edits intact.
+            span = scan.spans[after]
+            for begin, finish in _captures(span.token.value):
+                if span.token.value[begin:finish] == edit.new:
+                    replacements.append((span.start + begin, span.start + finish, edit.old))
+            continue
+        if (edit.form != "name" or not _contains(scope.ranges, after) or not previous.name_word(before) or not scan.name_word(after)
+                or previous.shorthand(before) or scan.shorthand(after)):
+            return OuterBindingUnproved("current rename's own edits cannot be identified exactly", rename.line, rename.text)
+        span = scan.spans[after]
+        replacements.append((span.start, span.end, edit.old))
+    if not replacements and scan.words[scope.declaration] == rename.old:
+        disposition = scan.outer_binding(scope, rename.new)
+        if isinstance(disposition, OuterBindingBlocked | OuterBindingUnproved):
+            return disposition
+        if not (0 < rename.line <= len(original.splitlines()) and original.splitlines()[rename.line - 1].strip() == rename.text.strip()):
+            return OuterBindingUnproved("finding text is absent", rename.line, rename.text)
+        return mapping
+    if not any(start == declaration.offset for start, _, _ in replacements):
+        return OuterBindingUnproved("current rename's declaration edit is not proved", rename.line, rename.text)
+    restored = source
+    for start, finish, replacement in sorted(set(replacements), reverse=True):
+        restored = restored[:start] + replacement + restored[finish:]
+    restored_scan = _BindingScan(restored)
+    disposition = restored_scan.outer_binding(scope, rename.new)
+    if isinstance(disposition, OuterBindingBlocked | OuterBindingUnproved):
+        return disposition
+    if not (0 < rename.line <= len(original.splitlines()) and original.splitlines()[rename.line - 1].strip() == rename.text.strip()):
+        return OuterBindingUnproved("finding text is absent", rename.line, rename.text)
+    return mapping
+
+
+@dataclass(frozen=True)
+class AnchoredRenameSource:
+    """Bytes at the authoritative judgment/follow coordinate, never a build comparison base."""
+
+    commit: str
+    path: str
+    line: int
+    source: str
+
+
+@dataclass(frozen=True)
+class RenameAnchorUnavailable:
+    reason: str = "no judging ticket for source anchor"
+
+
+@dataclass(frozen=True)
+class CurrentRenameSourceUnavailable:
+    reason: str = "current source file is missing"
+
+
+@dataclass(frozen=True)
+class AdmittedLocalRename:
+    """An anchored local declaration mapped and admitted against one exact current snapshot.
+
+    Only admit_anchored_rename constructs this capability. It cannot authorize another
+    finding version, pair, path or source snapshot. Applied-check evidence is separate.
+    """
+
+    finding_version: str
+    rename: BindingRename
+    anchor: AnchoredRenameSource
+    item_identity: tuple[str, ...]
+    declaration_position: int
+    current_path: str
+    source_fingerprint: str
+    edit_mapping: tuple[tuple[int, int], ...]
+
+    def covers(self, version: str, rename: BindingRename, path: str, source: str) -> bool:
+        return (self.finding_version == version and self.rename == rename and self.current_path == path
+                and self.source_fingerprint == hashlib.sha256(source.encode()).hexdigest())
+
+
+RenameAdmission = AdmittedLocalRename | NonLocalReferenceCompanion | OuterBindingBlocked | OuterBindingUnproved
+
+
+def admit_anchored_rename(authority: AnchoredRenameSource | RenameAnchorUnavailable, version: str,
+                          rename: BindingRename, path: str, source: str | CurrentRenameSourceUnavailable, *,
+                          companions: tuple[BindingRename, ...] = (),
+                          purpose: RenameAdmissionPurpose = RenameAdmissionPurpose.REVIEW_APPLIED_EDIT) -> RenameAdmission:
+    """Classify only at the authoritative anchor and admit only mapped current bytes."""
+    if isinstance(authority, RenameAnchorUnavailable):
+        return OuterBindingUnproved(authority.reason, rename.line, rename.text)
+    anchored = BindingRename(authority.line, rename.text, rename.old, rename.new)
+    if authority.path != path:
+        return OuterBindingUnproved("current path has no proved follow from source anchor", rename.line, rename.text)
+    try:
+        previous = _BindingScan(authority.source)
+        declaration = previous.declaration_on_line(anchored, authority.line)
+    except style_footprint.UnreadableTokenSpans:
+        return OuterBindingUnproved("source anchor tokens unread", rename.line, rename.text)
+    if isinstance(declaration, NoBindingScope):
+        classified = rename_admission(authority.source, anchored)
+        if isinstance(classified, NonLocalReferenceCompanion):
+            return classified
+        return OuterBindingUnproved(declaration.reason, rename.line, rename.text)
+    if declaration.scope.kind in {"field", "variant", "item"}:
+        return NonLocalReferenceCompanion()
+    if isinstance(source, CurrentRenameSourceUnavailable):
+        return OuterBindingUnproved(source.reason, rename.line, rename.text)
+    admitted = _map_current_rename(source, anchored, authority.source, companions=companions, purpose=purpose)
+    if isinstance(admitted, OuterBindingBlocked | OuterBindingUnproved):
+        return admitted
+    if not isinstance(admitted, MappedLocalRename):
+        return OuterBindingUnproved("anchored local target has no proved current declaration", rename.line, rename.text)
+    return AdmittedLocalRename(version, rename, authority, admitted.item_identity, admitted.anchor_position, path,
+                               hashlib.sha256(source.encode()).hexdigest(), admitted.tokens)
+
+
+TYPE_NAMED_PARAMETER_RULE = (
+    "---\ntier: C\nfamily: names\ninput_scope: file\n---\n"
+    "# Type-named parameters\n\n"
+    "Name a function parameter with an explicit direct named type after the snake_case form of that type's final path component.\n"
+    "References, optional lifetimes and mutability do not change that name.\n"
+    "Do not rename inferred or compound types, fields or other bindings under this contract.\n"
+)
+
+
+@dataclass(frozen=True)
+class TypeNamedParameterRule:
+    """The complete rule is the direct named-type parameter contract checked below."""
+
+
+@dataclass(frozen=True)
+class NoMachineRenameRule:
+    reason: str = "rule has no recognized machine-checkable contract"
+
+
+@cache
+def _type_named_parameter_rule_blob() -> str:
+    return git_blob_id(TYPE_NAMED_PARAMETER_RULE.encode())
+
+
+def machine_rename_rule(rule_blob: str) -> TypeNamedParameterRule | NoMachineRenameRule:
+    # Match the entire pinned rule, including metadata. A filename, a matching
+    # paragraph or an extra restriction is insufficient authority to judge code.
+    return TypeNamedParameterRule() if rule_blob == _type_named_parameter_rule_blob() else NoMachineRenameRule()
+
+
+def type_named_parameter(source: str, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
+    """Machine-check the direct named-type parameter subset of the type-named rule.
+
+    Inferred types, generic/compound types, fields and semantic role names still need a person.
+    Reference identity, capture, visibility and documentation remain the rename executor's proof.
+    """
+    declaration = rename_declaration(source, rename)
+    if isinstance(declaration, NoBindingScope):
+        return declaration
+    if declaration.scope.kind != "fn parameter":
+        return NoBindingScope("rule applicability is not machine-checkable for this declaration")
     scan = _BindingScan(source)
-    lines = [i for i, text in enumerate(source.splitlines(), 1) if text.strip() == rename.text.strip()]
-    if not lines:
-        return NoBindingScope("finding text is absent")
-    distance = min(abs(line - rename.line) for line in lines)
-    nearest = [line for line in lines if abs(line - rename.line) == distance]
-    if len(nearest) != 1:
-        return NoBindingScope("finding location is tied")
-    indexes = {i for i, span in enumerate(scan.spans) if scan.tokenized.lines[i] == nearest[0]
-               and span.token.value.removeprefix("r#") == rename.old.removeprefix("r#")}
-    candidates: dict[int, BindingScope] = {}
-    for site in scan.sites:
-        for i in indexes:
-            if scan.binding_word(site, i, rename.old, raw=True):
-                candidates[i] = BindingScope(site.kind, i, site.ranges)
-    for start, word in enumerate(scan.words):
-        if word not in {"struct", "enum", "union"}:
-            continue
-        body = next((i for i in range(start + 2, len(scan.words)) if scan.words[i] in {"{", "(", ";"}), -1)
-        if body not in scan.ends or scan.words[body] != "{":
-            continue
-        for i in indexes:
-            if body < i < scan.ends[body] and (scan.words[i + 1:i + 2] == (":",)
-                    or word == "enum" and scan.parents.get(i) == body and scan.words[i - 1] in {"{", ","}):
-                candidates[i] = BindingScope("field" if scan.words[i + 1:i + 2] == (":",) else "variant",
-                                             i, ((start, scan.ends[body] + 1),))
-    for i in indexes:
-        if i and scan.words[i - 1] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
-            candidates[i] = BindingScope("item", i, ((max(0, i - 1), len(scan.words)),))
-    if len(candidates) != 1:
-        return NoBindingScope("finding line has no unique declaration of " + repr(rename.old))
-    index, scope = next(iter(candidates.items()))
-    # Reuse precise shadowing ranges where available, without any file-wide refusal.
-    local = scan.locate(rename)
-    if isinstance(local, BindingScope) and local.declaration == index:
-        scope = local
-    return RenameDeclaration(scan.spans[index].start, scope)
+    index = declaration.scope.declaration
+    words = scan.words
+    if words[index + 1:index + 2] != (":",):
+        return NoBindingScope("parameter type is not explicit")
+    cursor = index + 2
+    if words[cursor:cursor + 1] == ("&",):
+        cursor += 1
+        if words[cursor:cursor + 1] == ("'",):
+            cursor += 2
+        if words[cursor:cursor + 1] == ("mut",):
+            cursor += 1
+    if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
+        return NoBindingScope("parameter type is not a direct named type")
+    name = words[cursor]
+    cursor += 1
+    while words[cursor:cursor + 1] == ("::",):
+        cursor += 1
+        if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
+            return NoBindingScope("parameter type path is unreadable")
+        name = words[cursor]
+        cursor += 1
+    if words[cursor:cursor + 1] not in {(",",), (")",)}:
+        return NoBindingScope("compound parameter type requires judgment")
+    expected = snake_case(name)
+    if rename.new.removeprefix("r#") != expected or rename.old.removeprefix("r#") == expected:
+        return NoBindingScope("current parameter does not prove the proposed type-named rule")
+    return declaration
 
 
 @dataclass(frozen=True)
@@ -439,6 +763,11 @@ class _BindingScan:
             if index in self.ends:
                 stack.append(index)
         self.macros: tuple[tuple[int, int], ...] = style_footprint.macro_spans(self.words, self.ends)
+        self.named_items: tuple[tuple[int, int], ...] = tuple(
+            (index, self.ends.get(end, end) + 1)
+            for index in sorted(style_footprint.code_item_starts(self.words))
+            if index < len(self.words) and self.words[index] in ITEM_KEYWORDS
+            for end in (self.stop(index + 1, self.block_end(index), frozenset({"{", ";"})),))
         self.macro_origins_uncertain: bool = self._uncertain_macro_origins()
         self.sites: tuple[PatternSite, ...] = self._pattern_sites()
         self.formats: frozenset[int] = self._format_arguments()
@@ -587,7 +916,16 @@ class _BindingScan:
                       if self.tokenized.lines[index] == nearest[0] and self.binding_word(site, index, rename.old)]
         if len({index for index, _ in candidates}) != 1:
             return NoBindingScope("finding line does not hold exactly one binding")
-        declaration, site = min(candidates, key=lambda found: found[1].end - found[1].start)
+        declaration, _ = min(candidates, key=lambda found: found[1].end - found[1].start)
+        return self.scope_at(declaration)
+
+    def scope_at(self, declaration: int) -> BindingScope | NoBindingScope:
+        """Keep the exact declaration token through the existing visibility proof."""
+        name = self.words[declaration]
+        candidates = [site for site in self.sites if self.binding_word(site, declaration, name, raw=True)]
+        if not candidates:
+            return NoBindingScope("declaration token has no binding scope")
+        site = min(candidates, key=lambda found: found.end - found.start)
         if site.kind in {"condition let", "let"}:
             end = self.block_end(site.start)
             scrutinee = self.stop(site.end, end, frozenset({"="})) + 1
@@ -612,15 +950,10 @@ class _BindingScan:
                 return NoBindingScope("for iterator contains a block before its body")
         hidden = [(begin, finish) for other in self.sites if other != site
                   and _contains(site.ranges, other.start)
-                  and any(self.binding_word(other, index, rename.old) for index in range(other.start, other.end))
+                  and any(self.binding_word(other, index, name, raw=True) for index in range(other.start, other.end))
                   for begin, finish in other.ranges]
         # Named items cannot capture their surrounding local bindings.
-        starts = style_footprint.item_starts(self.words)
-        for index in starts:
-            if index >= len(self.words) or not _contains(site.ranges, index) or self.words[index] not in ITEM_KEYWORDS:
-                continue
-            end = self.stop(index + 1, self.block_end(index), frozenset({"{", ";"}))
-            hidden.append((index, self.ends.get(end, end) + 1))
+        hidden.extend((start, end) for start, end in self.named_items if _contains(site.ranges, start))
         ranges = list(site.ranges)
         for begin, finish in hidden:
             ranges = [(a, b) for start, end in ranges for a, b in
@@ -755,6 +1088,169 @@ class _BindingScan:
                   and site.start <= scope.declaration < site.end}
         return any(site.ranges[-1] in bodies and any(self.binding_word(site, i, name) for i in range(site.start, site.end))
                    for site in self.sites if site.kind == scope.kind)
+
+    def declaration(self, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
+        lines = [i for i, text in enumerate(self.source.splitlines(), 1) if text.strip() == rename.text.strip()]
+        if not lines:
+            return NoBindingScope("finding text is absent")
+        distance = min(abs(line - rename.line) for line in lines)
+        nearest = [line for line in lines if abs(line - rename.line) == distance]
+        if len(nearest) != 1:
+            return NoBindingScope("finding location is tied")
+        return self.declaration_on_line(rename, nearest[0])
+
+    def declaration_on_line(self, rename: BindingRename, line: int) -> RenameDeclaration | NoBindingScope:
+        """Classify the coordinate with the same declaration reader, independently of line bytes."""
+        indexes = {i for i, span in enumerate(self.spans) if self.tokenized.lines[i] == line
+                   and span.token.value.removeprefix("r#") == rename.old.removeprefix("r#")}
+        candidates: dict[int, BindingScope] = {}
+        for site in self.sites:
+            for i in indexes:
+                if self.binding_word(site, i, rename.old, raw=True):
+                    candidates[i] = BindingScope(site.kind, i, site.ranges)
+        # A preceding keyword is not an item proof: e.g. `const g` can be
+        # a generic parameter. Reuse the closed item reader's statement/item
+        # positions, including its delimiter and attribute/visibility grammar.
+        reading = finding_sites.SourceSites(self.source).item_reading
+        items = () if isinstance(reading, finding_sites.UnreadableSourceItems) else reading
+        attributes = dict(style_footprint.attribute_spans(self.words))
+        for item in items:
+            start = item.token_start
+            while start in attributes:
+                start = attributes[start]
+            header = item.header_reading
+            if isinstance(header, finding_sites.UnreadItemHeader):
+                continue
+            keyword = header.keyword
+            word = self.words[keyword]
+            name = keyword + (2 if word == "macro_rules" or self.words[keyword:keyword + 2] == ("static", "mut") else 1)
+            if word in ITEM_KEYWORDS | {"macro_rules"} and name in indexes and name not in candidates:
+                candidates[name] = BindingScope("item", name, ((item.token_start, item.token_end),))
+            if word not in {"struct", "enum", "union"}:
+                continue
+            body_reading = item.body_reading
+            if isinstance(body_reading, finding_sites.UnreadItemBody):
+                continue
+            body = body_reading.tokens.start
+            if body not in self.ends or self.words[body] != "{":
+                continue
+            # A field exemption needs a direct field position. Descendants of
+            # its type/initializer delimiters are expressions, never fields.
+            fields: frozenset[int] = field_sites(self.words, body, self.ends[body]) if word != "enum" else frozenset()
+            variants: set[int] = set()
+            if word == "enum":
+                for enum in style_footprint.enum_bodies(self.words):
+                    if enum.start != body:
+                        continue
+                    variants.update(enum.variants)
+                    for variant in enum.variants:
+                        opening = variant + 1
+                        if self.words[opening:opening + 1] == ("{",) and opening in self.ends:
+                            fields |= field_sites(self.words, opening, self.ends[opening])
+            for i in indexes:
+                if i not in candidates and (i in fields or i in variants):
+                    candidates[i] = BindingScope("field" if i in fields else "variant", i,
+                                                 ((start, self.ends[body] + 1),))
+        if len(candidates) != 1:
+            return NoBindingScope("finding line has no unique declaration of " + repr(rename.old))
+        index, scope = next(iter(candidates.items()))
+        # Reuse precise shadowing ranges where available, without any file-wide refusal.
+        if scope.kind not in {"field", "variant", "item"}:
+            local = self.scope_at(index)
+            if isinstance(local, NoBindingScope):
+                return NoBindingScope(local.reason)
+            scope = local
+        return RenameDeclaration(self.spans[index].start, scope)
+
+    def outer_binding(self, scope: BindingScope, name: str) -> OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock:
+        """Item-local absence policy; the pattern reader supplies binding diagnostics only."""
+        if scope.kind in {"field", "variant", "item"}:
+            return NoOuterBindingBlock()
+        target = scope.declaration
+        reading = finding_sites.SourceSites(self.source).item_reading
+        if isinstance(reading, finding_sites.UnreadableSourceItems):
+            return OuterBindingUnproved("containing item unread: " + str(reading), self.tokenized.lines[target], self.source.splitlines()[self.tokenized.lines[target] - 1])
+        enclosing = tuple(item for item in reading if item.token_start <= target < item.token_end)
+        if not enclosing:
+            return OuterBindingUnproved("target has no established containing item", self.tokenized.lines[target], self.source.splitlines()[self.tokenized.lines[target] - 1])
+        if any(sum(other.identity == owner.identity for other in reading) != 1 for owner in enclosing):
+            return OuterBindingUnproved("recorded item path is not unique in current source", self.tokenized.lines[target], self.source.splitlines()[self.tokenized.lines[target] - 1])
+        return self.item_presence(enclosing, target, name)
+
+    def item_presence(self, enclosing: tuple[finding_sites.EnclosingItem, ...], target: int,
+                      name: str) -> OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock:
+        """Read the current item for refusal evidence without granting local admission."""
+        item = max(enclosing, key=lambda owner: owner.token_start)
+        region = set(range(item.token_start, item.token_end))
+        for owner in enclosing:
+            if owner.kind in {"impl", "trait"}:
+                header = owner.header_reading
+                if isinstance(header, finding_sites.UnreadItemHeader):
+                    return OuterBindingUnproved("containing item header unread", self.tokenized.lines[target])
+                region.update(range(owner.token_start, header.end))
+        # Attributes belong to every enclosing item, including the containing module.
+        attributes = style_footprint.attribute_owners(self.words)
+        try:
+            policy: dict[str, object] = tomllib.loads(Path(__file__).with_name("rename_policy.toml").read_text())
+            inert = policy.get("inert_attributes")
+            standard = policy.get("std_macros")
+            if not isinstance(inert, list) or not all(isinstance(word, str) for word in cast(list[object], inert)):
+                raise ValueError("inert_attributes must be a list of names")
+            if not isinstance(standard, list) or not all(isinstance(word, str) for word in cast(list[object], standard)):
+                raise ValueError("std_macros must be a list of names")
+        except (OSError, ValueError) as error:
+            return OuterBindingUnproved("rename presence policy unread: " + str(error))
+        enclosing_braces = {opening for opening, closing in self.ends.items()
+                            if self.words[opening] == "{" and opening < target < closing}
+        for start, finish in style_footprint.attribute_spans(self.words):
+            owner = attributes.get(start, -1)
+            inner = self.words[start + 1:start + 2] == ("!",)
+            # Inner attributes belong to their brace scope, not the following item.
+            # One brace ancestry applies equally to items and statement scopes.
+            parent = self.parents.get(start, -1)
+            inherited_inner = inner and (parent == -1 or parent in enclosing_braces)
+            if not (inherited_inner or start in region or any(
+                    item.token_start <= start <= owner < item.header_reading.end
+                    for item in enclosing if isinstance(item.header_reading, finding_sites.ReadItemHeader))):
+                continue
+            at = start + (3 if self.words[start + 1:start + 2] == ("!",) else 2)
+            name_at = self.plain_words[at] if at < finish else "<unread>"
+            if name_at not in inert or self.words[at + 1:at + 2] == ("::",):
+                line = self.tokenized.lines[start]
+                return OuterBindingUnproved(f"unresolved attribute macro {name_at!r} at line {line}",
+                                            line, self.source.splitlines()[line - 1])
+        for bang, finish in self.macros:
+            if bang in region:
+                macro = self.plain_words[bang - 1]
+                start = bang - 1
+                while start >= 2 and self.words[start - 1] == "::":
+                    start -= 2
+                prefixes = frozenset[tuple[str, ...]]() if self.macro_origins_uncertain else style_footprint.STANDARD_PATH_PREFIXES
+                unresolved = style_footprint.macro_refusal(self.plain_words[start:finish], frozenset({macro}), prefixes)
+                if macro not in standard or unresolved:
+                    line = self.tokenized.lines[bang]
+                    return OuterBindingUnproved(f"unresolved bang macro {macro!r} at line {line}",
+                                                line, self.source.splitlines()[line - 1])
+        wanted = name.removeprefix("r#")
+        occurrences = tuple(index for index in sorted(region)
+                            if self.tokenized.tokens[index].kind == "identifier" and self.plain_words[index] == wanted)
+        for index in occurrences:
+            for site in self.sites:
+                if not _contains(site.ranges, target) or not self.binding_word(site, index, wanted, raw=True):
+                    continue
+                outer = self.scope_at(index)
+                if isinstance(outer, BindingScope) and _contains(outer.ranges, target):
+                    line = self.tokenized.lines[index]
+                    return OuterBindingBlocked(f"rename blocked by outer binding {wanted!r} at line {line}",
+                                               wanted, line, self.source.splitlines()[line - 1])
+        if occurrences:
+            line = self.tokenized.lines[occurrences[0]]
+            return OuterBindingUnproved(f"wanted name already used in this item: {wanted!r} at line {line}",
+                                        line, self.source.splitlines()[line - 1])
+        if any(isinstance(owner.body_reading, finding_sites.UnreadItemBody) for owner in enclosing):
+            return OuterBindingUnproved("containing item body unread", self.tokenized.lines[target],
+                                        self.source.splitlines()[self.tokenized.lines[target] - 1])
+        return NoOuterBindingBlock()
 
     def unread_binding(self, scope: BindingScope, rename: BindingRename) -> bool:
         """Refuse scoping syntax the scan cannot account for, including bindings inside macro token trees."""
@@ -1012,6 +1508,18 @@ def binding_rename_check(path: str, before: str, after: str, renames: tuple[Bind
     return BindingProof(checks, refusals, alignment and comments_explained and all(edit in explained for edit in edits), line_map)
 
 
+def binding_admission_check(before: str, renames: tuple[BindingRename, ...], proof: BindingProof, *,
+                            current: str) -> BindingProof:
+    """Compose local admission with edit proof; explicitly nonlocal companions confer no binding approval."""
+    checks, refusals = dict(proof.checks), dict(proof.refusals)
+    for rename in renames:
+        admission = current_rename_admission(current, rename, before, companions=renames)
+        if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+            checks[rename] = admission
+            refusals[rename] = admission.reason
+    return BindingProof(checks, refusals, proof.explained and checks == proof.checks, proof.line_map)
+
+
 def _check_binding_comments(before: _BindingScan, after: _BindingScan, aligned: Mapping[int, int],
                             plans: tuple[BindingComments, ...]) -> tuple[bool, frozenset[int]]:
     """Every comment stays at its aligned code boundary and changes only by planned mention replacements."""
@@ -1145,15 +1653,6 @@ def field_sites(words: tuple[str, ...], start: int, end: int) -> frozenset[int]:
             cursor += 1
         cursor += 1
     return frozenset(sites)
-
-
-def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The segments of the type or trait path that the words of an impl header name, or none when it is not a path."""
-    finish = next((i for i, word in enumerate(words) if word in {"<", "where"}), len(words))
-    path = words[:finish]
-    readable = len(path) % 2 == 1 and all(
-        word == "::" if i % 2 else style_footprint.IDENTIFIER.fullmatch(word) is not None for i, word in enumerate(path))
-    return path[::2] if readable else ()
 
 
 def inline_modules(words: tuple[str, ...], starts: frozenset[int]) -> tuple[InlineModule, ...]:

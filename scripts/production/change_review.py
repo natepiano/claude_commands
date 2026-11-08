@@ -1,101 +1,65 @@
-#!/usr/bin/env python3
-"""The change-review list: the trailer every checkpoint commit carries, and the rows a merge adds.
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+"""Read checkpoint trailers and write change review rows.
 
-    change_review.py check --repo R --checkpoint C --previous P --merge-branch B
-    change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
-    change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
-    change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
-    change_review.py show [--production DOC] [--list L]
-    change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
-    change_review.py mark-important [--production DOC] [--list L] --row ID
-    change_review.py list-path [--production DOC]
-    change_review.py showrunner [--production DOC]
-    change_review.py backfill-production [--list L] [--write]
+A visible trailer has three fields and an optional fourth field: after <step>.
+An invisible change uses Change-Review: none — <reason>.
+See commands/change_review.md for actions, list selection, urgency, verdicts, and scratch folders.
 
-A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
-see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
-<what you see>`, three parts split on " | ", where "where" names the machine (natedev or the Mac) and
-the session (a terminal, a showrunner session, a unit session or any Claude session). For example:
-`Change-Review: Panels keep their shields | In a natedev terminal, run `hana` | Each panel shows its
-shield`. A line with another number of parts, or an empty part, is refused. `Change-Review: none —
-<why nothing visible changes>` names a change the user cannot see. A checkpoint that changes only
-Markdown needs none. A pushed checkpoint that
-missed its line is covered by a later one carrying the lines and `Change-Review-Covers: <hash>`. The merge gate refuses a
-unit's checkpoint without one, then adds one row per visible line under the list's "## To review":
-the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
-see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
-row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
-its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date, and removes the row's scratch folders and held folders (task `row:<showrunner>-C<n>`,
-scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
-checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
+An open Production cell holds its unit's fixed staff id or its showrunner's fixed staff id.
+Readers resolve current names and the unit's current parent.
+Reviewed rows retain the production name recorded at the verdict.
+Unknown owner names remain unresolved.
 
-Each row's Production cell names the production whose change it is: the production whose Units
-table names the branch of the checkpoint that carries the row's line (`visible_owners`), else the
-merging one. `backfill-production` fills the empty cells of older rows under To review, in the list
---list names or in every list, from the row's merge hash: the checkpoint that names the row's
-change, else the one production of every checkpoint the merge brought in. It prints each cell it
-fills and each row it cannot trace, with why, and writes only with --write.
-
-To review keeps the order of urgency.py, rewritten on every write: the row `show` last printed
-first until its verdict, then by urgency, then by C number. A row's Urgency cell holds its level,
-due time and prerequisite (`soon, due 2026-10-22, after C3`); it is empty for a normal row, and a
-list gains the column on its first row that needs it. Every write holds a lock on the list's directory, and the first write to a missing list
-creates it from the skeleton. Every write sets the frontmatter's date_modified and adds the
-writing production's doc to its productions. A list in a git work tree is committed alone after
-each write, still under the lock, and never pushed; a refused commit warns and the next write
-commits it.
-
-Each top-level showrunner keeps one list, `change-review/change-review - <showrunner>.md`, and a
-child production's rows go to its root's list. A production opts in with a `- **Change review:**
-<path>` line in its Production Context. While the root showrunner runs, its session name names the
-list; otherwise the line's path does. `list-path` prints the list and `showrunner` the name, each
-from the calling showrunner's update timer when no doc is given; add, show and verdict find the
-list the same way unless --list names one; edit does too. Every write names its production, the same way.
-For edit, verdict and mark-important, --row takes the ID /next printed: C434 selects the current
-list; production/C9 selects that production's named list. An explicit --list must match that name.
-With a production, show reads its current and earlier lists and keeps the same pin as /next.
-Rows in other lists carry their list name; current-list rows keep their plain IDs. Without a
-production, show --list reads every row in that explicit list.
+Run backfill-production [--list PATH] [--write] to resolve empty cells from recorded merge history.
+List writes hold the directory lock. Normal writes update metadata and commit only the list.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
 import os
 import re
+import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+from scripts.lib import scratch  # noqa: E402
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from atomic_file import write_text_atomic  # noqa: E402
-import scratch  # noqa: E402
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-
-# The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import issues  # noqa: E402
-from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
-from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
+from scripts.production import issues  # noqa: E402
+from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
+from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup
+from scripts.production.production_doc import Refusal, production_field
+from scripts.shutdown import remote
 
 TRAILER = "Change-Review"
+COVERS = f"{TRAILER}-Covers"
+HELD_NEXT_STEP = (f"commit a checkpoint (a plain commit, not a merge: a merge may carry only `{TRAILER}: none` lines) "
+                  + f"whose {TRAILER} lines describe the change and that names each "
+                  + f"listed commit in a `{COVERS}: <hash>` line, push it, and send its hash")
 LIST_HEADER = "- **Change review:**"
 SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
 URGENCY = "Urgency"
-# The production a row's change is from: its slug. A row from before the column is the root's.
+# Open rows hold the owner's fixed staff id. Reviewed rows keep their recorded production.
 PRODUCTION = "Production"
+PRODUCER = change_routing.PRODUCER
+KIND = "Kind"
+REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -103,19 +67,23 @@ SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
 CHECKED_FROM = 1792036800
 LANDED = "2026-10-15"
+# Scan only merges made after the readiness rule starts.
+READY_FROM = "2026-11-06"
+_CURRENT_REPO = Path(".")
 _NONE = re.compile(r"^none\s*[—–-]+\s*(?P<why>\S.*)$")
 _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
-_COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
+_COVERS = re.compile(rf"^{COVERS}:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
 _LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
+_BREAK_TAG = re.compile(r"<(\\*)br>")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
-LISTS = Path(os.environ.get("CHANGE_REVIEW_DIR") or Path.home() / "rust/hanadocs/change-review")
+lists_directory = change_routing.lists_directory
 PREFIX = "change-review - "
 FENCE = "---"
 PRODUCTIONS = "productions"
@@ -138,10 +106,21 @@ Result = TypeVar("Result")
 
 
 @dataclass(frozen=True)
+class ReadyNow:
+    """The change needs no further live step."""
+
+
+@dataclass(frozen=True)
+class AfterStep:
+    step: str
+
+
+@dataclass(frozen=True)
 class Visible:
     change: str
     check: str
     see: str
+    readiness: ReadyNow | AfterStep = ReadyNow()
 
     def how(self) -> str:
         """The row's How to check cell: how to try the change, then what the user sees."""
@@ -181,11 +160,19 @@ def parse(value: str) -> Entry:
     parts = [part.strip() for part in text.split(SEPARATOR)]
     if len(parts) == 3 and all(parts):
         return Visible(parts[0], parts[1], parts[2])
+    if (len(parts) == 4 and all(parts) and parts[3].startswith("after ")
+            and (step := parts[3].removeprefix("after ").strip())):
+        return Visible(parts[0], parts[1], parts[2], AfterStep(step))
     return Malformed(text)
 
 
 def entries(message: str) -> list[Entry]:
     return [parse(found.group("value")) for found in _LINE.finditer(message)]
+
+
+def checkpoint_changes(message: str) -> tuple[str, ...]:
+    """The visible change names in a checkpoint message."""
+    return tuple(item.change for item in entries(message) if isinstance(item, Visible))
 
 
 def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
@@ -202,8 +189,17 @@ def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
+    return ""
+
+
+def merge_review_problem(message: str, *, is_merge: bool) -> str:
+    """Merge messages allow only review lines that parse as Invisible."""
+    if is_merge and (any(not isinstance(item, Invisible) for item in entries(message))
+                     or re.search(rf"^{COVERS}:", message, re.MULTILINE)):
+        return (f"Merge commits cannot carry visible {TRAILER} or {COVERS} lines. "
+                + "Put the lines on a plain commit after the merge")
     return ""
 
 
@@ -212,6 +208,20 @@ def _git(repo: Path, *arguments: str) -> str:
     if result.returncode:
         raise ChangeReviewError(f"git {' '.join(arguments)}: {result.stderr.strip()}")
     return result.stdout
+
+
+def on_main(repo: Path, merged: str) -> bool:
+    """Return whether origin/main contains the requested commit."""
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", merged, "origin/main"],
+                          capture_output=True, check=False).returncode == 0
+
+
+def _require_main(repo: Path, merged: str) -> None:
+    if not on_main(repo, merged):
+        raise ChangeReviewError(
+            f"{merged} is not on origin/main; no row added. "
+            + "A change goes on the list only when the user can check it now. "
+            + "If it just landed, run git fetch and retry.")
 
 
 def registered_productions() -> Iterable[Path]:
@@ -227,7 +237,8 @@ def common_git_directory(repo: Path) -> Path:
     return (repo / directory).resolve()
 
 
-def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -> list[str]:
+def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]], *,
+                        record: staff.StaffSnapshot | None = None) -> list[str]:
     """Origin branches whose readable productions in this repository already write review rows."""
     try:
         common = common_git_directory(repo)
@@ -239,7 +250,7 @@ def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -
     for doc in docs:
         try:
             lines = doc.read_text(encoding="utf-8").splitlines()
-            if list_path(doc) is None:
+            if list_path(doc, record=record) is None:
                 continue
             where = Path(production_field(lines, "Repository")).expanduser()
             if common_git_directory(where) != common:
@@ -257,10 +268,19 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
                  productions: Callable[[], Iterable[Path]] = registered_productions) -> list[Commit]:
     """The unit's commits, excluding origin merge branches that already write review rows."""
     excluded = list(dict.fromkeys([f"origin/{merge_branch}", *reviewed_merge_refs(repo, productions)]))
-    records = _git(repo, "log", "--no-merges", "--format=%H %ct", checkpoint, f"^{previous}",
-                   *(f"^{ref}" for ref in excluded), "--").splitlines()
-    return [Commit(sha, *_described(repo, sha)) for sha, stamp in (record.split() for record in records)
-            if int(stamp) >= checked_from]
+    records = _git(repo, "log", "-z", "--format=%H %ct %P%n%B", checkpoint, f"^{previous}",
+                   *(f"^{ref}" for ref in excluded), "--").split("\0")
+    commits: list[Commit] = []
+    for record in filter(str.strip, records):
+        header, message = record.split("\n", 1)
+        sha, stamp, *parents = header.split()
+        if int(stamp) < checked_from:
+            continue
+        if len(parents) < 2:
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha)))
+        elif reason := merge_review_problem(message, is_merge=True):
+            raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
+    return commits
 
 
 def missing(commits: list[Commit]) -> list[str]:
@@ -275,10 +295,17 @@ def missing(commits: list[Commit]) -> list[str]:
             and not any(commit.sha.startswith(sha) for sha in covered)]
 
 
+def _checkpoint_entries(commits: list[Commit]) -> Iterable[tuple[Commit, Visible]]:
+    for commit in reversed(commits):
+        if commit.subject.startswith("checkpoint("):
+            for item in entries(commit.message):
+                if isinstance(item, Visible):
+                    yield commit, item
+
+
 def visible(commits: list[Commit]) -> list[Visible]:
-    """Every visible change a checkpoint names, also one whose files are all Markdown and need no line."""
-    return [item for commit in reversed(commits) if commit.subject.startswith("checkpoint(")
-            for item in entries(commit.message) if isinstance(item, Visible)]
+    """Read each visible change from checkpoint commits."""
+    return [item for _, item in _checkpoint_entries(commits)]
 
 
 def _line_value(doc: Path) -> str | None:
@@ -292,18 +319,19 @@ def _line_value(doc: Path) -> str | None:
     return None
 
 
-def list_path(doc: Path) -> Path | None:
-    """The production's list, or None when its doc has no Change review line.
+def list_path(doc: Path, *,
+              record: staff.StaffSnapshot | None = None) -> Path | None:
+    """Return the root showrunner's list, or the document's path when its owner cannot be resolved.
 
-    The list is named for the top-level showrunner while it runs; otherwise it is the path the
-    line names. A line naming another path than the showrunner's list is warned about.
+    Return None when the document has no Change review line.
+    Report a different path in that line.
     """
     value = _line_value(doc)
     if value is None:
         return None
     named = Path(value).expanduser() if value else None
     try:
-        derived = list_file(showrunner_of(doc))
+        derived = list_file(showrunner_of(doc, record=record))
     except (ChangeReviewError, OSError):
         return named
     if named is not None and named.absolute() != derived.absolute():
@@ -322,11 +350,18 @@ def today() -> date:
 
 
 def _cell(text: str) -> str:
-    return text.replace("|", "\\|")
+    """Encode a cell as one table line.
+
+    A final line separator can drop because callers strip cell text.
+    """
+    escaped = _BREAK_TAG.sub(lambda match: "<\\" + match[1] + "br>", text.replace("|", "\\|"))
+    return "<br>".join(escaped.splitlines())
 
 
 def _plain(cell: str) -> str:
-    return cell.replace("\\|", "|")
+    """Decode line breaks and remove one backslash from each typed break tag."""
+    return _BREAK_TAG.sub(lambda match: "<" + match[1][1:] + "br>" if match[1] else "\n",
+                          cell.replace("\\|", "|"))
 
 
 def _cells(line: str) -> list[str]:
@@ -346,7 +381,7 @@ def read(path: Path) -> str:
 
 def list_file(showrunner: str) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
-    return LISTS / f"{PREFIX}{showrunner}.md"
+    return lists_directory() / f"{PREFIX}{showrunner}.md"
 
 
 def _owner(path: Path) -> str:
@@ -428,9 +463,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
     frontmatter for `production` on `day`. `what` names the write in the commit subject.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        fcntl.flock(directory, fcntl.LOCK_EX)
+    with _list_lock(path):
         text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
         lines = text.splitlines(keepends=True)
         result = write(lines)
@@ -442,8 +475,6 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         write_text_atomic(path, "".join(lines))
         _commit(path, what(result))
         return result
-    finally:
-        os.close(directory)
 
 
 def _commit(path: Path, what: str) -> None:
@@ -490,11 +521,15 @@ def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, 
     return _cells(lines[header]), min(header + 2, end), end
 
 
+def _join_cells(cells: Iterable[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
 def _row(path: Path, columns: list[str], values: dict[str, str]) -> str:
     """A row with each column's value, in the table's own column order."""
     if unknown := [column for column in columns if column not in values]:
         raise ChangeReviewError(f"{path}: no value for the `{unknown[0]}` column")
-    return "| " + " | ".join(values[column] for column in columns) + " |"
+    return _join_cells(values[column] for column in columns)
 
 
 def _insert(lines: list[str], at: int, rows: list[str]) -> None:
@@ -563,44 +598,125 @@ def _sort(path: Path, lines: list[str]) -> None:
     lines[first:end] = [rows[row["#"]] for row in ordered(named, path)]
 
 
-def append_rows(path: Path, changes: list[Visible], day: date, merged: str, production: Path,
-                rank: str = "", owners: Sequence[Path] = ()) -> list[str]:
-    """Add one row per change to the To review table; return the rows written.
+def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day: date, merged: str, production: Path,
+                rank: str = "", owners: Sequence[Path] = (),
+                producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
+                record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
+                on_hold: Callable[[PublicationChange], None] | None = None,
+                merge_changes: Sequence[PublicationChange] = ()) -> list[str]:
+    """Add changes to To review with fixed staff IDs from record.
 
-    `merged` is the merge's hash, or empty for a change no merge names. The Mac build column is
-    written only when the table has one. `production` is the doc whose change the rows are.
-    `rank` is the rows' Urgency cell; empty is a normal row. The Production column takes the
-    production's slug, so /next in a showrunner below the root shows only its own rows. `owners`,
-    when given, holds each change's own production doc (`visible_owners`); else every row is
-    `production`'s.
+    owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
+    merge_changes supplies every change of this merge routed to this list.
     """
     if not changes:
         return []
+    items = [change.item if isinstance(change, PublicationChange) else change for change in changes]
+    row_owners = [change.source.production if isinstance(change, PublicationChange) and isinstance(change.source, UnitSource)
+                  else owners[index] if owners else production for index, change in enumerate(changes)]
+    row_producers = [change.producer if isinstance(change, PublicationChange)
+                     else producers[index] if producers else UnknownProducer() for index, change in enumerate(changes)]
+
+    identities = [str(unit_lookup.doc_owner(owner, record).id)
+                  if isinstance(change, PublicationChange)
+                  else str(producer) if isinstance(producer, str) else row_production(owner, record)
+                  for change, owner, producer in zip(changes, row_owners, row_producers)]
+    unregistered: set[str] = set()
 
     def write(lines: list[str]) -> list[str]:
+        existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
+        covered = _merge_covered(existing, merge_changes, repo, merged)
+        selected: list[int] = []
+        for index, change in enumerate(changes):
+            if isinstance(change, PublicationChange):
+                if change in covered or (not merge_changes and _covered(existing, change, repo)):
+                    continue
+                if isinstance(change.item.readiness, AfterStep) and on_hold is not None:
+                    on_hold(change)
+                    continue
+                existing.append({"Change": change.item.change, "Merged": merged})
+            selected.append(index)
+        if not selected:
+            return []
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
         _add_column(path, lines, SECTION, PRODUCTION)
+        _add_column(path, lines, SECTION, PRODUCER)
         columns, first, end = _table(path, lines, SECTION)
-        if merged and (held := _held(columns, lines[first:end], changes, merged)):
+        plain = [change for change in changes if isinstance(change, Visible)]
+        if merged and (held := _held(columns, lines[first:end], plain, merged)):
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
-        rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
-                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
-                                     PRODUCTION: _cell(row_production(owners[offset] if owners else production))})
-                for offset, item in enumerate(changes)]
+        rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
+                                     "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
+                                     KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
+                                     PRODUCTION: _cell(identities[index])})
+                for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
+        unregistered.update(change.unit_name for index in selected
+                            if isinstance(change := changes[index], PublicationChange)
+                            and isinstance(change.producer, UnknownProducer) and change.unit_name)
         return rows
 
     def what(rows: list[str]) -> str:
+        if not rows:
+            return "no new rows"
         ids = [row_id(row) for row in rows]
         named = ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"
         if not merged:
             return f"add {named}"
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
-    return _edit(path, production, day, write, what)
+    rows = _edit(path, production, day, write, what)
+    for name in sorted(unregistered):
+        print(f"change review: no staff row for unit {name}; Producer stays empty")
+    return rows
+
+
+def _covered(rows: list[dict[str, str]], change: PublicationChange, repo: Path) -> bool:
+    """A matching row covers checkpoints that its merge already contains."""
+    for row in rows:
+        if row.get("Change") != change.item.change:
+            continue
+        merged = _HASH.search(row.get("Merged", ""))
+        if merged is None:
+            return True
+        known = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{merged[0]}^{{commit}}"],
+                               capture_output=True, check=False)
+        if known.returncode:
+            return True
+        ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", change.checkpoint, merged[0]],
+                                  capture_output=True, check=False)
+        if ancestor.returncode == 0:
+            return True
+    return False
+
+
+def _merge_covered(rows: list[dict[str, str]], changes: Sequence[PublicationChange],
+                   repo: Path, merged: str) -> list[PublicationChange]:
+    """Use text matches first, then pair merge rows with ready changes and held changes from one step."""
+    covered: list[PublicationChange] = []
+    used: set[int] = set()
+    for change in changes:
+        for index, row in enumerate(rows):
+            if _covered([row], change, repo):
+                covered.append(change)
+                used.add(index)
+                break
+    uncovered = [change for change in changes if change not in covered]
+    ready = [change for change in uncovered if isinstance(change.item.readiness, ReadyNow)]
+    held = [change for change in uncovered if isinstance(change.item.readiness, AfterStep)]
+    steps = {change.item.readiness.step for change in held if isinstance(change.item.readiness, AfterStep)}
+    remaining = iter(ready + (held if len(steps) == 1 else []))
+    for index, row in enumerate(rows):
+        found = _HASH.search(row.get("Merged", ""))
+        if index not in used and found is not None and (found[0].startswith(merged) or merged.startswith(found[0])):
+            change = next(remaining, None)
+            if change is None:
+                break
+            covered.append(change)
+    return covered
 
 
 def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: str) -> str:
@@ -620,23 +736,25 @@ def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: s
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
-    columns, first, end = _table(path, lines, SECTION)
-    return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+    return _review_table(path, lines, SECTION)
 
 
-def scope_list(doc: Path) -> Path:
+def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
-    from scripts.production import showrunners
-    import showrunner_tree
 
-    slug = slug_of(doc)
-    root = showrunner_tree.root_of(slug)
+    if doc.is_file() and (value := _line_value(doc)):
+        return Path(value).expanduser()
+    record = staff.snapshot() if record is None else record
+    name = unit_lookup.doc_owner(doc, record).name
+    if not doc.is_file():
+        return list_file(name)
+    root = showrunner_tree.root_of(name, record=record)
     try:
-        return production_list(str(doc))
+        return production_list(name, record=record)
     except ChangeReviewError:
-        if slug == root:
+        if name == root:
             raise
-        return production_list(str(showrunners.timer_docs().get(root, doc)))
+        return production_list(root, record=record)
 
 
 @dataclass(frozen=True)
@@ -651,33 +769,83 @@ class ScopedReviewEntry:
     entry: urgency.Entry[dict[str, str]]
 
 
-def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
+def scope_lists(path: Path, doc: Path, below: bool = False, *,
+                record: staff.StaffSnapshot | None = None) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunner_tree
-
-    lists = {path.absolute(): ProductionReviewList(path, showrunner_tree.root_of(slug_of(doc)))}
-    for production in scope_docs(doc, below):
-        slug = slug_of(production)
-        earlier = list_file(slug)
+    record = staff.snapshot() if record is None else record
+    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_of(doc, record=record)
+    lists = {path.absolute(): ProductionReviewList(path, owner)}
+    for production in scope_docs(doc, below, record=record):
+        name = unit_lookup.doc_owner(production, record).name
+        earlier = list_file(name)
         if earlier.absolute() in lists or earlier.exists():
-            lists[earlier.absolute()] = ProductionReviewList(earlier, slug)
+            lists[earlier.absolute()] = ProductionReviewList(earlier, name)
     return tuple(lists.values())
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
-    """Read and rank each list independently; a bad list leaves the others in the queue."""
-    scope = {slug_of(each) for each in scope_docs(doc, below)}
-    entries: list[ScopedReviewEntry] = []
-    for review_list in scope_lists(path, doc, below):
+def routed_review_entries(path: Path, doc: Path, below: bool = False,
+                          record: staff.StaffSnapshot | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Read all source lists before the shared staff rule assigns their rows."""
+    return _routed_review_entries(path, doc, below, record if record is not None else staff.snapshot())
+
+
+def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route all rows with one consistent staff snapshot."""
+    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below, record=record)}
+    for source in lists_directory().glob(PREFIX + "*.md"):
+        _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
+    documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
+                 if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
+    snapshots: dict[Path, ReviewListSnapshot] = {}
+    for source in listed:
         try:
-            rows = [row for row in pending(review_list.path)
-                    if (row.get(PRODUCTION) or review_list.default_production) in scope]
-            ranked = row_entries(rows)
+            snapshot = review_snapshot(source)
         except (ChangeReviewError, OSError, UnicodeError) as error:
-            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+            print(f"change review: {source}: {error}", file=sys.stderr)
             continue
-        entries.extend(ScopedReviewEntry(review_list, entry) for entry in ranked)
-    return entries
+        snapshots[source] = snapshot
+    documents = change_routing.production_documents(documents,
+        ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
+    routing = change_routing.StaffRouting(record, documents)
+    names = {path.name for path in change_routing.review_root().glob(".review-link-delivery-*")}
+    routed: list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]] = []
+    for source, snapshot in snapshots.items():
+        rows = change_routing.waiting_rows(source, snapshot.pending, names)
+        try:
+            entries = row_entries(rows)
+        except ChangeReviewError as error:
+            print(f"change review: {source}: {error}", file=sys.stderr)
+            continue
+        routed.extend((listed[source], routing.owner(entry.item, source), entry.item) for entry in entries)
+    return routed
+
+
+def review_scope(doc: Path, below: bool, record: staff.StaffSnapshot) -> set[str]:
+    """Name the staff tabs counted for this production."""
+    documents = set(scope_docs(doc, below, record=record))
+    scope = {member.name for member in record.rows
+             if member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+             and member.doc.path in documents}
+    return scope
+
+
+def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+    """Use the same staff tab as the change page."""
+    record = staff.snapshot()
+    scope = review_scope(doc, below, record)
+    grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
+    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+        if owner.tab in scope:
+            if review_list.path not in grouped:
+                grouped[review_list.path] = (review_list, [])
+            grouped[review_list.path][1].append(row)
+    found: list[ScopedReviewEntry] = []
+    for review_list, rows in grouped.values():
+        try:
+            found.extend(ScopedReviewEntry(review_list, entry) for entry in row_entries(rows))
+        except ChangeReviewError as error:
+            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+    return found
 
 
 def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
@@ -718,84 +886,216 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(pending(path)))
-    import showrunner_tree
+        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
 
-    slug = slug_of(scope)
-    name = queue(path) if slug == showrunner_tree.root_of(slug) else f"{queue(path)}-{slug}"
+    record = staff.snapshot()
+    name = unit_lookup.doc_owner(scope, record).name
+    name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
-def row_production(production: Path) -> str:
-    """The Production cell for a change of the production doc `production`: the slug of the production
-    it is credited to (`credited`)."""
-    return slug_of(credited(production))
+def row_production(production: Path, record: staff.StaffSnapshot) -> str:
+    """Read the fixed showrunner id for a production-owned change."""
+    return str(unit_lookup.doc_owner(credited(production.expanduser(), record), record).id)
 
 
-def credited(production: Path) -> Path:
-    """The production a change of `production` belongs to. A style production's work lands on its parent's
-    merge branch through a hand-off, so its changes are its parent's, and its showrunner does not show them
-    (user, 2026-10-27). Any other production is its own."""
-    seen = {production}
-    while True:
+def credited(production: Path, record: staff.StaffSnapshot) -> Path:
+    """Credit a style production to its staff parent. Other productions keep their own credit."""
+    row = record.by_doc(remote.local_machine(), production)
+    while row is not None and isinstance(row.parent, staff.ReportsTo):
         try:
-            lines = production.read_text(encoding="utf-8").splitlines()
-            if production_field(lines, "Kind") != "style":
+            if production_field(production.read_text(encoding="utf-8").splitlines(), "Kind") != "style":
                 return production
-            parent = Path(production_field(lines, "Parent production")).expanduser()
         except (OSError, UnicodeError, Refusal):
             return production
-        if parent in seen:
+        row = record.by_id(row.parent.id)
+        if row is None or not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             return production
-        seen.add(parent)
-        production = parent
+        production = row.doc.path
+    return production
 
 
-def unit_branches(docs: Iterable[Path]) -> dict[str, Path]:
-    """Each name a checkpoint can carry for a unit of the docs, with the doc whose Units table lists it.
+@dataclass(frozen=True)
+class MissingUnitWorktree:
+    """The unit's branch worktree is unavailable."""
 
-    A checkpoint is named for the unit's branch or its plan, so both count, and so do the unit's name
-    and its worktree's folder name, which a merge subject can carry.
-    """
-    found: dict[str, Path] = {}
+
+@dataclass(frozen=True)
+class UnknownProducer:
+    """The change has no known staff producer."""
+
+
+UNKNOWN_PRODUCER = UnknownProducer()
+
+
+@dataclass(frozen=True)
+class UnitSource:
+    """The production document and branch worktree of a unit."""
+
+    production: Path
+    worktree: Path | MissingUnitWorktree
+    name: str
+    producer: staff.StaffId | UnknownProducer = UnknownProducer()
+
+
+def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
+    """Resolve exact branch names before plan, unit and folder aliases."""
+    return _unit_branches(docs, _branch_snapshot())
+
+
+def _branch_snapshot() -> staff.StaffSnapshot:
+    """Return the staff snapshot used to resolve branches."""
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        print(f"change review: {error}", file=sys.stderr)
+        record = staff.StaffSnapshot(())
+    return record
+
+
+def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve branch names and aliases from the unit staff rows of each document."""
+    return _branches_from_units(_document_units(docs, record), record)
+
+
+def _document_units(docs: Iterable[Path], record: staff.StaffSnapshot) -> list[tuple[Path, staff.StaffRow]]:
+    """Collect each document's units and report unreadable staff records."""
+    pairs: list[tuple[Path, staff.StaffRow]] = []
     for doc in docs:
         try:
-            rows = unit_table(doc.read_text(encoding="utf-8").splitlines())
-        except (Refusal, OSError):
+            rows = unit_lookup.doc_units(doc, record)
+        except staff.StaffUnreadable as error:
+            print(f"change review: {error}", file=sys.stderr)
             continue
-        for row in rows:
-            names = (cell_value(row.get("Branch", "")), Path(cell_value(row.get("Plan", ""))).stem,
-                     cell_value(row.get("Unit", "")), Path(cell_value(row.get("Worktree", ""))).name)
-            for name in names:
-                if name:
-                    _ = found.setdefault(name, doc)
+        pairs.extend((doc, row) for row in rows)
+    return pairs
+
+
+def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
+                         record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve exact branches before aliases, in the supplied unit order."""
+    found: dict[str, UnitSource] = {}
+    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
+    resolver = session_staff.RowResolver(record)
+    machine = remote.local_machine()
+    for doc, row in pairs:
+        tree = row.worktree
+        worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                    else MissingUnitWorktree())
+        source = UnitSource(doc, worktree, row.name, row.id)
+        branch = resolver.unit_branch(row)
+        if isinstance(branch, session_staff.Branch):
+            _ = found.setdefault(branch.name, source)
+        try:
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            print(f"change review: {source.name}: {error}", file=sys.stderr)
+            config = unit_config.ConfigMissing(str(error))
+        plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
+                and isinstance(config.plan, unit_config.PlanFile) else "")
+        aliases.append((source, (plan, plan.removesuffix("-plan"), source.name,
+                                 worktree.name if isinstance(worktree, Path) else "")))
+    for source, names in aliases:
+        for name in names:
+            if name:
+                _ = found.setdefault(name, source)
     return found
 
 
-def _owner_of(commit: Commit, branches: dict[str, Path]) -> Path | None:
+def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve live units before retired units, with scoped units first in each group."""
+    pairs = _document_units(_publication_docs(production, record), record)
+    scoped = {pair[1].id for pair in pairs}
+    machine = remote.local_machine()
+    resolver = session_staff.RowResolver(record)
+    for row in record.find(kind="unit"):
+        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
+            continue
+        doc = resolver.production_doc(row)
+        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
+    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
+    return _branches_from_units(pairs, record)
+
+
+def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
     """The production of the unit whose branch the checkpoint names, or None for another commit."""
     found = _CHECKPOINT.match(commit.subject)
-    return branches.get(found["branch"]) if found else None
+    unit = branches.get(found["branch"]) if found else None
+    return unit.production if unit is not None else None
 
 
-def visible_owners(commits: list[Commit], production: Path) -> list[Path]:
-    """The production doc of each change `visible` gives, in its order: the production whose Units table
-    names the checkpoint's branch, at `production` or below it, else `production` itself.
-
-    A root's gate merges its children's merge branches too, and their rows belong to the child.
-    """
-    branches = unit_branches(owner_docs(production))
-    return [_owner_of(commit, branches) or production for commit in reversed(commits)
-            if commit.subject.startswith("checkpoint(")
-            for item in entries(commit.message) if isinstance(item, Visible)]
+@dataclass(frozen=True)
+class UnresolvedSource:
+    """The checkpoint has no matching unit source."""
 
 
-def merge_commits(repo: Path, merge: str) -> list[Commit]:
+@dataclass(frozen=True)
+class PublicationChange:
+    """One checkpoint change with its unit and fixed producer identity."""
+
+    item: Visible
+    source: UnitSource | UnresolvedSource
+    producer: staff.StaffId | UnknownProducer
+    checkpoint: str
+    unit_name: str
+
+
+def producer_for(source: UnitSource, record: staff.StaffSnapshot, machine: str) -> staff.StaffId | UnknownProducer:
+    """Use the fixed producer from the shared member join on this machine."""
+    if isinstance(source.producer, UnknownProducer):
+        return UnknownProducer()
+    member = record.by_id(source.producer)
+    if member is None or member.kind != "unit" or isinstance(member.worktree, staff.WorktreeUnfilled):
+        return UnknownProducer()
+    return member.id if member.worktree.machine == machine else UnknownProducer()
+
+
+def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId | UnknownProducer:
+    """Read the fixed id of the unit that owns the requested directory."""
+    machine = remote.local_machine()
+    member = record.unit_by_worktree(machine, directory) or record.by_worktree(machine, directory)
+    return member.id if member is not None and member.kind == "unit" else UnknownProducer()
+
+
+def unit_producer(unit: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer of one unit across the staff record."""
+    try:
+        return unit_lookup.unit_row(unit, staff.snapshot()).id
+    except staff.StaffUnreadable:
+        return UNKNOWN_PRODUCER
+
+
+def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
+    """Resolve child production documents with the held staff snapshot."""
+    return scope_docs(production, below=True, record=record)
+
+
+def publication_changes(commits: list[Commit], production: Path, *,
+                        record: staff.StaffSnapshot | None = None,
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
+    """Resolve each visible change's unit and producer in one pass."""
+    record = staff.snapshot() if record is None else record
+    branches = _publication_branches(production, record)
+    machine = remote.local_machine()
+    changes: list[PublicationChange] = []
+    for commit, item in _checkpoint_entries(commits):
+        match = _CHECKPOINT.match(commit.subject)
+        source = branches.get(match["branch"]) if match is not None else None
+        producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
+        if isinstance(known_producer, str) and (source is None or source.producer == known_producer):
+            producer = known_producer
+        name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
+        changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
+    return changes
+
+
+def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge).split()[1:]
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
+    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}",
+                   *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     for record in records.split("\x1e")[1:]:
         sha, message = record.split("\x1f", 1)
@@ -815,22 +1115,27 @@ class Tree:
 
     def __init__(self, docs: Iterable[Path]) -> None:
         self.docs: list[Path] = list(dict.fromkeys(docs))
-        self.branches: dict[str, Path] = unit_branches(self.docs)
+        self.record: staff.StaffSnapshot = _branch_snapshot()
+        self.branches: dict[str, UnitSource] = _unit_branches(self.docs, self.record)
         self.repos: list[Path] = []
         self.targets: dict[tuple[Path, str], Path] = {}
         self._chains: dict[tuple[Path, str], set[str]] = {}
         for doc in self.docs:
             try:
                 lines = doc.read_text(encoding="utf-8").splitlines()
-                repo = Path(production_field(lines, "Repository")).expanduser()
-            except (Refusal, OSError):
+            except OSError:
                 continue
-            if repo not in self.repos:
-                self.repos.append(repo)
-            try:
-                _ = self.targets.setdefault((repo, production_field(lines, "Merge branch")), doc)
-            except Refusal:
-                pass
+            for field in ("Repository", "Showrunner checkout"):
+                try:
+                    repo = Path(production_field(lines, field)).expanduser()
+                except Refusal:
+                    continue
+                if repo not in self.repos:
+                    self.repos.append(repo)
+                try:
+                    _ = self.targets.setdefault((repo, production_field(lines, "Merge branch")), doc)
+                except Refusal:
+                    pass
 
     def landed_on(self, repo: Path, sha: str) -> Path | None:
         """The production whose merge branch has the commit on its first-parent line: where it merged.
@@ -852,6 +1157,13 @@ class Tree:
         return None
 
 
+def matching_checkpoint_names(commits: list[Commit], change: str) -> tuple[str, ...]:
+    """Match the change text before resolving a checkpoint name."""
+    return tuple(dict.fromkeys(match["branch"] for commit in commits
+                 if change in checkpoint_changes(commit.message)
+                 and (match := _CHECKPOINT.match(commit.subject)) is not None))
+
+
 def trace(row: dict[str, str], tree: Tree) -> Path | str:
     """The production of an older row, from its merge. In order: the checkpoint that names the row's
     change; else the one production of every checkpoint the merge brought in; else the production
@@ -865,8 +1177,8 @@ def trace(row: dict[str, str], tree: Tree) -> Path | str:
         return f"{found} is in no repository of this list's productions"
     commits = merge_commits(repo, found)
     change = row.get("Change", "")
-    named = {owner for commit in commits if (owner := _owner_of(commit, tree.branches)) is not None
-             and any(isinstance(item, Visible) and item.change == change for item in entries(commit.message))}
+    named = {source.production for name in matching_checkpoint_names(commits, change)
+             if (source := tree.branches.get(name)) is not None}
     if len(named) == 1:
         return named.pop()
     every = {owner for commit in commits if (owner := _owner_of(commit, tree.branches)) is not None}
@@ -881,18 +1193,34 @@ def trace(row: dict[str, str], tree: Tree) -> Path | str:
 
 def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     """The productions whose root keeps the list `path`, with every production below each root."""
-    import showrunner_tree
 
     owned: list[Path] = []
+    record = staff.snapshot()
     for doc in docs:
-        slug = slug_of(doc)
+        name = unit_lookup.doc_owner(doc, record).name
         try:
-            if showrunner_tree.root_of(slug) != slug or list_path(doc) != path:
+            if showrunner_tree.root_of(name, record=record) != name or list_path(doc, record=record) != path:
                 continue
         except OSError:
             continue
-        owned.extend(owner_docs(doc))
+        owned.extend(owner_docs(doc, record=record))
     return Tree(owned)
+
+
+def _fill_column(path: Path, lines: list[str], section: str, column: str,
+                 values: dict[str, str]) -> set[str]:
+    """Add a column and fill only its empty cells."""
+    _add_column(path, lines, section, column)
+    columns, first, end = _table(path, lines, section)
+    at = columns.index(column)
+    changed: set[str] = set()
+    for index in range(first, end):
+        cells = _cells(lines[index])
+        if cells[0] in values and at < len(cells) and not cells[at]:
+            cells[at] = _cell(values[cells[0]])
+            lines[index] = _join_cells(cells) + "\n"
+            changed.add(cells[0])
+    return changed
 
 
 def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[str, str]]:
@@ -909,53 +1237,41 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
             continue
         found = trace(row, tree)
         if isinstance(found, Path):
-            filled[row["#"]], owners[row["#"]] = row_production(found), found
+            filled[row["#"]], owners[row["#"]] = row_production(found, tree.record), found
         else:
             untraced[row["#"]] = found
     if not write or not filled:
         return filled, untraced
 
     def fill(lines: list[str]) -> None:
-        _add_column(path, lines, SECTION, PRODUCTION)
-        columns, first, end = _table(path, lines, SECTION)
-        at = columns.index(PRODUCTION)
-        for index in range(first, end):
-            cells = _cells(lines[index])
-            if cells[0] in filled and at < len(cells) and not cells[at]:
-                cells[at] = _cell(filled[cells[0]])
-                lines[index] = "| " + " | ".join(cells) + " |\n"
+        _ = _fill_column(path, lines, SECTION, PRODUCTION, filled)
 
     _edit(path, next(iter(owners.values())), today(), fill, lambda _: f"production cells for {len(filled)} rows")
     return filled, untraced
 
 
-def rename_production(path: Path, production: Path, old: str, new: str) -> list[str]:
-    """Rewrite each Production cell under To review that names `old` to `new`; return the rows changed.
-
-    A production rename keeps its rows on the list (`/showrunner:rename`). `production` is the renamed
-    doc, which stamps the write. A list with no such cell is not written.
-    """
-    if not path.exists() or not any(row.get(PRODUCTION) == old for row in pending(path)):
-        return []
-
-    def rewrite(lines: list[str]) -> list[str]:
-        columns, first, end = _table(path, lines, SECTION)
-        at = columns.index(PRODUCTION)
-        changed: list[str] = []
-        for index in range(first, end):
-            cells = _cells(lines[index])
-            if at < len(cells) and _plain(cells[at]) == old:
-                cells[at] = _cell(new)
-                lines[index] = "| " + " | ".join(cells) + " |\n"
-                changed.append(cells[0])
-        return changed
-
-    return _edit(path, production, today(), rewrite, lambda rows: f"production {old} renamed {new} in {len(rows)} rows")
+@contextmanager
+def _list_lock(path: Path) -> Generator[None]:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def describe(row: dict[str, str]) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
-    rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK) and value]
+    record = staff.initial_snapshot()
+    shown = dict(row)
+    member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
+    if member is not None and not row.get("Verdict"):
+        parent = record.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+        shown[PRODUCTION] = parent.name if parent is not None else member.name
+    producer = record.by_id(staff.StaffId(row.get(PRODUCER, "")))
+    if producer is not None:
+        shown[PRODUCER] = producer.name
+    rest = [f"  {column}: {value}" for column, value in shown.items() if column not in ("#", "Change", CHECK) and value]
     return "\n".join([f"{row.get('#', '')} {row.get('Change', '')}", f"  {CHECK}: {row.get(CHECK, '')}", *rest])
 
 
@@ -1055,14 +1371,82 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
                 return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        identity = staff.initial_snapshot()
+        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+        if member is not None:
+            parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
+        if not any(line.strip() == REVIEWED for line in lines):
+            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+            _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if member is not None:
+            _add_column(path, lines, REVIEWED, PRODUCTION)
+        if PRODUCER in cells:
+            _add_column(path, lines, REVIEWED, PRODUCER)
+        # Page rows retain their description and proof in the same record after
+        # answering. Older lists keep their existing Reviewed table shape.
+        if cells.get(KIND):
+            for column in (KIND, CHECK, PRODUCTION):
+                _add_column(path, lines, REVIEWED, column)
         reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
+        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
                                                    "Verdict": _cell(verdict), "Date": day.isoformat(),
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
+
+
+def review_rows(path: Path) -> list[dict[str, str]]:
+    """Read pending and saved page answers from the authoritative list."""
+    snapshot = review_snapshot(path)
+    return [*snapshot.pending, *snapshot.reviewed]
+
+
+def _review_table(path: Path, lines: list[str], section: str) -> list[dict[str, str]]:
+    """Decode one review table and refuse rows with missing or extra cells."""
+    columns, first, end = _table(path, lines, section)
+    result: list[dict[str, str]] = []
+    for line in lines[first:end]:
+        cells = _cells(line)
+        if len(cells) != len(columns):
+            raise ChangeReviewError(f"{path}: {cells[0] if cells else line.rstrip()} has the wrong number of cells")
+        result.append(dict(zip(columns, map(_plain, cells))))
+    return result
+
+
+@dataclass(frozen=True)
+class ReviewListSnapshot:
+    """One list read, with its metadata and both review tables."""
+
+    text: str
+    pending: list[dict[str, str]]
+    reviewed: list[dict[str, str]]
+
+
+def review_snapshot(path: Path) -> ReviewListSnapshot:
+    text = read(path)
+    lines = text.splitlines(keepends=True)
+    pending = _review_table(path, lines, SECTION)
+    reviewed = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
+    return ReviewListSnapshot(text, pending, reviewed)
+
+
+def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
+    """Classify by whether the change alters something the user runs or sees."""
+    if kind not in REVIEW_KINDS:
+        raise ChangeReviewError("--kind must be 'See in action' or 'Read only'")
+
+    def write(lines: list[str]) -> str:
+        _add_column(path, lines, SECTION, KIND)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        written = _row(path, columns, {**cells, KIND: kind})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, today(), write, lambda _: f"kind {row}")
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
@@ -1089,41 +1473,34 @@ def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
     return lines
 
 
-def production_doc(production: str) -> Path:
+def production_doc(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The production doc given; without one, the calling showrunner's."""
-    if production:
-        return Path(production).expanduser()
-    from scripts.production import showrunners  # only the actions that name a production read the update timers
+    from scripts.production import showrunners
 
+    if production:
+        row = showrunners.owner_for(production, record)
+        if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            return row.doc.path
+        raise ChangeReviewError(f"{row.name}: no production document")
     found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if found is None:
-        raise ChangeReviewError("this session is no production's showrunner; pass --production <doc>")
+        raise ChangeReviewError("this session is no production's showrunner; pass --production <name>")
     return found
 
 
-def showrunner_of(doc: Path) -> str:
-    """The name of the top-level showrunner whose list takes the production's rows.
+def showrunner_of(doc: Path, *,
+                  record: staff.StaffSnapshot | None = None) -> str:
+    """Read the staff name of the root showrunner."""
 
-    A child production's rows go to its root's list. The name is the root showrunner's session
-    name as it is now, never the production slug, so it is read only while that showrunner runs.
-    """
-    from scripts.production import showrunners
-    import showrunner_tree
-
-    try:
-        root = showrunner_tree.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
-    except ValueError as error:
-        raise ChangeReviewError(str(error)) from None
-    name = showrunners.current_name(root)
-    if not name:
-        raise ChangeReviewError(f"the showrunner of {root} is not running; the list is named for it")
-    return name
+    record = staff.snapshot() if record is None else record
+    row = unit_lookup.doc_owner(doc, record)
+    return showrunner_tree.root_of(row.name, record=record)
 
 
-def production_list(production: str) -> Path:
-    """The list the production doc names; without a doc, the calling showrunner's production."""
-    doc = production_doc(production)
-    path = list_path(doc)
+def production_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+    """Return the review list for the staff name, or for the calling showrunner when the name is empty."""
+    doc = production_doc(production, record=record)
+    path = list_path(doc, record=record)
     if path is None:
         raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     return path
@@ -1136,66 +1513,142 @@ def _words(name: str, value: str) -> str:
     return value.strip()
 
 
-def drift(repo: Path, merge_branch: str, text: str, since: str, foreign: Collection[str] = ()) -> list[str]:
-    """Each merge on the merge branch since `since` whose visible changes have no row: none with its hash
-    and none, under To review or Reviewed, with one of its changes. A checkpoint named in `foreign`
-    (`foreign_units`) is another list's: a merge of main brings such changes in, and they are left out."""
-    lines: list[str] = []
-    changes = _changes(text)
-    for record in _git(repo, "log", "--first-parent", "--merges", f"--since={since}",
-                       "--format=%H %P", f"origin/{merge_branch}", "--").splitlines():
-        merge, *parents = record.split()
-        if len(parents) < 2:
+@dataclass(frozen=True)
+class KnownMergeProducer:
+    """The unit identity supplied by the checkpoint request for one merge."""
+
+    merge: str
+    producer: staff.StaffId
+
+
+@dataclass(frozen=True)
+class ReadinessScan:
+    """Scan published merges for changes that need no further step."""
+
+
+@dataclass(frozen=True)
+class CompletedStep:
+    merged: str
+    step: str
+
+
+_READINESS_SCAN = ReadinessScan()
+
+
+def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list[str]:
+    """Exclude foreign history before each branch imports this merge."""
+    merge = _git(repo, "rev-parse", merge).strip()
+    excluded: set[str] = set()
+    for ref in refs:
+        path = [line.split() for line in _git(
+            repo, "rev-list", "--ancestry-path", "--parents", f"{merge}..{ref}").splitlines()]
+        if not path:
+            if _git(repo, "rev-parse", ref).strip() != merge:
+                excluded.add(ref)
             continue
-        commits = [commit for sha in
-                   _git(repo, "log", "--no-merges", "--format=%H", parents[1], f"^{parents[0]}", "--").split()
-                   if not _named_in(commit := Commit(sha, *_described(repo, sha)), foreign)]
-        short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
-        if visible(commits) and f"· {short}" not in text and not any(item.change in changes for item in visible(commits)):
-            lines.append(f"{short}: {len(visible(commits))} visible change(s) and no row in the list")
-    return lines
+        descendants = {merge, *(commit[0] for commit in path)}
+        excluded.update(parent for commit in path for parent in commit[1:] if parent not in descendants)
+    return sorted(excluded)
 
 
-def _named_in(commit: Commit, names: Collection[str]) -> bool:
-    """Whether the commit is a checkpoint named for one of `names`."""
-    found = _CHECKPOINT.match(commit.subject)
-    return found is not None and found["branch"] in names
-
-
-def foreign_units(production: Path) -> set[str]:
-    """The checkpoint names of the units of every production outside the tree of `production`'s root.
-
-    Empty when the productions cannot be read: drift then counts every checkpoint.
-    """
-    from scripts.production import showrunners
-    import showrunner_tree
-
+def list_ready(repo: Path, production: Path, merge_branch: str, *,
+               review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+               selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+               known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Add live changes on origin/main, or release one completed step of one merge."""
+    repo = repo.expanduser().resolve()
     try:
-        docs = list(showrunners.timer_docs().values())
-        root = showrunner_tree.root_of(slug_of(production))
-        top = next((doc for doc in docs if slug_of(doc) == root), production)
-        return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
-    except (OSError, ValueError, Refusal):
-        return set()
+        fetched = subprocess.run(["git", "-C", str(repo), "fetch", "origin", "main"],
+                                 capture_output=True, text=True, check=False)
+    except OSError as error:
+        print(f"change review: git fetch origin main failed; no rows added: {str(error).splitlines()[0]}", file=sys.stderr)
+        return []
+    if fetched.returncode:
+        detail = " ".join((fetched.stderr or fetched.stdout).splitlines())
+        print(f"change review: git fetch origin main failed; no rows added: {detail}", file=sys.stderr)
+        return []
+    if isinstance(selection, CompletedStep):
+        _require_main(repo, selection.merged)
+        merges = _git(repo, "log", "-1", "--format=%H%x09%s", selection.merged, "--").splitlines()
+    else:
+        merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
+                      "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
+    record = staff.snapshot() if record is None else record
+    scoped = set(_publication_docs(production, record))
+    outside_docs = [row.doc.path for row in record.find(kind="showrunner")
+                    if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path not in scoped]
+    outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
+    rows: list[str] = []
+    matched_step = False
+    for entry in merges:
+        merge, subject = entry.split("\t", 1)
+        if not subject.endswith(f" into {merge_branch}"):
+            continue
+        if not on_main(repo, merge):
+            continue
+        commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
+        short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
+        routed: dict[tuple[Path, Path], list[PublicationChange]] = {}
+        merge_changes: dict[Path, list[PublicationChange]] = {}
+        noted: set[str] = set()
+
+        def note(change: PublicationChange) -> None:
+            readiness = change.item.readiness
+            if not isinstance(readiness, AfterStep) or readiness.step in noted:
+                return
+            checkout = Path(__file__).resolve().parents[2]
+            owner = unit_lookup.doc_owner(production, record)
+            command = shlex.join([str(checkout / "scripts/lib/py"), str(checkout / "scripts/production/change_review.py"),
+                                  "live", "--merged", short, "--step", readiness.step,
+                                  "--repo", str(repo), "--production", owner.name])
+            print(f"{short}: after {readiness.step}; run {command}")
+            noted.add(readiness.step)
+
+        producer = (known_producer.producer
+                    if isinstance(known_producer, KnownMergeProducer) and known_producer.merge == merge
+                    else UNKNOWN_PRODUCER)
+        for change in publication_changes(commits, production, record=record, known_producer=producer):
+            readiness = change.item.readiness
+            if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
+                matched_step = True
+            owner_doc = credited(change.source.production if isinstance(change.source, UnitSource) else production, record)
+            path = review_list if review_list is not None else list_path(owner_doc, record=record)
+            if path is None:
+                path = list_path(production, record=record)
+            if path is None:
+                continue
+            routed.setdefault((path, owner_doc), []).append(change)
+            merge_changes.setdefault(path, []).append(change)
+        for (path, owner_doc), changes in routed.items():
+            selected = changes
+            if isinstance(selection, CompletedStep):
+                selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
+                            and change.item.readiness.step == selection.step]
+            rows.extend(append_rows(path, selected, today(), short, owner_doc, record=record, repo=repo,
+                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                    merge_changes=merge_changes[path]))
+    if isinstance(selection, CompletedStep) and not matched_step:
+        raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
+    return rows
 
 
-def _changes(text: str) -> set[str]:
-    """The Change cell of every row in the list, under To review and under Reviewed alike.
+def _changes(text: str) -> list[dict[str, str]]:
+    """Read each row's cells under To review and Reviewed.
 
-    A reviewed row keeps no Merged cell, so drift knows a settled merge by its rows' changes.
+    A reviewed row keeps its change name and its Merged cell.
     """
-    found: set[str] = set()
+    found: list[dict[str, str]] = []
+    columns: list[str] = []
     for line in text.splitlines():
-        cells = _cells(line) if _NUMBER.match(line) else []
-        if len(cells) > 1:
-            found.add(_plain(cells[1]))
+        if line.startswith("| # |"):
+            columns = _cells(line)
+        elif _NUMBER.match(line):
+            found.append(dict(zip(columns, map(_plain, _cells(line)))))
     return found
 
 
-def _described(repo: Path, sha: str) -> tuple[str, str, tuple[str, ...]]:
-    message = _git(repo, "show", "-s", "--format=%B", sha)
-    files = tuple(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
-    return message.split("\n", 1)[0], message, files
+def _files(repo: Path, sha: str) -> tuple[str, ...]:
+    return tuple(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
 
 
 class CommandLine(argparse.Namespace):
@@ -1206,12 +1659,13 @@ class CommandLine(argparse.Namespace):
     merge_branch: str = ""
     list: str = ""
     merged: str = ""
-    since: str = ""
+    step: str = ""
     change: str = ""
     check: str = ""
     see: str = ""
     row: str = ""
     verdict: str = ""
+    kind: str = ""
     production: str = ""
     urgency: str = ""
     due: str = ""
@@ -1227,7 +1681,11 @@ def _list(options: CommandLine) -> Path:
 
 def _visible(options: CommandLine) -> Visible:
     """The change, how to try it and what the user sees, from --change, --check and --see."""
-    return Visible(_words("change", options.change), _words("check", options.check), _words("see", options.see))
+    change = _words("change", options.change)
+    for name, value in (("check", options.check), ("see", options.see)):
+        if not value.strip():
+            _ = _words(name, value)
+    return Visible(change, options.check.strip(), options.see.strip())
 
 
 @dataclass(frozen=True)
@@ -1268,12 +1726,26 @@ def _rank_option(options: CommandLine) -> str:
     return urgency.cell(level, _row_id("after", options.after) if options.after.strip() else "")
 
 
+def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
+    from scripts.production import showrunners
+
+    documents = list(showrunners.timer_docs().values())
+    lists = [Path(options.list).expanduser()] if options.list else sorted(lists_directory().glob(f"{PREFIX}*.md"))
+    return documents, lists
+
+
 def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
+            repo = Path(options.repo).expanduser().resolve()
+            merged = options.merged.strip()
+            if merged:
+                _require_main(repo, merged)
             item, rank = _visible(options), _rank_option(options)
             path = _list(options)
-            rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank)
+            record = staff.snapshot()
+            rows = append_rows(path, [item], today(), merged, production_doc(options.production), rank,
+                               producers=[producer_at(repo, record)], record=record)
             row = row_id(rows[0])
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
@@ -1296,6 +1768,9 @@ def _run(options: CommandLine) -> int:
             target = _row_option(options)
             now = datetime.now(user_zone()).replace(tzinfo=None)
             print(mark_row(target.path, target.row, now, production_doc(options.production)))
+        case "set-kind":
+            target = _row_option(options)
+            print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
             verdict = _words("verdict", options.verdict)
@@ -1318,55 +1793,51 @@ def _run(options: CommandLine) -> int:
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
         case "backfill-production":
-            from scripts.production import showrunners
-
-            docs = list(showrunners.timer_docs().values())
-            lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))
+            docs, lists = _backfill_targets(options)
             for path in lists:
                 filled, untraced = backfill(path, list_tree(path, docs), options.write)
                 print(f"{path.name}: {len(filled)} {'filled' if options.write else 'to fill'}, "
                       + f"{len(untraced)} untraced")
-                for row, slug in filled.items():
-                    print(f"  {row}: {slug}")
+                for row, name in filled.items():
+                    print(f"  {row}: {name}")
                 for row, why in untraced.items():
                     print(f"  {row}: untraced, {why}")
-        case "drift":
-            try:
-                foreign = foreign_units(production_doc(options.production))
-            except ChangeReviewError:
-                foreign = set[str]()
-            found = drift(Path(options.repo).resolve(), options.merge_branch, read(_list(options)), options.since,
-                          foreign)
-            print("\n".join(found) if found else "no drift")
-            return 1 if found else 0
-        case _:
+        case "list-ready" | "live":
+            selection = (CompletedStep(_words("merged", options.merged), _words("step", options.step))
+                         if options.action == "live" else ReadinessScan())
+            production = production_doc(options.production)
+            branch = options.merge_branch or production_field(production.read_text(encoding="utf-8").splitlines(), "Merge branch")
+            rows = list_ready(Path(options.repo), production, branch,
+                              review_list=Path(options.list).expanduser() if options.list else None,
+                              selection=selection)
+            if rows:
+                print("\n".join(rows))
+        case "check":
             commits = unit_commits(Path(options.repo).resolve(), options.checkpoint, options.previous,
                                    options.merge_branch)
-            if options.action == "check":
-                refused = missing(commits)
-                print("\n".join(refused) if refused else f"{len(commits)} commit(s) carry their {TRAILER} lines")
-                return 1 if refused else 0
-            rows = append_rows(_list(options), visible(commits), today(), options.merged,
-                               production_doc(options.production))
-            print("\n".join(rows) if rows else "no visible change to add")
+            refused = missing(commits)
+            print("\n".join(refused) if refused else f"{len(commits)} commit(s) carry their {TRAILER} lines")
+            return 1 if refused else 0
+        case _:
+            pass
     return 0
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "mark-important", "list-path", "showrunner",
+    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
+                                                   "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
-    for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after"):
+    for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
+                 "row", "verdict", "production", "urgency", "due", "after", "kind"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
     except (ChangeReviewError, OSError) as error:
-        print(f"change review: {error}", file=sys.stderr)
+        print(error, file=sys.stderr)
         return 1
 
 

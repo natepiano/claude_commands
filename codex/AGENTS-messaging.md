@@ -6,17 +6,20 @@ Send one: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to <addr
 
 Send groups: `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`. Groups are `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level` (Claude sessions except workers and unit directors under a showrunner), and `--all` (every role). Put `--of <unit, director name, or session: address>` before `--workers` for one unit. Each recipient gets the last selecting flag's text once. The sender is excluded by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`.
 
-Message the user: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --from "<your session name>" --summary "<title>" --text "<message>" --action "<what the user does>"`, or use `--no-action` when nothing is needed. Action flags go only with `--to user`. `--need decision` and `--need blocked` require `--action`; emergency (`--need blocked`) is only for an action the user must take now because work cannot continue.
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
+
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 
 ## Outcomes and recovery
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
-- `REFUSED: <why>` (exit 2): fix the action flags as the line says and send again. No PushNotification fallback.
+- `REFUSED: <why>` (exit 2): fix the action flags as the line says and send again. Use no other phone path.
 - `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a worker between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.
 - `send.py: <name> matches <N> sessions:` (exit 2) lists their addresses; send again with one listed address.
 - `send.py: no roster session has address <address>` (exit 2): the address is stale or its worker is between turns; read the roster again.
-- `FAILED: <why>` (exit 3), including a Codex queue failure or timeout: no fallback; report the failure.
+- `FAILED: <why>` (exit 3): report the failure. Repair the registered send before another attempt.
 - `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems, so the other machine was not asked and nothing was sent; send again with an address or `--machine HOST`.
 - With `--machine HOST`, recipient refusals and ambiguous-name errors there return as `FAILED: ssh <host>: <reason>` (exit 3); recover from the reason as for that refusal here.
 - `broadcast: <unit> matches more than one unit director:` (exit 2) lists addresses, including matches across machines; nothing was delivered. Send again with `--of <one listed address>` before `--workers`.

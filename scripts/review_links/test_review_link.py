@@ -5,6 +5,7 @@ import html
 import fcntl
 import json
 import os
+import shutil
 import secrets
 import subprocess
 import sys
@@ -19,27 +20,22 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import review_link, serve
 
 
-from typing import TYPE_CHECKING, cast
-
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    from typing import TypeVar
-
-    OverriddenMethod = TypeVar("OverriddenMethod")
-
-    def override(method: OverriddenMethod) -> OverriddenMethod:
-        return method
-
+from typing import cast, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("review_link.py")
 TAILSCALE_IP = "100.103.14.30"
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    for stem in ("review_links", "change_review"):
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 class ReviewPage(HTMLParser):
@@ -76,6 +72,16 @@ class ReviewPage(HTMLParser):
 
 
 class PrivateNameTests(unittest.TestCase):
+    def test_atomic_temporary_names_are_private_for_metadata_and_public_files(self) -> None:
+        for target in (".index.json", ".index.lock", ".review-link-delivery-abc123.json",
+                       ".review-link-changes.json", ".review-link-browser.json", "report.1.2.html"):
+            for name in (f".{target}.123.456.tmp", f".{target}.123.456.TMP".upper()):
+                with self.subTest(name=name):
+                    self.assertTrue(review_link.private_name(name))
+        for name in (".index.json.bak", "index.json"):
+            with self.subTest(name=name):
+                self.assertFalse(review_link.private_name(name))
+
     def test_private_names_ignore_case_without_hiding_similar_public_names(self) -> None:
         for name, expected in (
             (".index.json", True),
@@ -128,6 +134,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "HOME": str(home),
+            "CLAUDE_PYTHON": sys.executable,
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
             "CLAUDE_CODE_SESSION_ID": "12345678-abcd-4321-abcd-123456789abc",
         }
@@ -141,9 +148,27 @@ class ReviewLinkTests(unittest.TestCase):
 
     def run_link(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments], env=self.env,
-            text=True, capture_output=True, check=False, timeout=10,
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.env,
+            text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_standalone_help_runs_without_pythonpath_from_another_directory(self) -> None:
+        environment = dict(self.env)
+        _ = environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), "--help"], env=environment, cwd=self.root,
+            text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_a_snapshot_input_with_an_atomic_temporary_name_is_refused_before_publication(self) -> None:
+        source = self.source(".draft.txt.123.456.tmp", "private unfinished content")
+        with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.snapshots), "REVIEW_LINKS_HOST": "natedev"}):
+            with self.assertRaisesRegex(ValueError, "reserved snapshot filename"):
+                _ = review_link.snapshot([source])
+        self.assertFalse(self.snapshots.exists())
+        self.assertFalse((self.snapshots / ".index.json").exists())
 
     def linked_snapshot(self, url: str) -> Path:
         address = urlsplit(url)
@@ -222,7 +247,7 @@ class ReviewLinkTests(unittest.TestCase):
         with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
-            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
             try:
                 connection.request("GET", urlsplit(first.stdout.strip()).path)
                 response = connection.getresponse()
@@ -231,7 +256,7 @@ class ReviewLinkTests(unittest.TestCase):
             finally:
                 connection.close()
                 server.shutdown()
-                thread.join(5)
+                thread.join(TEST_HANG_GUARD_SECS)
 
     def test_a_different_file_set_gets_a_new_id(self) -> None:
         first = self.source("first.txt", "first")
@@ -302,7 +327,7 @@ class ReviewLinkTests(unittest.TestCase):
             thread.start()
             try:
                 for url in (original_url, alias_url):
-                    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
                     try:
                         connection.request("GET", urlsplit(url).path)
                         response = connection.getresponse()
@@ -312,7 +337,7 @@ class ReviewLinkTests(unittest.TestCase):
                         connection.close()
             finally:
                 server.shutdown()
-                thread.join(5)
+                thread.join(TEST_HANG_GUARD_SECS)
         repeated_original = self.run_link(str(original))
         repeated_alias = self.run_link(str(alias))
         self.assertEqual(repeated_original.returncode, 0, repeated_original.stderr)
@@ -377,10 +402,10 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertIn("marked.use({renderer: {html(text)", document)
         self.assertIn("text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')", document)
 
-    def test_table_cells_keep_prices_and_short_headers_unbroken(self) -> None:
+    def test_table_cells_allow_long_paths_to_wrap_without_break_all(self) -> None:
         document = review_link.render_markdown("| $/GB |\n| --- |\n| $14.32 |\n", "prices.md")
         cell_style = document.split("td, th {", 1)[1].split("}", 1)[0]
-        self.assertIn("overflow-wrap: normal;", cell_style)
+        self.assertIn("overflow-wrap: anywhere;", cell_style)
         self.assertIn("word-break: normal;", cell_style)
 
     def test_text_and_source_keep_a_centered_column_without_limiting_tables(self) -> None:
@@ -400,15 +425,16 @@ class ReviewLinkTests(unittest.TestCase):
         text_rule = document.split("<style>", 1)[1].split("max-width: 48rem;", 1)[0].rsplit("\n", 1)[1]
         self.assertEqual(text_rule, "main > :not(table):not(:has(table)), #markdown-source { ")
 
-    def test_tables_use_the_available_width_and_scroll_inside_the_page(self) -> None:
+    def test_tables_fit_available_width_with_automatic_columns(self) -> None:
         document = review_link.render_markdown("| Product | Price |\n| --- | --- |\n| Disk | $14.32 |", "prices.md")
         table_style = document.split("table {", 1)[1].split("}", 1)[0]
-        self.assertIn("display: block;", table_style)
-        self.assertIn("width: max-content;", table_style)
+        self.assertIn("display: table;", table_style)
+        self.assertIn("width: 60%;", table_style)
+        self.assertIn("table-layout: auto;", table_style)
         self.assertIn("max-width: 100%;", table_style)
         self.assertIn("margin-left: auto;", table_style)
         self.assertIn("margin-right: auto;", table_style)
-        self.assertIn("overflow-x: auto;", table_style)
+        self.assertNotIn("width: max-content;", table_style)
 
     def test_multiple_files_share_one_snapshot_and_preserve_html_image_and_text_bytes(self) -> None:
         page = self.source("page.html", "<!doctype html><title>Existing</title><p>café</p>")
@@ -510,11 +536,11 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 if first_read:
                     # Keep the first read open until the other publisher is
                     # contending for the real lock, with a finite failure guard.
-                    self.assertTrue(second_lock_attempt.wait(2), "second publisher never attempted the lock")
+                    self.assertTrue(second_lock_attempt.wait(TEST_HANG_GUARD_SECS), "second publisher never attempted the lock")
                 return index
 
             def publish(source: Path) -> list[str]:
-                _ = start.wait(timeout=5)
+                _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
                 return review_link.snapshot([source])
 
             with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}):
@@ -522,7 +548,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                       patch.object(review_link, "read_snapshot_index", side_effect=hold_first_read),
                       ThreadPoolExecutor(max_workers=2) as workers):
                     runs = [workers.submit(publish, source) for source in sources]
-                    urls = [run.result(timeout=5) for run in runs]
+                    urls = [run.result(timeout=TEST_HANG_GUARD_SECS) for run in runs]
                 index = cast(dict[str, str], json.loads((snapshots / ".index.json").read_text(encoding="utf-8")))
                 self.assertEqual(len(index), 2)
                 self.assertEqual(lock_attempts, 2)
@@ -561,7 +587,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                     self.assertEqual(review_link.snapshot([source]), initial)
                 self.assertEqual(replaced, [source.name, ".index.json"])
                 self.assertEqual(destination.read_text(encoding="utf-8"), "new")
-                self.assertEqual(list(snapshots.rglob(".review-link-*")), [])
+                self.assertEqual(
+                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
+                )
 
     def test_failed_refresh_keeps_the_previous_file_and_cleans_the_temporary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="review-atomic-test-") as directory:
@@ -579,7 +608,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 destination = snapshots / urlsplit(initial[0]).path.lstrip("/")
                 self.assertEqual(destination.read_text(encoding="utf-8"), "old")
                 self.assertEqual((snapshots / ".index.json").read_bytes(), index)
-                self.assertEqual(list(snapshots.rglob(".review-link-*")), [])
+                self.assertEqual(
+                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
+                )
 
     def test_taken_id_retries_without_overwriting_the_existing_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(prefix="review-id-test-") as directory:
@@ -591,7 +623,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", side_effect=list("taken1fresh2"))):
+                  patch.object(secrets, "token_hex", side_effect=["taken1", "fresh2"])):
                 urls = review_link.snapshot([source])
             self.assertEqual(urls, ["http://natedev:8765/fresh2/source.txt"])
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
@@ -607,10 +639,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", return_value="a") as choose):
+                  patch.object(secrets, "token_hex", return_value="aaaaaa") as token_hex):
                 with self.assertRaisesRegex(FileExistsError, "after 10 tries"):
                     _ = review_link.snapshot([source])
-                self.assertEqual(choose.call_count, 60)
+                self.assertEqual(token_hex.call_count, 10)
             self.assertEqual(set(snapshots.iterdir()), {old, snapshots / ".index.lock"})
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
 

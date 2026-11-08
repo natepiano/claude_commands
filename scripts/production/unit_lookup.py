@@ -2,39 +2,38 @@
 """Find recorded production units and join their herdr panes by staff identity.
 
 Current names, places and messaging sockets come from herdr and live session
-records. Run state comes from /unit:direct records. Duplicate marks are refused.
+records. Run state comes from /unit:direct records.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
+import subprocess
 import sys
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-MESSAGE = Path(__file__).resolve().parent.parent / "message"
-sys.path.insert(0, str(MESSAGE))
-sys.path.insert(0, str(MESSAGE.parent / "herdr"))
-sys.path.insert(0, str(MESSAGE.parents[1]))
-import herdr  # noqa: E402
-import sessions  # noqa: E402
-from herdr import HerdrPlace  # noqa: E402
-from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from scripts.production import staff  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.herdr.herdr import HerdrPlace  # noqa: E402
+from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
+from scripts.production import staff, session_staff, unit_config  # noqa: E402
+from scripts.production.session_labels import StaffLabels
+from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
-USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
+USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"
 
 
-from unit_marks import (
-    PRODUCTION_MARK as PRODUCTION_MARK,
-    UNIT_MARK as UNIT_MARK,
+from scripts.production.session_staff import (
     ShowrunnerMember as ShowrunnerMember,
     UnitMember as UnitMember,
     ObservedUnit as ObservedUnit,
@@ -49,57 +48,162 @@ from unit_marks import (
     ClaudeUnknown as ClaudeUnknown,
     Claude as Claude,
     Place as Place,
-    MarkedUnit as MarkedUnit,
+    LabeledSession as LabeledSession,
+    ObservedProcess as ObservedProcess,
+    ProcessUnobserved as ProcessUnobserved,
+    LiveSession as LiveSession,
+    NoSession as NoSession,
     place_text as place_text,
     holder_text as holder_text,
-    MarkedProductions as MarkedProductions,
-    lookup_slug as _lookup_slug,
+    LabeledProductions as LabeledProductions,
     production_members as production_members,
-    group_marked_units as group_marked_units,
-    session_unit_marks as session_unit_marks,
+    group_labeled_sessions as group_labeled_sessions,
+    retained_session_labels,
+    session_staff_and_directors as session_staff_and_directors,
 )
+
+
+def doc_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """The showrunner row whose staff `doc` is this local production document."""
+    owner = record.by_doc(remote.local_machine(), doc.resolve())
+    if owner is None or owner.kind != "showrunner":
+        raise staff.StaffUnreadable(f"{doc}: no showrunner staff row")
+    return owner
+
+
+def doc_units(doc: Path, record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """The production's unit rows in staff.json row order; a retired row has a RemovedWorktree."""
+    return tuple(record.find(kind="unit", parent=doc_owner(doc, record).id))
+
+
+def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktree | staff.RemovedWorktree:
+    """Require a recorded local location without changing its lifecycle state."""
+    if isinstance(selected, NoSuchMember):
+        raise staff.StaffUnreadable(f"{selected.selector}: no matching staff member")
+    location = selected.row.worktree
+    if isinstance(location, staff.WorktreeUnfilled):
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is unfilled")
+    if location.machine != remote.local_machine():
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is on {location.machine}: {location.path}")
+    return location
+
+
+@dataclass(frozen=True)
+class UnitProblem:
+    unit_id: staff.StaffId
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitMetadata:
+    cells: dict[staff.StaffId, dict[str, str]]
+    problems: tuple[UnitProblem, ...]
+
+
+def unit_metadata(record: staff.StaffSnapshot, *,
+                  name: str | None = None) -> UnitMetadata:
+    """Return unit facts and problems without writing diagnostics."""
+    productions = production_members(record)
+    rows = (tuple(row for children in productions.values() for row in children) if name is None
+            else productions.get(name, ()))
+    resolver = session_staff.RowResolver(record, rows=rows)
+    metadata: dict[staff.StaffId, dict[str, str]] = {}
+    issues: list[UnitProblem] = []
+    for row in rows:
+        cells = {"Unit": row.name}
+        problems: list[str] = []
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            cells["Worktree"] = "unavailable: the worktree is not recorded"
+            problems.append("the worktree is not recorded")
+        else:
+            cells["Worktree"] = f"`{tree.path}`"
+        branch = resolver.unit_branch(row)
+        cells["Branch"] = branch.name if isinstance(branch, session_staff.Branch) else "unavailable: " + branch.reason
+        if not isinstance(branch, session_staff.Branch):
+            problems.append(branch.reason)
+        try:
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            cells["Plan"] = "unavailable: " + str(error)
+            problems.append(str(error))
+        else:
+            if isinstance(config, unit_config.UnitConfig):
+                if isinstance(config.plan, unit_config.PlanFile):
+                    cells["Plan"] = ("unavailable: the worktree is not recorded"
+                                     if isinstance(tree, staff.WorktreeUnfilled)
+                                     else "active" if config.plan.path == Path("active")
+                                     else str(tree.path / config.plan.path))
+                else:
+                    cells["Plan"] = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
+                if isinstance(config.port, unit_config.AppPort):
+                    cells["Port"] = str(config.port.number)
+            else:
+                reason = config.reason if not isinstance(config, session_staff.NoUnitConfig) else "no unit configuration"
+                cells["Plan"] = "unavailable: " + reason
+                problems.append(reason)
+        doc = resolver.production_doc(row)
+        if not isinstance(doc, session_staff.ProductionDoc):
+            problems.append(doc.reason)
+        if problems:
+            causes = dict.fromkeys(" ".join(reason.splitlines()) for reason in problems)
+            issues.append(UnitProblem(row.id, row.name, "; ".join(causes)))
+        metadata[row.id] = cells
+    return UnitMetadata(metadata, tuple(issues))
 
 
 @dataclass(frozen=True)
 class UnitProduction:
     """The current parent and its source document, resolved from the staff edge."""
 
-    slug: str
+    name: str
     doc: str
 
 
-def unit_row(unit: str, record: staff.StaffSnapshot, *, staff_id: str = "") -> staff.StaffRow:
-    """Join a pane by durable id, or by its unique legacy name until 2026-11-13."""
-    found = _unit_match(ObservedUnit(unit, staff_id), record, staff_id)
+def unit_row(unit: str, record: staff.StaffSnapshot, *,
+             reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME) -> staff.StaffRow:
+    """Resolve a selected identity without a name fallback."""
+    found = _unit_match(ObservedUnit(unit), record, reference)
     if isinstance(found, NoSuchMember):
-        raise staff.StaffUnreadable(f"{unit or staff_id}: no unique staff entry")
+        raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
     return found.row
 
 
-def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
-                   sources: MemberSources) -> UnitProduction:
+def row_production(row: staff.StaffRow, record: staff.StaffSnapshot) -> UnitProduction:
     """Resolve a unit's current parent from the caller's owner snapshot."""
-    parents = [slug for slug, parent in sources.showrunner_members(record).items() if parent.id == row.parent]
-    if len(parents) != 1:
-        raise staff.StaffUnreadable(f"{row.name}: staff parent has no unique production document")
-    slug = parents[0]
-    return UnitProduction(slug, str(sources.productions[slug].timer.doc))
+    parent = record.parent_of(row)
+    if parent is not None and parent.kind == "showrunner" and isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return UnitProduction(parent.name, str(parent.doc.path))
+    raise staff.StaffUnreadable(f"{row.name}: no showrunner parent document")
 
 
-def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
-                sources: MemberSources | None = None) -> UnitProduction:
+@dataclass(frozen=True)
+class NoSessionShowrunner:
+    """The session has no staff row with a showrunner at or above it."""
+
+
+def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
+                       sources: MemberSources) -> MemberFound | NoSessionShowrunner:
+    """Follow the newest launch's staff id to its first showrunner."""
+    row = record.by_current_session(session_id)
+    launches = [launch for launch in sources.launches
+                if row is not None and record.by_member_reference(launch["session_id"]) == row]
+    if not launches:
+        return NoSessionShowrunner()
+    while row is not None:
+        if row.kind == "showrunner":
+            return MemberFound(row)
+        row = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
+    return NoSessionShowrunner()
+
+
+def unit_parent(unit: str,
+                reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME, *,
+                record: staff.StaffSnapshot) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
-    sources = sources if sources is not None else member_sources()
-    launches = [launch for launch in sources.launches if session_id and launch["session_id"] == session_id]
-    environment = max(launches, key=lambda launch: launch["written_at"])["environment"] if launches else {}
-    if launches:
-        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=environment.get("STAFF_ID", ""))
-    else:
-        selected = sources.member(ObservedUnit(unit), record)
-        if isinstance(selected, NoSuchMember):
-            raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
-        row = selected.row
-    return row_production(row, record, sources)
+    row = unit_row(unit, record, reference=reference)
+    return row_production(row, record)
 
 
 class UnitState(Enum):
@@ -118,8 +222,66 @@ class RunRecord(NamedTuple):
     state: UnitState
 
 
+class HeldRun(NamedTuple):
+    """A directed run and its recorded worktree and state."""
+
+    path: Path
+    worktree: Path
+    state: UnitState
+
+
+@dataclass(frozen=True)
+class NoUnfinishedRun:
+    """The director holds no run with an unfinished history."""
+
+
+@dataclass(frozen=True)
+class HeldRunUnknown:
+    """A held history cannot establish the unit's run state."""
+
+    path: Path
+    reason: str
+
+
+class HeldRunLookup:
+    """Read only held histories and retain each result for one watch pass."""
+
+    def __init__(self, *, record: staff.StaffSnapshot | None = None) -> None:
+        self._record: staff.StaffSnapshot | None = record
+        self._folders: dict[str, list[str]] | None = None
+        self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
+
+    def unfinished_held_run(self, session_id: str) -> HeldRun | HeldRunUnknown | NoUnfinishedRun:
+        if not session_id:
+            return NoUnfinishedRun()
+        if self._folders is None:
+            self._folders = unit_runs.held_by_session()
+        for folder in unit_runs.held(session_id, scanned=self._folders):
+            path = runs_dir() / (Path(folder).name + ".jsonl")
+            if path not in self._histories:
+                try:
+                    with path.open("rb") as handle:
+                        first = _event(handle.readline().decode("utf-8"))
+                    if first is None or first.get("event_type") != "run_started":
+                        raise ValueError("history does not start with run_started")
+                    if self._record is None:
+                        self._record = staff.snapshot()
+                    row = self._record.by_member_reference(session_id)
+                    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+                        raise ValueError(f"{session_id}: the staff worktree is unavailable")
+                    last = _last_event(path)
+                    state = (UnitState.RUN_FINISHED if last is not None
+                             and last.get("event_type") == "run_finished" else UnitState.RUNNING)
+                    self._histories[path] = HeldRun(path, row.worktree.path, state)
+                except (OSError, UnicodeError, ValueError) as error:
+                    self._histories[path] = HeldRunUnknown(path, str(error))
+            run = self._histories[path]
+            if isinstance(run, HeldRunUnknown) or run.state is UnitState.RUNNING:
+                return run
+        return NoUnfinishedRun()
+
+
 class RunStates(NamedTuple):
-    # Keep the recorded spelling: unit_move matches working_dir exactly.
     records: dict[str, RunRecord]
 
     def state(self, worktree: Path) -> UnitState:
@@ -162,12 +324,8 @@ def _last_event(path: Path) -> dict[str, object] | None:
     return None
 
 
-def read_run_states() -> RunStates:
-    """Snapshot newest runs once: each file's first line, then each newest file's last event.
-
-    Keys keep working_dir as recorded; state() looks up a resolved worktree path. Unreadable
-    records raise OSError, and invalid UTF-8 in the lines read raises UnicodeError.
-    """
+def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
+    """Join each run's director to its staff folder and read the newest run state."""
     directory = runs_dir()
     if not directory.exists():
         return RunStates({})
@@ -179,9 +337,16 @@ def read_run_states() -> RunStates:
             first = _event(handle.readline().decode("utf-8"))
         if first is None or first.get("event_type") != "run_started":
             continue
-        worktree = first.get("working_dir")
-        if not isinstance(worktree, str) or not worktree:
+        agent = first.get("main_agent")
+        identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
+        if not isinstance(identity, str):
             continue
+        if record is None:
+            record = staff.snapshot()
+        row = record.by_member_reference(identity)
+        if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+            continue
+        worktree = str(row.worktree.path)
         started = first.get("run_started_at")
         at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
         if worktree not in newest or at > newest[worktree].at:
@@ -203,10 +368,6 @@ def run_state(worktree: Path) -> UnitState:
     return read_run_states().state(worktree)
 
 
-def sessions_dir() -> Path:
-    return Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
-
-
 class RecordsRead(NamedTuple):
     """Every session record was readable."""
 
@@ -225,16 +386,6 @@ def _place_of(pid: int, places: dict[int, HerdrPlace]) -> HerdrPlace | None:
     return None if isinstance(placement, herdr.NotInHerdr) else placement
 
 
-def _pid_runs(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (ProcessLookupError, OverflowError):
-        return False
-    return True
-
-
 class UnreadAt(NamedTuple):
     """Records that could not be read: the panes they belong to, and whether any names no process."""
 
@@ -242,7 +393,8 @@ class UnreadAt(NamedTuple):
     unplaced: RecordsRead | RecordsPartlyUnread
 
 
-def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude], UnreadAt]:
+def _claudes(processes: list[herdr.HerdrProcess], *,
+             running: Sequence[SessionRecord] | None = None) -> tuple[dict[int, LiveClaude], UnreadAt]:
     """Newest live Claude record per pid, and the panes whose record could not be read.
 
     Claude names each record after its pid. A record that cannot be read for a pid that no longer runs,
@@ -250,28 +402,25 @@ def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude]
     many exit at once. It makes only its own pane unknown, never every pane.
     """
     places = {process.pid: process.place for process in processes}
-    try:
-        paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
-    except OSError as error:
-        return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
+    entries: Iterable[SessionRecord]
     newest: dict[int, tuple[int, LiveClaude]] = {}
     unread: dict[HerdrPlace, str] = {}
     unplaced: RecordsRead | RecordsPartlyUnread = RecordsRead()
-    for path in paths:
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord):
+    if running is None:
+        registry = sessions.read_registry()
+        if sessions.sessions_dir() in registry.unreadable:
+            return {}, UnreadAt({}, RecordsPartlyUnread("cannot list session records"))
+        entries = (item.record for item in registry.entries)
+        for path in registry.unreadable:
             pid = int(path.stem) if path.stem.isdigit() else None
-            if pid is not None and (not path.exists() or not _pid_runs(pid)):
-                continue
-            # A record that Claude is writing reads complete a moment later.
-            record = read_session(path)
-            if isinstance(record, UnreadableSessionRecord):
-                place = None if pid is None else _place_of(pid, places)
-                if pid is None:
-                    unplaced = RecordsPartlyUnread("one or more session records could not be read")
-                elif place is not None:
-                    unread[place] = f"the session record of pid {pid} could not be read"
-                continue
+            place = None if pid is None else _place_of(pid, places)
+            if pid is None:
+                unplaced = RecordsPartlyUnread("one or more session records could not be read")
+            elif place is not None:
+                unread[place] = f"the session record of pid {pid} could not be read"
+    else:
+        entries = running
+    for record in entries:
         if not live_session(record):
             # A running registered Claude with no messaging socket cannot be
             # called absent. Preserve the existing fail-closed unknown state.
@@ -289,87 +438,133 @@ def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude]
     return {pid: claude for pid, (_, claude) in newest.items()}, UnreadAt(unread, unplaced)
 
 
-def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
-                  processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
+def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
+                  processes: list[herdr.HerdrProcess]) -> Iterable[LabeledSession]:
     """Join live Claude by PID, retaining stopped panes and unknown evidence."""
     running = {session["name"] for session in herdr.live_sessions()}
-    unknown_seen: set[tuple[HerdrPlace, str, str]] = set()
-    live_marks = {(process.place, process.marks.get(PRODUCTION_MARK), process.marks.get(UNIT_MARK))
-                  for process in processes if process.pid in claudes}
+    holders = {process.pid: (process.place, claudes[process.pid].session_id if process.pid in claudes else
+                            process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
+               for process in processes}
+    process_counts = Counter(process.place for process in processes)
+    inherited: set[int] = set()
+    agents = [process for process in processes if holders[process.pid][1]
+              and (process.pid in claudes or process.command in ("claude", "codex"))]
+    if agents:
+        from scripts.message import process_table
+
+        darwin = os.environ.get("HERDR_PLATFORM", sys.platform) == "darwin"
+        try:
+            parents = process_table.snapshot() if darwin else {}
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            parents = {}
+        for process in agents:
+            try:
+                current = process.pid
+                seen: set[int] = {current}
+                while current > 1:
+                    if darwin:
+                        parent = parents.get(current)
+                        if parent is None:
+                            break
+                        current = parent.parent
+                    else:
+                        current = herdr.linux_process_parent(current)
+                    if current in seen:
+                        break
+                    seen.add(current)
+                    if holders.get(current) == holders[process.pid]:
+                        # A registered Claude keeps its pane; its headless claude child is the copy.
+                        inherited.add(process.pid if current in claudes else current)
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                # Keep this process evidence when its ancestry is unavailable.
+                pass
     for process in processes:
-        place = process.place
-        if place.session not in running:
+        if process.pid in inherited:
             continue
-        slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
-        staff_id = process.marks.get("STAFF_ID", "")
-        if not unit and not staff_id:
+        if process.place.session not in running:
+            continue
+        native = holders[process.pid][1]
+        problem = unread.places.get(process.place, unread.unplaced.reason
+                                    if isinstance(unread.unplaced, RecordsPartlyUnread) else "")
+        if problem and process.pid not in claudes:
+            _ = session_staff.collect_anomaly(f"pid {process.pid} in {place_text(process.place)}: {problem}", pid=process.pid)
+        if not native:
+            if process.place in unread.places or process.command in ("claude", "codex"):
+                yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
+                                     ObservedProcess(process.pid, process.command))
             continue
         claude: Claude
         if process.pid in claudes:
             claude = claudes[process.pid]
-        elif place in unread.places:
-            claude = ClaudeUnknown(unread.places[place])
-        elif isinstance(unread.unplaced, RecordsPartlyUnread):
-            if (place, slug, unit) in live_marks:
-                continue
-            claude = ClaudeUnknown(unread.unplaced.reason)
-        else:
+        elif problem:
+            claude = ClaudeUnknown(problem)
+        elif (process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh") and process_counts[process.place] == 1
+              and process.marks.get("CLAUDE_CODE_SESSION_ID") == native
+              and not process.marks.get("CODEX_THREAD_ID")):
             claude = ClaudeNotRunning()
-        if isinstance(claude, ClaudeUnknown):
-            key = (place, slug, unit)
-            if key in unknown_seen:
-                continue
-            unknown_seen.add(key)
-        yield slug, MarkedUnit(unit, claude, place, process.pid, process.command, staff_id)
+        else:
+            claude = ClaudeUnknown("native process has no registered Claude session")
+        yield LabeledSession("", claude, process.place,
+                                 ObservedProcess(process.pid, process.command), LiveSession(native))
 
 
-def observed_unit_marks() -> tuple[tuple[str, MarkedUnit], ...]:
-    """Read pane marks for stop and cleanup checks, including former staff names."""
+def observed_session_labels(*, record: staff.StaffSnapshot | None = None, running: Sequence[SessionRecord] | None = None) -> tuple[LabeledSession, ...]:
+    """Read native process identities for stop and cleanup checks."""
     try:
-        processes = herdr.herdr_processes()
-        claudes, unread = _claudes(processes)
-        return tuple(_herdr_marked(claudes, unread, processes))
+        record = record if record is not None else staff.snapshot()
+        processes = herdr.herdr_processes(membership=StaffLabels(record))
+        claudes, unread = _claudes(processes, running=running)
+        return tuple(_herdr_labeled(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
 
 
-def every_marked_unit(*, record: staff.StaffSnapshot | None = None) -> MarkedProductions:
+def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
+                      sources: MemberSources | None = None,
+                      running: Sequence[SessionRecord] | None = None) -> LabeledProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_unit_marks(), record=record)
+    record = record if record is not None else staff.snapshot()
+    return group_labeled_sessions(observed_session_labels(record=record, running=running), record=record, sources=sources)
 
 
-def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None) -> dict[str, MarkedUnit]:
-    """Every unit of the production. Unreadable herdr, or any unit's mark on two sessions, raises OSError."""
-    slug = _lookup_slug(slug)
-    found = every_marked_unit(record=record)
-    if fault := found.production_fault(slug):
-        raise OSError(fault)
-    return found.units.get(slug, {})
+def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot | None = None,
+                 sources: MemberSources | None = None) -> dict[str, LabeledSession]:
+    """Return the selected process state for each unit."""
+    found = every_labeled_session(record=record, sources=sources)
+    return found.status_units(production_name)
 
 
-def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = None) -> MarkedUnit | None:
-    """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
-    slug = _lookup_slug(slug)
-    found = every_marked_unit(record=record)
-    if fault := found.faults.get(slug, {}).get(name):
-        raise OSError(fault)
-    return found.units.get(slug, {}).get(name)
+def labeled_session(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None,
+                sources: MemberSources | None = None,
+                running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
+    """Return one unit of the production. Unreadable herdr raises OSError."""
+    record = record if record is not None else staff.snapshot()
+    sources = sources if sources is not None else member_sources()
+    selected = sources.member(UnitMember(production_name, name), record)
+    label = selected.row.name if isinstance(selected, MemberFound) else name
+    marked = observed_session_labels(record=record, running=running)
+    if isinstance(selected, MemberFound):
+        # A retained row still needs pane liveness checks when cleanup is retried.
+        found = retained_session_labels(marked, selected.row, production_name, record=record, sources=sources)
+    else:
+        found = group_labeled_sessions(marked, record=record, sources=sources)
+    return found.units.get(production_name, {}).get(label)
 
 
 def main(arguments: list[str]) -> int:
     """Exit 0 found or done, 1 no such unit session, 2 usage, 3 cannot tell or could not do it."""
     try:
         match arguments:
-            case ["list", slug]:
-                for unit in marked_units(slug).values():
+            case ["list", production_name]:
+                for unit in labeled_sessions(production_name).values():
                     claude = unit.claude
                     told = ((claude.name, claude.session_id, claude.socket) if isinstance(claude, LiveClaude)
                             else ("", "", ""))
                     running = ("live" if isinstance(claude, LiveClaude)
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
                     print("\t".join((unit.unit, place_text(unit.place), unit.place.session, running, *told)))
-            case ["pane", slug, name]:
-                found = marked_unit(slug, name)
+            case ["pane", production_name, name]:
+                found = labeled_session(production_name, name)
                 if found is None:
                     return 1
                 print(place_text(found.place))

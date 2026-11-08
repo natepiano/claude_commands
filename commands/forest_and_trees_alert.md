@@ -1,5 +1,5 @@
 ---
-description: Send a /forest_and_trees style alert to every other running agent — stop the task in hand, the bigger underlying problem is the only thing that matters now. Prefix with `respond` to have each agent answer back.
+description: Tell agents to change to a larger task.
 ---
 
 # Forest and Trees Alert

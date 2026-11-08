@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
 
 
 HOOKS = Path(__file__).resolve().parent
 SESSION = "wait-director"
+SHOWRUNNER_SESSION = fixture_runtime_id("wait-showrunner")
 STOP = "stop-direct-continue.py"
 PROMPT = "user-prompt-submit-conversation-pause.py"
 
@@ -32,9 +38,9 @@ class DirectorWaitFixture:
 
     def call(self, hook: str, fields: dict[str, object], at: int) -> None:
         result = subprocess.run(
-            [sys.executable, str(HOOKS / hook)],
+            [sys.executable, str(self.root / "session_lookup.py"), str(HOOKS / hook)],
             input=json.dumps({"session_id": SESSION, **fields}), text=True,
-            capture_output=True, check=True, timeout=30,
+            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             env={**self.environment, "UNIT_NOW_EPOCH": str(at)}, cwd=self.root,
         )
         if result.stderr or result.stdout:
@@ -52,7 +58,7 @@ class DirectorWaitFixture:
 
 @contextmanager
 def director_wait_fixture() -> Generator[DirectorWaitFixture]:
-    with tempfile.TemporaryDirectory(dir="/tmp/claude") as temporary, ExitStack() as resources:
+    with short_socket_directory("turn-wait-") as temporary, ExitStack() as resources:
         root = Path(temporary)
         run = root / "run"
         run.mkdir()
@@ -81,7 +87,12 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         document = root / "wait-production.md"
         _ = document.write_text("Fixture production\n")
         _ = (notifier / "conf").write_text(
-            f"TARGET=session:showrunner-id\nCHECK=zsh /scripts/production_check.sh {document}\n")
+            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh expected-showrunner\n")
+        staff_environment: dict[str, str] = {}
+        resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
+        _ = fixture_member("showrunner", name="expected-showrunner",
+                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc(remote.local_machine(), document))
+        _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
@@ -89,11 +100,28 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
             address = str(root / f"socket-{index}")
             connection.bind(address)
             _ = (sessions / (f"{os.getpid()}.json" if index == 0 else f"peer-{index}.json")).write_text(json.dumps(
-                {"pid": os.getpid(), "sessionId": "showrunner-id" if index == 0 else f"peer-{index}",
+                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else f"peer-{index}",
                  "name": name, "messagingSocketPath": address, "updatedAt": 1, "tmux": "", "formerNames": []}))
         _ = (root / "current_socket").write_text("/fixture/showrunner/socket")
         session_lookup = root / "session_lookup.py"
-        _ = session_lookup.write_text(f"from pathlib import Path\nprint(Path({str(root / 'current_socket')!r}).read_text())\n")
+        _ = session_lookup.write_text("\n".join((
+            "import runpy, sys",
+            "from pathlib import Path",
+            f"with open({str(HOOKS.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
+            "from scripts.message import sessions",
+            "from unittest.mock import patch",
+            "read_sessions = sessions.live_sessions",
+            "def fixture_sessions():",
+            "    records = read_sessions()",
+            "    for record in records:",
+            f"        if record['sessionId'] == {SHOWRUNNER_SESSION!r}:",
+            f"            record['messagingSocketPath'] = Path({str(root / 'current_socket')!r}).read_text()",
+            "    return records",
+            "sys.argv = sys.argv[1:]",
+            "with patch.object(sessions, 'live_sessions', side_effect=fixture_sessions):",
+            "    runpy.run_path(sys.argv[0], run_name='__main__')",
+            "",
+        )))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root), "XDG_STATE_HOME": str(root / "state"),
             "UNIT_ACTIVE_DIR": str(active), "UNIT_HISTORY_DIR": str(root / "history"), "UNIT_SYNC_WRITES": "0",
@@ -104,6 +132,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
             "CONVERSATION_PAUSE_NOTIFIER": false_command, "AUTO_SILENCE_COMMAND": true_command,
             "CONVERSATION_PAUSE_HOOK_BUDGET": "25",
             "SHOWRUNNERS_SESSIONS": str(session_lookup), "NOTIFIER_SESSIONS_DIR": str(sessions),
+            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": "/nonexistent/herdr",
         }
         yield DirectorWaitFixture(root, run, history, environment)
 
@@ -127,7 +156,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
 
     def test_supplier_wait_only_finishes_on_its_current_address(self) -> None:
         for final_line, sender, address in (
-            ("blocked: waiting on the showrunner to merge", "showrunner:wait-production", "/fixture/showrunner/socket"),
+            ("blocked: waiting on the showrunner to merge", "showrunner:expected-showrunner", "/fixture/showrunner/socket"),
             ("blocked: waiting on claude-build-followups-other", "claude-build-followups-other", "socket-1"),
             ("blocked: waiting on session:peer-1", "session:peer-1", "socket-1"),
         ):
@@ -216,7 +245,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             replies.mkdir(parents=True)
             record: dict[str, object] = {
                 "at_ms": 1020000, "socket": "uds:" + supplier_socket,
-                "name": "renamed-showrunner", "session_id": "showrunner-id",
+                "name": "renamed-showrunner", "session_id": SHOWRUNNER_SESSION,
                 "senders": ["another-director", "director"], "body": reply,
                 # This director is the second intended recipient. The reply's
                 # filename counter and each forward's suffix are independent.
@@ -302,13 +331,16 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             runs = fixture.root / "unit-runs"
             worker_run = runs / "supplier-run"
             worker_run.mkdir(parents=True)
-            _ = (worker_run / "mesh_roster.json").write_text(json.dumps({"supplier-fix": {"thread_id": "supplier-thread"}}))
+            parent, = staff.local_snapshot().find(kind="unit")
+            worker = fixture_worker("supplier-fix", parent.id,
+                                    backend=staff.CodexBackend(fixture.root / "codex"))
+            _ = (worker_run / "mesh_roster.json").write_text(json.dumps({"supplier-fix": {"staff_id": worker.id}}))
             fixture.environment["UNIT_RUN_ROOT"] = str(runs)
             supplier = "worker:supplier-run/supplier-fix"
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
             fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
             self.assertEqual(len(fixture.wait_events()), 1)
-            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:supplier-thread")}, 1040)
+            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address=f"codex:{worker.current_session}")}, 1040)
             self.assertEqual(fixture.wait_events()[-1]["event_type"], "wait_finished")
 
     def test_unnamed_supplier_remains_unresolved_and_different_supplier_replaces_wait(self) -> None:

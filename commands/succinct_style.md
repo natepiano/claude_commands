@@ -1,5 +1,5 @@
 ---
-description: Load before editing any command, skill, or style rule file.
+description: Read before command, skill, or style edits.
 ---
 
 Load before editing anything that enters a session as instructions: `~/.claude/commands/`, skills, and style rules under `~/rust/nate_style/` or a repo-local `docs/style/`.

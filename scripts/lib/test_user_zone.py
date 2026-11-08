@@ -15,7 +15,7 @@ from scripts.lib.code_kind import is_test_code
 from scripts.lib import user_zone
 
 SCRIPT = Path(__file__).with_name("user_zone.py")
-PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
+PROBE = ("from scripts.lib import user_zone; from datetime import datetime, timezone; "
          "print(user_zone.user_zone().key, user_zone.zone_label(datetime(2026, 7, 1, 12, tzinfo=timezone.utc)), "
          "user_zone.zone_label(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)))")
 
@@ -38,7 +38,6 @@ USES_THE_MACHINE_ZONE = {
     "notify/review.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
-    "shutdown/inventory.py": "Codex names its session folders by the machine's date",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
     "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
@@ -107,7 +106,7 @@ class UserZoneTests(unittest.TestCase):
 
     def test_the_label_comes_from_the_zone_and_the_date(self) -> None:
         env = {**os.environ, "USER_ZONE_CONF": str(self.conf), "USER_ZONE": "America/New_York"}
-        result = subprocess.run([sys.executable, "-c", PROBE, str(SCRIPT.parent)], env=env, capture_output=True,
+        result = subprocess.run([str(SCRIPT.with_name("py")), "-c", PROBE], env=env, capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.stdout, "America/New_York EDT EST\n", result.stderr)
 

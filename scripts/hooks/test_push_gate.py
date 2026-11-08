@@ -1,14 +1,12 @@
 """A fallback approval survives interruption and is consumed on delivery."""
 from __future__ import annotations
 
-import importlib.util
 import fcntl
 import io
 import json
 import os
 import tempfile
 import time
-import sys
 import subprocess
 import shlex
 import unittest
@@ -17,17 +15,20 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, override
 from unittest import mock
+from scripts.lib.file_module import load_file_module
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
-    from ..notify import review, pushover
-    from ..notify.user_action import ActionRequired
+    from scripts.notify import review, pushover
+    from scripts.notify.push_test_support import registered_send
+    from scripts.notify.user_action import ActionRequired
 else:
-    import review
-    import pushover
-    from user_action import ActionRequired
+    from scripts.notify import review
+    from scripts.notify import pushover
+    from scripts.notify.push_test_support import registered_send
+    from scripts.notify.user_action import ActionRequired
 
-spec = importlib.util.spec_from_file_location("push_gate", Path(__file__).with_name("pre-tool-use-push-gate.py"))
+module = load_file_module("push_gate", Path(__file__).with_name("pre-tool-use-push-gate.py"))
+spec = module.__spec__
 assert spec is not None and spec.loader is not None
 class PushGate(Protocol):
     DENIAL: str
@@ -38,11 +39,10 @@ class PushGate(Protocol):
     def main(self, *, clock: Callable[[], float], sleep: Callable[[float], None]) -> None: ...
 
 
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
 push_gate = cast(PushGate, cast(object, module))
 
-delivered_spec = importlib.util.spec_from_file_location("push_delivered", Path(__file__).with_name("post-tool-use-push-delivered.py"))
+delivered_module = load_file_module("push_delivered", Path(__file__).with_name("post-tool-use-push-delivered.py"))
+delivered_spec = delivered_module.__spec__
 assert delivered_spec is not None and delivered_spec.loader is not None
 
 
@@ -50,8 +50,6 @@ class PushDelivered(Protocol):
     def main(self) -> None: ...
 
 
-delivered_module = importlib.util.module_from_spec(delivered_spec)
-delivered_spec.loader.exec_module(delivered_module)
 push_delivered = cast(PushDelivered, cast(object, delivered_module))
 
 
@@ -73,6 +71,8 @@ class Marker(TypedDict):
     body: str
     message: str
     fallback: str
+    text_id: NotRequired[str]
+    sender: NotRequired[str]
     held: NotRequired[bool]
     reviewed: NotRequired[bool]
     need: NotRequired[str]
@@ -106,12 +106,13 @@ class PushGateTests(unittest.TestCase):
         message = ("Action: " + action if action is not None else "No action needed.") + "\nThe build stopped."
         record: Marker = {"time": stamp, "title": "Build choice", "action": action,
                           "body": "The build stopped.", "message": message,
-                          "fallback": "Build choice — " + message.partition("\n")[0]}
+                          "fallback": "Title: Build choice\n" + message + "\n\nSent by: writer · Template: alert.blocked",
+                          "text_id": "alert.blocked", "sender": "writer", "reviewed": True, "need": "blocked"}
         path = directory / "writer.json"
         _ = path.write_text(json.dumps(record))
         return path
 
-    def call(self, *, message: str = "Build choice — Action: Choose retry.",
+    def call(self, *, message: str = "Title: Build choice\nAction: Choose retry.\nThe build stopped.\n\nSent by: writer · Template: alert.blocked",
              session: str = "writer", raw: str = "") -> tuple[str, str]:
         payload: HookPayload = {"session_id": session, "tool_name": "PushNotification",
                                "tool_input": {"message": message, "status": "proactive"}}
@@ -128,7 +129,7 @@ class PushGateTests(unittest.TestCase):
         self.assertEqual(response["hookSpecificOutput"]["hookEventName"], "PreToolUse")
         self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.DENIAL)
 
-    def delivered(self, *, message: str = "Build choice — Action: Choose retry.",
+    def delivered(self, *, message: str = "Title: Build choice\nAction: Choose retry.\nThe build stopped.\n\nSent by: writer · Template: alert.blocked",
                   response: object = None, tool: str = "PushNotification") -> tuple[str, str]:
         payload = {"session_id": "writer", "tool_name": tool, "tool_input": {"message": message},
                    "tool_response": {"success": True} if response is None else response}
@@ -182,13 +183,15 @@ class PushGateTests(unittest.TestCase):
         self.assertEqual(self.delivered(tool="Bash"), ("", ""))
         self.assertEqual(path.read_bytes(), before_marker)
 
-    def test_a_failed_push_keeps_approval_and_a_whitespace_matched_delivery_consumes_it(self) -> None:
+    def test_a_failed_push_keeps_approval_and_an_exact_delivery_consumes_it(self) -> None:
         path = self.marker()
         for response in ({"success": False}, {"is_error": True}, {"success": True, "is_error": True}, {}):
             with self.subTest(response=response):
                 self.assertEqual(self.delivered(response=response), ("", ""))
                 self.assertTrue(path.exists())
         self.assertEqual(self.delivered(message=" Build\tchoice — Action:   Choose retry. "), ("", ""))
+        self.assertTrue(path.exists())
+        self.assertEqual(self.delivered(), ("", ""))
         self.assertFalse(path.exists())
 
     def test_an_unreadable_marker_or_post_hook_error_never_blocks_or_deletes_approval(self) -> None:
@@ -226,33 +229,39 @@ class PushGateTests(unittest.TestCase):
             self.assertEqual(errors, "")
             self.assertFalse(path.exists())
 
-    def test_reviewed_and_blocked_fallbacks_are_allowed_and_consumed(self) -> None:
-        for reviewed, need in ((True, "note"), (True, "decision"), (False, "blocked")):
+    def test_only_reviewed_blocked_registered_fallbacks_are_allowed(self) -> None:
+        for reviewed, need in ((True, "note"), (True, "decision"), (False, "blocked"), (True, "blocked")):
             with self.subTest(reviewed=reviewed, need=need):
                 path = self.marker()
                 marker = cast(Marker, json.loads(path.read_text()))
                 marker.update(reviewed=reviewed, need=need)
                 _ = path.write_text(json.dumps(marker))
-                self.assertEqual(self.call(), ("", ""))
-                self.assertEqual(self.delivered(), ("", ""))
-                self.assertFalse(path.exists())
+                output, errors = self.call()
+                self.assertEqual(errors, "")
+                if reviewed and need == "blocked":
+                    self.assertEqual(output, "")
+                    self.assertEqual(self.delivered(), ("", ""))
+                    self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(cast(Response, json.loads(output))["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_legacy_marker_without_review_fields_still_allows_in_flight_fallback(self) -> None:
+    def test_marker_without_a_registered_template_is_denied(self) -> None:
+        for text_id in ("", "unknown.template"):
+            path = self.marker()
+            marker = cast(Marker, json.loads(path.read_text()))
+            if text_id:
+                marker["text_id"] = text_id
+            else:
+                del marker["text_id"]
+            _ = path.write_text(json.dumps(marker))
+            self.assert_denied(self.call()[0])
+            self.assertTrue(path.exists())
+
+    def test_whitespace_changes_are_denied_for_the_full_rendering(self) -> None:
         path = self.marker()
-        marker = cast(Marker, json.loads(path.read_text()))
-        self.assertNotIn("reviewed", marker)
-        self.assertNotIn("need", marker)
-        self.assertEqual(self.call(), ("", ""))
-        self.assertEqual(self.delivered(), ("", ""))
-        self.assertFalse(path.exists())
-
-    def test_whitespace_changes_are_allowed_for_action_and_no_action(self) -> None:
-        for action in ("Choose retry.", None):
-            path = self.marker(action=action)
-            header = "Action: Choose retry." if action is not None else "No action needed."
-            self.assertEqual(self.call(message="  Build\tchoice —  " + header + " "), ("", ""))
-            self.assertEqual(self.delivered(message="  Build\tchoice —  " + header + " "), ("", ""))
-            self.assertFalse(path.exists())
+        self.assert_denied(self.call(message="  Build choice — Action: Choose retry. ")[0])
+        self.assertEqual(self.delivered(message="  Build choice — Action: Choose retry. "), ("", ""))
+        self.assertTrue(path.exists())
 
     def test_missing_expired_and_other_session_markers_deny(self) -> None:
         self.assert_denied(self.call()[0])
@@ -286,7 +295,7 @@ class PushGateTests(unittest.TestCase):
         with (mock.patch.object(review, "review", return_value=review.Approved(draft)),
               mock.patch.object(pushover, "LOG_FILE", self.root / "push.jsonl"),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
-            self.assertEqual(pushover.send(["--source", draft.source, "--priority", "1", "--answerable",
+            self.assertEqual(registered_send(["--source", draft.source, "--priority", "1", "--answerable",
                                            "--action", "Choose retry.", draft.title, draft.body],
                                           keys, lambda _u, _d: (500, b'{"status":0}')), 1)
         record = cast(dict[str, object], json.loads(output.getvalue().splitlines()[0].removeprefix("pushover: reviewed JSON: ")))
@@ -353,7 +362,7 @@ class PushGateTests(unittest.TestCase):
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
                 review.release(draft.source)  # Keep local and remote cases independent if an assertion fails.
                 review.hold(review.Held(draft.source, 1000 + index, draft, draft, ["Which build?"]))
-                self.assertEqual(pushover.send(arguments, keys, lambda _u, _d: (500, b'{"status":0}')), 1)
+                self.assertEqual(registered_send(arguments, keys, lambda _u, _d: (500, b'{"status":0}')), 1)
                 record = cast(dict[str, object], json.loads(output.getvalue().splitlines()[0].removeprefix("pushover: reviewed JSON: ")))
                 path = self.marker()
                 marker = cast(Marker, json.loads(path.read_text()))
@@ -361,7 +370,7 @@ class PushGateTests(unittest.TestCase):
                 marker["held_identity"] = cast(str, record["held_identity"])
                 marker["held_machine"] = machine
                 _ = path.write_text(json.dumps(marker))
-                self.assertEqual(pushover.send(arguments, keys, lambda _u, _d: (200, b'{"status":1}')), 0)
+                self.assertEqual(registered_send(arguments, keys, lambda _u, _d: (200, b'{"status":1}')), 0)
                 replacement = review.Held(draft.source, 2000, draft, draft, ["Which terminal?"])
                 review.hold(replacement)
                 with mock.patch.object(subprocess, "run", side_effect=self.remote_release) as run:
@@ -484,7 +493,7 @@ class PushGateTests(unittest.TestCase):
             if operation & fcntl.LOCK_NB and elapsed[0] >= 109:
                 raise BlockingIOError("worker still posting")
         payload: HookPayload = {"session_id": "writer", "tool_name": "PushNotification",
-            "tool_input": {"message": "Build choice — Action: Choose retry.", "status": "proactive"}}
+            "tool_input": {"message": "Title: Build choice\nAction: Choose retry.\nThe build stopped.\n\nSent by: writer · Template: alert.blocked", "status": "proactive"}}
         with (mock.patch.object(review, "review_timeout_seconds", return_value=90),
               mock.patch.object(fcntl, "flock", side_effect=flock),
               mock.patch("sys.stdin", io.StringIO(json.dumps(payload))),
@@ -496,28 +505,29 @@ class PushGateTests(unittest.TestCase):
         self.assertEqual(self.delivered(), ("", ""))
         self.assertFalse(path.exists())
 
-    def test_hook_errors_allow_and_report_the_error(self) -> None:
+    def test_hook_errors_deny_and_report_the_error(self) -> None:
         for raw in ("bad JSON", "[]", '{"tool_name":"PushNotification"}'):
             output, errors = self.call(raw=raw)
-            self.assertEqual(output, "")
+            self.assert_denied(output)
             self.assertIn("push gate:", errors)
         path = self.marker()
         _ = path.write_text("bad JSON")
         output, errors = self.call()
-        self.assertEqual(output, "")
+        self.assert_denied(output)
         self.assertIn("JSONDecodeError", errors)
         self.assertTrue(path.exists())
         path = self.marker()
         marker = cast(Marker, json.loads(path.read_text()))
         marker["held"] = True
+        marker["need"] = "decision"
         _ = path.write_text(json.dumps(marker))
         with mock.patch.object(Path, "unlink", side_effect=OSError("cannot consume")):
             output, errors = self.call()
-        self.assertEqual(output, "")
+        self.assert_denied(output)
         self.assertIn("cannot consume", errors)
         for session in ("../writer", "..", ""):
             output, errors = self.call(session=session)
-            self.assertEqual(output, "")
+            self.assert_denied(output)
             self.assertIn("invalid session_id", errors)
 
 

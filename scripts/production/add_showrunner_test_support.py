@@ -2,6 +2,8 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -16,20 +18,19 @@ from types import ModuleType, SimpleNamespace
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
+from scripts.whoami.account_test_support import write_claude_account
 from scripts.production import add_showrunner
-from scripts.production import showrunners
+from scripts.production import showrunners, showrunner_tree, staff
 from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.production.fake_unit_host import private_process_registry, confirm_tab_close, native_claude, process as write_process
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
-PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
+PARENT_SESSION = "1c1dbca4-3e25-5434-9285-b225246489a5"
 STUB = '''#!__PYTHON__
 import json
 import os
@@ -62,7 +63,8 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 '''
 
 
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AddShowrunnerFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -112,6 +114,12 @@ class AddShowrunnerFixture(unittest.TestCase):
         self.herdr_overrides = {}
         self.processes = []
         self.addCleanup(self.close_processes)
+        _ = self.enterContext(private_process_registry())
+        self.timer("top", PARENT_SESSION)
+        _ = self.doc("kid")
+        owner = staff.by_path("top")
+        assert owner is not None
+        _ = staff.update_current_session(owner.current_session, staff.native_id(PARENT_SESSION))
         self.live(PARENT_SESSION, "top")
 
     def build_fixture(self) -> None:
@@ -133,13 +141,50 @@ class AddShowrunnerFixture(unittest.TestCase):
             'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
         source = source.replace('raise SystemExit(main(sys.argv[1:]))', 'raise SystemExit(submitting_main(sys.argv[1:]))')
         hook = r'''def submitting_main(argv):
+    if argv[2:4] == ["pane", "process-info"]:
+        pid = int(os.environ["FAKE_CLAUDE_PID"])
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        responses = json.loads(path.read_text())
+        pane_shell = Path(os.environ["STUB_STATE"]) / "pane-shell"
+        shell = int(pane_shell.read_text()) if pane_shell.exists() else 998040
+        agent_stat = Path(os.environ["HERDR_PROC"]) / str(pid) / "stat"
+        live = agent_stat.exists() and int(agent_stat.read_text().rsplit(")", 1)[1].split()[1]) == shell
+        foreground = pid if live else shell
+        command = "claude" if live else "zsh"
+        responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {"process_info": {
+            "shell_pid": shell, "foreground_process_group_id": foreground,
+            "foreground_processes": [{"pid": foreground, "name": command, "argv": [command]}]}}})}
+        from scripts.lib.atomic_file import write_text_atomic
+        write_text_atomic(path, json.dumps(responses))
     result = main(argv)
+    if result == 0 and argv[2:4] == ["workspace", "create"]:
+        with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root:
+            exec(package_root.read(), {"__file__": package_root.name})
+        from scripts.production.fake_unit_host import process
+        from scripts.lib.atomic_file import write_text_atomic
+        root = Path(os.environ["HERDR_PROC"])
+        shell = max(int(item.name) for item in root.iterdir() if item.name.isdecimal()) + 1
+        process(os.environ, shell, 1, ["zsh"], {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"})
+        write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
+    if result == 0 and argv[2:4] == ["agent", "start"]:
+        with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root:
+            exec(package_root.read(), {"__file__": package_root.name})
+        from scripts.production.staff_test_support import record_fixture_claude_start
+        from scripts.production.fake_unit_host import private_process_registry, process
+        from scripts.message import sessions
+        pid = int(os.environ["FAKE_CLAUDE_PID"])
+        shell = int((Path(os.environ["STUB_STATE"]) / "pane-shell").read_text())
+        process(os.environ, pid, shell, ["claude"],
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": argv[argv.index("--pane") + 1]},
+                started=sessions.process_start(pid) or "1")
+        with private_process_registry():
+            record_fixture_claude_start(argv)
     if result == 0 and argv[2:4] == ["agent", "prompt"]:
         from datetime import datetime, timezone
         calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
         start = next(row for row in reversed(calls) if row[:2] == argv[:2] and row[2:4] == ["agent", "start"])
-        flag = "--resume" if "--resume" in start else "--session-id"
-        session_id = start[start.index(flag) + 1]
+        session_id = json.loads((Path(os.environ["NOTIFIER_SESSIONS_DIR"]) /
+                                (os.environ["FAKE_CLAUDE_PID"] + ".json")).read_text())["sessionId"]
         config = next(value.split("=", 1)[1] for row in reversed(calls) for value in row
                       if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR="))
         path = Path(config) / "projects/fixture" / (session_id + ".jsonl")
@@ -172,6 +217,7 @@ class AddShowrunnerFixture(unittest.TestCase):
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.root / "sent.jsonl"),
                     # The parent runs the command, so its own session and account are in the caller's environment.
+                    "CODEX_THREAD_ID": PARENT_SESSION,
                     "CLAUDE_CODE_SESSION_ID": PARENT_SESSION, "CLAUDE_CONFIG_DIR": str(self.root / "unit-account"),
                     "ADD_SHOWRUNNER_WAIT_S": "0", "ADD_SHOWRUNNER_POLL_S": "0.01",
                     "ADD_SHOWRUNNER_CLAUDE_JSON": str(self.root / "claude.json")}
@@ -183,17 +229,9 @@ class AddShowrunnerFixture(unittest.TestCase):
         notes = home / "notes"
         notes.mkdir()
         self.env["AGENT_NOTES_DIR"] = str(notes)
-        _ = (notes / "claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
-        now = datetime.now(timezone.utc)
-        file = home / ".local/state/agent-notes/usage.json"
-        file.parent.mkdir(parents=True)
-        _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
-            "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
         with patch.dict(os.environ, self.env):
-            self.assertEqual(accounts.setup("claude2"), [])
-            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
+            write_claude_account("claude2", "main@example.invalid", 1, datetime.now(timezone.utc) + timedelta(days=2))
         _ = self.configure_groups()
-        self.timer("top", PARENT_SESSION)
 
     def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> Path:
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
@@ -207,27 +245,32 @@ class AddShowrunnerFixture(unittest.TestCase):
                     for folder in folders}
         _ = (self.root / "claude.json").write_text(json.dumps({**(extra or {}), "projects": projects}), encoding="utf-8")
 
-    def doc(self, slug: str) -> Path:
-        path = self.root / f"{slug}-production.md"
+    def doc(self, production_name: str) -> Path:
+        path = self.root / f"{production_name}-production.md"
         if not path.exists():
-            (self.root / f"{slug}-checkout").mkdir()
+            (self.root / f"{production_name}-checkout").mkdir()
             _ = path.write_text("\n".join([
-                f"# {slug}", "", f"- **Merge branch:** `{slug}`",
-                f"- **Showrunner checkout:** `{self.root / f'{slug}-checkout'}`",
-                f"- **Log:** `docs/plans/{slug}-log.md`", "- **User zone:** America/Los_Angeles",
-                "- **Updates:** every 15 minutes", "", "## Units", "", "| Unit | Plan |", "| --- | --- |", ""]),
+                f"# {production_name}", "", f"- **Merge branch:** `{production_name}`",
+                f"- **Showrunner checkout:** `{self.root / f'{production_name}-checkout'}`",
+                f"- **Log:** `docs/plans/{production_name}-log.md`", "- **User zone:** America/Los_Angeles",
+                "- **Updates:** every 15 minutes", ""]),
                 encoding="utf-8")
         return path
 
-    def timer_conf(self, slug: str) -> Path:
-        return self.root / "notifier" / f"showrunner-{slug}" / "conf"
+    def timer_conf(self, production_name: str) -> Path:
+        _ = self.doc(production_name)
+        row = staff.by_path(production_name)
+        identity = row.id if row is not None else self.env["FAKE_CLAUDE_SESSION_ID"]
+        return self.root / "notifier" / f"showrunner-{identity}" / "conf"
 
-    def timer_text(self, slug: str, session: str) -> str:
-        return f"TARGET=session:{session}\nCHECK=zsh /x/production_check.sh {self.doc(slug)}\n"
+    def timer_text(self, production_name: str, session: str) -> str:
+        return f"TARGET=session:{session}\nCHECK=zsh /x/production_check.sh {production_name}\n"
 
-    def timer(self, slug: str, session: str) -> None:
-        self.timer_conf(slug).parent.mkdir(parents=True)
-        _ = self.timer_conf(slug).write_text(self.timer_text(slug, session), encoding="utf-8")
+    def timer(self, production_name: str, session: str) -> None:
+        _ = fixture_member("showrunner", name=production_name, runtime_id=session,
+                           doc=staff.LiveDoc(remote.local_machine(), self.doc(production_name)))
+        self.timer_conf(production_name).parent.mkdir(parents=True, exist_ok=True)
+        _ = self.timer_conf(production_name).write_text(self.timer_text(production_name, session), encoding="utf-8")
 
     def close_processes(self) -> None:
         for process in self.processes:
@@ -237,13 +280,14 @@ class AddShowrunnerFixture(unittest.TestCase):
                 process.stdin.close()
 
     def record(self, session: str, name: str = "") -> tuple[str, str]:
-        """A live session's record: where it is kept and what it holds. Its name is read from a live process's;
-        a showrunner's name is its production's slug."""
+        """Create a private record for a live session."""
         process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.processes.append(process)
+        native_claude(self.env, process.pid, kernel_process=True)
         return (str(self.root / "sessions" / f"{process.pid}.json"),
-                json.dumps({"pid": process.pid, "name": name or f"{session}-name", "sessionId": session,
+                json.dumps({"pid": process.pid, "procStart": sessions.process_start(process.pid),
+                            "name": name or f"{session}-name", "sessionId": session, "updatedAt": 1,
                             "messagingSocketPath": str(self.root / f"{session}.sock")}))
 
     def live(self, session: str, name: str = "") -> None:
@@ -253,6 +297,8 @@ class AddShowrunnerFixture(unittest.TestCase):
     def starts(self, session: str, *, registers: str = "") -> None:
         """The started session comes up as `session`, and registers `registers`'s update timer when named."""
         path, text = self.record(session, registers)
+        self.env["FAKE_CLAUDE_PID"] = Path(path).stem
+        self.env["FAKE_CLAUDE_SESSION_ID"] = session
         self.on_start[path] = text
         if registers:
             self.on_start[str(self.timer_conf(registers))] = self.timer_text(registers, session)
@@ -270,10 +316,19 @@ class AddShowrunnerFixture(unittest.TestCase):
         sent = [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
         return [arguments[arguments.index("--to") + 1] for arguments in sent]
 
-    def run_command(self, slug: str, *extra: str, cwd: Path | None = None,
+    def run_command(self, production_name: str, *extra: str, cwd: Path | None = None,
                     subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
-        self.prepare_herdr(slug)
-        return self.invoke(["--production", str(self.doc(slug)), "--model", "opus", "--effort", "high", *extra],
+        doc = self.doc(production_name)
+        owner = staff.by_path(production_name)
+        if "--resume" in extra and "--cwd" in extra and owner is None:
+            owner = fixture_member("showrunner", name=production_name,
+                                   runtime_id=extra[extra.index("--resume") + 1],
+                                   doc=staff.LiveDoc(remote.local_machine(), doc))
+        if owner is not None:
+            _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", owner.current_session)
+        self.prepare_herdr(production_name)
+        creation = ["--doc", str(doc)] if owner is None else []
+        return self.invoke(["--production", production_name, *creation, "--model", "opus", "--effort", "high", *extra],
                            cwd=cwd, subprocess_cli=subprocess_cli)
 
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
@@ -327,10 +382,14 @@ class AddShowrunnerFixture(unittest.TestCase):
             return invoke_cli(add_showrunner, lambda: add_showrunner.main(arguments), arguments,
                               self.env, cwd or Path.cwd(), production_state=True)
 
-    def prepare_herdr(self, slug: str) -> None:
-        """Fake herdr answers a launch of `slug`'s showrunner as a tab of the shared session, which has
+    def prepare_herdr(self, production_name: str) -> None:
+        """Fake herdr answers a launch of `production_name`'s showrunner as a tab of the shared session, which has
         a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
-        a tab named `slug`."""
+        a tab named `production_name`."""
+        _ = self.env.setdefault("FAKE_CLAUDE_PID", "998041")
+        native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
+        _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", fixture_runtime_id("showrunner::" + production_name))
+        self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
                     session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
@@ -343,19 +402,21 @@ class AddShowrunnerFixture(unittest.TestCase):
             f"--session {SHARED} workspace list": CommandResponse(
                 code=0, stdout=json.dumps({"result": {"workspaces": []}})),
             f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
-                "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": slug}]}})),
+                "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": production_name}]}})),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
+        write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})
         responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            "result": {"agent": {"agent_status": "idle"}}}))
         responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         for suffix in ("", " resume"):
-            prompt = f"/showrunner:produce {self.doc(slug)}{suffix}"
+            prompt = f"/showrunner:produce {self.doc(production_name)}{suffix}"
             responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
                 code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
         responses.update(self.herdr_overrides)
+        confirm_tab_close(responses, SHARED, "w1:t1", Path(self.env["FAKE_HERDR_RESPONSES"]))
         _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
 
     def events(self, command: str) -> list[dict[str, object]]:
@@ -375,9 +436,8 @@ class AddShowrunnerFixture(unittest.TestCase):
     def opened(self) -> list[str]:
         return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"])
 
-    def parent_of(self, slug: str) -> str:
-        path = self.root / "showrunner" / slug / "parent"
-        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    def parent_of(self, production_name: str) -> str:
+        return showrunner_tree.parent_of(production_name)
 
     def refused(self, result: subprocess.CompletedProcess[str], cause: str) -> None:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -402,8 +462,8 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def resume_record(self) -> None:
         _ = (self.root / "sessions/resume.json").write_text(json.dumps({
-            "pid": 991001,
-            "sessionId": "abc-123",
+            "pid": 991001, "procStart": "1",
+            "sessionId": "cfc4564d-fed3-5803-9a4c-e3119733bb53",
             "name": "kid",
             "messagingSocketPath": "",
             "updatedAt": 1,

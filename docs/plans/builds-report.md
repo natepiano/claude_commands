@@ -1,397 +1,771 @@
 # builds-report
 
-> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** `/build:queue` opens a pane from the unit-board mod, with no model turn, as `/accounts-board` does, and says at once why the head step waits; the build log index stops rewriting its source logs; app launches reach the build log again with their memory wait.
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** The build report shows build rates per day before and after each build moment: the new build rules (Moment 1, Moment 2), the natedev build events and the power profile changes, from one list of moments.
 
-> **As-built disposition: amend** — `docs/as-built/unit-board.md` (the shared table pane and `/build:queue`); `docs/as-built/build-memory-admission.md` (Queue API); `docs/as-built/buildlog-memory-stalls.md` (index reads old field names); `docs/as-built/build-followups.md` (rebuild bins: the warm rule, `first build here`, the step build-key columns)
+> **As-built disposition: amend** — `docs/as-built/buildlog-memory-stalls.md` (report sections); `docs/as-built/build-followups.md` (rebuild bins and the clone-rebuild count)
 
-> **Production: builds** — unit `report-unit`; production doc `docs/plans/builds-production.md`
 ## Source
 
-2026-10-29 21:00 EDT (the user, to report-unit)
+2026-10-31 06:5x EDT (the showrunner, the user's request via sdlc)
 
-build queue - i need you to make it work  like /accounts-board - so that it can load quickly without going through a skill - if it can share code to do this claude code modifiction that would be fine
+Track the new build rules as a moment in time, with a before and after report. Moment 1: 2026-10-31 06:50 EDT. The broadcast rules are: fix every visible failure before a rerun; no rerun after a pass until edits are done; `verify.sh check` while editing; lint once at the phase gate. Moment 2: phases-unit's prompt and lint change lands (clippy judge first, `--fix` only if it fails). The showrunner sends that hash.
 
-2026-10-29 20:58 EDT (the showrunner)
+Baseline, 2026-10-24 to 10-31, from `~/.local/state/buildlog/index.sqlite`:
+- hana used 595 of 708 run hours and 1329 of 2125 wait hours on natedev.
+- nextest ran 246 steps/day; 46% were resubmitted within 10 minutes, and 62% failed.
+- clippy ran 160 steps/day.
+- Per phase: 12.9 nextest and 8.4 clippy steps.
 
-the user-approved rerun sweep (docs/plans/sdlc-rerun-sweep.md, main 4dfc4dce) has 1 row for report-unit. Plan it as a small phase, with a test that stops at the named line and then reruns.
+Report the same numbers after, split at each moment and at the other events in natedev's build events record and the power profile change. Clone rebuilds (805 runs of 300+ crates, 231 of 327 nextest hours) go on their own row; they are a separate cause under study.
 
-The row: `scripts/buildlog/index.py:689` (Q3). Interrupt the source-log rewrite after it writes only part of the new bytes. The rerun keeps malformed lines during migration and skips them during indexing; the original records have been overwritten and cannot be restored from this file.
+Design rules:
+- Extend the one before-and-after comparison that the Power profile section already uses, with the moments in one place. No second copy of it.
+- Give per-day rates, because the windows differ.
+- Run on demand only, with no notifier.
+- Recheck the baseline numbers from the index.
 
-2026-10-29 21:04 EDT (the user, after a `/build:queue` run showed 33 steps waiting 74 min behind a head step while 27.6 GiB was free)
+Due: the first report to the showrunner at 07:00 EDT on 2026-11-01, 24 hours after Moment 1, with the caveat that one day is thin. The next report is due 24 hours after Moment 2.
 
-first run a /build:queue - there is very little memory when i'm typing this that is being taken - yet the first one in the queue is not running
+2026-10-31 07:0x EDT (the showrunner)
 
-this question comes up so often - i need an instantaneous way to answer it
+Use report-unit's definitions:
+- A rerun is a step in the same worktree whose start is at most 10 minutes after the previous step's end.
+- hana means every repo path except cargo-liner.
+- Phases come from progress history.
 
-2026-10-29 21:05 EDT (the showrunner)
+Print each definition once on the report. Wherever sdlc's number differs from ours, print it beside ours, so the before figure is not silently changed. If sdlc's query arrives and it is a better measure, take it.
 
-the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-09 to 10-15), and none of those rows carries mem_wait_s. Find why app launches stopped being recorded, and restore the rows with their memory wait. If the cause is in resources' launch hook, send me the cause and I'll route it. I need those numbers to judge whether launches lose time in the memory queue.
+2026-10-31 07:1x EDT (sdlc, then the showrunner)
 
-2026-10-29 22:0x EDT (the user, relayed by the showrunner, who named it `build-why`)
+sdlc corrected its rerun figure: 46% → 16% (same folder, next start 0–10 min after the previous end); 62% failed stands. The showrunner's rulings:
+1. The rerun row is our 16%. Add 46% as a second row, "queue-hidden repeats": next submit (start − `mem_wait_s`) at most 600 s after the previous end, a different call_id, by folder.
+2. The hana set is sdlc's SQL definition (1329 wait hours, 160 clippy/day). Name it in the report, hold it across all windows, and keep one definition in one place.
+3. 12.9 and 8.4 are load ratios: week totals 1724 nextest and 1123 clippy over phase_finished events. Compute them the same way after.
+4. Add a same-worker rerun row, within 60 minutes: sdlc gives 221 runs and 33.3 h after a pass, and 50–55 h fail then fail.
+5. Add the floor sweep e3b8e391 (2026-10-29 14:26 EDT) as a moment: clone rebuild repeats 52.7% → 29.8%, 124 after.
 
-i need a command that i can run at the cli - that tells me exactly what is going on - clearly with the running and the first one waiting (what it needs) and how many arein line - different than the build:queue - something that runs fast and tells me why the current one is waiting showing the me analysis that we have done so far
+2026-10-31 07:2x EDT (the showrunner)
 
-including the details to make it clear
+Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's number beside it. For phases, use natedev only and say so. The fail-then-fail gap (ours 80 h against 50–55) goes on the report as a note.
+
+2026-11-03 15:3x EST (the user, to report-unit, after an interview)
+
+The build report is too long for the user and is not used for analysis. Retire it. Keep all the data. report-unit's job is now a loop like the test improvement work. Each round has five steps:
+
+1. Rank the largest build cost.
+2. State a prediction.
+3. Fix the cost where it lives.
+4. Measure the result.
+5. Repeat.
+1. Score: phase time, the wall time of each finished phase. Build hours per phase are the second view.
+2. Scope: all build capacity (natedev, the Mac, CI, and the AWS build machine when it opens), every repository and production. Rank by cost only.
+3. Authority: report-unit fixes buildlog code itself and owns every hypothesis and measurement. A fix in another unit's code goes through the showrunner, and that unit edits. Money (AWS hours), machine changes and worker rule changes go to the user first.
+4. Speed: one or two rounds open. A round is measured after at least 10 finished hana phases, plus one more day if the result is not clear. This is a starting point.
+5. Reports: keep the showrunner informed; the showrunner and report-unit agree when the user hears. The user always hears a measured change, up or down.
+6. Later, lower priority: a way to see the build history as charts, not tables.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — the build log, the build queue view and the unit-board Claude Code mod.
-- **Project started:** 2026-10-29T11:45:32-04:00
-- **Stack:** Python 3.13 (basedpyright strict, unittest); TypeScript mod under `mods/unit-board/` (its own tests in `mods/unit-board/tests/`).
-- **Layout:** `scripts/buildlog/` (record, index, launches, report); `scripts/build_queue/build_queue.py`; `scripts/lint/memory_admit.py` (read only: resources-unit's); `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`; `scripts/hana_shot/hana_shot.py` (natedev screenshot-unit's).
-- **Key files:** `scripts/build_queue/build_queue.py` — the queue tables; `mods/unit-board/hooks/register.tsx` — mod commands, panes, timers; `mods/unit-board/hooks/accounts.tsx` — the accounts pane view; `scripts/buildlog/index.py` — the SQLite index over the append-only `.jsonl` logs; `scripts/buildlog/store.py` — where records live and how a line is appended; `scripts/buildlog/launches.py` — launch rows from transcripts.
-- **Test lanes:** `scripts/buildlog/test_*.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/`.
-- **Test:** `python3 -m unittest <module>` from the worktree root for Python; the mod's test command as its as-built (`docs/as-built/unit-board.md`) names it.
-- **Lint:** `basedpyright <the slot's own Python files>`; footer must read `0 errors, 0 warnings, 0 notes`.
-- **Ownership:** `mods/unit-board/` belongs to natedev's unit-board-unit; the user asked report-unit for this change and allowed shared code (21:00 EDT). The showrunner approved Phases 1 and 2 side by side and told natedev. `scripts/lint/memory_admit.py` is resources-unit's: no edit in Phases 2 and 4 (showrunner, 21:10 EDT); Phase 1 adds only the typed bump refusal `UnmatchedWaiter(ValueError)` (unit director's call 22:3x: the refusal is decided there, so its type lives there); Phase 3 adds its read-only explain function and the waiter's need-source fields (showrunner, 22:0x EDT), and its notice names resources as also-touches, tested against origin/builds-resources. `scripts/hana_shot/hana_shot.py` is screenshot-unit's: edit it only through cargo-berth, and the checkpoint notice names it.
-- **Invariants:** build-log `.jsonl` files are appended and never edited (`store.py` docstring). Shown names are separate short names; only copy folders join showrunner and unit.
+- **Project:** `~/.claude` — the build log and its report.
+- **Project started:** 2026-10-31T07:05:00-04:00
+- **Stack:** Python 3.13 (basedpyright strict, unittest).
+- **Layout:** `scripts/buildlog/` (index, report, cli).
+- **Key files:** `scripts/buildlog/report.py` — `power_profile_section`, `profile_changes` and `profile_step_durations` hold today's one before-and-after comparison; `scripts/buildlog/index.py` — the `steps` and `samples` tables; `scripts/buildlog/cli.py` — commands; `~/.local/state/plan-delegate/runs/*.jsonl` — progress history (`event_type` `phase_finished`, `status` `completed`, `timestamp_epoch`, `phase_instance_id`, `working_dir`).
+- **Test lanes:** `scripts/buildlog/test_*.py`.
+- **Test:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/buildlog -p '<module>.py'` from the worktree root.
+- **Lint:** `basedpyright <the slot's own Python files>`; the footer must read `0 errors, 0 warnings, 0 notes`.
+- **Invariants:** build-log `.jsonl` files are appended and never edited. The report reads the index read-only. Never write the live build log or the live progress history.
 
 ## Phases
 
-### Phase 1 — /build:queue opens a mod pane and says at once why the head waits  · status: done
-
-#### As-built
-
-- `build_queue.py --json` prints one `QueueSnapshot` object: running and waiting rows with their headers, the head line `{"text", "tone"}`, the totals and the roster problems. Each cell is formatted once, in the user's zone. The text tables and the JSON come from the same row values.
-- `head_line()` gives one line above the Waiting table, in the text output and in the pane. It reads the decision through `memory_admit`'s queue view and keeps no copy of its rules. A budget hold names each running step that holds budget, with its charge and its measured use. A free-memory hold gives free memory against the step's need. A pressure hold gives the pressure reason. When the head has waited 15 min or more and free memory covers its need, the line starts `Stalled:` with tone `error`; else it starts `Head:` with tone `default`.
-- The unit-board mod answers `command.run` for `build:queue` with no model turn. It opens pane `build-queue` (title `Build queue`), runs `build_queue.py --json`, refreshes every 10 s, and closes on `close`, Escape or the close mark. A failed run shows `Build queue could not be read.`, never process output. `bump <selector>` runs `build_queue.py bump <selector>` and replies with its result line. The pane refresh after a bump is outside the bump's error catch, so a refresh failure never replaces the bump reply.
-- `tablePane()` in `register.tsx` is the one table-pane lifecycle: open, loading, one run per tick, busy guard, 10 s timer, restart on reload, close, fixed failure text. `/accounts-board` and `/build:queue` both use it.
-- A bump selector refusal is a type. `memory_admit.bump_waiter` raises `UnmatchedWaiter(ValueError)` for an unknown or ambiguous selector, and `build_queue.py`'s shown-name match raises the same type for an ambiguous name. `build_queue.py` catches only `UnmatchedWaiter`: it prints `build queue: <text>` on stdout, with control characters escaped, and exits 3. The mod forwards only that exit 3 reply.
-- `commands/build/queue.md` still runs the script, so a session without the mod gets the tables. It names `/reload-plugins` for a session that started before the mod change.
-
-**Files:**
-- `scripts/build_queue/build_queue.py` — `--json`, `head_line()`, the bump CLI and its exit 3 refusal
-- `scripts/lint/memory_admit.py` — `UnmatchedWaiter(ValueError)`, raised at `bump_waiter`'s match check
-- `mods/unit-board/hooks/register.tsx` — `tablePane()` helper; the `build:queue` command
-- `mods/unit-board/hooks/queue.tsx` — the build queue pane view
-- `mods/unit-board/types/queue.d.ts` — the `QueueSnapshot` JSON shape
-- `commands/build/queue.md` — fallback body and the `/reload-plugins` line
-- `docs/as-built/unit-board.md` — the shared pane and `/build:queue`
-- `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests
-
-**Binds later work:** the mod pane reads `--json`, so the head line's JSON field keeps the `{"text", "tone"}` shape when build-why takes over its text. A selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that.
-
-**Gotchas:** only `UnmatchedWaiter` is a refusal. Every other bump error, a `ValueError` from the locked reread included, prints on stderr and exits 2. A refusal found by exit code or text prefix alone lets operational errors through to the pane.
-
-**Ruled out:** a refusal channel by exit code or message prefix without a type — it leaks operational errors.
-
-### Phase 2 — The index reads old field names and never rewrites a source log  · status: done
-
-#### As-built
-
-- The build-log index never writes a `.jsonl` source log. `migrate_worker_fields` is gone.
-- `read_file` maps old field names at index time. For a `step` or `call` record, each `FORMER_FIELDS` pair (`seat`→`worker`, `delegate_session`→`unit_session`) fills the new name from the old one; a record with both keeps the new value. An old-name record and a new-name record give the same index row.
-- A stop at any line of an index update leaves every source byte unchanged, and a rerun indexes each record once. This closes the rerun sweep row for `scripts/buildlog/index.py:689`.
-
-**Files:**
-- `scripts/buildlog/index.py` — `FORMER_FIELDS` read-side mapping in `read_file`; no source rewrite
-- `scripts/buildlog/test_index_rerun.py` — stop-and-rerun test: source bytes unchanged, new field names, a second rerun adds nothing
-- `scripts/buildlog/test_index.py` — `test_first_index_read_maps_worker_fields_and_leaves_source_unchanged` checks unchanged source bytes
-- `docs/as-built/buildlog-memory-stalls.md` — the index reads old field names
-
-**Binds later work:** the index never rewrites a source log.
-
-**Gotchas:** the live logs still hold old-name fields (about 70 at closeout). No code rewrites them; only the index read maps them, so a reader that opens the `.jsonl` files directly must map `FORMER_FIELDS` too.
-
-### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: done
-
-#### As-built
-
-- `memory_admit.explain_queue() -> QueueExplanation` is a read-only record filled on the same locked pass as `read_queue` (`locked_queue_read`), from admission's own functions: host (free, total, earlyoom reserve, budget, pressure, or reading unavailable), each running step's charge with its `ChargeBasis`, totals, the head's budget, free and order checks with their numbers, and the line behind it. No SQLite is opened.
-- `head_after_steps_end` reapplies `head_priority` and `queue_decision` (run-alone rule included) to the record minus named running steps, and returns `HeadAdmitsAfterEnd` or `HeadStillHeld` with its causes. `smallest_head_release` returns the smallest set by count, then charge, then Running order, judged by that verdict.
-- Each waiting row records `need_source`, `need_runs` and `test_threads` at estimate time; an older row reads "source not recorded".
-- `scripts/build_queue/build_why.py` prints the record in seven sections in under 1 s (0.3–0.8 s live under load); every number and its unit form one right-aligned cell and text is left-aligned, measured in terminal cells. A read failure prints `build-why: the admission state could not be read.` and exits 2.
-- `/build:queue`'s head line prints from the same `QueueExplanation`; its Markdown number columns are `---:`, and the pane right-aligns numbers.
-- `roster.unit_labels_for` also resolves Codex thread ids from run `mesh_roster.json` records, with no process scan, so build-why names every holder as the full roster does.
-
-**Files:**
-- `scripts/lint/memory_admit.py` — `explain_queue`, `QueueExplanation` and variants, `head_after_steps_end`, `smallest_head_release`, waiter need-source fields, `READ_HOST_ADMISSION_LIMITS` default
-- `scripts/build_queue/build_why.py` — the command
-- `scripts/build_queue/build_queue.py` — head line from `QueueExplanation`; aligned tables
-- `scripts/message/roster.py` — `unit_labels_for` resolves Codex workers
-- `mods/unit-board/hooks/queue.tsx` — number columns right-aligned
-- `commands/build/queue.md` — names `build-why`
-- `docs/as-built/build-memory-admission.md` — the explain record and need-source fields
-- tests: `test_memory_admit.py`, `test_build_why.py`, `test_build_queue.py`, `test_roster.py`, `mods/unit-board/tests/queue.test.ts`
-
-**Binds later work:** release advice and the head line only print admission's answer; no caller repeats budget or free arithmetic. build-why uses `unit_labels_for`, never the 4–7 s full roster.
-
-**Gotchas:** origin/builds-resources' Phase 14 rewrites `queue_rows`; on merge, take its `owner_live` + `reservation_lifetime` form (one hunk).
-
-### Phase 4 — App launches reach the build log again  · status: done
-
-#### As-built
-
-- Each `/hana_shot` start writes one launch row. `record.launch(state_path, worktree)` takes a lock and saves a pending record atomically: `_save_pending_launch` writes a temp file, syncs it with fsync and moves it into place with `os.replace`, under `pending_launches_root()` (`<BUILDLOG_DIR>/pending-launches`).
-- `finish_pending_launch` then publishes the row through `write_launch_line` (hard link, fsync, directory sync). It checks that the row file is present, and only then unlinks the pending record. `launches.collect()` finishes each pending launch that a failed publish left.
-- A launch takes no memory admission by design (resources Phase 6, showrunner ruling 2026-10-30). `report.py` `launches_section` shows "no admission" for each `step=launch` row, never "not recorded".
-- The transcript backfill and the hana-shot cache scan are gone. Legacy BRP transcript rows stay in the log.
-- `hana_shot.py` (owner screenshot-unit) loads the recorder by file path as `_hana_shot_buildlog_record` and calls it in its cleanup step. A recorder failure goes to `note_error`, and cleanup continues.
-
-**Files:**
-- `scripts/buildlog/record.py` — `hana_launch_record`, `write_launch_line`, `pending_launches_root`, `_save_pending_launch`, `finish_pending_launch`, `launch`
-- `scripts/buildlog/launches.py` — `collect()` finishes pending launches
-- `scripts/buildlog/report.py` — `launches_section` shows "no admission"
-- `scripts/hana_shot/hana_shot.py` — one recorder call in cleanup
-- `scripts/hana_shot/test_hana_shot.py` — `BuildLogIsolatedTest` gives every test its own `BUILDLOG_DIR`; a test proves the real log stays unchanged
-- `scripts/buildlog/test_launch_recording.py` — 16 tests
-- `docs/as-built/buildlog-memory-stalls.md` — launch rows
-
-**Binds later work:** a failed step's record that must survive a failed save uses the same durable-before-delete shape. It reuses `_save_pending_launch` and `finish_pending_launch`, and adds no second atomic-save routine.
-
-**Gotchas:** hana_shot tests import `scripts.hana_shot` and run from the repo root: `python3 -m unittest scripts.hana_shot.test_hana_shot`. The live check is still open: after 05:00 EDT, one `/hana_shot` must add one row that `/build:report` counts as "no admission".
-
-**Ruled out:** a launch memory wait (launches take no admission); a transcript backfill (rows start from the phase's landing).
-
-### Phase 4a — A bump by shown name moves only the step it names  · status: done
-
-#### As-built
-
-- `build_queue.bump_selector(selector, reading: QueueRead, labels)` maps an exact shown name of one waiting step to `memory_admit.WaiterRowSelector(row_key, original_selector)`. `row_key` is the row's own file name, `{pid}-{start_time}.waiting`, read from `QueueRead.ordered`. The key comes from the row, never from the caller's environment.
-- `memory_admit.bump_waiter(selector: str | WaiterRowSelector, actor)` finds that row again by file name under the queue lock and moves only it. If the row left the queue, it gives `UnmatchedWaiter` that names the original shown name, on stdout with exit 3; no other row moves.
-- The `queue_bump` build-log row's `old_position` is the row's position under the lock.
-- Tests cover a row removed between reads, a reordered queue, two shown names with a shared prefix (and a repeat bump), and a departed row key with another step in the same session. Waiter fixture files use `{pid}-{start_time}.waiting`.
-
-**Files:**
-- `scripts/build_queue/build_queue.py` — `bump_selector` makes the row-key hand-off
-- `scripts/lint/memory_admit.py` — `WaiterRowSelector`; `bump_waiter` matches the row key under the lock
-- `scripts/build_queue/test_build_queue.py` — race and prefix tests
-
-**Gotchas:** a shown name with no match still goes to `bump_waiter` as a plain string, which then matches by position, session id, session name or folder. `old_position` is the locked position, not the position the user saw. `memory_admit.py` also-touches resources: trial-merge against `origin/builds-resources`.
-
-**Ruled out:** a second waiter identity (the row file name is the key); session id alone (several waiters share one).
-
-### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: done
-
-#### As-built
-
-- `record.py step` writes a `PendingStep` record (`pending-steps/<row_key>.json`) with the original id, the full record context and `month_row_end` (the end of the last whole row; a record written before Phase 6 has only `month_offset` and scans from 0) before any save. `PendingStep` is its own type, apart from `LaunchStep` and `PublishedLaunch`.
-- `_finish_step` owns the order: save the gzip log, append the row to the host's monthly file, delete the held log and the peak file, then rename the record to `<row_key>.done`. The sources stay on disk until the row is durable.
-- Replay rules: a rerun finishes an existing `.json` and records nothing new. A call that names a held log or peak file and finds `.done` records nothing. A call that names no source always records. Recovery scans the monthly file only from `month_row_end` and counts a row only on a newline-terminated line.
-- `launches.collect()` drains `pending-steps/*.json` and deletes `.done` markers older than `STEP_COMPLETION_MAX_AGE_SECONDS` (2 days).
-- `store.append_line` adds a missing final newline under its flock before it appends.
-- `sync.py` pulls only the host folders `record.SYNC_HOSTS` names, minus this host. Only natedev pushes `ci/`, and no host pulls it.
-- `report.recorder_health_lines(day)` prints `N records not published yet; M recorder errors since <time>` for this host, only when N or M is above 0.
-
-**Files:**
-- `scripts/buildlog/record.py` — `PendingStep`, `_finish_step` order, replay rules, `SYNC_HOSTS`
-- `scripts/buildlog/store.py` — `append_line` tail repair
-- `scripts/buildlog/sync.py` — host-folder allow-list pull, natedev-only `ci/` push
-- `scripts/buildlog/launches.py` — pending-step drain, `.done` expiry
-- `scripts/buildlog/report.py` — local recorder health line
-- `scripts/buildlog/test_record_rerun.py`, `test_store.py`, `test_sync.py` — stop-and-rerun, health line and sync allow-list cases
-
-**Binds later work:** A step row reaches the log only through `record.py`'s `PendingStep` record (`pending-steps/<row_key>.json`, the host's monthly file, `month_row_end`, the `.done` replay proof, `store.append_line`); every new row field must be in the pending record before the save starts. A source file the row needs (held log, peak file, any new sidecar) is deleted only by `_finish_step` after the row is durable. `record.SYNC_HOSTS` names the host folders sync carries; a file that must cross machines sits inside a host folder. `report.recorder_health_lines(day)` is the local recorder health line.
-
-**Gotchas:** A named peak file that never existed is the normal `fallback` slice, so absent sources never prove a finished step. `_finish_step` sets the `.done` mtime at finish time, so a late finish does not expire at once.
-
-**Ruled out:** one file per step row (index cost); source absence as proof of a finish.
-
-### Phase 4c — Each scoped test step records its test-phase memory peak  · status: done
-
-#### As-built
-
-- The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` also opens a test-phase window on the first tick when a running executable in the step's scope has a direct parent folder named `deps` (`/deps/[^/]+$`). This works under any target folder name, with or without a target-triple level. Build scripts run from `<profile>/build/<pkg>-<hash>/` and do not open it. One `readlink` per tick covers all scope processes. The peak is the scope's `memory.stat` `anon`, so it counts all parallel tests.
-- The sampler writes the window's anon peak and start time (epoch seconds) to the sidecar `$BUILDLOG_PEAK.test-phase.json` (temp + `mv`). It also writes the context from `record.py test-phase-context RESERVATION ARGV...`, read once before the loop. The same loop still writes admission's `.max` and `.wave` files.
-- `record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar into `PendingStep.test_phase` (`TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord`) before the save. An absent sidecar records unknown (null). An unreadable one keeps the sources and the pending record (`test_phase_read_error`) for a retry and writes one `pending record <path>` line to `errors.log`. Only `_finish_step` and the invalid-argument cleanup delete the sidecar.
-- Row fields: `test_phase_peak_bytes`, `test_phase_started_at`, and the typed `TestPhaseContext` (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). `test_threads` comes from the nextest flag first, then `NEXTEST_TEST_THREADS`, through admission's one parser `memory_admit.test_threads`. `test_phase_charge` records null: admission has no test-phase entry-charge field yet.
-- Sampler CPU cost: about +0.36 CPU-s per accelerated 60-tick fixture step.
-
-**Files:**
-- `scripts/lint/invoke.sh` — the shared sampler opens and writes the test-phase window; `buildlog_end` passes `BUILDLOG_TEST_PHASE_FILE` to the recorder
-- `scripts/buildlog/record.py` — `test-phase-context` command, the test-phase record types, the sidecar in `PendingStep` and its cleanup
-- `scripts/buildlog/test_test_phase_peak.py` — window start, parallel peak, unknown cases, custom target folders, build-script negative, recovery after stops, width narrowed from 32 to 8
-- `scripts/lint/test_invoke_scope.py` — the shared sampler still writes `.max` and `.wave`
-
-**Binds later work:** an unreadable test-phase sidecar is a third cause of a held pending step and uses the same `pending record <path>` error line. `record.py` imports `memory_admit` once at module load, so every module that imports `record` loads it too. `test_test_phase_peak.py` composes the `RecordRerunTests` fixtures. `test_phase_charge` stays null until admission records a test-phase entry charge.
-
-**Gotchas:** only a sidecar that does not exist is absent; a read or validation error holds the step pending. `memory_admit` imports `record` back through `importlib` and must not use `record` attributes while it loads. invoke.sh runs the installed `~/.claude/scripts/buildlog/record.py`, so the live check (one filtered `verify.sh test` step gets `test_phase_peak_bytes`) runs only after the change lands on main; it is still open.
-
-**Ruled out:** a matcher that needs a folder literally named `target` (misses `CARGO_TARGET_DIR`); a match on any `/deps/` ancestor (a build script under such a path opened the window); reading the sidecar at finish time (a transient read error published null); a second sampler or a change to admission's release API.
-
-### Phase 4d — Recorder health covers both hosts  · status: done
-
-#### As-built
-
-- `scripts/buildlog/health.py` owns recorder health. `calculate_snapshot()` runs on the machine that owns the data. It counts the `.json` files under `record.pending_launches_root()` and `record.pending_steps_root()`, and keeps each timestamped `errors.log` line except a `pending record <path>` line whose path no longer exists. It returns `RecorderHealthSnapshot(machine, generated_at, unfinished_records, error_timestamps)`.
-- `write_snapshot()` writes `<host folder>/recorder-health.json` (`v: 1`) under an exclusive `flock` on `store.root()/recorder-health.lock`, through a temp file, fsync and `os.replace`. On any failure it writes `recorder health snapshot` to `errors.log`, keeps the old snapshot and returns False. `python health.py` runs it for this host.
-- `launches.collect()` refreshes the snapshot at its end. `sync._sync_locked()` refreshes the local snapshot before the transfer. The Mac writes its own snapshot inside the mkdir ssh call that sync already makes, so sync opens no extra connection.
-- `machine_for_host()` maps every non-natedev `record.SYNC_HOSTS` folder to `Machine.MAC`, so the Mac counts once. `read_snapshots()` returns one state per `Machine`: `FreshRecorderHealth` (at most `SNAPSHOT_MAX_AGE_SECONDS`, 2 h, old), `StaleRecorderHealth`, or `RecorderHealthUnavailable` (absent, unreadable or invalid). It skips a snapshot more than `SNAPSHOT_CLOCK_SKEW_SECONDS` (300 s) in the future. The newest usable Mac folder wins.
-- `report.recorder_health_lines(day)` formats the states. It applies the reader's own local midnight through `errors_since()` and picks singular or plural nouns by count. A clean, fresh machine adds no line. Line forms:
-  - `Mac: 2 records the recorder has not finished; 1 recorder error since 00:00 EDT — run buildlog launches on the Mac`
-  - `natedev: recorder health unknown (snapshot stale; last updated <time>) — run buildlog launches on natedev`
-  - `Mac: recorder health unknown (snapshot unavailable) — run buildlog launches on the Mac`
-
-**Files:**
-- `scripts/buildlog/health.py` — the recorder-health model: calculate, write, read, freshness states
-- `scripts/buildlog/launches.py` — `collect()` refreshes this host's snapshot
-- `scripts/buildlog/sync.py` — refreshes both snapshots before the transfer
-- `scripts/buildlog/report.py` — `recorder_health_lines()`, one line per machine
-- `scripts/buildlog/test_recorder_health.py` — model, freshness, Mac folder alias, lock and peer-failure cases
-- `scripts/buildlog/test_sync.py`, `scripts/buildlog/test_record_rerun.py` — refresh order and the health line through the shared model
-
-**Gotchas:**
-- The lock file sits at `store.root()/recorder-health.lock`, outside the synced host folders.
-- The snapshot creates the Mac's host folder, so the Mac's sync push now always runs.
-- The Mac's snapshot comes from the Mac's installed `~/.claude` scripts. Until that copy holds `health.py`, natedev shows the Mac as unknown.
-- `health.py` imports `record`, which loads `scripts/lint/memory_admit.py`.
-- A stale or unavailable machine reads as unknown, never as 0.
-
-**Ruled out:** freshness from `sync.json` (the Mac does not update it on a push); a separate ssh connection for the Mac refresh; the label "not published yet" (a pending record whose cleanup failed stays after its row is saved).
-
-### Phase 4e — build-why and /build:queue show how long the first step has been head, who bumped which steps since it joined, the order window and a cargo-token wait  · status: done
-
-#### As-built
-
-- `head_facts.read_head_facts(reading: memory_admit.QueueRead) -> HeadFacts | memory_admit.NoWaiter` reads four facts for the first waiting step from the one locked `QueueRead`. `build_why.py` and `build_queue.py` call it and its formatters (`head_time_text`, `bump_text`, `bump_rows`, `bump_remainder`, `order_text`, `cargo_token_lines`, `cargo_token_text`, `session_ids`) and keep no copy of a rule, field read or phrase. The reader computes nothing admission decides. A fact with no record shows `unknown`, never `0`.
-- Sources: head time is the Waiter `head_since` field (written by resources-unit) on the first row of `QueueRead.ordered`, used only when finite, >= 0 and <= now. Bumps are `queue_bump` rows (`at`, `actor`, `session`, `step`, `folder`, `old_position`) in this host's monthly build-log files, `since <= at <= now`, grouped by (`session`, `step`, `folder`) with count, actors and last `at`, ordered by count, then last `at`, both descending. The window is `HeadExplanation.order` (`StrictUntil`/`BackfillUntil` deadline) and `has_priority`. Cargo-token waits are `kind` `token_gap` lines in `admission/queue_times.jsonl` under the build-log root: `session_id`, `step`, `pid`, `start_time`, `token_left_at`, `token_back_at`, and `at` on every line of every kind.
-- build-why, after `First in line`: `Head for: <n> min (since HH:MM:SS)` or `Head for: unknown`; `Bumps since it joined at HH:MM:SS: <n>` with an `aligned_table` (Step, Session, Folder, Bumps right-aligned, By, Last bump; 8 rows, then `and <k> more steps with <j> bumps`), or `: none`, or `Bumps since it joined: unknown (<reason>)`; `Order rule:` with `strict until HH:MM:SS (<m> min <s> s left): younger steps wait`, `backfill until … : younger steps that fit may start` or `no head priority: younger steps that fit may start`, plus `; bumped by position at HH:MM` or `; head priority recorded at HH:MM` when the head has a recorded bump; one `Cargo token: <session> <step>: waited <n> s (HH:MM-HH:MM)` line per matched wait, or `Cargo token waits: none`/`unknown`. All actor and session ids go into the one `roster.unit_labels_for` call. A failed bump read shows `unknown` and never becomes exit 2.
-- `/build:queue` `head_line` adds `head for <n> min`/`head for: unknown`; `<n> bumps since it joined, most: <folder name> <step> (<count>)`/`no bumps since it joined`/`bumps: unknown`; the build-why window text; and `cargo token waited <n> s` (sum of the head step's waits)/`no cargo token wait`/`cargo token: unknown`. `Stalled:`, the `{"text", "tone"}` shape and the `QueueSnapshot` keys do not change.
-
-**Files:**
-- `scripts/build_queue/head_facts.py` — the reader, result types, backward scan (`BLOCK_BYTES`, `MAX_SCAN_BYTES`, `QUEUE_TIMES_PATH`, `BUMP_TABLE_ROWS`) and one formatter per fact
-- `scripts/build_queue/build_why.py`, `build_queue.py` — the callers above
-- `docs/as-built/build-memory-admission.md` — the build-why paragraph names the four facts and their sources
-- `scripts/build_queue/test_head_facts.py`, `test_build_why.py`, `test_build_queue.py` — reader cases (block edges that split a bump row or a UTF-8 character), line order, label call, head-line forms
-
-**Gotchas:**
-- Bump scan: months from now back to the month of `since`, each file backward in 1 MiB blocks; only complete lines that match `"kind":"queue_bump"`; a torn last line is skipped. It stops at the first bump row with `at` before `since` (rows append in `at` order under the admission lock). A missing month file has no rows, not unknown. A read error, a malformed bump row (`at` without zone, a non-string name field, `old_position` not a positive int) or more than 32 MiB read makes the whole fact unknown; a partial count never shows. A bump row has no waiter key: the step is named only by `session`, `step`, `folder`, never as "this step".
-- Token gaps match waiting steps only: same `step`, `token_left_at` >= the step's `since`, same non-empty `session_id`, else same `pid` and `start_time`. Duplicates count once. Other kinds in the file are skipped. The scan stops at the first line whose `at` is before the oldest waiting step's `since`.
-- `Cargo token waits: none` only with a present record that has at least one valid line and no bad line. An absent file, no waiting step, a read error, a line without `at`, a torn line or an invalid `token_gap` (`pid` <= 0, `token_back_at` before `token_left_at` or after now) gives unknown; next to matched waits it adds a `Cargo token waits: unknown` line.
-
-**Ruled out:** Waiting-table rows for a step in a token wait (it has no waiter row; the record holds only finished waits); a running step's waits; head time from `since` or `priority_since` (set only at priority or a bump, kept after a later bump moves the row back, deleted at a token give-back); SQLite for bumps (the index lags the live log); a second label read or the full roster.
-
-### Phase 4f — A run counts as warm only when its target folder already built the same target with the same features  · status: done
-
-#### As-built
-
-- Rebuild bins: `none` (0 crates); `edited crate (1–3 crates)` and `cascade (4–49 crates)` for warm steps only; `first build here (1–49 crates)` (`FIRST_BUILD_LABEL`) for the rest; `cold (50+ crates)`. `rebuild_bin(crates_compiled: int, warm: bool) -> str` serves `rebuild_timings`, `package_rebuild_rows` (warm edited-crate nextest steps, via `KnownCrateStep.is_warm`) and `profile_step_durations`. The Rebuilds `Source:` line says edited-crate and cascade rows count only steps whose folder had built the same target with the same features before.
-- `report.warm_step_clause() -> str` is the one warm rule, a SQL expression that `known_crate_steps` and `profile_step_durations` select. A step is warm when earlier finished steps (smaller `started_at_us`, `finished_s` not null) on the same `host`, `target_folder` and `build_base`, over all indexed history, together cover each item of its `build_items`. `--bins`, `--tests`, `--examples`, `--benches` cover their named members; `--all-targets` covers every item but `--doc`, and also covers `[]`; else only `[]` covers `[]`. A step with a null key is never warm.
-- Step rows: `compiled_crate_names` from `parse.log_facts` (one name per counted line, in log order; length equals `crates_compiled`). `record.py` writes `target_dir` (`CARGO_TARGET_DIR` resolved against `cwd`, else `TARGET_DIR_UNSET = "unset"`) and `repo_identity` (one `memory_admit.git_identity(argv, cwd)` key, else `store.UNKNOWN_IDENTITY = "unknown"`), never null. `test_phase_fields` no longer copies the phase context's `repo_identity`; the sidecar keeps admission's value.
-- Index `SCHEMA_VERSION = 25` rebuilds once from the source logs (4f set 24; the merge with builds' `test_build_key` step column set 25). 4f step columns: `compiled_crate_names`, `target_dir` and `repo_identity` (`TEXT NOT NULL`, `"unknown"` before 4f), `target_folder` (an absolute `target_dir`, else `worktree`, else `cwd`), `build_base`, `build_items`, `started_at_us` (UTC epoch microseconds). Index `steps_build_history (host, target_folder, build_base, started_at_us)`.
-- `index.build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild` is the one argv key function. `base` is sorted JSON of command (`nextest run` = `test`), profile, the sorted `--target` set, workspace, packages, excludes, features (split on commas and spaces), `all_features`, `no_default_features`. `items` is the sorted target-selector list; `[]` is cargo's default. Run options (`-E`, `--test-threads`, `--target-dir`, …) and words after `--` are dropped. A non-cargo step has null keys.
-
-**Files:**
-- `scripts/buildlog/parse.py`, `record.py`, `index.py`, `report.py` — the names above
-- `scripts/buildlog/test_parse.py`, `test_index.py`, `test_report.py`, `test_test_phase_peak.py` — field values, hana argv keys, the warm rule and its three callers
-
-**Binds later work:** `report.warm_step_clause()` and `rebuild_bin(crates_compiled, warm)` stay as they are. resources-unit's sweep (`scripts/lint/sweep.py`) reads step-row `target_dir` and `repo_identity`: the wire values `"unset"` and `"unknown"` and the names `record.TARGET_DIR_UNSET` and `store.UNKNOWN_IDENTITY` are its contract.
-
-**Gotchas:**
-- Never order step rows by the `started_at` text: the log mixes `.mmmZ`, `.ffffff+00:00` and `+00:00` endings. Use `started_at_us`.
-- `index.py` must never import `record` again. Of the buildlog modules it imports only `store` and `parse`. builds' `scripts/lint/memory_admit.py` imports `index` at load, and `record.py` imports `memory_admit`, so an `index` → `record` import closes the cycle `record` → `memory_admit` → `index` → `record`.
-- `record.py` imports `memory_admit`, so a change to `git_identity`, `RepositoryIdentity`, `UnknownRepository` or `test_threads` can break the recorder on every build step.
-- `target_folder` is the recorded path. A symlinked `target/` or a `.cargo/config` `target-dir` reads as the worktree, so the step misses shared history and reads `first build here`. The two cases that can give a false warm are under "The package table's Source line says it counts only warm steps".
-- History before 4f has `target_folder` = worktree, so a `CARGO_TARGET_DIR` folder reads `first build here` until it builds once with the new recorder.
-- `index.py` writes `store.UNKNOWN_IDENTITY` for a missing `target_dir` too.
-- The warm clause takes about 8 s over all steps with no host or kind filter; filter first. Each power-profile change in the last 7 days adds about 0.3 s to the report.
-
-**Ruled out:** a copy of `git_identity` in the recorder; the phase context as a second `repo_identity` source; a reader for `compiled_crate_names` before a consumer exists.
-
-### Phase 5 — The package table's Source line says it counts only warm steps  · status: done
-
-#### As-built
-
-- `rebuilds_section` prints the package table's `Source:` line as `f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time."`. The line names the steps that `package_rebuild_rows` counts: warm edited-crate nextest steps. No other report text changes.
-- `docs/as-built/build-followups.md`: the Rebuilds **Layout** lists the five bins in `REBUILD_LABELS` order and quotes both `Source:` lines as `report.py` prints them. Its "Recorded build identity" paragraph gives the 4f step fields, the index columns and their limits.
-
-**Files:**
-- `scripts/buildlog/report.py` — the package table's `Source:` line in `rebuilds_section`
-- `scripts/buildlog/test_report.py` — `test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin` checks that the line starts with `Source: warm nextest steps`
-- `docs/as-built/build-followups.md` — the bins, the warm rule, both `Source:` lines, the recorded build identity
-- `docs/as-built/buildlog-memory-stalls.md` — the index schema version
-
-**Gotchas:** the warm rule can give a false warm in two known cases. A sweep that deletes a folder's output after a build writes no build-log row, so the next step in that folder can still read warm (comment at `report.warm_step_clause`). A `--target-dir` argument reads as the worktree, so a step that builds into another folder shares the worktree's history and can read warm.
-
-### Phase 6 — A cut-short row no longer leaves bad JSON in the build log  · status: done
-
+### Phase 0 — The builds merge keeps report-unit's head times on queue-unit's new admission reader  · status: done
 **Depends on:** none
+
+#### As-built
+
+- The phase-start merge of origin/builds is in the branch. report-unit's phase 8 work (head times, cargo-token waits, sccache rows) sits on queue-unit's lock-free admission reader (`exclusive_queue`, `gather_queue_inputs` → `QueueInputs` → `queue_read_from`).
+- `queue_rows()` owns the one waiter order. `write_head_since()` writes `head_since` and runs under the admission lock.
+- `memory_gate.sh` keeps the cargo-token left and back times.
+- The tests of both sides stay. The suite runs 514 tests and they pass; basedpyright reads 0 errors, 0 warnings, 0 notes.
+- Later merge (builds at 2e272204): resources-unit Phase 26's `resolve_queue_order()` and builds' token wait (`token_left_at` on the waiter) replace the head-time and cargo-token gap recorder above. `write_head_since()`, `head_since` on the waiter and the token arguments of the check are gone, with the tests that checked them.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`
+- `scripts/lint/memory_gate.sh` — cargo-token left and back times
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_queue_evidence.py` — both sides' tests
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/unit-board.md` — the merged as-built text
+
+### Phase 1 — The build report compares build rates before and after each build moment  · status: done
+**Depends on:** Phase 0
+
+#### As-built
+
+- `scripts/buildlog/moments.py` is the one place for build moments and the hana set:
+  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1); Phase 3 adds a seventh. Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
+  - `HANA_CTE` is the one hana set: sdlc's `nat` predicate, with sessions and calls classified over each measured window, natedev only.
+  - `MetricKey` names each metric; `RATE_ROWS` lists the rate rows.
+  - `window_rates(connection, start, end, *, phases=())` makes one SQL population read and one Python pass for every row. A step with a NULL session or cwd counts in the totals but never pairs.
+  - `phase_events()` reads `unit_runs.history_root()/runs`, natedev only.
+  - `comparison_windows(moments, end)` is the one window rule: before = 7 days, cut at the previous moment; after = up to the next moment or the report end. A fixed moment shows while its after window reaches into the last 7 days. Observed profile changes keep the 7-day rule.
+- `report.py`: `moments_section()` prints `### Before and after` and replaces the Power profile section in `buildlog report`. `report_end(day, now)` = min(now, day end), and `ci_freshness` uses it too. Each moment keeps the p50 table and adds a rates table. sdlc's figure prints beside ours when the two differ by more than 5%. The definitions and notes print once.
+- `cli.py`: `buildlog moments [YYYY-MM-DD]` prints only that section, read-only, in about 2-4 s.
+- Over sdlc's window 2026-10-24T10:40:20Z..2026-10-31T10:33:06Z the live numbers match the recheck within 1%: hana wait 1328.75 h, clippy 160.5/day, 1723 nextest / 1123 clippy steps, reruns 16.19%, queue-hidden 45.73%, after a pass 218 runs / 33.72 h.
+
+**Files:**
+- `scripts/buildlog/moments.py` — moments, hana set, rate rows, windows, phase events
+- `scripts/buildlog/report.py` — `moments_section`, `report_end`
+- `scripts/buildlog/cli.py` — `buildlog moments`
+- `scripts/buildlog/test_moments.py` — fixture tests for moments, the hana set, rates and windows
+- `scripts/buildlog/test_report.py` — the Before and after section in the report
+
+**Ruled out:** a one-line moment heading — it would change 4 existing assertions.
+
+### Phase 2 — The build report shows memory figures before and after the build budget raise  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `scripts/buildlog/moments.py` puts each moment on a track (`MomentTrack.BUILD` or `MomentTrack.MEMORY`, a class variable of the type, not a flag):
+  - `MemoryMoment(at, name)` is a live memory moment. The live entry is `MemoryMoment(2026-10-31 13:33 UTC, "Build budget 21 → 24 GiB (e791376e)")`, 09:33 EDT.
+  - `PendingMemoryMoment(name)` is a memory moment with no live time. The report prints `<name>: not live yet` in place of its table.
+  - `comparison_windows` is still the one window rule, applied once per track. A memory moment never cuts a build moment's windows, and a build moment never cuts a memory moment's windows.
+- `scripts/buildlog/memory.py`: `earlyoom_kills(start, end)` returns a typed list of `EarlyoomKill` (time, pid, command, `oom_score_adj`, cmdline) or `JournalUnavailable` (the Mac, or journalctl fails). A kill is a build kill when its `oom_score_adj` equals `build_oom_score_adj`, or when its cmdline program is under `/target/` (outside the build gate). The program is the cmdline text before the first space. `window_report` uses the same reader, and its output is unchanged.
+- `scripts/buildlog/report.py`: a memory moment prints its own table (Before, After, Change) with these rows: earlyoom kills/day for builds as `N (M outside the build gate)`, earlyoom kills/day for others, full memory stall %, memory wait p90, and memory-kill retries/day with the stopped calls in brackets. An unreadable journal prints `unavailable` for the kill rows. Under the table, one overlap line names each build moment inside its windows, with date and time. The first memory moment's before column reads `no earlier memory moment`. `MIN_RATE_WINDOW_DAYS` is the one thin-window limit for the rate and memory tables. `buildlog moments` and `buildlog report` both show the memory moment.
+- `config/lint.conf` holds `build_oom_score_adj=500` under `[build]`, the one build kill level:
+  - `invoke.sh` reads it once, when it sources `lint_config.sh` (shell builtins only, no new process, 0.9 ms per source). A `declare -F` guard keeps `invoke.sh` working with an older reader that lacks the function.
+  - Python reads it through `scripts/lint/config_values.py` (`build_oom_score_adj()`).
+  - An absent key gives 500 with no message. A present invalid value prints a warning and gives 500.
+- Live on natedev, the week before Build rules 1 reads 54 builds kills (9 outside the build gate) and 0 others. `buildlog moments` runs in 3.0–4.1 s. The buildlog suites (220 tests), the invoke scope suite (22 tests) and the 124 test files that reach `invoke.sh` pass.
+
+**Files:**
+- `scripts/buildlog/moments.py` — `MomentTrack`, `MemoryMoment`, `PendingMemoryMoment`, the per-track window rule
+- `scripts/buildlog/memory.py` — `earlyoom_kills`, `EarlyoomKill`, `BUILD_OOM_SCORE_ADJ`
+- `scripts/buildlog/report.py` — the memory moment table, overlap lines, `MIN_RATE_WINDOW_DAYS`
+- `config/lint.conf` — `build_oom_score_adj` under `[build]`
+- `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh` — the shell reader and the build scope's kill level
+- `scripts/lint/config_values.py` — the Python reader
+- `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_memory_window.py`, `scripts/lint/test_invoke_scope.py` — tests
+
+**Gotchas:** earlyoom joins argv with spaces and no shell quotes, so only the text before the first space is the program. A journal that cannot be read is `unavailable`, never zero.
+
+### Phase 3 — The build report splits build rates at the queue test-phase charge  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `MOMENTS` in `scripts/buildlog/moments.py` gains `BuildMoment(2026-10-31 20:36 UTC, "Queue test-phase charge (2a819dfd)", "all")`, 16:36 EDT, with no sdlc baseline. The showrunner set it when queue's test-phase charge and one decision pass reached main.
+- It is not Moment 2. Moment 2 stays phases-unit's prompt and lint change.
+- `buildlog moments` shows it as the newest section, with Build rules 1 (Moment 1) as its before window. Its after window is thin until a day of data exists.
+
+**Files:** `scripts/buildlog/moments.py`; `scripts/buildlog/test_moments.py` (the pinned moment order).
+
+### Phase 4 — /build:report names the hourly memory table  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `commands/build/report.md` names `buildlog usage-hours [YYYY-MM-DD]` near its top. The line lists what the table holds: hourly build memory, process memory, file cache, build and CI CPU, disk traffic, lowest free disk and free pool tokens.
+- A second line tells the agent to run it for questions about memory, CPU or disk by hour, and to answer from its table in a few lines.
+- Source: the user's change review C682 (2026-11-02). The table is hard to read in the CLI; agents use it for analysis.
+
+**Files:** `commands/build/report.md`.
+
+### Phase 5 — The build report compares moments per phase, not per day  · status: done
+**Depends on:** Phase 1
+
+2026-11-03 (the user, through the builds showrunner): the machines ran much lighter after Build rules 1. A time comparison per day does not show whether matters improved. The report needs a comparison per a unit of work.
+
+#### As-built
+
+- The unit of work is the finished natedev hana phase (`WindowRates.phase_count`).
+- Each build moment's rate table leads with rows per phase: nextest, clippy, run hours, wait hours, failed nextest, nextest reruns, clone rebuilds, clone rebuild hours and fail-then-fail runs.
+- One row shows hana wait hours per hana run hour. It is unavailable when run hours are zero.
+- The per-day rows follow. Each cell suffix states its unit (`/phase`, `h /phase`, `/day`, `h /day`, `%`, `h wait / h run`). The header is `| Rate | Before | After | Change |`.
+- Under the table: `Hana phases finished: before N, after M.` and a note. The note says per-day rows follow load, per-phase counts do not, and per-phase hours still fall on a quieter machine.
+- `RateRow.formula` is `PerDay | Ratio`. One loop over `RATE_ROWS` computes every rate. Units `runs_per_phase` and `hours_per_phase` replace `per_phase`.
+- Both moment tables and the Moment 1 baseline table use `table()`, `rate_change()` and `rate_window_days()`. The baseline line reads `Hana phases finished in the baseline: N.`
+- Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
+
+**Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
+
+### Phase 6 — Dylib A/B timing for hana  · status: todo
+**Depends on:** the user lifts the hana pause (paused 2026-11-04).
+**Workers:** 1 writer (the benchmark runner).
+
+2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
+
+1. Run one cold build.
+2. Run three incremental test runs.
+
+The result goes to the showrunner. No repository code changes.
+
+Method (side A and side B 1 already ran this way; keep it):
+1. Use one shared clone of hana origin/main 72d2c08da9bdbc295f7a36af216e01941b582371. The source checkout stays unchanged.
+2. Side A keeps `[workspace.metadata.dev] features = ["hana/dynamic_linking"]` in the root manifest. Side B removes only that activation.
+3. Side A builds into `dylib_ab/target-a`, side B into `dylib_ab/target-b`, through `CARGO_TARGET_DIR`. Cold means an empty target folder; compiler and download caches stay.
+4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
+5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
+
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
+
+### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
+**Depends on:** none (runs beside Phase 6)
+
+#### As-built
+
+- `buildlog costs [--days N]` (`scripts/buildlog/costs.py`) prints one ranked list of build hours lost by machine and cause, as h/day and h/finished phase. Causes: memory wait, cold rebuilds (50+ crates), failed runs, reruns after a pass, cancelled CI, and Mac idle while natedev waits. It runs in 0.45–0.70 s.
+- The machine comes from `steps.target`, else from `record.target_hosts()`. No host list is copied.
+- Mac idle = candidate waits minus Mac execution and complete Mac holds. Holds with no recorded end make the row an upper bound, with its unknown part beside it (`MacIdleEstimate`, `RankedCost.unknown_seconds`).
+- Phase time reads only `phase_finished` events (wall time = finish minus `phase_started_at`). It prints the median and p90 for hana phases and for all phases.
+- `moments.py` holds the shared `window_bounds`, `nextest_outcome`, `previous_nextest` and `nearest_rank`. `number_option.py` parses `--days` and `--hours`. `holds.py` and `mac_outcome.py` import coordination and recorder modules only where a reader needs them.
+- `docs/plans/builds-report-rounds.md` holds the round record, with four round-1 rows.
+- `/build:report` (`commands/build/report.md`) is retired. `buildlog report`, the index and every collector remain.
+
+**Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
+
+### Phase 8 — Build history as charts  · status: done
+**Depends on:** Phase 7
+
+The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
+
+#### As-built
+
+- Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
+- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
+- Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
+- The fresh design check found two label defects; Phase 10 fixes them.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/index.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_index.py`, `docs/plans/builds-report-charts-design.md`.
+
+### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
+**Depends on:** Phase 7
+
+Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
+
+### Phase 10 — Chart labels do not collide  · status: done
+**Depends on:** Phase 8
+
+#### As-built
+
+- Moment numbers sit in their own rows below each panel title. Numbers closer than 26 px go to the next row, and the plot top moves down to make room.
+- End labels stay at their own line ends. Ends with the same bucket and value share one label, which names each series and the value.
+- A label that does not fit, or that sits on another series' end, is dropped; the legend names that series. Gap notes yield to end labels.
+- Coincident line segments alternate dashed strokes. A point shared by several series shows one sector per series.
+- `test_charts.py` pins both rules: no moment number box overlaps a panel title box, and each end label is nearest its own line end.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
+
+### Phase 11 — Every build step records its real target folder  · status: done
+**Depends on:** none (runs beside Phase 10)
+
+#### As-built
+
+- Cause (Phase 9): 1,399 of 1,517 cold natedev steps in 7 days had no absolute target folder (678 `unknown`, 721 unset).
+- `scripts/buildlog/step_context.py` gives the shell each step's tree key and target folder in 0.08 s. It applies the command's `env` wrapper (options, `--`, `-u`, `-C`, assignments), Cargo config and workspace default. It does not start `cargo locate-project`. It works as a script, as a package module and with `python3 -m`.
+- Caller metadata and known-folder hints are used only when the command does not change `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_HOME`, `HOME` or the working folder.
+- Target states: an absolute folder, `none` (not a Cargo step), or `unresolved` (the folder is not known). A missing captured folder records `unresolved`; the detached writer never resolves late. Old `unknown` and `unset` rows stay as they are.
+- `index.py` schema 29 stores `build_history_group` once: `folder:<path>`, `legacy:<checkout>` for old unknown/unset rows only, or NULL. NULL rows never read or make warm history. Index `steps_build_group_history` replaces `steps_build_history`. `report.py` compares the stored column.
+- `scripts/lib/cargo_target_config.py` is the one Cargo config and workspace reader for the recorder and `scripts/lint/sweep.py` (`CargoConfigPolicy`).
+- `scripts/lint/invoke.sh` writes each step through one `buildlog_write_step` function. verify-unit has the new line ranges.
+- The live index check runs after the merge (Change-Review line in the checkpoint).
+
+**Files:** `scripts/buildlog/step_context.py`, `parse.py`, `record.py`, `index.py`, `report.py`, `launches.py`, `scripts/lib/cargo_target_config.py`, `scripts/lib/shell_test_support.py`, `scripts/lint/invoke.sh`, `scripts/lint/sweep.py`, `scripts/direct/verify.sh`, and their tests.
+
+### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
+**Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
+
+The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault step stopped on uncommitted files in `~/rust/hanadocs` on the Mac and returned exit 1 (`vault_pull.py:310` returns 1 for every stop except "Mac unreachable"). The stop already alerts the user to commit or discard the files.
+
+1. A vault stop that waits on a user action, with its alert sent, exits 0 and keeps its printed stop line.
+2. A real failure (`command_failed`) still exits 1.
+
+Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
+
+**Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
+
+### Phase 14 — Build history charts open and show every machine's costs  · status: done
+**Depends on:** Phase 8, Phase 10
+
+#### As-built
+
+- Cause (C950, C951 "not works", 2026-11-04): the aws-build target was configured with no build log, and "All machines" needed every configured machine, so every cost chart was unavailable. `buildlog` is also not on the terminal PATH; that fix is in `/etc/nixos` and goes through the builds showrunner.
+- `costs.first_source_times` gives each machine's first indexed event. Empty and eventless monthly files do not count. `CostReading.first_sources` carries the mapping; `build_series` joins it with observations.
+- `cost_value` returns `NoDataYet` for each day before a machine's first event. JS sums (All machines and grouped "Other") skip those cells. The chart, table, tooltip and detail line read the same cell. A machine with no data in the window shows one line, and the selector names it "no data yet".
+- A machine with recorded data that misses a day still makes the day unavailable. A missing applicable wait stays unavailable.
+- Page CPU: 7 days about 0.6 s, 30 days about 1.8 s.
+- The checkpoint's Change-Review rows re-check C950 and C951 with the full path.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
+
+### Phase 15 — The build page gets its chart and top-cost data from one typed function  · status: done
+**Depends on:** Phase 14
+
+The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the top 3 costs move onto the one build page, each with the action that cuts it and its owner, beside the build history charts (C950). queue-unit's Phase 10m draws the page; this phase gives it typed data, no HTML. The top 3 rank the last 2 days, so a fixed cost does not stay on top.
+
+#### As-built
+
+- `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` gives queue's build page feed its data. It opens the index once (`read_index`), reads costs once over the page window in one snapshot (`read_snapshot`), and builds the charts and the top costs from that one reading. `page_data(7)` takes 0.42-0.48 s wall on the live index.
+- `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
+- `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
+- Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
+
+**Files:**
+- `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
+- `scripts/buildlog/test_charts.py` — `PageDataTests`.
+- `config/buildlog.conf` — recent days, actions and owners.
+
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
+
+**Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
+
+### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+#### As-built
+
+- `record.py` loads config, target, hash, gzip, json, store and url parsing only on the paths that use them. The pending writer uses `os.open(O_EXCL, 0o600)` and `os.replace`; ids come from `os.urandom`.
+- One owner for each rule: `repository.remote_identity` (repository key), `repository.repository_key` (origin remote, else `git-root:<first root>`; admission's `git_identity` calls it), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
+- `remote_identity` has an SCP shortcut that skips `urllib.parse`; it builds the path as the urlsplit path does, so keys are unchanged. `test_step_row.py` pins the keys in a table and uses a temporary build log.
+- CPU ms per call, bevy_brp with a real Cargo.toml, before -> after (merged tree 08397569e): terminal 294.8 -> 150.3, tee 289.3 -> 151.4, call 118.2 -> 86.3, step-context 77.2 -> 60.0, test-phase-context 208.2 -> 80.9. The driver is in the phase 18 folder (`cpu_driver.py`).
+
+**Files:** `scripts/buildlog/record.py`, `parse.py`, `step_context.py`, `costs.py`, `test_step_row.py`, `test_costs.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, three as-built docs.
+
+**Gotchas:** `memory_admit.py` is edited by several units; the builds merge took builds' direct buildlog imports over phase 16's typed stubs.
+
+### Phase 17 — The build log stores each memory reading once each minute  · status: done
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+#### As-built
+
+- Each `buildlog sample` tick writes the slices once, in the sample row. The tick `memory_snapshot` row (`TickMemorySnapshot`) holds `kind`, `at`, `host` and `zram` only. `memory.write_snapshot(at, host) -> None` writes it.
+- The standalone `buildlog snapshot` row (`MemorySnapshot`) keeps its slices, because no sample row is beside it.
+- `memory.nearest_snapshot` takes the nearest non-null slices from `samples` UNION ALL `memory_snapshots` (snapshot row first on equal distance), and the nearest zram in a second query. Old logs, new ticks and standalone snapshots give the same report. No slice reading in the window reads as unavailable, never as absent.
+- Log size: 8,321,760 bytes/day before, 4,808,160 after (1,440 ticks).
+
+**Files:** `scripts/buildlog/memory.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_memory_window.py`, `docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`.
+
+**Gotchas:** old logs keep slices in `memory_snapshots`, so the reader reads both tables.
+
+**Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
+
+### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: done
+**Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
+
+#### As-built
+
+- Admission selects the charge after the grant and publishes it in its history row (`admission/anon_peaks.jsonl`, `test_phase_charge_use`) at release, before the recorder runs. The grant never carries it; `test-phase-context` writes `test_phase_charge: null` and keeps the sidecar's `reservation_id`.
+- At step end and on pending-record retry, `record.completed_test_phase_charge(reservation_id)` searches the history from the end (mmap, shared flock, whole rows only), only when the sidecar's window is `ObservedTestPhase`. A match builds `ChargedTestPhaseRecord`; the row copies the evidence unchanged.
+- Bad or unreadable evidence records null and writes one `errors.log` line; the row is always published. A step whose admission published no history row (no sampled peak, or unscoped) records null.
+- The index has `steps.test_phase_charge_bytes` (`SCHEMA_VERSION` 32); older rows read null.
+- `TestPhaseChargeUse`, `NoTestPhaseChargeUse`, `CallRecord`, `NoCallRecord` and `parse_test_phase_charge_use` live in `scripts/lib/test_phase.py`; `memory_admit` re-exports the names. `record.py` loads no `memory_admit`.
+- CPU ms per call, bevy_brp: terminal 118.5 (charged with the real 11 MB history 117.0, no row 113.6), tee 112.1 (120.2, 117.0), call 56.3, step-context 50.5, test-phase-context 51.0. Drivers: `cpu_driver.py` and `cpu_driver_charged.py` in the phase 18 folder.
+
+**Files:** `scripts/buildlog/record.py`, `index.py`, `test_step_row.py`, `test_index.py`, `scripts/lib/test_phase.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, `docs/as-built/buildlog-memory-stalls.md`.
+
+**Ruled out:** reading the charge from the grant's sampling context (the charge is chosen later); a history offset in the sidecar (a search with no match costs about 1 ms).
+
+### Phase 19 — Each step row names the output folders its own command built  · status: done
+**Depends on:** none
+
+#### As-built
+
+- At step end, `step_context.step_output_roots(argv, cwd)` runs `cargo metadata` with the step's own Cargo inputs: the program (with `+toolchain`), the env wrapper's environment and folder, `--manifest-path`, `--config`, and the first `--target-dir` passed as `--config build.target-dir="<absolute>"`. `step_context.cargo_command_context` gives this split to both start capture and end read.
+- When `target_dir` is an absolute folder and the read `target_directory` differs from it, the row has no pair and `errors.log` gets one line. With `target_dir` `unresolved` or `none`, a successful read still writes the pair. Old rows are unchanged.
+- `cargo_target_config.cargo_folder_settings` applies Cargo's order under both policies, lowest first: config files, `CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR`, CLI `--config` (inline and file), `CARGO_TARGET_DIR`, `--target-dir`. Strict capture now reads `--config` (it ignored it since Phase 11); bad TOML or an unreadable file records `unresolved`. sweep.py gets the same order.
+- `read_cargo_output_roots(checkout, *, cargo, options, environment)` builds `[*cargo, "metadata", "--format-version", "1", "--no-deps", *options]`; its six other callers keep the default call.
+- CPU ms per call, bevy_brp, interleaved A/B against Phase 18 (f88894adc) on one loaded machine: terminal 150.5 → 152.3 (1.012x), tee 157.9 → 159.6 (1.010x). Driver: `cpu_ab.py` in the phase 19 folder.
+
+**Files:** `scripts/buildlog/record.py`, `step_context.py`, `test_record.py`, `test_step_row.py`, `scripts/lib/cargo_output.py`, `cargo_output_test_support.py`, `cargo_target_config.py`, `test_cargo_output.py`, `docs/as-built/build-targets.md`.
+
+**Gotchas:** Cargo reads `CARGO_TARGET_DIR` before all build config, CLI `--config` included; `CARGO_BUILD_TARGET_DIR` is ordinary config and loses to `--config`. A CPU baseline from an earlier phase is not valid under a different load: measure A/B in one run.
+
+### Phase 20 — memory.py reads recorded output folders through one reader  · status: done
+**Depends on:** resources' `build_shape.recorded_output_roots` on builds.
+
+#### As-built
+
+- `memory.build_output_roots(index_file, current_checkout, host)` reads recorded Cargo pairs through `build_shape.recorded_output_roots(index_file, host)`, the reader the floor sweep uses. One reader of the steps output pairs remains. The signature, `@lru_cache(maxsize=1)` and `build_output_program` are unchanged.
+- Each `AbsoluteRecordedRoot` side of a pair adds its resolved path; each distinct path resolves once. Each `AbsoluteRecordedRoot` workspace key adds a checkout beside the current checkout. `RecordedRootsUnavailable` leaves only the current checkout. Rows from another host and rows with a `--target-dir` override add nothing (the reader's rule).
+- The `cargo metadata` fallback is unchanged: each checkout with a `Cargo.toml` gets `read_cargo_output_roots`; only a `CargoOutputRoots` result adds roots.
+- The import of `build_shape` is lazy, inside the function, with a `TYPE_CHECKING` split (`from ..lint import build_shape` for basedpyright, `from scripts.lint import build_shape` at run time), so `buildlog snapshot` does not load it.
+- On the live natedev index the root set is 157 (was 166): 6 lost roots lie under kept roots and 3 come from old `unknown`-pair vendor/bevy_render rows whose folders do not exist, so the kill classification is the same.
+- First-call own CPU is about 420-450 ms (was about 120 ms), with `cargo metadata` stubbed; accepted for one reader. Wall time stays about 10 s from 116 sequential `cargo metadata` probes.
+
+**Files:**
+- `scripts/buildlog/memory.py` — `build_output_roots` calls the shared reader.
+- `scripts/buildlog/test_memory_window.py` — `BuildOutputRootsTests`: six outcome tests with a `build_roots(outputs, index_file)` helper; fixtures use `create_step_index` and `record_root_attempt` from `scripts/lint/test_build_shape.py`.
+
+**Binds later work:** the parallel probe change keeps the reader call, the lazy import and the `build_roots` test helper. Resources' later reader change (dedupe pairs, row facts, move into buildlog) edits `memory.py` after this unit's merges.
+
+**Gotchas:**
+- The shared reader returns duplicate pairs because its `SELECT DISTINCT` includes argv: 15,838 pairs, 1,120 distinct on natedev.
+- The tree's own index path can name a schema file that does not exist live; a timing run must pass the live index path.
+
+**Ruled out:** an equal-root-set gate — a lost root is acceptable when a kept root covers it or its folder does not exist.
+
+### Phase 21 — Each memory tick writes one row  · status: done
+
+#### As-built
+
+- Each `buildlog sample` tick writes one sample row, and that row carries `zram`. The tick writes no `memory_snapshot` row, and `cli.py` `sample` has no second writer.
+- `memory.read_zram() -> ZramPresent | ZramAbsent` reads `BUILDLOG_ZRAM` (default `/sys/block/zram0`). `sample.sample()` (lazy import) and `memory.snapshot()` call it. `zram_state` reads an unreadable path as absent, so the sample is kept.
+- `MemorySnapshot` is one TypedDict (`kind`, `at`, `host`, `zram`, `slices`): the standalone `buildlog snapshot` row.
+- `index.py`: `samples.zram` TEXT column; `SCHEMA_VERSION = 33`.
+- `memory.nearest_snapshot` uses one local `nearest_value(column)` over `samples` UNION ALL `memory_snapshots`, key (distance, snapshot row first, `at`). It takes the nearest slices, then the nearest zram. No slices in range reads as unavailable.
+- CPU per tick 313.0 → 297.1 ms (interleaved A/B against c5d618d86); log size 4,808,160 → 4,698,720 bytes/day.
+
+**Files:**
+- `scripts/buildlog/sample.py` — zram in the sample record.
+- `scripts/buildlog/index.py` — the `zram` column and schema 33.
+- `scripts/buildlog/memory.py` — `read_zram`, `MemorySnapshot`, `nearest_snapshot`.
+- `scripts/buildlog/cli.py` — the `sample` command writes one row.
+- `scripts/buildlog/cgroup_test_support.py` — `write_zram` and `ZRAM_READING`.
+- `scripts/buildlog/test_sample.py`, `test_memory_window.py`, `test_index.py`, `test_mac_idle.py` — tests.
+- `docs/as-built/build-memory-admission.md` — owns "Slice snapshots" and the schema number; `docs/as-built/buildlog-memory-stalls.md` points to it.
+
+**Gotchas:**
+- Old logs keep zram and old slices in `memory_snapshots`, so the reader reads both tables.
+- An equal-distance test needs different `at` text forms (`…00.000Z` sorts before `…00Z`), or text order alone picks the winner.
+
+**Ruled out:** moving the zram reader to `cgroup_capture.py` — it removes no copy and gives no CPU gain.
+
+### Phase 22 — buildlog charts prints a tailnet link  · status: done
+
+#### As-built
+
+- `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
+- `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
+- `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
+- `review_link.SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)`; `review_link.main` and charts catch it.
+
+**Files:**
+- `scripts/buildlog/charts.py` — `present_page`, `local_display`.
+- `scripts/buildlog/test_charts.py` — link, display table, browser failure, cache and review-root failure, stable-link tests; `check_publication` fixes the platform.
+- `scripts/review_links/review_link.py` — `SNAPSHOT_ERRORS`.
+- `scripts/buildlog/cli.py` — the charts help line.
+
+**Gotchas:**
+- `review_link.snapshot` costs about 141 ms CPU per call, mostly its `change_routing` import (natedev-efficiency owns that cost).
+- Tests that reach `present_page` must fix `charts.sys.platform`: darwin with no environment is a local display.
+
+**Ruled out:** opening the page on the Mac over ssh with a target config read — the user's rule is "it should always be a tailscale link".
+
+### Phase 23 — The first kill lookup runs its cargo metadata probes in parallel  · status: done
+
+#### As-built
+
+- `memory.build_output_roots` runs `read_cargo_output_roots` for each checkout with a `Cargo.toml` through `ThreadPoolExecutor(max_workers=workers)` and `executor.map`. The root set does not depend on probe order, and a probe exception reaches the caller.
+- `config/buildlog.conf` `METADATA_PROBE_WORKERS=8` (`# whole: 1..`) sets `workers`, read at use with `conf.read("buildlog").whole(...)`.
+- On the live natedev index (157 roots, same set), the first kill lookup takes 1.08 s wall instead of 4.98 s. Total CPU is 5.54 s instead of 4.85 s, because parallel `cargo metadata` runs contend. The cost is paid once per report process that classifies a kill.
+
+**Files:**
+- `scripts/buildlog/memory.py` — the pooled probe loop; `concurrent.futures` is a top-level import, and `build_shape` stays a lazy import (import cycle).
+- `config/buildlog.conf` — `METADATA_PROBE_WORKERS`.
+- `scripts/buildlog/test_memory_window.py` — `probe`, `configure_workers` (`write_config_fixture`, so the committed limits stay) and `probes_meet` (one `threading.Barrier(2)`) helpers; tests for overlapping probes, one worker in sequence and exception propagation.
+
+**Gotchas:** `METADATA_PROBE_WORKERS=1` restores the sequence and the lower CPU.
+
+**Ruled out:**
+- Checking recorded roots before the probes — a second cached reader for a path that runs about once a month.
+- Pooling the `disk.py` timer probes — background wall time only; CPU stays the same.
+- Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
+- A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
+
+### Phase 24 — Mac offload reads the repository key without loading memory_admit  · status: done
+**Depends on:** queue 10z on builds (done, b7ad7675c).
+
+#### As-built
+
+- `offload.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
+- `persist_attempt` writes `repository.key`, else `store.UNKNOWN_IDENTITY`. A keyless repository no longer writes an empty `repo_identity` that `index.py` reads as a real identity.
+- `memory_admit.git_identity` reads the same function and keeps only its name and legacy-name rules, so one place holds the key rule. `git_output` is gone.
+- `offload.py` imports `record` and `store` at module top; it calls no `memory_admit` function.
+- `test_linux_runner` wraps its in-process child `exec` in `contextlib.chdir(os.getcwd())`, so the fake child cannot move the test process's working folder.
+
+**Files:**
+- `scripts/mac_test/offload.py` — repository key for claims, mirrors and attempts.
+- `scripts/lint/memory_admit.py` — `git_identity` name rules over the shared key.
+- `scripts/mac_test/test_target_slots.py` — `RepositoryKeyTests`: origin forms, root-commit key, no commits, unknown attempt, and a `sys.setprofile` check that a lookup runs no `memory_admit.py` code.
+- `scripts/lint/test_memory_admit.py` — real-repository key and legacy-name cases.
+- `scripts/mac_test/test_linux_runner.py` — working-folder restore.
+
+**Gotchas:**
+- Importing `offload` still loads `scripts.lint.memory_admit` through `sweep` -> `build_hold` -> the admission modules. resources-unit owns that chain.
+- Check "no `memory_admit` code runs" by the files a call executes, not by `sys.modules` names: the chain loads `scripts.lint.memory_admit`, not the bare name.
+
+**Ruled out:** passing the eligibility `KnownRepository` into `persist_attempt` (about 4 ms per offload run); deleting `git_reply` fixture branches that other `record` paths still reach. natest-unit moved the key to `repository.repository_key(directory)` with no `argv`; the merge of builds 5493dfa93 switched `offload.py` and `memory_admit.git_identity` to it.
+
+### Phase 25 — A kill counts as a build when its program is under a Cargo target folder  · status: done
+
+#### As-built
+
+- `memory.build_output_program(program)` returns True when a resolved parent folder of an absolute program satisfies `sweep.is_cargo_target`. A relative program is never a build. `sweep` is imported lazily under the module name `sweep`, as in `disk.py`.
+- `EarlyoomKill.is_build` is the configured `build_oom_score_adj` or a target program. `outside_build_gate` is a target program without that adjustment. One `_target_program` helper holds the folder check.
+- No root cache, no index read and no `cargo metadata` probe run. The first kill lookup in a fresh process takes 0.09 s CPU and 0.09 s wall on natedev.
+- A kill under a removed Cargo folder is not a build. On natedev, 5 of 6 logged kills count as build.
+- The build report's kill definition line says "under a Cargo target folder".
+
+**Files:**
+- `scripts/buildlog/memory.py` — the classifier.
+- `scripts/buildlog/test_memory_window.py` — `cargo_output(path)` fixture helper; `BuildOutputProgramTests`.
+- `scripts/buildlog/test_moments.py` — moment tests use `cargo_output` folders.
+- `scripts/buildlog/report.py` — kill definition line.
+- `docs/as-built/buildlog-memory-stalls.md` — classifier paragraph.
+
+**Gotchas:**
+- `METADATA_PROBE_WORKERS` stays in `config/buildlog.conf` with no reader until the user answers the key deletion question.
+- Tests that classify kills need a fixture folder with Cargo markers; a plain `target/debug` path is not a build.
+
+**Ruled out:** a per-kill `cached_property` (under 1 ms per report).
+
+### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`)
+
+From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
 
 #### Work Order
 
-**Goal:** after any failed append, the build log's month file holds only whole rows, so every reader parses each line.
+**Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
 
 **Spec:**
-- Defect (showrunner, from resources' Phase 4 review, 2026-10-30): `store._write_all` writes a row in a loop of `os.write` calls. When one write is short and the next fails (a full disk, for example), part of the row stays in the file with no newline. Since 4b, `locked_append` then writes a `\n` after that part, so the part becomes a line of its own that is not JSON; readers such as `sweep.read_rebuild_steps` (`scripts/lint/sweep.py:2207`, resources-unit's file) fail on it: it calls `json.loads` on each newline-terminated line and does not catch `ValueError`. Resources' uncommitted work renames it `read_rebuild_evidence`, which reads through `sweep.build_log_rows` and behaves the same way.
-- Showrunner's ruling: under the append lock, before it writes, the appender cuts an unfinished tail back to the last newline, then writes the row.
-- In `store.locked_append`, replace the `\n` repair with that cut: read only the last byte when it is `\n` (the usual case); otherwise find the last `\n` by reading back from the end, and `os.ftruncate` the file to just after it, or to 0 when the file has no `\n`. The cut runs under the same `flock`, before the caller's write.
-- `record.step` takes `month_offset` from the same `store` function instead of `st_size` (Constraints).
-- A row counts as written only when its newline lands, so a whole JSON object with no newline after it is cut too. A step row lost this way is published again by 4b's recovery (`record._resume_step_line`), which scans for its id; other rows stay lost, as they were before.
-- No reader changes. Old damage is removed once instead (showrunner, 2026-10-30): count the lines that do not parse in each live month file under `~/.local/state/buildlog/`. In each file a reader still reads that has any, remove those lines once, after a backup copy beside the file named so that no reader's glob matches it. The month-file globs after the phase-start merge are `index.py:844` and `record.py:1007` (`*/*.jsonl`), `ci.py:135` (`ci/*.jsonl`) and `scripts/lint/sweep.py:2209` (`natedev/????-??.jsonl`); a name that continues after `.jsonl` matches none of them. Run `git grep -n 'glob(' -- scripts` again before the run. Rewrite the file in place under its `flock` (truncate, then write the kept lines; same inode): never rename a new file over it, because an appender waiting on the lock holds the old inode. Skip and report a file that a pending 4b step record names (its `month_offset` would move): the records are `record.pending_steps_root()/*.json`, and each names its month file through its row's `host` and `started_at` (`record._step_month_file`). The index reads each rewritten file again through its existing path: `index.update()` calls `read_file` (`index.py:784-795`), which forgets a file and reads it from 0 when the file is smaller than its stored offset or the bytes before that offset (`marks`) changed. Name that path in the output. `sync.py` pulls the Mac's host folders with `rsync -rt` (`sync.py:235-246`), which replaces a changed file by rename, so the next sync brings the Mac's bad lines back. Report each bad file in a Mac host folder and leave it unchanged. This is a one-time live step, not new repository code; save its output (each file, lines removed, backup path) to the phase folder for the notice.
-- Update the module docstring (`store.py` lines 9–10). No as-built doc names the `\n` repair; `docs/as-built/buildlog-memory-stalls.md:46` says `store.append_line` "writes one line under a flock with `O_APPEND`": add there that it first cuts an unfinished tail back to the last newline. Take every name from the code.
-- The checkpoint notice names resources-unit as also-affected: the cut can move the file end below a size offset taken over an unfinished tail. Their uncommitted `TrimTake.log_offset` (`scripts/lint/sweep.py:1081` in their worktree) is such an offset, and `build_log_rows` (line 1133 there) then raises `ValueError` on a row fragment. Offer them the one `store` function from Constraints.
-- The director corrected `docs/as-built/build-targets.md:127` (`rebuild_bin(crates_compiled, warm)`, with `warm` from `warm_step_clause()`), which 4f made wrong; this phase's checkpoint commits it. The phase-start merge of builds at 31eaac9c kept both new step columns (`started_at_us`, `test_build_key`) and set `SCHEMA_VERSION = 25`; that merge commit carries the schema lines in `docs/as-built/build-memory-admission.md:168` and `docs/as-built/buildlog-memory-stalls.md:17`.
+- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
+- Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
+- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
+- Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
+- A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
+- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
 
 **Files:**
-- `scripts/buildlog/store.py` — the end-of-last-whole-row function, the cut in `locked_append`, the module docstring
-- `scripts/buildlog/record.py` — `month_offset` from that function (line 849)
-- `scripts/buildlog/test_store.py` — the new test and the changed assertion
-- `scripts/buildlog/test_record_rerun.py` — the offset rerun test
-- `docs/as-built/buildlog-memory-stalls.md` — line 46, the cut
-- `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — director edits, already in the tree
+- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
+- `scripts/buildlog/cli.py` — no `costs` command.
+- `scripts/buildlog/costs.py` — no text output.
+- `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — assertions about removed output go; calculation assertions stay on the typed data; new link tests.
+- `docs/as-built/buildlog-memory-stalls.md` — Definitions.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `store.py`, `record.py`'s `month_offset` capture, `docs/as-built/buildlog-memory-stalls.md`, and the one-time live removal after its code passes
-- `test` — `test_store.py`: a test that cuts a write short: `os.write` writes a few bytes of a row, then raises `OSError`; `append_line` raises; the next `append_line` leaves the file as the old rows plus the new row, and every line parses as JSON. Also a file with no newline at all is cut to empty. It must fail on the old code. And `test_record_rerun.py`: the month file ends in an unfinished tail when `record.step` starts; the row write lands, then the save fails (for example `os.fsync` raises); the rerun leaves the row in the file once. It must fail with the cut in place and `month_offset` still from `st_size`.
-
-**Assertion-Change:** `scripts/buildlog/test_store.py` `test_append_separates_an_interrupted_tail_before_the_next_row` — old: `self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')` for both tails; new: the file is `b'{"id":"next"}\n'` for both tails, because the ruling cuts every unfinished tail. Rename the test for the new behavior. `test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync` stays as it is: its file ends in `\n`, so the cut still reads one byte with `os.read(fd, 1)`. The test patches `os.read` and asserts `read_sizes == [1]`.
-
-**Assertion-Change (director ruling after review pass 1, 2026-10-30):** `scripts/buildlog/test_record_rerun.py`:
-- `test_normal_step_appends_without_opening_month_history_for_reading` becomes `test_normal_step_reads_only_tail_bytes_without_scanning_month_history` — old: any read open of the month file raises `AssertionError("a normal step read the monthly history")`; new: the only month-file reads are `os.read` of size 1 at `original_size - 1`, `read_sizes == [1, 1]`, because `record.step` now reads the tail byte to find the row end, and the cut reads it again.
-- `assert_short_append_recovers` (used by `test_fragment_then_normal_step_and_call_recovers_one_physical_row_per_id`, `test_complete_object_without_newline_then_other_writers_recovers_without_duplicate` and the two stop tests) — old: the stop is the `\n` write (`self.assertEqual(bytes(data), b"\n")`), then `self.assertTrue(month.read_bytes().endswith(b"\n"))`, and `self.assertEqual(finished.added, not complete_object)`; new: the stop is the cut (`os.ftruncate`, `self.assertEqual(length, 0)`), then `self.assertEqual(month.read_bytes(), b"")`, and `self.assertTrue(finished.added)`, because a whole object with no newline is cut and its row is published again.
-- `test_stop_after_fragment_repair_newline_recovers_without_losing_later_rows` and `test_stop_after_complete_object_repair_newline_recovers_without_duplicate` become `test_stop_after_fragment_tail_cut_recovers_without_losing_later_rows` and `test_stop_after_complete_object_tail_cut_recovers_without_duplicate`.
-
-**Repair round 1 (director ruling, 2026-10-30):** a short `os.read` could make the row-end search skip bytes, so the cut removed whole rows. `store.last_whole_row_end` now reads the last byte, and when it is not `\n` maps the file read-only and finds the last `\n`, with no block loop. Its caller holds the file's flock, so a cut cannot shrink the mapping: `locked_append` holds the exclusive lock, and `record.step` captures through `store.read_last_whole_row_end`, which takes a shared one. A pending record written before this phase can hold an offset inside an unfinished tail, so the row end is saved under a new key, `month_row_end`, and a record with only `month_offset` scans its month file from 0.
-
-**Assertion-Change (director ruling after repair round 1, 2026-10-30):** `scripts/buildlog/test_record_rerun.py` `test_recovery_starts_at_the_saved_month_offset_and_keeps_other_appends` — old: `self.assertEqual(saved["month_offset"], len(prefix))`; new: `self.assertEqual(saved["month_row_end"], len(prefix))`, the same value under the renamed key.
-
-**State:** the month file's tail: a cut under the exclusive lock, before the write. A pending step's `month_row_end`: the end of the last whole row at record time; a cut never moves below it. A record with only the old `month_offset` key scans from 0. A rerun after a failed append cuts the same tail again and writes once. The one-time removal: a second run finds no bad line and changes nothing, and never overwrites an existing backup.
-
-**Constraints from prior phases:** 4b's recovery scan (`record._resume_step_line`, `record.py:682-697`) seeks to `month_offset` under `locked_append` and skips lines that do not parse. Today `record.step` sets `month_offset` to the month file's `st_size` (`record.py:849`), outside the month file's lock, so it can sit inside an unfinished tail. The cut would then put the next row before `month_offset`, and a rerun after that row landed would miss it and append it again. So `month_offset` must be the end of the last whole row: the byte after the last `\n` at or before the size, or 0. A cut removes only bytes after the last `\n`, so bytes up to that point never change. The capture still takes a shared flock, because the search maps the file (repair round 1). One `store` function finds the end of the last whole row; the cut and the `month_offset` capture both call it. No second backward read in `record.py`, and no copy of `head_facts._backward_lines`' block loop (`scripts/build_queue/head_facts.py:111`).
-
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_store scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_recorder_health` from the worktree root green, with the new `test_store` tests failing on the old code and the offset test failing on the cut with `st_size` capture; basedpyright on `scripts/buildlog/store.py scripts/buildlog/record.py scripts/buildlog/test_store.py scripts/buildlog/test_record_rerun.py` `0 errors, 0 warnings, 0 notes`; live: the one-time removal above ran, with a backup per changed file, and a second count finds no bad line in any file a reader reads; `python3 scripts/buildlog/cli.py report` from the worktree root runs clean.
-
-### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: todo
-
-**Depends on:** none
-
-#### Work Order
-
-**Goal:** `/build:report` gives the true average memory that running builds held in each hour of the last 24 hours, from 60 s readings of current use, not from step peaks.
-
-**Spec:**
-- User, 2026-10-30: asked for the average real memory use of running builds per hour. The only answer the log could give summed step peaks, and one hour came to 56 GiB, above the 44 GiB cap of `builds.slice`. The 60 s `memory_snapshot` rows hold only `memory.peak` (the peak since the slice started), so no true reading exists.
-- Accuracy first (user, 2026-10-30: "we keep making mistakes - undercounting, double counting"). In `memory.slice_state` (`scripts/buildlog/memory.py`), store each reading as the kernel gives it, under its own name, and derive nothing at write time:
-  - `current_bytes` from `memory.current`: the slice's whole charge, the same number `memory.max` enforces. It already includes every child cgroup (each step's scope) and file cache and kernel memory. This is the one "held" total; never add child cgroups, `memory.stat` lines or swap to it.
-  - `swap_current_bytes` from `memory.swap.current`; kept apart, never added to `current_bytes`.
-  - From `memory.stat`, these lines as named fields in a `stat` record: `anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`. `shmem` is part of `file`, so never add the two; `inactive_file` is the cache the kernel frees first. A line the kernel does not print is stored as absent, never 0.
-  - `max_bytes` at that instant (already read as `max`); `builds` and `ci` slices stay separate, never summed.
-  Use the existing typed slice record and its one reader of slice files; add no second reader.
-- In the report's Memory pressure section, add one line from the samples of the last 24 hours: `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` The hour uses the user's zone, as other report times do. With no sample that has `current_bytes`, the line reads `Build memory held: no readings yet.`
-- Add a command that prints the hour-by-hour table on demand, in the existing `cli.py` (columns: hour, average GiB held, processes, file cache, samples). Times in the user's zone.
-- Averages are the mean of the readings in each hour, with the reading count shown; a missing reading is skipped, never 0. Rows written before this phase have no `current_bytes`; they count as no reading. Step `peak_mem_bytes` is never used for this line.
-- Update `docs/as-built/buildlog-memory-stalls.md` (the snapshot fields, the new line and the command).
-- CPU and disk, same rules (user, 2026-10-30: record what builds really do, for trends). Store raw kernel counters as read; derive rates only in the report, from the difference of two readings; a missing file is absent, never 0:
-  - per step, at step end, from the step's own scope cgroup (the folder `BUILDLOG_SCOPE_SH` writes to `"$BUILDLOG_PEAK.cgroup"`): `cpu.stat` `usage_usec`, `user_usec`, `system_usec` and `io.stat` `rbytes`, `wbytes` summed over devices (the sum, and the per-device lines kept as read);
-  - per 60 s sample, for the builds slice and the CI slice apart: `cpu.stat` `usage_usec` and `io.stat` `rbytes`, `wbytes`;
-  - per 60 s sample: free and total bytes of the filesystem that holds the build targets (`os.statvfs`); `disk.json` keeps only the latest snapshot, so it gives no trend;
-  - per 60 s sample: free slots in each jobserver pool (`/dev/steve`, 31; `/dev/steve-ci`, 14), read without taking a slot (for example `FIONREAD` on the fifo). If no read is safe, record nothing and say so in the as-built; never take and return a slot to count.
-  - Report: the hourly command shows, per hour, average CPU cores busy for builds (`usage_usec` difference / wall time), disk bytes read and written, lowest free disk and average free slots per pool, each with its reading count.
-
-**Files:**
-- `scripts/buildlog/memory.py` — the new slice fields
-- `scripts/buildlog/report.py` — the new line
-- `scripts/buildlog/cli.py` — the hourly command
-- `scripts/buildlog/test_sample.py` — slice field tests
-- `scripts/buildlog/test_report.py` — line tests
-- `docs/as-built/buildlog-memory-stalls.md` — the fields, line and command
-
-**Workers:** 1 writer + 1 tester
-- `impl` — `memory.py`, `report.py`, `cli.py`, the as-built doc
-- `test` — `test_sample.py`: the fields come from a fake slice folder; `test_report.py`: the line with readings, with only old rows (`no readings yet`), and an average that never exceeds the cap for a fixture within it
+**Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
 
 **State:** none.
 
-**Constraints from prior phases:** samples reach `index.sqlite` table `memory_snapshots` (`slices` JSON); read them from there, through the existing query path.
+**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line.
 
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_sample scripts.buildlog.test_report` from the worktree root green; basedpyright on the five Python files `0 errors, 0 warnings, 0 notes`; live cross-check: read `memory.current` and `memory.stat` by hand in the folder `memory.builds_path()` returns at one instant beside one sample run, and show that the stored values equal the files, that `anon + file + kernel` is within 5% of `current_bytes` (report the gap), and that no stored `current_bytes` exceeds `max_bytes`; live: after the installed sampler writes a row with `current_bytes` (or one `python3 scripts/buildlog/cli.py` sample run from the worktree), `python3 scripts/buildlog/cli.py report` prints the new line and the hourly command prints a row per hour with readings.
+**Acceptance gate:**
+- A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
+- A test proves a missing link prints the reason and exits non-zero.
+- `buildlog costs` prints the CLI's unknown-command usage and exits 2.
+- `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
+- `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
+
+### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: done
+
+#### As-built
+
+A step row has the Cargo output pair from its record, or `unknown` in both folders. The index never builds the pair from `target_dir`.
+- `index.add_step` reads `target_directory` and `build_directory` only from the record. When either one is absent, it stores `store.UNKNOWN_IDENTITY` in both. `target_dir`, `target_folder` and `build_history_group` still read `target_dir`.
+- Column text: `target_directory` is "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` is "resolved Cargo intermediate root; unknown when the record has no output pair".
+- `SCHEMA_VERSION` is 35, so `index.update()` rebuilds every old step row once. Column text alone does not change the index file name, because `schema_statements()` leaves out the descriptions.
+- Readers: `step_outputs.recorded_output_roots` gives an `UnknownRecordedRoot` for an unknown pair, and `sweep.discover_cargo_outputs` skips it.
+
+**Files:**
+- `scripts/buildlog/index.py` — `add_step` and the column text.
+- `scripts/buildlog/test_index.py` — the pair table (legacy, override, target-only and build-only rows read unknown), the reader test through `recorded_output_roots` and `discover_cargo_outputs`, and the schema-bump rebuild test.
+
+**Gotchas:**
+- Records from before the pair and records whose Cargo metadata failed have the same fields (`v` is 1 for both). A fallback for one is a made-up pair for the other.
+- On the live log (2026-11-08), 102,951 of 109,321 steps read unknown; the rebuild took 6.0 s.
+
+**Ruled out:**
+- A pair made from `target_dir` for old records: it is wrong when Cargo's build folder differs.
+
+### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
+
+#### As-built
+
+- `verify.sh` `set_gate_metadata` runs `cargo metadata --no-deps --format-version 1`, sets `GATE_METADATA` and exports `BUILDLOG_OUTPUT_ROOTS` from `step_context.py output-roots` (one line: `<evidence>\t<workspace_root>\t<target_directory>\t<build_directory>`, or empty). `load_metadata` calls it only when `GATE_METADATA` is empty, so a reuse of the saved metadata keeps the export of the real read.
+- `step_context.step_output_roots` reads the export first. When the step's `_output_evidence` equals the exported evidence, it returns the exported folders (resolved); else it reads `cargo metadata` as before. The user kept this folder-match check (2026-11-05).
+- `_output_evidence` hashes the resolved working folder, the `+toolchain` word, each `--manifest-path`/`--config`/`--target-dir` argument as written, the Cargo folder environment values, and the content of `Cargo.toml`, `rust-toolchain(.toml)` in each parent and `config`/`config.toml` in each Cargo config folder.
+- `cargo_output.cargo_metadata_output_roots(text)` is the one metadata decode; `cargo_target_config.cargo_config_folders(cwd, environment)` is the one Cargo config folder list.
+- Recorder CPU per verify.sh step on bevy_brp: terminal 157 → 119 ms, tee 157 → 118 ms.
+
+**Files:**
+- `scripts/buildlog/step_context.py` — evidence, the `output-roots` verb, the export read in `step_output_roots`.
+- `scripts/direct/verify.sh` — `set_gate_metadata` and the export.
+- `scripts/lib/cargo_output.py`, `scripts/lib/cargo_target_config.py` — the shared decode and folder list.
+- `scripts/buildlog/test_step_row.py` (`VerifyOutputEvidenceTests`), `scripts/direct/test_verify_python_starts.py`, `scripts/lib/test_cargo_output.py` — tests.
+
+**Gotchas:**
+- A step with `--manifest-path`, `--config` or `--target-dir` never matches the plain export and reads metadata.
+- Suite tests use a fake `cargo` with fixed answers: `merge_gate.py` puts a Cargo tripwire first on `PATH`. A fake that execs the installed cargo wrapper loops unless it removes its own folder from `PATH`.
+
+**Ruled out:**
+- Reading the test-path metadata without an export, and an export through a `verify_metadata.py` request: routed to verify-unit, which owns `verify.sh`.
+
+### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: done
+
+#### As-built
+
+`buildlog vault` syncs the Mac's `~/rust/hanadocs` with GitHub each hour, from natedev. A stop files one question on natedev's open-questions list and sends no phone push (user, 2026-11-05).
+- natedev pushes its `refs/remotes/origin/main` to the Mac. The Mac script (`REMOTE_PULL`) stops with `branch` off main, and stops with the conflict outcome on an open merge (`MERGE_HEAD`: the unmerged files, else the files that differ from HEAD; no abort, add or commit; the user chose this check, 2026-11-05). It then runs `git add -A`, commits once (`vault: Mac edits`) and runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main`. A conflict prints the `--diff-filter=U` files and runs `git merge --abort`. The commit and the merge retry a busy `index.lock` (`vault.lock_retries`, `vault.lock_retry_delay_s`). The `VAULT_OUTCOME=` marker gives the outcome, because Mac login can hide the exit status.
+- natedev fetches the Mac's main into `refs/remotes/mac/main`, then `origin main` after `ci.warm()`. It pushes a fast-forward, or a `git merge-tree --write-tree` plus `git commit-tree` merge made in the object store, to GitHub `main`. A natedev merge-tree conflict, cold credentials and a rejected push (`git push --porcelain`) are deferrals: one printed line, exit 0. The next hour's Mac merge files the conflict question.
+- `mac_git` alone applies the Mac ssh options. A nonzero exit 255, or connection text on a nonzero exit, is `MacUnreachable`; a timeout is too.
+- `PullOutcome = Pulled | Current | DeferredSync | PullStop`; `PullStop = VaultConflict | NotOnMain | MacUnreachable | VaultLocked | VaultCommandFailed`; `StopCause` is the `Literal` of `conflict`, `not_on_main`, `mac_unreachable`, `vault_locked`, `command_failed`.
+- State (`store.root()/vault_pull.json`): `VaultState(last_good: LastGoodPull | NeverPulled, outage: OpenOutage | NoOutage)`, `OpenOutage(cause, since, asked, detail)`, written with `write_text_atomic` under `file_lock.exclusive`. An outage files one question with `update_registration.py ask --urgency soon --due <since + 1 day>`; `asked` is saved before `ask` and reset when `ask` fails. `MacUnreachable` files only after `UNREACHABLE_GRACE_S` (24 h) from `last_good`; a deferral after a Mac contact refreshes `last_good` and keeps the outage. A good run deletes the local outage; the question stays open until natedev clears it by hand.
+- The `vault.stopped` push is gone from `push_catalog.py`, `push_texts_reviewed.json` and `test_push_texts.py`.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the job, the Mac script, the state and the question.
+- `scripts/buildlog/test_vault_pull.py` — real-git tests (a GitHub bare repo, a natedev clone and a Mac clone, built once per class and copied for each test).
+- `scripts/buildlog/test_target_sync.py` — the vault stand-in uses the marker and the Mac transport calls.
+- `scripts/buildlog/cli.py` — the usage line.
+- `config/build_targets.conf`, `config/README.md` — the lock retry text.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py` — no `vault.stopped`.
+
+**Gotchas:**
+- A successful git transfer can print connection text on stderr (hooks). The unreachable rule applies only to a nonzero exit.
+- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
+- The first run committed the Mac's `home-base/vault map.base` change; that was the wanted result.
+
+**Ruled out:**
+- A phone push for a vault stop (user, 2026-11-05).
+- A natedev question for a merge-tree conflict: no working tree holds natedev's merge.
+- Importing `update_registration.py` internals: the job runs the public `ask` command.
+
+### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: done
+
+#### As-built
+
+One idle episode sends one showrunner message and at most one phone push. A changed cause or holder in the same episode sends one new message.
+- `mac_idle.mac_work` reads `run.json` first, then `mac_test.read_claims(mac_test.StatePaths(paths.mac_state))`, filtered by `run_is_live`. The claims folder time no longer moves the episode start.
+- `watch_once` ends the episode when the Mac runs natedev work, or when a live claim that started before the episode start has a `work_idle_since` later than that start. `mac_test` writes one activity answer for each host into every live claim, so this holds for every cause, blocked included, and another repository's claim does not restart the episode. No claim path is saved.
+- The alert record saves `changed`, the time the current cause and holder started. `SavedAlert.changed: float` is required, and `read_alert` validates it like `since`; a record without it is unreadable, so the next pass starts clean.
+- `outage_key(saved)` gives the message key `mac-idle-showrunner-<since>-<changed>`, so a cause that returns to an earlier value also sends. `messaged` is kept when the key does not change. The phone push stays once per episode (`mac-idle-<since>`).
+- `cleared --since` and the push `--clears-when` are unchanged.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py` — `mac_work`, `watch_once`, `outage_key`; `OutageMessage` carries `key`.
+- `scripts/buildlog/mac_idle_alert.py` — `SavedAlert.changed`.
+- `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/test_mac_idle_alert.py`, `scripts/buildlog/mac_idle_test_support.py` — the 12:50-13:09 repeat case, cause changes, a returning cause, a blocked episode that ends on Mac work, another repository's claim that sorts first, `test_own_claim_work_restarts_the_idle_interval`.
+
+**Ruled out:**
+- Saving the episode's claim path: it missed work in a blocked episode and took another repository's claim.
+- A cause-and-holder message key: it did not send when a cause came back.
+
+### Phase 31 — A vault sync that works again closes its open question by itself  · status: done
+
+#### As-built
+
+A good vault sync closes the question that its outage filed, through the public `withdraw` command. This replaces the earlier rule that natedev clears the question by hand.
+- `question_text(since: float) -> str` in `vault_pull.py` is the one source of the short line: `Hanadocs vault sync stopped, <opened iso>`. The cause is only in `--question`, because a cause can change inside one outage and `withdraw` needs the exact text.
+- `registration(command: str, *args: str) -> bool` runs `update_registration.py <command> --production <PRODUCTION> <args>` through `run(..., COMMAND_TIMEOUT_S)`. `ask_question(reason, choices, since)` files the text through it, and `withdraw_question(since) -> bool` runs `withdraw --item <text>` through it.
+- In `_vault_locked`, a `Pulled` or `Current` outcome writes `VaultState(LastGoodPull(now), NoOutage())` first. It then withdraws once when the earlier outage is an `OpenOutage` with `asked=True`.
+- A failed or timed-out withdraw still exits 0 and keeps `NoOutage`. The sync line ends `; the question was not withdrawn`, and nothing retries.
+- A `DeferredSync` keeps the outage and withdraws nothing. An outage with `asked=False` withdraws nothing. `VaultState` and `vault_pull.json` keep their form.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — `question_text`, `withdraw_question`, `ask_question`, `_vault_locked`.
+- `scripts/buildlog/test_vault_pull.py` — `QUESTION_STAND_IN` keeps withdraw calls apart from ask calls; real-git tests for each case above.
+
+**Gotchas:**
+- A question the user already answered gives the same exit 2 as a real withdraw failure, so a rare failure leaves a stale question for natedev to clear.
+- The live check waits for the next real outage on natedev, because a forced outage files a real question on the user's list.
+
+**Ruled out:**
+- Saving the filed text in the state file: `question_text` rebuilds it from `since`.
+- A retry of a failed withdraw: an answered question would retry for ever.
+- A withdraw on a deferral: a deferral is not a good sync.
+- A migration: the live state had no outage and no open hanadocs question.
+
+### Phase 32 — One shared helper merges overlapping time spans  · status: done
+
+#### As-built
+
+`scripts/lib/intervals.py` is the one place that merges overlapping time spans. All four callers use it and keep no merge loop of their own.
+- `merged_spans(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]` returns the spans sorted by start, with each overlapping or touching span merged into the one before it.
+- `union_seconds(spans: Iterable[tuple[float, float]]) -> float` returns the duration that at least one span covers.
+- `hold_duration` in `scripts/buildlog/holds.py` passes each span as whole microseconds from the requested start, and converts the result back through a `timedelta`. `MICROSECOND` is the unit.
+- `source_coverage` in `scripts/buildlog/costs.py` groups spans by machine and builds its rows from `merged_spans`. The order stays machine, then start.
+- `_elapsed_union` in `scripts/history/history.py` returns `union_seconds` and keeps its `started_at > 0` filter.
+- `_work_seconds` in `scripts/direct/progress_history.py` walks `merged_spans` and keeps its idle grace.
+
+**Files:**
+- `scripts/lib/intervals.py` — `merged_spans`, `union_seconds`.
+- `scripts/lib/test_intervals.py` — one table of six cases, and one generator test.
+- `scripts/buildlog/holds.py` — `hold_duration`, `MICROSECOND`.
+- `scripts/buildlog/test_holds.py` — fractional hold seconds total a full minute.
+- `scripts/buildlog/costs.py` — `source_coverage`.
+- `scripts/history/history.py` — `_elapsed_union`. Owner: sdlc.
+- `scripts/direct/progress_history.py` — `_work_seconds`. Owner: sdlc.
+
+**Gotchas:**
+- Float timestamps lose precision: holds at second offsets [0,20.1], [30,50.1], [60,79.8] add up to 59.99999976158142 seconds and read `0:00`. Pass whole numbers to the helper when an exact total matters.
+- `costs.py` and `vault_pull.py` get `scripts/lib` on their path through another module's import. The root fix is one shared path setup for `scripts/buildlog`.
+
+**Ruled out:**
+- A key argument on the helper: all callers fit plain float pairs.
+- A `sys.path` line in `costs.py` and `vault_pull.py`: each adds one more copy of that line.
+
+### Phase 33 — scripts/buildlog imports from the repo root  · status: done
+
+#### As-built
+
+All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form. Behavior does not change.
+- A module or test module imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`, and another script folder as `from scripts.lib.y import z`.
+- No module in `scripts/buildlog` has a `sys.path` line. The seven modules that run by path (`cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`) start with the shared `scripts/lib/package_root.py` bootstrap that devtools 3z added (merge of builds f7e3cbce3).
+- A patch string names the root form: `mock.patch("scripts.buildlog.record.x")`. A code string that a test runs in a subprocess imports through the repo root.
+- Outside `scripts/notify`, no file imports a `scripts/notify` module by a bare name.
+- `_register_module_aliases` and `test_store_identity.py` do not exist. `scripts/buildlog/__init__.py` holds only a docstring; it adopts no bare module, and basedpyright needs it to resolve `scripts.buildlog` to this checkout.
+
+**Files:**
+- `scripts/buildlog/` — every module and test module, in the root form.
+- `scripts/buildlog/test_repo_root_imports.py` — `test_entry_scripts_import_without_pythonpath` runs each by-path module with `PYTHONPATH` removed and an unrelated `scripts` package in the working folder; `test_entry_scripts_load_each_shared_module_once` checks that a shared module loads under one name.
+- `scripts/aws_target/`, `scripts/build_hold/`, `scripts/build_queue/`, `scripts/build_targets/`, `scripts/lint/`, `scripts/mac_test/`, `scripts/test_times/` — outside importers of buildlog modules.
+- `docs/as-built/build-followups.md`, `docs/as-built/build-targets.md` — the path line of `disk.py` and the rule on shared module names.
+
+**Binds later work:** A buildlog import, patch string or test code string uses the root form. A library module adds no `sys.path` line.
+
+**Gotchas:**
+- A caller suite list misses test strings in modules outside the list; the merge gate finds them.
+- The type check of the gate passes `--pythonpath` with a pinned venv, so that `bpy` and `PIL` resolve. Bare `basedpyright` differs from it.
+- `merge_gate.py --tests-only` runs no type check unless `--type-dirs` names folders.
+- Another unit can add a bare import of a buildlog module until it merges this phase.
+
+**Ruled out:**
+- A path module for `scripts/buildlog`: the repo already has one way, and a per-folder module is a second way.
+- Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
+
+### Phase 34 — A failed merge gate module keeps its failure text  · status: done
+
+#### As-built
+
+A failed merge gate attempt keeps the end of its output in the build log, for local and cloud gates. A passing or restarted attempt keeps no log. Nothing prunes the logs; the per-file limit bounds the growth.
+- `gate_record.Execution` has a required `output: str`, and `ModuleRun` has `log: str`: the kept log's path relative to the build log root, or empty.
+- `gate_record.keep_failure_logs(record_id, host, epoch, modules, executions)` pairs modules with executions by `zip(..., strict=True)`. For each attempt with a non-zero `status` and an empty `restart`, it writes the last `GATE_FAILURE_LOG_KIB` KiB through `record.keep_log`, after one line that gives the count of cut bytes. The log name is the record id plus a sha256 of (suite, module, attempt). A failed write goes to `report_not_written`; the verdict and the record stay.
+- `write_gate_run(run, executions)` takes its executions with no default and calls `keep_failure_logs`. `merge_gate.record_gate_run` passes each `job.output`.
+- Cloud: `gate_box.execution_records(run)` builds the one `Execution` list, with output, from `run.executions or run.jobs`; `completion_record` uses it. `cloud_gate.import_record` decodes `row['gate']` and calls `keep_failure_logs` on natedev with the record's id, host and start epoch before it appends the box's record.
+- `index.py`: `gate_modules.log` column, `SCHEMA_VERSION` 36. A record without `log` indexes the column as NULL.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `Execution.output`, `ModuleRun.log`, `keep_failure_logs`, `write_gate_run`.
+- `scripts/test_times/gate_record_test_support.py` — `fixture_executions`, the one fixture that builds executions from module rows.
+- `config/test_times.conf` — `GATE_FAILURE_LOG_KIB=64`.
+- `scripts/production/merge_gate.py` — passes the output.
+- `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py` — the cloud list builder and the import that keeps the logs.
+- `scripts/buildlog/index.py` — the `log` column.
+- Tests: `test_gate_record.py`, `test_merge_gate_test_times.py`, `test_gate_index.py` (`test_query_recovers_failure_log_paths_after_an_index_rebuild`), `test_cloud_gate.py` (`test_import_uses_real_remote_host_and_appends_once` with a failed first attempt), `test_gate_box.py`, `test_show.py`.
+- `docs/as-built/merge-gate-and-test-speed.md` — "Failed module output": the `buildlog query` for the path, then `zcat`.
+
+**Gotchas:**
+- The cloud gate builds its record on the box, so the box cannot write a natedev log; the import on natedev keeps the logs.
+- A new required field on `Execution` or `write_gate_run` reaches every test fixture that builds a gate record; type-check every file that names `gate_record`.
+
+**Ruled out:**
+- Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).

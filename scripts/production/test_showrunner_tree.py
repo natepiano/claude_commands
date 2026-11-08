@@ -1,7 +1,6 @@
-"""Staff-backed reporting trees, legacy edge writes and their command-line behavior."""
+"""Staff rows supply reporting trees and parent commands."""
 from __future__ import annotations
 
-from pathlib import Path
 import io
 import os
 import subprocess
@@ -10,17 +9,41 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import showrunner_parent
-import showrunner_tree
+from scripts.production import showrunner_parent
+from scripts.production import showrunner_tree
 from scripts.production import showrunners
-import test_showrunners
+from scripts.production import test_showrunners
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 
 
 class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
+    def test_attach_refuses_unknown_liveness_instead_of_accepting_a_partial_inventory(self) -> None:
+        self.showrunner("top")
+        self.showrunner("kid")
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("kid", "kid lookup failed"),))
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)):
+            with self.assertRaisesRegex(OSError, "kid lookup failed"):
+                showrunner_tree.check_attach("kid", "top")
+        self.assertFalse(self.parent_receipt("kid").exists())
+
+    def test_wrapped_showrunner_keeps_its_raw_parent_but_leaves_the_active_tree_despite_a_stale_timer(self) -> None:
+        self.showrunner("top", running=False)
+        self.showrunner("wrapped", running=False)
+        self.recorded_parent("wrapped", "top")
+        old = staff.snapshot().by_path("wrapped")
+        assert old is not None
+        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
+        record = staff.snapshot()
+        self.assertEqual(showrunner_tree.children_of("top", record=record), [])
+        self.assertEqual(showrunner_tree.parent_edges(record=record), {})
+        retained = record.by_id(old.id)
+        assert retained is not None
+        self.assertEqual(retained.parent, old.parent)
+
     def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
@@ -31,7 +54,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
                 mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("before notices")), \
                 redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             _ = showrunners.main(["attach", "mid", "top"])
-        self.assertEqual((self.state / "mid/parent").read_text(), "top\n")
+        self.assertFalse(self.parent_receipt("mid").exists())
         self.assertEqual(self.successful("attach", "mid", "top").splitlines(),
                          ["mid now reports to top", "told mid", "told top"])
         notices = self.messages()
@@ -40,15 +63,15 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertIn("never a unit", notices[1][1])
 
     def test_tree_uses_one_supplied_snapshot_and_ignores_stale_parent_files(self) -> None:
-        for slug in ("old", "new", "child", "leaf"):
-            self.showrunner(slug, running=False)
+        for production_name in ("old", "new", "child", "leaf"):
+            self.showrunner(production_name, running=False)
         self.recorded_parent("child", "old")
         self.recorded_parent("leaf", "child")
         record = staff.snapshot()
         child = record.by_path("child")
         parent = record.by_path("new")
         assert child is not None and parent is not None
-        _ = staff.move(child.id, parent.id)
+        _ = staff.move(child.id, staff.ReportsTo(parent.id))
         write_text_atomic(self.state / "child" / "parent", "old\n")
         record = staff.snapshot()
         expected = {"child": "new", "leaf": "child"}
@@ -77,7 +100,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.showrunner("mid", name="mid-name")
         stderr = self.refused("attach", "mid", "top")
         self.assertIn("production mid has showrunner mid-name", stderr)
-        self.assertFalse((self.state / "mid/parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
 
     def test_attach_stores_the_parent_and_every_lookup_reads_it(self) -> None:
         self.showrunner("top")
@@ -85,7 +108,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.showrunner("leaf", running=False)
         attached = self.successful("attach", "mid", "top")
         self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid", "told top"])
-        self.assertEqual((self.state / "mid" / "parent").read_text(), "top\n")
+        self.assertFalse(self.parent_receipt("mid").exists())
         deeper = self.successful("attach", "leaf", "mid")
         self.assertEqual(deeper.splitlines(),
                          ["leaf now reports to mid", "leaf is not running: tell it when it starts", "told mid"])
@@ -93,42 +116,46 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertEqual(self.successful("parent", "top"), "")
         self.assertEqual(self.successful("children", "top"), "mid\n")
         self.assertEqual(self.successful("children", "leaf"), "")
-        self.assertEqual([self.successful("root", slug) for slug in ("top", "mid", "leaf")], ["top\n"] * 3)
+        self.assertEqual([self.successful("root", production_name) for production_name in ("top", "mid", "leaf")], ["top\n"] * 3)
         self.assertEqual(self.successful("tree").splitlines(),
                          ["top\ttop", "  mid\tmid", "    leaf\t<not running>"])
         sockets = [socket for socket, _ in self.messages()]
-        self.assertEqual(sockets, [f"uds:{self.root / f'{slug}-id.sock'}" for slug in ("mid", "top", "mid")])
+        self.assertEqual(sockets, [f"uds:{self.root / f'{production_name}-id.sock'}" for production_name in ("mid", "top", "mid")])
         to_child, to_parent, to_leafs_parent = (text for _, text in self.messages())
         self.assertIn("mid now reports to top. The root is top: send it each item for the user.", to_child)
-        self.assertIn("never a unit: it has no Units row", to_parent)
+        self.assertIn("never a unit", to_parent)
         self.assertIn("leaf now reports to mid. It is a child showrunner", to_leafs_parent)
 
-    def test_tree_commands_accept_former_slugs_and_answer_with_current_slugs(self) -> None:
-        self.showrunner("top", running=False, formerly=("old-top",))
-        self.showrunner("leaf", running=False, formerly=("old-leaf",))
+    def test_tree_commands_answer_with_current_slugs(self) -> None:
+        self.showrunner("top", running=False)
+        self.showrunner("leaf", running=False)
         self.recorded_parent("leaf", "top")
-        for arguments, expected in ((("parent", "old-leaf"), "top\n"),
-                                    (("children", "old-top"), "leaf\n"),
-                                    (("root", "old-leaf"), "top\n")):
+        for arguments, expected in ((("parent", "leaf"), "top\n"),
+                                    (("children", "top"), "leaf\n"),
+                                    (("root", "leaf"), "top\n")):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.successful(*arguments), expected)
 
-    def test_attach_and_detach_former_slugs_use_the_current_state_directory(self) -> None:
-        self.showrunner("top", running=False, formerly=("old-top",))
-        self.showrunner("leaf", running=False, formerly=("old-leaf",))
+    def test_attach_and_detach_change_staff_without_parent_files(self) -> None:
+        self.showrunner("top", running=False)
+        self.showrunner("leaf", running=False)
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state)):
-            self.recorded_parent("leaf", "top")
-            showrunner_parent.attach("old-leaf", "old-top")
-            self.assertEqual((self.state / "leaf" / "parent").read_text(), "top\n")
-            self.assertFalse((self.state / "old-leaf").exists())
-            self.assertEqual(showrunner_parent.detach("old-leaf"), "top")
-            self.assertFalse((self.state / "leaf" / "parent").exists())
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state),
+              mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()),
+              redirect_stdout(io.StringIO())):
+            showrunner_parent.attach_parent("leaf", "top")
+            self.assertEqual(showrunner_tree.parent_of("leaf"), "top")
+            self.assertFalse(self.parent_receipt("leaf").exists())
+            showrunner_parent.detach_parent("leaf")
+            self.assertEqual(showrunner_tree.parent_of("leaf"), "")
+            self.assertFalse(self.parent_receipt("leaf").exists())
 
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
-        attached = self.successful("attach", "mid", caller="top-id")
+        caller = staff.by_path("top")
+        assert caller is not None
+        attached = self.successful("attach", "mid", caller=caller.id)
         self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid"])
         self.assertEqual([socket for socket, _ in self.messages()], [f"uds:{self.root / 'mid-id.sock'}"])
         self.assertIn("name the parent: this session runs no production", self.refused("attach", "top"))
@@ -146,7 +173,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertIn("leaf now reports to mid. The root is top:", self.messages()[2][1])
         self.assertIn("mid already reports to top; detach it first", self.refused("attach", "mid", "leaf"))
         self.assertIn("leaf already reports to top, directly or through others", self.refused("attach", "top", "leaf", code=2))
-        self.assertEqual(sorted(path.parent.name for path in self.state.glob("*/parent")), ["leaf", "mid"])
+        self.assertEqual(list(self.state.glob("*/parent")), [])
         self.assertEqual(len(self.messages()), 4)
 
     def test_detach_removes_the_edge_tells_both_and_accepts_a_child_with_none(self) -> None:
@@ -155,7 +182,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         _ = self.successful("attach", "mid", "top")
         detached = self.successful("detach", "mid")
         self.assertEqual(detached.splitlines(), ["mid no longer reports to top", "told mid", "told top"])
-        self.assertFalse((self.state / "mid" / "parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
         self.assertEqual(self.successful("root", "mid"), "mid\n")
         self.assertIn("mid is a root again", self.messages()[-1][1])
         self.assertIn("mid reports to no one", self.successful("detach", "mid"))
@@ -183,13 +210,13 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertEqual(self.successful("parent", "mid"), "top\n")
 
     def test_a_cycle_written_by_hand_makes_each_of_its_members_a_root(self) -> None:
-        for slug in ("one", "two", "under"):
-            self.showrunner(slug, running=False)
+        for production_name in ("one", "two", "under"):
+            self.showrunner(production_name, running=False)
         self.stored_parent("one", "two")
         self.stored_parent("two", "one")
         self.stored_parent("under", "one")
         self.recorded_parent("under", "one")
-        self.assertEqual([self.successful("root", slug) for slug in ("one", "two", "under")],
+        self.assertEqual([self.successful("root", production_name) for production_name in ("one", "two", "under")],
                          ["one\n", "two\n", "one\n"])
         self.assertEqual(self.successful("tree").splitlines(),
                          ["one\t<not running>", "  under\t<not running>", "two\t<not running>"])
@@ -205,31 +232,31 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.recorded_parent("leaf", "mid")
         known = {"top", "mid", "other", "leaf", "alone"}
         with (mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state),
-              mock.patch.object(showrunners, "timer_slugs", return_value=known)):
-            self.assertEqual([showrunner_tree.root_of(slug) for slug in ("top", "mid", "leaf", "alone")],
+              mock.patch.object(showrunners, "timer_names", return_value=known)):
+            self.assertEqual([showrunner_tree.root_of(production_name) for production_name in ("top", "mid", "leaf", "alone")],
                              ["top", "top", "top", "alone"])
             self.assertEqual(showrunner_tree.descendants_of("mid"), ["leaf"])
-            for slug in ("top", "mid", "leaf", "alone"):
-                self.assertEqual(showrunner_tree.user_facing(slug), [slug])
+            for production_name in ("top", "mid", "leaf", "alone"):
+                self.assertEqual(showrunner_tree.user_facing(production_name), [production_name])
             self.assertEqual(showrunner_tree.user_facing("top", below=True), ["top", "mid", "other", "leaf"])
             self.assertEqual(showrunner_tree.user_facing("mid", below=True), ["mid", "leaf"])
             self.assertEqual(showrunner_tree.user_facing("leaf", below=True), ["leaf"])
 
     def test_what_all_must_hear_once_goes_to_the_highest_running_showrunner_of_each_tree(self) -> None:
-        def runner(slug: str, *, running: bool) -> showrunners.Showrunner:
-            return showrunners.Showrunner(session=slug if running else "", socket=f"/{slug}.sock" if running else "",
-                                          slug=slug, zone="UTC", doc="/d")
+        def runner(production_name: str, *, running: bool) -> showrunners.Showrunner:
+            return showrunners.Showrunner(session=production_name if running else "", socket=f"/{production_name}.sock" if running else "",
+                                          name=production_name, zone="UTC", doc="/d")
 
         self.recorded_parent("mid", "top")
         self.recorded_parent("leaf", "mid")
         self.recorded_parent("orphan", "down")
         with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state):
-            every = [runner(slug, running=True) for slug in ("top", "mid", "leaf", "alone")]
-            self.assertEqual([one["slug"] for one in showrunner_tree.highest_running(every)], ["top", "alone"])
+            every = [runner(production_name, running=True) for production_name in ("top", "mid", "leaf", "alone")]
+            self.assertEqual([one["name"] for one in showrunner_tree.highest_running(every)], ["top", "alone"])
             # With the root down, the showrunner nearest it hears, and nothing below that one does.
             below = [runner("top", running=False), runner("mid", running=True), runner("leaf", running=True),
                      runner("down", running=False), runner("orphan", running=True)]
-            self.assertEqual([one["slug"] for one in showrunner_tree.highest_running(below)], ["mid", "orphan"])
+            self.assertEqual([one["name"] for one in showrunner_tree.highest_running(below)], ["mid", "orphan"])
             self.assertEqual(showrunner_tree.highest_running([]), [])
 
 

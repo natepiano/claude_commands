@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import index
-import mac_outcome as outcome
-from test_index import call, encode, point_root_at
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome as outcome
+from scripts.buildlog.test_index import call, encode, point_root_at
 
 
 class MacOutcomeTests(unittest.TestCase):
@@ -131,9 +131,9 @@ class MacOutcomeTests(unittest.TestCase):
         for caller in ("verify-mac", "verify", None, "agent"):
             self.assertEqual(outcome.is_mac_step(caller), caller == "verify-mac")
 
-    def test_natedev_step_predicate_selects_host_independently_of_caller(self) -> None:
-        self.assertEqual(outcome.natedev_step_predicate(), "steps.host = 'natedev'")
-        self.assertEqual(outcome.natedev_step_predicate("s"), "s.host = 'natedev'")
+    def test_natedev_host_predicate_selects_host_independently_of_caller(self) -> None:
+        self.assertEqual(outcome.natedev_host_predicate(), "steps.host = 'natedev'")
+        self.assertEqual(outcome.natedev_host_predicate("s"), "s.host = 'natedev'")
         with closing(sqlite3.connect(":memory:")) as connection:
             _ = connection.execute("CREATE TABLE steps (id INTEGER, host TEXT, caller TEXT)")
             _ = connection.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
@@ -145,9 +145,28 @@ class MacOutcomeTests(unittest.TestCase):
             for alias in ("steps", "s"):
                 with self.subTest(alias=alias):
                     rows = connection.execute(
-                        f"SELECT id FROM steps AS {alias} WHERE {outcome.natedev_step_predicate(alias)} ORDER BY id"
+                        f"SELECT id FROM steps AS {alias} WHERE {outcome.natedev_host_predicate(alias)} ORDER BY id"
                     ).fetchall()
                     self.assertEqual(rows, [(1,), (2,), (3,)])
+
+
+    def test_natedev_step_predicate_respects_target_before_legacy_host(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            _ = connection.execute("CREATE TABLE steps (id INTEGER, host TEXT, caller TEXT, target TEXT)")
+            _ = connection.executemany("INSERT INTO steps VALUES (?, ?, ?, ?)", [
+                (1, "natedev", "verify", "natedev"),
+                (2, "aws-build", "verify", "natedev"),
+                (3, "natedev", "verify-linux", "aws"),
+                (4, "natedev", "verify", "aws"),
+                (6, "natedev", "verify", None),
+                (7, "Mac", "verify-mac", "mac"),
+            ])
+            for alias in ("steps", "s"):
+                with self.subTest(alias=alias):
+                    rows = connection.execute(
+                        f"SELECT id FROM steps AS {alias} WHERE {outcome.natedev_step_predicate(alias)} ORDER BY id"
+                    ).fetchall()
+                    self.assertEqual(rows, [(1,), (2,), (6,)])
 
 
 if __name__ == "__main__":

@@ -13,8 +13,9 @@ from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites
+from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -181,7 +182,7 @@ state = Path(os.environ["MERGE_GATE_TEST_STATE"])
 (state / "types-memory-environment.json").write_text(json.dumps({
     "tripwire_present": "BUILDLOG_LIVE_MEMORY_TRIPWIRE" in os.environ}))
 print("0 errors, 0 warnings, 0 notes")
-raise SystemExit(3)
+raise SystemExit(0)
 ''')
         module_statuses: list[tuple[str, int]] = []
         finish = merge_gate.finish_gate_job

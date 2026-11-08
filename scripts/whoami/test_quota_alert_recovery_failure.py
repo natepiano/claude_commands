@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import cast
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.accounts import moves
 
 setUpModule = support.setUpModule
@@ -19,7 +19,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)
         edit = quota_alert.edit_registry
         def fail_one(function: str, *arguments: str) -> str | None:
-            if function == "agents_set_assignment" and arguments[0] == "module_review":
+            if function == "agents_set_assignment" and arguments[0] == "design_roles":
                 return "registry locked"
             return edit(function, *arguments)
         with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
@@ -28,9 +28,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routing not restored"])
         self.assertEqual(entries[1]["outcome"], "partial")
         self.assertEqual(entries[1]["restored"], ["direct"])
-        self.assertEqual(entries[1]["failed"], ["module_review (registry locked)"])
+        self.assertEqual(entries[1]["failed"], ["design_roles (registry locked)"])
         self.assertEqual(entries[1]["fallback_at"], entries[0]["fallback_at"])
-        self.assertEqual(self.assignments()["module_review"], "claude")
+        self.assertEqual(self.assignments()["design_roles"], "claude")
 
     def test_unreadable_registry_records_failed_recovery_for_every_owed_key(self) -> None:
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)
@@ -41,7 +41,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(entries[1]["outcome"], "failed")
         self.assertEqual(entries[1]["restored"], [])
         self.assertEqual(set(cast(list[str], entries[1]["failed"])),
-                         {"direct (registry unreadable)", "module_review (registry unreadable)"})
+                         {"direct (registry unreadable)", "design_roles (registry unreadable)"})
 
     def test_unknown_fallback_owner_stays_unknown_after_reload_and_recovery_on_a_noted_home(self) -> None:
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)

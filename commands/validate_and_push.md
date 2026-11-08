@@ -1,5 +1,5 @@
 ---
-description: Run local CI validation, push to origin, and monitor GitHub CI
+description: Validate, push, and monitor GitHub CI.
 ---
 
 Run `~/.claude/scripts/validate_and_push/validate_and_push.sh` with `dangerouslyDisableSandbox: true`.

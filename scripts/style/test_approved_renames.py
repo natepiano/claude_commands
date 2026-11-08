@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import unittest
+import subprocess
+from pathlib import Path
 
-import style_footprint
-from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
+from scripts.style import style_footprint
+from scripts.style import approved_renames
+from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
                               Declarations, FileReader, FileRename, Folder, MissingFile, NoAppliedCheck, NoBindingRename,
                               NoBindingScope, NoFileRename, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_scope, resolution_scope, declaration_sites, file_rename,
@@ -31,7 +34,450 @@ def sites(before: str, after: str, path: str, source: str, name: str) -> Declara
     return declaration_sites(tuple(token.value for token in style_footprint.tokens(source)), path, rename, name)
 
 
+
+# label, complete item(s), target line, refusal kind. Independent items are outside the policy region.
+PRESENCE_REFUSALS = (
+    ("signature", "fn label(checkout_info: usize) {\nmap(|g| g + 1)\n}\n", 2, approved_renames.OuterBindingBlocked),
+    ("break closure one", "fn label() { loop { break |checkout_info: usize| {\n[1].map(|g| g + checkout_info)\n}; } }\n", 2, approved_renames.OuterBindingUnproved),
+    ("break closure two", "fn label() { loop { break |unused: usize, checkout_info: usize| {\n[1].map(|g| g + checkout_info)\n}; } }\n", 2, approved_renames.OuterBindingUnproved),
+    ("attribute", "#[inject] fn label() {\nmap(|g| g + 1)\n}\n", 2, approved_renames.OuterBindingUnproved),
+    ("enclosing attribute", "#[inject] mod outer { fn label() {\nmap(|g| g + 1)\n} }\n", 2, approved_renames.OuterBindingUnproved),
+    ("proc bang", "fn label() { inject!();\nmap(|g| g + 1)\n}\n", 2, approved_renames.OuterBindingUnproved),
+    ("use", "fn label() { use dep::checkout_info;\nmap(|g| g + 1)\n}\n", 2, approved_renames.OuterBindingUnproved),
+    ("shorthand", "fn label() { consume(Value { checkout_info });\nmap(|g| g + 1)\n}\n", 2, approved_renames.OuterBindingUnproved),
+    ("impl const generic", "impl<const checkout_info: usize> Value<checkout_info> { fn label() {\nmap(|g| g + 1)\n} }\n", 2, approved_renames.OuterBindingUnproved),
+    ("unread target", "fn label() { loop {\nbreak |g: usize| g + 1;\n} }\n", 2, approved_renames.OuterBindingUnproved),
+    ("const initializer", "const VALUE: fn(usize) -> usize = { use dep::checkout_info;\n|g| g + 1\n};\n", 2, approved_renames.OuterBindingUnproved),
+    ("else arm", "fn label() { if let Some(checkout_info) = if flag { value } else { other } {} else {\nmap(|g| g + 1)\n} }\n", 2, approved_renames.OuterBindingUnproved),
+)
+
+# Enclosing brace ownership is independent of the item's Rust kind.
+INHERITED_INNER_ATTRIBUTES = (
+    ("impl", "impl X { #![inject] fn label() {\nmap(|g| g + 1)\n} }\n"),
+    ("trait", "trait X { #![inject] fn label() {\nmap(|g| g + 1)\n} }\n"),
+    ("function", "fn label() { #![inject]\nmap(|g| g + 1)\n}\n"),
+    ("block", "fn label() { { #![inject]\nmap(|g| g + 1)\n} }\n"),
+)
+
+IDENTICAL_BINDING_ITEMS = "fn first() {\n    map(|g| g + 1)\n}\nfn second() {\n    map(|g| g + 1)\n}\n"
+DUPLICATE_BINDING_ITEM_PATH = "impl X { fn first() {\n    map(|g| g + 1)\n} }\nimpl X { fn first() {\n    map(|g| g + 1)\n} }\n"
+CAPTURE_BINDING_ITEM = 'fn label() {\n    let g = 1;\n    println!("{g}");\n}\n'
+
+# Each target is local despite its enclosing field declaration; line two owns g.
+FIELD_EXPRESSION_BINDINGS = (
+    ("array length", "struct X { f: [u8; { let checkout_info=2;\nlet g: usize=1; g }] }\n"),
+    ("const generic", "struct X { f: Value<{ let checkout_info=2;\nlet g: usize=1; g }> }\n"),
+    ("variant field", "enum X { V { f: [u8; { let checkout_info=2;\nlet g: usize=1; g }] } }\n"),
+    ("field closure", "struct X { f: [u8; { let checkout_info=2;\nmap(|g: usize| g + 1) }] }\n"),
+)
+TRUE_FIELD_BINDING = "struct X {\n    g: usize,\n}\n"
+
+# The keyword `const` declares a parameter here, never an item; line two owns g.
+GENERIC_PARAMETER_BINDINGS = (
+    ("fn const parameter", "fn label<const checkout_info: usize,\nconst g: usize>() {}\n"),
+    ("impl const parameter", "impl<const checkout_info: usize,\nconst g: usize> X<checkout_info, g> {}\n"),
+    ("struct const parameter", "struct X<const checkout_info: usize,\nconst g: usize> {}\n"),
+    ("trait const parameter", "trait X<const checkout_info: usize,\nconst g: usize> {}\n"),
+)
+TRUE_ITEM_BINDINGS = (
+    "pub const g: usize = 1;\n",
+    "#[allow(dead_code)] pub(crate) fn g() {}\n",
+    "struct g;\n", "enum g {}\n", "union g { value: usize }\n",
+    "trait g {}\n", "type g = usize;\n", "static mut g: usize = 1;\n",
+    "mod g {}\n", "macro_rules! g { () => {} }\n",
+    "fn outer() { const g: usize = 1; }\n",
+    "mod outer { pub const g: usize = 1; }\n",
+    "impl X { const g: usize = 1; }\n", "trait X { const g: usize = 1; }\n",
+)
+
+# The shared reader proves each function's header before encountering unread body syntax.
+UNREAD_ITEM_BODIES = (
+    ("async move block", "// Header remains readable.\nfn g() { let task = async move { 1 }; }\n"),
+    ("typed closure", "// Header remains readable.\nfn g() { let task = || -> usize { 1 }; }\n"),
+)
+
+# Local admission must not reuse a readable header as proof of either body.
+UNREAD_LOCAL_BODIES = tuple((label, source.replace("fn g()", "fn label()").replace("; }", "; map(|g| g + 1) }"))
+                            for label, source in UNREAD_ITEM_BODIES)
+
+# Current signatures determine blockers; the anchor only establishes target identity.
+PARAMETER_CHANGES = (
+    ("removed", "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n",
+     "fn label() {\n    map(|g| g + 1)\n}\n", False),
+    ("added", "fn label() {\n    map(|g| g + 1)\n}\n",
+     "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n", True),
+)
+
 class AppliedCheckTests(unittest.TestCase):
+    def test_only_current_parameters_can_block_an_anchored_local_rename(self) -> None:
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            for applied in (False, True):
+                with self.subTest(parameter=label, applied=applied):
+                    pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                    authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+                    edited = current.replace("|g| g", "|checkout_info| checkout_info") if applied else current
+                    result = approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", edited)
+                    if blocked:
+                        self.assertIsInstance(result, approved_renames.OuterBindingBlocked)
+                        assert isinstance(result, approved_renames.OuterBindingBlocked)
+                        self.assertEqual(result.line, 1)
+                        self.assertEqual(result.text, current.splitlines()[0])
+                    else:
+                        self.assertIsInstance(result, approved_renames.AdmittedLocalRename)
+                        assert isinstance(result, approved_renames.AdmittedLocalRename)
+                        self.assertTrue(result.covers("row", pair, "src/lib.rs", edited))
+                        self.assertFalse(result.covers("row", pair, "src/lib.rs", source))
+
+    def test_signature_changes_cannot_map_a_local_rename_inside_an_unread_body(self) -> None:
+        from scripts.style import finding_sites
+        for label, source in UNREAD_LOCAL_BODIES:
+            with self.subTest(body=label):
+                item, = finding_sites.SourceSites(source).items
+                self.assertIsInstance(item.header_reading, finding_sites.ReadItemHeader)
+                self.assertIsInstance(item.body_reading, finding_sites.UnreadItemBody)
+                self.assertFalse(hasattr(item.body_reading, "tokens"))
+                pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+                pending = source.replace("label()", "label(extra: usize)")
+                for current in (source, pending, pending.replace("|g| g", "|checkout_info| checkout_info")):
+                    with self.subTest(current=current):
+                        result = approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", current)
+                        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+                        assert isinstance(result, approved_renames.OuterBindingUnproved)
+                        self.assertEqual(result.reason, "containing item body unread")
+                read_item, = finding_sites.SourceSites("fn label() { map(|g| g + 1) }").items
+                self.assertIsInstance(read_item.body_reading, finding_sites.ReadItemBody)
+                assert isinstance(read_item.body_reading, finding_sites.ReadItemBody)
+                self.assertTrue(read_item.body_reading.tokens)
+
+    def test_proved_item_names_keep_their_exemption_with_unread_bodies(self) -> None:
+        from scripts.style import finding_sites
+        for label, source in UNREAD_ITEM_BODIES:
+            with self.subTest(body=label):
+                item, = finding_sites.SourceSites(source).items
+                self.assertIsInstance(item.header_reading, finding_sites.ReadItemHeader)
+                self.assertIsInstance(item.body_reading, finding_sites.UnreadItemBody)
+                pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+                self.assertIsInstance(approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", source),
+                                      approved_renames.NonLocalReferenceCompanion)
+                with self.assertRaises(finding_sites.UnreadableSourceItems):
+                    _ = finding_sites.SourceSites(source).owner_chain(2)
+        source = "fn g(value: impl Trait { fn hidden() {} }) {}\n"
+        item, = finding_sites.SourceSites(source).items
+        self.assertIsInstance(item.header_reading, finding_sites.UnreadItemHeader)
+        pair = BindingRename(1, source.strip(), "g", "checkout_info")
+        authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 1, source)
+        self.assertIsInstance(approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", source),
+                              approved_renames.OuterBindingUnproved)
+
+    def test_generic_parameters_need_positive_item_position_before_an_exemption(self) -> None:
+        for label, source in GENERIC_PARAMETER_BINDINGS:
+            with self.subTest(form=label):
+                pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+                result = approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", source)
+                self.assertIsInstance(result, approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
+        pair = BindingRename(2, TRUE_FIELD_BINDING.splitlines()[1], "g", "checkout_info")
+        authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, TRUE_FIELD_BINDING)
+        self.assertIsInstance(approved_renames.admit_anchored_rename(
+            authority, "row", pair, "src/lib.rs", TRUE_FIELD_BINDING), approved_renames.NonLocalReferenceCompanion)
+
+        for source in TRUE_ITEM_BINDINGS:
+            with self.subTest(item=source):
+                pair = BindingRename(1, source.splitlines()[0], "g", "checkout_info")
+                authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 1, source)
+                self.assertIsInstance(approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", source),
+                                      approved_renames.NonLocalReferenceCompanion)
+
+    def test_field_expressions_never_receive_the_nonlocal_field_exemption(self) -> None:
+        for label, source in FIELD_EXPRESSION_BINDINGS:
+            with self.subTest(form=label):
+                pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+                result = approved_renames.admit_anchored_rename(authority, "row", pair, "src/lib.rs", source)
+                self.assertIsInstance(result, approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
+        pair = BindingRename(2, TRUE_FIELD_BINDING.splitlines()[1], "g", "checkout_info")
+        authority = approved_renames.AnchoredRenameSource("judged", "src/lib.rs", 2, TRUE_FIELD_BINDING)
+        self.assertIsInstance(approved_renames.admit_anchored_rename(
+            authority, "row", pair, "src/lib.rs", TRUE_FIELD_BINDING), approved_renames.NonLocalReferenceCompanion)
+
+    def assert_admitted_local_capability_is_bound_to_anchor_version_pair_path_and_snapshot(self) -> None:
+        from scripts.style.approved_renames import (AdmittedLocalRename, AnchoredRenameSource, RenameAnchorUnavailable,
+                                      admit_anchored_rename, OuterBindingBlocked, OuterBindingUnproved)
+        source = "fn label() {\n    map(|g| g + 1)\n}\n"
+        pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        authority = AnchoredRenameSource("judged", "src/lib.rs", 2, source)
+        admitted = admit_anchored_rename(authority, "version-1", pair, "src/lib.rs", source)
+        self.assertIsInstance(admitted, AdmittedLocalRename)
+        assert isinstance(admitted, AdmittedLocalRename)
+        self.assertTrue(admitted.covers("version-1", pair, "src/lib.rs", source))
+        self.assertFalse(admitted.covers("version-2", pair, "src/lib.rs", source))
+        self.assertFalse(admitted.covers("version-1", pair, "other.rs", source))
+        changed = source.replace("label()", "label(checkout_info: usize)")
+        self.assertFalse(admitted.covers("version-1", pair, "src/lib.rs", changed))
+        self.assertIsInstance(admit_anchored_rename(authority, "version-1", pair, "src/lib.rs", changed), OuterBindingBlocked)
+        self.assertIsInstance(admit_anchored_rename(RenameAnchorUnavailable(), "version-1", pair, "src/lib.rs", source), OuterBindingUnproved)
+
+    def test_current_admission_maps_the_recorded_item_instead_of_an_identical_line(self) -> None:
+        self.assert_admitted_local_capability_is_bound_to_anchor_version_pair_path_and_snapshot()
+        source = IDENTICAL_BINDING_ITEMS
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        edited = source.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
+        result = approved_renames.current_rename_admission(edited, rename, source)
+        self.assertIsInstance(result, approved_renames.OuterBindingBlocked)
+        assert isinstance(result, approved_renames.OuterBindingBlocked)
+        self.assertEqual((result.name, result.line), ("checkout_info", 1))
+
+    def test_current_admission_refuses_a_duplicate_recorded_item_path(self) -> None:
+        source = DUPLICATE_BINDING_ITEM_PATH
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        edited = source.replace("|g| g", "|checkout_info| checkout_info", 1)
+        result = approved_renames.current_rename_admission(edited, rename, source)
+        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+        assert isinstance(result, approved_renames.OuterBindingUnproved)
+        self.assertIn("item path is not unique", result.reason)
+
+    def test_current_admission_reverses_proven_format_capture_edits(self) -> None:
+        source = CAPTURE_BINDING_ITEM
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        edited = source.replace("g =", "checkout_info =").replace("{g}", "{checkout_info}")
+        proof = binding_rename_check("src/lib.rs", source, edited, (rename,))
+        self.assertEqual(proof.checks[rename], AppliedInCode())
+        self.assertTrue(proof.explained)
+        admitted = approved_renames.binding_admission_check(source, (rename,), proof, current=edited)
+        self.assertEqual(admitted.checks[rename], AppliedInCode())
+        self.assertTrue(admitted.explained)
+
+    def test_current_admission_retains_a_later_outer_binding_after_undoing_just_the_rename(self) -> None:
+        before = "fn label() {\nmap(|g| g + 1)\n}\n"
+        rename = BindingRename(2, before.splitlines()[1], "g", "checkout_info")
+        after = before.replace("label()", "label(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info")
+        proof = approved_renames.binding_admission_check(before, (rename,), binding_rename_check(
+            "src/lib.rs", before, after, (rename,)), current=after)
+        result = proof.checks[rename]
+        self.assertIsInstance(result, approved_renames.OuterBindingBlocked)
+        assert isinstance(result, approved_renames.OuterBindingBlocked)
+        self.assertEqual((result.name, result.line), ("checkout_info", 1))
+
+    def test_every_enclosing_brace_scope_contributes_its_inner_attributes(self) -> None:
+        for label, source in INHERITED_INNER_ATTRIBUTES:
+            with self.subTest(scope=label):
+                rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                result = approved_renames.rename_admission(source, rename)
+                self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+                assert isinstance(result, approved_renames.OuterBindingUnproved)
+                self.assertIn("unresolved attribute macro 'inject'", result.reason)
+                edited = source.replace("|g| g", "|checkout_info| checkout_info")
+                proof = approved_renames.binding_admission_check(source, (rename,), binding_rename_check(
+                    "src/lib.rs", source, edited, (rename,)), current=edited)
+                self.assertEqual(proof.checks[rename], result)
+
+    def test_stale_local_sites_still_require_admission_but_nonlocal_targets_keep_their_proof(self) -> None:
+        source = "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        rename = BindingRename(2, "map(|g| g + 2)", "g", "checkout_info")
+        expected = approved_renames.OuterBindingBlocked(
+            "rename blocked by outer binding 'checkout_info' at line 1", "checkout_info", 1,
+            source.splitlines()[0])
+        proof = binding_rename_check("src/lib.rs", source, source, (rename,))
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), proof, current=source).checks[rename], expected)
+        for nonlocal_source, pair in (
+                ("fn old() {}\n", BindingRename(1, "fn old() { changed(); }", "old", "fresh")),
+                ("struct Value { old: usize }\n", BindingRename(1, "struct Value { old: u8 }", "old", "fresh")),
+                ("enum Outcome { NewName }\n", BindingRename(2, "rename", "helper", "assistant"))):
+            with self.subTest(nonlocal_source=nonlocal_source):
+                existing = binding_rename_check("src/lib.rs", nonlocal_source, nonlocal_source, (pair,))
+                self.assertEqual(approved_renames.binding_admission_check(
+                    nonlocal_source, (pair,), existing, current=nonlocal_source).checks, existing.checks)
+        missing = BindingRename(2, "map(|gone| gone + 1)", "gone", "fresh")
+        self.assertIsInstance(approved_renames.rename_admission(source, missing),
+                              approved_renames.OuterBindingUnproved)
+        self.assertIsInstance(approved_renames.rename_admission(
+            "inject!();", BindingRename(1, "rename", "g", "checkout_info")),
+                              approved_renames.OuterBindingUnproved)
+
+    def test_every_local_binding_form_keeps_admission_when_its_site_text_is_stale(self) -> None:
+        for body in (
+                "map(|g| g + 1);", "let g = input; consume(g);",
+                "let (g, _) = input; consume(g);", "match input { Some(g) => consume(g), _ => () }",
+                "for g in input { consume(g); }", "if let Some(g) = input { consume(g); }",
+                "while let Some(g) = next() { consume(g); }"):
+            with self.subTest(body=body):
+                source = "fn label(checkout_info: usize) {\n" + body + "\n}\n"
+                pair = BindingRename(2, body + " // stale", "g", "checkout_info")
+                proof = binding_rename_check("src/lib.rs", source, source, (pair,))
+                self.assertIsInstance(approved_renames.binding_admission_check(source, (pair,), proof, current=source).checks[pair],
+                                      approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
+        source = "fn label(checkout_info: usize, g: usize) { consume(g); }\n"
+        pair = BindingRename(1, source.strip() + " // stale", "g", "checkout_info")
+        self.assertIsInstance(approved_renames.binding_admission_check(source, (pair,), binding_rename_check(
+            "src/lib.rs", source, source, (pair,)), current=source).checks[pair],
+                              approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
+
+    def test_syntax_and_site_modules_import_without_an_initialization_cycle(self) -> None:
+        result = subprocess.run(
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-B", "-c", "from scripts.style import approved_renames, finding_sites, declarations"],
+            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_inner_attributes_of_the_file_and_enclosing_modules_require_admission(self) -> None:
+        for source in (
+                "mod outer { #![inject] fn label() {\nmap(|g| g + 1)\n} }\n",
+                "#![inject]\nfn label() { map(|g| g + 1) }\n",
+                "mod outer { #![allow(dead_code)] mod inner { #![inject] fn label() {\nmap(|g| g + 1)\n} } }\n"):
+            with self.subTest(source=source):
+                rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+                result = approved_renames.rename_admission(source, rename)
+                self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+                assert isinstance(result, approved_renames.OuterBindingUnproved)
+                self.assertIn("unresolved attribute macro 'inject'", result.reason)
+                proof = approved_renames.binding_admission_check(source, (rename,), binding_rename_check(
+                    "src/lib.rs", source, source.replace("|g| g", "|checkout_info| checkout_info"), (rename,)), current=source)
+                self.assertEqual(proof.checks[rename], result)
+        for source in (
+                "#![allow(dead_code)]\nfn label() { map(|g| g + 1) }\n",
+                "mod sibling { #![inject] fn earlier() {} }\nfn label() { map(|g| g + 1) }\n"):
+            with self.subTest(unrelated_or_inert=source):
+                self.assertIsInstance(approved_renames.rename_admission(
+                    source, BindingRename(2, source.splitlines()[1], "g", "checkout_info")), RenameDeclaration)
+
+    def test_item_presence_policy_handles_astra_cases_and_unread_targets(self) -> None:
+        for label, source, line, expected in PRESENCE_REFUSALS:
+            rename = BindingRename(line, source.splitlines()[line - 1], "g", "checkout_info")
+            with self.subTest(form=label):
+                result = approved_renames.rename_admission(source, rename)
+                self.assertIsInstance(result, expected)
+                self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+
+    def test_enclosing_scope_closed_grammar_corpus(self) -> None:
+        unproved = approved_renames.OuterBindingUnproved
+        blocked = approved_renames.OuterBindingBlocked
+        rows = (
+            ("less-than let before unread condition", "let flag = left < right;\n"
+             + "if let Some(checkout_info) = if flag { value } else { other } {\nTARGET\n}", unproved),
+            ("less-than let before macro", "let flag = left < right; introduce!(checkout_info);\nTARGET", unproved),
+            ("greater-than let", "let flag = left > right;\nTARGET", RenameDeclaration),
+            ("less-than condition", "if left < right {\nTARGET\n}", RenameDeclaration),
+            ("greater-than condition", "if left > right {\nTARGET\n}", RenameDeclaration),
+            ("less-than argument", "consume(left < right);\nTARGET", RenameDeclaration),
+            ("greater-than argument", "consume(left > right);\nTARGET", RenameDeclaration),
+            ("less-than preceding argument", "consume(left < right,\nTARGET\n);", RenameDeclaration),
+            ("shift", "let flag = left << right;\nTARGET", RenameDeclaration),
+            ("turbofish", "let value = value::<usize>();\nTARGET", RenameDeclaration),
+            ("const generic", "let value = value::<{ 1 }>();\nTARGET", RenameDeclaration),
+            ("generic annotation", "let value: Vec<Vec<usize>> = Vec::new();\nTARGET", RenameDeclaration),
+            ("if-let else", "if let Some(checkout_info) = value::<{ 1 }>() { consume(checkout_info); }"
+             + " else {\nTARGET\n}", unproved),
+            ("while-let then", "while let Some(checkout_info) = value {\nTARGET\n}", blocked),
+            ("completed while-let", "while let Some(checkout_info) = value { consume(checkout_info); }\nTARGET",
+             unproved),
+            ("match arm", "match value { Some(checkout_info) => {\nTARGET\n}, _ => {} }", blocked),
+            ("sibling match arm", "match value { Some(checkout_info) => {}, _ => {\nTARGET\n} }", unproved),
+            ("nested closure", "consume(|checkout_info| {\nTARGET\n});", blocked),
+            ("preceding macro", "introduce!(checkout_info);\nTARGET", unproved),
+            ("sibling macro", "{ introduce!(checkout_info); }\nTARGET", unproved),
+        )
+        for label, body, expected in rows:
+            source = "fn label() {\n" + body.replace("TARGET", "map(|g| g + 1)") + "\n}\n"
+            line = next(i for i, text in enumerate(source.splitlines(), 1) if "|g|" in text)
+            rename = BindingRename(line, source.splitlines()[line - 1], "g", "checkout_info")
+            with self.subTest(form=label):
+                self.assertIsInstance(approved_renames.rename_admission(source, rename), expected)
+
+    def test_unparsed_enclosing_condition_is_unproved_instead_of_clear(self) -> None:
+        source = ("fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
+                  "        map(|g| g + 1);\n    }\n}\n")
+        rename = BindingRename(3, source.splitlines()[2], "g", "checkout_info")
+        result = approved_renames.rename_admission(source, rename)
+        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+        assert isinstance(result, approved_renames.OuterBindingUnproved)
+        self.assertEqual(result.reason, "wanted name already used in this item: 'checkout_info' at line 2")
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+
+    def test_preceding_enclosing_macro_cannot_hide_a_binding(self) -> None:
+        source = "fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n"
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        result = approved_renames.rename_admission(source, rename)
+        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+        assert isinstance(result, approved_renames.OuterBindingUnproved)
+        self.assertEqual(result.reason, "unresolved bang macro 'introduce' at line 1")
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+
+    def test_unread_sibling_scopes_cannot_reject_a_later_unblocked_binding(self) -> None:
+        for earlier in (
+                "fn earlier() { if let Some(checkout_info) = value::<{ 1 }>() { consume(checkout_info); } }\n",
+                "fn earlier() { introduce!(checkout_info); }\n",
+                "fn earlier(checkout_info: usize) {\n    fn label() {\n        map(|g| g + 1)\n    }\n}\n"):
+            source = earlier if "|g|" in earlier else earlier + "fn label() {\n    map(|g| g + 1)\n}\n"
+            line = next(i for i, text in enumerate(source.splitlines(), 1) if "|g|" in text)
+            rename = BindingRename(line, source.splitlines()[line - 1], "g", "checkout_info")
+            with self.subTest(source=source):
+                self.assertIsInstance(approved_renames.rename_admission(source, rename), RenameDeclaration)
+        # Even within one function, a completed sibling condition cannot enclose the target.
+        source = ("fn label() {\n    if let Some(checkout_info) = value::<{ 1 }>() { consume(checkout_info); }\n"
+                  "    map(|g| g + 1)\n}\n")
+        self.assertIsInstance(approved_renames.rename_admission(source, BindingRename(3, source.splitlines()[2], "g", "checkout_info")),
+                              approved_renames.OuterBindingUnproved)
+        for source in (
+                "fn label() { { introduce!(checkout_info); }\n    map(|g| g + 1)\n}\n",
+                "fn label() { match value {\n    First => introduce!(checkout_info),\n"
+                + "    Second => map(|g| g + 1),\n} }\n",
+                "fn label() { println!(\"earlier\");\n    map(|g| g + 1)\n}\n"):
+            line = next(i for i, text in enumerate(source.splitlines(), 1) if "|g|" in text)
+            with self.subTest(source=source):
+                self.assertIsInstance(approved_renames.rename_admission(source, BindingRename(line, source.splitlines()[line - 1],
+                                                                               "g", "checkout_info")),
+                                      RenameDeclaration if "println!" in source else approved_renames.OuterBindingUnproved)
+
+    def test_same_line_outer_declarations_keep_their_exact_binding_identity(self) -> None:
+        source = "fn label(checkout_info: usize) { let checkout_info = 1;\n    map(|g| g + 1)\n}\n"
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        result = approved_renames.rename_admission(source, rename)
+        self.assertIsInstance(result, approved_renames.OuterBindingBlocked)
+        assert isinstance(result, approved_renames.OuterBindingBlocked)
+        self.assertEqual((result.name, result.line, result.text), ("checkout_info", 1, source.splitlines()[0]))
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+
+    def test_raw_outer_binding_and_plain_destination_are_the_same_identifier(self) -> None:
+        source = "fn label(r#checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        rename = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        result = approved_renames.rename_admission(source, rename)
+        self.assertIsInstance(result, approved_renames.OuterBindingBlocked)
+        assert isinstance(result, approved_renames.OuterBindingBlocked)
+        self.assertEqual((result.name, result.line), ("checkout_info", 1))
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+        # Normalization must also subtract a raw local shadow's scope from its plain enclosing parameter.
+        source = "fn label(checkout_info: usize) { let r#checkout_info = 1;\n    map(|g| g + 1)\n}\n"
+        self.assertIsInstance(approved_renames.rename_admission(source, rename), approved_renames.OuterBindingBlocked)
+
+    def test_undecidable_outer_visibility_is_an_explicit_unproved_result(self) -> None:
+        source = "fn label() {\n    if let Some(checkout_info) = value::<{ 1 }>() {\n        map(|g| g + 1);\n    }\n}\n"
+        rename = BindingRename(3, source.splitlines()[2], "g", "checkout_info")
+        result = approved_renames.rename_admission(source, rename)
+        self.assertIsInstance(result, NoBindingScope)
+        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
+        assert isinstance(result, approved_renames.OuterBindingUnproved)
+        self.assertEqual(result.reason, "wanted name already used in this item: 'checkout_info' at line 2")
+        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
+
+    def test_closure_rename_reports_the_visible_outer_binding_in_the_shared_proof(self) -> None:
+        source = "fn label(checkout_info: usize) -> usize {\n    map(|g| g + 1)\n}\n"
+        pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        blocked = approved_renames.rename_admission(source, pair)
+        self.assertIsInstance(blocked, approved_renames.OuterBindingBlocked)
+        assert isinstance(blocked, approved_renames.OuterBindingBlocked)
+        self.assertEqual((blocked.name, blocked.line, blocked.text),
+                         ("checkout_info", 1, source.splitlines()[0]))
+        self.assertEqual(approved_renames.binding_admission_check(source, (pair,), binding_rename_check("src/lib.rs", source, source, (pair,)), current=source).checks[pair], blocked)
+        unblocked = BindingRename(2, pair.text, "g", "entry")
+        edited = source.replace("|g| g", "|entry| entry")
+        self.assertEqual(approved_renames.binding_admission_check(source, (unblocked,), binding_rename_check("src/lib.rs", source, edited, (unblocked,)), current=source).checks[unblocked],
+                         AppliedInCode())
+
+        source = "fn outer(checkout_info: usize) {\n    fn inner(g: usize) -> usize { g }\n}\n"
+        pair = BindingRename(2, source.splitlines()[1], "g", "checkout_info")
+        self.assertIsInstance(approved_renames.rename_admission(source, pair), RenameDeclaration)
+
     def test_an_enum_variant_rename_is_applied_only_when_the_old_variant_is_gone(self) -> None:
         self.assertEqual(check("Kind::Old", "Kind::New", "src/kind.rs", "pub enum Kind { New, Other }\n"), AppliedInCode())
         self.assertEqual(check("Kind::Old", "Kind::New", "src/kind.rs", "pub enum Kind { Old, Other }\n"),
@@ -657,6 +1103,27 @@ class BindingRenameTests(unittest.TestCase):
                          ("alert-count", "fresh-count"), ("alert.rs", "fresh.rs"), ("alertx", "freshx")):
             with self.subTest(old=old):
                 self.assertFalse(self.prove(source, edited.replace(old, new), 3, "alert").explained)
+
+
+class MachineRuleTests(unittest.TestCase):
+    def test_machine_rule_contract_rejects_extra_conditions_in_body_or_metadata(self) -> None:
+        from scripts.style.git_process import run_git
+        original = approved_renames.TYPE_NAMED_PARAMETER_RULE
+        for text, allowed in ((original, True), (original + "Only in functions returning bool.\n", False),
+                              (original.replace("input_scope: file", "input_scope: file\nonly_return: bool"), False)):
+            with self.subTest(text=text):
+                blob = run_git(("git", "hash-object", "--stdin"), input=text.encode()).stdout.decode().strip()
+                self.assertEqual(isinstance(approved_renames.machine_rename_rule(blob),
+                                           approved_renames.TypeNamedParameterRule), allowed)
+
+    def test_type_named_parameter_proof_requires_a_current_direct_named_type(self) -> None:
+        for annotation, allowed in (("&ImplItem", True), ("&mut ImplItem", True),
+                                    ("&crate::ImplItem", True), ("&OtherType", False),
+                                    ("Vec<ImplItem>", False), ("impl Trait", False)):
+            with self.subTest(annotation=annotation):
+                source = "fn changed(item: " + annotation + ") { inspect(item); }\n"
+                pair = BindingRename(1, source.strip(), "item", "impl_item")
+                self.assertEqual(isinstance(approved_renames.type_named_parameter(source, pair), RenameDeclaration), allowed)
 
 
 if __name__ == "__main__":

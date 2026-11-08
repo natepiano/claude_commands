@@ -9,7 +9,6 @@ import io
 import threading
 import time
 import os
-import sys
 import tempfile
 import unittest
 from collections.abc import Generator
@@ -18,12 +17,12 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import proposal_issue
-from user_zone import user_zone
+from scripts.production import proposal_issue
+from scripts.production.issues import Issue
+from scripts.production import staff, unit_names
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.lib.user_zone import user_zone
+from scripts.style import rules
 
 ISSUE = """---
 area: "[[tooling]]"
@@ -68,7 +67,35 @@ class ProposalIssueTests(unittest.TestCase):
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
-        _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value="hana"))
+        members: tuple[tuple[str, staff.Kind], ...] = (
+            ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
+            ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
+        rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
+                                    unit_names.name(name) if kind == "unit" else name,
+                                    staff.ReportsTo(staff.StaffId(fixture_runtime_id("hana"))) if kind == "unit" else staff.StaffRoot(),
+                                    current_session=staff.StaffId(fixture_runtime_id(name)))
+                     for name, kind in members)
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
+        _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value=fixture_runtime_id("hana")))
+
+    def test_unit_staff_reference_accepts_the_short_name_and_unit_id(self) -> None:
+        row = next(member for member in staff.snapshot().rows if member.name == "names")
+        for reference in ("names", "names", row.id):
+            with self.subTest(reference=reference):
+                self.assertEqual(proposal_issue.staff_reference(reference, "unit"), row)
+        with self.assertRaises(proposal_issue.Refusal):
+            _ = proposal_issue.staff_reference("names unit", "unit")
+
+    def test_proposal_unit_reads_the_unit_id_from_staff(self) -> None:
+        row = next(member for member in staff.snapshot().rows if member.name == "names")
+        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names")
+        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {})), "")
+
+    def test_a_stored_unit_name_does_not_select_a_staff_row(self) -> None:
+        issue = Issue(self.issue, {"unit": ["retired-types"]})
+        result = proposal_issue.proposal_unit(issue)
+        self.assertEqual(result, "")
+        self.assertIsInstance(rules.style_family(result), rules.NotStyleUnit)
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
         code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
@@ -87,7 +114,12 @@ class ProposalIssueTests(unittest.TestCase):
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = proposal_issue.main(list(argv))
+            arguments = list(argv)
+            for flag in ("--showrunner", "--plan"):
+                if flag in arguments:
+                    index = arguments.index(flag)
+                    del arguments[index:index + 2]
+            code = proposal_issue.main(arguments)
         return code, out.getvalue(), err.getvalue()
 
     def today(self) -> str:
@@ -118,7 +150,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(code, 0, err)
                 self.assertIn(f"\n\nProposed ranking: {expected}\n\n<!-- style-decision:start -->\n# Findings\nBefore and after.\n",
                               destination.read_text())
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         fields = frontmatter(issue)
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
         self.assertNotIn("style_findings", fields)
@@ -149,7 +181,7 @@ class ProposalIssueTests(unittest.TestCase):
                 folder.mkdir()
                 issue = folder / "proposal.md"
                 original = (f'---\n{area}date_modified: "[[2000-01-01]]"\nstatus: {status}\n'
-                            + 'unit: "names-unit"\nplan: "unit.md"\n' + metadata
+                            + 'unit: "names"\nplan: "unit.md"\n' + metadata
                             + 'tags: ["issue", "proposal", "style"]\n---\nUser notes stay.\n')
                 _ = issue.write_text(original)
                 code, out, err = self.run_cli("area-style", str(folder))
@@ -287,7 +319,7 @@ class ProposalIssueTests(unittest.TestCase):
         issue = self.root / "decision.md"
         original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
                     b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
-                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+                    b'unit: "names"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
         link = os.link
         stamps: list[int] = []
 
@@ -338,7 +370,7 @@ class ProposalIssueTests(unittest.TestCase):
         issue = self.root / "decision.md"
         original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
                     b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
-                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+                    b'unit: "names"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
 
         @contextlib.contextmanager
         def competing_create(folder: Path) -> Generator[None]:
@@ -394,7 +426,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertTrue(proposal_issue.create(
             second, "alpha", "a", "style", ["style"], "global:rust/names.md", "beta", "abc", 1,
             "# Beta examples\n", template, date(2026, 10, 20), initial_fields={}))
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual((frontmatter(first)["proposal_id"], frontmatter(second)["proposal_id"]),
                          (["P1"], ["P2"]))
         self.assertEqual(first.read_bytes(), original)
@@ -411,7 +443,7 @@ class ProposalIssueTests(unittest.TestCase):
                 "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "1", "--rules", urls, "--template", str(template), "--body-file", str(body)]
         code, _, error = self.run_cli(*args)
         self.assertEqual(code, 0, error)
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual(frontmatter(issue)["style_rules"], sorted(urls.split(",")))
         original = issue.read_bytes()
         args[args.index("--rules") + 1] = "https://github.com/o/r/blob/main/changed.md"
@@ -419,13 +451,13 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(issue.read_bytes(), original)
 
     def test_refresh_updates_generated_examples_and_count_preserving_answer_and_notes(self) -> None:
-        original = ISSUE.replace("---\n# body", 'unit: "names-unit"\nstyle_count: "1"\n---\n# body')
+        original = ISSUE.replace("---\n# body", 'unit: "names"\nstyle_count: "1"\n---\n# body')
         original += "\n" + proposal_issue.decision_body("# Old examples\n") + "\nUser notes stay.\n"
         _ = self.issue.write_text(original)
         body = "# New examples\nFindings: 4\n"
         today = datetime.now(user_zone()).date()
         self.assertIn("body", proposal_issue.refresh_decision(self.issue, 4, body, "ranking", today))
-        self.assertIn('unit: "names-unit"', self.text())
+        self.assertIn('unit: "names"', self.text())
         self.assertIn('style_count: "4"', self.text())
         self.assertIn("# body\n\nstatus: open stays in the body", self.text())
         self.assertIn("User notes stay.", self.text())
@@ -436,8 +468,8 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(self.issue.stat().st_mtime_ns, stamp)
 
     def test_reopen_removes_every_close_field_and_keeps_the_answer(self) -> None:
-        _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
-        from issues import frontmatter
+        _ = proposal_issue.edit(self.issue, {"unit": "names", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
+        from scripts.production.issues import frontmatter
         def fields() -> dict[str, list[str]]:
             return {key: value for key, value in frontmatter(self.issue).items() if key != "date_modified"}
         before = fields()
@@ -455,17 +487,17 @@ class ProposalIssueTests(unittest.TestCase):
     def test_refresh_and_approve_at_the_same_time_keep_both_changes(self) -> None:
         self.decision_issue()
         today = datetime.now(user_zone()).date()
-        original = proposal_issue._write  # pyright: ignore[reportPrivateUsage]
-        approval = threading.Thread(target=proposal_issue.edit, args=(self.issue, {"unit": "names-unit", "plan": "p"}, today))
+        original = proposal_issue.write_issue
+        approval = threading.Thread(target=proposal_issue.edit, args=(self.issue, {"unit": "names", "plan": "p"}, today))
         def write_after_the_approval_starts(path: Path, text: str) -> None:
             if not approval.is_alive() and "# New examples" in text:
                 approval.start()
                 time.sleep(0.3)
             original(path, text)
-        with mock.patch.object(proposal_issue, "_write", side_effect=write_after_the_approval_starts):
+        with mock.patch.object(proposal_issue, "write_issue", side_effect=write_after_the_approval_starts):
             _ = proposal_issue.refresh_decision(self.issue, 2, "# New examples\n", "effort two", today)
             approval.join()
-        self.assertIn('unit: "names-unit"', self.text())
+        self.assertIn('unit: "names"', self.text())
         self.assertIn("# New examples", self.text())
         self.assertIn('style_count: "2"', self.text())
 
@@ -477,16 +509,16 @@ class ProposalIssueTests(unittest.TestCase):
         def approved_at_backlog() -> None:
             self.decision_issue()
             _ = self.issue.write_text(self.text().replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
-            _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md"}, date(2026, 10, 15))
+            _ = proposal_issue.edit(self.issue, {"unit": "names", "plan": "unit.md"}, date(2026, 10, 15))
         def approved_by_showrunner() -> None:
             approved_at_backlog()
-            _ = proposal_issue.edit(self.issue, {"approved_by": "showrunner", "approved_in": "hana"}, date(2026, 10, 15))
+            _ = proposal_issue.edit(self.issue, {"approved_by": "showrunner", "approved_in": fixture_runtime_id("hana")}, date(2026, 10, 15))
         verbs = (("edit", closed, lambda: proposal_issue.edit(self.issue, {"stage": "active"}, today)),
                  ("rules", closed, lambda: proposal_issue.edit_rules(self.issue, ["https://example.invalid/rule.md"], today)),
                  ("refresh", closed, lambda: proposal_issue.refresh_decision(self.issue, 3, "# Locked\n", "effort", today)),
                  ("reopen", closed, lambda: proposal_issue.reopen(self.issue, today)),
                  ("unapprove", approved_by_showrunner,
-                  lambda: proposal_issue.unapprove(self.issue, "hana", today, dry_run=False)),
+                  lambda: proposal_issue.unapprove(self.issue, fixture_runtime_id("hana"), today, dry_run=False)),
                  ("move-approved", approved_at_backlog,
                   lambda: list(proposal_issue.move_approved(self.root, today, dry_run=False))))
         for name, setup, verb in verbs:
@@ -501,7 +533,7 @@ class ProposalIssueTests(unittest.TestCase):
                         except BlockingIOError:
                             blocked.append(True)
                     _ = path.write_text(text)
-                with mock.patch.object(proposal_issue, "_write", side_effect=write):
+                with mock.patch.object(proposal_issue, "write_issue", side_effect=write):
                     _ = verb()
                 self.assertEqual(blocked, [True])
                 self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["a proposal.md"])
@@ -518,7 +550,7 @@ class ProposalIssueTests(unittest.TestCase):
                 except BlockingIOError:
                     blocked.append(True)
             _ = path.write_text(text)
-        with mock.patch.object(proposal_issue, "_write", side_effect=write):
+        with mock.patch.object(proposal_issue, "write_issue", side_effect=write):
             self.assertTrue(proposal_issue.fill_ranking(self.issue, "effort two"))
             self.assertEqual(blocked, [True])
             self.assertIn("\nProposed ranking: effort two\n", self.text())
@@ -544,19 +576,20 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn(message, error)
                 self.assertFalse(issue.exists())
-        self.assertEqual(self.run_cli(*arguments, '{"unit": "names-unit", "plan": "unit.md"}')[0], 0)
-        from issues import frontmatter
-        self.assertEqual((frontmatter(issue)["unit"], frontmatter(issue)["plan"]), (["names-unit"], ["unit.md"]))
+        self.assertEqual(self.run_cli(*arguments, '{"unit": "names"}')[0], 0)
+        from scripts.production.issues import frontmatter
+        self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names")
+        self.assertNotIn("plan", frontmatter(issue))
 
     def test_a_decision_created_with_an_inherited_approval_starts_in_progress(self) -> None:
         template = self.root / "template.yaml"
         _ = template.write_text("---\nstatus: open\n---\n")
         body = self.root / "body.md"
         _ = body.write_text("# Examples\n")
-        from issues import frontmatter
-        for name, fields, stage in (("approved", '{"unit": "names-unit", "plan": "unit.md", "stage": "backlog"}', "active"),
-                                    ("unanswered", '{"plan": "unit.md", "stage": "backlog"}', "backlog"),
-                                    ("waiting", '{"showrunner": "hana", "stage": "waiting"}', "waiting"),
+        from scripts.production.issues import frontmatter
+        for name, fields, stage in (("approved", '{"unit": "names", "stage": "backlog"}', "active"),
+                                    ("unanswered", '{"stage": "backlog"}', "backlog"),
+                                    ("waiting", '{"stage": "waiting"}', "waiting"),
                                     ("no fields", "{}", "backlog")):
             with self.subTest(name=name):
                 issue = self.root / f"{name}.md"
@@ -597,47 +630,47 @@ class ProposalIssueTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         text = self.text()
-        self.assertIn('showrunner: "hana"\n', text)
-        self.assertIn('unit: "build-report"\n', text)
-        self.assertIn('plan: "docs/plans/x.md Phase 4–6"\n', text)
+        self.assertNotIn('showrunner:', text)
+        self.assertIn(f'unit: "{fixture_runtime_id("build-report")}"\n', text)
+        self.assertNotIn('plan:', text)
         self.assertIn("stage: active\n", text)
         self.assertNotIn("stage: backlog", text)
         self.assertIn(f"date_modified: {self.today()}\n", text)
         self.assertIn('approved_by: "user"\n', text)
-        self.assertIn('approved_in: "hana"\n', text)
-        self.assertEqual(out, "approve a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage, date_modified\n")
-        from issues import Issue, frontmatter
+        self.assertIn(f'approved_in: "{fixture_runtime_id("hana")}"\n', text)
+        self.assertEqual(out, "approve a proposal.md: set plan, unit, approved_by, approved_in, stage, date_modified\n")
+        from scripts.production.issues import Issue, frontmatter
         self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
                          proposal_issue.InProgress())
 
     def test_unapprove_sets_an_approved_proposal_back_to_waiting_for_approval(self) -> None:
-        from issues import Issue, frontmatter
+        from scripts.production.issues import Issue, frontmatter
         _ = self.issue.write_text(VAULT_ISSUE, encoding="utf-8")
         _ = self.run_cli("approve", str(self.issue), "--by", "showrunner", "--showrunner", "hana", "--unit", "u", "--plan", "p")
         approved = self.text()
         code, out, error = self.run_cli("unapprove", str(self.issue), "--dry-run")
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(out, "unapprove a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage\n")
+        self.assertEqual(out, "unapprove a proposal.md: set unit, approved_by, approved_in, stage\n")
         self.assertEqual(self.text(), approved)
         code, out, error = self.run_cli("unapprove", str(self.issue))
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(out, "unapprove a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage\n")
+        self.assertEqual(out, "unapprove a proposal.md: set unit, approved_by, approved_in, stage\n")
         text = self.text()
-        for line in ('showrunner: ""\n', 'unit: ""\n', 'plan: ""\n', 'approved_by: ""\n', 'approved_in: ""\n', "stage: backlog\n", f"date_modified: {self.today()}\n"):
+        for line in ('unit: ""\n', 'approved_by: ""\n', 'approved_in: ""\n', "stage: backlog\n", f"date_modified: {self.today()}\n"):
             self.assertIn(line, text)
         self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
                          proposal_issue.AwaitingApproval())
 
     def test_unapprove_refuses_an_issue_with_no_approval_to_undo(self) -> None:
-        by_showrunner = {"unit": "u", "plan": "p", "approved_by": "showrunner", "approved_in": "hana"}
+        by_showrunner = {"unit": "u", "plan": "p", "approved_by": "showrunner", "approved_in": fixture_runtime_id("hana")}
         cases: tuple[tuple[str, dict[str, str], str], ...] = (("waiting", {}, "no approval is recorded"),
                  ("declined", {**by_showrunner, "style_answer": "declined"}, "no approval is recorded"),
                  ("closed", {**by_showrunner, "status": "closed"}, "not an open proposal"),
                  ("user approval", {**by_showrunner, "approved_by": "user"}, "the user approved it"),
                  ("approval without approved_by", {"unit": "u", "plan": "p"}, "the user approved it"),
                  ("another showrunner", {**by_showrunner, "approved_in": "cargo-liner"},
-                  "approved in cargo-liner, not in hana"),
-                 ("no showrunner recorded", {**by_showrunner, "approved_in": ""}, "approved in no showrunner, not in hana"))
+                  f"approved in cargo-liner, not in {fixture_runtime_id("hana")}"),
+                 ("no showrunner recorded", {**by_showrunner, "approved_in": ""}, f"approved in no showrunner, not in {fixture_runtime_id("hana")}"))
         for name, fields, reason in cases:
             with self.subTest(name=name):
                 _ = self.issue.write_text(VAULT_ISSUE, encoding="utf-8")
@@ -670,7 +703,7 @@ class ProposalIssueTests(unittest.TestCase):
         # An approval from before approved_by is the user's, so a showrunner approval keeps it.
         _ = self.issue.write_text(ISSUE, encoding="utf-8")
         _ = proposal_issue.edit(self.issue, {"unit": "u", "plan": "p", "stage": "active"}, date(2026, 10, 15))
-        self.assertEqual(approve("showrunner"), "approve a proposal.md: set showrunner, date_modified\n")
+        self.assertEqual(approve("showrunner"), "approve a proposal.md: set plan, unit, date_modified\n")
         self.assertNotIn("approved_by", self.text())
 
     def test_approve_and_unapprove_refuse_outside_a_showrunner(self) -> None:
@@ -686,8 +719,8 @@ class ProposalIssueTests(unittest.TestCase):
                     self.assertEqual(self.text(), before)
 
     def test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress(self) -> None:
-        from issues import frontmatter
-        for name, fields, stage, changed in (("approved", {"unit": "names-unit", "plan": "unit.md"}, "active",
+        from scripts.production.issues import frontmatter
+        for name, fields, stage, changed in (("approved", {"unit": "names", "plan": "unit.md"}, "active",
                                               "reason, status, stage, date_modified"),
                                              ("unanswered", {}, "backlog", "reason, status, date_modified")):
             with self.subTest(name=name):
@@ -703,12 +736,12 @@ class ProposalIssueTests(unittest.TestCase):
         _ = self.run_cli("approve", str(self.issue), "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p")
         code, _, error = self.run_cli("close", str(self.issue), "--reason", "built in u-1")
         self.assertEqual(code, 0, error)
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual((frontmatter(self.issue)["status"], frontmatter(self.issue)["stage"]), (["closed"], ["active"]))
 
     def test_proposal_progress_reads_an_approval_or_an_active_stage_as_in_progress(self) -> None:
-        from issues import Issue
-        approval = {"unit": ["names-unit"], "plan": ["unit.md"]}
+        from scripts.production.issues import Issue
+        approval = {"unit": ["names"], "plan": ["unit.md"]}
         for name, fields, expected in (
                 ("approved at backlog", {**approval, "stage": ["backlog"]}, proposal_issue.InProgress()),
                 ("approved at waiting", {**approval, "stage": ["waiting"]}, proposal_issue.InProgress()),
@@ -724,7 +757,7 @@ class ProposalIssueTests(unittest.TestCase):
         """One folder of issues: one open approved proposal at backlog, and each kind move-approved leaves alone."""
         folder = self.root / "issues"
         folder.mkdir()
-        approval = 'plan: "unit.md"\nunit: "names-unit"\n'
+        approval = 'plan: "unit.md"\nunit: "names"\n'
         for name, answer, stage, status, tags in (
                 ("approved", approval, "backlog", "open", "[issue, proposal]"),
                 ("unanswered", 'plan: ""\n', "backlog", "open", "[issue, proposal]"),
@@ -768,7 +801,7 @@ class ProposalIssueTests(unittest.TestCase):
     def test_move_approved_dry_run_refuses_the_files_the_real_run_refuses_and_both_go_on(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        approved = (ISSUE.replace('plan: ""\n', 'plan: "unit.md"\nunit: "names-unit"\n')
+        approved = (ISSUE.replace('plan: ""\n', 'plan: "unit.md"\nunit: "names"\n')
                     .replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
         for name, text in (("a-good", approved), ("b-bad", approved.replace("---\n", "--- \n", 1)), ("c-good", approved)):
             _ = (folder / f"{name}.md").write_text(text, encoding="utf-8")
@@ -794,8 +827,8 @@ class ProposalIssueTests(unittest.TestCase):
         )
         lines = self.text().splitlines()
         fence = lines.index("---", 1)
-        self.assertEqual(lines[fence - 4:fence], ['showrunner: "hana"', 'unit: "u"', 'approved_by: "user"', 'approved_in: "hana"'])
-        self.assertEqual(lines.index('plan: "p Phase 1"'), ISSUE.splitlines().index('plan: ""'))
+        self.assertEqual(lines[fence - 3:fence], [f'unit: "{fixture_runtime_id("u")}"', 'approved_by: "user"', f'approved_in: "{fixture_runtime_id("hana")}"'])
+        self.assertFalse(any(line.startswith('plan:') for line in lines))
 
     def test_a_home_relative_path_is_expanded(self) -> None:
         with mock.patch.dict(os.environ, {"HOME": str(self.root)}):

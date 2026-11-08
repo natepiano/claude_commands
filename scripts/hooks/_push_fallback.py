@@ -27,4 +27,4 @@ def marker_path(session_id: str) -> Path:
 
 
 def fallback_matches(message: str, record: dict[str, object]) -> bool:
-    return " ".join(message.split()) == " ".join(text(record, "fallback").split())
+    return message == text(record, "fallback")

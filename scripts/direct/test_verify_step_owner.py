@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -15,7 +13,8 @@ import unittest
 
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct import implement_launcher_test_support, review_launcher_test_support
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_function
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -25,6 +24,7 @@ WAIT = VERIFY.with_name("wait_for_test_state.py")
 
 
 class StepOwnership(TypedDict):
+    start_format: str
     group: int
     start: str
 
@@ -34,45 +34,26 @@ class StepProcess(TypedDict):
     group: int
 
 
-def shell_function(source: str, name: str) -> str:
-    match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}", source)
-    if match is None:
-        raise AssertionError(f"missing shell function: {name}")
-    return match.group(0)
-
-
-class CopiedLauncherBoardTests(unittest.TestCase):
-    def test_copied_launchers_reclaim_unexpired_locks_after_their_holder_exits(self) -> None:
-        for fixture_type in (implement_launcher_test_support.ImplementLauncherFixture,
-                             review_launcher_test_support.ReviewLauncherFixture):
-            with self.subTest(fixture=fixture_type.__name__):
-                root = Path(self.enterContext(tempfile.TemporaryDirectory(
-                    prefix="copied-launcher-board-")))
-                fixture = fixture_type("runTest")
-                fixture.root = root
-                fixture.prepare_fixture()
-                environment = fixture.environment()
-                _ = environment.pop("PYTHONPATH", None)
-                environment["UNIT_NOW_EPOCH"] = "1000"
-                with subprocess.Popen([sys.executable, "-c", "pass"],
-                                      env=environment) as holder:
-                    self.assertEqual(holder.wait(timeout=300), 0)
-                session = root / "run"
-                lock = session / "locks" / "cargo.d"
-                lock.mkdir(parents=True)
-                _ = (lock / "holder").write_text("former-worker")
-                _ = (lock / "holder_pid").write_text(str(holder.pid))
-                _ = (lock / "expires").write_text("1600")
-                result = subprocess.run(
-                    ["bash", str(root / "scripts" / "direct" / "board.sh"), "acquire",
-                     str(session), "next-worker", "cargo", "--pid", str(os.getpid())],
-                    cwd=root, env=environment, capture_output=True, text=True,
-                    check=False, timeout=300,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("reclaimed from former-worker", result.stdout)
-                self.assertEqual((lock / "holder").read_text(), "next-worker")
-                self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
+class TokenWaitNoteTests(unittest.TestCase):
+    def test_holder_without_trailing_newline_is_named_in_wait_note(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="verify-wait-note-") as directory:
+            board = Path(directory)
+            lock = board / "locks/cargo.d"
+            lock.mkdir(parents=True)
+            _ = (lock / "holder").write_bytes(b"w74")
+            script = "\n".join((
+                "set -euo pipefail",
+                'BOARD_DIR="$1"',
+                "TOKEN_WAITERS_AHEAD=0",
+                shell_function(VERIFY.read_text(), "token_wait_note"),
+                "token_wait_note still 5",
+            ))
+            result = subprocess.run(["bash", "-c", script, "wait-note-test", str(board)],
+                                    text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("w74 (pid unknown) holds it", result.stderr)
+            self.assertNotIn("it came free just now", result.stderr)
 
 
 class VerifyStepOwnerTests(unittest.TestCase):
@@ -93,15 +74,17 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PEAK": "",
+            "BUILD_FOLDERS_SCRIPT": str(VERIFY.parent.parent / "lib" / "build_folders.py"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BOARD_DIR": str(self.root / "board"),
             "BOARD_HELPER": str(BOARD),
-            "TOKEN_HELD": "1",
+            "TOKEN_HELD": "1", "BOARD_SLOT": "fixture",
+            "TOKEN_HOLD_S": "30", "TOKEN_RENEW_S": "60",
+            "HOLD_WAIT_DIR": str(self.root / "tmp"),
             "TEST_ROOT": str(self.root),
             "TEST_PYTHON": sys.executable,
-            "PY": str(VERIFY.parent.parent / "lib" / "py"),
-            "PROCESS_REPOSITORY": str(VERIFY.parent.parent.parent),
+            "PY": str(VERIFY.parent.parent / "lib/py"),
             "TEST_WAIT": str(WAIT),
             "TEST_COMMAND": str(self.root / "step.py"),
         }
@@ -123,7 +106,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-sys.path.insert(0, sys.argv[1])
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -142,7 +125,7 @@ wait_for_file(root / (name + ".release"))
         return subprocess.run(
             ["bash", "-c", self.shell + '\nbuildlog_exec "$@"', "step-owner-test", *command],
             cwd=self.root, env=self.environment, capture_output=True, text=True,
-            check=False, timeout=300, start_new_session=True)
+            check=False, timeout=TEST_HANG_GUARD_SECS, start_new_session=True)
 
     def background_sweep(self) -> subprocess.Popen[str]:
         script = self.shell + '''
@@ -177,10 +160,10 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
         for name in ("real.release", "cleanup.release", "sweep.release"):
             (self.root / name).touch()
         try:
-            output, errors = process.communicate(timeout=300)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             process.kill()
-            _ = process.communicate(timeout=300)
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             raise
         self.assertEqual(process.returncode, 0, output + errors)
 
@@ -198,6 +181,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
         self.wait_for("both-started", process)
         record = cast(StepOwnership, json.loads(
             (self.root / "board" / "locks" / "cargo.d" / "owned").read_text()))
+        self.assertEqual(record["start_format"], "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1")
         self.assertEqual(record["group"], self.step_process("real")["group"])
         self.assertNotEqual(record["group"], self.step_process("sweep")["group"])
         self.assertFalse((self.root / "real.finished").exists())

@@ -4,7 +4,7 @@
 
 ## What it is
 
-One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. The existing senders take their recipients from it: `send.py` reaches any one listed session by address or unique name, on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
+One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. `send.py` selects identity from staff and checks transport through the roster. It reaches a staff member on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
 
 ### Data flow
 
@@ -23,45 +23,54 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 ### Record sources
 
-The roster joins records that each name one part of the picture. A session's role comes from these records, never from its name; the one value read from a name is a Claude worker's slot role, the suffix of its worker ledger worker name.
+The roster joins staff, run records, process evidence, and assignment logs.
+Staff supplies each worker's current session and parent.
+The assignment log supplies its task role and lens.
+The [worker design](long-lived-workers.md#roster-fields) defines stored run fields.
 
 | Source | Where | Gives |
-
 |---|---|---|
-
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
-
-| Units table | the production doc, via `production_units.unit_table` without retired rows (`production_units.unit_is_retired`) | `Unit` and `Worktree` per row (fallback only) |
-
+| Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
 | Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
-
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
-
-| Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
-
-| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
-
-| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` (`design_roles.state_root()`, `DESIGN_ROLES_STATE`) | held Astra designers and reviewers: holder, lifecycle, thread, mesh entry |
-
-| Review state | `<run>/review_status[_<lens>]`, `<run>/review_pid[_<lens>]` | running blind reviewers |
-
+| Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
+| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Fixed `staff_id`, turn status, launcher PID, server PID, and run details |
+| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` | Held Astra role lifecycle and staff reference |
+| Review state | `<run>/<worker>_status[_<lens>]`, `<run>/<worker>_pid[_<lens>]` | running blind reviewers |
 | Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
-
 | Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, worker `--cwd` |
 
 The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
+
+`codex_mesh.py end` keeps the staff row and its thread id.
+`assign.sh --to` reopens an ended worker or a worker whose launcher died, using the recorded thread.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+The unit ledger keeps ended workers until permanent removal retires their staff rows.
 
 ### How each row's role is derived
 
 A live run is a run directory with a marker whose director session is running, or a heartbeat younger than 600 s (then it has no running director).
 
-Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest `updatedAt`). A headless `claude -p` run, whose record's `entrypoint` starts with `sdk-`, is never running there. The relay is one: it takes its sender's name with `-n`, so without this every live relay was a row named like its sender. First match wins:
+Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest `updatedAt`). A headless `claude -p` run is never running there: its record's `entrypoint` starts with `sdk-`, or `relay_identity.live_relay_identity` verifies its saved sender and process start identity against that PID's live process. This also excludes relay records that have no entrypoint. A real session named `relay/<name>` stays visible. A sender record left by an earlier process with the same PID cannot hide it. First match wins:
 
 Codex rows:
 
-- **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
-- **held Astra role** (`_durable_roles`) — each open held role in the held role store (`docs/as-built/long-lived-workers.md#lasting-roles`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `design_roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
-- **blind reviewer** — `review_status[_<lens>]` reads `reviewing` with a live `review_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
+- **Worker.** A live run's mesh entry supplies status and process evidence.
+  The entry's `staff_id` resolves the current thread and parent through one staff snapshot.
+  A worker whose backend is Claude appears only as a Claude row.
+  The assignment log supplies the task role and review lens.
+  Status `done` displays `idle`; capacity states retain their named display text.
+  The process supplies the working directory when available; the director's directory is the fallback.
+  Staff parents supply the director and showrunner relationships.
+- **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
+  Staff supplies the current thread and the role's parent.
+  The role store supplies the design repository, instance name, and lifecycle.
+  A missing backend prints an anomaly and skips that role.
+  The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
+  The holder adds pending messages through `design_roles.py`.
+  The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
+- **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
 
 ### Domain types (`roster.py`)
@@ -74,9 +83,9 @@ Codex rows:
   - Blind reviewer: `CannotReceiveMessages("blind reviewer")`.
   - Held Astra role: `CannotReceiveMessages("held role; its holder adds pending messages to an authorized assignment")`.
 - `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`; `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`; `Assignment = WorkerAssignment | NotAWorker`.
-- `thread: CodexThread | NoCodexThread` (mesh record or daemon thread); `session: ClaudeSession | NoClaudeSession` (the Claude identity, kept even without a socket).
+- `thread: CodexThread | NoCodexThread` (staff current session or daemon thread); `session: ClaudeSession | NoClaudeSession` (the Claude identity, kept even without a socket).
 - Link addresses, text nesting, sort and `--of` use `_session_address(entry)` on `session`, so a socketless unit director still owns its workers.
-- `Roster(entries, problems)`; `RosterScope = ThisMachine | AllMachines`; `roster(environment, scope) -> Roster` (scope required).
+- `Roster(entries, problems, warnings)`; `RosterScope = ThisMachine | AllMachines`; `roster(environment, scope) -> Roster` (scope required). Unreadable durable-role records are warnings: they preserve the readable rows and do not make recipient discovery incomplete. Other source failures remain problems. `diagnostics` combines problems and labelled warnings for display.
 - `SenderIdentity = CodexThread | ClaudeSession | NoSession` from `sender_identity(environment)`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`. `is_sender(entry, identity)` matches a Codex row's `thread` or any row's `session`; `NoSession` matches nothing.
 - `is_top_level(entry)`: a Claude row that is not a worker and not a unit director `UnderShowrunner`.
 - `cannot_receive_message_text(entry)`: the one refusal text for `send.py` and `broadcast.py`, `<name> cannot take messages (<reason>)` plus a tail: a worker `UnderDirector` gets `; contact its unit director <name> or wait`, a worker with `NoDirector` none, a socketless Claude session `; wait for it to open its messaging socket, then read the roster again and send again`.
@@ -85,10 +94,16 @@ Codex rows:
 
 `roster.py` holds the one rule that names a session's showrunner and unit for build views and copy folders. Callers never derive these names themselves.
 
-- `UnitLabels(session, showrunner="—", unit="—")` is frozen, and each field is whitespace-collapsed. Showrunner is the production slug and unit is the unit id without its `-unit` suffix, read through `_production_of` and `_unit_of`, the same helpers `shown_name` uses through `_production(entry)` and `_unit(entry)`; `_short_unit` is the one place that strips `-unit`. A production with no running showrunner still names its slug. These are the short names herdr shows (production `builds`, unit `report-unit` gives `builds`, `report`), never a session name. `—` marks a missing part.
+- `UnitLabels` shows the parent showrunner row's `name` and the unit row's `name`.
+  A stopped showrunner keeps its staff name. `—` marks a missing part.
 - `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
-- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and unit marks through `unit_lookup.session_unit_marks(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
-- Both paths group marks through `unit_lookup.group_marked_units`, the one slug-rename and duplicate-mark rule; a test pins that both paths give the same labels.
+- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and session labels through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
+- Both paths use `session_staff.group_labeled_sessions`.
+  Duplicate live or unknown processes produce a fault.
+- Native runtime IDs select staff rows for session labels.
+  `pane_launch.RecordedLabels` and `StaffLabels.environment` remove retired copied identity values.
+  A folder or session name does not select a staff row.
+  The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines this join.
 - `UnitLabels.folder_name() -> str` names the copies folder `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
 - Imports: `roster.py` imports `scripts.shutdown.remote` by package and does not put `scripts/shutdown` on `sys.path`; `account`, `agent_accounts` and `note_file` load lazily, so a label-only caller does not load account discovery. `scripts/shutdown/inventory.py` appends its own folder after existing `sys.path` entries for its sibling imports.
 
@@ -102,6 +117,8 @@ Codex rows:
 - **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON that decodes back into the same variants, used only between machines.
 - **Problems** go to stderr as `could not read: <source>: <detail>`; the other machine's are prefixed with its host; an unreachable machine, timeout or undecodable snapshot is `<host>: not reached: <why>`. A decodable snapshot is used whatever the remote exit status. Exit 0 clean, 1 with any problem.
 
+Durable-role warnings print once on stderr with `warning:`. JSON and snapshots carry an optional `warnings` list; older snapshots without it have no warnings. Warnings alone leave exit status 0. `send.py` prints them once and continues transport resolution; they do not trigger the incomplete-roster refusal. `top_level.py` and `broadcast.py` display the same diagnostics while retaining readable recipients.
+
 ### `send.py`: one recipient
 
 ```
@@ -109,33 +126,32 @@ send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
         [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
         [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
         (--text TEXT | --file PATH | stdin)
-send.py --to user --summary TITLE [--need note|decision|blocked] (--action TEXT | --no-action) ...
+send.py --to user --text-id ID --value KEY=VALUE ...
 send.py ack KEY | reopen KEY | pending [NAME] | retire --to ADDRESS --from SENDER --key KEY
 send.py drain-sockets
 ```
 
 The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
 
-Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: roster.Roster) -> DeliveryRoute`). `observed` holds the roster already read for this send:
+`send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
+A typed name first matches a staff path or short name. Unit names accept both `resources` and `resources`.
+One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
+The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
-| `--to` | Route |
-|---|---|
-| `user` | `pushover.py` here; under `--machine`, `send.py --here --to user ...` there |
-| `uds:<path>` | Claude delivery on this machine, even with `--machine`; a missing relay socket or a delivery connect returning `ENOENT` or `ECONNREFUSED` resolves its saved sender name to a live session, else `FAILED` (exit 3); postmaster first when registered and available, else relay |
-| any form, `--machine HOST` | `ssh HOST send.py --here ...` with no local roster read |
-| `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
-| `worker:<run>/<worker>` | that row's `codex_mesh.py send --session-dir <run dir> --to <worker>` |
-| `codex:<thread>` | the loaded roster row carries its account daemon; `codex_daemon.queue(daemon, thread_id, text, timeout)` calls `thread/queue/add` on that socket. An unloaded thread fails (exit 3), naming the homes checked; multiple owners are ambiguous (exit 2), listing their accounts |
-| bare name | roster rows whose names are equal after `str.casefold()`; one `Messageable` sends by its address |
-| `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
+A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
+A name without a staff row or live session prints `send.py: no staff row or live session for 'x'`.
+That refusal exits 2. It creates no relay or queue.
 
-Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses exactly; names match any row without regard to letter case, with no preference for an exact-case match. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
+Explicit `uds:`, `session:`, `codex:`, and `worker:` addresses also select a matching staff row's `current_session`.
+Worker lookup uses the native ID from the local or peer roster. The roster and registry supply transport for the current session.
+A staff member's old live socket cannot override its current session.
+Explicit non-staff addresses keep their transport, peer lookup, and queue behavior.
+`uds:` stays on this machine. `--machine HOST` forwards the selected address.
+`--codex --session-dir DIR --to SLOT` selects a run-scoped worker slot without staff lookup.
 
-- A match here sends here; the other machine is not asked.
-- Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role; Codex daemon rows also name their account and home.
-- One `CannotReceiveMessages` row: exit 2 with `cannot_receive_message_text`.
-- No match under `LocalThenPeer`: the other machine's roster is read. One `Messageable` row there sends through `ssh` with its address; ambiguity and `cannot take messages` apply to its rows too; a miss while it reports problems is `FAILED` with those problems. A bare name absent from a local roster that had problems asks no one: exit 2, `absence of <name> here is not proven; use an address or --machine`.
-- A clean miss: `session:` queues here (exit 1), `codex:` fails with `no live Codex daemon has thread <id> loaded; checked <homes>`, `worker:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
+The SendMessage-miss hook uses the same resolver and snapshot. It reports the matching transport and a send command.
+The hook never sends a message. Successes, socket misses, and unrelated failures do not read the roster.
+
 
 Every ssh send runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" --here ...` with the text on stdin. `remote()` reads the outcome word from the last stdout line there, prefixing the detail `on <host>: `; a run that prints no outcome line (usage errors, `cannot take messages`, ambiguity, `no roster session has address`, which go to stderr) returns `FAILED: ssh <host>: <reason>`. Action flags are forwarded only for `--to user`.
 
@@ -145,11 +161,11 @@ Outcomes print as one line and log with the full text to `$XDG_STATE_HOME/messag
 |---|---|---|
 | `SENT: <how>` | 0 | delivered; the outbox path reports `postmaster; verbatim` or `postmaster; NOT VERBATIM`, then `session:<id>` |
 | `SKIPPED: <why>` | 0 | key acknowledged, or inside its repeat window |
-| `QUEUED: <why>` | 1 | a Claude recipient not reached; kept under its session id |
+| `QUEUED: <why>` | 1 | a Claude recipient or staff member without a live transport; kept under its native session id |
 | `REFUSED: <why>` | 2 | `pushover.py` refused before sending; nothing kept |
 | `HELD: <why>` | 4 | a user push not sent: it failed review (revise and resend), or another sender's claim on a legacy hold is live |
 | `REPLACED: <why>` | 0 | a newer version replaced this user push; nothing was sent |
-| `FAILED: <why>` | 3 | not delivered, not kept: an unresolved dead socket, a Codex recipient, the user, or ssh; for the user it ends with a `fallback text:` line |
+| `FAILED: <why>` | 3 | not delivered, not kept: an unresolved dead socket, a Codex recipient, the user, or ssh |
 
 The `--to user` outcomes in full, including `SENT: … rewritten:` and `sent despite failed review:`, are in `docs/as-built/message-clarity.md`.
 
@@ -157,11 +173,41 @@ Usage errors, the stderr-only refusals above, an unreadable `--file` and an empt
 
 Delivery mechanics: for a Claude recipient found in the live registry, `send.py` first tries the local postmaster. It waits up to 3 s for a result, withdrawing the entry before checking for a claim; an existing claim allows another 2 s for a result. A confirmed `delivered` result reports `SENT: postmaster; …`. Each miss requires the relay: `absent` (no heartbeat), `stale` (unreadable, older than 2 s or no live postmaster identity), `self` (recipient is the postmaster), `unclaimed` (withdrawn without a delivery), `outbox-error` (entry write failed), `failed`, `expired`, `claimed-no-result` (delivery unknown), and `relay-only-sender` (`shutdown`). A recipient not in the live registry uses the relay directly and logs `unresolved`. With no fresh heartbeat, the relay outcome, queue and text stay as before. After an attempt, the relay receives `max(1.0, options.timeout - attempt.seconds)`; a recipient not in the registry gets the original timeout.
 
-The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named `--from`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
+The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
-The relay's launcher atomically publishes its sender in `STATE/relay_senders/<pid>` before execing Claude. Exec preserves the PID used in Claude's `cc-socks/<pid>.sock` address. A reply to a missing socket, or a delivery connect returning `ENOENT` or `ECONNREFUSED`, looks up that sender with `sessions.addressed(name, sessions.live_sessions())`. Send and drain use the same resolver; no extra connect probes a live socket. No record or no live named recipient produces a failed result and a stderr line naming the socket and sender. The queue boundary rejects raw sockets without a live session; sends carry the session ID found at their queue decision so a later session exit cannot create a raw socket queue.
+The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook resolves the exact target through staff. A non-staff name can use a live roster row. Verified relay recovery retains its saved sender lookup. This name is display text. `send.py` records the runtime sender ID separately.
+The generated `Authority: morty (speaks for the user)` mark requires the configured native ID.
+Caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix in delivered text.
+Rendering converts line separators to LF before it quotes caller labels, including sender and forwarded display text.
+Only the generated metadata block directly after the preview grants authority. Quoted labels elsewhere grant none.
+Forwarded stamps require `SSH_CONNECTION` as a context check against accidental use.
+A session can inherit this variable. The check does not prove that `remote()` supplied the stamp.
+Code under the same account can set that environment. The mark is not authentication.
+See [message-clarity.md](message-clarity.md#sender-identity) for the stamp and queue rules.
+
+Before execing Claude, the relay's launcher uses `relay_identity.publish_relay_identity` to publish `STATE/relay_senders/<pid>.identity` and then the plain sender file `STATE/relay_senders/<pid>`, through the shared atomic-file writer. The identity file binds that sender to the process start and, on Linux, the boot ID. The shared `process_identity.process_start` reads the platform process identity; `sessions.process_start` exports the same reader for existing callers. Exec preserves both the process start and the PID used in Claude's `cc-socks/<pid>.sock` address. `live_relay_identity` is the shared check for session exclusion and miss recovery. Missing, unreadable, legacy or mismatched lifetime metadata cannot prove a live relay. The plain sender file remains available through `read_relay_sender` after the process exits, for dead-socket replies. A reply to a missing socket, or a delivery connect returning `ENOENT` or `ECONNREFUSED`, checks that sender through the supplied staff snapshot. A staff sender uses its current session. A non-staff sender uses the registry. Send and drain use the same resolver; no extra connect probes a live socket. No record or no live named recipient produces a failed result and a stderr line naming the socket and sender. The queue boundary rejects raw sockets without a live session; sends carry the session ID found at their queue decision so a later session exit cannot create a raw socket queue.
 
 `send.py drain-sockets` recovers raw `uds__*.sock.jsonl` queue files under a separate `.drain-sockets.lock`, so its relays do not block normal sends. It delivers each message in a recent file (newest entry under 24 hours old) to the live session, marked `Stuck message from <original time>:`. A saved relay sender takes precedence over queued recipient metadata. Each stable recovery ID gets a flushed and fsynced attempt in `STATE/socket-recovery-attempts.jsonl` before relay, then a durable result in `STATE/log.jsonl` before the queue checkpoint. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends and retries known failures without a second queued copy. An attempt with no result is archived without resending, reports `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent`, and exits 3 once. Its archive checkpoint preserves other unsent entries, and a retry reuses an identical archive instead of copying it. Unresolved or unreadable files stay in place with a report naming the file (exit 3); the drain continues with other files. Files at least 24 hours old move intact to `STATE/socket-queue-archive/`; one line reports the count and oldest and newest message times. Archive names never replace an existing file. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move. `pending` keeps its existing print-and-clear behavior.
+
+### Codex queue drain
+
+`send.py pending` without a target stays Claude-only. It uses the caller's live Claude session.
+`pending codex:<thread>` selects a Codex native thread explicitly and needs no Claude registry entry.
+The reader also selects queues owned by the current staff row, including rows kept for an earlier thread.
+For Codex, it reads only the local staff record and starts no SSH operation.
+It keeps the sender stamp, shown sender, message order and newest keyed copy.
+
+`scripts/hooks/codex-queue-drain.py` calls the same reader for Codex `SessionStart` and every `PostToolUse` event.
+The adapter uses the payload's `session_id`, so an inherited parent thread id cannot select the parent's queue.
+It prints `hookSpecificOutput.additionalContext` and flushes stdout while it holds the queue lock.
+It removes the selected rows only after that flush succeeds. A write or flush error leaves the rows for a retry.
+An unreadable queue stays in place. This rule also applies to Claude `pending`.
+Concurrent hook calls consume the selected rows once. An empty queue produces no hook output.
+A process exit after the flush and before removal can cause repeated output on retry.
+
+`scripts/hooks/codex_hooks.py install` registers and trusts both handlers in each selected Codex home.
+The queue drains at startup or after the next completed tool. An idle session waits for its next hook event.
+Live pane and daemon delivery use their existing paths. The hook needs no pane registration and adds no timer.
 
 ### Postmaster mod
 
@@ -196,7 +242,7 @@ The client writes `outbox/.<id>.json.tmp` and publishes it as `outbox/<id>.json`
 
 A delivered result's hash sets `verbatim`; a mismatched hash is still reported as sent with `NOT VERBATIM`. Unreadable result files remain pending. An unparsable heartbeat is read up to three times 20 ms apart, since an overwrite through `$.fs.write` can be read torn; one that parses but fails validation, a heartbeat without a non-empty string `run` included, counts as `stale` at once, so a mod older than the `run` field reads as not running. Every return after the heartbeat and `self` checks attempts entry cleanup before temp, withdrawn, claim and result cleanup. If entry removal fails, the client keeps the claim and result to prevent another mod send. Each such attempt also prunes `outbox/`, `claimed/` and `results/` files older than 10 minutes (a claim or result whose entry still exists stays) and `delivered/` files older than 30 minutes, since a new worker restores `open` routes inside `REPLY_WINDOW_MS`. `postmaster.py status` performs that cleanup and removes errors older than seven days; its first line reads `postmaster: running, heartbeat <age> s old, worker <run>; errors: <count>; replies: <count>`, with age to one decimal, or `postmaster: not running; errors: <count>; replies: <count>`. It also prints today's route counts in `user_zone()`, exiting 0 for a fresh live heartbeat and 1 otherwise.
 
-`RELAY_ONLY_SENDERS = frozenset({"shutdown"})` bypasses all postmaster file access. Shutdown instructions depend on the wrapper's sender name, which a mod delivery changes to `postmaster`; these messages keep the relay during the trial. The mod delivery share below excludes them. Removing `shutdown` from the set is the one change once recipients are shown to read the real sender from the first line.
+`RELAY_ONLY_SENDERS = frozenset({"shutdown"})` bypasses all postmaster file access. Shutdown messages use the relay's explicit `Shown sender: shutdown` attribution; these messages keep the relay during the trial. The mod delivery share below excludes them. Removing `shutdown` from the set is the one change once recipients are shown to read the real sender from the first line.
 
 **Replies**
 
@@ -215,7 +261,7 @@ The unit director runs this on natedev, from main, since the session loads `~/.c
 From the repo root, define `pm_rows` once; it selects today's local Claude rows using the user's zone, without computing the trial's results here:
 
 ```sh
-pm_rows() { python3 -c 'import datetime,json,os,sys; from pathlib import Path; sys.path.insert(0,"scripts/lib"); from user_zone import user_zone; z=user_zone(); today=datetime.datetime.now(z).date(); p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/log.jsonl"; rows=(json.loads(s) for s in p.read_text().splitlines() if s.strip()) if p.exists() else []; [print(json.dumps(r)) for r in rows if "via" in r and datetime.datetime.fromisoformat(r["time"]).astimezone(z).date()==today]'; }
+pm_rows() { ~/.claude/scripts/lib/py -c 'import datetime,json,os; from pathlib import Path; from scripts.lib.user_zone import user_zone; z=user_zone(); today=datetime.datetime.now(z).date(); p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/log.jsonl"; rows=(json.loads(s) for s in p.read_text().splitlines() if s.strip()) if p.exists() else []; [print(json.dumps(r)) for r in rows if "via" in r and datetime.datetime.fromisoformat(r["time"]).astimezone(z).date()==today]'; }
 ```
 
 Each following line reads those rows without changing state. The delivery-share denominator includes `queue` rows as messages not delivered by the mod; the relay count includes only `via: relay`. Compare the daily relay count to the baseline of about 600 and the elapsed-time median to the relay baseline of 4.5 s; use the trial start timestamp to select the two-day interval for the final comparison.
@@ -326,14 +372,39 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 - `refused_at(action, priority) -> ActionAllowed | ActionRefused` refuses `NoActionRequired` above priority 0.
 - `first_line(action, session)`: `Action: <text>` or `No action needed.`, with an optional `Session: <name>` line above it (`SessionLine | NoSessionLine`); `FIX` is the recovery text and `REFUSED_BEFORE_SENDING` the stderr marker.
 
-`scripts/notify/pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…` for a catalog text, is the one path to the user's phone, called by `send.py --to user` and directly. Refusals come before the keys file is read, in order: `ActionRefused` from parsing, `ActionUnstated` (`no action stated`), action text over `ACTION_TEXT_MAX` (1015), `refused_at`. A refusal sends nothing, logs `refused before sending: <reason>`, prints `pushover: refused before sending: <reason>. <FIX>` and exits 2. After the refusal checks, `review.review()` checks the push unless the user's `review_off` switch is set. A send opens with `first_line(action, session)`; it ends with a `Sent by: <sender>` line and a last `Template: <text id>` line (`Template: none (free text)` with no `--text-id`). Over `MESSAGE_MAX` (1024) the body is cut, never the action line or those two lines; an empty sender is refused. Priority 2 repeats every 300 s until acknowledged, for at most 3 h. Every `~/.local/state/notify/pushover.jsonl` line names `--source`, else the parent command line (80 chars). Exit 0 sent; 1 Pushover refused or unreachable; 2 refused before sending, usage, or keys missing; 4 another sender's hold claim is live; 5 replaced; 6 not sent (failed review or withheld). The review and these outcomes are in `docs/as-built/message-clarity.md`.
+`scripts/notify/pushover.py --text-id ID --value k=v…` is the direct phone boundary.
+It refuses a missing template before review, credentials, claims, or posting.
+`send.py --to user` uses this boundary and requires the same template.
+Legacy pushes already kept during silence still release.
+Agent-written values receive live review.
+Each push ends with `Sent by: <sender> · Template: <id>`.
+Priority 2 repeats until acknowledgment or expiry.
+The review and delivery outcomes are in `docs/as-built/message-clarity.md`.
 
 Senders:
 
-- `send.py --to user` requires `--action` or `--no-action` and `--summary`; `--need note|decision|blocked` maps to priority 0, 1, 2, and `decision` / `blocked` require `--action`. The action flags on any other recipient are a usage error (`--action and --no-action go with --to user`). A `pushover.py` exit 2 with the `refused before sending:` marker becomes `REFUSED`; any other failure is `FAILED: the user was not reached: ...`. With `CLAUDE_PROBE_SESSION=1` in its environment (`PROBE_ENV`, `scripts/lib/probe_session.py`; set by `accounts.py exec --probe`), `--to user` prints `not sent: probe sessions never push to the phone` and exits 0 before review, logging or delivery.
-- `escalate.py hold(key, summary, text, action: UserAction, minutes=15, need="decision")` raises `ValueError` for `NoActionRequired` with a `need` other than `note`; a stored hold without an action (`LegacyHeld`) is never delivered, lists as `waiting for a hold that states its action`, and the next `hold()` for its key replaces it.
+- `send.py --to user` requires `--text-id`; the template supplies its title and action.
+  Decisions and blocked pushes require an action.
+  Other recipients reject action flags.
+  A channel refusal becomes `REFUSED`; other delivery errors become `FAILED`.
+  Probe sessions send no phone pushes.
+
+| Need | Phone priority |
+| --- | --- |
+| note | 0 |
+| decision | 0 by default; 1 only when `0 < due - now <= decision_high_priority_window_seconds` |
+| blocked | 2 |
+
+`--due` requires ISO 8601 with an explicit offset and a user decision.
+`config/send.conf` sets `decision_high_priority_window_seconds=1800`.
+The sender reads this value at use.
+An overdue decision stays at priority 0 and records a diagnostic.
+`--priority 1` cannot bypass this rule.
+Release recalculates the priority of a kept decision.
+
+- `escalate.hold(key, push: RenderedPush, minutes=15)` keeps the registered template id and its values. Legacy free-text holds stay unchanged. They are not delivered or replaced. The owner must revise them with a registered template.
 - `restart_support.send_message(recipient, ...)` raises `ValueError` for `user`; `restart_support.alert_user(push: RenderedPush, *, machine="")` is the shutdown path to the user; the catalog render supplies title, body and action; it takes no scope, and callers skip the call when the session record's `alerts` is `"none"`.
-- `/alert_user` sends with `--need decision|blocked --action`; on the Mac it adds `--machine natedev`, since the Pushover keys exist only there. On `FAILED` it falls back to PushNotification with the exact `fallback text:` line `send.py` printed; the PreToolUse gate `scripts/hooks/pre-tool-use-push-gate.py` allows nothing else. `REFUSED` and `HELD` never fall back.
+- `/alert_user` uses a registered template. Mac callers add `--machine natedev`. Only a reviewed blocked push with a registered template can use the exact rendered emergency fallback after delivery fails.
 
 ### Shutdown test guard (`scripts/shutdown/test_support.py`)
 
@@ -386,7 +457,7 @@ Senders:
 
 - `--action` / `--no-action` go only with `--to user`; every other recipient carries `NoUserRecipient`; `broadcast.py` passes no action flags; `remote()` forwards them only for `user`.
 
-- No message reaches the user without `--action` or `--no-action`. `REFUSED:` (exit 2) means fix the flags and resend, never a PushNotification fallback.
+- No message reaches the user without `--action` or `--no-action`. `REFUSED:` (exit 2) means fix the flags and resend, never another phone path.
 
 - Under `LocalThenPeer` a local match is sent here and the other machine is not asked. Every ssh send and every per-row broadcast send passes `--here`. `--here` keeps `roster.py`, `send.py` and `broadcast.py` to this machine.
 
@@ -394,7 +465,7 @@ Senders:
 
 - `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` imports `roster.py` without a cycle.
 
-- `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `scripts.lib.process_start` is the one process-start reader; `sessions` reads through it. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity. A headless run (`sessions.headless`) is never running either, so a relay is never a roster row and no name lookup finds it.
+- `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `sessions.process_start` is the one process-start reader. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity. A headless run (`sessions.headless`) is never running either, so a relay is never a roster row and no name lookup finds it.
 
 - A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
 
@@ -414,7 +485,8 @@ Senders:
 
 **Roster records**
 
-- A Claude worker ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
+- A Claude worker ledger id is the background id that `scripts/direct/claude_worker.py` reads from the start banner.
+  The id is a prefix of the `sessionId`.
 
 - Session records are one file per pid, indexed by `(sessionId, pid)`; the newest `updatedAt` wins. A pid-to-name map therefore cannot hold a stale name.
 
@@ -439,10 +511,10 @@ Senders:
 - Strict checks from the repo root: `command claude plugin validate --strict mods/postmaster`, `command claude plugin test mods/postmaster`, and `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster` (natedev has no `tsc`, `node` or `bun` on `PATH`). Repeat validation and the kit after a Claude Code update. The bare `claude` name is a shell alias, so commands and launches spell `command claude`.
 - The validator accepts only direct `$.noun.method(...)` call sites and literal `$.env.get` names, and refuses `import()` and a re-exported `register`; the mod imports only its own files with import declarations. A new engine call goes into `callsFor($)` in `register.ts`, never into `outbox.ts` or `replies.ts`.
 - Engine-generated `mods/postmaster/.claude-plugin/types/` stays ignored; it supplies `Register`, the hook and call types and the worker globals, so the mod uses ES2023 without `DOM`. The engine writes it only when a live session loads the folder; in a fresh checkout `tsc` reports `TS2307` for `claude-code` until then.
-- `--plugin-dir` hot-reloads the folder. A pull on main replaces the running mod's worker 19–23 s after `register.ts` changes; the relay covers a stale-heartbeat pause. A stopped postmaster must be started by hand. Restart's resume command carries no `--plugin-dir`, so whether `/shutdown restart` brings the postmaster back with its mod loaded is unverified.
+- `--plugin-dir` reloads the folder when its files change. A pull on main replaces the worker 19–23 s after `register.ts` changes. The relay covers a stale heartbeat. The shutdown pane record retains each plugin directory as an absolute path. Account moves and pane restores pass those directories to Claude again. Old records without those directories need a manual launch with the plugin flag. A stopped postmaster needs a manual start.
 - After about 32 quick sends to one session the engine answers `isDelivered: false` (then about one per 2 s); the mod does not pace, so these surface as `failed` and the client relays them.
 - A reply only counts when the recipient answers the postmaster session with SendMessage. A recipient that answers through `send.py --to postmaster` sends through the relay, whose socket holds no route, so the postmaster takes an ordinary turn.
-- `quota_alert.py` gives a session send 45 s in all (`RELAY_TIMEOUT` 40 plus 5); its phone sends wait `review.user_send_seconds()` plus kill grace instead, since a push may be reviewed twice. One budget covers both paths: the relay after a miss gets `--timeout` less the attempt's seconds, at least 1 s, which keeps the 5 s worst-case attempt, the relay and 10 s of kill grace inside it.
+- `quota_alert.py` reads `quota_relay_timeout_seconds` from `config/accounts.conf` for session sends. The default is 40 seconds, with 10 seconds reserved before `send_budget.seconds()` adds the delivery allowances. Phone sends use `review.user_send_seconds()` and `send_budget.user_seconds()`.
 - Unmeasured: whether a `$` taken in `session.receive` keeps the outbox poll timer alive after a receive-first start. The live check could not reach receive-first; a hook reload starts the new worker through `session.start`.
 - The test kit skips a throwing `fs.list` hook, so a test that makes the listing throw sees the kit's own implementation failure instead.
 - `/home/natepiano/postmaster` is outside the repo and trusted per account. A new account or a removed/recreated directory can meet the folder-trust dialog.
@@ -463,7 +535,7 @@ Senders:
 
 **Imports**
 - `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
-- Buildlog uses `record.py`; shutdown uses `shutdown_record.py`. Their bare imports have distinct module names even when both folders are on `sys.path`. Shutdown has no old-name alias or shim. `roster.py` imports shutdown's `remote` by package.
+- Buildlog imports `scripts.buildlog.record`. Shutdown uses `shutdown_record.py`. These modules have distinct names. Shutdown has no alias for an old module name. `roster.py` imports shutdown's `remote` by package.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.
@@ -525,7 +597,25 @@ Account attribution is read on the owning machine and travels in the snapshot. C
 
 ## Herdr placement
 
-Unit marks come from `unit_lookup.every_marked_unit()`. A marked live Claude
-identifies its director; a socketless registry record joins by its pid's herdr
-place. Worktree ownership is a fallback when marks cannot be read, never for
-a worker ledger entry. Interactive herdr Codex panes are included.
+Session labels come from `unit_lookup.every_labeled_session()`. Native runtime ids select current staff rows. Incomplete identity evidence causes refusal. Interactive herdr Codex panes remain visible.
+
+Automatic silence ends only after a user prompt passes source classification.
+Generated prose carries a script envelope and writes no source record.
+The classifier checks the envelope before it reads source records.
+Only slash commands use source records.
+Slash-command classification is a heuristic.
+A user can type the same slash command in the same pane while a script command waits.
+The two submissions can then exchange classifications.
+The same classification controls the WaitingForUser end and conversation-pause answers.
+A classification error can leave WaitingForUser open or bypass a conversation-pause answer.
+Peer prompts, script prompts, harness notices, and unknown prompts preserve silence.
+The return notice names the activity session.
+`~/.local/state/notify/auto-silence-events.jsonl` records each transition and ignored activity under the silence lock.
+An append failure preserves silence and held pushes.
+Raw agent calls to herdr `send-text` remain outside this source-marking boundary.
+
+Every new phone push requires a registered template before review or delivery.
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
+
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.

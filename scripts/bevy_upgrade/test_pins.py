@@ -5,17 +5,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, final
+from typing import final, override
 
-import pins
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        """The checker marker is an identity decorator on Python 3.11."""
-        return method
-
+from scripts.bevy_upgrade import pins
 
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 REVISION = "1234567890abcdef1234567890abcdef12345678"
@@ -46,7 +38,7 @@ class PinsTests(unittest.TestCase):
         _ = (self.checkout / "demo-production.md").write_text(
             "# Test production\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {self.checkout}\n"
-            + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
+            + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
 

@@ -8,6 +8,7 @@ sit under `${SESSION_DIR}/phases/<id>/` and never overwrite each other.
 from __future__ import annotations
 
 import subprocess
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,12 +41,14 @@ class PhaseArtifactTests(unittest.TestCase):
         return path
 
     def test_clearing_a_phase_review_leaves_the_phase_beside_it(self) -> None:
+        _ = self.write("mesh_roster.json", json.dumps({"project-review": {"role": "review"}}))
         cleared = [self.write(f"phases/3/{name}") for name in ("review_prompt_1_adversary.md",
                                                                 "review_findings_1_adversary.txt",
-                                                                "review_status_adversary", "ux_shots_1.txt")]
+                                                                "review_status_adversary", "project-review_status_adversary", "ux_shots_1.txt")]
         kept = [self.write(f"phases/4/{name}") for name in ("review_prompt_1_adversary.md",
                                                              "review_findings_1_adversary.txt")]
         kept.append(self.write("phases/3/implementation_prompt.md"))
+        kept.append(self.write("phases/3/impl_status_impl", "implementing\n"))
         result = subprocess.run(["bash", str(CLEAR), str(self.session), "3"], capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -53,11 +56,11 @@ class PhaseArtifactTests(unittest.TestCase):
         self.assertEqual([path for path in kept if not path.exists()], [])
 
     def test_a_phase_reviewing_counts_as_running_work(self) -> None:
-        _ = self.write("phases/4/review_status_adversary", "reviewing\n")
+        _ = self.write("phases/4/project-review_status_adversary", "reviewing\n")
         self.assertEqual(direct_run.running_work(self.session), "a review pass")
 
     def test_a_phase_implementing_counts_as_running_work(self) -> None:
-        _ = self.write("phases/3/impl_status_impl", "implementing\n")
+        _ = self.write("phases/3/fix7_status", "running\n")
         self.assertEqual(direct_run.running_work(self.session), "an implementation or fix pass")
 
 

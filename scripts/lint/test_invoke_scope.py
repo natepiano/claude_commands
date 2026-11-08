@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build-step admission and behavior inside each step's systemd scope."""
 
 from __future__ import annotations
 
 import errno
 import os
-import re
 import select
 import signal
 import subprocess
@@ -13,22 +12,42 @@ import sys
 import tempfile
 import time
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import cast
+from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lib import test_hang_guard
 
-if TYPE_CHECKING:
-    from ..lib import process_start
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
+from scripts.buildlog.cgroup_test_support import write_cgroup
+from scripts.buildlog.test_memory_window import write_lint_config
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).with_name("invoke.sh")
+LINT_CONFIG_READER = INVOKE.with_name("lint_config.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
+
+
+class VerifyTemporaryParentTests(NixFixture):
+    def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        missing = self.root / "session with spaces" / "tmp"
+        _ = self.envrc(self.work)
+        self.env.update({"TMPDIR": str(missing), "CLAUDE_PYTHON": sys.executable})
+        self.script(self.bin / "direnv", '''import os, sys
+from pathlib import Path
+if sys.argv[1] == "allow":
+    raise SystemExit(0)
+Path(os.environ["TMPDIR"], "environment-probe").write_text("environment loaded")
+print("environment probe complete", file=sys.stderr)
+raise SystemExit(7)
+''')
+        verify = INVOKE.parent.parent / "direct/verify.sh"
+        result = subprocess.run(["bash", str(verify), "check", "sample"], cwd=self.work,
+                                env=self.env, text=True, capture_output=True,
+                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual((missing / "environment-probe").read_text(), "environment loaded")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"nix_env: {self.work}: environment probe complete\n")
 
 
 @dataclass(frozen=True)
@@ -52,12 +71,32 @@ def sampler_command() -> str:
     return "buildlog_sample_anon() {" + body + "\n}\n"
 
 
+def configured_scope_command(root: Path, config: Path, *,
+                             reader: Path = LINT_CONFIG_READER) -> str:
+    result = BuildAdmissionTests(methodName="runTest").run_invoke(
+        root, 'printf "%s" "$BUILDLOG_SCOPE_SH"', [], environment={
+            "LINT_CONFIG_READER": str(reader),
+            "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+        },
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    return result.stdout
+
+
 def scope_command() -> str:
-    source = INVOKE.read_text(encoding="utf-8")
-    match = re.search(r"^BUILDLOG_SCOPE_SH='([^'\n]*)'$", source, re.MULTILINE)
-    if match is None:
-        raise AssertionError("BUILDLOG_SCOPE_SH is missing or no longer a single-quoted string")
-    return match.group(1)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        return configured_scope_command(root, write_lint_config(root, 500))
+
+
+def python_spy(root: Path) -> None:
+    tool = root / ".claude/scripts/lib/py"
+    tool.parent.mkdir(parents=True)
+    _ = tool.write_text("\n".join([
+        "#!/bin/sh", 'echo python >> "$HOME/python-called"', "exit 93", "",
+    ]))
+    tool.chmod(0o755)
 
 
 def require_score_below_500(test: unittest.TestCase) -> None:
@@ -65,6 +104,94 @@ def require_score_below_500(test: unittest.TestCase) -> None:
         test.skipTest(f"{OOM_SCORE_ADJ} is unavailable")
     if int(Path(OOM_SCORE_ADJ).read_text(encoding="utf-8")) >= 500:
         test.skipTest("this process already runs at oom_score_adj 500 or more, so a 500 in the step proves nothing")
+
+
+class BuildOomScoreAdjReaderTests(unittest.TestCase):
+    python_reader: list[str] = [
+        str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import conf; "
+        + 'print(conf.read("lint").whole("build_oom_score_adj"))',
+    ]
+
+    def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False,
+            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+                 "PYTHONPATH": str(INVOKE.resolve().parents[2])},
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+
+    def assert_readers(self, config: Path, expected: int, *, warns: bool, python: bool = False) -> None:
+        readers = (
+            ("shell", ["bash", "-c", 'set -euo pipefail; source "$1"; '
+                       + 'lint_config_build_oom_score_adj adjustment; printf "%s\\n" "$adjustment"',
+                       "config-reader-test", str(LINT_CONFIG_READER)]),
+            *(((("python", self.python_reader),) if python else ())),
+        )
+        for reader, command in readers:
+            with self.subTest(reader=reader):
+                result = self.read_config(config, command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, f"{expected}\n")
+                if warns:
+                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                    self.assertTrue(result.stderr.startswith(f"warning: {config}: build_oom_score_adj="))
+                    self.assertIn("is invalid", result.stderr)
+                    self.assertIn("expected integer -1000..1000", result.stderr)
+                    self.assertTrue(result.stderr.endswith("using 500\n"))
+                else:
+                    self.assertEqual(result.stderr, "")
+
+    def test_absent_file_uses_default_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assert_readers(Path(directory) / "lint.conf", 500, warns=False)
+
+    def test_absent_key_uses_default_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_lint_config(Path(directory), 650, include_adjustment=False)
+            self.assert_readers(config, 500, warns=False)
+
+    def test_python_reader_recovers_committed_values_and_refuses_without_history(self) -> None:
+        from scripts.lint.memory_test_support import commit_config_fixture
+
+        for damage in ("missing file", "missing key", "bad encoding", "", "abc", "2000", "-1001"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), 650)
+                _ = config.write_text("# whole: -1000..1000\nbuild_oom_score_adj=650\n")
+                commit_config_fixture(config)
+                if damage == "missing file":
+                    config.unlink()
+                elif damage == "missing key":
+                    _ = config.write_text("other=1\n")
+                elif damage == "bad encoding":
+                    _ = config.write_bytes(b"\xff")
+                else:
+                    _ = config.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={damage}\n")
+                result = self.read_config(config, self.python_reader)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "650\n")
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn(str(config), result.stderr)
+                self.assertIn("build_oom_score_adj", result.stderr)
+                # A fresh private folder has no revision to recover.
+                empty = Path(directory) / "no-history/lint.conf"
+                empty.parent.mkdir()
+                _ = empty.write_text("# whole: -1000..1000\nbuild_oom_score_adj=bad\n")
+                refused = self.read_config(empty, self.python_reader)
+                # This folder is still under the fixture repo; the file itself has no history.
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("Unusable", refused.stderr)
+
+    def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
+        for value in ("", " # comment", "abc", "2000", "-1001"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), value)
+                self.assert_readers(config, 500, warns=True)
+
+    def test_valid_override_is_silent(self) -> None:
+        for value in (650, -1000, 0, 1000):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), value)
+                self.assert_readers(config, value, warns=False, python=True)
 
 
 class BuildScopeTests(unittest.TestCase):
@@ -101,9 +228,50 @@ class BuildScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "500\n")
 
+    def test_configured_kill_level_reaches_the_scope_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            score = root / "oom-score-adj"
+            command = configured_scope_command(root, write_lint_config(root, 650))
+            result = self.run_scope(
+                ["sh", "-c", 'cat "$1"', "step", str(score)],
+                command.replace(OOM_SCORE_ADJ, str(score)),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "650\n")
+            self.assertEqual(score.read_text(), "650\n")
+
+    def test_legacy_reader_keeps_scope_kill_level_and_step_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader = root / "legacy-reader.sh"
+            _ = reader.write_text("lint_config_enabled() { return 0; }\n"
+                                  + "lint_config_skip_notice() { :; }\n", encoding="utf-8")
+            score = root / "oom-score-adj"
+            command = configured_scope_command(root, write_lint_config(root, 650), reader=reader)
+            result = self.run_scope(["sh", "-c", "exit 7"],
+                                    command.replace(OOM_SCORE_ADJ, str(score)))
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertEqual(score.read_text(), "500\n")
+            self.assertEqual(result.stderr, "")
+
     def test_step_exit_status_passes_through(self) -> None:
         result = self.run_scope(["sh", "-c", "exit 7"])
         self.assertEqual(result.returncode, 7)
+
+    def test_scope_copies_counters_without_python_and_keeps_status_when_io_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "scope"
+            write_cgroup(scope, with_io=False)
+            python_spy(root)
+            command = scope_command().replace(
+                '"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"')
+            result = self.run_scope(["/bin/sh", "-c", "exit 7"], command,
+                                    {**os.environ, "HOME": str(root)})
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertFalse((root / "python-called").exists())
+            self.assertFalse((scope / "io.stat").exists())
 
     def test_scope_writes_cgroup_sidecar_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -167,7 +335,7 @@ buildlog_sample_anon "$1" "$2" "$$"
 '''
             with near_peak.open() as old_snapshot:
                 result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
-                                         str(maximum), str(scope)], capture_output=True, text=True, timeout=10)
+                                         str(maximum), str(scope)], capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), [
                     "100:100 1000", "100:100 1000", "100:100 1060", "100:100 1060", "100:100 1121",
@@ -210,7 +378,7 @@ buildlog_sample_anon "$1" "$2" "$$"
 '''
                 result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
                                          str(maximum), str(scope), str(int(fail_first_peak))],
-                                        capture_output=True, text=True, timeout=10)
+                                        capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = (["100", "100", "between:200:100 1", "200", "200"] if fail_first_peak
                             else ["100", "200", "200"])
@@ -238,15 +406,15 @@ buildlog_sample_anon "$1" "$2" "$$"
                 assert shell.stdout is not None
                 sampler_pid = int(cast(str, shell.stdout.readline()).strip())
                 os.kill(shell.pid, signal.SIGKILL)
-                _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
-                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+                _ = shell.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
                 while time.monotonic() < deadline and self.process_running(sampler_pid):
                     time.sleep(0.05)
                 self.assertFalse(self.process_running(sampler_pid), "sampler survived its parent shell")
             finally:
                 if shell.poll() is None:
                     shell.kill()
-                    _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
+                    _ = shell.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 if sampler_pid and self.process_running(sampler_pid):
                     os.kill(sampler_pid, signal.SIGKILL)
                 if shell.stdout is not None:
@@ -260,10 +428,13 @@ buildlog_sample_anon "$1" "$2" "$$"
             return False
         except PermissionError:
             return True
-        try:
-            return process_start.process_state(pid) is not process_start.ProcessRunState.GONE
-        except process_start.ProcessReadError:
-            return True
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            try:
+                return stat.read_text().rsplit(") ", 1)[1][0] != "Z"
+            except FileNotFoundError:
+                return False
+        return True
 
     def test_unreserved_scoped_step_removes_cgroup_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -315,10 +486,10 @@ class SweepStartupTests(unittest.TestCase):
             )
             os.close(writer)
             try:
-                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
                 events = b""
-                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
                 while True:
                     ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
                     self.assertTrue(ready, "sweep stand-in still holds its pipe")
@@ -332,7 +503,7 @@ class SweepStartupTests(unittest.TestCase):
             finally:
                 if process.poll() is None:
                     process.kill()
-                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
     def test_offload_switch_starts_no_detached_sweep(self) -> None:
@@ -346,6 +517,77 @@ class SweepStartupTests(unittest.TestCase):
 
 
 class BuildAdmissionTests(unittest.TestCase):
+    def clippy_capture(self, root: Path, command: str, config_text: str) -> subprocess.CompletedProcess[str]:
+        cargo = root / "cargo"
+        _ = cargo.write_text('''#!/bin/sh
+printf '%s\\n' "$@" > "$TMPDIR/cargo-argv"
+printf '%s\\n' "${CARGO_MAKEFLAGS-absent}" "${MAKEFLAGS-absent}" "${MFLAGS-absent}" > "$TMPDIR/cargo-pool"
+''')
+        cargo.chmod(0o755)
+        config = root / "lint.conf"
+        _ = config.write_text("clippy=on\n[clippy]\n" + config_text)
+        shell = '''
+buildlog_step_compiles() { return 1; }
+buildlog_begin() { BUILDLOG_START="" BUILDLOG_PEAK=""; }
+buildlog_exec() { "$@"; }
+buildlog_end() { shift 3; printf '%s\\n' "$@" > "$TMPDIR/recorded-argv"; }
+sweep_after_step() { :; }
+"$@" --workspace --all-targets --all-features --keep-going -- -W clippy::pedantic
+'''
+        return self.run_invoke(root, shell, [command], environment={
+            "PATH": str(root) + os.pathsep + os.environ["PATH"],
+            "LINT_CONFIG_READER": str(LINT_CONFIG_READER), "LINT_CONFIG_FILE": str(config),
+            "LINT_INVOKE_SOURCED": "", "BUILDLOG_MEM_RESERVATION": "",
+            "CARGO_MAKEFLAGS": "cargo-pool", "MAKEFLAGS": "make-pool", "MFLAGS": "m-pool",
+        })
+
+    def test_clippy_fix_uses_configured_jobs_and_plain_clippy_keeps_the_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
+            lints = ["--", "-D", "warnings", "-W", "clippy::pedantic"]
+            for jobs in (3, 5):
+                with self.subTest(jobs=jobs):
+                    result = self.clippy_capture(root, "invoke_clippy_fix", f"clippy_fix_jobs={jobs}\n")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    arguments = (root / "cargo-argv").read_text().splitlines()
+                    jobs_index = arguments.index("--jobs")
+                    self.assertEqual(arguments[jobs_index + 1], str(jobs))
+                    del arguments[jobs_index:jobs_index + 2]
+                    self.assertEqual(arguments, ["clippy", "--fix", "--allow-dirty",
+                                                 "--allow-staged", "--allow-no-vcs", *scope, *lints])
+                    self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+                    self.assertIn("--fix", (root / "recorded-argv").read_text().splitlines())
+            plain = self.clippy_capture(root, "invoke_clippy", "clippy_fix_jobs=5\n")
+            self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+            self.assertEqual(plain.stderr, "")
+            self.assertEqual((root / "cargo-argv").read_text().splitlines(), ["clippy", *scope, *lints])
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(),
+                             ["cargo-pool", "make-pool", "m-pool"])
+
+    def test_clippy_fix_warns_once_for_invalid_jobs_and_uses_eight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.clippy_capture(root, "invoke_clippy_fix", "clippy_fix_jobs=bad\n")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+            self.assertIn("clippy_fix_jobs=bad", result.stderr)
+            self.assertIn("using 8", result.stderr)
+            arguments = (root / "cargo-argv").read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--jobs") + 1], "8")
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+
+    def test_clippy_fix_uses_eight_jobs_when_the_key_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.clippy_capture(root, "invoke_clippy_fix", "")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stderr, "")
+            arguments = (root / "cargo-argv").read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--jobs") + 1], "8")
+            self.assertEqual((root / "cargo-pool").read_text().splitlines(), ["absent"] * 3)
+
     def run_invoke(
         self, root: Path, shell: str, arguments: list[str], *,
         environment: dict[str, str] | None = None, cwd: Path | None = None,
@@ -366,13 +608,13 @@ class BuildAdmissionTests(unittest.TestCase):
         isolated.update(environment or {})
         if not terminal:
             return subprocess.run(command, capture_output=True, text=True, check=False,
-                                  env=isolated, cwd=cwd, timeout=TEST_HANG_GUARD_SECS)
+                                  env=isolated, cwd=cwd, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         reader, writer = os.openpty()
         try:
             try:
                 result = subprocess.run(command, stdout=writer, stderr=subprocess.PIPE,
                                         text=True, check=False, env=isolated, cwd=cwd,
-                                        timeout=TEST_HANG_GUARD_SECS)
+                                        timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             finally:
                 os.close(writer)
             chunks: list[bytes] = []
@@ -390,6 +632,74 @@ class BuildAdmissionTests(unittest.TestCase):
                                                b"".join(chunks).decode(), result.stderr)
         finally:
             os.close(reader)
+
+    def test_terminal_and_tee_runs_capture_scope_after_command_before_release(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+buildlog_step_compiles() { return 1; }
+buildlog_begin() {
+    BUILDLOG_START="" BUILDLOG_PEAK="$TMPDIR/peak" BUILDLOG_MEM_RESERVATION=""
+    printf '%s\n' "$TMPDIR/scope" > "$BUILDLOG_PEAK.cgroup"
+}
+buildlog_exec() {
+    /bin/sh -c "$SCOPE_TEST_COMMAND" "$BUILDLOG_PEAK" sh -c \
+        'echo command >> "$TMPDIR/events"; printf "usage_usec 99\n" > "$TMPDIR/scope/cpu.stat"; exit 7' 3>&2
+}
+buildlog_release_memory() {
+    test "$(cat "$BUILDLOG_PEAK.cpu.stat")" = "usage_usec 99" || return 91
+    test ! -s "$BUILDLOG_PEAK.io.stat" || return 92
+    echo capture >> "$events"
+    echo release >> "$events"
+    rm -rf "$TMPDIR/scope"
+}
+nextest_share_end() { :; }
+buildlog_end() { echo "record $1" >> "$events"; }
+sweep_after_step() { :; }
+run_once fixture-step
+'''
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "scope").mkdir()
+                python_spy(root)
+                translated = scope_command().replace(
+                    '\"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)\"', f'"{root / "scope"}"')
+                result = self.run_invoke(root, shell, [], terminal=terminal,
+                                         environment={"SCOPE_TEST_COMMAND": translated})
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertEqual((root / "events").read_text().splitlines(),
+                                 ["command", "capture", "release", "record 7"])
+                self.assertFalse((root / "peak.cgroup").exists())
+                self.assertFalse((root / "python-called").exists())
+                self.assertEqual((root / "peak.cpu.stat").read_text(), "usage_usec 99\n")
+                self.assertEqual((root / "peak.io.stat").read_text(), "")
+
+    def test_linux_target_runs_without_natedev_admission_or_hold(self) -> None:
+        shell = r'''
+buildlog_begin() { BUILDLOG_START="" BUILDLOG_MEM_RESERVATION=""; }
+buildlog_exec() { "$@"; }
+buildlog_end() { :; }
+sweep_after_step() { :; }
+cargo() { printf 'target command ran\n'; }
+buildlog_memory_python() { echo unexpected-admission >&2; return 93; }
+run_once cargo check --workspace
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            holders = root / "holders"
+            holders.mkdir()
+            _ = (holders / "holder.json").write_text('{"holder":"natedev-owner"}')
+            reader = root / "lint_config.sh"
+            _ = reader.write_text("lint_config_enabled() { return 0; }\n")
+            result = self.run_invoke(root, shell, [], environment={
+                "LINT_CONFIG_READER": str(reader),
+                "BUILDLOG_CALLER": "verify-linux", "BUILDLOG_CALL_ID": "remote-step",
+                "BUILD_TARGETS_SCRIPT": "/nonexistent/build_targets.py", "OSTYPE": "linux-gnu",
+            })
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("target command ran\n", result.stdout)
+            self.assertEqual(result.stderr, "")
+            self.assertFalse((root / "buildlog").exists())
 
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [

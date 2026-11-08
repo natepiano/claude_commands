@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Write a production's board snapshot from its durable records."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -11,22 +15,22 @@ import subprocess
 import sys
 import tempfile
 from contextlib import closing
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-import unit_table_cells
+from scripts.production import display_cells
 
-from scripts.direct import phase_table, plan_history
+from scripts.agents import worker_lifecycle
+from scripts.direct import phase_table, plan_history, worker_runs
 from scripts.lib import unit_runs
-from scripts.production import showrunner_tree, production_units, showrunners, unit_run
+from scripts.production import session_staff, showrunners, staff, unit_run, unit_config
+from scripts.shutdown import remote
 
 
 def text(value: object) -> str:
@@ -41,10 +45,12 @@ def fields(value: object) -> dict[str, object]:
     return cast(dict[str, object], value) if isinstance(value, dict) else {}
 
 
-def read_object(path: Path) -> dict[str, object]:
+def read_object(path: Path, *, required: bool = False) -> dict[str, object]:
     try:
         return fields(cast(object, json.loads(path.read_text(encoding="utf-8"))))
     except (OSError, UnicodeError, ValueError):
+        if required:
+            raise
         return {}
 
 
@@ -78,23 +84,13 @@ class BoardClock:
     def trail(self, row: phase_table.PhaseHistory) -> list[list[dict[str, object]]]:
         return [[self.time(target), self.time(stated)] for target, stated in row.eta_trail]
 
-    def gate(self, gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate) -> dict[str, object]:
-        if isinstance(gate, phase_table.NoGate):
-            return {"kind": "none"}
-        result: dict[str, object] = {"kind": "untimed", "gate": gate.gate, "waits_on": gate.waits_on}
-        if isinstance(gate, phase_table.TimedGate):
-            result.update(kind="timed", until=self.time(gate.until))
-        return result
-
     def phase(self, row: phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase) -> dict[str, object]:
         status = "done" if isinstance(row, phase_table.DonePhase) else "open"
-        gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate = phase_table.NoGate()
         start: object = None
         finish: object = None
         took: object = None
         if isinstance(row, phase_table.TodoPhase):
-            gate = row.gate
-            status = "todo" if isinstance(gate, phase_table.NoGate) else "gated"
+            status = "todo"
         if isinstance(row, phase_table.DonePhase | phase_table.TodoPhase):
             if isinstance(row.times, phase_table.CompletedPhaseTiming | phase_table.PredictedPhaseTiming):
                 start, finish = self.time(row.times.start), self.time(row.times.finish)
@@ -105,7 +101,7 @@ class BoardClock:
             took = max(0, self.now - row.started.timestamp())
         return {
             "id": row.phase, "title": row.title, "status": status, "took": took,
-            "start": start, "finish": finish, "gate": self.gate(gate),
+            "start": start, "finish": finish, "gate": {"kind": "none"},
             "fix_done": row.fix_done, "fix_running": row.fix_running, "findings": row.findings,
             "eta": {"first": self.time(row.first_eta) if isinstance(row.first_eta, datetime) else None,
                     "trail": self.trail(row),
@@ -125,9 +121,7 @@ class BoardClock:
             "fix_done": row.fix_done, "fix_running": row.fix_running,
         }
 
-    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish | phase_table.GateBlockedFinish) -> dict[str, object]:
-        if isinstance(finish, phase_table.GateBlockedFinish):
-            return {"kind": "after_gate", "gate": finish.gate, "waits_on": finish.waits_on}
+    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish) -> dict[str, object]:
         if isinstance(finish, phase_table.FinishedAt | phase_table.PredictedFinish):
             return {"kind": "finished" if isinstance(finish, phase_table.FinishedAt) else "predicted", "at": self.time(finish.at)}
         return {"kind": "unknown"}
@@ -142,20 +136,117 @@ def session_directory(run_id: str) -> Path:
     return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
-def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[dict[str, object]]:
-    from scripts.agents.codex_mesh import recorded_turn_settings
+def pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, list[dict[str, object]]]:
+    parents = session_staff.pane_parents(record)
+    if not parents:
+        return {}
+    from scripts.herdr import worker_panes
 
-    roster = read_object(session / "mesh_roster.json")
+    result: dict[staff.StaffId, list[dict[str, object]]] = {}
+    for parent, observed in worker_panes.observe_parents(parents, record).items():
+        rows: list[dict[str, object]] = []
+        for worker in observed:
+            reason = ""
+            pane = ""
+            if isinstance(worker, worker_panes.OpenWorker):
+                state, pane = worker.status.value, worker.pane
+            elif isinstance(worker, worker_panes.StoppedWorker):
+                state, pane = "stopped", worker.pane
+            elif isinstance(worker, worker_panes.ClosedWorker):
+                state = "closed"
+            elif isinstance(worker, worker_panes.ProcessUnknownWorker):
+                state, pane, reason = "unknown", worker.pane, worker.reason
+            else:
+                state, reason = "incomplete", worker.reason
+            if reason:
+                print(f"board_json: {worker.row.name}: {state}: {reason}", file=sys.stderr)
+            rows.append({"slot": worker.row.name, "role": "", "state": state,
+                         "model": "", "effort": "", "doing": ": ".join(part for part in (pane, reason) if part)})
+        result[parent] = rows
+    return result
+
+
+class ReadPaneRows(Enum):
+    CURRENT = "read the current pane workers"
+
+
+class ReadWorkerRuns(Enum):
+    CURRENT = "measure the current worker runs"
+
+
+def board_root() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state"))
+    return Path(os.environ.get("UNIT_BOARD_DIR") or str(state / "unit-board")).expanduser().resolve()
+
+
+def resolve_worker_readings(readings: worker_runs.BoardRunReadings | ReadWorkerRuns,
+                            now: float) -> worker_runs.BoardRunReadings:
+    if isinstance(readings, ReadWorkerRuns):
+        return worker_runs.BoardRunReadings(board_root(), now, worker_runs.read_process_table)
+    return readings
+
+
+@dataclass(frozen=True)
+class PaneRowsUnreadable:
+    reason: str
+
+
+def read_pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable:
+    try:
+        return pane_worker_rows(record)
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"board_json: {error}", file=sys.stderr)
+        return PaneRowsUnreadable(str(error))
+
+
+def workers(session: Path, sources: set[Path], mesh_prefix: str = "", *,
+            record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+            pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT,
+            events: Sequence[Mapping[str, object]] = (),
+            readings: worker_runs.BoardRunReadings | ReadWorkerRuns = ReadWorkerRuns.CURRENT) -> list[dict[str, object]]:
+    try:
+        record = staff.snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+        state_path = session / unit_runs.STATE_FILE
+        transport = unit_runs.run_pin(session)
+        mesh_pinned = transport == "mesh"
+        if not mesh_pinned:
+            pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
+            if isinstance(pane_rows, PaneRowsUnreadable):
+                return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": pane_rows.reason}]
+        owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = unit_runs.RunOwnerUnrecorded("run has no unit staff owner")
+        if state_path.exists():
+            state = cast(object, json.loads(state_path.read_text(encoding="utf-8")))
+            if not isinstance(state, dict):
+                raise ValueError(f"{state_path}: expected an object")
+            owner = unit_runs.run_owner(cast(dict[str, object], state), record)
+            if not mesh_pinned and isinstance(owner, staff.StaffRow) and isinstance(pane_rows, dict) and owner.id in pane_rows:
+                sources.update((state_path, session, session / "board.log"))
+                run_readings = resolve_worker_readings(readings, plan_history.now_epoch())
+                rows = worker_runs.observe_pane_rows(session, pane_rows[owner.id], record, owner.id, events, run_readings)
+                sources.update(run_readings.sources)
+                if isinstance(readings, ReadWorkerRuns):
+                    run_readings.save()
+                return rows
+        if transport == "herdr":
+            reason = owner.reason if isinstance(owner, unit_runs.RunOwnerUnrecorded) else f"{owner.name}: no local pane parent"
+            raise staff.StaffUnreadable(f"{session}: {reason}")
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"board_json: {session}: {error}", file=sys.stderr)
+        return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
+    try:
+        roster = read_object(session / "mesh_roster.json", required=mesh_pinned)
+    except (OSError, ValueError) as error:
+        return [{"name": "", "slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
     sources.update(metadata)
     by_name: dict[str, dict[str, object]] = {}
     prefixes = {mesh_prefix} if mesh_prefix else set[str]()
     for path in metadata:
-        record = read_object(path)
-        record["slot"] = text(record.get("slot")) or path.stem.removeprefix("impl_worker_")
-        by_name[text(record.get("name"))] = record
-        name, slot = text(record.get("name")), text(record.get("slot"))
+        entry = read_object(path)
+        entry["slot"] = text(entry.get("slot")) or path.stem.removeprefix("impl_worker_")
+        by_name[text(entry.get("name"))] = entry
+        name, slot = text(entry.get("name")), text(entry.get("slot"))
         if name.endswith(f"-{slot}"):
             prefixes.add(name[: -len(slot) - 1])
 
@@ -165,12 +256,12 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
                 return name[len(prefix) + 1:]
         return name
 
-    by_slot = {short_slot(text(record.get("slot"))): record for record in by_name.values()}
+    by_slot = {short_slot(text(entry.get("slot"))): entry for entry in by_name.values()}
 
     def slot_for(name: str) -> str:
         meta = by_name.get(name, {})
-        record = fields(roster.get(name))
-        return short_slot(text(meta.get("slot")) or text(record.get("slot")) or name)
+        entry = fields(roster.get(name))
+        return short_slot(text(meta.get("slot")) or text(entry.get("slot")) or name)
 
     selected: dict[str, str] = {}
     for name in roster:
@@ -192,13 +283,15 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
             newest[slot_for(match[1])] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
     result: list[dict[str, object]] = []
     for slot, name in selected.items():
-        record = fields(roster[name])
+        entry = fields(roster[name])
         meta = by_name.get(name, {}) or by_slot.get(slot, {})
-        status = text(record.get("status"))
-        settings = recorded_turn_settings(record)
+        status = text(entry.get("status"))
+        settings = worker_lifecycle.recorded_turn_settings(entry)
         model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
         state = {"done": "idle"}.get(status, status)
-        result.append({"slot": slot, "role": text(record.get("role")), "state": state,
+        task = text(entry.get("task"))
+        role = text(entry.get("role")) or (task.removeprefix("direct.") if task.startswith("direct.") else "")
+        result.append({"name": name, "slot": slot, "role": role, "state": state,
                        "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
                        "effort": settings.effort,
                        "doing": newest.get(slot, "")})
@@ -230,7 +323,7 @@ def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: pha
     return result
 
 
-def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
+def stage(events: list[dict[str, object]], state: str, current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
     events = [event for event in events if isinstance(current, phase_table.OpenPhase)
               and event.get("phase_instance_id") == current.instance_id]
     open_passes: dict[str, dict[str, object]] = {}
@@ -260,18 +353,13 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
             repairing = False
     if repairing:
         return f"Repair round {dispatched}"
-    step = unit_table_cells.open_step(events)
-    if isinstance(step, unit_table_cells.OpenStep):
+    step = display_cells.open_step(events)
+    if isinstance(step, display_cells.OpenStep):
         return step.label
     if isinstance(current, phase_table.OpenPhase):
         return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
     if state == "run-finished":
         return "Run done"
-    for row in rows:
-        if isinstance(row, phase_table.TodoPhase) and not isinstance(row.gate, phase_table.NoGate):
-            return f"Waiting on {row.gate.gate}"
-        if not isinstance(row, phase_table.DonePhase):
-            break
     return "Standing by"
 
 
@@ -282,7 +370,7 @@ def is_standing_plan(plan: Path) -> bool:
         return False
 
 
-def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> UnitTicketProgress:
+def unit_ticket_progress(worktree: Path, unit_id: staff.StaffId, sources: set[Path]) -> UnitTicketProgress:
     try:
         common = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -301,39 +389,42 @@ def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> 
                 """SELECT
                     (SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'),
                     (SELECT id FROM tickets WHERE unit = ? AND state IN ('assigned', 'checkpointed')
-                     ORDER BY created_at DESC LIMIT 1)""", (unit_name, unit_name),
+                     ORDER BY created_at DESC LIMIT 1)""", (unit_id, unit_id),
             ).fetchone())
             return UnitTicketProgress(row[0], TicketInProgress(row[1]) if row[1] else NoTicketInProgress())
     except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
         return UnitTicketProgress()
 
 
-def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[str, object]:
-    value = production_units.cell_value
-    worktree = Path(value(cells.get("Worktree", ""))).expanduser().resolve()
-    plan_cell = value(cells.get("Plan", ""))
-    plan = plan_history.resolve_plan_path(worktree, plan_cell.split(" ", 1)[0])
+def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str, clock: BoardClock, sources: set[Path],
+         *, resolver: session_staff.RowResolver | None = None,
+         pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT,
+         readings: worker_runs.BoardRunReadings | ReadWorkerRuns = ReadWorkerRuns.CURRENT) -> dict[str, object]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    worktree = worktree.expanduser().resolve()
+    plan = plan_history.resolve_plan_path(worktree, plan_text)
     sources.add(plan)
     sources.add(plan_history.history_root() / "runs")
     if not (plan_history.history_root() / "runs").exists():
         sources.add(plan_history.history_root())
     sources.update(unit_runs.run_roots())
-    found = unit_run.local_run(plan_history.history_root(), str(worktree))
+    found = unit_run.local_run(plan_history.history_root(), str(worktree), record=resolver.record)
     events: list[dict[str, object]] = []
     worker_rows: list[dict[str, object]] = []
     if isinstance(found, unit_run.RunFound):
         path = plan_history.history_root() / "runs" / f"{found.run_id}.jsonl"
         sources.add(path)
-        events = unit_table_cells.run_events(path)
+        events = display_cells.run_events(path)
         worker_rows = workers(session_directory(found.run_id), sources,
-                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40])
+                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40],
+                              record=resolver.record, pane_rows=pane_rows, events=events, readings=readings)
     header = events[0] if events else {}
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))
     record_plan = plan_history.resolve_plan_path(worktree, run_plan) if run_plan else plan
     sources.add(record_plan)
-    sources.update(plan_history.plan_runs(record_plan))
+    sources.update(plan_history.plan_runs(record_plan, record=resolver.record))
     try:
-        record = phase_table.build_plan(record_plan)
+        record = phase_table.build_plan(record_plan, resolver=resolver)
     except phase_table.NoPlan:
         record = phase_table.PhaseRecord(record_plan, datetime.fromtimestamp(clock.now, clock.zone), phase_table.NoOpenPhase(), [], phase_table.UnknownFinish(), phase_table.NothingToStart("no plan"))
     if not record.phases:
@@ -342,9 +433,8 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
-    unit_name = value(cells.get("Unit", ""))
     standing = is_standing_plan(record.plan)
-    tickets = unit_ticket_progress(worktree, unit_name, sources) if standing else UnitTicketProgress()
+    tickets = unit_ticket_progress(worktree, unit_id, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
         current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
@@ -361,43 +451,110 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
         else:
             current_phase = {"kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title}
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
-    return {"key": unit_name.removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
+    return {"key": unit_name, "plan": plan_text if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
-            "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
+            "stage": stage(events, state, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 
-def checkout(document: Path) -> Path:
-    return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
+@dataclass(frozen=True)
+class BoardProduction:
+    owner: staff.StaffRow
+    runner: showrunners.Showrunner
 
 
-def resolve(cwd: str, production: str, session: str = "") -> list[showrunners.Showrunner]:
-    registered = showrunners.registered_showrunners()
-    if not production:
-        document = showrunners.production_of(session)
-        if document is not None:
-            production = next((runner["slug"] for runner in registered
-                               if Path(runner["doc"]).expanduser().resolve() == document.expanduser().resolve()), "")
-    if not production:
-        directory = Path(cwd).expanduser().resolve()
-        production = next((runner["slug"] for runner in registered
-                           if directory.is_relative_to(checkout(Path(runner["doc"])))), "")
-    by_slug = {runner["slug"]: runner for runner in registered}
-    if production not in by_slug:
-        return []
-    return [by_slug[slug] for slug in [production, *showrunner_tree.descendants_of(production)] if slug in by_slug]
+@dataclass(frozen=True)
+class BoardSubtree:
+    record: staff.StaffSnapshot
+    runners: tuple[BoardProduction, ...]
 
 
-def build(runner: showrunners.Showrunner) -> dict[str, object]:
+@dataclass(frozen=True)
+class NoBoardSubtree:
+    pass
+
+
+def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree:
+    try:
+        record = staff.snapshot()
+        runners: dict[staff.StaffId, showrunners.Showrunner] = {}
+        for owner in staff.active(record, "showrunner"):
+            timer = showrunners.timer_for(owner, record)
+            if isinstance(timer, showrunners.NoTimer):
+                continue
+            runners[owner.id] = showrunners.Showrunner(
+                name=owner.name, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
+                zone=timer.zone)
+        if production:
+            root = next((row for row in staff.active(record, "showrunner")
+                         if row.name == production and row.id in runners), None)
+        else:
+            root = record.by_current_session(session)
+            while root is not None and root.kind != "showrunner":
+                root = record.by_id(root.parent.id) if isinstance(root.parent, staff.ReportsTo) else None
+    except staff.StaffUnreadable as error:
+        print(f"board_json: {error}", file=sys.stderr)
+        return NoBoardSubtree()
+    if root is None or root.id not in runners:
+        return NoBoardSubtree()
+    boards: list[BoardProduction] = []
+    level = [root]
+    while level:
+        for row in level:
+            boards.append(BoardProduction(row, runners[row.id]))
+        level = sorted((child for row in level for child in staff.active(record, "showrunner")
+                        if child.parent == staff.ReportsTo(row.id) and child.id in runners),
+                       key=lambda row: row.name)
+    return BoardSubtree(record, tuple(boards))
+
+
+def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
+          resolver: session_staff.RowResolver | None = None,
+          pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT,
+          readings: worker_runs.BoardRunReadings | ReadWorkerRuns = ReadWorkerRuns.CURRENT) -> dict[str, object]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(record)
+    pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
     clock = BoardClock(ZoneInfo(runner["zone"]), plan_history.now_epoch())
+    run_readings = resolve_worker_readings(readings, clock.now)
     document = Path(runner["doc"]).expanduser().resolve()
     sources = {document}
-    rows = production_units.live_unit_table(document.read_text(encoding="utf-8").splitlines(), runner["slug"])
+    owner = record.by_doc(remote.local_machine(), document)
+    units: list[dict[str, object]] = []
+    if owner is None:
+        print(f"board_json: {runner['name']}: the production document is not recorded", file=sys.stderr)
+    for row in staff.active(record, "unit"):
+        if owner is None or row.parent != staff.ReportsTo(owner.id):
+            continue
+        tree = resolver.unit_worktree(row)
+        try:
+            config = resolver.unit_config(row)
+        except ValueError as error:
+            config = session_staff.ConfigMissing(str(error))
+        doc = resolver.production_doc(row)
+        problems: list[str] = []
+        if not isinstance(tree, staff.PresentWorktree):
+            problems.append("the worktree is not recorded")
+        if not isinstance(config, unit_config.UnitConfig):
+            problems.append(getattr(config, "reason", "the unit configuration is unavailable"))
+        if not isinstance(doc, session_staff.ProductionDoc):
+            problems.append(doc.reason)
+        if problems:
+            reason = "; ".join(dict.fromkeys(problems))
+            print(f"board_json: {row.name}: {reason}", file=sys.stderr)
+            units.append({"key": row.name, "state": "unavailable", "problem": reason})
+        elif isinstance(config, unit_config.UnitConfig) and isinstance(tree, staff.PresentWorktree):
+            plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
+            units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver,
+                              pane_rows=pane_rows, readings=run_readings))
+    if isinstance(readings, ReadWorkerRuns):
+        run_readings.save()
+    live = any(fields(worker).get("state") in ("working", "waiting on run") for row in units
+               for worker in cast(list[object], row.get("workers", [])))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
-    return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
+    return {"production": runner["name"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
-            "units": [unit(cells, clock, sources) for cells in rows], "sources": existing_sources(sources)}
+            "units": units, "sources": existing_sources(sources), "live": live}
 
 
 def write_board(path: Path, board: dict[str, object]) -> None:
@@ -415,21 +572,31 @@ def write_board(path: Path, board: dict[str, object]) -> None:
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group(required=True)
-    _ = group.add_argument("--cwd", default="")
-    _ = group.add_argument("--production", default="")
     _ = parser.add_argument("--session", default="")
+    _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
-    runners = resolve(cast(str, args.cwd), cast(str, args.production), cast(str, args.session))
-    root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
+    session, production = cast(str, args.session), cast(str, args.production)
+    root = board_root()
+    if not session and not production:
+        parser.error("--session or --production is required")
+    subtree = resolve(production, session)
     files: list[str] = []
-    for runner in runners:
-        path = root / f"{runner['slug']}.json"
-        write_board(path, build(runner))
-        files.append(str(path))
+    if isinstance(subtree, BoardSubtree):
+        resolver = session_staff.RowResolver(subtree.record)
+        pane_rows = read_pane_worker_rows(subtree.record)
+        readings = worker_runs.BoardRunReadings(root, plan_history.now_epoch(), worker_runs.read_process_table)
+        for production_board in subtree.runners:
+            path = root / f"{production_board.owner.id}.json"
+            write_board(path, build(production_board.runner, record=subtree.record, resolver=resolver,
+                                    pane_rows=pane_rows, readings=readings))
+            files.append(str(path))
+        readings.save()
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
-    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
-                         for runner in showrunners.registered_showrunners())
+    if isinstance(subtree, BoardSubtree):
+        for row in staff.active(subtree.record, "showrunner"):
+            timer = showrunners.timer_for(row, subtree.record)
+            if isinstance(timer, showrunners.TimerRegistration):
+                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / row.id)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

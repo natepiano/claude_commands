@@ -14,10 +14,11 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
-import codex_daemon
+from scripts.message import codex_daemon
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-from codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
+from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
 
 
 class CodexDaemonTests(unittest.TestCase):
@@ -27,6 +28,18 @@ class CodexDaemonTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
+
+    def test_queue_default_uses_the_current_configured_timeout(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        daemon = codex_daemon.CodexDaemon(self.root, self.root / "daemon.sock")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for seconds in (0.15, 0.35):
+                _ = (config / "codex_daemon.conf").write_text(
+                    f"# range: 0.001..\nqueue_timeout_seconds={seconds}\n")
+                with mock.patch.object(codex_daemon, "_queue_socket", return_value=codex_daemon.Queued()) as queue:
+                    self.assertIsInstance(codex_daemon.queue(daemon, "thread", "body"), codex_daemon.Queued)
+                queue.assert_called_once_with(daemon.socket, "thread", "body", seconds)
 
     def test_loaded_sessions_initializes_pages_and_reads_each_thread(self) -> None:
         methods: list[str] = []
@@ -120,7 +133,7 @@ class CodexDaemonTests(unittest.TestCase):
 
         socket_path = self.root / "notifications.sock"
         with FakeDaemon(socket_path, conversation):
-            with mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.05):
+            with mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.05):
                 found = codex_daemon.loaded_sessions(socket_path)
 
         self.assertEqual(
@@ -143,7 +156,7 @@ class CodexDaemonTests(unittest.TestCase):
 
         socket_path = self.root / "alternating-cursors.sock"
         with FakeDaemon(socket_path, conversation):
-            with mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.1):
+            with mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.1):
                 found = codex_daemon.loaded_sessions(socket_path)
 
         self.assertEqual(requested_cursors, ["", "A", "B"])
@@ -251,7 +264,7 @@ class CodexDaemonTests(unittest.TestCase):
                         reply(connection, initialize, {})
                         self.assertEqual(receive_frame(connection)["method"], "initialized")
                         self.assertEqual(receive_frame(connection)["method"], "thread/queue/add")
-                    connection.settimeout(2)
+                    connection.settimeout(TEST_HANG_GUARD_SECS)
                     self.assertEqual(connection.recv(1), b"")
 
                 with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {

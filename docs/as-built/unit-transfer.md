@@ -4,10 +4,10 @@ Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
 
-`/showrunner:transfer_unit <unit> <to production doc>` (`commands/showrunner/transfer_unit.md`)
+`/showrunner:transfer_unit <unit> <receiving showrunner name>` (`commands/showrunner/transfer_unit.md`)
 moves one natedev unit director from one production to another. The giving showrunner runs it. The
 script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `apply` and `verify`
-(user, 2026-10-21: "yes i want this"). The first use is hierarchies-unit from build-followups to sdlc.
+(user, 2026-10-21: "yes i want this"). The first use is hierarchies from build-followups to sdlc.
 
 ## What stays and what moves
 
@@ -15,24 +15,18 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
   unmerged commits.
 - The Units row moves from the giving doc to the receiving doc. It is written under the receiving
   doc's own columns, and a column the giving row lacks gets `—`. The row is not marked retired.
-- The plan's `> **Production:**` header names the receiving production and doc. The unit reads its
-  production from that header, so the header commit goes on the unit branch, and the branch is
-  pushed. The plan's prose is history and does not change. Work in progress stays: the commit is
-  built from HEAD's plan in a temporary index (`commit-tree`, then `update-ref`), and the same header
-  change then goes into the real index and the worktree file (showrunner, 2026-10-21).
-- The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
-  the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
-  entry is forgotten, because the relaunch records a new pane.
+- The unit's staff parent selects the receiving production.
+  The parent row's `name` gives the production name. Its `doc.path` gives the document.
+  The plan stays unchanged.
+- The stall-watch stretch and its prompt file keep the unit staff id. The unit owns
+  `review`; a concurrent review uses `review2`. Their threads move with the unit's workers.
+  The old pane entry is forgotten, because the relaunch records a new pane.
 - Each held design the unit holds (`scripts/astra/design_roles.py`) takes the receiving production as
   holder (`design_roles.move_holder`), so resume, rebind and end accept the relaunched unit. The role
   threads, role names, checkout paths and saved prompts stay.
-- The shutdown record's host takes the receiving `production` and `doc`. A herdr session name of
-  the form `<giving slug>-<stem>` takes `<receiving slug>-<stem>`. Its `renamed` field holds the
-  moved note, which `restart.restart_note` puts first in the relaunched session's prompt. The note
-  names the new production doc, merge branch and showrunner address command.
-- The relaunch runs `add_unit.py` with the record's doc, so the unit's marks
-  (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`) name the receiving production. Status, dailies, panes and
-  merges find the unit there.
+- The staff row names the receiving parent. The current session ID stays the same.
+- The relaunch runs `shutdown.py restart --only ID`.
+  Restart reads the current session and worktree from staff. It sends no work prompt.
 - The phase note follows at the unit's next refresh. The giving showrunner's report state keeps its
   rows as history.
 
@@ -54,13 +48,13 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 apply works under the production lock in `unit_move` and saves the journal `transfer_unit.json` in
 the giving production's state folder before it changes anything. A rerun resumes at the step that
 refused. The journal keeps the request and progress, but not the productions' checkout or doc
-paths. Resume and verify find the giving doc through its current update timer and read the
-receiving doc supplied on the command line, just as a fresh apply does. Both checkouts come from
+paths. Resume and verify find the giving doc through its staff row and read the
+receiving doc from its staff row, just as a fresh apply does. Both checkouts come from
 those docs. Old journals' stored locations are ignored, so a checkout move does not strand an
 open transfer; the receiving doc must still name the journal's receiving production.
-Each step except stop, relaunch and verify runs under both merge locks, taken in slug order,
-and runs the preflight again first. Stop is `rename_unit.stop_unit` through the shared
-`rename_unit.StopTarget` protocol: a transfer keeps the id, so the old and new ids are the same.
+Each step except stop, relaunch and verify runs under both merge locks, taken in staff name order.
+Each step repeats the preflight. The transfer uses `staff.move` to change the parent.
+It calls `staff_move.move_unit` for the folder and branch move.
 
 The doc commits use `git commit --only` on the doc, and an earlier run's commit is adopted by its
 subject. If a run stops between a row write and its commit, the journaled step accepts only
@@ -70,8 +64,7 @@ row commit does (user, 2026-10-08). The unit takes the receiving merge branch at
 
 ## verify
 
-verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
-not name the receiving production, the stretch is still under the giving slug, the shutdown record
-does not name the receiving production, the unit is not live under the receiving slug, a session
-still carries the giving marks, a giving reviewer is still leased to the unit, or a held design
+verify fails when the receiving doc has no row, the giving doc still has one, the stretch is still under the giving showrunner name, the staff row
+does not name the receiving production, the unit is not live under the receiving showrunner name, a session
+still carries the giving marks, or a held design
 still names the giving production as the unit's holder (`design_roles.holder_failures`).

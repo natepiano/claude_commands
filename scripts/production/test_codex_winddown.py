@@ -1,6 +1,10 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import json
 import os
 import io
@@ -12,21 +16,24 @@ import tempfile
 import unittest
 from collections import Counter
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import broadcast
-import codex_winddown
-import fake_unit_host
-import fake_showrunner
-from scripts.production import showrunners
-import roster
-from process_table import Process
-from sessions import SessionRecord
+from scripts.production import broadcast
+from scripts.production import codex_winddown
+from scripts.production import fake_unit_host
+from scripts.production import fake_showrunner
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import herdr, worker_panes
+from scripts.message import process_table, roster
+from scripts.message.process_table import Process
+from scripts.message.sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -49,6 +56,20 @@ class NoticeRetryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(codex_winddown, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(codex_winddown, "instances", return_value=["production"]))
         _ = self.enterContext(mock.patch.object(broadcast, "SEND", self.state / "fake-send.py"))
+
+    def test_status_reports_partial_discovery_after_rendering_healthy_work(self) -> None:
+        runner = Showrunner(session="healthy", socket="/fixture.sock", name="healthy", zone="UTC", doc="fixture.md")
+        partial = showrunners.ShowrunnerDiscovery([runner], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        output = io.StringIO()
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(codex_winddown, "current_counts", return_value={"healthy": 1}),
+              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy"]) as units,
+              mock.patch.object(codex_winddown, "read_projections", return_value={}),
+              redirect_stdout(output)):
+            self.assertEqual(codex_winddown.main(["status"]), 1)
+        units.assert_called_once_with(runner)
+        self.assertIn("healthy", output.getvalue())
 
     def test_quiet_claim_is_retried_after_a_stop_before_delivery(self) -> None:
         class Killed(BaseException):
@@ -94,7 +115,7 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return [sys.executable, str(self.state / "fake-send.py")]
 
-        with (mock.patch("push_texts.user_send_argv", side_effect=prepare),
+        with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
             codex_winddown.announce_quiet(0)
         self.assertFalse((self.state / codex_winddown.QUIET).exists())
@@ -109,8 +130,8 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return {}
 
-        runner = Showrunner(session="runner", socket="/fixture", slug="show", zone="UTC", doc="doc.md")
-        with (mock.patch.object(showrunners, "named", return_value=runner),
+        runner = Showrunner(session="runner", socket="/fixture", name="show", zone="UTC", doc="doc.md")
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
               mock.patch.object(codex_winddown, "live_unit_names", return_value=["unit"]),
               mock.patch.object(codex_winddown, "current_counts", return_value=Counter[str]()),
               mock.patch.object(codex_winddown, "refresh", side_effect=refresh),
@@ -218,7 +239,7 @@ class NoticeRetryTests(unittest.TestCase):
                 self.assertEqual(codex_winddown.read_projections(), {
                     "unit": codex_winddown.ZeroNoticeOwed(codex_winddown.ProjectionAnswerOwed()),
                 })
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", answer), 0)
                 self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ZeroNoticeOwed(expected)})
                 with mock.patch.object(broadcast, "send", return_value="") as send:
@@ -281,7 +302,7 @@ class NoticeRetryTests(unittest.TestCase):
                         showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
                     mock.call("unit", "runner", zero_notice),
                 ])
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return observed
 
@@ -299,7 +320,7 @@ class NoticeRetryTests(unittest.TestCase):
 
     def test_an_eta_recorded_during_ask_is_not_replaced_with_answer_owed(self) -> None:
         def answer_during_send(_unit: str, _sender: str, _message: str) -> str:
-            with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+            with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                 self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return ""
 
@@ -334,7 +355,7 @@ class CountTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
             mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(broadcast, "broadcast", return_value=[]) as send_groups,
             mock.patch.object(broadcast, "report", return_value=True) as report,
@@ -373,7 +394,7 @@ class CountTests(unittest.TestCase):
             mock.patch.object(roster, "machine_name", return_value="fixture"),
             mock.patch.object(roster.remote, "other_machine", return_value="mac"),
             mock.patch.object(broadcast, "SEND", root / "record-send.py"),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(subprocess, "run", new=run), redirect_stdout(output),
         ):
@@ -420,13 +441,13 @@ class CountTests(unittest.TestCase):
             tmux="",
             formerNames=[],
         )
-        runner = Showrunner(session="hana", socket="/tmp/newer.sock", slug="show", zone="UTC", doc="doc.md")
+        runner = Showrunner(session="hana", socket="/tmp/newer.sock", name="show", zone="UTC", doc="doc.md")
 
         with (
             mock.patch.object(codex_winddown, "STATE", state),
             mock.patch.object(codex_winddown, "announce", return_value=True),
             mock.patch.object(codex_winddown, "live_sessions", return_value=[newer, older, unnamed]),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[runner]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
             mock.patch.object(codex_winddown, "start_count", return_value=True) as start_count,
             mock.patch.object(
                 broadcast,
@@ -442,7 +463,7 @@ class CountTests(unittest.TestCase):
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
-                 30: Process(30, 20, "bash", "bash implement.sh"), 40: Process(40, 30, "python3", f"{MESH} start"),
+                 30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "python3", f"{MESH} start"),
                  50: Process(50, 1, "codex", "codex exec")}
         counts = codex_winddown.agent_counts(table, {10: "showrunner", 20: "trunk"})
         self.assertEqual(counts, {"trunk": 1, codex_winddown.NO_SESSION: 1})
@@ -503,36 +524,32 @@ class CountTests(unittest.TestCase):
 class MessageTests(unittest.TestCase):
     root: Path = Path()
     environment: dict[str, str] = {}
+    timers: tuple[Path, Path] = (Path(), Path())
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ("notifier", "sessions"):
             (self.root / name).mkdir()
-        # hana's one unit: a row of its production doc, and a herdr pane marked as that unit.
+        # hana's one unit: a staff row, and a herdr pane marked as that unit.
         doc = self.root / "show-production.md"
-        _ = doc.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                      "| --- | --- | --- | --- | --- | --- |",
-                                      "| trunk-unit | docs/plan.md | /tmp/no-worktree-of-trunk | trunk | — | — |")),
-                           encoding="utf-8")
+        _ = doc.write_text("# Show\n", encoding="utf-8")
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
             "always": [],
         }), encoding="utf-8")
         # A second showrunner whose production has no units.
         other = self.root / "other-production.md"
-        _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                        "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
+        _ = other.write_text("# Other\n", encoding="utf-8")
         # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
-        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
-        _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
         socket_dir = Path(self.enterContext(short_socket_directory()))
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)
             listener.bind(str(socket_dir / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
+                "pid": pid, "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
+                    fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"), "name": name, "updatedAt": 1,
                 "tmux": "",
                 "messagingSocketPath": str(socket_dir / f"{name}.sock"),
             }), encoding="utf-8")
@@ -563,9 +580,15 @@ class MessageTests(unittest.TestCase):
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        _ = unit_membership("show", "trunk-unit")
+        self.timers = (
+            fake_showrunner.write_timer(self.root / "notifier", "show", "b861068b-66ee-573d-b3be-ec6d4a321e71", "America/Los_Angeles", doc),
+            fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other),
+        )
+        runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
+        _ = unit_membership("show", "trunk")
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
-            fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
+            labeled_host("trunk", "w1:p1", "trunk", production_name="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 
@@ -573,7 +596,7 @@ class MessageTests(unittest.TestCase):
         _ = (self.root / "ps").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, capture_output=True,
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.environment, capture_output=True,
                               text=True, check=False)
 
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
@@ -582,16 +605,18 @@ class MessageTests(unittest.TestCase):
         lines = done.stdout.splitlines()
         self.assertEqual(lines[-1], "hana: counting every 2 minutes")
         self.assertCountEqual(lines[:-1], [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
-            self.assertIn(f"send --to session:id-{session} --from natedev --here --text Codex wind-down, from the user", log)
+            identity = (fixture_runtime_id("showrunner::show") if session == "hana" else
+                        fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"))
+            self.assertIn(f"send --to session:{identity} --from natedev --here --text Codex wind-down, from the user", log)
         self.assertEqual(log.count('a "Codex count" message arrives'), 1)
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
         self.assertEqual(log.count("Sent directly to showrunners and unit directors on fixture and mac; do not pass it on."), 2)
-        self.assertIn("notifier new codex-count-hana --every 2 --to session:id-hana", log)
+        self.assertIn("notifier new codex-count-hana --every 2 --to session:b861068b-66ee-573d-b3be-ec6d4a321e71", log)
         prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
         self.assertIn(f"{SCRIPT} count hana`", prompt)
 
@@ -602,14 +627,14 @@ class MessageTests(unittest.TestCase):
         lines = done.stdout.splitlines()
         self.assertEqual(lines[0], "hana: count stopped")
         self.assertCountEqual(lines[1:], [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         # Only the showrunners' own update timers are left: every count is gone.
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
-                         ["showrunner-show", "showrunner-zz-gone"])
+                         sorted(path.name for path in self.timers))
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("send --to session:id-hana --from natedev --here --text All clear, from the user", log)
+        self.assertIn("send --to session:b861068b-66ee-573d-b3be-ec6d4a321e71 --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
@@ -617,8 +642,8 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
         self.assertCountEqual(done.stdout.splitlines(), [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
@@ -664,6 +689,76 @@ class MessageTests(unittest.TestCase):
         self.assertIn("Wind-down: off", self.run_script("status").stdout)
         _ = self.run_script("start", "--from", "natedev")
         self.assertIn("Wind-down: on for hana", self.run_script("status").stdout)
+
+
+class PaneCountTests(StaffTestCase):
+    def test_five_states_count_only_working_codex_and_name_uncertainty(self) -> None:
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        worker = fixture_worker("reader", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        cases: tuple[tuple[worker_panes.WorkerPane, int, str], ...] = (
+            (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.WORKING), 1, ""),
+            (worker_panes.StoppedWorker(worker, "p1", "t1"), 0, ""),
+            (worker_panes.ClosedWorker(worker), 0, ""),
+            (worker_panes.ProcessUnknownWorker(worker, "p1", "t1", "process unreadable"), 0, "unknown: process unreadable"),
+            (worker_panes.UncertainWorker(worker, "pane read incomplete"), 0, "incomplete: pane read incomplete"),
+            (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.IDLE), 0, ""),
+        )
+        for state, expected, reason in cases:
+            error = io.StringIO()
+            with self.subTest(state=state), mock.patch.object(unit_runs, "parent_transport", return_value="herdr"), mock.patch.object(
+                    worker_panes, "observe_parents", return_value={parent.id: [state]}), mock.patch.object(
+                    codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                    process_table, "snapshot", return_value={}), mock.patch.object(
+                    staff, "snapshot", wraps=staff.snapshot) as snapshot, redirect_stderr(error):
+                counts = codex_winddown.current_counts()
+            self.assertEqual(counts[parent.name], expected)
+            self.assertEqual(snapshot.call_count, 1)
+            if reason:
+                self.assertIn("reader", error.getvalue())
+                self.assertIn(reason, error.getvalue())
+
+    def test_mesh_counts_keep_process_ownership_without_a_pane_read(self) -> None:
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        worker = fixture_worker("reader", parent.id)
+        table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "codex", "codex exec task")}
+        with mock.patch.object(unit_runs, "parent_transport", return_value="mesh"), mock.patch.object(
+                worker_panes, "observe_parents", side_effect=AssertionError("mesh pane read")), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[{"pid": 10, "name": "mesh-unit"}]), mock.patch.object(
+                process_table, "snapshot", return_value=table):
+            counts = codex_winddown.current_counts()
+        self.assertEqual(counts, {"mesh-unit": 1})
+        self.assertFalse((self.root / "worker_transport").exists())
+        self.assertNotIn(worker.name, counts)
+
+    def test_unreachable_owner_names_the_cause(self) -> None:
+        error = io.StringIO()
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("natedev not reached", error.getvalue())
+        self.assertEqual(counts.total(), 0)
+
+    def test_malformed_staff_names_the_cause(self) -> None:
+        write_text_atomic(self.staff_file, "not json")
+        error = io.StringIO()
+        with mock.patch.object(codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("staff", error.getvalue())
+        self.assertEqual(counts.total(), 0)
+
+    def test_missing_parent_names_the_worker_and_member(self) -> None:
+        missing = staff.native_id(fixture_runtime_id("absent-count-parent"))
+        worker = staff.StaffRow(staff.native_id(fixture_runtime_id("count-orphan")), "worker", "reader", staff.ReportsTo(missing), current_session=staff.native_id(fixture_runtime_id("count-orphan")))
+        error = io.StringIO()
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((worker,))), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("reader", error.getvalue())
+        self.assertIn(missing, error.getvalue())
+        self.assertEqual(counts.total(), 0)
 
 
 if __name__ == "__main__":

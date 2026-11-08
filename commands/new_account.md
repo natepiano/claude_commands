@@ -1,5 +1,5 @@
 ---
-description: Add a Claude or Codex account and wire it into every system that names accounts.
+description: Add a Claude or Codex account.
 argument-hint: 'claudeN [login] | codexN <login>'
 ---
 

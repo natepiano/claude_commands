@@ -1,5 +1,5 @@
 ---
-description: Change how often a running production's scheduled updates come, and restart its notifier instance.
+description: Set the production report interval.
 argument-hint: "[minutes]"
 ---
 

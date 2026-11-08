@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Publish and refresh files at short review links on this machine's tailnet."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -13,23 +17,28 @@ import secrets
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from string import Template, ascii_lowercase, digits
+from string import Template
 from typing import cast
 from urllib.parse import quote
 
-PORT = 8765
+from scripts.lib import atomic_file, conf
+
+
+SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
-    return folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+    return (folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+            or atomic_file.temporary_target(folded) is not None)
 
 
 def review_root() -> Path:
-    return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+    from scripts.production import change_routing
+
+    return change_routing.review_root()
 
 
 def link_host() -> str:
@@ -37,28 +46,41 @@ def link_host() -> str:
     if override := os.environ.get("REVIEW_LINKS_HOST"):
         return override.rstrip(".")
     result = subprocess.run(["tailscale", "ip", "-4"],
-                            capture_output=True, text=True, check=True, timeout=10)
+                            capture_output=True, text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
     return str(ipaddress.IPv4Address(result.stdout.strip()))
 
 
 def render_markdown(source: str, title: str) -> str:
     """Keep an escaped, readable copy visible until Markdown rendering succeeds."""
+    metadata = ""
+    front = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)", source, re.DOTALL)
+    if front and re.search(r"(?m)^[A-Za-z_][\w-]*:", front.group(1)):
+        metadata = '<details><summary>Document metadata</summary><pre>' + html.escape(front.group(1)) + '</pre></details>'
+        source = source[front.end():]
     return Template("""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>$title</title>
 <style>
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+h1 { font-size: 1.7rem; }
+h2 { font-size: 1.35rem; }
+h3 { font-size: 1.15rem; }
+summary { cursor: pointer; color: #888; }
 body { margin: auto; padding: 1rem; overflow-wrap: anywhere; }
 main > :not(table):not(:has(table)), #markdown-source { max-width: 48rem; margin-left: auto; margin-right: auto; }
+details { max-width: 48rem; margin: 0 auto 1rem; }
 pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; padding: 1rem; background: light-dark(#f0f2f5, #202329); border-radius: .5rem; }
 code { font-family: ui-monospace, monospace; }
 img { max-width: 100%; height: auto; }
-table { display: block; width: max-content; max-width: 100%; margin-left: auto; margin-right: auto; overflow-x: auto; border-collapse: collapse; }
-td, th { border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: normal; word-break: normal; }
+table { display: table; table-layout: auto; width: 60%; max-width: 100%; margin-left: auto; margin-right: auto; border-collapse: collapse; }
+td, th { min-width: 9ch; border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: anywhere; word-break: normal; vertical-align: top; }
+th { overflow-wrap: normal; }
+td:first-child, th:first-child { min-width: 14ch; }
 a { color: light-dark(#145ac2, #91bdff); }
 </style></head><body>
+$metadata
 <main id="rendered" hidden></main>
 <pre id="markdown-source">$source</pre>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
@@ -76,7 +98,7 @@ try {
   }
 } catch (_) { /* The source remains readable without the renderer. */ }
 </script></body></html>
-""").substitute(title=html.escape(title), source=html.escape(source))
+""").substitute(title=html.escape(title), source=html.escape(source), metadata=metadata)
 
 
 def read_snapshot_index(root: Path) -> dict[str, str]:
@@ -94,23 +116,13 @@ def read_snapshot_index(root: Path) -> dict[str, str]:
             and not (root / identifier).is_symlink() and (root / identifier).is_dir()}
 
 
-def replace_file(path: Path, content: bytes) -> None:
-    """Publish complete bytes with one rename on the destination filesystem."""
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".review-link-", delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
-            _ = stream.write(content)
-        except OSError:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
     """Refresh a source set's short URLs; new requests a separate snapshot."""
+    return snapshot_at(review_root(), files, name, new=new)
+
+
+def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
+    """Publish files under the root selected for this operation."""
     _ = name
     if not files:
         raise ValueError("name at least one file")
@@ -134,8 +146,10 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
             output_sources[folded] = file
             contents[output] = content
         destinations.append(destination)
+    settings = conf.read("review_links")
+    allocation_tries = settings.whole("snapshot_allocation_tries")
+    port = settings.whole("server_port")
     host = link_host()
-    root = review_root()
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".index.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -145,29 +159,29 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
         if reuse:
             folder = root / index[source_set]
         else:
-            for _ in range(10):
-                folder = root / "".join(secrets.choice(ascii_lowercase + digits) for _ in range(6))
+            for _ in range(allocation_tries):
+                folder = root / secrets.token_hex(3)
                 try:
                     folder.mkdir()
                 except FileExistsError:
                     continue
                 break
             else:
-                raise FileExistsError("could not allocate a snapshot id after 10 tries")
+                raise FileExistsError(f"could not allocate a snapshot id after {allocation_tries} tries")
         try:
             for output, content in contents.items():
-                replace_file(folder / output, content)
+                atomic_file.write_bytes_atomic(folder / output, content, mode=0o600)
             for obsolete in folder.iterdir():
                 if obsolete.name not in contents and (obsolete.is_file() or obsolete.is_symlink()):
                     obsolete.unlink()
             os.utime(folder, None)
             index[source_set] = folder.name
-            replace_file(root / ".index.json", json.dumps(index, sort_keys=True).encode("utf-8"))
+            atomic_file.write_bytes_atomic(root / ".index.json", json.dumps(index, sort_keys=True).encode("utf-8"), mode=0o600)
         except OSError:
             if not reuse:
                 shutil.rmtree(folder)
             raise
-    return [f"http://{host}:{PORT}/{quote((folder / output).relative_to(root).as_posix())}"
+    return [f"http://{host}:{port}/{quote((folder / output).relative_to(root).as_posix())}"
             for output in destinations]
 
 
@@ -179,7 +193,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     try:
         urls = snapshot(cast(list[Path], args.files), cast(str, args.name), new=cast(bool, args.new))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except SNAPSHOT_ERRORS as error:
         print(f"review_link: {error}", file=sys.stderr)
         return 2
     print("\n".join(urls))

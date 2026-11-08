@@ -3,43 +3,18 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_cache_test_support as support
+from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 import json
 
 
-class VerifyLintScopeTests(support.VerifyLintCacheFixture):
-    def test_failed_judgment_repairs_and_formats_before_the_deciding_judgment(self) -> None:
-        source = self.root / "src/lib.rs"
-        formatted = "pub fn value() -> u8 {\n    2\n}\n"
-        self.environment.update({
-            "TEST_GIT_DIRTY": "1",
-            "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
-            "TEST_FMT_SOURCE": formatted,
-        })
-        for final_status in (0, 43):
-            with self.subTest(final_status=final_status):
-                _ = source.write_text("pub fn value() -> u8 { 1 }\n", encoding="utf-8")
-                self.environment["TEST_CLIPPY_STATUSES"] = f"[101, {final_status}]"
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
-                self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
-                self.assert_fix_and_judgment_calls(fix_passes=2)
-                self.assertEqual(source.read_text(encoding="utf-8"), formatted)
-                clippy = self.calls("clippy")
-                self.assertEqual(self.lint_stages(), [
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[0]],
-                    ["clippy", *clippy[1]],
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[2]],
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[3]],
-                ])
+class VerifyLintScopeTests(VerifyLintJudgmentFixture):
 
     def test_fix_exposes_another_fix_before_the_final_judgment(self) -> None:
         original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
         first_fix = original.replace("a * b + c", "a.mul_add(b, c)")
         final_fix = first_fix.replace("pub fn", "pub const fn")
         self.environment.update({
+            "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_GIT_DIRTY": "1",
             "TEST_FIX_STEPS": json.dumps({original: first_fix, first_fix: final_fix}),
             "TEST_CLIPPY_EXPECT_SOURCE": final_fix,
@@ -56,6 +31,8 @@ class VerifyLintScopeTests(support.VerifyLintCacheFixture):
                 self.assertEqual(self.calls("doc"), [])
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
                                  [["fmt", "-p", "sample"]] * 4)
+                self.assertEqual([args for args in self.calls("+nightly") if "--version" in args],
+                                 [["fmt", "--version"]])
 
 
 if __name__ == "__main__":

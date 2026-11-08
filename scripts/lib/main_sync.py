@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Keep a main checkout (default ~/.claude) at origin/main without a hand step.
+"""Fast-forward a clean main checkout to origin/main without deleting local work.
 
-A promotion fast-forwards the Mac's ~/.claude over ssh, and when that step fails nothing retries: on
-2026-10-27 the Mac sat 78 commits behind for 18 hours. The claude-sync job (nixos
-modules/common/claude-sync.nix) runs `main_sync.py` every 15 minutes on both machines. It fetches
-origin main and fast-forwards only when all of these are true: the checkout is on main, no tracked
-file has changes, no merge, rebase or cherry-pick is in progress, and origin/main holds main. It never
-resets, stashes or makes a merge commit, so local edits are never at risk. Untracked files do not
-count: Claude Code's own state sits untracked in ~/.claude.
+Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
+send.py with a key for the host and state. send.py limits delivery to one message
+per main_sync_repeat_minutes window from send.conf. A successful run changes no
+notification state. Fetch failures advise github-warmup only when
+github-warm-status fails, times out, or is missing.
 
-Each run appends one JSON line to SYNC_LOG in the main-sync state folder. When a run is blocked, the
-`--notify` roster name gets one message for each new blocked state (send.py finds the name on this
-machine or its peer); a run that syncs again clears the state.
-`main_sync.py [--checkout PATH] [--notify NAME]` exits 0 when the checkout is
-at origin/main, 1 when blocked.
+Exit 0 means the checkout is at origin/main. Exit 1 means the run is blocked.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -29,16 +27,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import conf
+from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
 
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
-BLOCKED_FILE = "blocked.txt"
 FETCH_TIMEOUT_SECONDS = 120
 IN_PROGRESS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")
-SEND = Path(__file__).resolve().parents[1] / "message" / "send.py"
 # A job has no terminal: git and ssh must fail rather than ask.
 GIT_ENVIRONMENT = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=20"}
 
@@ -82,9 +79,13 @@ def sync(checkout: Path) -> Outcome:
     fetched = _git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main",
                    timeout=FETCH_TIMEOUT_SECONDS)
     if fetched.returncode:
-        return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; "
-                       + "if it names publickey or an agent refusal, run github-warmup at a terminal on "
-                       + socket.gethostname())
+        try:
+            warm = subprocess.run(["github-warm-status"], capture_output=True, check=False, timeout=5).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            warm = False
+        advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
+                  + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
+        return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
     head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     target = _git(checkout, "rev-parse", "origin/main").stdout.strip()
     if head == target:
@@ -105,31 +106,22 @@ def state_dir() -> Path:
     return Path(os.path.expanduser(os.environ.get(STATE_ENV, DEFAULT_STATE_DIR)))
 
 
-def record(outcome: Outcome, checkout: Path, now: float) -> bool:
-    """Log the run and keep the blocked state; True when this blocked state is new."""
+def record(outcome: Outcome, checkout: Path, now: float) -> None:
+    """Append the run to the log."""
     folder = state_dir()
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / SYNC_LOG).open("a", encoding="utf-8") as log:
         _ = log.write(json.dumps({"at": now, "checkout": str(checkout), "state": outcome.state,
                                   "detail": outcome.detail}) + "\n")
-    marker = folder / BLOCKED_FILE
-    if not outcome.blocked:
-        marker.unlink(missing_ok=True)
-        return False
-    try:
-        previous = marker.read_text(encoding="utf-8")
-    except OSError:
-        previous = ""
-    if previous == outcome.state:
-        return False
-    _ = marker.write_text(outcome.state, encoding="utf-8")
-    return True
 
 
 def notify(name: str, outcome: Outcome) -> None:
-    text = (f"main sync on {socket.gethostname()}: {outcome.detail}. Commands there stay old until this is "
-            + "cleared; the job retries every 15 minutes and sends again only for a new cause.")
-    _ = subprocess.run([sys.executable, str(SEND), "--to", name, "--from", "main-sync", "--text", text],
+    minutes = conf.read("send").number("main_sync_repeat_minutes")
+    host = socket.gethostname()
+    text = (f"main sync on {host}: {outcome.detail}. Commands there stay old until this is "
+            + "cleared; the job retries every 15 minutes.")
+    _ = subprocess.run(session_send.send_argv("--to", name, "--from", "main-sync", "--text", text,
+                        "--key", f"main-sync-{host}-{outcome.state}", "--repeat-minutes", f"{minutes:g}"),
                        check=False, capture_output=True)
 
 
@@ -142,7 +134,8 @@ def main(argv: list[str]) -> int:
     outcome = sync(checkout)
     print(f"main sync: {outcome.state}: {outcome.detail}")
     notify_name = cast(str, arguments.notify)
-    if record(outcome, checkout, time.time()) and notify_name:
+    record(outcome, checkout, time.time())
+    if outcome.blocked and notify_name:
         notify(notify_name, outcome)
     return 1 if outcome.blocked else 0
 

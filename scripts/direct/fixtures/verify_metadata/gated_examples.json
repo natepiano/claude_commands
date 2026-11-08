@@ -1,0 +1,91 @@
+{
+  "workspace_root": "/tmp/verify workspace's $root; literal",
+  "target_directory": "/tmp/verify target's $dir; literal",
+  "workspace_members": [
+    "gated-app",
+    "bad-app"
+  ],
+  "packages": [
+    {
+      "id": "gated-app",
+      "name": "gated-app",
+      "manifest_path": "/tmp/verify fixture/gated-app/Cargo.toml",
+      "features": {
+        "default": [
+          "fast"
+        ],
+        "fast": [],
+        "extra": [
+          "fast"
+        ],
+        "cycle-a": [
+          "cycle-b"
+        ],
+        "cycle-b": [
+          "cycle-a"
+        ]
+      },
+      "targets": [
+        {
+          "name": "gated-app",
+          "kind": [
+            "lib"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "ready",
+          "kind": [
+            "test"
+          ],
+          "test": true,
+          "required-features": [
+            "fast"
+          ],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "optional",
+          "kind": [
+            "test"
+          ],
+          "test": true,
+          "required-features": [
+            "extra"
+          ],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "gated",
+          "kind": [
+            "example"
+          ],
+          "test": false,
+          "required-features": [
+            "extra"
+          ],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/gated.rs"
+        }
+      ]
+    },
+    {
+      "id": "bad-app",
+      "name": "bad-app",
+      "manifest_path": "/tmp/verify fixture/bad-app/Cargo.toml",
+      "features": {},
+      "targets": [
+        {
+          "name": "bad",
+          "kind": [
+            "example"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/bad.rs"
+        }
+      ]
+    }
+  ]
+}

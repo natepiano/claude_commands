@@ -40,42 +40,57 @@ GIT_FILTERS_LABEL="com.natemccoy.claude-settings-git-refresh"
 # Only paths whose filtered content already matches the index are touched: a
 # genuine change must stay visible, which is the whole point of the check
 # against clean_hash below.
-git_filters_refresh_path() {
-    local repo_root="$1" clean_script="$2" path="$3"
-    local clean_hash index_entry index_mode index_hash refreshed_hash
+git_filters_refresh_path() (
+    local repo_root="$1" clean_script="$2" path="$3" driver="$4"
+    local clean_hash index_entry index_hash index_stage index_path raw_hash checked_input index_mode working_mode
 
     [[ -f "$repo_root/$path" ]] || return 0
     [[ -x "$repo_root/$clean_script" ]] || return 0
 
+    checked_input="$(mktemp)" || return 1
+    trap 'rm -f "$checked_input"' EXIT
+    cp "$repo_root/$path" "$checked_input" || return 1
+    raw_hash="$(git -C "$repo_root" hash-object --no-filters "$checked_input")" || return 1
     clean_hash="$(
-        "$repo_root/$clean_script" < "$repo_root/$path" 2>/dev/null |
+        set -o pipefail
+        "$repo_root/$clean_script" < "$checked_input" 2>/dev/null |
             git -C "$repo_root" hash-object --stdin 2>/dev/null
-    )" || return 0
+    )" || {
+        echo "git_filters: clean failed for $path; index refresh stopped." >&2
+        return 1
+    }
     [[ -n "$clean_hash" ]] || return 0
 
     index_entry="$(git -C "$repo_root" ls-files --stage -- "$path" 2>/dev/null)" || return 0
     [[ -n "$index_entry" ]] || return 0
+    while read -r _ _ index_stage _; do
+        [[ "$index_stage" == 0 ]] || return 0
+    done <<<"$index_entry"
     read -r index_mode index_hash _ <<<"$index_entry"
+
+    # Preserve mode changes when Git tracks the executable bit.
+    if [[ "$(git -C "$repo_root" config --bool core.filemode)" != false ]]; then
+        working_mode=100644
+        if [[ -n "$(find "$repo_root/$path" -prune -perm -100 -print)" ]]; then
+            working_mode=100755
+        fi
+        [[ "$working_mode" == "$index_mode" ]] || return 0
+    fi
 
     # A real change to the filtered content — leave it showing.
     [[ "$clean_hash" == "$index_hash" ]] || return 0
 
-    git -C "$repo_root" update-index --refresh -- "$path" >/dev/null 2>&1 || true
-
-    # --refresh should only rewrite stat data, never the blob. Verify, and put
-    # the entry back if it ever does otherwise: staging the unfiltered content
-    # is the one failure here that would actually lose the filter's protection.
-    refreshed_hash="$(git -C "$repo_root" rev-parse --verify --quiet ":$path" 2>/dev/null)" || return 0
-    if [[ -n "$refreshed_hash" && "$refreshed_hash" != "$index_hash" ]]; then
-        git -C "$repo_root" update-index --cacheinfo "$index_mode" "$index_hash" "$path" 2>/dev/null || true
-    fi
-}
+    # Check the input and the index blob while Git holds the index lock.
+    printf -v index_path '%q' ":$path"
+    git -C "$repo_root" -c "filter.$driver.clean=[ \"\$(git hash-object --no-filters --stdin)\" = $raw_hash ] && [ \"\$(git rev-parse --verify -q $index_path)\" = $index_hash ] && git cat-file blob $index_hash" \
+        update-index -q --refresh -- "$path" >/dev/null 2>&1 || true
+)
 
 git_filters_refresh_all() {
     local repo_root="$1" entry
     for entry in "${GIT_FILTERS[@]}"; do
         git_filters_parse "$entry"
-        git_filters_refresh_path "$repo_root" "$GF_CLEAN" "$GF_PATH"
+        git_filters_refresh_path "$repo_root" "$GF_CLEAN" "$GF_PATH" "$GF_NAME" || return 1
     done
 }
 

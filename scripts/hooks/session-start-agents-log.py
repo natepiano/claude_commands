@@ -2,20 +2,19 @@
 """Record a default role for a Claude session or subagent from a hook payload."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 
 def main() -> None:
-    if TYPE_CHECKING:
-        from ..usage import agents_log
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from scripts.usage import agents_log
+    from scripts.usage import agents_log
 
     value = cast(object, json.loads(sys.stdin.read()))
     if not isinstance(value, dict):

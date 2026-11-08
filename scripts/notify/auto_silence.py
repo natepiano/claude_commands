@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """Silence pushes while the user is away: `auto_silence.py [on | SPAN | off] | active | check`.
 
-`on` sets the idle length to DEFAULT_IDLE (2 h); a SPAN (45min, 1h) sets that length: after that long with no prompt typed in a showrunner or unit
-director session, `check` tells the user, then turns silence on with the auto marker. `active`, the
-prompt hook's call, records the prompt; when the silence is an auto silence it ends it, tells the
-user how many pushes it held, and then posts them as `silence.py off` does. A silence set by hand is never ended here. `off` stops
-auto silence; no argument shows it. Off until set.
+`on` sets the idle interval to DEFAULT_IDLE (2 h). A SPAN sets another interval.
+`check` starts automatic silence after that interval without user activity.
+`active` receives the classified prompt source and its session identity.
+Only UserTypedPrompt changes last_active or ends automatic silence.
+Other sources preserve silence and append an ignored activity event.
+An end event precedes the return notice and the release of held pushes.
+`off` disables automatic silence. Manual silence remains separate.
 
 The idle length and the last prompt's time are in one file next to silence.json. `check` runs every
 minute as the notifier job `auto-silence`, which `on` or a SPAN makes and `off` removes. natedev holds the
 state: on the Mac every subcommand runs there over ssh.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import argparse
 import json
+import os
+import socket
+import uuid
 import shlex
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import push_texts  # noqa: E402
-import silence  # noqa: E402
-from silence import Deliver, Run  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.notify.silence import Deliver, Run  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
+from scripts.lib.prompt_activity import PromptActivity, UserTypedPrompt, UnknownPrompt, SOURCES
+from scripts.lib.session_paths import sessions_directory
 
 SENDER = "natedev"
 JOB = "auto-silence"
@@ -43,9 +55,12 @@ JOB_TIMEOUT_SECONDS = 300
 
 Send = Callable[[Sequence[str]], int]
 Clock = Callable[[], float]
+UNKNOWN_ACTIVITY = UnknownPrompt()
 
 
 class AutoRecord(TypedDict):
+    last_session: NotRequired[str]
+    last_name: NotRequired[str]
     idle_seconds: int | None
     last_active: float
     # The last_active a silence was already started for: one auto silence per absence.
@@ -68,7 +83,8 @@ def read_config() -> AutoRecord:
     idle, last, started = record.get("idle_seconds"), record.get("last_active"), record.get("started_for")
     return {"idle_seconds": idle if isinstance(idle, int) and idle > 0 else None,
             "last_active": float(last) if isinstance(last, int | float) else 0.0,
-            "started_for": float(started) if isinstance(started, int | float) else None}
+            "started_for": float(started) if isinstance(started, int | float) else None,
+            "last_session": str(record.get("last_session", "")), "last_name": str(record.get("last_name", ""))}
 
 
 def write_config(record: AutoRecord) -> None:
@@ -82,8 +98,8 @@ def send(argv: Sequence[str]) -> int:
     return subprocess.run(list(argv), check=False).returncode
 
 
-def tell(text_id: str, sender: Send, **values: str) -> int:
-    rendered = push_texts.render(text_id, sender=SENDER, **values)
+def tell(text_id: str, sender: Send, *, session_name: str = SENDER, **values: str) -> int:
+    rendered = push_texts.render(text_id, sender=session_name, **values)
     code = sender(push_texts.user_send_argv(rendered))
     if code != 0:
         print(f"auto silence: the {text_id} push was not sent (exit {code})", file=sys.stderr)
@@ -110,15 +126,61 @@ def set_length(seconds: int, runner: Run, clock: Clock) -> int:
     return 0
 
 
+def session_name(session_id: str) -> str:
+    """Use the activity session's registry name, or its identity when unavailable."""
+    for path in sessions_directory().glob("*.json"):
+        try:
+            raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict):
+            record = cast(dict[str, object], raw)
+            if record.get("sessionId") == session_id:
+                name = record.get("name")
+                if isinstance(name, str) and name:
+                    return name
+    return session_id or "manual command"
+
+
+def append_event(event: str, cause: str, activity: PromptActivity, record: AutoRecord,
+                 previous: silence.SilenceRecord | None, next_state: str, now: float) -> None:
+    """Append the cause under the silence lock before changing silence or releasing pushes."""
+    state = "automatic" if previous and previous["auto"] else "manual" if previous else "off"
+    entry = {"event_id": uuid.uuid4().hex, "timestamp_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+             "event": event, "cause": cause, "silence_id": previous["since"] if previous else "",
+             "previous_state": "off" if event in {"start", "cancelled_start"} else state, "next_state": next_state, "session_id": activity.session_id,
+             "pane_id": activity.pane_id, "machine": socket.gethostname(),
+             "prompt_source": type(activity).__name__, "evidence_kind": activity.evidence_kind,
+             "prompt_hash": activity.prompt_hash, "idle_seconds": record["idle_seconds"],
+             "last_active": record["last_active"], "held_count": len(silence.read_kept()), "result": event}
+    with (silence.state_dir() / "auto-silence-events.jsonl").open("a", encoding="utf-8") as stream:
+        _ = stream.write(json.dumps(entry) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def record_command_event(event: str, cause: str, record: silence.SilenceRecord, next_state: str) -> None:
+    """Record an automatic transition requested by the silence command."""
+    append_event(event, cause, UnknownPrompt(evidence_kind="silence_command"),
+                 read_config(), record, next_state, time.time())
+
+
 def come_back(sender: Send, runner: Run, deliver: Deliver) -> int:
-    """End an auto silence as `off` does and tell the user; any other silence stays."""
-    claimed = silence.claim(lambda record: record["auto"])
-    if claimed is None:
-        return 0
-    record, kept = claimed
-    # The off push goes first, so it tells what comes next before the kept pushes arrive.
+    """An explicit off command ends automatic silence, but preserves manual silence."""
+    with silence.locked():
+        previous = silence.read_state()
+        if previous is None or not previous["auto"]:
+            return 0
+        try:
+            append_event("end", "manual_off", UnknownPrompt(evidence_kind="manual_command"),
+                         read_config(), previous, "off", time.time())
+        except OSError as error:
+            print(f"auto silence: event append failed: {error}", file=sys.stderr)
+            return 1
+        kept = silence.read_kept()
+        silence.state_file().unlink()
     code = tell(OFF_TEXT, sender, held=held(len(kept)))
-    return max(code, silence.release(record, kept, runner, deliver, "silence off"))
+    return max(code, silence.release(previous, kept, runner, deliver, "silence off"))
 
 
 def held(count: int) -> str:
@@ -151,11 +213,31 @@ def show(clock: Clock) -> int:
     return 0
 
 
-def active(clock: Clock, sender: Send, runner: Run, deliver: Deliver) -> int:
+def active(clock: Clock, sender: Send, runner: Run, deliver: Deliver,
+           activity: PromptActivity = UNKNOWN_ACTIVITY) -> int:
     with silence.locked():
         record = read_config()
-        write_config({**record, "last_active": clock()})
-    return come_back(sender, runner, deliver)
+        previous = silence.read_state()
+        state = "automatic" if previous and previous["auto"] else "manual" if previous else "off"
+        typed = isinstance(activity, UserTypedPrompt) and bool(activity.session_id)
+        ending = typed and previous is not None and previous["auto"]
+        try:
+            append_event("end" if ending else "activity" if typed else "ignored_activity",
+                         "user_prompt" if typed else type(activity).__name__, activity, record, previous,
+                         "off" if ending else state, clock())
+        except OSError as error:
+            print(f"auto silence: event append failed: {error}", file=sys.stderr)
+            return 1
+        if not typed:
+            return 0
+        name = session_name(activity.session_id)
+        write_config({**record, "last_active": clock(), "last_session": activity.session_id, "last_name": name})
+        if previous is None or not previous["auto"]:
+            return 0
+        kept = silence.read_kept()
+        silence.state_file().unlink()
+    code = tell(OFF_TEXT, sender, session_name=name, held=held(len(kept)))
+    return max(code, silence.release(previous, kept, runner, deliver, "silence off"))
 
 
 def idle_for(record: AutoRecord, now: float) -> float | None:
@@ -178,13 +260,26 @@ def check(clock: Clock, sender: Send) -> int:
     with silence.locked():
         now = read_config()
         returned = now["last_active"] != record["last_active"]
-        if not returned and silence.read_state() is None:
-            silence.write_state({"since": datetime.now(user_zone()).isoformat(), "until": None,
-                                 "timer": None, "auto": True})
+        previous = silence.read_state()
+        if previous is not None:
+            return code
+        started: silence.SilenceRecord = {"since": datetime.fromtimestamp(clock(), timezone.utc).isoformat(),
+                                          "until": None, "timer": None, "auto": True}
+        activity = UserTypedPrompt(now.get("last_session", "")) if returned else UnknownPrompt(evidence_kind="idle_timer")
+        try:
+            append_event("cancelled_start" if returned else "start",
+                         "start_cancelled_by_user_prompt" if returned else "idle_threshold", activity,
+                         now, started, "off" if returned else "automatic", clock())
+        except OSError as error:
+            silence.write_state(started)
+            print(f"auto silence: event append failed: {error}", file=sys.stderr)
+            return 1
+        if not returned:
+            silence.write_state(started)
             print(f"silence on after {minutes(idle)} min idle {silence.UNTIL_BACK}")
         write_config({**now, "started_for": record["last_active"]})
     if returned:
-        return max(code, tell(OFF_TEXT, sender, held=held(0)))
+        return max(code, tell(OFF_TEXT, sender, session_name=now.get("last_name", "") or now.get("last_session", ""), held=held(0)))
     return code
 
 
@@ -192,7 +287,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = silence.run, system: s
          remote: Run = silence.passthrough, sender: Send = send, deliver: Deliver | None = None,
          clock: Clock = time.time) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) > 1:
+    if len(arguments) > 1 and arguments[0] != "active":
         print(__doc__, file=sys.stderr)
         return 2
     if silence.on_mac(system):
@@ -202,7 +297,15 @@ def main(argv: Sequence[str] | None = None, runner: Run = silence.run, system: s
     if word == "":
         return show(clock)
     if word == "active":
-        return active(clock, sender, runner, kept_poster)
+        parser = argparse.ArgumentParser(prog="auto_silence.py active")
+        _ = parser.add_argument("--source", choices=list(SOURCES), default="UnknownPrompt")
+        _ = parser.add_argument("--session-id", default="")
+        _ = parser.add_argument("--pane-id", default="")
+        _ = parser.add_argument("--prompt-hash", default="")
+        parsed = parser.parse_args(arguments[1:])
+        source = SOURCES[cast(str, parsed.source)]
+        activity = source(cast(str, parsed.session_id), cast(str, parsed.pane_id), cast(str, parsed.prompt_hash))
+        return active(clock, sender, runner, kept_poster, activity)
     if word == "check":
         return check(clock, sender)
     if word == "off":

@@ -173,8 +173,10 @@ def statement_atom(statement: str) -> Atom:
         arguments = words[2:] if name == "bash" else words[1:]
         if arguments and arguments[0] == "read":
             return WaitAtom("board.sh read")
-        if len(arguments) >= 4 and arguments[0] == "post" and arguments[3] == "status":
-            return StatusAtom()
+        if len(arguments) >= 3 and arguments[0] == "post":
+            kind_index = 3 if arguments[1].startswith("/") else 2
+            if len(arguments) > kind_index and arguments[kind_index] == "status":
+                return StatusAtom()
         return WorkAtom()
     label = status_file_label(rest)
     if name == "tail" and ">" not in rest:
@@ -209,7 +211,7 @@ def shell_atoms(command: str) -> tuple[Atom, ...]:
 
 # Codex rollout records.
 
-STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1).)*)\1"""
+STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1)[^\\])*)\1"""
 TOOL_CALL = re.compile(r"tools\.(\w+)\(")
 COMMAND_FIELD = re.compile(r"""["']?cmd["']?\s*:\s*""" + STRING_LITERAL, re.S)
 CHARS_FIELD = re.compile(r"""["']?chars["']?\s*:\s*""" + STRING_LITERAL, re.S)

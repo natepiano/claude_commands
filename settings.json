@@ -18,6 +18,7 @@
       "Read(~/.claude2/projects/**/tool-results/**)",
       "Read(~/.claude3/projects/**/tool-results/**)",
       "Read(~/.claude4/projects/**/tool-results/**)",
+      "Read(~/.claude5/projects/**/tool-results/**)",
       "Bash(cargo *)",
       "Bash(cargo-berth *)",
       "Bash(gh *)",
@@ -54,6 +55,7 @@
       "Edit(~/.claude2/**)",
       "Edit(~/.claude3/**)",
       "Edit(~/.claude4/**)",
+      "Edit(~/.claude5/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",
@@ -99,14 +101,81 @@
       "Bash(date)",
       "Bash(true)",
       "Bash(git ls-files)",
-      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [
       "Bash(git stash)",
       "Bash(git stash *)",
       "Bash(git stash:*)",
-      "AskUserQuestion"
+      "AskUserQuestion",
+      "Bash(gh secret *)",
+      "Bash(gh variable *)",
+      "Bash(gh auth login*)",
+      "Bash(gh auth logout*)",
+      "Bash(gh auth token*)",
+      "Bash(gh auth refresh*)",
+      "Bash(gh auth setup-git*)",
+      "Bash(gh extension *)",
+      "Bash(gh alias *)",
+      "Bash(gh ssh-key *)",
+      "Bash(gh gpg-key *)",
+      "Bash(gh repo delete*)",
+      "Bash(gh repo archive*)",
+      "Bash(cargo owner*)",
+      "Bash(cargo login*)",
+      "Bash(cargo logout*)",
+      "Bash(git config core.*)",
+      "Bash(git config alias.*)",
+      "Bash(git config filter.*)",
+      "Bash(git config credential.*)",
+      "Bash(git config url.*)",
+      "Bash(git config --global*)",
+      "Bash(git config --system*)",
+      "Bash(git config --local*)",
+      "Bash(git config --worktree*)",
+      "Bash(git config --file*)",
+      "Bash(git config -f *)",
+      "Bash(rg --pre*)",
+      "Bash(rg * --pre*)",
+      "Bash(gpg -d*)",
+      "Bash(gpg --decrypt*)",
+      "Bash(gpg * -d*)",
+      "Bash(gpg * --decrypt*)",
+      "Read(~/.cargo/credentials.toml)",
+      "Read(~/.config/pushover/env)",
+      "Read(~/.claude*/.credentials.json)",
+      "Read(~/.codex*/auth.json)"
+    ],
+    "ask": [
+      "Bash(gh gist *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f*)",
+      "Bash(git push --mirror*)",
+      "Bash(git push * --mirror*)",
+      "Bash(git push * +*)",
+      "Bash(git push * :main*)",
+      "Bash(git push * --delete main*)",
+      "Bash(git push --delete * main*)",
+      "Bash(git push * -d main*)",
+      "Bash(git push -d * main*)",
+      "Bash(cargo publish*)",
+      "Bash(cargo yank*)",
+      "Bash(gh repo edit*)",
+      "Bash(gh api *-X PATCH*)",
+      "Bash(gh api *-X PUT*)",
+      "Bash(gh api *-X DELETE*)",
+      "Bash(gh api *-XPATCH*)",
+      "Bash(gh api *-XPUT*)",
+      "Bash(gh api *-XDELETE*)",
+      "Bash(gh api *--method PATCH*)",
+      "Bash(gh api *--method PUT*)",
+      "Bash(gh api *--method DELETE*)",
+      "Bash(gh api *--method=PATCH*)",
+      "Bash(gh api *--method=PUT*)",
+      "Bash(gh api *--method=DELETE*)"
     ],
     "defaultMode": "auto",
     "blockReadsOutsideWorkingDirectories": false,
@@ -190,16 +259,6 @@
         ]
       }
     ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/showrunner-compaction.py\""
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Write|NotebookEdit",
@@ -250,6 +309,17 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/staff_session_identity.py\""
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
@@ -261,6 +331,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-temp-root.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-ste.py\""
           }
         ]
       },
@@ -313,7 +387,14 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 2430
+            "timeout": 1840
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"",
+            "timeout": 60,
+            "asyncRewake": true,
+            "rewakeSummary": "Continuing the unit run"
           }
         ]
       }
@@ -324,6 +405,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-agents-log.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-ste.py\""
           }
         ]
       }
@@ -369,6 +454,7 @@
         "~/.claude2",
         "~/.claude3",
         "~/.claude4",
+        "~/.claude5",
         "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
@@ -389,7 +475,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 283800,
+  "autoCompactWindow": 258000,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"
@@ -397,7 +483,6 @@
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
-  "theme": "dark",
   "editorMode": "normal",
   "autoCompactEnabled": true,
   "switchModelsOnFlag": false,
@@ -415,7 +500,7 @@
       "**Repository visibility**: mixed, per repo under Source control; PUBLIC unless listed PRIVATE there",
       "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
       "**Secrets management**: None configured",
-      "**Default / protected branches**: main (default, protected via ruleset `main_protection`)",
+      "**Default / protected branches**: main is the default branch; no repo has branch protection or a ruleset, so a force push or a delete on main is not blocked by GitHub",
       "**CI/CD deploy targets**: None configured",
       "**Network posture**: None configured",
       "**Source control**: the user's own GitHub account natepiano. PRIVATE: natepiano/hana (~/rust/hana and its worktrees), natepiano/nixos (/etc/nixos on natedev, ~/nixos on the Mac). PUBLIC: natepiano/bevy_brp, natepiano/claude_commands (~/.claude), natepiano/cargo-liner, natepiano/nate_style, natepiano/obsidian_knife, natepiano/nateroids, natepiano/bevy, natepiano/bevy_hana, natepiano/rust-template, natepiano/gltf-ibl-sampler-egui and the user's other natepiano/* repos. Also hanallc/hanadocs (~/rust/hanadocs), the user's docs vault. Each is cloned under ~/rust unless noted; pushing a repo's own work to its own remote is routine. PUBLIC repos take no secrets or confidential material.",

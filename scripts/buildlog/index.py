@@ -1,41 +1,62 @@
 """The SQLite index over the build log's JSON lines.
 
-<root>/index.sqlite is derived and disposable: the JSON lines are the record,
-and `buildlog reindex` rebuilds this from nothing, as does a schema version
-change. Every query first brings it up to date: for each <root>/*/*.jsonl it
-reads only the complete lines past the offset it stopped at last time. sync
-replaces a file by rename, so a file is known by its path, its first bytes and
-the bytes just before its offset, never by its inode: a file that shrank, or
-whose bytes there changed, is read again from the start, its old rows dropped
-first. The first bytes hold the first record's id, so a file that started over
-differs there even when its records end alike.
+Each schema has a derived index file. The JSON lines are the permanent record.
+`buildlog reindex` rebuilds the current schema from those lines.
+Each query updates the index with complete rows after its saved file offsets.
+File marks detect replacement or truncation and force a new read from the start.
 
-One updater at a time: an exclusive flock on <root>/index.lock, then BEGIN
-IMMEDIATE with a busy timeout, so a reader never waits on a half-made index.
+An exclusive flock on <root>/index.lock permits one updater at a time.
+BEGIN IMMEDIATE and a busy timeout protect index transactions.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import sqlite3
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import BinaryIO, cast
+from typing import BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
-import store
-import parse
+from scripts.buildlog import store, parse
 
-SCHEMA_VERSION = 25
+from scripts.lib import conf
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
+SCHEMA_VERSION = 36
+
+
+# These indexes support repeated queries over the current schema.
+COST_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
+    "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
+    "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
+    "CREATE INDEX IF NOT EXISTS calls_copy ON calls (copy, id)",
+    "CREATE INDEX IF NOT EXISTS steps_build_group_history ON steps"
+    + " (host, build_history_group, build_base, started_at_us) WHERE finished_s IS NOT NULL",
+)
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
+INDEX_PREFIX = "index"
+INDEX_SUFFIX = ".sqlite"
+INDEX_PATTERN = re.compile(rf"{INDEX_PREFIX}(-[0-9a-f]{{64}})?{re.escape(INDEX_SUFFIX)}")
+# No current code opens this name. Remove this rule when no host holds the file.
+LEGACY_INDEX_NAME = f"{INDEX_PREFIX}{INDEX_SUFFIX}"
+INDEX_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+BOOKKEEPING_TABLES = {
+    "meta": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+    "files": "CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)",
+}
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
 # A Mac "no tests to run" (status 4) and a natedev nextest step stopped because
@@ -49,6 +70,19 @@ COUNTED_FAILURE = (
 Column = tuple[str, str, str]
 
 
+class GateChildContext(TypedDict):
+    run_id: object
+    src: str
+    host: object
+    started_at: object
+
+
+class GateTestOwner(GateChildContext):
+    suite: object
+    module: object
+    attempt: object
+
+
 class JobRunState(StrEnum):
     RAN = "ran"
     SKIPPED = "skipped"
@@ -58,7 +92,7 @@ class JobRunState(StrEnum):
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
     ("src", "TEXT", "the JSON lines file the row came from, relative to the root"),
-    ("host", "TEXT", "natedev, or the Mac's short host name"),
+    ("host", "TEXT", "the host that ran the step"),
     ("started_at", "TEXT", "UTC ISO time; date(started_at,'localtime') gives the local day"),
     ("ended_at", "TEXT", "UTC ISO time"),
     ("duration_s", "REAL", "wall time of the step"),
@@ -69,8 +103,8 @@ STEP_COLUMNS: list[Column] = [
     ("build_base", "TEXT", "normalized cargo command, profile, target, package scope and features; NULL for non-cargo"),
     ("build_items", "TEXT", "sorted JSON target selectors; [] for cargo's default selection, NULL for non-cargo"),
     ("cwd", "TEXT", "where it ran"),
-    ("target_dir", "TEXT NOT NULL", "absolute CARGO_TARGET_DIR, unset when absent, unknown for older records"),
-    ("target_folder", "TEXT", "target_dir when an absolute path, else worktree, else cwd"),
+    ("target_dir", "TEXT NOT NULL", "absolute target folder, none, unresolved, or legacy unknown/unset"),
+    ("target_folder", "TEXT", "absolute target_dir, NULL when the folder is not known"),
     ("repo_identity", "TEXT NOT NULL", "admission's repository key, or unknown"),
     ("repo_path", "TEXT", "the repo every worktree shares (parent of the git common dir)"),
     ("repo", "TEXT", "repo_path's folder name: hana, cargo-port, ..."),
@@ -94,6 +128,7 @@ STEP_COLUMNS: list[Column] = [
     ("status", "INTEGER", "exit status; 128+n for signal n"),
     ("rustc", "TEXT", "rustc -V for the step's toolchain"),
     ("peak_mem_bytes", "INTEGER", "cgroup memory.peak of the step (page cache included); natedev only"),
+    ("test_phase_charge_bytes", "INTEGER", "charge admission used for the test phase; NULL when no charge was recorded"),
     ("mem_stall_some_s", "REAL", "seconds at least one task waited on memory; natedev only"),
     ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
     ("finished_s", "REAL", "cargo's own 'Finished ... in' build time (mend: its check time)"),
@@ -114,6 +149,12 @@ STEP_COLUMNS: list[Column] = [
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
     ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
+    ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
+    ("target", "TEXT", "the configured build target; NULL for legacy records"),
+    ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root; unknown when the record has no output pair"),
+    ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; unknown when the record has no output pair"),
+    ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
+    ("identity_derived", "INTEGER NOT NULL DEFAULT 0", "1 when the index derives the repository key from the call"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -131,6 +172,78 @@ TEST_COLUMNS: list[Column] = [
     ("slow", "INTEGER", "1 when nextest reported it SLOW"),
 ]
 
+GATE_RUN_COLUMNS: list[Column] = [
+    ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
+    ("id", "TEXT PRIMARY KEY", "gate run identity"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "UTC ISO start time"),
+    ("ended_at", "TEXT", "UTC ISO end time"),
+    ("wall_s", "REAL", "wall time of the run"),
+    ("hold_wait_s", "REAL", "seconds spent waiting for a build hold"),
+    ("selection", "TEXT", "full, affected, or reused"),
+    ("reason", "TEXT", "reason for the selection"),
+    ("status", "INTEGER", "exit status"),
+    ("max_jobs", "INTEGER", "maximum number of concurrent jobs"),
+    ("peak_mib", "REAL", "peak memory in MiB"),
+    ("cap_mib", "REAL", "runner memory governor in MiB"),
+    ("checkout", "TEXT", "checkout path"),
+    ("branch", "TEXT", "branch"),
+    ("sha", "TEXT", "commit"),
+    ("tree", "TEXT", "tree identity"),
+    ("source", "TEXT", "tests-only or checkpoint"),
+    ("aborted", "INTEGER", "1 when the run was aborted"),
+    ("dirty", "INTEGER", "1 when the checkout had changes"),
+    ("modules_run", "INTEGER", "distinct test modules; excludes the type job"),
+    ("tests_run", "INTEGER", "recorded sum of tests across module attempts"),
+    ("slow_test_s", "REAL", "threshold used to retain passing test times"),
+]
+
+GATE_SUITE_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("wall_s", "REAL", "wall time of the suite"),
+    ("status", "INTEGER", "exit status"),
+]
+
+GATE_MODULE_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("module", "TEXT", "test module; basedpyright for the types suite"),
+    ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
+    ("restart", "TEXT", "hold when a build hold stopped the attempt; empty otherwise"),
+    ("times_missing", "TEXT", "reason test times are missing; empty when present"),
+    ("log", "TEXT", "gzipped output of a failed attempt; empty otherwise"),
+    ("wall_s", "REAL", "wall time of the module"),
+    ("cpu_s", "REAL", "user and system CPU seconds"),
+    ("peak_mib", "REAL", "peak memory in MiB"),
+    ("status", "INTEGER", "exit status"),
+    ("tests_run", "INTEGER", "tests run"),
+    ("failures", "INTEGER", "test failures"),
+    ("errors", "INTEGER", "test errors"),
+    ("skipped", "INTEGER", "skipped tests"),
+    ("tests_s", "REAL", "sum of all test times"),
+]
+
+GATE_TEST_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("module", "TEXT", "test module"),
+    ("attempt", "INTEGER", "module execution number from 1"),
+    ("test", "TEXT", "test identity without the module name"),
+    ("duration_s", "REAL", "test time in seconds"),
+    ("status", "TEXT", "pass, fail, error, skip, expected_failure, or unexpected_success"),
+]
+
 CALL_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "BUILDLOG_CALL_ID; steps.call_id points here"),
     ("src", "TEXT", "source file"),
@@ -141,7 +254,7 @@ CALL_COLUMNS: list[Column] = [
     ("caller", "TEXT", "verify for verify.sh (NULL before 2026-10-02), cargo-port for port-lint"),
     ("command", "TEXT", "'lint hana', 'test hana_diegetic', 'port-lint clippy', ..."),
     ("verb", "TEXT", "verify.sh: check, test, lint, fmt, example, example-test, final; port-lint: clippy, mend, sweep"),
-    ("package", "TEXT", "the package named"),
+    ("package", "TEXT", "the named package, or workspace"),
     (
         "outcome",
         "TEXT",
@@ -270,6 +383,10 @@ SAMPLE_COLUMNS: list[Column] = [
     ("cpu_total_ticks", "INTEGER", "CPU total ticks since boot from /proc/stat, USER_HZ, excluding guest fields; NULL when not recorded"),
     ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
     ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+    ("slices", "TEXT", "JSON raw builds and CI slice readings; memory.current is the whole held charge"),
+    ("filesystem", "TEXT", "JSON filesystem free/used/total and top-layer device identity"),
+    ("jobserver", "TEXT", "JSON free pool tokens, not CPUs in use; measured or unavailable"),
+    ("zram", "TEXT", "JSON zram storage at the sample time"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
@@ -322,7 +439,7 @@ MAC_IDLE_COLUMNS: list[Column] = [
     ("package", "TEXT", "test package"),
     ("wait", "TEXT", "memory, build_hold, cargo_token or routing; backed by live wait evidence"),
     ("cause", "TEXT", "missing_temp_root, missing_leave_hook, retry_delayed, call_has_no_marker_hook or idle_with_waiter"),
-    ("action", "TEXT", "created_session_temp_root, retry_marker, message_builds_unit or message_pending (send retried; row stays once)"),
+    ("action", "TEXT", "created_session_temp_root, retry_marker, message_showrunner or message_pending (send retried; row stays once)"),
 ]
 
 QUEUE_BUMP_COLUMNS: list[Column] = [
@@ -337,7 +454,38 @@ QUEUE_BUMP_COLUMNS: list[Column] = [
     ("old_position", "INTEGER", "waiting position before the move, starting at one"),
 ]
 
+SSH_ATTEMPT_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "attempt identity"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "recording host"),
+    ("at", "TEXT", "record time"),
+    ("call_id", "TEXT", "verify call identity"),
+    ("target", "TEXT", "selected SSH target"),
+    ("repo_identity", "TEXT", "normalized origin identity"),
+    ("queued_at", "REAL", "original queue timestamp"),
+    ("departed_at", "REAL", "SSH departure timestamp"),
+    ("slot", "INTEGER", "reserved repository slot"),
+    ("outcome", "TEXT", "passed, failed, lost, or declined"),
+    ("completion", "TEXT", "confirmed or missing completion evidence"),
+    ("cleanup", "TEXT", "confirmed or unconfirmed cleanup evidence"),
+    ("unresolved_count", "INTEGER", "remaining processes; NULL when unavailable"),
+    ("evidence_at", "REAL", "ownership evidence timestamp"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "gate_runs": (
+        GATE_RUN_COLUMNS, "", "one row per targeted-test or merge-gate run",
+    ),
+    "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
+    "gate_modules": (
+        GATE_MODULE_COLUMNS, "PRIMARY KEY (run_id, suite, module, attempt)", "one row per gate module attempt",
+    ),
+    "gate_tests": (
+        GATE_TEST_COLUMNS,
+        "PRIMARY KEY (run_id, suite, module, attempt, test)",
+        "per-test rows of a gate module, kept only for tests that failed or took at least SLOW_TEST_S (config/test_times.conf)",
+    ),
+    "ssh_attempts": (SSH_ATTEMPT_COLUMNS, "", "SSH attempts, including retained capacity after completion"),
     "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
     "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
     "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per build, hold and action: audit or stopped"),
@@ -346,7 +494,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "tests": (
         TEST_COLUMNS,
         "PRIMARY KEY (step_id, binary, test)",
-        "per-test rows of a nextest step, kept only for tests that failed, were retried, took over 1 s or hit SLOW",
+        "nextest rows that failed, were retried, took over NEXTEST_SLOW_TEST_S (config/test_times.conf), or hit SLOW",
     ),
     "calls": (
         CALL_COLUMNS,
@@ -359,6 +507,8 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
     "memory_snapshots": (MEMORY_SNAPSHOT_COLUMNS, "", "slice and zram counters at a requested instant"),
 }
+
+GATE_TABLES = tuple(table for table in TABLES if table.startswith("gate_"))
 
 VIEWS: dict[str, tuple[str, str]] = {
     "holds": (
@@ -427,16 +577,70 @@ WHERE j.run_state != 'carried_over' GROUP BY day, j.workflow, j.name""",
 
 
 def index_path() -> Path:
-    return store.root() / store.INDEX_NAME
+    """Return the current schema path in the build log root."""
+    return index_path_in(store.root())
 
 
-def read_only_uri() -> str:
-    return f"file:{quote(str(index_path()))}?mode=ro"
+def index_path_in(root: Path) -> Path:
+    """Name the index by its schema SQL and version within the selected root."""
+    schema = json.dumps((SCHEMA_VERSION, schema_statements()), separators=(",", ":"))
+    digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()
+    return root / f"{INDEX_PREFIX}-{digest}{INDEX_SUFFIX}"
+
+
+def read_only_uri(root: Path) -> str:
+    return read_only_path_uri(index_path_in(root))
+
+
+def read_only_path_uri(path: Path) -> str:
+    """Return a read-only SQLite URI for the selected index."""
+    return f"file:{quote(str(path))}?mode=ro"
+
+
+@dataclass(frozen=True)
+class NoCompleteGateIndex:
+    """No complete index has compatible gate tables."""
+
+
+def complete_gate_index_in(root: Path) -> Path | NoCompleteGateIndex:
+    """Prefer the current index, then the newest complete compatible index."""
+    expected = {statement.split()[2]: statement for statement in schema_statements()
+                if statement.startswith("CREATE TABLE ") and statement.split()[2] in GATE_TABLES}
+    current = index_path_in(root)
+    candidates: list[tuple[float, Path]] = []
+    read_wait = conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS")
+    for path in root.glob(f"{INDEX_PREFIX}-*{INDEX_SUFFIX}"):
+        try:
+            connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=read_wait)
+            try:
+                completed = cast(tuple[str] | None, connection.execute(
+                    "SELECT value FROM meta WHERE key = 'updated_at'"
+                ).fetchone())
+                tables = dict(cast(list[tuple[str, str]], connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()))
+                if completed is None or any(tables.get(name) != sql for name, sql in expected.items()):
+                    continue
+                completed_at = float(completed[0])
+                if path == current:
+                    return path
+                candidates.append((completed_at, path))
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValueError):
+            continue
+    return max(candidates)[1] if candidates else NoCompleteGateIndex()
 
 
 @contextmanager
 def update_lock() -> Generator[None]:
-    lock = store.root() / LOCK_NAME
+    with update_lock_in(store.root()):
+        yield
+
+
+@contextmanager
+def update_lock_in(root: Path) -> Generator[None]:
+    lock = root / LOCK_NAME
     lock.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -446,9 +650,9 @@ def update_lock() -> Generator[None]:
         os.close(descriptor)
 
 
-def create_schema(connection: sqlite3.Connection) -> None:
-    statements = ["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)"]
-    statements.append("CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)")
+def schema_statements() -> list[str]:
+    """Return the SQL that defines every table, column, index, and view."""
+    statements = list(BOOKKEEPING_TABLES.values())
     for table, (columns, key, _) in TABLES.items():
         body = [f"{name} {kind}" for name, kind, _ in columns]
         if key:
@@ -459,33 +663,58 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
-    statements.append("CREATE INDEX steps_build_history ON steps (host, target_folder, build_base, started_at_us)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX steps_call ON steps (call_id)")
-    statements.append("CREATE INDEX tests_step ON tests (step_id)")
+    statements.append("CREATE INDEX ssh_attempts_call ON ssh_attempts (call_id)")
+    statements.append("CREATE INDEX gate_runs_started ON gate_runs (started_at)")
+    statements.append("CREATE INDEX gate_suites_suite ON gate_suites (suite, started_at)")
+    statements.append("CREATE INDEX gate_modules_key ON gate_modules (suite, module, started_at)")
+    statements.append("CREATE INDEX gate_tests_key ON gate_tests (suite, module, test, started_at)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
     statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
     statements.append("CREATE INDEX memory_snapshots_at ON memory_snapshots (at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
-    for statement in statements:
+    statements.extend(COST_INDEXES)
+    return statements
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    for statement in schema_statements():
         _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def open_for_update() -> sqlite3.Connection:
-    """The index at the current schema; any other version is deleted and made again."""
-    path = index_path()
+def remove_index(path: Path) -> None:
+    """Remove the SQLite sidecars before the index file."""
+    for suffix in INDEX_SIDECAR_SUFFIXES:
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+
+
+def open_for_update(path: Path) -> sqlite3.Connection:
+    """Open the schema, rebuild invalid tables, and restore missing indexes."""
     connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
     version = cast(tuple[int], connection.execute("PRAGMA user_version").fetchone())[0]
-    if version != SCHEMA_VERSION:
+    tables = {row[0] for row in cast(list[tuple[str]], connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall())}
+    if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
         connection.close()
-        path.unlink(missing_ok=True)
+        remove_index(path)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")
+    indexes = {row[0] for row in cast(list[tuple[str]], connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    ).fetchall())}
+    for statement in schema_statements():
+        if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
+            _ = connection.execute(statement)
+    spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+    connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -538,6 +767,14 @@ def pick(record: dict[str, object], columns: list[Column]) -> dict[str, object]:
         value = record.get(name)
         row[name] = json.dumps(value) if isinstance(value, list | dict) else value
     return row
+
+
+def entries(record: dict[str, object], field: str) -> list[dict[str, object]]:
+    """Return the dictionary entries of a list field."""
+    value = record.get(field)
+    if not isinstance(value, list):
+        return []
+    return [cast(dict[str, object], item) for item in cast(list[object], value) if isinstance(item, dict)]
 
 
 @dataclass(frozen=True)
@@ -625,32 +862,39 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
 
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
-    target_dir = record.get("target_dir")
+    charge = record.get("test_phase_charge")
+    charge_bytes = cast(dict[str, object], charge).get("bytes") if isinstance(charge, dict) else None
+    charge_bytes = charge_bytes if type(charge_bytes) is int else None
+    target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
+    folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
+    target_directory, build_directory = record.get("target_directory"), record.get("build_directory")
+    if not target_directory or not build_directory:
+        target_directory = build_directory = store.UNKNOWN_IDENTITY
+    checkout = record.get("worktree") or record.get("cwd")
     key = (build_keys(cast(list[str], argv))
            if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
            else NonCargoBuild())
     record = {
         **record,
         "src": src,
+        "test_phase_charge_bytes": charge_bytes,
         "started_at_us": epoch_microseconds(record.get("started_at")),
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),
         "target_dir": target_dir or store.UNKNOWN_IDENTITY,
+        "target_directory": target_directory,
+        "build_directory": build_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
-        "target_folder": (target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
-                          else record.get("worktree") or record.get("cwd")),
+        "identity_derived": 0,
+        "target_folder": folder,
+        "build_history_group": ("folder:" + folder if folder else
+                                "legacy:" + str(checkout) if checkout and target_dir in ("unknown", "unset") else None),
         "build_base": key.base if isinstance(key, CargoBuildKey) else None,
         "build_items": list(key.items) if isinstance(key, CargoBuildKey) else None,
     }
     insert(connection, "steps", pick(record, STEP_COLUMNS))
     _ = connection.execute("DELETE FROM tests WHERE step_id = ?", (record.get("id"),))
-    tests = record.get("tests")
-    if not isinstance(tests, list):
-        return
-    for test in cast(list[object], tests):
-        if not isinstance(test, dict):
-            continue
-        row = cast(dict[str, object], test)
+    for row in entries(record, "tests"):
         insert(
             connection,
             "tests",
@@ -667,6 +911,50 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
                 TEST_COLUMNS,
             ),
         )
+
+
+def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    """Replace a gate run and all its suite, module, and test rows."""
+    run_id = record.get("id")
+    for table in GATE_TABLES[1:]:
+        _ = connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+    module_rows = entries(record, "modules")
+    module_keys: set[tuple[str, str]] = set()
+    for module in module_rows:
+        suite, name = module.get("suite"), module.get("module")
+        if not isinstance(suite, str) or not isinstance(name, str):
+            continue
+        key = (suite, name)
+        if key != TYPE_CHECK_JOB:
+            module_keys.add(key)
+    insert(connection, "gate_runs", pick({
+        "step": "",
+        **record,
+        "src": src,
+        "modules_run": len(module_keys),
+    }, GATE_RUN_COLUMNS))
+    parent: GateChildContext = {
+        "run_id": run_id,
+        "src": src,
+        "host": record.get("host"),
+        "started_at": record.get("started_at"),
+    }
+    for suite_row in entries(record, "suites"):
+        insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
+    for module in module_rows:
+        insert(connection, "gate_modules", pick({**module, **parent}, GATE_MODULE_COLUMNS))
+        owner: GateTestOwner = {
+            **parent,
+            "suite": module.get("suite"),
+            "module": module.get("module"),
+            "attempt": module.get("attempt"),
+        }
+        for test in entries(module, "tests"):
+            insert(connection, "gate_tests", pick({
+                **test,
+                **owner,
+                "duration_s": test.get("s"),
+            }, GATE_TEST_COLUMNS))
 
 
 def add_call(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
@@ -730,11 +1018,7 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             if queue_elapsed is not None and queue_elapsed >= 0:
                 job_row["queued_s"] = round(queue_elapsed, 3)
         insert(connection, "ci_jobs", pick(job_row, CI_JOB_COLUMNS))
-        steps = job.get("steps")
-        for entry in cast(list[object], steps) if isinstance(steps, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            ci_step = cast(dict[str, object], entry)
+        for ci_step in entries(job, "steps"):
             step_row = {
                 **ci_step,
                 "job_id": job.get("job_id"),
@@ -761,7 +1045,11 @@ def add_queue_bump(connection: sqlite3.Connection, record: dict[str, object], sr
     insert(connection, "queue_bumps", pick({**record, "src": src}, QUEUE_BUMP_COLUMNS))
 
 
-ADDERS = {"queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "ssh_attempts", pick({**record, "src": src}, SSH_ATTEMPT_COLUMNS))
+
+
+ADDERS = {"gate_run": add_gate_run, "ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 
@@ -780,7 +1068,8 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
-def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
+def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None,
+              touched_calls: set[str]) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
@@ -815,6 +1104,11 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
             if adder is not None:
                 adder(connection, typed, src)
                 lines += 1
+                kind = typed.get("kind")
+                if kind in ("step", "call", "ssh_attempt"):
+                    call_id = typed.get("id" if kind == "call" else "call_id")
+                    if isinstance(call_id, str) and call_id:
+                        touched_calls.add(call_id)
         new_offset = offset + end
         stored = marks(handle, new_offset)
     _ = connection.execute(
@@ -823,13 +1117,84 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
     return lines
 
 
+def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead) -> None:
+    """Remove unused indexes and orphan sidecars.
+
+    A file removed between a peer's stat and open costs that peer one rebuild.
+    """
+    candidates: set[Path] = set()
+    for path in root.iterdir():
+        for suffix in INDEX_SIDECAR_SUFFIXES:
+            if path.name.endswith(suffix):
+                path = path.with_name(path.name.removesuffix(suffix))
+                break
+        if path != current and INDEX_PATTERN.fullmatch(path.name):
+            candidates.add(path)
+    if not candidates:
+        return
+    unused_days = settings.number("INDEX_UNUSED_DAYS")
+    cutoff = time.time() - unused_days * 24 * 60 * 60
+    for path in candidates:
+        try:
+            changed = path.stat()
+        except FileNotFoundError:
+            remove_index(path)
+        else:
+            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+                remove_index(path)
+
+
+def resolve_mac_repositories(connection: sqlite3.Connection, touched_calls: set[str]) -> None:
+    """Recompute derived step identities only for calls with new identity evidence."""
+    _ = connection.execute("""
+        UPDATE steps INDEXED BY steps_call
+        SET repo_identity = COALESCE(
+            (SELECT s.repo_identity FROM steps s INDEXED BY steps_call
+             WHERE s.call_id = steps.call_id AND s.repo_identity != :unknown
+               AND s.identity_derived = 0
+               AND s.repo_path = (SELECT repo_path FROM calls WHERE id = steps.call_id)
+             ORDER BY s.started_at DESC, s.id DESC LIMIT 1),
+            (SELECT a.repo_identity FROM ssh_attempts a
+             WHERE a.call_id = steps.call_id AND a.repo_identity != :unknown
+             ORDER BY a.at DESC, a.id DESC LIMIT 1),
+            repo_identity),
+            identity_derived = 1
+        WHERE call_id IN (SELECT value FROM json_each(:call_ids))
+          AND (repo_identity = :unknown OR identity_derived = 1)
+    """, {"unknown": store.UNKNOWN_IDENTITY, "call_ids": json.dumps(sorted(touched_calls))})
+
+
 def update() -> int:
     """Bring the index up to date with the JSON lines; returns the lines read."""
-    root = store.root()
+    return update_in(store.root())
+
+
+def has_numeric_update_time(connection: sqlite3.Connection) -> bool:
+    """Return whether the index has a numeric completion time."""
+    completed = cast(tuple[str | None] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is None:
+        return False
+    try:
+        _ = float(str(completed[0]))
+    except ValueError:
+        return False
+    return True
+
+
+def update_in(root: Path) -> int:
+    """Update the index in the selected build log root."""
     root.mkdir(parents=True, exist_ok=True)
-    with update_lock():
-        connection = open_for_update()
+    with update_lock_in(root):
+        current = index_path_in(root)
+        connection = open_for_update(current)
         try:
+            now = time.time()
+            settings = conf.read("buildlog")
+            touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
+            if now - current.stat().st_mtime > touch_minutes * 60:
+                os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
                 path: (offset, stored)
@@ -837,15 +1202,23 @@ def update() -> int:
                     list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall()
                 )
             }
-            _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),))
+            stored_root = cast(tuple[str] | None, connection.execute("SELECT value FROM meta WHERE key = 'root'").fetchone())
+            if stored_root != (str(root),):
+                _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),))
             lines = 0
+            touched_calls: set[str] = set()
             present: set[str] = set()
             for path in sorted(root.glob("*/*.jsonl")):
                 src = path.relative_to(root).as_posix()
                 present.add(src)
-                lines += read_file(connection, path, src, known.get(src))
+                lines += read_file(connection, path, src, known.get(src), touched_calls)
             for gone in set(known) - present:
                 forget(connection, gone)
+            if touched_calls:
+                resolve_mac_repositories(connection, touched_calls)
+            if connection.total_changes or not has_numeric_update_time(connection):
+                _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('updated_at', ?)",
+                                       (str(time.time()),))
             _ = connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -853,16 +1226,17 @@ def update() -> int:
             raise
         finally:
             connection.close()
+        cleanup_unused_indexes(root, current, settings)
     return lines
 
 
 def reindex() -> int:
     with update_lock():
-        index_path().unlink(missing_ok=True)
+        remove_index(index_path())
     return update()
 
 
 def read_only() -> sqlite3.Connection:
-    connection = sqlite3.connect(read_only_uri(), uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
+    connection = sqlite3.connect(read_only_uri(store.root()), uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
     _ = connection.execute("PRAGMA query_only = ON")
     return connection

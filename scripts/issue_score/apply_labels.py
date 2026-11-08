@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Apply explicit review approvals, refusing stale content or reviewed values."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Mapping
@@ -14,11 +18,10 @@ import sys
 from tempfile import NamedTemporaryFile
 from typing import cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.issue_score import questions, vault
 from scripts.issue_score.score_issues import content_hash
+from scripts.lib.conf import UseConfiguredValue
 
 
 @dataclass(frozen=True)
@@ -133,15 +136,18 @@ def _write_edit(edit: ApprovedEdit) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def apply_labels(approvals_path: Path, *, issues_dir: Path = vault.ISSUES_DIR,
-                 area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
-                 rules_dirs: tuple[Path, ...] = vault.STYLE_RULES_DIRS) -> list[Path]:
+def apply_labels(approvals_path: Path, *, issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                 area_definitions_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                 rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Path]:
     """Preflight all approvals before writing only the approved frontmatter fields.
 
     Approvals: {"review_path": "...-reassess.json", "approvals":
                 [{"issue_path": "...md", "fields": {"backlog_impact": "⭐⭐⭐"}}]}.
     The Markdown companion is for reading; the JSON preserves its reviewed values.
     """
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    area_definitions_path = vault.area_definitions_path() if isinstance(area_definitions_path, UseConfiguredValue) else area_definitions_path
+    rules_dirs = vault.style_rules_dirs() if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
     approvals = _object(cast(object, json.loads(approvals_path.read_text(encoding="utf-8"))))
     review_path = Path(_text(approvals.get("review_path")))
     if not review_path.is_absolute():

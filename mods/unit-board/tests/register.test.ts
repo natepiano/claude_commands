@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "claude-code/testing";
 import type { Engine, Mounted } from "claude-code/testing";
 import type { CommandRunInput, RenderSurface, TurnCompleteInput } from "claude-code";
-import { refreshIfChanged } from "../hooks/data";
+import { loadBoard, refreshIfChanged } from "../hooks/data";
 import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, SESSION, time } from "./kit";
 
 const command = (args = ""): CommandRunInput => ({ command: "showrunner:unit_board", args,
@@ -21,7 +21,24 @@ async function press<Surface extends RenderSurface>(ui: Mounted<Surface, "Pane">
 }
 
 describe("unit board commands and lifetime", () => {
-  test("startup registers only accounts-board", async ($, on) => {
+  test("the reader keeps the staff-id path after a production rename", async () => {
+    const board = fixture();
+    const reads: string[] = [];
+    const calls = {
+      home: async () => "/test-home", registry: async () => REGISTRY, now: async () => NOW,
+      run: async () => ({ exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }),
+        stderr: "", isStdoutTruncated: false, isStderrTruncated: false }),
+      read: async (path: string) => { reads.push(path); return JSON.stringify(board); },
+    };
+    const before = await loadBoard(calls, SESSION, () => true, () => {});
+    board.production = "renamed";
+    const after = await loadBoard(calls, "cleared-session", () => true, () => {});
+    expect(after.files).toEqual(before.files);
+    expect(reads).toEqual([BOARD, BOARD]);
+    expect(after.boards[0]?.production).toBe("renamed");
+  });
+
+  test("startup registers no commands", async ($, on) => {
     mock.env(on, { HOME: "/test-home", USER_ZONE: "UTC" });
     const registered: string[] = [];
     on("session.start", (_$, event) => ({ cwd: event.cwd }));
@@ -32,7 +49,16 @@ describe("unit board commands and lifetime", () => {
     });
 
     await $.session.start(start);
-    expect(registered).toEqual(["accounts-board"]);
+    expect(registered).toEqual([]);
+  });
+
+  test("the retired accounts command does not open a pane", async ($, on) => {
+    const fake = engineFiles(on);
+    on("command.run", () => ({ text: "Command not handled by the mod." }));
+    expect(await $.command.run({ ...command(), command: "accounts-board" }))
+      .toEqual({ text: "Command not handled by the mod." });
+    expect(fake.opened).toEqual([]);
+    expect(fake.processes).toEqual([]);
   });
 
   test("the showrunner command handles open and close without a model turn and leaves the retired command alone", async ($, on) => {
@@ -91,7 +117,7 @@ describe("unit board commands and lifetime", () => {
       const result = await $.command.run(command());
       expect(result.text).toBe("Unit board opened.");
       expect(fake.processes).toEqual([["/test-home/.claude/scripts/lib/py",
-        "/test-home/.claude/scripts/direct/board_json.py", "--cwd", CWD, "--session", SESSION]]);
+        "/test-home/.claude/scripts/direct/board_json.py", "--session", SESSION]]);
       expect(fake.opened).toEqual(["unit-board"]);
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
@@ -206,7 +232,7 @@ describe("unit board commands and lifetime", () => {
     expect(fake.processes).toEqual([]);
   });
 
-  test("opening the board passes the current session id to the generator", async ($, on) => {
+  test("opening the board passes only the current session to the generator", async ($, on) => {
     const fake = engineFiles(on);
     fake.setSession("command-showrunner-id");
 
@@ -214,8 +240,7 @@ describe("unit board commands and lifetime", () => {
 
     expect(fake.processes.length).toBe(1);
     const argv = fake.processes[0]!;
-    expect(argv).toContain("--cwd");
-    expect(argv[argv.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(argv).not.toContain("--cwd");
     expect(argv).toContain("--session");
     expect(argv[argv.indexOf("--session") + 1]).toBe("command-showrunner-id");
   });
@@ -234,8 +259,7 @@ describe("unit board commands and lifetime", () => {
 
     expect(fake.processes.length).toBe(1);
     const refreshed = fake.processes[0]!;
-    expect(refreshed).toContain("--cwd");
-    expect(refreshed[refreshed.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(refreshed).not.toContain("--cwd");
     expect(refreshed).toContain("--session");
     expect(refreshed[refreshed.indexOf("--session") + 1]).toBe("resumed-showrunner-id");
     expect(fake.reads).toEqual([BOARD]);
@@ -479,7 +503,7 @@ describe("unit board commands and lifetime", () => {
     fake.replaceBoards([]);
     await $.command.run(command());
     const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("Run /showrunner:unit_board in a showrunner session.");
+    expect(drawnText(await ui.drawn())).toContain("This session is not on the staff list.");
     fake.clear();
     await fake.clock.advance(10_000);
     expect(fake.processes).toEqual([]);
@@ -522,7 +546,7 @@ describe("unit board commands and lifetime", () => {
 
 
 describe("accounts pane clock", () => {
-  const accountsCommand: CommandRunInput = { ...command(), command: "accounts-board" };
+  const accountsCommand: CommandRunInput = { ...command(), command: "showrunner:accounts" };
 
   function accountsClockHost(on: Parameters<typeof hostEngine>[0]) {
     const host = hostEngine(on);
@@ -545,7 +569,7 @@ describe("accounts pane clock", () => {
         isStdoutTruncated: false, isStderrTruncated: false } };
     });
     on("state.set", { plugin: "unit-board", key: "accountsPanes" }, (_$, event, next) => {
-      const state = event.value["accounts-board"];
+      const state = event.value["accounts"];
       if (state?.kind === "accounts") snapshots.push({ ...state });
       return next(event);
     });
@@ -581,20 +605,20 @@ describe("accounts pane clock", () => {
   });
 
   for (const surface of ["terminal", "desktop"] as const) {
-    test(`${surface}: an unchanged tick across local midnight redraws resets and read age from the new now`, async ($, on) => {
+    test(`${surface}: an unchanged tick across local midnight redraws resets from the new now`, async ($, on) => {
       const fake = accountsClockHost(on);
       const midnight = Date.UTC(2026, 9, 17, 4, 0);
       await fake.clock.advance(midnight - NOW - 5_000);
       await $.command.run(accountsCommand);
-      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
+      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(before).toContain("account role left resets credits enabled in use read");
-      expect(before).toMatch(/● Fixture workers 60% 23:59 0s\s*$/);
+      expect(before).toContain("account left role busy idle paused exited total resets credits enabled");
+      expect(before).toMatch(/● Fixture 60% workers 23:59 total 0 0 0 0 0\s*$/);
       await fake.clock.advance(10_000);
       const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(after).toContain("account role left resets credits enabled in use read");
-      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 10s\s*$/);
+      expect(after).toContain("account left role busy idle paused exited total resets credits enabled");
+      expect(after).toMatch(/● Fixture 60% workers Fri 23:59 total 0 0 0 0 0\s*$/);
       expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
       expect(fake.processes.length).toBe(1);
       expect(fake.reads).toEqual([]);

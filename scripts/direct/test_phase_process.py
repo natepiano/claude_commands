@@ -150,7 +150,7 @@ class TrialProcessTests(unittest.TestCase):
                 self.assertIn(reason, cast(process.ExposureNotRecorded, exposure).reason)
 
     def test_route_revision_uses_git_bytes_and_does_not_label_dirty_bytes(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             direct = "commands/unit/direct.md"
             commit_fixture_documents(root, {direct: "old contract\n"}, "Old route")
@@ -166,7 +166,7 @@ class TrialProcessTests(unittest.TestCase):
             self.assertIsInstance(process.read_route_hashes(root, "no-such-revision"), process.NotRecorded)
 
     def test_before_anchor_classifies_recorded_hashes_without_a_route_commit(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             direct = "commands/unit/direct.md"
             commit_fixture_documents(root, {direct: "earlier contract\n"}, "Earlier before")
@@ -181,7 +181,7 @@ class TrialProcessTests(unittest.TestCase):
                     self.assertEqual(trial.interval, process.PhaseWithGap(120))
 
     def test_before_anchor_does_not_include_contract_changes_after_it(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             direct = "commands/unit/direct.md"
             commit_fixture_documents(root, {direct: "old contract\n"}, "Before anchor")
@@ -195,7 +195,7 @@ class TrialProcessTests(unittest.TestCase):
                                   process.BeforeChange)
 
     def test_explicit_before_anchor_can_make_route_side_ambiguous(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             direct = "commands/unit/direct.md"
             commit_fixture_documents(root, {direct: "old contract\n"}, "Before")
@@ -210,7 +210,7 @@ class TrialProcessTests(unittest.TestCase):
                                   process.AfterChange)
 
     def test_absent_options_and_invalid_before_anchor_keep_exposure_unknown(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             commit_fixture_documents(root, {"commands/unit/direct.md": "old contract\n"}, "Before")
             blob = process.git_output(root, ["rev-parse", "HEAD:commands/unit/direct.md"]).strip()
@@ -306,7 +306,7 @@ class TrialProcessTests(unittest.TestCase):
             request_record(28, "later", 900, []),
             transcript_record("system", 100, subtype="compact_boundary"),
         ]
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "director.jsonl"
             _ = path.write_text("\n".join(json.dumps(record) for record in records))
             before = path.read_bytes()
@@ -342,7 +342,7 @@ class TrialProcessTests(unittest.TestCase):
                 self.assertIsInstance(cast(tuple[object, ...], cast(process.PhaseReloads, result).contexts)[0], process.NoReload)
         absent = process.NotRecorded("fixture", "transcript absent")
         self.assertEqual(process.measure_reloads(phase, absent, paths), absent)
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             mapping = process.read_director_transcripts(Path(folder), (DIRECTOR,))
             self.assertIsInstance(mapping[DIRECTOR], process.NotRecorded)
 
@@ -480,7 +480,7 @@ class TrialProcessTests(unittest.TestCase):
                 self.assertTrue(all(len(line) <= 60 for line in section.splitlines()), section)
 
     def test_cli_filters_fixture_units_and_exposure_and_reads_usage_through_gap(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             contract = root / ".claude"
             commit_fixture_documents(contract, {"commands/unit/direct.md": "old contract\n"}, "Before")
@@ -547,7 +547,7 @@ class TrialProcessTests(unittest.TestCase):
         self.assertNotIn("999", output.getvalue())
 
     def test_baseline_trial_phase_time_matches_exposure_filter_in_both_report_modes(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             commit_fixture_documents(root / ".claude", {"commands/unit/direct.md": "old contract\n"}, "Before")
             anchor = process.git_output(root / ".claude", ["rev-parse", "HEAD"]).strip()
@@ -581,7 +581,7 @@ class TrialProcessTests(unittest.TestCase):
             self.assertEqual(process.date_epoch("2026-10-28T09:00:00"), process.date_epoch("2026-10-28T13:00:00+00:00"))
 
     def test_cli_before_anchor_keeps_mixed_open_and_other_exclusion_counts(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             commit_fixture_documents(root / ".claude", {"commands/unit/direct.md": "old contract\n"}, "Before anchor")
             records: list[dict[str, object]] = []
@@ -630,6 +630,14 @@ class TrialProcessTests(unittest.TestCase):
 
 
 class PhaseProcessTests(unittest.TestCase):
+    def test_ad_hoc_reviews_do_not_launch_external_reviewers(self) -> None:
+        commands = Path(__file__).resolve().parents[2] / "commands"
+        for name in ("module_review", "team_review", "api_review"):
+            with self.subTest(command=name):
+                text = (commands / f"{name}.md").read_text(encoding="utf-8")
+                for launch in ("agent_exec", "claude --print", "claude -p"):
+                    self.assertNotIn(launch, text, f"{name} must review in the invoking session")
+
     def test_wall_steps_share_overlap_and_preserve_director_gaps(self) -> None:
         events = (*phase_events(), event("activity_started", 40, instance="gate", step="verification"),
                   event("activity_finished", 80, instance="gate", step="verification"),
@@ -765,7 +773,7 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertIn("mixed n=1 (finished in window or open)", output.getvalue())
         self.assertIn("open unmixed n=1 (started before window end)", output.getvalue())
 
-    def test_ledger_only_round_counts_without_worker_time(self) -> None:
+    def test_dispatch_without_a_fix_pass_adds_no_round_or_worker_time(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "run.jsonl"
             records = [
@@ -776,7 +784,7 @@ class PhaseProcessTests(unittest.TestCase):
             _ = path.write_text("\n".join(json.dumps(record) for record in records))
             events, problems = process.read_events((path,))
         self.assertEqual(problems, ())
-        self.assertEqual(process.fix_time(process.phase_boundaries(events, WINDOW)), (process.FixWorkerTime(0, 1),))
+        self.assertEqual(process.fix_time(process.phase_boundaries(events, WINDOW)), (process.FixWorkerTime(0, 0),))
 
     def test_closure_review_stays_in_review_wall_costs(self) -> None:
         events = parsed_phase_records([

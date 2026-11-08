@@ -10,15 +10,15 @@ from typing import cast
 from scripts.direct.verify_hold_wait_test_support import (
     INVOKE,
     LINT_STEP,
-    TEST_HANG_GUARD_SECS,
     VerifyHoldWaitFixture,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_mac_allowed_check_during_hold_starts_no_phase_hold_wait(self) -> None:
         history = self.record_phase()
-        self.set_hold_routing("mac_allowed")
+        self.set_hold_routing("any_target")
         self.hold()
         before = self.cycle_file.read_bytes()
         self.fixture.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})

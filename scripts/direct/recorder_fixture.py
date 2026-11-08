@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+
+from scripts.lib.process_group import send_process_group
 from scripts.lib import test_hang_guard
 
 from collections.abc import Mapping, Sequence
@@ -9,7 +12,6 @@ from pathlib import Path
 import os
 import signal
 import shutil
-import sys
 import subprocess
 import tempfile
 import unittest
@@ -19,36 +21,29 @@ from unittest.mock import patch
 # Initialize dependencies before invoke_cli swaps HOME. The recorder currently
 # imports user_zone eagerly; its production integrations remain real children.
 from scripts.direct import progress_history
-from scripts.lib import user_zone
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.lib import models_registry, user_zone
+from scripts.lib.test_models_registry import write_registry
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
-
-
-STUB_ATOMIC_JSON_WRITER = '''
-import pathlib
-import sys
-if len(sys.argv) > 1 and sys.argv[1] == 'compact':
-    session = pathlib.Path(sys.argv[sys.argv.index('--session-dir') + 1])
-    if (session / 'compact_roster_changed').exists():
-        with (session / 'mesh_events.txt').open('a') as events:
-            events.write('compact\\n')
-        print('codex_mesh: roster changed during compaction; reopen before following', file=sys.stderr)
-        sys.exit(4)
-def write_json(path, value):
+def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
+                        workers: Mapping[str, str]) -> None:
+    """Publish private staff references before the recorder attributes a wait."""
     import json
-    import os
-    import tempfile
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
-    try:
-        with os.fdopen(descriptor, 'w') as output:
-            json.dump(value, output)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-'''
+    with isolated_staff_file(root / "staff.json", environment):
+        owner = fixture_member("showrunner", name="wait-owner")
+        parent = fixture_member("unit", name="wait", parent=owner.id,
+                                runtime_id=fixture_runtime_id("fixture-director"),
+                                worktree=staff.PresentWorktree("natedev", root))
+        roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+                  for name, identity in workers.items()}
+    session.mkdir(parents=True, exist_ok=True)
+    _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
+
+
+
 
 LEGACY_RECORDER_ARGUMENTS = """
 # Compatibility for older launch cases whose subject is root-level artifacts.
@@ -116,7 +111,7 @@ class LauncherFixture(unittest.TestCase):
                            check=True, capture_output=True, text=True)
         self.config_file = self.root / "direct.conf"
         _ = self.config_file.write_text("\n".join(configuration), encoding="utf-8")
-        registry_file = self.root / ".claude/config/agents.conf"
+        registry_file = self.root / ".claude/config/models.conf"
         registry_file.parent.mkdir(parents=True)
         _ = write_registry(registry_file, base_text=registry)
         self.prompt_file = self.root / prompt_name
@@ -149,30 +144,24 @@ class LauncherFixture(unittest.TestCase):
         return session_dir
 
 
-def launcher_registry(implementation_roles: tuple[str, ...], *, mesh: bool = False) -> str:
-    """Build both launcher registries from the same catalog and role settings."""
-    return registry_text({
-        "assignments": ExactRows({"direct": "codex"}),
-        "direct.codex": {**dict.fromkeys(implementation_roles, "gpt-called:xhigh"), "review": "gpt-blind:max"},
-        "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
-        "direct.options": {"codex_mesh": "1" if mesh else "0"},
-    })
-
-
 def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     """Install shared launcher dependencies once in the disposable script tree."""
     source = Path(__file__).resolve().parents[1]
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "atomic_file.py", "process_start.py", "user_zone.py", "unit_runs.py",
-                 "agents_registry.py", "codex_models_cache.py", "probe_session.py"):
+    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
+                 "codex_models_cache.py", "build_folders.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
+    home_lib = root / ".claude/scripts/lib"
+    home_lib.mkdir(parents=True, exist_ok=True)
+    for name in ("py", "process_group.py"):
+        _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py", "codex_mesh.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
-    for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
-                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh", "tag_inventory.py"):
+    for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
+                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
 
@@ -190,15 +179,13 @@ def configure_launcher_fixture(launcher: Path) -> None:
 
 def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
-    environment = os.environ.copy()
-    environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
-                       UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
-                       TEST_LEGACY_LAUNCH="1", AGENTS_CONFIG_FILE=str(root / ".claude/config/agents.conf"),
-                       UNIT_HISTORY_DIR=str(root / "history"), UNIT_CONFIG=str(root / "direct.conf"),
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
+    environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
+                       UNIT_WORKER_POLL_SECS="0.01", UNIT_SYNC_WRITES="0",
+                       TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
+                       UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
-    cache = root / "cache/claude/python3-3.11"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    _ = cache.write_text(sys.executable + "\n")
+    seed_interpreter_cache(root / "cache")
     for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
         _ = environment.pop(name, None)
     return environment
@@ -210,7 +197,7 @@ def communicate_launcher(process: subprocess.Popen[str], timeout: float = test_h
         return process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            send_process_group(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = process.communicate()
@@ -228,8 +215,8 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     progress_history._config_digest.cache_clear()  # pyright: ignore[reportPrivateUsage]
     try:
         with (
-            patch.object(progress_history, "DEFAULT_CONFIG_PATH", home / ".claude/config/direct.conf"),
-            patch.object(progress_history, "DEFAULT_AGENTS_CONFIG_PATH", home / ".claude/config/agents.conf"),
+            patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
+            patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
             patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
                                                str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
         ):

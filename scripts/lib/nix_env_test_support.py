@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -45,9 +46,12 @@ class NixFixture(unittest.TestCase):
         self.work.mkdir(parents=True)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        self.env = {"HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
+        configuration = self.root / "settings"
+        _ = shutil.copytree(ROOT / "config", configuration)
+        self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),
+                    "HERDR_BIN": "/nonexistent/herdr",
                     "DIRENV_LOG": str(self.root / "direnv.jsonl"),
                     "DIRENV_APPROVAL": str(self.root / "approved"),
                     "KEEP": "caller", "REMOVE": "old"}

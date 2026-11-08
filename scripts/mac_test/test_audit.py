@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,8 @@ import tempfile
 import unittest
 from typing import final, override
 
+
+from scripts.lint.memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("audit.py")
 
@@ -39,15 +42,17 @@ class AuditCommandTests(unittest.TestCase):
         (self.workspace / ".git").mkdir()
         self.state_directory.mkdir()
         self.bin_directory.mkdir()
+        (self.bin_directory / "bash").symlink_to("/bin/bash")
         self.write_workspace()
         self.write_config("linux-target,compound-review")
         self.write_command_stands()
         self.environment = {
             **os.environ,
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_COMMAND_LOG": str(self.command_log),
             "PATH": str(self.bin_directory),
+            "CLAUDE_PYTHON": sys.executable,
         }
 
     def write_workspace(self) -> None:
@@ -133,9 +138,7 @@ edition = "2021"
         self.write_file(member / "src/lib.rs", "pub fn member() {}\n")
 
     def write_config(self, packages: str) -> None:
-        _ = self.config_path.write_text(
-            f"linux_only.{self.workspace.name}={packages}\n", encoding="utf-8"
-        )
+        _ = write_config_fixture(self.config_path, f"linux_only.{self.workspace.name}={packages}\n", template="mac_test")
 
     def write_command_stands(self) -> None:
         stand = self.bin_directory / "command-stand"
@@ -157,7 +160,7 @@ exit 97
 
     def run_audit(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), str(self.workspace), *arguments],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT), str(self.workspace), *arguments],
             env=self.environment,
             capture_output=True,
             text=True,

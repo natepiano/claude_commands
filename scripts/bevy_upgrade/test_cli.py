@@ -1,26 +1,28 @@
 """Exercise the real Bevy upgrade CLI with private fixtures and tool boundaries."""
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 import json
-import shlex
 import unittest
 from datetime import datetime
-from pathlib import Path
 from typing import cast, final
+from unittest import mock
+from scripts.production import staff
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cli_test_support import CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
+from scripts.bevy_upgrade.cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
 
 
 @final
 class CliTests(CliFixture):
+    # Keep one complete CLI process case.
+    @process_boundary
     def test_start_reads_the_production_checkout_and_writes_an_open_record(self) -> None:
         result = self.run_cli("start", "0.20")
         self.assert_table(result)
         current = self.read_record()
-        self.assertEqual(current["slug"], "demo")
-        self.assertEqual(current["production"], str(self.doc))
+        self.assertEqual(current["staff_id"], OWNER_ID)
+        self.assertEqual(current["production"], "demo")
         self.assertEqual(current["checkout"], str(self.checkout))
         self.assertEqual(current["target"], "0.20")
         self.assertEqual(current["bevy"], ["0.19.1"])
@@ -39,7 +41,7 @@ class CliTests(CliFixture):
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(result.stdout,
                                  "no Bevy upgrade is tracked for demo; start one with /showrunner:bevy_upgrade start <version>\n")
-                self.assertFalse((self.root / "state/demo.json").exists())
+                self.assertFalse((self.root / "state" / f"{OWNER_ID}.json").exists())
 
 
     def test_no_registered_production_has_the_specified_error(self) -> None:
@@ -47,20 +49,14 @@ class CliTests(CliFixture):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr,
-                         "bevy_upgrade: this session runs no production; pass --production <doc>\n")
+                         "bevy_upgrade: this session runs no production; pass --production <name>\n")
 
 
-    def test_registered_production_comes_from_the_session_timer(self) -> None:
-        timer = self.root / "notifier/showrunner-demo"
-        timer.mkdir(parents=True)
-        check_command = shlex.join([str(self.root / "production_check.sh"), str(self.doc)])
-        _ = (timer / "conf").write_text(
-            f'TARGET=session:no-real-session\nCHECK={check_command}\n',
-            encoding="utf-8",
-        )
+    def test_registered_production_comes_from_the_staff_row(self) -> None:
+        self.env["CLAUDE_CODE_SESSION_ID"] = CURRENT_ID
         result = self.run_cli("start", "0.20", explicit_production=False)
         self.assert_table(result)
-        self.assertEqual(self.read_record()["production"], str(self.doc))
+        self.assertEqual(self.read_record()["production"], "demo")
 
 
     def test_approve_decline_forget_and_note_end_in_a_table(self) -> None:
@@ -211,7 +207,7 @@ class CliTests(CliFixture):
         self.assertEqual(result.stdout, "")
         self.assertTrue(result.stderr.startswith(f"bevy_upgrade: {self.checkout / 'Cargo.lock'}: "))
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertFalse((self.root / "state/demo.json").exists())
+        self.assertFalse((self.root / "state" / f"{OWNER_ID}.json").exists())
 
 
     def test_record_refusals_print_one_error_and_preserve_the_watch(self) -> None:
@@ -286,7 +282,7 @@ class CliTests(CliFixture):
 
     def test_hand_check_failed_pin_read_shows_stored_facts_and_saves_baseline_once(self) -> None:
         self.begin()
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         (self.checkout / "Cargo.lock").unlink()
         result = self.run_cli("check", count_saves=True)
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -295,7 +291,7 @@ class CliTests(CliFixture):
         self.assertIn("| Dependency | Our pin | crates.io | Git | State | Next |", result.stdout)
         self.assertFalse((self.root / "fetch-calls").exists())
         self.assertEqual((self.root / "save-calls").read_text(), "saved\n")
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
 
 
     def test_check_all_requested_entries_fail_exits_one_preserves_facts_and_saves_once(self) -> None:
@@ -347,7 +343,7 @@ class CliTests(CliFixture):
         self.begin()
         current = self.read_record()
         current["target_bevy"] = {"status": "unread"}
-        _ = (self.root / "state/demo.json").write_text(json.dumps(current), encoding="utf-8")
+        _ = (self.root / "state" / f"{OWNER_ID}.json").write_text(json.dumps(current), encoding="utf-8")
         bodies = cast(dict[str, object], json.loads((self.root / "fixtures.json").read_text(encoding="utf-8")))
         del bodies["https://crates.io/api/v1/crates/bevy/versions"]
         _ = (self.root / "fixtures.json").write_text(json.dumps(bodies), encoding="utf-8")
@@ -376,7 +372,7 @@ class CliTests(CliFixture):
         self.assertTrue(self.tool_calls("notifier")[0]["record_exists"], "start scheduled before its save")
         self.assertTrue(self.tool_calls("notifier")[0]["locked"], "start scheduled outside the record lock")
         self.assertEqual(self.tool_args("notifier")[0][:7],
-                         ["new", "bevy-upgrade-demo", "--every", "240", "--timeout", "300", "--run"])
+                         ["new", f"bevy-upgrade-{OWNER_ID}", "--every", "240", "--timeout", "300", "--run"])
         self.assertEqual(self.tool_args("send"), [])
 
 
@@ -420,13 +416,12 @@ class CliTests(CliFixture):
         self.clear_calls()
         baseline = self.read_record()["announced"]
         self.make_branch_ready()
-        self.env["TEST_SHOWRUNNER_ADDRESS"] = ""
-        absent = self.run_cli("check", "--scheduled")
+        with mock.patch.object(staff.StaffSnapshot, "by_id", return_value=None):
+            absent = self.run_cli("check", "--scheduled")
         self.assert_silent_check(absent)
         self.assertEqual(absent.stderr, "bevy_upgrade: the showrunner was not told: no showrunner session\n")
         self.assertEqual(self.read_record()["announced"], baseline)
         self.assertEqual(self.tool_args("send"), [])
-        self.env["TEST_SHOWRUNNER_ADDRESS"] = "uds:/test/session"
         self.assert_silent_check(self.run_cli("check", "--scheduled"))
         self.assertEqual(len(self.tool_args("send")), 1)
         self.assertNotEqual(self.read_record()["announced"], baseline)
@@ -481,7 +476,7 @@ class CliTests(CliFixture):
         self.assert_silent_check(self.run_cli("check", "--scheduled"))
         self.clear_calls()
         self.write_lock(version="1.2.4")
-        path = self.root / "state/demo.json"
+        path = self.root / "state" / f"{OWNER_ID}.json"
         before = path.read_bytes()
         lock = path.with_suffix(".lock")
         lock.unlink()
@@ -504,7 +499,7 @@ class CliTests(CliFixture):
         self.env["TEST_SHOWRUNNER_ADDRESS"] = ""
         self.assert_silent_check(self.run_cli("check", "--scheduled"))
         self.clear_calls()
-        path = self.root / "state/demo.json"
+        path = self.root / "state" / f"{OWNER_ID}.json"
         before = path.read_bytes()
         lock = path.with_suffix(".lock")
         lock.unlink()
@@ -540,20 +535,20 @@ class CliTests(CliFixture):
                 self.assertNotIn("waiting for your answer", str(update["update"]))
         self.assert_table(self.run_cli("forget", "adapter"))
         self.write_lock(bevy="0.20.0")
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         result = self.run_cli("line", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         update = cast(dict[str, object], json.loads(result.stdout))
         self.assertIs(update["needs_user"], False)
         self.assertIn("1 of 1 done", str(update["update"]))
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
 
 
     def test_line_json_failed_pins_prints_one_object_using_stored_facts(self) -> None:
         self.begin()
         self.make_branch_ready()
         self.assert_silent_check(self.run_cli("check", "--scheduled"))
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         self.clear_calls()
         (self.checkout / "Cargo.lock").unlink()
         result = self.run_cli("line", "--json", count_saves=True)
@@ -565,7 +560,7 @@ class CliTests(CliFixture):
         self.assertIs(update["needs_user"], True)
         self.assertIn("(1 waiting for your answer)", str(update["update"]))
         self.assertIn("; pins not re-read since ", str(update["update"]))
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
         self.assertFalse((self.root / "save-calls").exists())
         self.assertFalse((self.root / "fetch-calls").exists())
         self.assertEqual(self.tool_args("send"), [])
@@ -578,9 +573,9 @@ class CliTests(CliFixture):
         self.begin()
         self.assert_table(self.run_cli("stop"))
         self.clear_calls()
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         self.assert_silent_check(self.run_cli("line", "--json", count_saves=True))
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
         self.assertEqual(self.tool_args("notifier"), [])
         self.assertEqual(self.tool_args("send"), [])
         self.assertFalse((self.root / "save-calls").exists())
@@ -601,7 +596,7 @@ class CliTests(CliFixture):
 
     def test_line_failed_pins_prints_one_sentence_and_preserves_record(self) -> None:
         self.begin()
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         (self.checkout / "Cargo.lock").unlink()
         result = self.run_cli("line", count_saves=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -609,7 +604,7 @@ class CliTests(CliFixture):
         self.assertEqual(len(result.stdout.splitlines()), 1)
         self.assertIn("; pins not re-read since ", result.stdout)
         self.assertNotIn("pins could not be re-read", result.stdout)
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
         self.assertFalse((self.root / "save-calls").exists())
 
 
@@ -618,14 +613,14 @@ class CliTests(CliFixture):
         current = self.read_record()
         current["dependencies"]["adapter"]["bevy"] = "0.20.0"
         self.store_record(current)
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         self.clear_calls()
         (self.checkout / "Cargo.lock").unlink()
         result = self.run_cli("check", "--scheduled", count_saves=True)
         self.assert_silent_check(result, 1)
         self.assertTrue(result.stderr.startswith("bevy_upgrade: pins could not be re-read: "))
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
         self.assertEqual(self.tool_args("send"), [])
         self.assertFalse((self.root / "save-calls").exists())
         self.assertFalse((self.root / "fetch-calls").exists())
@@ -683,13 +678,13 @@ class CliTests(CliFixture):
         self.assert_table(result)
         self.assertIsNotNone(self.read_record()["closed"])
         self.assertEqual((self.root / "save-calls").read_text(), "saved\n")
-        self.assertIn(["remove", "bevy-upgrade-demo"], self.tool_args("notifier"))
+        self.assertIn(["remove", f"bevy-upgrade-{OWNER_ID}"], self.tool_args("notifier"))
         self.assertTrue(self.tool_calls("notifier")[-1]["locked"], "stop removed the job outside the record lock")
         status = self.run_cli("status")
         self.assert_table(status)
         self.assertTrue(status.stdout.startswith("This watch closed "))
         self.assertNotIn("Changed since the last report:", status.stdout)
-        before = (self.root / "state/demo.json").read_bytes()
+        before = (self.root / "state" / f"{OWNER_ID}.json").read_bytes()
         self.clear_calls()
         hand = self.run_cli("check", count_saves=True)
         self.assertEqual(hand.returncode, 2)
@@ -699,11 +694,11 @@ class CliTests(CliFixture):
         scheduled = self.run_cli("check", "--scheduled", count_saves=True)
         self.assert_silent_check(scheduled)
         self.assertEqual(scheduled.stderr, "")
-        self.assertEqual(self.tool_args("notifier"), [["remove", "bevy-upgrade-demo"]])
+        self.assertEqual(self.tool_args("notifier"), [["remove", f"bevy-upgrade-{OWNER_ID}"]])
         self.assertTrue(self.tool_calls("notifier")[0]["locked"], "closed scheduled check removed the job outside the record lock")
         self.assertEqual(self.retire_calls(), [])
         self.assertEqual(self.tool_args("send"), [])
-        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual((self.root / "state" / f"{OWNER_ID}.json").read_bytes(), before)
 
 
     def test_line_with_no_watch_or_closed_watch_is_empty_and_saves_nothing(self) -> None:

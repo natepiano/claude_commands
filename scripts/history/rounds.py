@@ -1,10 +1,10 @@
-"""Read repair dispatches without changing the stored run records.
+"""Read started repair passes without changing the stored run records.
 
 The pure API takes parsed events. Phase boundaries are the recorded phase
 start and finish (zero means no finish); pass boundaries and span are separate.
 Fix seconds are agent time, so concurrent workers each contribute their time.
-An unfinished pass has no observed interval: its start counts, but cannot
-extend a round across later work whose overlap is unknown.
+Relaunches of one ledger batch form one round. Passes without a ledger round
+group by overlap. An unfinished pass cannot extend that overlap interval.
 """
 
 from __future__ import annotations
@@ -37,12 +37,13 @@ Cause = Literal["review-ux", "review-code", "gate", "merge", "live", "other"]
 
 
 class Round(TypedDict):
-    """One repair dispatch, including concurrent workers and its ledger batch."""
+    """One ledger batch with started fix passes, or one group of overlapping legacy passes."""
 
     round: int
     started_at: float
     finished_at: float
     cause: Cause
+    ledger_rounds: list[int]
     fix_seconds: float
     passes: int
     fix_passes: list[int]
@@ -81,6 +82,7 @@ class RepairPass(TypedDict):
     finished_at: float
     seconds: float
     fix_pass: int
+    ledger_round: int
     activity: str
     status: str
 
@@ -104,6 +106,27 @@ def _pass_start(event: dict[str, object]) -> float:
     )
 
 
+def pass_ledger_round(event: dict[str, object]) -> int:
+    """Return the launch's ledger round, or zero for a legacy pass."""
+    launch_check = event.get("launch_check")
+    launch = cast(dict[str, object], launch_check) if isinstance(launch_check, dict) else {}
+    fix_cause = launch.get("fix_cause")
+    cause = cast(dict[str, object], fix_cause) if isinstance(fix_cause, dict) else {}
+    return _integer(cause.get("round"))
+
+
+def refunded_batches(events: list[dict[str, object]]) -> set[int]:
+    """Return explicitly refunded ledger rounds without a later landing."""
+    refunded: set[int] = set()
+    for event in sorted(events, key=_stamp):
+        kind = _string(event.get("event_type"))
+        if kind == "finding_batch_abandoned" and event.get("edits_landed") is False:
+            refunded.add(_integer(event.get("round")))
+        elif kind == "finding_batch_landed":
+            refunded.discard(_integer(event.get("round")))
+    return refunded
+
+
 def _passes(events: list[dict[str, object]]) -> list[RepairPass]:
     joined: dict[tuple[str, ...], RepairPass] = {}
     # Finishes carry the final status and elapsed time, even if input is unsorted.
@@ -119,11 +142,16 @@ def _passes(events: list[dict[str, object]]) -> list[RepairPass]:
         )
         finished = event_type == "pass_finished"
         seconds = max(0.0, _number(event.get("pass_elapsed_seconds")))
+        ledger_round = pass_ledger_round(event)
+        previous = joined.get(key)
+        if finished and previous is not None:
+            ledger_round = previous["ledger_round"]
         joined[key] = RepairPass(
             kind=_string(event.get("pass_kind")), started_at=started,
             finished_at=max(started, _number(event.get("timestamp_epoch"), started + seconds)) if finished else 0.0,
             seconds=seconds if finished else 0.0,
             fix_pass=_integer(event.get("fix_pass")),
+            ledger_round=ledger_round,
             activity=_string(event.get("pass_activity")),
             status=_string(event.get("status"), "completed" if finished else "open"),
         )
@@ -143,6 +171,7 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
     batches: list[dict[str, object]] = []
     ux_findings: set[str] = set()
     live_finishes: list[float] = []
+    refunded = refunded_batches(events)
     for event in events:
         kind = _string(event.get("event_type"))
         if kind == "finding_batch_dispatched":
@@ -155,33 +184,45 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
             live_finishes.append(_stamp(event))
     live_finishes.sort()
     groups: list[list[RepairPass]] = []
+    ledger_groups: dict[int, list[RepairPass]] = {}
+    overlap_group: list[RepairPass] = []
     open_until = -1.0
     for repair in passes:
         if repair["kind"] != "fix":
             continue
-        if not groups or repair["started_at"] >= open_until:
-            groups.append([])
+        number = repair["ledger_round"]
+        if number > 0:
+            if number in refunded:
+                continue
+            if number not in ledger_groups:
+                ledger_groups[number] = []
+                groups.append(ledger_groups[number])
+            ledger_groups[number].append(repair)
+            continue
+        if not overlap_group or repair["started_at"] >= open_until:
+            overlap_group = []
+            groups.append(overlap_group)
             open_until = -1.0
-        groups[-1].append(repair)
+        overlap_group.append(repair)
         if repair["finished_at"]:
             open_until = max(open_until, repair["finished_at"])
 
     group_batches: dict[int, list[dict[str, object]]] = defaultdict(list)
-    unmatched_batches: list[dict[str, object]] = []
     # Each dispatch belongs to the first eligible pass, even within an open group.
     for batch in sorted(batches, key=_stamp):
         number = _integer(batch.get("round"))
         dispatched = _stamp(batch)
         for index, group in enumerate(groups):
-            if any(repair["fix_pass"] == number and repair["started_at"] >= dispatched for repair in group):
+            if any((repair["ledger_round"] or repair["fix_pass"]) == number
+                   and repair["started_at"] >= dispatched for repair in group):
                 group_batches[index].append(batch)
                 break
-        else:
-            unmatched_batches.append(batch)
 
     result: list[Round] = []
     for index, group in enumerate(groups):
         ledger = group_batches[index]
+        if ledger and all(_integer(batch.get("round")) in refunded for batch in ledger):
+            continue
         numbers = sorted({repair["fix_pass"] for repair in group})
         covered = sorted({finding for batch in ledger for finding in _strings(batch.get("covered"))})
         activities = [repair["activity"] for repair in group]
@@ -200,16 +241,12 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
         result.append(Round(
             round=0, started_at=started,
             finished_at=max(repair["finished_at"] for repair in group) if all(repair["finished_at"] for repair in group) else 0.0,
-            cause=cause, fix_seconds=sum(repair["seconds"] for repair in group),
+            cause=cause, ledger_rounds=sorted(
+                ({_integer(batch.get("round")) for batch in ledger}
+                 | {repair["ledger_round"] for repair in group if repair["ledger_round"] > 0}) - refunded
+            ),
+            fix_seconds=sum(repair["seconds"] for repair in group),
             passes=len(group), fix_passes=numbers, activities=activities, covered=covered,
-        ))
-    # A recorded dispatch is work even when its worker events are absent.
-    for batch in unmatched_batches:
-        covered = sorted(set(_strings(batch.get("covered"))))
-        result.append(Round(
-            round=0, started_at=_stamp(batch), finished_at=0.0,
-            cause="review-ux" if ux_findings.intersection(covered) else "review-code",
-            fix_seconds=0.0, passes=0, fix_passes=[_integer(batch.get("round"))], activities=[], covered=covered,
         ))
     result.sort(key=lambda repair: repair["started_at"])
     for number, repair in enumerate(result, 1):

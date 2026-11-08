@@ -6,6 +6,10 @@ under a showrunner. Session records provide the socket that SendMessage needs.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import subprocess
@@ -13,8 +17,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import roster
-import sessions
+from scripts.message import roster
+from scripts.message import sessions
 
 USAGE = "usage: top_level.py"
 
@@ -38,7 +42,7 @@ ForwardedSession = AddressableSession | UnaddressableSession
 def forwarded_sessions() -> list[ForwardedSession]:
     identity = roster.sender_identity(os.environ)
     result = roster.roster(os.environ, roster.ThisMachine())
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"top_level: roster: {problem}", file=sys.stderr)
     # Select the newest running record before checking its socket, as the
     # roster does, so an older reachable process never replaces it.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -14,11 +15,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import codex_hooks
+from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
 
+from scripts.hooks import codex_hooks
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
 FN_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"'
@@ -27,18 +28,26 @@ FN_HANDLER: dict[str, object] = {"type": "command", "command": FN_COMMAND, "time
 BERTH_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/pre-tool-use-berth.py"'
 BERTH_GROUP: dict[str, object] = {"matcher": "apply_patch",
                                   "hooks": [{"type": "command", "command": BERTH_COMMAND, "timeout": 30}]}
-GUARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/pre-tool-use-scratch-guard.py"'
+GUARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/../copies/copy_guard.py"'
 GUARD_GROUP: dict[str, object] = {"matcher": "Bash",
                                   "hooks": [{"type": "command", "command": GUARD_COMMAND, "timeout": 10}]}
 HOLD_COMMAND = '"$HOME/.claude/scripts/hooks/pre-tool-use-build-hold-guard.sh"'
 HOLD_GROUP: dict[str, object] = {"matcher": "Bash",
                                 "hooks": [{"type": "command", "command": HOLD_COMMAND, "timeout": 10}]}
 PRE_GROUPS = [BERTH_GROUP, GUARD_GROUP, HOLD_GROUP]
+STE_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-ste.py"'
+STE_GROUP: dict[str, object] = {"matcher": "*",
+                               "hooks": [{"type": "command", "command": STE_COMMAND, "timeout": 10}]}
+QUEUE_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/codex-queue-drain.py"'
+QUEUE_GROUP: dict[str, object] = {"matcher": "*",
+                                "hooks": [{"type": "command", "command": QUEUE_COMMAND, "timeout": 10}]}
+START_GROUPS = {"SessionStart": [STE_GROUP, QUEUE_GROUP], "SubagentStart": [STE_GROUP]}
 
 STUB = r'''#!__PYTHON__
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -62,7 +71,8 @@ def hooks_list(state):
         for group_index, group in enumerate(groups):
             matcher = group.get("matcher", "")
             for handler_index, handler in enumerate(group.get("hooks", [])):
-                key = f"{hooks_file}:{event.lower().replace('tooluse', '_tool_use')}:{group_index}:{handler_index}"
+                event_key = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+                key = f"{hooks_file}:{event_key}:{group_index}:{handler_index}"
                 material = json.dumps([event, matcher, handler], sort_keys=True)
                 current_hash = hashlib.sha256(material.encode()).hexdigest()
                 recorded_hash = state["trust"].get(key)
@@ -165,6 +175,57 @@ class CodexHookInstallerTests(unittest.TestCase):
             env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
         )
 
+    def run_bash_policy(self, command: str | list[str]) -> subprocess.CompletedProcess[str]:
+        hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
+        script = shlex.split(hook.command)[-1].replace("$HOME/.claude", str(INSTALLER.resolve().parents[2]))
+        return subprocess.run([str(INSTALLER.parents[1] / "lib/py"), script], input=json.dumps({
+            "tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"}),
+            env={**self.environment, "PATH": os.environ["PATH"]}, text=True,
+            capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+
+    def test_registered_bash_policy_refuses_clones_and_allows_the_checkout_service(self) -> None:
+        hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
+        self.assertEqual((hook.event, hook.matcher), ("PreToolUse", "Bash"))
+        for command, expected in (("git clone source destination", 2),
+                                  ("copies.py run --repo . --commit HEAD -- true", 0)):
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected:
+                    self.assertIn("copies.py run", result.stderr)
+
+    def test_registered_policy_distinguishes_literal_and_executable_substitutions(self) -> None:
+        for case in shell_policy_cases():
+            with self.subTest(command=case.command):
+                result = self.run_bash_policy(case.command)
+                self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
+                if case.operation:
+                    self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
+                else:
+                    self.assertEqual(result.stdout, "")
+
+    def test_interpreter_vectors_and_unresolved_programs_reach_the_codex_policy(self) -> None:
+        for command, operation in argv_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, 2 if operation else 0, result.stderr)
+                self.assertEqual(result.stderr.split(":", 1)[0] if result.stderr else "", operation)
+        for command, reason in unresolved_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue(result.stderr.startswith("unresolved relevant operation: " + reason + ":"), result.stderr)
+
+    def test_recorded_commands_and_interpreter_descriptor_context_matrix(self) -> None:
+        for case in repair_policy_cases():
+            with self.subTest(case=case.name, provenance=case.provenance):
+                result = self.run_bash_policy(case.command)
+                self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
+                if case.expected:
+                    self.assertTrue(result.stderr.startswith(case.expected + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
+
     def state(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.state_file.read_text()))
 
@@ -214,12 +275,15 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.groups(), [
             {"matcher": "apply_patch", "hooks": [FN_HANDLER]},
+            QUEUE_GROUP,
         ])
         self.assertTrue(self.hooks_file.read_text().endswith("\n"))
         self.assertIn('\n  "hooks":', self.hooks_file.read_text())
         calls = self.calls()
         self.assertEqual([call["method"] for call in calls],
                          ["initialize", "hooks/list", "config/batchWrite", "hooks/list",
+                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
+                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
                           "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
                           "config/batchWrite", "hooks/list"])
         initialize = cast(dict[str, object], calls[0]["params"])
@@ -236,11 +300,15 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(edits[0]["mergeStrategy"], "upsert")
         self.assertEqual(self.groups("PreToolUse"), PRE_GROUPS)
         trust = self.trust()
-        self.assertEqual(len(trust), 4)
+        self.assertEqual(len(trust), 8)
         self.assertIn("fn-length codex hook: trusted " + next(iter(trust)), result.stdout)
         self.assertIn(f"berth codex hook: trusted {self.hooks_file}:pre_tool_use:0:0", result.stdout)
         self.assertIn(f"scratch-guard codex hook: trusted {self.hooks_file}:pre_tool_use:1:0", result.stdout)
         self.assertIn(f"build-hold-guard codex hook: trusted {self.hooks_file}:pre_tool_use:2:0", result.stdout)
+        self.assertEqual(self.groups("SessionStart"), [STE_GROUP, QUEUE_GROUP])
+        self.assertEqual(self.groups("SubagentStart"), [STE_GROUP])
+        self.assertIn(f"ste codex hook: trusted {self.hooks_file}:session_start:0:0", result.stdout)
+        self.assertIn(f"ste-subagent codex hook: trusted {self.hooks_file}:subagent_start:0:0", result.stdout)
         self.assertEqual(self.state()["cwd"], str(self.home))
         self.assertEqual(self.state()["argv"], ["app-server"])
 
@@ -255,8 +323,9 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.groups()[:2], old_groups)
         self.assertEqual(self.groups()[2:], [
             {"matcher": "apply_patch", "hooks": [FN_HANDLER]},
+            QUEUE_GROUP,
         ])
-        self.assertEqual(len(self.groups()), 3)
+        self.assertEqual(len(self.groups()), 4)
 
     def test_install_keeps_the_hooks_link_and_adds_missing_hooks_to_its_target(self) -> None:
         shared = self.root / "shared"
@@ -273,9 +342,9 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertTrue(self.hooks_file.is_symlink())
         self.assertEqual(os.readlink(self.hooks_file), original_link)
         self.assertEqual(self.hooks_file.resolve(), target)
-        self.assertEqual(self.groups(), [existing])
+        self.assertEqual(self.groups(), [existing, QUEUE_GROUP])
         self.assertEqual(target.read_bytes(), self.hooks_file.read_bytes())
-        self.assertEqual(len(self.trust()), 4)
+        self.assertEqual(len(self.trust()), 8)
         self.assertEqual({entry.name for entry in shared.iterdir()}, {"hooks.json"})
 
     def test_install_creates_the_temporary_hooks_file_beside_the_link_target(self) -> None:
@@ -294,6 +363,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertTrue(self.hooks_file.is_symlink())
         self.assertEqual(self.groups(), [
             {"matcher": "apply_patch", "hooks": [FN_HANDLER]},
+            QUEUE_GROUP,
         ])
 
     def _assert_existing_fn_group_keeps_trust(self, old_groups: list[dict[str, object]]) -> None:
@@ -310,14 +380,17 @@ class CodexHookInstallerTests(unittest.TestCase):
 
         result = self.run_installer("install")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.groups(), original)
+        self.assertEqual(self.groups(), [*original, QUEUE_GROUP])
         self.assertEqual(self.trust()[fn_key], fn_hash)
         writes = [call for call in self.calls() if call["method"] == "config/batchWrite"]
         written = [key for call in writes
                    for edit in cast(list[dict[str, object]], cast(dict[str, object], call["params"])["edits"])
                    for key in cast(dict[str, object], edit["value"])]
-        self.assertEqual(written, [f"{self.hooks_file}:pre_tool_use:{index}:0" for index in range(3)])
-        self.assertEqual(len(self.trust()), 4)
+        self.assertEqual(written, [f"{self.hooks_file}:pre_tool_use:{index}:0" for index in range(3)] + [
+            f"{self.hooks_file}:session_start:0:0", f"{self.hooks_file}:subagent_start:0:0",
+            f"{self.hooks_file}:session_start:1:0", f"{self.hooks_file}:post_tool_use:{len(original)}:0",
+        ])
+        self.assertEqual(len(self.trust()), 8)
 
     def test_existing_natedev_fn_group_keeps_trust(self) -> None:
         self._assert_existing_fn_group_keeps_trust([])
@@ -378,7 +451,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         params = cast(dict[str, object], writes[0]["params"])
         edits = cast(list[dict[str, object]], params["edits"])
         expected = {
-            f"{self.hooks_file}:post_tool_use:1:0": {"trusted_hash": custom_hashes["custom-post"]},
+            f"{self.hooks_file}:post_tool_use:2:0": {"trusted_hash": custom_hashes["custom-post"]},
             f"{self.hooks_file}:pre_tool_use:3:0": {"trusted_hash": custom_hashes["custom-pre"]},
         }
         self.assertEqual(edits, [{"keyPath": "hooks.state", "value": expected, "mergeStrategy": "upsert"}])
@@ -406,7 +479,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.trust(), trusted)
         self.assertNotIn("config/batchWrite", [call["method"] for call in self.calls()])
         custom = next(entry for entry in self.listed_handlers() if entry["command"] == "custom-untrusted")
-        self.assertEqual(custom["key"], f"{self.hooks_file}:post_tool_use:1:0")
+        self.assertEqual(custom["key"], f"{self.hooks_file}:post_tool_use:2:0")
         self.assertEqual(custom["trustStatus"], "untrusted")
 
     def test_cleanup_does_not_restore_trust_for_disabled_custom_sibling(self) -> None:
@@ -425,15 +498,16 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.trust(), trusted)
         self.assertNotIn("config/batchWrite", [call["method"] for call in self.calls()])
         moved = next(entry for entry in self.listed_handlers() if entry["command"] == "custom-disabled")
-        self.assertEqual(moved["key"], f"{self.hooks_file}:post_tool_use:1:0")
+        self.assertEqual(moved["key"], f"{self.hooks_file}:post_tool_use:2:0")
         self.assertEqual(moved["trustStatus"], "untrusted")
         self.assertEqual(moved["enabled"], False)
 
     def assert_custom_command_preserved(self, command: str) -> subprocess.CompletedProcess[str]:
         _ = self.hooks_file.write_text(json.dumps({"hooks": {
             "PostToolUse": [{"matcher": "apply_patch", "hooks": [FN_HANDLER]},
-                            {"matcher": "Write", "hooks": [{"type": "command", "command": command}]}],
+                            {"matcher": "Write", "hooks": [{"type": "command", "command": command}]}, QUEUE_GROUP],
             "PreToolUse": PRE_GROUPS,
+            **START_GROUPS,
         }}, indent=4))
         before = self.hooks_file.read_bytes()
 
@@ -468,15 +542,17 @@ class CodexHookInstallerTests(unittest.TestCase):
             {"matcher": "apply_patch", "hooks": [], "description": "old group"},
             {"matcher": "apply_patch", "hooks": [FN_HANDLER]},
             {"matcher": "Write", "hooks": [other, absolute, similar]},
+            QUEUE_GROUP,
         ]
         original_groups = [
             {**retained_groups[0], "hooks": [retired]},
             retained_groups[1],
             {**retained_groups[2], "hooks": [other, {**retired, "timeout": 99}, absolute, similar]},
+            QUEUE_GROUP,
         ]
         _ = self.hooks_file.write_text(json.dumps({
             "description": "user configuration",
-            "hooks": {"PostToolUse": original_groups, "PreToolUse": PRE_GROUPS},
+            "hooks": {"PostToolUse": original_groups, "PreToolUse": PRE_GROUPS, **START_GROUPS},
         }))
 
         installed = self.run_installer("install")
@@ -485,12 +561,12 @@ class CodexHookInstallerTests(unittest.TestCase):
         document = cast(dict[str, object], json.loads(self.hooks_file.read_text()))
         self.assertEqual(document, {
             "description": "user configuration",
-            "hooks": {"PostToolUse": retained_groups, "PreToolUse": PRE_GROUPS},
+            "hooks": {"PostToolUse": retained_groups, "PreToolUse": PRE_GROUPS, **START_GROUPS},
         })
         self.assertEqual(installed.stderr.splitlines(), [
             f"{self.hooks_file}: remove the remaining retired script handler by hand",
         ])
-        self.assertEqual(len(self.trust()), 4)
+        self.assertEqual(len(self.trust()), 8)
         self.assertIn(f"{self.hooks_file}:post_tool_use:1:0", self.trust())
         before = self.hooks_file.read_bytes()
         modified = self.hooks_file.stat().st_mtime_ns
@@ -511,7 +587,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.environment["PATH"] = "bin"
         installed = self.run_installer("install", cwd=self.root)
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
-        self.assertEqual(len(self.groups()), 1)
+        self.assertEqual(len(self.groups()), 2)
         self.assertEqual(self.state()["codex_home"], str(self.codex_home))
         self.environment["CODEX_BIN"] = "bin/codex"
         checked = self.run_installer("check", cwd=self.root)
@@ -526,7 +602,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         state = self.state()
         trust = cast(dict[str, str], state["trust"])
-        self.assertEqual(len(trust), 4)
+        self.assertEqual(len(trust), 8)
         first_key = next(key for key in trust if key.endswith(":post_tool_use:0:0"))
         second_key = first_key.replace(":0:0", ":1:0")
         trust[second_key] = trust.pop(first_key)
@@ -538,7 +614,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         self.assertNotIn("config/batchWrite", [call["method"] for call in self.calls()])
         self.assertEqual(self.trust(), trust)
-        self.assertEqual(len(self.groups()), 2)
+        self.assertEqual(len(self.groups()), 3)
 
     def test_same_handler_under_other_matcher_does_not_count(self) -> None:
         existing = {"matcher": "Write", "hooks": [FN_HANDLER]}
@@ -546,7 +622,77 @@ class CodexHookInstallerTests(unittest.TestCase):
         result = self.run_installer("install")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.groups(), [existing,
-                         {"matcher": "apply_patch", "hooks": [FN_HANDLER]}])
+                         {"matcher": "apply_patch", "hooks": [FN_HANDLER]}, QUEUE_GROUP])
+
+    def test_queue_drain_registers_and_trusts_both_events_with_one_adapter(self) -> None:
+        installed = self.run_installer("install")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        handlers = [entry for entry in self.listed_handlers() if entry["command"] == QUEUE_COMMAND]
+        self.assertEqual([(entry["eventName"], entry["matcher"], entry["trustStatus"], entry["enabled"])
+                          for entry in handlers],
+                         [("postToolUse", "*", "trusted", True), ("sessionStart", "*", "trusted", True)])
+
+    def test_context_hooks_are_listed_and_trusted_for_each_event(self) -> None:
+        installed = self.run_installer("install")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        contexts = [entry for entry in self.listed_handlers() if entry["command"] == STE_COMMAND]
+        self.assertEqual([(entry["eventName"], entry["matcher"], entry["trustStatus"], entry["enabled"])
+                          for entry in contexts],
+                         [("sessionStart", "*", "trusted", True), ("subagentStart", "*", "trusted", True)])
+        trust = self.trust()
+        subagent_key = cast(str, contexts[1]["key"])
+        trust[subagent_key] = "stale hash"
+        self.save_trust(trust)
+        checked = self.run_installer("check")
+        self.assertEqual(checked.returncode, 1, checked.stdout + checked.stderr)
+        self.assertIn("ste codex hook: trusted", checked.stdout.splitlines())
+        self.assertIn("ste-subagent codex hook: modified", checked.stdout.splitlines())
+        self.clear_calls()
+        repaired = self.run_installer("install")
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        writes = [call for call in self.calls() if call["method"] == "config/batchWrite"]
+        self.assertEqual(len(writes), 1)
+        params = cast(dict[str, object], writes[0]["params"])
+        edits = cast(list[dict[str, object]], params["edits"])
+        self.assertEqual(list(cast(dict[str, object], edits[0]["value"])), [subagent_key])
+
+    def test_context_hooks_with_narrow_matchers_do_not_satisfy_install(self) -> None:
+        narrow = {"SessionStart": [{**STE_GROUP, "matcher": "startup|resume"}],
+                  "SubagentStart": [{**STE_GROUP, "matcher": "apply_patch"}]}
+        _ = self.hooks_file.write_text(json.dumps({"hooks": narrow}))
+        installed = self.run_installer("install")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        for event, original in narrow.items():
+            self.assertEqual(self.groups(event), [*original, STE_GROUP, *([QUEUE_GROUP] if event == "SessionStart" else [])])
+        contexts = [entry for entry in self.listed_handlers() if entry["command"] == STE_COMMAND]
+        self.assertEqual([(entry["matcher"], entry["trustStatus"]) for entry in contexts],
+                         [("startup|resume", "untrusted"), ("*", "trusted"),
+                          ("apply_patch", "untrusted"), ("*", "trusted")])
+
+    def test_context_trust_survives_retired_sibling_removal(self) -> None:
+        installed = self.run_installer("install")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        document = cast(dict[str, object], json.loads(self.hooks_file.read_text()))
+        hooks = cast(dict[str, object], document["hooks"])
+        hooks["SessionStart"] = [{"matcher": "*", "hooks": [
+            {"type": "command", "command": RETIRED_COMMAND},
+            {"type": "command", "command": STE_COMMAND, "timeout": 10},
+        ]}]
+        _ = self.hooks_file.write_text(json.dumps(document))
+        trust = self.trust()
+        restored_key = f"{self.hooks_file}:session_start:0:0"
+        trust[f"{self.hooks_file}:session_start:0:1"] = trust.pop(restored_key)
+        self.save_trust(trust)
+        self.clear_calls()
+        repaired = self.run_installer("install")
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        self.assertEqual(self.groups("SessionStart"), [STE_GROUP, QUEUE_GROUP])
+        writes = [call for call in self.calls() if call["method"] == "config/batchWrite"]
+        self.assertEqual(len(writes), 1)
+        params = cast(dict[str, object], writes[0]["params"])
+        edits = cast(list[dict[str, object]], params["edits"])
+        self.assertEqual(list(cast(dict[str, object], edits[0]["value"])), [restored_key])
+        self.assertEqual(self.trust()[restored_key], trust[f"{self.hooks_file}:session_start:0:1"])
 
     def test_modified_entry_is_trusted_again(self) -> None:
         first = self.run_installer("install")
@@ -561,7 +707,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("config/batchWrite", [call["method"] for call in self.calls()])
         self.assertNotEqual(cast(dict[str, str], self.state()["trust"])[key], "stale hash")
-        self.assertEqual(len(self.groups()), 1)
+        self.assertEqual(len(self.groups()), 2)
 
     def test_only_modified_hook_is_retrusted(self) -> None:
         first = self.run_installer("install")
@@ -590,6 +736,8 @@ class CodexHookInstallerTests(unittest.TestCase):
         fn_line = "fn-length codex hook: trusted"
         guard_line = "scratch-guard codex hook: trusted"
         hold_line = "build-hold-guard codex hook: trusted"
+        start_lines = ["ste codex hook: trusted", "ste-subagent codex hook: trusted",
+                       "queue-start codex hook: trusted", "queue-tools codex hook: trusted"]
 
         trust = self.trust()
         berth_key = next(key for key in trust if key.endswith(":pre_tool_use:0:0"))
@@ -597,23 +745,27 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.save_trust(trust)
         untrusted = self.run_installer("check")
         self.assertEqual(untrusted.returncode, 1)
-        self.assertEqual(untrusted.stdout.splitlines(), [fn_line, "berth codex hook: untrusted", guard_line, hold_line])
+        self.assertEqual(untrusted.stdout.splitlines(),
+                         [fn_line, "berth codex hook: untrusted", guard_line, hold_line, *start_lines])
 
         trust[berth_key] = "stale hash"
         self.save_trust(trust)
         modified = self.run_installer("check")
         self.assertEqual(modified.returncode, 1)
-        self.assertEqual(modified.stdout.splitlines(), [fn_line, "berth codex hook: modified", guard_line, hold_line])
+        self.assertEqual(modified.stdout.splitlines(),
+                         [fn_line, "berth codex hook: modified", guard_line, hold_line, *start_lines])
 
         restored = self.run_installer("install")
         self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
         self.environment["STUB_DISABLED_COMMAND"] = BERTH_COMMAND
         disabled = self.run_installer("check")
         self.assertEqual(disabled.returncode, 1)
-        self.assertEqual(disabled.stdout.splitlines(), [fn_line, "berth codex hook: disabled", guard_line, hold_line])
+        self.assertEqual(disabled.stdout.splitlines(),
+                         [fn_line, "berth codex hook: disabled", guard_line, hold_line, *start_lines])
         failed_install = self.run_installer("install")
         self.assertEqual(failed_install.returncode, 1)
-        self.assertEqual(failed_install.stdout.splitlines(), [fn_line, "berth codex hook: disabled", guard_line, hold_line])
+        self.assertEqual(failed_install.stdout.splitlines(),
+                         [fn_line, "berth codex hook: disabled", guard_line, hold_line, *start_lines])
         _ = self.environment.pop("STUB_DISABLED_COMMAND")
 
         _ = self.hooks_file.write_text(json.dumps({"hooks": {"PostToolUse": self.groups()[:1]}}))
@@ -621,7 +773,9 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(absent.returncode, 1)
         self.assertEqual(absent.stdout.splitlines(),
                          [fn_line, "berth codex hook: absent", "scratch-guard codex hook: absent",
-                          "build-hold-guard codex hook: absent"])
+                          "build-hold-guard codex hook: absent", "ste codex hook: absent",
+                          "ste-subagent codex hook: absent", "queue-start codex hook: absent",
+                          "queue-tools codex hook: absent"])
 
     def test_check_reports_absent_untrusted_modified_and_disabled(self) -> None:
         absent = self.run_installer("check")

@@ -15,11 +15,21 @@ from functools import cached_property, lru_cache
 from itertools import accumulate
 import re
 
-import style_footprint
-from approved_renames import ITEM_KEYWORDS, type_path
+from scripts.style import style_footprint
 
+# The keywords that declare an item directly in a module, trait or impl body.
+ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
 # The items whose body is in braces; the other items end at their semicolon.
 BRACED_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "mod", "impl"})
+
+
+def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the path segments from an impl header, or an empty tuple for an unreadable path."""
+    finish = next((i for i, word in enumerate(words) if word in {"<", "where"}), len(words))
+    path = words[:finish]
+    readable = len(path) % 2 == 1 and all(
+        word == "::" if i % 2 else style_footprint.IDENTIFIER.fullmatch(word) is not None for i, word in enumerate(path))
+    return path[::2] if readable else ()
 
 
 @dataclass(frozen=True)

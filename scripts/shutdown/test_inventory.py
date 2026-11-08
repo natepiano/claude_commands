@@ -2,46 +2,39 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import io
 import os
 import socket
-import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
-from datetime import datetime
-from collections.abc import Iterator, Sequence
+from datetime import datetime, timezone
+from functools import cached_property
 from pathlib import Path
-
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import StaffTestCase, showrunner_relationship, unit_membership
-from test_support import ShutdownTestCase, linux_process_fixture
-from test_restart import entry, top_level, worker_session
-import shutdown_record
-import inventory
-import conversation_pause
-import unit_runs
+from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
+from scripts.production import staff
+from scripts.lib import unit_runs as owned_runs
+from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable
+from scripts.usage import agents_log
+from scripts.shutdown.test_support import ShutdownTestCase, linux_process_fixture
+from scripts.shutdown import inventory
+from scripts.lib import unit_runs
 from scripts.whoami import account
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import showrunners
-import unit_lookup
-import restart
-import shutdown
-from fake_herdr import CommandResponse, herdr_listener
-from cli_fixture import ImmutableGitSeed, invoke_cli
-import fake_herdr
+from scripts.production import unit_lookup
+from scripts.shutdown import shutdown
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.herdr import fake_herdr
 
 
 TARGET_LOGIN = "owner@example.com"
@@ -111,14 +104,18 @@ class InventoryImportTests(unittest.TestCase):
     def test_package_inventory_imports_without_shutdown_on_search_path(self) -> None:
         root = Path(__file__).resolve().parents[2]
         result = subprocess.run(
-            [sys.executable, "-I", "-c", """
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", """
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-sys.path.insert(0, str(root))
+with open(root / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 assert str(root / "scripts/shutdown") not in sys.path
 from scripts.shutdown import inventory
-assert inventory.codex_seats([]) == []
+from scripts.production import staff
+from scripts.lib import unit_runs as owned_runs
+parent = staff.StaffRow(staff.StaffId("parent"), "unit", "parent", staff.STAFF_ROOT, current_session=staff.StaffId("parent"))
+assert inventory.worker_resumes(parent, staff.StaffSnapshot(())) == []
 """, str(root)],
             cwd=root / "scripts" / "herdr",
             capture_output=True, text=True, check=False, timeout=60,
@@ -146,74 +143,85 @@ class InventoryTests(ShutdownTestCase):
         cls.seed_head = fixture.head
         fixture.live_socket.close()
 
-    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+    def test_paused_worker_reads_its_current_thread_from_the_staff_backend_record(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        owner = fixture_member("showrunner", name="owner")
+        unit = fixture_member("unit", name="unit", parent=owner.id)
+        worker = fixture_worker("impl2", unit.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        current = staff.native_id(fixture_runtime_id("shutdown-replaced-thread"))
+        fixture_session(current, staff.CodexBackend(self.root / "codex-home"))
+        worker = staff.update_current_session(worker.current_session, current)
+        agents_log.append(current, "review", None, datetime.now(timezone.utc))
+        run = self.root / "paused-staff-worker"
+        run.mkdir()
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "paused", "role": "review"},
+        }))
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)), patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
+            found = inventory.worker_resumes(unit, staff.local_snapshot())
+        self.assertTrue(all(isinstance(result, Idle) for result in found))
+        seats = [result.seat for result in found if isinstance(result, Idle)]
+        self.assertEqual(len(seats), 1)
+        self.assertEqual(seats[0]["staff_id"], worker.id)
+        recorded = staff.by_id(staff.StaffId(seats[0]["staff_id"]))
+        assert recorded is not None
+        self.assertEqual(recorded.current_session, current)
+        self.assertEqual(seats[0]["role"], "review")
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertNotIn("thread_id", (run / "mesh_roster.json").read_text())
+
+    def test_worker_resumes_records_nearest_launcher_argv_for_direct_children(self) -> None:
         run = self.root / "paused run"
         run.mkdir()
         command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
+        outer = ["bash", "/config/scripts/direct/assign.sh", "--role", "implement",
+                 "--session-dir", str(run), "--cwd", "/checkout with spaces", "--prompt", "/old/prompt.md"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})
-        _ = (run / "mesh_roster.json").write_text(json.dumps({
-            "busy": {"role": "review", "thread_id": "busy-thread", "turn_id": "turn", "status": "running", "launcher_pid": 810},
-            "idle": {"role": "impl", "thread_id": "idle-thread", "status": "done"},
-            "orphan": {"role": "impl", "thread_id": "orphan-thread", "status": "starting", "launcher_pid": 99999999},
-            "ended": {"role": "impl", "thread_id": "ended-thread", "status": "ended"},
-        }))
+        _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
+            "busy": {"role": "review", "thread_id": "75863a97-cb41-5754-bb95-d7e89deccf43", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "fe371221-a140-5ddf-8753-e906f9ce3519", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "cbf7634e-e57a-51ad-99e2-5cfbeabec92b", "status": "ended"},
+        }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
+        agents_log.append("75863a97-cb41-5754-bb95-d7e89deccf43", "review", None, datetime.now(timezone.utc))
+        agents_log.append("fe371221-a140-5ddf-8753-e906f9ce3519", "impl", None, datetime.now(timezone.utc))
+        agents_log.append("ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "impl", None, datetime.now(timezone.utc))
+
         def launcher_alive(pid: int) -> bool:
             return pid in {810, 811, 812}
-
-        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
-            found = inventory.codex_seats([run])
-        seats = {seat["seat"]: seat for seat in found}
+        # An ended worker no longer belongs to the director's active children.
+        unit = unit_membership("fixture", run.name.replace(" ", "-"))
+        membership = staff.StaffSnapshot(tuple(row for row in staff.local_snapshot().rows if row.current_session != "cbf7634e-e57a-51ad-99e2-5cfbeabec92b"))
+        with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
+              patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
+              patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
+            found = inventory.worker_resumes(unit, membership)
+        self.assertTrue(all(isinstance(result, (Resumable, Idle)) for result in found))
+        seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
         self.assertEqual(set(seats), {"busy", "idle", "orphan"})
-        self.assertEqual(seats["busy"], shutdown_record.PausedSeat(run_dir=str(run), seat="busy", role="review", thread_id="busy-thread", turn_live=True, launcher_command=command))
-        self.assertEqual(seats["idle"], shutdown_record.PausedSeat(run_dir=str(run), seat="idle", role="impl", thread_id="idle-thread", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["busy"], PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
         self.assertEqual(seats["orphan"]["launcher_command"], [])
 
-    def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
-        def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
-            run = self.root / name
-            run.mkdir()
-            _ = (run / "mesh_roster.json").write_text(json.dumps({
-                seat: {"role": "test", "thread_id": f"{seat}-thread", "status": status}
-                for seat, status in statuses.items()
-            }))
-            board = run / "board.log"
-            _ = board.write_text("[director] dispatch\n")
-            os.utime(board, (board_at, board_at))
-            if offered_at is not None:
-                for seat in statuses:
-                    prompt = run / f"{seat}.resume-prompt.md"
-                    _ = prompt.write_text("paused\n")
-                    os.utime(prompt, (offered_at, offered_at))
-            return run
-
-        left = run_with("left", {"a75-test": "paused", "p39a-impl": "paused"}, board_at=1_000, offered_at=2_000)
-        taken_back = run_with("taken back", {"impl": "paused"}, board_at=3_000, offered_at=2_000)
-        dispatched = run_with("dispatched", {"impl": "paused", "test": "done"}, board_at=1_000, offered_at=2_000)
-        never_offered = run_with("never offered", {"impl": "paused"}, board_at=1_000, offered_at=None)
-
-        found = inventory.codex_seats([left, taken_back, dispatched, never_offered])
-
-        self.assertEqual(
-            sorted((Path(seat["run_dir"]).name, seat["seat"]) for seat in found),
-            [("dispatched", "impl"), ("dispatched", "test"), ("never offered", "impl"), ("taken back", "impl")],
-        )
-
-    def test_old_shutdown_record_reads_back_without_codex_seats_and_new_seats_survive_wire_roundtrip(self) -> None:
-        saved = entry(top_level("legacy-director"))
-        document = cast(dict[str, object], json.loads(json.dumps(saved)))
-        _ = document.pop("codex_seats", None)
-        parsed = shutdown_record.parse_session_records(json.dumps([document]))[0]
-        self.assertNotIn("codex_seats", parsed)
-        seats = [shutdown_record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="thread-kept", turn_live=True, launcher_command=["bash", "/scripts/implement.sh", "argument with spaces"])]
-        document["codex_seats"] = seats
-        parsed = shutdown_record.parse_session_records(json.dumps([document]))[0]
-        self.assertEqual(parsed.get("codex_seats"), seats)
-        document["codex_seats"] = [{**seats[0], "turn_live": "true"}]
-        with self.assertRaisesRegex(shutdown_record.InvalidRecord, "turn_live"):
-            _ = shutdown_record.parse_session_records(json.dumps([document]))
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                command = ["bash" if launcher.endswith(".sh") else "python3",
+                           f"/config/scripts/direct/{launcher}", "--role", "review", "--to", "busy",
+                           "--session-dir", str(run), "--cwd", "/checkout with spaces",
+                           "--prompt", "/old/prompt.md", "--phase", "1", "--lens", "contract", "--pass", "2"]
+                self.herdr_process(811, 812, command, {})
+                with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
+                      patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
+                      patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
+                    found = inventory.worker_resumes(unit, membership)
+                seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
+                self.assertEqual(seats["busy"]["launcher_command"], command)
 
     def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
         timestamp = 1_791_563_350_123
@@ -223,26 +231,6 @@ class InventoryTests(ShutdownTestCase):
         decoded = inventory.parse_inventory(json.dumps(found))
         self.assertEqual(decoded["sessions"][0]["updated_at"], timestamp)
 
-    def test_updated_at_is_required_and_must_be_an_integer_in_fresh_inventory(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
-        values = cast(dict[str, object], cast(object, found["sessions"][0]))
-        for invalid in (True, 12.5, "123", None):
-            with self.subTest(updated_at=invalid):
-                values["updated_at"] = invalid
-                with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
-                    _ = inventory.parse_inventory(json.dumps(found))
-        del values["updated_at"]
-        with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
-            _ = inventory.parse_inventory(json.dumps(found))
-
-    def test_shutdown_record_without_updated_at_remains_readable(self) -> None:
-        saved = entry(top_level("legacy-owner"))
-        document = cast(dict[str, object], json.loads(json.dumps(saved)))
-        owner = cast(dict[str, object], document["session"])
-        del owner["updated_at"]
-        parsed = shutdown_record.parse_session_records(json.dumps([document]))[0]
-        self.assertEqual(parsed["session"]["updated_at"], 0)
-        self.assertEqual(parsed["session"]["session_id"], "legacy-owner")
 
     def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
         transcript = self.root / "metadata.jsonl"
@@ -340,7 +328,6 @@ class InventoryTests(ShutdownTestCase):
             patch.object(inventory, "_git", side_effect=AssertionError("listing runs git")),
             patch.object(inventory, "_timers", side_effect=AssertionError("listing reads timers")),
             patch.object(inventory, "_host", side_effect=AssertionError("listing builds a host")),
-            patch.object(inventory, "_snapshot_desktops", side_effect=AssertionError("listing reads desktops")),
             patch.object(inventory, "_newest_unit_plans", side_effect=AssertionError("listing reads plan history")),
         ):
             listed = inventory.listing()
@@ -366,17 +353,33 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
                     self.assertNotIn("doc", session["host"])
 
+    def test_registration_reads_the_folder_owner_document_from_one_staff_snapshot(self) -> None:
+        doc = self.root / "document-name-differs.md"
+        _ = doc.write_text("# Production\n", encoding="utf-8")
+        owner = recorded_showrunner("staff-name", doc)
+        other = recorded_showrunner("other-owner", self.root / "other-document.md")
+        folder = self.notifier / f"showrunner-{owner.id}"
+        folder.mkdir()
+        _ = (folder / "conf").write_text(
+            f"TARGET=session:{owner.id}\nCHECK=zsh /opt/production_check.sh {other.id}\n", encoding="utf-8")
+        with patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            registrations = inventory.showrunner_registrations()
+        found = next(item for item in registrations.entries if item.name == owner.name)
+        self.assertEqual(found.doc, str(doc))
+        self.assertEqual(reads.call_count, 1)
+
     def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
         with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
-              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+              patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked):
             registrations = inventory.showrunner_registrations()
             listed = inventory.listing(registrations=registrations)
             missing = inventory.unregistered_showrunners(listed, registrations=registrations)
@@ -387,7 +390,7 @@ class InventoryTests(ShutdownTestCase):
         unit = next(item for item in listed if item.session_id == UNIT_ID)
         self.assertEqual((unit.kind, unit.production, unit.doc),
             ("unit", "build-followups", director.doc))
-        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
+        self.assertEqual([(runner["name"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
 
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
@@ -413,48 +416,6 @@ class InventoryTests(ShutdownTestCase):
             self.assertGreater(stream.bytes_read, 0)
             self.assertLess(stream.bytes_read, 1024 * 1024)
 
-    def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
-        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
-              patch.object(subprocess, "run") as updater):
-            desktops = inventory._snapshot_desktops(refresh=False)  # pyright: ignore[reportPrivateUsage]
-        updater.assert_not_called()
-        self.assertEqual(desktops[DESKTOP_ID], "Writing")
-
-    def test_desktop_snapshot_update_skips_the_agent_notes_refresh(self) -> None:
-        with (patch.dict(os.environ),
-              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
-              patch.object(subprocess, "run") as updater):
-            _ = os.environ.pop("REFUSAL_WATCH_INVENTORY", None)
-            _ = os.environ.pop("PYTHONUNBUFFERED", None)
-            _ = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
-        updater.assert_called_once()
-        environment = cast("dict[str, str]", updater.call_args.kwargs["env"])
-        self.assertEqual(environment[inventory.SKIP_AGENT_NOTES], "1")
-        self.assertEqual(environment["PATH"], os.environ["PATH"])
-
-    def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
-        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
-              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
-              patch.object(subprocess, "run") as updater):
-            desktops = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
-        updater.assert_not_called()
-        self.assertEqual(desktops[DIRECTOR_ID], "Production")
-
-    def test_refusal_synthetic_model_keeps_the_last_real_reply_model(self) -> None:
-        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
-        transcript.parent.mkdir(parents=True)
-        entries = [
-            {"type": "assistant", "message": {"model": "claude-opus-real"}},
-            {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
-             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
-        ]
-        _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
-        model = inventory._model("refused", self.home / ".claude")  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
-        self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
-        owner = top_level("refused", model=model)
-        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude3"))
-        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude3"))
 
     def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
@@ -491,7 +452,7 @@ class InventoryTests(ShutdownTestCase):
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
-        self.notifier = self.root / "notifier"
+        self.notifier = Path(os.environ["NOTIFIER_STATE_DIR"])
         self.history = self.root / "history"
         self.runs = self.root / "runs"
         self.checkout = self.root / "checkout"
@@ -521,9 +482,9 @@ class InventoryTests(ShutdownTestCase):
         environment = {
             **os.environ,
             "HOME": str(self.home),
+            "USAGE_STATE_DIR": str(self.root / "usage"),
             "AGENT_NOTES_DIR": str(self.notes),
             "NOTIFIER_SESSIONS_DIR": str(self.records),
-            "NOTIFIER_STATE_DIR": str(self.notifier),
             "UNIT_HISTORY_DIR": str(self.history),
             "SHUTDOWN_RUN_ROOT": str(self.runs),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
@@ -541,12 +502,6 @@ class InventoryTests(ShutdownTestCase):
         _home_context: object = self.enterContext(
             patch.object(Path, "home", return_value=self.home)
         )
-        _notifier_context: object = self.enterContext(
-            patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)
-        )
-        _sessions_context: object = self.enterContext(
-            patch.object(showrunners, "SESSIONS_DIR", self.records)
-        )
         _live_context: object = self.enterContext(
             patch.object(sessions, "live_session", return_value=True)
         )
@@ -555,10 +510,10 @@ class InventoryTests(ShutdownTestCase):
         )
         _process_environment_context = cast(
             object,
-            self.enterContext(patch("inventory._process_environment", return_value={})),
+            self.enterContext(patch("scripts.shutdown.inventory._process_environment", return_value={})),
         )
-        _ = self.enterContext(
-            patch.object(process_identity, "process_start", return_value=process_identity.parse_start(CURRENT_PROCESS_START))
+        _process_start_context: object = self.enterContext(
+            patch("scripts.shutdown.inventory._process_start", return_value=CURRENT_PROCESS_START)
         )
 
         self.director_pid = os.getpid()
@@ -600,7 +555,6 @@ class InventoryTests(ShutdownTestCase):
             (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
         self.make_worker_state()
-        self.make_snapshot()
         replay_herdr_commands(self)
 
     def write_account(self, config_dir: Path, login: str) -> None:
@@ -612,7 +566,7 @@ class InventoryTests(ShutdownTestCase):
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
         process.mkdir(exist_ok=True)
-        _ = write_stat(process.parent, int(process.name), ppid=parent)
+        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
@@ -695,24 +649,20 @@ class InventoryTests(ShutdownTestCase):
 
     def build_git_checkout(self) -> None:
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "shutdown-unit", cwd=self.checkout)
+        _ = self.git("init", "-b", "shutdown", cwd=self.checkout)
         _ = self.git("config", "user.name", "Shutdown Test")
         _ = self.git("config", "user.email", "shutdown@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
         _ = (self.checkout / "dirty.txt").write_text("base\n", encoding="utf-8")
         _ = self.git("add", "dirty.txt")
         _ = self.git("commit", "-m", "base")
-        _ = self.git("push", "-u", "origin", "shutdown-unit")
+        _ = self.git("push", "-u", "origin", "shutdown")
         for number in (1, 2):
             _ = (self.checkout / f"ahead-{number}.txt").write_text(
                 f"ahead {number}\n", encoding="utf-8"
             )
             _ = self.git("add", f"ahead-{number}.txt")
             _ = self.git("commit", "-m", f"ahead {number}")
-        # A snapshot commit is pushed by its own job, so the ahead count leaves it out.
-        _ = (self.checkout / "snapshot.md").write_text("sessions\n", encoding="utf-8")
-        _ = self.git("add", "snapshot.md")
-        _ = self.git("commit", "-m", "agent-sessions-snapshot: update agent sessions")
         _ = (self.checkout / "dirty.txt").write_text("changed\n", encoding="utf-8")
         self.head = self.git("rev-parse", "HEAD")
 
@@ -732,8 +682,7 @@ class InventoryTests(ShutdownTestCase):
         }
         self.write_executable(
             "ps",
-            """import copy
-import json
+            """import json
 import os
 import sys
 
@@ -751,7 +700,6 @@ elif "comm=" in joined:
 """,
         )
         os.environ["SHUTDOWN_TEST_PARENT_ROWS"] = json.dumps(parent_rows)
-        self.write_executable("agent-sessions-snapshot", "exit 0\n", interpreter="/bin/sh")
         self.write_executable("kdotool", "exit 1\n", interpreter="/bin/sh")
 
     def write_session(
@@ -811,7 +759,7 @@ elif "comm=" in joined:
         self.write_session(
             UNIT_PID,
             UNIT_ID,
-            "shutdown-unit",
+            "shutdown",
             self.checkout,
             tmux="old-label:@1.%4",
             updated_at=50,
@@ -836,16 +784,23 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
-        _ = unit_membership("build-followups", "shutdown-unit")
+        member = unit_membership("build-followups", "shutdown")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.checkout), expected=member.worktree)
+        assert isinstance(member.parent, staff.ReportsTo)
+        parent = staff.by_id(member.parent.id)
+        assert parent is not None
+        _ = staff.update_current_session(parent.current_session, staff.StaffId(DIRECTOR_ID))
+        _ = staff.update_current_session(member.current_session, staff.StaffId(UNIT_ID))
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
-        showrunner = self.notifier / "showrunner-build-followups"
+        _ = staff.set_doc(parent.id, staff.LiveDoc("natedev", production_doc))
+        showrunner = self.notifier / f"showrunner-{parent.id}"
         showrunner.mkdir()
         _ = (showrunner / "conf").write_text(
             "\n".join(
                 (
                     f"TARGET=session:{DIRECTOR_ID}",
-                    f"CHECK=zsh /opt/production_check.sh {production_doc}",
+                    f"CHECK=zsh /opt/production_check.sh {parent.id}",
                     "",
                 )
             ),
@@ -862,7 +817,7 @@ elif "comm=" in joined:
         self.herdr_process(72_001, 1, ["/fixture/herdr", "--session", "unit-renamed", "server"], {})
         self.herdr_process(UNIT_PID, 72_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         for name, started_at, plan in (
             ("newer", 20, "docs/shutdown-plan.md"),
@@ -874,13 +829,16 @@ elif "comm=" in joined:
                 "main_agent": {"session_id": UNIT_ID},
                 "working_dir": str(self.checkout),
                 "plan_doc": plan,
-                "branch": "shutdown-unit",
+                "branch": "shutdown",
             }
             _ = (self.history / "runs" / f"{name}.jsonl").write_text(
                 json.dumps(event) + "\n", encoding="utf-8"
             )
 
     def make_worker_state(self) -> None:
+        parent = staff.local_snapshot().by_current_session(DIRECTOR_ID)
+        assert parent is not None
+        _ = fixture_worker("review-worker", parent.id, runtime_id=WORKER_ID)
         run_dir = self.runs / "phase-two"
         run_dir.mkdir()
         _ = (self.runs / "active" / DIRECTOR_ID).write_text(
@@ -892,50 +850,28 @@ elif "comm=" in joined:
         )
         _ = (run_dir / "mesh_roster.json").write_text(
             json.dumps(
-                {
+                fixture_roster(cast(dict[str, object], {
                     "busy-codex": {
-                        "thread_id": "thread-busy",
+                        "thread_id": "fe0c4217-2bac-5469-b661-2b4d94550a98",
                         "turn_id": "turn-busy",
                         "status": "running",
                         "launcher_pid": os.getpid(),
                     },
                     "busy-without-launcher": {
-                        "thread_id": "thread-without-launcher",
+                        "thread_id": "afeb2efd-6f41-5075-857b-c1f97cad78ab",
                         "status": "running",
                     },
                     "orphaned-start": {
-                        "thread_id": "thread-orphaned",
+                        "thread_id": "2b572040-6864-5d68-932f-e25da01f0cb7",
                         "status": "starting",
                         "launcher_pid": 999_999_999,
                     },
-                    "finished-codex": {"thread_id": "thread-done", "status": "done"},
-                }
+                    "finished-codex": {"thread_id": "4efc4edc-6d50-52e3-a71b-736c5dbfae93", "status": "done"},
+                }), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")
             ),
             encoding="utf-8",
         )
 
-    def make_snapshot(self) -> None:
-        snapshot = self.home / "rust" / "hanadocs" / "agent sessions.md"
-        snapshot.parent.mkdir(parents=True)
-        _ = snapshot.write_text(
-            "\n".join(
-                (
-                    "## desktop: Production",
-                    f"`{self.root / 'plain'}` · ghostty · build-followups",
-                    "```sh",
-                    f"cd {self.root / 'plain'} && claude --resume {DIRECTOR_ID} -n build-followups",
-                    "```",
-                    "",
-                    "## desktop: Writing",
-                    f"`{self.root / 'plain'}` · ghostty · notes",
-                    "```sh",
-                    f"cd {self.root / 'plain'} && claude --resume {DESKTOP_ID} -n notes",
-                    "```",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
 
     def test_inventory_is_account_scoped_and_discovers_every_owned_resource(self) -> None:
         _ = self.enterContext(patch.object(herdr, "run_program", REAL_HERDR_RUN_PROGRAM))
@@ -966,11 +902,13 @@ elif "comm=" in joined:
         self.assertEqual(
             director["model"], {"kind": "model", "name": "director-model"}
         )
-        self.assertEqual(director["timers"], ["showrunner-build-followups"])
+        owner = staff.snapshot().by_current_session(DIRECTOR_ID)
+        assert owner is not None
+        self.assertEqual(director["timers"], [f"showrunner-{owner.id}"])
         self.assertEqual(director["host"]["kind"], "ghostty")
         self.assertEqual(
             director["host"].get("desktop"),
-            {"kind": "named", "name": "Production"},
+            {"kind": "not in snapshot"},
         )
         self.assertEqual(director["production"], "build-followups")
         self.assertEqual(
@@ -998,7 +936,7 @@ elif "comm=" in joined:
             unit["host"],
             {
                 "kind": "unit",
-                "unit": "shutdown-unit",
+                "unit": "shutdown",
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "session_name": "unit-renamed",
                 "session_host": "herdr",
@@ -1009,7 +947,7 @@ elif "comm=" in joined:
             {
                 "kind": "git",
                 "path": str(self.checkout),
-                "head": {"kind": "branch", "name": "shutdown-unit"},
+                "head": {"kind": "branch", "name": "shutdown"},
                 "upstream": {"kind": "tracking", "ahead": 2},
                 "dirty": ["dirty.txt"],
             },
@@ -1025,7 +963,7 @@ elif "comm=" in joined:
             cast(inventory.TopLevelSession, by_id[DESKTOP_ID])["host"],
             {
                 "kind": "ghostty",
-                "desktop": {"kind": "named", "name": "Writing"},
+                "desktop": {"kind": "not in snapshot"},
                 "window_shell": DESKTOP_SHELL_PID,
                 "supervisor": {"kind": "no supervisor"},
             },
@@ -1037,7 +975,7 @@ elif "comm=" in joined:
             {DIRECTOR_ID, WORKER_ID},
         )
 
-    def test_truncated_wrapped_ghostty_name_keeps_snapshot_desktop(self) -> None:
+    def test_truncated_wrapped_ghostty_name_has_no_desktop_observation(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         director = next(
             session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID
@@ -1046,9 +984,8 @@ elif "comm=" in joined:
         self.assertEqual(director["host"]["kind"], "ghostty")
         self.assertEqual(
             director["host"].get("desktop"),
-            {"kind": "named", "name": "Production"},
+            {"kind": "not in snapshot"},
         )
-
 
 
     def test_herdr_host_comes_from_the_process_server_ancestor(self) -> None:
@@ -1075,22 +1012,6 @@ elif "comm=" in joined:
             parsed = inventory.parse_inventory(json.dumps(found))
             self.assertEqual(parsed, found)
 
-    def test_old_herdr_inventory_reads_detached_and_rejects_invalid_presentation(self) -> None:
-        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
-        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        found = inventory.inventory(TARGET_LOGIN)
-        wire = cast(dict[str, object], json.loads(json.dumps(found)))
-        owners = cast(list[dict[str, object]], wire["sessions"])
-        host = cast(dict[str, object], next(owner for owner in owners if owner["session_id"] == DESKTOP_ID)["host"])
-        _ = host.pop("presentation")
-        parsed = inventory.parse_inventory(json.dumps(wire))
-        desktop = next(owner for owner in parsed["sessions"] if owner["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"].get("presentation"), "detached")
-        for invalid in ("window", 3, {"kind": "invalid"}, None):
-            with self.subTest(invalid=invalid):
-                host["presentation"] = invalid
-                with self.assertRaises(inventory.InvalidInventory):
-                    _ = inventory.parse_inventory(json.dumps(wire))
 
     def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
         self.herdr_sessions(["unit-herdr"])
@@ -1101,7 +1022,7 @@ elif "comm=" in joined:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "unit-herdr", "server"], {})
         self.herdr_process(UNIT_PID, 71_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
@@ -1109,14 +1030,14 @@ elif "comm=" in joined:
         self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
         self.assertEqual(unit["host"].get("session_host"), "herdr")
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
 
 
     def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
+        with patch("scripts.shutdown.inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(desktop["host"], {"kind": "unknown"})
@@ -1144,8 +1065,7 @@ elif "comm=" in joined:
                 patch.dict(os.environ, {"SHUTDOWN_TEST_PARENT_ROWS": json.dumps(rows)}),
                 patch.object(Path, "read_bytes", autospec=True, side_effect=cmdline),
             ):
-                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
-                    refresh_desktops=refresh)
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
                 owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
                 host = owner["host"]
                 assert host["kind"] == "ghostty"
@@ -1153,55 +1073,15 @@ elif "comm=" in joined:
                 self.assertEqual(host.get("supervisor"), {"kind": "supervisor", "pid": supervisor_pid,
                     "proc_start": CURRENT_PROCESS_START})
 
-    def test_mac_ghostty_inventory_preserves_supervisor_and_legacy_terminal_host(self) -> None:
-        rows = {
-            101: "902 claude", 902: "901 python3", 901: "900 zsh",
-            900: "1 /Applications/Ghostty.app/Contents/MacOS/ghostty",
-        }
-        def process(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            pid = int(argv[-1])
-            output = ("python3 /tmp/relaunch.py run -- claude" if argv[2] == "args="
-                      else rows[pid])
-            return subprocess.CompletedProcess(argv, 0, output, "")
-        with (patch.object(sys, "platform", "darwin"),
-              patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
-              patch.object(subprocess, "run", side_effect=process),
-              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start"))):
-            host = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(host, {"kind": "terminal", "supervisor": {
-                "kind": "supervisor", "pid": 902, "proc_start": "supervisor-start"}})
-            owner = top_level("mac-supervised", host=host)
-            saved = entry(owner)
-            parsed = shutdown_record.parse_session_records(json.dumps([saved]))[0]
-            self.assertEqual(parsed["session"]["host"], host)
-            rows[101] = "901 claude"
-            with patch.object(inventory, "_supervisor_process", return_value=inventory.NoSupervisor(kind="no supervisor")):
-                legacy = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(legacy, {"kind": "terminal"})
 
     def test_ghostty_shell_parent_is_not_a_supervisor(self) -> None:
         with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
-            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
-                refresh_desktops=False)
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
         owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
         host = owner["host"]
         assert host["kind"] == "ghostty"
         self.assertEqual(host.get("supervisor"), {"kind": "no supervisor"})
 
-    def test_pre_supervisor_window_inventory_and_record_read_as_no_supervisor(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
-        owner = found["sessions"][0]
-        host = owner["host"]
-        assert host["kind"] == "ghostty"
-        _ = host.pop("supervisor", None)
-        decoded = inventory.parse_inventory(json.dumps(found))["sessions"][0]["host"]
-        assert decoded["kind"] == "ghostty"
-        self.assertEqual(decoded.get("supervisor"), {"kind": "no supervisor"})
-        saved = entry(owner)
-        parsed = shutdown_record.parse_session_records(json.dumps([saved]))[0]
-        legacy_host = parsed["session"]["host"]
-        assert legacy_host["kind"] == "ghostty"
-        self.assertEqual(legacy_host.get("supervisor"), {"kind": "no supervisor"})
 
     def test_only_running_codex_workers_with_live_launchers_are_busy(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1219,21 +1099,22 @@ elif "comm=" in joined:
         run_dir = self.runs / "phase-two"
         roster = cast(dict[str, dict[str, object]], json.loads((run_dir / "mesh_roster.json").read_text()))
         roster["orphaned-start"]["status"] = "running"
-        _ = (run_dir / "mesh_roster.json").write_text(json.dumps(roster))
+        _ = (run_dir / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], roster), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")))
         found = inventory.inventory(TARGET_LOGIN)
         director = next(session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID)
         self.assertEqual(director["codex_servers"][0]["busy_workers"], ["busy-codex"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
-        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
+        before = {runner["name"] for runner in inventory.unregistered_showrunners()}
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
-        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
+        self.assertEqual({runner["name"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
 
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"
@@ -1252,10 +1133,10 @@ elif "comm=" in joined:
     def test_reused_pid_with_different_process_start_is_unknown(self) -> None:
         path = self.records / f"{DESKTOP_PID}.json"
         record = cast(dict[str, object], cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        record["procStart"] = "123"
+        record["procStart"] = "recorded-before-pid-reuse"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
-        with patch.object(process_identity, "process_start", return_value=process_identity.ProcessStartTime(456)):
+        with patch("scripts.shutdown.inventory._process_start", return_value="live-reused-pid-start"):
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})
@@ -1274,6 +1155,7 @@ elif "comm=" in joined:
         previous = current.with_name("seats")
         modified = current.stat().st_mtime_ns
         _ = current.replace(previous)
+        contents = previous.read_bytes()
         found = inventory.inventory(TARGET_LOGIN)
         worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
         self.assertEqual(worker["kind"], "worker")
@@ -1281,21 +1163,29 @@ elif "comm=" in joined:
                          {"kind": "director", "session_id": DIRECTOR_ID})
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"], {"kind": "no director"})
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
         _ = inventory.inventory(TARGET_LOGIN)
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
         with previous.open("a", encoding="utf-8") as ledger:
             _ = ledger.write(f"{DESKTOP_ID[:8]}\tlate-worker\n")
-        self.assertIn("late-worker", current.read_text(encoding="utf-8"))
-        modified = current.stat().st_mtime_ns
+        self.assertIn("late-worker", previous.read_text(encoding="utf-8"))
+        contents = previous.read_bytes()
+        modified = previous.stat().st_mtime_ns
+        parent = staff.local_snapshot().by_current_session(DIRECTOR_ID)
+        assert parent is not None
+        _ = fixture_worker("late-worker", parent.id, runtime_id=DESKTOP_ID)
         found = inventory.inventory(TARGET_LOGIN)
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(late_worker["kind"], "worker")
         self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
 
     def test_live_worker_keeps_owner_after_director_exits(self) -> None:
         (self.records / f"{self.director_pid}.json").unlink()
@@ -1324,6 +1214,12 @@ elif "comm=" in joined:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
         (self.runs / "phase-two" / "workers").unlink()
+        path = Path(os.environ["STAFF_FILE"])
+        membership = cast(dict[str, object], json.loads(path.read_text()))
+        membership["rows"] = [row for row in cast(list[dict[str, object]], membership["rows"])
+                              if row["current_session"] != WORKER_ID]
+        _ = cast(dict[str, object], membership.get("backends", {})).pop(WORKER_ID, None)
+        _ = path.write_text(json.dumps(membership))
         transcript = (
             self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
         )
@@ -1483,36 +1379,96 @@ elif "comm=" in joined:
 
         self.assertEqual(parsed["host"], {"kind": "legacy tmux", "session_name": "legacy"})
 
-    def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        first = cast(dict[str, object], session_values[0])
-        first["host"] = {"kind": "spaceship"}
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.kind is invalid",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
 
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        window_host: dict[str, object] | None = None
-        for item in session_values:
-            session_data = cast(dict[str, object], item)
-            host_data = cast(dict[str, object], session_data["host"])
-            if host_data["kind"] == "ghostty":
-                window_host = host_data
-                break
-        self.assertIsNotNone(window_host)
-        assert window_host is not None
-        host = window_host
-        del host["window_shell"]
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.window_shell is missing",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
+    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+        run = self.root / "paused run"
+        run.mkdir()
+        command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/direct/assign.sh", "outer arguments"]
+        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(811, 812, command, {})
+        self.herdr_process(812, 1, outer, {})
+        _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
+            "busy": {"role": "review", "thread_id": "75863a97-cb41-5754-bb95-d7e89deccf43", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "fe371221-a140-5ddf-8753-e906f9ce3519", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "cbf7634e-e57a-51ad-99e2-5cfbeabec92b", "status": "ended"},
+        }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
+        agents_log.append("75863a97-cb41-5754-bb95-d7e89deccf43", "review", None, datetime.now(timezone.utc))
+        agents_log.append("fe371221-a140-5ddf-8753-e906f9ce3519", "impl", None, datetime.now(timezone.utc))
+        agents_log.append("ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "impl", None, datetime.now(timezone.utc))
+
+        def launcher_alive(pid: int) -> bool:
+            return pid in {810, 811, 812}
+        # An ended worker no longer belongs to the director's active children.
+        unit = unit_membership("fixture", run.name.replace(" ", "-"))
+        membership = staff.StaffSnapshot(tuple(row for row in staff.local_snapshot().rows if row.current_session != "cbf7634e-e57a-51ad-99e2-5cfbeabec92b"))
+        with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
+              patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
+              patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
+            found = inventory.worker_resumes(unit, membership)
+        self.assertTrue(all(isinstance(result, (Resumable, Idle)) for result in found))
+        seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
+        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
+        self.assertEqual(seats["busy"], PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["orphan"]["launcher_command"], [])
+
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                command = ["bash" if launcher.endswith(".sh") else "python3",
+                           f"/config/scripts/direct/{launcher}", "--role", "review", "--to", "busy",
+                           "--session-dir", str(run), "--cwd", "/checkout with spaces",
+                           "--prompt", "/old/prompt.md", "--phase", "1", "--lens", "contract", "--pass", "2"]
+                self.herdr_process(811, 812, command, {})
+                with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
+                      patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
+                      patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
+                    found = inventory.worker_resumes(unit, membership)
+                seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
+                self.assertEqual(seats["busy"]["launcher_command"], command)
+
+
+    def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
+        def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
+            run = self.root / name
+            run.mkdir()
+            _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
+                seat: {"role": "test", "thread_id": fixture_runtime_id(f"{name}-{seat}-thread"), "status": status}
+                for seat, status in statuses.items()
+            }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
+            board = run / "board.log"
+            _ = board.write_text("[director] dispatch\n")
+            os.utime(board, (board_at, board_at))
+            if offered_at is not None:
+                for seat in statuses:
+                    prompt = run / f"{seat}.resume-prompt.md"
+                    _ = prompt.write_text("paused\n")
+                    os.utime(prompt, (offered_at, offered_at))
+            return run
+
+        left = run_with("left", {"a75-test": "paused", "p39a-impl": "paused"}, board_at=1_000, offered_at=2_000)
+        taken_back = run_with("taken back", {"impl": "paused"}, board_at=3_000, offered_at=2_000)
+        dispatched = run_with("dispatched", {"impl": "paused", "test": "done"}, board_at=1_000, offered_at=2_000)
+        never_offered = run_with("never offered", {"impl": "paused"}, board_at=1_000, offered_at=None)
+
+        departed = unit_membership("fixture", left.name.replace(" ", "-"))
+        successor = unit_membership("fixture", "successor")
+        for child in staff.local_snapshot().find(kind="worker", parent=departed.id):
+            _ = staff.move(child.id, staff.ReportsTo(successor.id))
+        membership = staff.local_snapshot()
+        for child in membership.find(kind="worker"):
+            agents_log.append(child.current_session, "test", None, datetime.now(timezone.utc))
+        with patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)):
+            results = [result for run in (left, taken_back, dispatched, never_offered)
+                       for result in inventory.worker_resumes(
+                           unit_membership("fixture", run.name.replace(" ", "-")), membership)]
+        found = [result.seat for result in results if isinstance(result, (Resumable, Idle))]
+
+        self.assertEqual(
+            sorted((Path(seat["run_dir"]).name, seat["seat"]) for seat in found),
+            [("dispatched", "impl"), ("dispatched", "test"), ("never offered", "impl"), ("taken back", "impl")],
+        )
 
 
 class ProcessEnvironmentTests(unittest.TestCase):
@@ -1588,767 +1544,143 @@ class ProcessEnvironmentTests(unittest.TestCase):
         probe.assert_not_called()
 
 
-class RecoveryInventoryTests(StaffTestCase):
-    root: Path = Path()
-    proc: Path = Path()
-    registry: Path = Path()
-    config: Path = Path()
-    notifier: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = showrunner_relationship("fixture")
-        linux_process_fixture(self)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.proc = self.root / "proc"
-        self.registry = self.root / "registry"
-        self.config = self.root / "claude"
-        self.notifier = self.root / "notifier"
-        for directory in (self.proc, self.registry, self.config, self.notifier, self.root / "runs/active"):
-            directory.mkdir(parents=True)
-        _ = (self.config / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
-        boot = self.proc / "sys/kernel/random/boot_id"
-        boot.parent.mkdir(parents=True)
-        _ = boot.write_text("boot-one\n")
-        _ = (self.proc / "stat").write_text("btime 1792065600\n")  # 2026-10-15 12:00 UTC
-        fake_responses = self.root / "herdr-responses.json"
-        _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
-            "XDG_CONFIG_HOME": str(self.root / ".config"),
-            "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_RUN_ROOT": str(self.root / "runs"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"),
-            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pauses"),
-            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
-            "FAKE_HERDR_RESPONSES": str(fake_responses), "FAKE_HERDR_LOG": str(self.root / "herdr-log"),
-        })))
-        _ = self.enterContext(patch.object(inventory, "_terminal_host", return_value=inventory.TerminalHost(kind="terminal")))
-        replay_herdr_commands(self)
-
-    def process(self, pid: int, *, command: str = "claude", arguments: list[str] | None = None,
-                environment: dict[str, str] | None = None, terminal: int = 7) -> Path:
-        directory = self.proc / str(pid)
-        directory.mkdir()
-        _ = (directory / "comm").write_text(command + "\n")
-        _ = write_stat(self.proc, pid, start_ticks=12345, tty_nr=terminal)
-        _ = (directory / "cmdline").write_bytes(("\0".join(arguments or [command]) + "\0").encode())
-        _ = (directory / "environ").write_bytes(("\0".join(f"{key}={value}" for key, value in
-            (environment or {}).items()) + "\0").encode())
-        (directory / "cwd").symlink_to(self.root)
-        (directory / "fd").mkdir()
-        return directory
-
-    def claude(self, pid: int = 1001, *, config: Path | None = None, identity: str = "owner-id") -> None:
-        _ = self.process(pid, environment={"CLAUDE_CONFIG_DIR": str(config or self.config)})
-        _ = (self.registry / f"{pid}.json").write_text(json.dumps({
-            "pid": pid, "procStart": "12345", "sessionId": identity, "name": identity,
-            "messagingSocketPath": str(self.root / "unused.sock"), "updatedAt": 123,
-            "tmux": "", "cwd": str(self.root), "status": "idle", "kind": "interactive",
-        }))
-
-    def darwin_snapshot(self) -> dict[str, CommandResponse]:
-        """A Mac process tree whose external readers all use the shared fake."""
-        # These fixture probes take no simulated time from their five-second budget.
-        _ = self.enterContext(patch.object(time, "monotonic", return_value=100.0))
-        self.claude()
-        registered = self.registry / "1001.json"
-        data = cast(dict[str, object], json.loads(registered.read_text()))
-        data["procStart"] = "Thu Oct 15 12:00:00 2026"
-        _ = registered.write_text(json.dumps(data))
-        fake = str(Path(__file__).parents[1] / "herdr/fake_herdr.py")
-        _ = cast(object, self.enterContext(patch.object(sys, "platform", "darwin")))
-        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HERDR_PS": fake, "HERDR_LSOF": fake, "SHUTDOWN_SYSCTL": fake, "HERDR_PROC": "/proc",
-            "XDG_CONFIG_HOME": str(self.root / ".config"),
-        })))
-        # Unit lookup's registry liveness is independent of this synthetic PID.
-        _ = self.enterContext(patch.object(unit_lookup, "live_session", return_value=True))
-        responses: dict[str, CommandResponse] = {
-            "default": {"code": 97, "stdout": "", "stderr": "unconfigured external read"},
-            "-n kern.bootsessionuuid": {"code": 0, "stdout": "boot-mac-one\n"},
-            "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": [{
-                "name": "writing", "running": True, "default": False,
-                "session_dir": "", "socket_path": "", } ]})},
-            "--session writing pane list": {"code": 0, "stdout": json.dumps({"result": {"panes": [
-                {"pane_id": "w1:p1", "workspace_id": "w1"}]}})},
-            "--session writing pane process-info --pane w1:p1": {
-                "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": 501}}})},
-            "-n -P -a -U -u " + str(os.getuid()) + " -F pfn": {"code": 0,
-                "stdout": f"p500\nf3\nn{self.root}/.config/herdr/sessions/writing/herdr.sock\n"},
-        }
-        commands = {400: (1, "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", ""),
-                    300: (400, "zsh", ""), 500: (1, "herdr", " --session writing server"),
-                    501: (500, "zsh", ""), 1001: (501, "claude", " --name owner"),
-                    2001: (300, "codex", " resume"), 2002: (300, "codex", " app-server")}
-        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="] = {
-            "code": 0, "stdout": "".join(f"{pid} {parent} {os.getuid()} {executable}\n"
-                for pid, (parent, executable, _) in commands.items())}
-        responses["-U " + str(os.getuid()) + " -o pid=,command="] = {
-            "code": 0, "stdout": "".join(f"{pid} {executable}{arguments}\n"
-                for pid, (_, executable, arguments) in commands.items())}
-        for pid, (_, executable, arguments) in commands.items():
-            command = executable + arguments
-            environment = (f"CLAUDE_CONFIG_DIR={self.config} HERDR_PANE_ID=w1:p1" if pid == 1001 else
-                           "HERDR_PANE_ID=w1:p1" if pid == 501 else
-                           f"CODEX_HOME={self.root}/.codex" if pid == 2001 else "")
-            responses[f"-o command= -p {pid}"] = {"code": 0, "stdout": command + "\n"}
-            responses[f"eww -o command= -p {pid}"] = {"code": 0, "stdout": command + " " + environment + "\n"}
-            responses[f"-o lstart= -p {pid}"] = {"code": 0, "stdout": "Thu Oct 15 12:00:00 2026\n"}
-            responses[f"-o stat= -p {pid}"] = {"code": 0, "stdout": "S\n"}
-            responses[f"-o tty= -p {pid}"] = {"code": 0, "stdout": "ttys001\n"}
-            responses[f"-a -p {pid} -d cwd -Fn"] = {"code": 0, "stdout": f"p{pid}\nn{self.root}\n"}
-        responses["-a -p 2001 -Fn"] = {"code": 0,
-            "stdout": f"p2001\nf8\nn{self.root}/.codex/sessions/2026/rollout-date-{OTHER_ID}.jsonl\n"}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        # Fail on even an attempted proc read, including swallowed fallback reads.
-        read_bytes, read_text, iterdir, stat = Path.read_bytes, Path.read_text, Path.iterdir, Path.stat
-        run = subprocess.run
-
-        def forbid_proc(path: Path) -> None:
-            if path.is_relative_to(self.proc) or path.is_relative_to(Path("/proc")):
-                self.fail(f"Darwin observation tried to read {path}")
-
-        def checked_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            if path == process_identity.PROC_ROOT:
-                raise FileNotFoundError("Mac has no proc")
-            return stat(path, follow_symlinks=follow_symlinks)
-
-        def ps(command: Sequence[str], *, capture_output: bool, text: bool, check: bool, timeout: float,
-               env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-            if command[0] != "ps":
-                return run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
-            self.assertTrue(capture_output and text)
-            self.assertFalse(check)
-            self.assertEqual(timeout, 5)
-            self.assertEqual((env["LC_ALL"], env["TZ"]), ("C", "UTC"))
-            return herdr.run_program([fake, *command[1:]], timeout=timeout, environment=env)
-
-        def checked_bytes(path: Path) -> bytes:
-            forbid_proc(path)
-            return read_bytes(path)
-
-        def checked_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-            forbid_proc(path)
-            return read_text(path, encoding=encoding, errors=errors)
-
-        def checked_iterdir(path: Path) -> Iterator[Path]:
-            forbid_proc(path)
-            return iterdir(path)
-
-        _ = self.enterContext(patch.object(Path, "stat", checked_stat))
-        _ = self.enterContext(patch.object(subprocess, "run", ps))
-        _ = self.enterContext(patch.object(Path, "read_bytes", checked_bytes))
-        _ = self.enterContext(patch.object(Path, "read_text", checked_text))
-        _ = self.enterContext(patch.object(Path, "iterdir", checked_iterdir))
-        return responses
-
-    def test_darwin_snapshot_reads_claude_codex_and_socket_host_without_proc(self) -> None:
-        _ = self.darwin_snapshot()
-        found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.CompleteInventory), found
-        self.assertEqual(found.boot, inventory.KnownBoot("boot-mac-one"))
-        owner = found.sessions[TARGET_LOGIN][0]
-        self.assertEqual(owner["session"]["host"], inventory.HerdrHost(kind="herdr",
-            herdr_session="writing", pane_id="w1:p1", presentation="detached"))
-        self.assertEqual(owner.get("host_process"), inventory.RecoveryHostProcess(
-            kind="process", pid=500, proc_start="Thu Oct 15 12:00:00 2026"))
-        codex = found.sessions["codex-.codex"]
-        self.assertEqual(len(codex), 1)
-        self.assertEqual(codex[0]["session"]["host"], {"kind": "terminal"})
-        self.assertEqual(codex[0].get("host_process"), inventory.RecoveryHostProcess(
-            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
-        codex_entry = codex[0]
-        assert codex_entry["agent"] == "codex"
-        self.assertEqual(codex_entry["codex"]["resume"], inventory.CodexSessionId(kind="session id", session_id=OTHER_ID))
-        self.assertEqual(inventory.codex_liveness(codex_entry), inventory.CodexLive(2001))
-        calls = [cast(list[str], json.loads(line)) for line in (self.root / "herdr-log").read_text().splitlines()]
-        self.assertIn(["-n", "kern.bootsessionuuid"], calls)
-        self.assertFalse(any("server" in call and "stop" in call for call in calls))
-
-    def test_darwin_without_path_binaries_still_observes_native_sessions(self) -> None:
-        _ = self.darwin_snapshot()
-        with patch.object(shutil, "which", return_value=None):
-            found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.CompleteInventory), found
-        self.assertEqual(set(found.sessions), {TARGET_LOGIN, "codex-.codex"})
-
-    def test_darwin_spaced_ghostty_executable_records_window_loss_for_recovery(self) -> None:
-        responses = self.darwin_snapshot()
-        for response in responses.values():
-            response["stdout"] = response["stdout"].replace(
-                "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
-                "/Applications/Nix Apps/Ghostty.app/Contents/MacOS/ghostty")
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        codex = first.sessions["codex-.codex"][0]
-        self.assertEqual(codex["session"]["host"], inventory.TerminalHost(kind="terminal"))
-        self.assertEqual(codex.get("host_process"), inventory.RecoveryHostProcess(
-            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
-        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
-            if not line.startswith(("400 ", "300 ", "2001 ", "2002 ")))
-        responses["-o lstart= -p 400"] = {"code": 1, "stdout": ""}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        lost = inventory.snapshot_inventory()
-        assert isinstance(lost, inventory.CompleteInventory), lost
-        self.assertIn(("codex-.codex", OTHER_ID), lost.gone_hosts)
-        _ = shutdown_record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")
-        saved = shutdown_record.read_snapshot("codex-.codex")
-        assert isinstance(saved, dict), saved
-        self.assertEqual([(item["state"], item.get("crash")) for item in saved["sessions"]],
-            [("unresolved", "host gone")])
-
-    def test_darwin_unreadable_codex_arguments_preserve_the_previous_snapshot(self) -> None:
-        responses = self.darwin_snapshot()
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        saved = shutdown_record.read_snapshot("codex-.codex")
-        key = "-U " + str(os.getuid()) + " -o pid=,command="
-        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.PartialInventory), found
-        self.assertIn("process 2001: arguments are unreadable", "; ".join(found.failures))
-        self.assertEqual(shutdown_record.merge_snapshots(found, "2026-10-15T12:01:00+00:00"), [])
-        self.assertEqual(shutdown_record.read_snapshot("codex-.codex"), saved)
-
-    def test_darwin_unreadable_codex_arguments_leave_liveness_unknown(self) -> None:
-        responses = self.darwin_snapshot()
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        codex = first.sessions["codex-.codex"][0]
-        assert codex["agent"] == "codex"
-        key = "-U " + str(os.getuid()) + " -o pid=,command="
-        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        found = inventory.codex_liveness(codex)
-        assert isinstance(found, inventory.CodexLivenessUnknown), found
-        self.assertIn("process 2001: arguments are unreadable", found.reason)
-
-    def test_darwin_server_loss_retains_recovery_but_clean_exit_drops_it(self) -> None:
-        responses = self.darwin_snapshot()
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
-        # Claude exits but its listening herdr server remains: this is clean.
-        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
-            if not line.startswith("1001 "))
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        clean = inventory.snapshot_inventory()
-        assert isinstance(clean, inventory.CompleteInventory), clean
-        self.assertEqual(clean.gone_hosts, frozenset())
-        saved = shutdown_record.merge_snapshots(clean, "2026-10-15T12:01:00+00:00")
-        self.assertFalse(any(item["session"]["session_id"] == "owner-id"
-            for snapshot in saved for item in snapshot["sessions"]))
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
-            if not line.startswith(("500 ", "501 ")))
-        responses["-o lstart= -p 500"] = {"code": 1, "stdout": ""}
-        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
-        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        lost = inventory.snapshot_inventory()
-        assert isinstance(lost, inventory.CompleteInventory), lost
-        self.assertEqual(lost.gone_hosts, frozenset({(TARGET_LOGIN, "owner-id")}))
-        saved = shutdown_record.merge_snapshots(lost, "2026-10-15T12:02:00+00:00")
-        retained = [item for snapshot in saved for item in snapshot["sessions"]
-            if item["session"]["session_id"] == "owner-id"]
-        self.assertEqual([(item["state"], item.get("crash")) for item in retained], [("unresolved", "host gone")])
-
-    def test_darwin_reboot_retains_missing_sessions_with_crash_evidence(self) -> None:
-        responses = self.darwin_snapshot()
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        responses["-n kern.bootsessionuuid"]["stdout"] = "boot-mac-two\n"
-        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="]["stdout"] = ""
-        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
-        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        second = inventory.snapshot_inventory()
-        assert isinstance(second, inventory.CompleteInventory), second
-        saved = shutdown_record.merge_snapshots(second, "2026-10-15T12:01:00+00:00")
-        self.assertEqual({item.get("crash") for snapshot in saved for item in snapshot["sessions"]}, {"reboot"})
-        self.assertEqual(sum(len(snapshot["sessions"]) for snapshot in saved), 2)
-        self.assertTrue(all(item["state"] == "unresolved" for snapshot in saved for item in snapshot["sessions"]))
-
-    def test_darwin_unreadable_required_program_prevents_snapshot_replacement(self) -> None:
-        responses = self.darwin_snapshot()
-        keys = ("-n kern.bootsessionuuid", "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm=",
-                "-U " + str(os.getuid()) + " -o pid=,command=",
-                "-n -P -a -U -u " + str(os.getuid()) + " -F pfn", "eww -o command= -p 1001",
-                "-a -p 1001 -d cwd -Fn", "-a -p 2001 -d cwd -Fn", "-a -p 2001 -Fn", "-o lstart= -p 1001", "-o tty= -p 1001")
-        for key in keys:
-            original = responses[key]
-            responses[key] = {"code": 1, "stdout": "", "stderr": "fixture source denied"}
-            _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-            with self.subTest(source=key):
-                found = inventory.snapshot_inventory()
-                self.assertIsInstance(found, inventory.PartialInventory)
-                assert isinstance(found, inventory.PartialInventory)
-                self.assertIn("fixture source denied", "; ".join(found.failures))
-                self.assertEqual(shutdown_record.merge_snapshots(found, "2026-10-15T12:00:00+00:00"), [])
-                self.assertFalse((self.root / "shutdown/snapshots").exists())
-            responses[key] = original
-
-    def test_complete_snapshot_collects_shared_sources_once_across_accounts_without_mutations(self) -> None:
-        self.claude()
-        other = self.root / "other-claude"
-        other.mkdir()
-        _ = (other / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": OTHER_LOGIN}}))
-        self.claude(1002, config=other, identity="other-id")
-        timer = self.notifier / "reminder"
-        timer.mkdir()
-        _ = (timer / "conf").write_text("TARGET=session:owner-id\n")
-        _ = (timer / "state").write_text("ENABLED=0\n")
-        pause = conversation_pause.PauseRecord("owner-id", ("reminder",), conversation_pause.Quiet(1, 2))
-        conversation_pause.write_record(pause)
-        before = conversation_pause.record_path("owner-id").read_bytes()
-        with (patch.object(inventory, "_snapshot_timers", wraps=inventory._snapshot_timers) as timers,  # pyright: ignore[reportPrivateUsage]
-              patch.object(inventory, "_snapshot_units", wraps=inventory._snapshot_units) as units,  # pyright: ignore[reportPrivateUsage]
-              patch.object(inventory, "_snapshot_desktops", wraps=inventory._snapshot_desktops) as desktops,  # pyright: ignore[reportPrivateUsage]
-              patch.object(conversation_pause, "release", side_effect=AssertionError("released pause")),
-              patch.object(conversation_pause, "run_notifier", side_effect=AssertionError("changed timer"))):
-            found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.CompleteInventory)
-        assert isinstance(found, inventory.CompleteInventory)
-        self.assertEqual(set(found.sessions), {TARGET_LOGIN, OTHER_LOGIN})
-        self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [
-            shutdown_record.TimerRestore(instance="reminder", was_enabled=True)])
-        self.assertEqual(conversation_pause.record_path("owner-id").read_bytes(), before)
-        self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
-        self.assertEqual((timers.call_count, units.call_count), (1, 1))
-        desktops.assert_called_once_with(refresh=False)
-        self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["cwd"], str(self.root))
-
-    def test_user_tmux_with_inherited_herdr_is_unknown_in_a_complete_snapshot(self) -> None:
-        self.claude()
-        _ = (self.proc / "1001/environ").write_bytes(
-            (f"CLAUDE_CONFIG_DIR={self.config}\0TMUX_PANE=%9\0HERDR_PANE_ID=w1:p1\0").encode())
-        found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.CompleteInventory), found
-        self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["host"], {"kind": "unknown"})
-
-    def test_snapshot_without_account_setting_keeps_home_identity_only_until_cutover(self) -> None:
-        self.claude()
-        self.claude(1002, identity="second-owner")
-        for pid in (1001, 1002):
-            _ = (self.proc / str(pid) / "environ").write_bytes(b"HOME=fixture\0")
-        seed = self.root / ".claude.json"
-        _ = seed.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
-        with patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads:
-            before = inventory.snapshot_inventory()
-            _ = seed.write_text("{}")
-            after = inventory.snapshot_inventory()
-        assert isinstance(before, inventory.CompleteInventory), before
-        self.assertEqual({entry["session"]["session_id"] for entry in before.sessions[TARGET_LOGIN]},
-                         {"owner-id", "second-owner"})
-        self.assertTrue(all(entry["session"].get("config_dir") == str(self.root / ".claude")
-                            for entry in before.sessions[TARGET_LOGIN]))
-        assert isinstance(after, inventory.PartialInventory), after
-        self.assertEqual(sum("account attribution" in failure for failure in after.failures), 2)
-        self.assertEqual(home_reads.call_count, 2)
-
-    def test_snapshot_explicit_config_home_without_a_login_is_not_an_account(self) -> None:
-        self.claude(config=self.root / ".claude")
-        _ = (self.root / ".claude.json").write_text("{}")
-        found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.PartialInventory), found
-        self.assertTrue(any("account attribution" in failure for failure in found.failures))
-
-    def test_snapshot_reports_unreadable_registry_and_account_instead_of_absence(self) -> None:
-        self.claude()
-        _ = (self.registry / "broken.json").write_text("broken")
-        _ = (self.config / ".claude.json").write_text("broken")
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.PartialInventory)
-        assert isinstance(found, inventory.PartialInventory)
-        self.assertTrue(any("broken.json" in failure for failure in found.failures))
-        self.assertTrue(any("account attribution" in failure for failure in found.failures))
-
-    def test_faulted_production_marks_cannot_turn_a_unit_into_a_standalone(self) -> None:
-        self.claude()
-        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": {"one-unit": "duplicate unit marks"}})) as marks:
-            found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.PartialInventory)
-        assert isinstance(found, inventory.PartialInventory)
-        self.assertIn("duplicate unit marks", "; ".join(found.failures))
-        marks.assert_called_once_with()
-
-    def test_each_required_shared_source_failure_refuses_a_complete_snapshot(self) -> None:
-        self.claude()
-        for source in ("_snapshot_timers", "_snapshot_units", "_snapshot_native_hosts"):
-            with self.subTest(source=source), patch.object(inventory, source, side_effect=OSError(source + " denied")):
-                found = inventory.snapshot_inventory()
-                self.assertIsInstance(found, inventory.PartialInventory)
-                assert isinstance(found, inventory.PartialInventory)
-                self.assertIn(source + " denied", "; ".join(found.failures))
-
-    def test_unreadable_process_liveness_is_partial_but_confirmed_absence_is_empty(self) -> None:
-        self.claude()
-        process = self.proc / "1001"
-        _ = (process / "stat").write_text("broken")
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.PartialInventory)
-        shutil.rmtree(process)
-        absent = inventory.snapshot_inventory()
-        self.assertIsInstance(absent, inventory.CompleteInventory)
-        assert isinstance(absent, inventory.CompleteInventory)
-        self.assertEqual(absent.sessions, {})
-
-    def test_snapshot_excludes_zombie_sessions_without_marking_the_inventory_partial(self) -> None:
-        self.claude()
-        _ = write_stat(self.proc, 1001, start_ticks=12345, state="Z", tty_nr=7)
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.CompleteInventory)
-        assert isinstance(found, inventory.CompleteInventory)
-        self.assertEqual(found.sessions, {})
-
-    def test_unreadable_production_registration_is_a_source_failure(self) -> None:
-        self.claude()
-        production = self.notifier / "showrunner-show"
-        production.mkdir()
-        _ = (production / "conf").write_text("TARGET=session:owner-id\nCHECK=invalid\n")
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.PartialInventory)
-        assert isinstance(found, inventory.PartialInventory)
-        self.assertIn("production registration", "; ".join(found.failures))
-
-    def test_interactive_codex_uses_open_rollout_identity_and_excludes_headless_workers(self) -> None:
-        home = self.root / "codex-work"
-        process = self.process(2001, command="codex", arguments=["codex", "--model", "exec"], environment={"CODEX_HOME": str(home)})
-        session_id = "12345678-1234-1234-1234-123456789abc"
-        (process / "fd/3").symlink_to(home / f"sessions/2026/10/15/rollout-date-{session_id}.jsonl")
-        _ = self.codex_rollout(home, OTHER_ID)
-        for pid, command in enumerate(("exec", "app-server", "mcp", "mcp-server", "proto"), start=2002):
-            _ = self.process(pid, command="codex", arguments=["codex", "--config", "model=x", command])
-        _ = self.process(2007, command="codex", terminal=0)
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.CompleteInventory)
-        assert isinstance(found, inventory.CompleteInventory)
-        self.assertEqual(set(found.sessions), {"codex-codex-work"})
-        entries = found.sessions["codex-codex-work"]
-        self.assertEqual(len(entries), 1)
-        entry = entries[0]
-        assert entry["agent"] == "codex"
-        self.assertEqual(entry["codex"], shutdown_record.CodexLaunch(home=str(home),
-            resume=shutdown_record.CodexSessionId(kind="session id", session_id=session_id)))
-        self.assertEqual((entry["session"]["pid"], entry["session"]["cwd"], entry["session"]["host"]),
-                         (2001, str(self.root), inventory.TerminalHost(kind="terminal")))
-
-    def codex_rollout(self, home: Path, session_id: str, *, timestamp: str = "2026-10-15T12:05:00Z",
-                      day: str = "2026/10/15", cwd: str = "") -> Path:
-        path = home / "sessions" / day / f"rollout-date-{session_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps({"type": "session_meta", "payload": {
-            "id": session_id, "cwd": cwd or str(self.root), "timestamp": timestamp}}) +
-            "\nnot session metadata: later conversation lines must not be read\n")
-        return path
-
-    def observed_codex_resume(self) -> inventory.CodexSessionId | inventory.CodexResumePicker:
-        found = inventory.snapshot_inventory()
-        assert isinstance(found, inventory.CompleteInventory), found
-        entry = found.sessions["codex-.codex"][0]
-        assert entry["agent"] == "codex"
-        return entry["codex"]["resume"]
-
-    def test_codex_closed_rollout_identifies_the_conversation_from_its_first_line(self) -> None:
-        _ = self.process(2001, command="codex")
-        _ = self.codex_rollout(self.root / ".codex", OTHER_ID)
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexSessionId(kind="session id", session_id=OTHER_ID))
-
-    def test_codex_without_a_rollout_keeps_the_resume_picker(self) -> None:
-        _ = self.process(2001, command="codex")
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-
-    def test_codex_multiple_closed_conversations_in_the_same_cwd_keep_the_picker(self) -> None:
-        _ = self.process(2001, command="codex")
-        for identity in (OTHER_ID, UNKNOWN_ID):
-            _ = self.codex_rollout(self.root / ".codex", identity)
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-
-    def test_codex_evening_start_finds_its_local_day_and_keeps_ambiguity_after_midnight(self) -> None:
-        self.addCleanup(time.tzset)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"TZ": "America/New_York"})))
-        time.tzset()
-        process = self.process(2001, command="codex")
-        # 20:30 EDT on October 15 is already October 16 in UTC.
-        started = datetime.fromisoformat("2026-10-16T00:30:00+00:00")
-        _ = (self.proc / "stat").write_text(f"btime {int(started.timestamp())}\n")
-        _ = write_stat(self.proc, int(process.name), start_ticks=0, tty_nr=7)
-        home = self.root / ".codex"
-        _ = self.codex_rollout(home, OTHER_ID, day="2026/10/15", timestamp="2026-10-16T00:31:00Z")
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexSessionId(kind="session id", session_id=OTHER_ID))
-        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T04:01:00Z")
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-
-    def test_codex_unreadable_session_folders_make_the_snapshot_partial_instead_of_picking_an_id(self) -> None:
-        _ = self.process(2001, command="codex")
-        home = self.root / ".codex"
-        hidden = self.codex_rollout(home, OTHER_ID)
-        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
-        scandir = os.scandir
-        for unreadable in (home / "sessions", hidden.parent.parent.parent, hidden.parent.parent, hidden.parent):
-            def readable_directories(path: str | os.PathLike[str]):
-                if Path(path) == unreadable:
-                    raise PermissionError(f"{unreadable}: directory denied")
-                return scandir(path)
-
-            with self.subTest(unreadable=unreadable), patch.object(os, "scandir", readable_directories):
-                found = inventory.snapshot_inventory()
-            self.assertIsInstance(found, inventory.PartialInventory)
-            assert isinstance(found, inventory.PartialInventory)
-            self.assertIn("directory denied", "; ".join(found.failures))
-
-    def test_codex_closed_rollout_before_process_birth_or_in_another_cwd_is_ignored(self) -> None:
-        process = self.process(2001, command="codex")
-        # Born two seconds after boot; a one-second-old session predates this process.
-        _ = write_stat(self.proc, int(process.name), start_ticks=2 * os.sysconf("SC_CLK_TCK"), tty_nr=7)
-        _ = self.codex_rollout(self.root / ".codex", OTHER_ID, timestamp="2026-10-15T12:00:01Z")
-        _ = self.codex_rollout(self.root / ".codex", UNKNOWN_ID, cwd=str(self.root / "other"))
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-
-    def test_codex_disk_lookup_does_not_visit_days_before_process_birth(self) -> None:
-        _ = self.process(2001, command="codex")
-        home = self.root / ".codex"
-        old = self.codex_rollout(home, OTHER_ID, day="2026/10/14")
-        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
-        iterdir = Path.iterdir
-
-        def relevant_days(path: Path) -> Iterator[Path]:
-            self.assertNotEqual(path, old.parent, "scanned a day before process birth")
-            return iterdir(path)
-
-        with patch.object(Path, "iterdir", relevant_days):
-            self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexSessionId(kind="session id", session_id=UNKNOWN_ID))
-
-    def test_darwin_codex_closed_rollouts_use_process_birth_and_refuse_ambiguity(self) -> None:
-        responses = self.darwin_snapshot()
-        responses["-a -p 2001 -Fn"] = {"code": 0, "stdout": ""}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
-        home = self.root / ".codex"
-        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T11:59:59Z")
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T12:00:00Z")
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexSessionId(kind="session id", session_id=OTHER_ID))
-        _ = self.codex_rollout(home, UNKNOWN_ID)
-        self.assertEqual(self.observed_codex_resume(), shutdown_record.CodexResumePicker(kind="picker"))
-
-    def test_codex_unreadable_fd_list_uses_picker_without_file_time_identity(self) -> None:
-        process = self.process(2001, command="codex")
-        rollout = self.root / ".codex/sessions/rollout-newest-12345678-1234-1234-1234-123456789abc.jsonl"
-        rollout.parent.mkdir(parents=True)
-        _ = rollout.write_text("not held open")
-        original = Path.iterdir
-
-        def paths(path: Path) -> Iterator[Path]:
-            if path == process / "fd":
-                raise PermissionError("fd denied")
-            return original(path)
-
-        with patch.object(Path, "iterdir", paths):
-            found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.CompleteInventory)
-        assert isinstance(found, inventory.CompleteInventory)
-        entry = found.sessions["codex-.codex"][0]
-        assert entry["agent"] == "codex"
-        self.assertEqual(entry["codex"], shutdown_record.CodexLaunch(home=str(self.root / ".codex"),
-            resume=shutdown_record.CodexResumePicker(kind="picker")))
-
-    def test_codex_unreadable_environment_makes_the_observation_partial(self) -> None:
-        process = self.process(2001, command="codex")
-        (process / "environ").unlink()
-        found = inventory.snapshot_inventory()
-        self.assertIsInstance(found, inventory.PartialInventory)
-        assert isinstance(found, inventory.PartialInventory)
-        self.assertIn("Codex observation", "; ".join(found.failures))
-
-    def test_pause_intent_restores_timers_but_kept_off_remains_off_without_changing_pause(self) -> None:
-        self.claude()
-        timer = self.notifier / "showrunner-show"
-        timer.mkdir()
-        doc = self.root / "production.md"
-        _ = doc.write_text("# Production\n")
-        _ = (timer / "conf").write_text(f"TARGET=session:owner-id\nCHECK=zsh /scripts/production_check.sh {doc}\n")
-        _ = (timer / "state").write_text("ENABLED=0\n")
-        for phase in (conversation_pause.Quiet(1, 2), conversation_pause.KeptOff()):
-            with self.subTest(phase=phase):
-                pause = conversation_pause.PauseRecord("owner-id", ("showrunner-show",), phase)
-                conversation_pause.write_record(pause)
-                path = conversation_pause.record_path("owner-id")
-                before = path.read_bytes()
-                found = inventory.snapshot_inventory()
-                assert isinstance(found, inventory.CompleteInventory), found
-                restore = not isinstance(phase, conversation_pause.KeptOff)
-                self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [shutdown_record.TimerRestore(
-                    instance="showrunner-show", was_enabled=restore)])
-                self.assertEqual(path.read_bytes(), before)
-                self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
-
-    def test_codex_liveness_follows_rollout_to_another_home_and_refuses_unreadable_evidence(self) -> None:
-        home = self.root / "first"
-        process = self.process(2001, command="codex", environment={"CODEX_HOME": str(home)})
-        identity = "12345678-1234-1234-1234-123456789abc"
-        (process / "fd/3").symlink_to(home / f"sessions/rollout-date-{identity}.jsonl")
-        observed = inventory.snapshot_inventory()
-        assert isinstance(observed, inventory.CompleteInventory), observed
-        saved = observed.sessions["codex-first"][0]
-        assert saved["agent"] == "codex"
-        self.assertEqual(inventory.codex_liveness(saved), inventory.CodexLive(2001))
-        shutil.rmtree(process)
-        self.assertIsInstance(inventory.codex_liveness(saved), inventory.CodexGone)
-        moved_home = self.root / "second"
-        moved = self.process(2002, command="codex", environment={"CODEX_HOME": str(moved_home)})
-        (moved / "fd/3").symlink_to(moved_home / f"sessions/rollout-date-{identity}.jsonl")
-        self.assertEqual(inventory.codex_liveness(saved), inventory.CodexLive(2002))
-        _ = (moved / "stat").write_text("malformed")
-        self.assertIsInstance(inventory.codex_liveness(saved), inventory.CodexLivenessUnknown)
-
-    def test_live_marked_unit_without_a_messaging_socket_is_not_a_standalone(self) -> None:
-        self.claude()
-        row = unit_lookup.MarkedUnit("unit", unit_lookup.ClaudeNotRunning(),
-                                   herdr.HerdrPlace("unit-host", "w1:p1"))
-        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({"show": {"unit": row}}, {})):
-            observed = inventory.snapshot_inventory()
-        self.assertIsInstance(observed, inventory.PartialInventory)
-        assert isinstance(observed, inventory.PartialInventory)
-        self.assertIn("marked host", "; ".join(observed.failures))
-
-    def test_unknown_host_is_observed_and_boot_identity_is_saved(self) -> None:
-        self.claude()
-        with patch.object(inventory, "_terminal_host", return_value=inventory.UnknownHost(kind="unknown")):
-            observed = inventory.snapshot_inventory()
-        assert isinstance(observed, inventory.CompleteInventory), observed
-        saved = shutdown_record.merge_snapshots(observed, "2026-10-15T12:00:00+00:00")[0]
-        self.assertEqual(saved["sessions"][0]["session"]["host"], {"kind": "unknown"})
-        self.assertEqual((saved.get("boot_id"), saved["sessions"][0].get("boot_id")), ("boot-one", "boot-one"))
-
-    def test_snapshot_boot_read_failure_prevents_replacing_recovery(self) -> None:
-        self.claude()
-        (self.proc / "sys/kernel/random/boot_id").unlink()
-        observed = inventory.snapshot_inventory()
-        self.assertIsInstance(observed, inventory.PartialInventory)
-        self.assertEqual(shutdown_record.merge_snapshots(observed, "2026-10-15T12:00:00+00:00"), [])
-        self.assertFalse((self.root / "shutdown/snapshots").exists())
-
-    def test_absence_after_reboot_is_retained_but_a_clean_exit_is_dropped(self) -> None:
-        self.claude()
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        shutil.rmtree(self.proc / "1001")
-        clean = inventory.snapshot_inventory()
-        assert isinstance(clean, inventory.CompleteInventory), clean
-        self.assertEqual(shutdown_record.merge_snapshots(clean, "2026-10-15T12:01:00+00:00")[0]["sessions"], [])
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        _ = (self.proc / "sys/kernel/random/boot_id").write_text("boot-two\n")
-        rebooted = inventory.snapshot_inventory()
-        assert isinstance(rebooted, inventory.CompleteInventory), rebooted
-        retained = shutdown_record.merge_snapshots(rebooted, "2026-10-15T12:02:00+00:00")[0]["sessions"]
-        self.assertEqual([(item["state"], item.get("crash"), item["last_seen"]) for item in retained],
-                         [("unresolved", "reboot", "2026-10-15T12:00:00+00:00")])
-
-    def test_lost_herdr_server_retains_a_missing_owner_with_host_loss_evidence(self) -> None:
-        self.claude()
-        with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
-                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
-            first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        shutil.rmtree(self.proc / "1001")
-        with patch.object(inventory, "_snapshot_native_hosts", return_value=({}, {"writing": "detached"})):
-            clean = inventory.snapshot_inventory()
-        assert isinstance(clean, inventory.CompleteInventory), clean
-        self.assertEqual(clean.gone_hosts, frozenset())
-        lost = inventory.snapshot_inventory()
-        assert isinstance(lost, inventory.CompleteInventory), lost
-        saved = shutdown_record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")[0]
-        self.assertEqual((saved["sessions"][0]["state"], saved["sessions"][0].get("crash")), ("unresolved", "host gone"))
-
-    def test_terminal_process_loss_retains_recovery_but_agent_exit_alone_does_not(self) -> None:
-        self.claude()
-        terminal = self.process(3001, command="ghostty")
-        _ = write_stat(self.proc, 1001, start_ticks=12345, ppid=3001, tty_nr=7)
-        first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        saved = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]
-        self.assertEqual(saved["sessions"][0].get("host_process"),
-                         {"kind": "process", "pid": 3001, "proc_start": "12345"})
-        shutil.rmtree(self.proc / "1001")
-        clean = inventory.snapshot_inventory()
-        assert isinstance(clean, inventory.CompleteInventory), clean
-        self.assertEqual(clean.gone_hosts, frozenset())
-        shutil.rmtree(terminal)
-        lost = inventory.snapshot_inventory()
-        assert isinstance(lost, inventory.CompleteInventory), lost
-        restored = shutdown_record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")[0]
-        self.assertEqual(restored["sessions"][0].get("crash"), "host gone")
-
-    def test_git_checkout_observations_disable_optional_index_locks(self) -> None:
-        checkout = Path(__file__).resolve().parents[2]
-        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
-            observed = inventory._checkout(str(checkout))  # pyright: ignore[reportPrivateUsage]
-        assert observed["kind"] == "git"
-        self.assertEqual(observed["path"], str(checkout))
-        self.assertTrue(run.call_args_list)
-        environments = [cast(dict[str, str], call.kwargs["env"]) for call in run.call_args_list]
-        self.assertEqual({env.get("GIT_OPTIONAL_LOCKS") for env in environments}, {"0"})
-
-
-    def test_same_name_herdr_replacement_cannot_hide_the_original_server_loss(self) -> None:
-        self.claude()
-        old = self.process(3001, command="herdr", arguments=["herdr", "server"])
-        herdr_listener(self.proc, 3001, "writing", {"HOME": str(self.root)})
-        with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
-                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
-            first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        saved = shutdown_record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]
-        self.assertEqual(saved["sessions"][0].get("host_process"),
-                         {"kind": "process", "pid": 3001, "proc_start": "12345"})
-        shutil.rmtree(self.proc / "1001")
-        shutil.rmtree(old)
-        _ = self.process(3002, command="herdr", arguments=["herdr", "server"])
-        herdr_listener(self.proc, 3002, "writing", {"HOME": str(self.root)})
-        with patch.object(inventory, "_snapshot_native_hosts", return_value=({}, {"writing": "detached"})):
-            replacement = inventory.snapshot_inventory()
-        assert isinstance(replacement, inventory.CompleteInventory), replacement
-        restored = shutdown_record.merge_snapshots(replacement, "2026-10-15T12:01:00+00:00")[0]
-        self.assertEqual(restored["sessions"][0].get("crash"), "host gone")
-
-
 if __name__ == "__main__":
     _ = unittest.main()
 
 
-class FreshSessionTests(ShutdownTestCase):
-    def test_fresh_session_reports_owned_workers_and_preserves_the_recorded_identity(self) -> None:
-        owner = top_level('owner')
-        owner['pid'] = 101
-        worker = worker_session('worker', owner='owner')
-        unrelated = worker_session('other', owner='elsewhere')
-        observed = inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[owner, worker, unrelated], unattributed=[]))
-        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'workers': [worker]})
-        changed = copy.deepcopy(owner)
-        changed['pid'] = 201
-        self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[changed], unattributed=[])), {'kind': 'session identity lost'})
-        self.assertEqual(owner['pid'], 101)
 
 
-    def test_fresh_session_rejects_any_resumed_occurrence_even_beside_the_recorded_process(self) -> None:
-        owner = top_level("owner")
-        owner["pid"] = 101
-        resumed = copy.deepcopy(owner)
-        resumed.update(pid=501, proc_start="200")
-        reports: tuple[list[inventory.Session], ...] = ([owner, resumed], [resumed, owner])
-        for rows in reports:
-            with self.subTest(pids=[row["pid"] for row in rows]):
-                self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=rows, unattributed=[])),
-                                 {"kind": "session identity lost"})
+@final
+class WorkerResumeTests(StaffTestCase):
+    @cached_property
+    def owner(self) -> staff.StaffRow:
+        return fixture_member("showrunner", name="owner")
+
+    @property
+    def runs(self) -> Path:
+        return self.root / "runs"
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.runs.mkdir()
+        _ = self.enterContext(patch("scripts.lib.unit_runs.run_roots", return_value=(self.runs,)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                                                                "USAGE_STATE_DIR": str(self.root / "usage")})))
+
+    def roster(self, name: str, entries: dict[str, object]) -> Path:
+        run = self.runs / name
+        run.mkdir()
+        self.write_json(run / "mesh_roster.json", entries)
+        return run
+
+    def assigned(self, *rows: staff.StaffRow) -> None:
+        for row in rows:
+            agents_log.append(row.current_session, "impl", None, datetime.now(timezone.utc))
+
+    def test_resume_results_select_children_across_families_and_deduplicate_run_references(self) -> None:
+        owner = self.owner
+        unit = fixture_member("unit", name="unit", parent=owner.id)
+        foreign = fixture_worker("foreign", unit.id)
+        codex = fixture_worker("codex-own", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        claude = fixture_worker("claude-own", owner.id)
+        idle = fixture_worker("idle-own", owner.id)
+        self.assigned(codex, claude, idle)
+        first = self.roster("first", {"codex-own": {"staff_id": codex.id, "status": "running"},
+                                      "foreign": {"staff_id": foreign.id, "status": "running"}})
+        second = self.roster("second", {"codex-own": {"staff_id": codex.id, "status": "paused", "paused_turn": True},
+                                        "idle-own": {"staff_id": idle.id, "status": "done"}})
+        self.write_json(second / "impl_worker_impl.json", {"staff_id": claude.id, "slot": "impl", "model": "opus"})
+        phase = second / "phases" / "build"
+        phase.mkdir(parents=True)
+        _ = (phase / "impl_status_impl").write_text("implementing\n")
+        os.utime(first, (1, 1))
+        os.utime(second, (2, 2))
+        with patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read_tasks:
+            results = inventory.worker_resumes(owner, staff.local_snapshot())
+        self.assertEqual(read_tasks.call_count, 1)
+        live = [result.seat for result in results if isinstance(result, Resumable)]
+        waiting = [result.seat for result in results if isinstance(result, Idle)]
+        self.assertEqual({seat["staff_id"] for seat in live}, {codex.id, claude.id})
+        self.assertEqual([seat["staff_id"] for seat in waiting], [idle.id])
+        self.assertEqual(len(results), 3)
+        self.assertEqual({seat["run_dir"] for seat in live}, {str(second)})
+
+    def test_capacity_workers_without_live_turns_are_idle(self) -> None:
+        owner = self.owner
+        child = fixture_worker("capacity", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        self.assigned(child)
+        run = self.roster("run", {})
+        for status in ("capacity_exhausted", "waiting_capacity"):
+            with self.subTest(status=status):
+                _ = (run / "mesh_roster.json").write_text(json.dumps({child.name: {"staff_id": child.id, "status": status}}))
+                results = inventory.worker_resumes(owner, staff.local_snapshot())
+                self.assertEqual([result.seat["staff_id"] for result in results if isinstance(result, Idle)], [child.id])
+                self.assertEqual(len(results), 1)
+
+    def test_roster_turn_state_wins_over_a_stale_slot_status(self) -> None:
+        owner = self.owner
+        child = fixture_worker("codex", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        self.assigned(child)
+        run = self.roster("run", {})
+        self.write_json(run / "impl_worker_impl.json", {"staff_id": child.id, "slot": "impl"})
+        for roster_status, slot_status, expected in (("running", "implemented", Resumable),
+                                                     ("done", "implementing", Idle)):
+            with self.subTest(roster=roster_status, slot=slot_status):
+                self.write_json(run / "mesh_roster.json", {child.name: {"staff_id": child.id, "status": roster_status}})
+                _ = (run / "impl_status_impl").write_text(slot_status + "\n")
+                results = inventory.worker_resumes(owner, staff.local_snapshot())
+                self.assertEqual(len(results), 1)
+                self.assertIsInstance(results[0], expected)
+                result = results[0]
+                assert isinstance(result, (Resumable, Idle))
+                self.assertEqual(result.seat["staff_id"], child.id)
+                self.assertEqual(result.seat["run_dir"], str(run))
+
+    def test_newer_parent_run_without_the_worker_keeps_the_older_live_entry(self) -> None:
+        owner = self.owner
+        child = fixture_worker("working", owner.id)
+        self.assigned(child)
+        older = self.roster("older", {child.name: {"staff_id": child.id, "status": "running"}})
+        newer = self.roster("newer", {})
+        owned_runs.activate(newer, owner.current_session)
+        os.utime(older, (1, 1))
+        os.utime(newer, (2, 2))
+        results = inventory.worker_resumes(owner, staff.local_snapshot())
+        self.assertEqual([result.seat["run_dir"] for result in results if isinstance(result, Resumable)], [str(older)])
+        self.assertEqual(len(results), 1)
+
+    def test_unreadable_foreign_owner_marker_does_not_hide_own_children(self) -> None:
+        owner = self.owner
+        child = fixture_worker("working", owner.id)
+        foreign = fixture_member("unit", name="foreign", parent=owner.id)
+        _ = fixture_worker("foreign-worker", foreign.id)
+        self.assigned(child)
+        run = self.roster("run", {child.name: {"staff_id": child.id, "status": "running"}})
+        active = self.runs / "active"
+        active.mkdir()
+        _ = (active / foreign.current_session).write_bytes(b"\xff")
+        results = inventory.worker_resumes(owner, staff.local_snapshot())
+        self.assertEqual([result.seat["run_dir"] for result in results if isinstance(result, Resumable)], [str(run)])
+        self.assertEqual(len(results), 1)
+
+    def test_missing_worker_evidence_is_unavailable_and_does_not_hide_other_children(self) -> None:
+        owner = self.owner
+        missing = fixture_worker("missing", owner.id)
+        unassigned = fixture_worker("unassigned", owner.id)
+        idle = fixture_worker("idle", owner.id)
+        self.assigned(idle)
+        run = self.roster("run", {"unassigned": {"staff_id": unassigned.id, "status": "done"},
+                                  "idle": {"staff_id": idle.id, "status": "done"}})
+        owned_runs.activate(run, owner.current_session)
+        results = inventory.worker_resumes(owner, staff.local_snapshot())
+        errors = {result.staff_id: result.reason for result in results if isinstance(result, Unavailable)}
+        self.assertIn("roster entry is unavailable", errors[missing.id])
+        self.assertIn("last assignment is unavailable", errors[unassigned.id])
+        self.assertEqual([result.seat["staff_id"] for result in results if isinstance(result, Idle)], [idle.id])
+        from scripts.lib.resume_message import ResumeWorkers, resume_message
+        message = resume_message("account move", workers=ResumeWorkers(results, str(self.root)))
+        self.assertEqual(message.count("anomaly:"), 2)
+        self.assertIn(f"anomaly: missing ({missing.id}):", message)
+        self.assertNotIn("missing (, idle)", message)
+        self.assertIn("idle (impl, idle): paused on its thread; nothing to run now", message)

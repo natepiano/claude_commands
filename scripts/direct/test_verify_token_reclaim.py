@@ -4,20 +4,59 @@ from __future__ import annotations
 import json
 import subprocess
 from typing import cast
-from scripts.direct.verify_token_wait_test_support import VERIFY
-from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY
+from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
+    def test_stop_before_reading_the_sleep_pid_leaves_no_live_sleep(self) -> None:
+        gate = self.root / "stop-renewer.sh"
+        _ = gate.write_text('''set -T
+stop_before_sleep_wait() {
+    if [[ "${FUNCNAME[1]:-}" == start_token_renewer &&
+          "$BASH_COMMAND" == 'renew_sleep_pid=$!' ]]; then
+        trap - DEBUG
+        printf '%s\\n' "$BASHPID" > "$TEST_STOPPED_RENEWER"
+        kill -TERM "$BASHPID"
+    fi
+}
+trap stop_before_sleep_wait DEBUG
+''')
+        harness = self.root / "renew-and-stop.sh"
+        _ = harness.write_text("set -eu\n"
+                               + shell_functions(VERIFY, "renew_token", "start_token_renewer")
+                               + '''BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder
+TOKEN_HELD=1 TOKEN_HOLD_S=120 TOKEN_RENEW_S=60
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 120
+start_token_renewer
+wait "$TOKEN_RENEWER_PID"
+bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
+''')
+        stopped = self.root / "stopped-renewer"
+        process = subprocess.Popen(
+            ["bash", str(harness), str(BOARD), str(self.root / "board")],
+            cwd=self.root,
+            env={**self.environment, "BASH_ENV": str(gate), "TEST_STOPPED_RENEWER": str(stopped)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        self.started_groups.add(process.pid)
+        try:
+            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertNotEqual(int(stopped.read_text()), process.pid)
+            self.wait_for_group_exit(process.pid, timeout=5)
+            self.assertEqual(self.live_group_processes(process.pid), [])
+        finally:
+            self.end_group(process.pid)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('''#!/bin/sh
-if [ "$1" = 3 ]; then
+        self.write_wait_sleep('''if [ "$1" = 3 ]; then
     printf '%s\\n' "$1" >> "$TEST_RECLAIM_POLLS"
 fi
 exit 0
 ''')
-        sleep.chmod(0o755)
         polls = self.root / "reclaim-polls"
         board = self.root / "board"
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),

@@ -2,12 +2,15 @@
 """Build and render a unit run's plan-phase table from durable events."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
 import json
 import os
-import re
 import statistics
 import subprocess
 import sys
@@ -20,21 +23,43 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_SCRIPTS = REPOSITORY_ROOT / "scripts" / "production"
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.direct import plan_history
+from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
-from scripts.production import showrunners, unit_lookup
-from production_units import Production, Refusal, cell_value, live_unit_table, read_production
-from scripts.production.production_doc import PromoteTo, promotion_from_doc
+from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production.production_doc import Refusal, production_field
+from scripts.shutdown import remote
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
 FINDING_SEVERITIES = ("blocker", "minor", "nit")
+
+
+class Production(NamedTuple):
+    doc: Path
+    name: str
+    zone: ZoneInfo
+
+
+def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    try:
+        owner = unit_lookup.doc_owner(path.expanduser(), resolver.record)
+    except staff.StaffUnreadable as error:
+        raise Refusal(f"cannot read production doc: {error}") from error
+    doc = resolver.production_doc(owner)
+    if not isinstance(doc, session_staff.ProductionDoc):
+        raise Refusal(f"cannot read production doc: {path}: {owner.name}: {doc.reason}")
+    try:
+        lines = doc.path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise Refusal(f"cannot read production doc: {path}: {error}") from error
+    _ = production_field(lines, "Merge branch")
+    _ = production_field(lines, "Showrunner checkout")
+    if Path(production_field(lines, "Log")).is_absolute():
+        raise Refusal("production Log must be relative to Showrunner checkout")
+    return Production(doc.path, owner.name, user_zone())
 
 
 class ProjectedEta(NamedTuple):
@@ -149,25 +174,6 @@ class PhaseHistory:
         return self.fix_done + self.fix_open_passes
 
 
-class NoGate(NamedTuple):
-    """No production gate restricts the phase's prediction."""
-
-
-class TimedGate(NamedTuple):
-    """A production gate supplies the earliest possible start."""
-
-    gate: str
-    until: datetime
-    waits_on: str
-
-
-class UntimedGate(NamedTuple):
-    """A production gate has no known clearing time."""
-
-    gate: str
-    waits_on: str
-
-
 @dataclass(frozen=True)
 class DonePhase(PhaseHistory):
     """A plan phase marked done in the current plan."""
@@ -201,7 +207,6 @@ class TodoPhase(PhaseHistory):
     phase: str
     title: str
     times: PredictedPhaseTiming | PhaseTimingNotPredicted
-    gate: NoGate | TimedGate | UntimedGate = NoGate()
 
 
 class NoOpenPhase(NamedTuple):
@@ -222,13 +227,6 @@ class PredictedFinish(NamedTuple):
 
 class UnknownFinish(NamedTuple):
     """The plan's completion time cannot yet be determined."""
-
-
-class GateBlockedFinish(NamedTuple):
-    """The plan cannot finish before an untimed production gate clears."""
-
-    gate: str
-    waits_on: str
 
 
 class CouldStart(NamedTuple):
@@ -259,7 +257,7 @@ class PhaseRecord(NamedTuple):
     updated: datetime
     current: OpenPhase | NoOpenPhase
     phases: list[DonePhase | OpenPhase | TodoPhase]
-    plan_finish: FinishedAt | PredictedFinish | UnknownFinish | GateBlockedFinish
+    plan_finish: FinishedAt | PredictedFinish | UnknownFinish
     parallel: ParallelCheck
 
 
@@ -350,7 +348,7 @@ class OutsidePlan(NamedTuple):
 class ProductionReference(NamedTuple):
     """The production and unit named by a worker plan."""
 
-    production: str
+    name: str
     unit: str
     document: str
 
@@ -371,13 +369,6 @@ class NoteOwnership(NamedTuple):
 
     production: str
     unit: str
-
-
-class ProductionIdentity(NamedTuple):
-    """The current slug and former names of one production."""
-
-    slug: str
-    former_slugs: tuple[str, ...]
 
 
 class NoteWithoutPhaseTableOwnership(NamedTuple):
@@ -630,8 +621,6 @@ def _parallel_check(
             for needed in phase["depends_on"] or []
             if states.get(needed) != "done"
         ]
-        if phase["blocked_by"]:
-            unmet.append(phase["blocked_by"])
         if not unmet:
             ready.append(phase["id"])
         elif not first_wait:
@@ -916,12 +905,9 @@ def _done_phase(
 
 def _plan_finish(
     phases: list[DonePhase | OpenPhase | TodoPhase],
-) -> FinishedAt | PredictedFinish | UnknownFinish | GateBlockedFinish:
+) -> FinishedAt | PredictedFinish | UnknownFinish:
     if not phases:
         return UnknownFinish()
-    for phase in phases:
-        if isinstance(phase, TodoPhase) and isinstance(phase.gate, UntimedGate):
-            return GateBlockedFinish(phase.gate.gate, phase.gate.waits_on)
     if all(isinstance(phase, DonePhase) for phase in phases):
         finishes = [
             phase.times.finish
@@ -1019,58 +1005,22 @@ def _with_history(
     )
 
 
-def _production_gates(plan_path: Path) -> dict[str, NoGate | TimedGate | UntimedGate]:
-    reference = _production_reference(plan_path)
-    if isinstance(reference, PlanOutsideProduction):
-        return {}
-    try:
-        document = _production_document(plan_path, reference)
-        lines = document.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError, Refusal):
-        return {}
-    gates: dict[str, NoGate | TimedGate | UntimedGate] = {}
-    in_gates = False
-    for line in lines:
-        if line.startswith("## "):
-            in_gates = line.strip() == "## Gates"
-            continue
-        if not in_gates or not line.lstrip().startswith("|"):
-            continue
-        cells = [
-            cell.strip().replace(r"\|", "|")
-            for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))
-        ]
-        if len(cells) != 4 or re.fullmatch(r"G\d+", cell_value(cells[0])) is None:
-            continue
-        gate, _, waits_on, clears = cells
-        gate = cell_value(gate)
-        if clears.casefold().startswith("cleared"):
-            gates[gate] = NoGate()
-            continue
-        match = re.search(r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}\b", clears)
-        if match is not None:
-            try:
-                until = datetime.strptime(match.group(), "%Y-%m-%d %H:%M").replace(
-                    tzinfo=user_zone()
-                )
-            except ValueError:
-                pass
-            else:
-                gates[gate] = TimedGate(gate, until, waits_on)
-                continue
-        gates[gate] = UntimedGate(gate, waits_on)
-    return gates
-
-
-def build_plan(plan_path: Path) -> PhaseRecord:
+def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> PhaseRecord:
     """Build one plan's phase view entirely from its durable events."""
     plan_path = plan_path.expanduser().resolve()
+    if resolver is None:
+        try:
+            record = staff.snapshot()
+        except OSError as error:
+            print(f"phase_table: {plan_path}: {error}", file=sys.stderr)
+            record = staff.StaffSnapshot(())
+        resolver = session_staff.RowResolver(record)
     try:
-        phases = plan_history.plan_phases(plan_path)
+        phases = plan_history.plan_phases(plan_path, resolver=resolver)
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
+    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
     return _build_phase_record(
@@ -1116,7 +1066,7 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,
          "done": isinstance(instance.finish, InstanceFinished),
-         "depends_on": None, "blocked_by": ""}
+         "depends_on": None}
         for instance in ordered
     ]
     return _build_phase_record(
@@ -1136,10 +1086,6 @@ def _build_phase_record(
     """Apply the same timing and history rules to plan and run phase rows."""
     open_instance = open_instances[-1] if open_instances else NoOpenPhase()
     open_ids = _open_phase_ids(run_events)
-    in_production = any(phase["blocked_by"] and not phase["done"] for phase in phases) and isinstance(
-        _production_reference(plan_path), ProductionReference
-    )
-    gates = _production_gates(plan_path) if in_production else {}
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
     if isinstance(open_instance, OpenPhaseInstance):
@@ -1204,14 +1150,6 @@ def _build_phase_record(
                     phase=phase["id"],
                     title=phase["title"],
                     times=PhaseTimingNotPredicted(),
-                    gate=(
-                        gates.get(
-                            phase["blocked_by"],
-                            UntimedGate(phase["blocked_by"], "gate not found"),
-                        )
-                        if in_production and phase["blocked_by"]
-                        else NoGate()
-                    ),
                 )
             )
 
@@ -1265,22 +1203,14 @@ def _build_phase_record(
         scheduled = replace(current, schedule_end=previous_finish)
         rows = [scheduled if row is current else row for row in rows]
         current = scheduled
-    blocked: UntimedGate | NoGate = NoGate()
     for index, row in enumerate(rows):
         if not isinstance(row, TodoPhase):
-            continue
-        if isinstance(blocked, NoGate) and isinstance(row.gate, UntimedGate):
-            blocked = row.gate
-        if isinstance(blocked, UntimedGate):
-            rows[index] = replace(row, times=PhaseTimingNotPredicted(), gate=blocked)
             continue
         if isinstance(typical, UnknownDuration):
             continue
         start = previous_finish
         if gap_before_first:
             start += timedelta(seconds=gap)
-        if isinstance(row.gate, TimedGate):
-            start = max(start, row.gate.until)
         finish = start + timedelta(seconds=typical.seconds)
         rows[index] = replace(row, times=PredictedPhaseTiming(start=start, finish=finish))
         previous_finish = finish
@@ -1312,15 +1242,23 @@ def _build_phase_record(
     )
 
 
-def build(session_dir: Path) -> PhaseRecord:
+def build(session_dir: Path, *, resolver: session_staff.RowResolver | None = None) -> PhaseRecord:
     """Build a session's phase view without changing its state or history."""
     state = _state(session_dir)
     working_dir_text = _text(state.get("working_dir"))
     plan_doc = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
     if not plan_doc:
         raise NoState(f"Progress state does not name a plan in {session_dir}")
-    working_dir = Path(working_dir_text) if working_dir_text else Path.cwd()
-    return build_plan(plan_history.resolve_plan_path(working_dir, plan_doc))
+    if not working_dir_text:
+        try:
+            resolver = resolver if resolver is not None else session_staff.RowResolver(staff.initial_snapshot())
+            owner = unit_runs.run_owner(state, resolver.record)
+        except staff.StaffUnreadable as error:
+            raise NoState(f"Progress state has no available owner folder in {session_dir}: {error}") from error
+        if isinstance(owner, unit_runs.RunOwnerUnrecorded) or isinstance(owner.worktree, staff.WorktreeUnfilled):
+            raise NoState(f"Progress state has no recorded folder or unit staff owner in {session_dir}")
+        working_dir_text = str(owner.worktree.path)
+    return build_plan(plan_history.resolve_plan_path(Path(working_dir_text), plan_doc), resolver=resolver)
 
 
 def _clock(moment: datetime, zone: ZoneInfo) -> str:
@@ -1340,7 +1278,7 @@ def _elapsed(seconds: int) -> str:
     return f"{hours}:{remainder // 60:02d}"
 
 
-def _row_status(row: DonePhase | OpenPhase | TodoPhase, zone: ZoneInfo) -> str:
+def _row_status(row: DonePhase | OpenPhase | TodoPhase) -> str:
     if isinstance(row, DonePhase):
         if isinstance(row.times, CompletedPhaseTiming):
             return f"done in {_elapsed(row.times.seconds)}"
@@ -1349,10 +1287,6 @@ def _row_status(row: DonePhase | OpenPhase | TodoPhase, zone: ZoneInfo) -> str:
         if isinstance(row.progress, ReportedPhaseProgress):
             return f"running, {row.progress.percent}%"
         return "running"
-    if isinstance(row.gate, TimedGate):
-        return f"gated until {row.gate.until.astimezone(zone):%a %d %b %H:%M}"
-    if isinstance(row.gate, UntimedGate):
-        return f"gated by {row.gate.gate}: {_cell_text(row.gate.waits_on)}"
     return (
         "predicted"
         if isinstance(row.times, PredictedPhaseTiming)
@@ -1434,8 +1368,6 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
         plan_finish = _clock(record.plan_finish.at, zone)
     elif isinstance(record.plan_finish, PredictedFinish):
         plan_finish = f"{_clock(record.plan_finish.at, zone)}, predicted"
-    elif isinstance(record.plan_finish, GateBlockedFinish):
-        plan_finish = f"after {record.plan_finish.gate}"
     summary.extend(
         [
             f"| Plan finish | {plan_finish} |",
@@ -1451,7 +1383,7 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
     for row in reversed(record.phases):
         start, finish = _row_clocks(row, zone)
         phase_table.append(
-            f"| {row.phase} | {row.title} | {_row_status(row, zone)} | "
+            f"| {row.phase} | {row.title} | {_row_status(row)} | "
             + f"{start} | {finish} |"
         )
     return "\n".join([heading, "", *summary, "", *phase_table])
@@ -1576,34 +1508,50 @@ def show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str:
     return render(record, zone)
 
 
-def _production_lines(production: Production) -> list[str]:
-    try:
-        return production.doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        raise Refusal(f"cannot read production doc: {error}") from error
+class UnitPlanUnavailable(NamedTuple):
+    unit: str
+    reason: str
 
 
-def _production_unit_plans(production: Production) -> list[ProductionUnitPlan]:
-    plans: list[ProductionUnitPlan] = []
-    for cells in live_unit_table(_production_lines(production), production.slug):
-        unit = cell_value(cells.get("Unit", ""))
-        worktree = Path(cell_value(cells.get("Worktree", ""))).expanduser()
-        plan_text = cell_value(cells.get("Plan", "")).split(" ", 1)[0]
-        plan = Path(plan_text).expanduser()
-        if not plan.is_absolute():
-            plan = worktree / plan
-        plans.append(ProductionUnitPlan(unit=unit, plan=plan.resolve()))
+def _production_unit_plans(production: Production, *, resolver: session_staff.RowResolver | None = None) -> list[ProductionUnitPlan | UnitPlanUnavailable]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    owner = resolver.record.by_doc(remote.local_machine(), production.doc)
+    if owner is None:
+        raise Refusal(f"{production.doc}: no staff owner binds the document")
+    plans: list[ProductionUnitPlan | UnitPlanUnavailable] = []
+    for row in staff.active(resolver.record, "unit"):
+        if not row.reports_to(owner.id):
+            continue
+        tree = resolver.unit_worktree(row)
+        try:
+            config = resolver.unit_config(row)
+        except ValueError as error:
+            config = session_staff.ConfigMissing(str(error))
+        reason = ""
+        if not isinstance(tree, staff.PresentWorktree):
+            reason = "the worktree is not recorded"
+        elif not isinstance(config, unit_config.UnitConfig):
+            reason = getattr(config, "reason", "configuration is unavailable")
+        elif isinstance(config.plan, unit_config.PlanFile):
+            plans.append(ProductionUnitPlan(row.name, (tree.path / config.plan.path).resolve()))
+        if reason:
+            print(f"phase_table: {row.name}: {reason}", file=sys.stderr)
+            plans.append(UnitPlanUnavailable(row.name, reason))
     return plans
 
 
 def show_production(production_doc: Path) -> str:
     """Return every live unit's phase record as one JSON object."""
-    production = read_production(production_doc)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = read_production(production_doc, resolver=resolver)
     records: dict[str, object] = {}
-    for unit_plan in _production_unit_plans(production):
+    for unit_plan in _production_unit_plans(production, resolver=resolver):
+        if isinstance(unit_plan, UnitPlanUnavailable):
+            records[unit_plan.unit] = {"unavailable": unit_plan.reason}
+            continue
         try:
             record: object = _json_record(
-                build_plan(unit_plan.plan), production.zone
+                build_plan(unit_plan.plan, resolver=resolver), production.zone
             )
         except NoPlan as error:
             record = {"unavailable": str(error)}
@@ -1611,26 +1559,17 @@ def show_production(production_doc: Path) -> str:
     return json.dumps(records, indent=2)
 
 
-PRODUCTION_PATTERN = re.compile(
-    r"^> \*\*Production: (?P<production>.+?)\*\* — unit `(?P<unit>[^`]+)`; "
-    + r"production doc `(?P<document>[^`]+)`$",
-    re.MULTILINE,
-)
-
-
-def _production_reference(plan_path: Path) -> ProductionReference | PlanOutsideProduction:
-    try:
-        text = plan_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise NoPlan(f"Unable to read plan {plan_path}") from error
-    match = PRODUCTION_PATTERN.search(text)
-    if match is None:
+def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> ProductionReference | PlanOutsideProduction:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    member = plan_history.plan_member(plan_path, resolver=resolver)
+    if isinstance(member, session_staff.NoSuchMember) or member.row.kind != "unit":
         return PlanOutsideProduction()
-    return ProductionReference(
-        production=match.group("production"),
-        unit=match.group("unit"),
-        document=match.group("document"),
-    )
+    doc = resolver.production_doc(member.row)
+    if not isinstance(doc, session_staff.ProductionDoc):
+        print(f"phase_table: {member.row.name}: {doc.reason}", file=sys.stderr)
+        return PlanOutsideProduction()
+    unit = member.row.name
+    return ProductionReference(doc.owner.name, unit, str(doc.path))
 
 
 def _git_output(directory: Path, *arguments: str) -> str:
@@ -1658,24 +1597,35 @@ def _production_document(plan_path: Path, reference: ProductionReference) -> Pat
     return (root / document).resolve()
 
 
-def _phase_note_name(production: str, unit: str) -> str:
+def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowResolver | None = None) -> str:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     name = unit
-    try:
-        marked = unit_lookup.marked_unit(production, unit)
-        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
-            if marked.claude.name:
-                name = marked.claude.name
-    except OSError:
-        pass
+    for owner in staff.active(resolver.record, "showrunner"):
+        if owner.name != production:
+            continue
+        row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)
+                    if unit_names.name(item.name) == unit_names.name(unit)), None)
+        if row is not None:
+            from scripts.message import sessions
+            live = next((item for item in sessions.live_sessions() if item["sessionId"] == row.current_session), None)
+            if live is not None:
+                name = live["name"]
+        break
     cleaned = name.replace("/", "-").replace("\0", "-").lstrip(".")
     return cleaned or unit
 
 
-def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+def _note_ownership(path: Path, record: staff.StaffSnapshot) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return NoteWithoutPhaseTableOwnership()
+    return phase_note_ownership(text, record)
+
+
+def phase_note_ownership(text: str, record: staff.StaffSnapshot) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+    """Read the writer's ownership marker and identity from note content."""
+    lines = text.splitlines()
     if not lines or lines[0] != "---":
         return NoteWithoutPhaseTableOwnership()
     fields: dict[str, str] = {}
@@ -1689,98 +1639,37 @@ def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnershi
             fields[key.strip()] = value.strip()
     if not closed or fields.get("phase_table") != "true":
         return NoteWithoutPhaseTableOwnership()
-    production = _production_slug_from_link(fields.get("production_file", ""))
-    # Notes written before `production_file` carry the slug as `production`.
-    production = production or fields.get("production", "")
     unit = fields.get("unit", "")
-    if not production or not unit:
+    row = record.by_id(staff.StaffId(unit))
+    if row is None or row.kind != "unit" or not isinstance(row.parent, staff.ReportsTo):
         return NoteWithoutPhaseTableOwnership()
-    return NoteOwnership(production=production, unit=unit)
-
-
-def production_identity(production: Production) -> ProductionIdentity:
-    """Read the production names that can own its phase notes."""
-    try:
-        text = production.doc.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise Refusal(f"cannot read production doc: {error}") from error
-    return ProductionIdentity(production.slug, showrunners.former_slugs(text))
+    owner = record.by_id(row.parent.id)
+    if owner is None:
+        return NoteWithoutPhaseTableOwnership()
+    return NoteOwnership(production=owner.name, unit=row.id)
 
 
 def _owns_note(
     ownership: NoteOwnership | NoteWithoutPhaseTableOwnership,
-    production: ProductionIdentity,
+    production: str,
     unit: str,
+    record: staff.StaffSnapshot,
 ) -> bool:
-    return (
-        isinstance(ownership, NoteOwnership)
-        and ownership.unit == unit
-        and ownership.production in (production.slug, *production.former_slugs)
-    )
-
-
-def _production_slug_from_link(link: str) -> str:
-    """Return the production slug named by a note's `production_file` link."""
-    if link.startswith('"'):
-        try:
-            decoded = cast(object, json.loads(link))
-        except json.JSONDecodeError:
-            return ""
-        link = decoded if isinstance(decoded, str) else ""
-    name = link.removeprefix("[[").removesuffix("]]").rsplit("/", 1)[-1]
-    slug = name.removesuffix(".md").removesuffix("-production")
-    return slug if slug and slug != name.removesuffix(".md") else ""
-
-
-def _github_blob_url(checkout: Path, relative: Path) -> str:
-    """Return the GitHub page of `relative` on `checkout`'s branch, or empty off GitHub."""
-    try:
-        remote = _git_output(checkout, "remote", "get-url", "origin")
-        branch = _git_output(checkout, "symbolic-ref", "--short", "HEAD")
-    except Refusal:
-        return ""
-    match = re.fullmatch(
-        r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
-        + r"(?P<repository>[^/]+/[^/]+?)(?:\.git)?/?",
-        remote,
-    )
-    if match is None:
-        return ""
-    return (
-        f"https://github.com/{match.group('repository')}/blob/{branch}/"
-        + relative.as_posix()
-    )
-
-
-def _production_file_link(document: Path, vault: Path) -> str:
-    """Link the production doc's main-branch copy, which outlives the production."""
-    try:
-        root = Path(_git_output(document.parent, "rev-parse", "--show-toplevel")).resolve()
-        relative = document.relative_to(root)
-        lines = document.read_text(encoding="utf-8").splitlines()
-    except (Refusal, ValueError, OSError, UnicodeError):
-        return document.as_uri()
-    promotion = promotion_from_doc(lines)
-    checkout = (
-        promotion.checkouts[0].resolve()
-        if isinstance(promotion, PromoteTo) and promotion.checkouts
-        else root
-    )
-    main_copy = checkout / relative
-    try:
-        in_vault = main_copy.relative_to(vault.resolve())
-    except ValueError:
-        return _github_blob_url(checkout, relative) or main_copy.as_uri()
-    return f"[[{in_vault.with_suffix('').as_posix()}]]"
+    if not isinstance(ownership, NoteOwnership):
+        return False
+    row = record.by_id(staff.StaffId(ownership.unit))
+    return (row is not None
+            and (unit == row.id or unit_names.name(unit) == row.name)
+            and ownership.production == production)
 
 
 def _most_recent_owned_note(
-    vault_root: Path, production: ProductionIdentity, unit: str
+    vault_root: Path, production: str, unit: str, record: staff.StaffSnapshot
 ) -> MostRecentOwnedPhaseNote | NoOwnedPhaseNote:
     matches = [
         path
         for path in vault_root.glob("*/*.md")
-        if _owns_note(_note_ownership(path), production, unit)
+        if _owns_note(_note_ownership(path, record), production, unit, record)
     ]
     if not matches:
         return NoOwnedPhaseNote()
@@ -1796,59 +1685,35 @@ def _most_recent_owned_note(
 
 def _note_text(
     name: str,
-    showrunner: str,
-    production_file: str,
     unit: str,
     record: PhaseRecord,
-    zone: ZoneInfo,
 ) -> str:
+    """Keep phase changes in the vault without clocks or progress updates."""
+    rows = ["| Phase | What it delivers | Status |", "| --- | --- | --- |"]
+    for row in reversed(record.phases):
+        if isinstance(row, DonePhase):
+            status = "done"
+        elif isinstance(row, OpenPhase):
+            status = "running"
+        else:
+            status = "todo"
+        rows.append(f"| {row.phase} | {_cell_text(row.title)} | {status} |")
     return "\n".join(
         (
             "---",
             "phase_table: true",
-            f"showrunner: {showrunner}",
-            f"production_file: {json.dumps(production_file, ensure_ascii=False)}",
             f"unit: {unit}",
             f"now: {json.dumps(_heading_text(record), ensure_ascii=False)}",
             "---",
             "",
             f"# {name}",
             "",
-            render(record, zone),
+            f"**{_heading_text(record)}**",
+            "",
+            *rows,
             "",
         )
     )
-
-
-def _ensure_showrunners_excluded(vault_root: Path) -> None:
-    try:
-        checkout = Path(
-            _git_output(vault_root.parent, "rev-parse", "--show-toplevel")
-        ).resolve()
-    except Refusal:
-        return
-    try:
-        relative = vault_root.resolve().relative_to(checkout)
-    except ValueError:
-        return
-    if relative == Path():
-        return
-    exclude_line = f"{relative.as_posix()}/"
-    git_path = Path(
-        _git_output(checkout, "rev-parse", "--git-path", "info/exclude")
-    )
-    exclude = git_path if git_path.is_absolute() else checkout / git_path
-    try:
-        before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if exclude_line in before.splitlines():
-            return
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.open("a", encoding="utf-8") as handle:
-            if before and not before.endswith("\n"):
-                _ = handle.write("\n")
-            _ = handle.write(f"{exclude_line}\n")
-    except OSError as error:
-        raise Refusal(f"cannot update {exclude}: {error}") from error
 
 
 @contextmanager
@@ -1865,17 +1730,19 @@ def _phase_note_lock(folder: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def _write_note(target: Path, content: str, production: ProductionIdentity, unit: str) -> None:
+def _write_note(target: Path, content: str, production: str, unit: str, record: staff.StaffSnapshot) -> None:
     temporary: Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with _phase_note_lock(target.parent):
             target_existed = target.exists()
-            if target_existed and not _owns_note(_note_ownership(target), production, unit):
+            if target_existed and not _owns_note(_note_ownership(target, record), production, unit, record):
                 raise Refusal(
                     "phase note target is not owned by "
-                    + f"{production.slug}/{unit}: {target}"
+                    + f"{production}/{unit}: {target}"
                 )
+            if target_existed and target.read_text(encoding="utf-8") == content:
+                return
             with tempfile.NamedTemporaryFile(
                 "w",
                 encoding="utf-8",
@@ -1906,10 +1773,10 @@ def _write_note(target: Path, content: str, production: ProductionIdentity, unit
 
 
 def _remove_stale_notes(
-    vault_root: Path, target: Path, production: ProductionIdentity, unit: str
+    vault_root: Path, target: Path, production: str, unit: str, record: staff.StaffSnapshot
 ) -> None:
     for candidate in vault_root.glob("*/*.md"):
-        if candidate == target or not _owns_note(_note_ownership(candidate), production, unit):
+        if candidate == target or not _owns_note(_note_ownership(candidate, record), production, unit, record):
             continue
         try:
             candidate.unlink()
@@ -1928,60 +1795,10 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
-def retarget_phase_notes(old_slug: str, new_doc: Path) -> list[Path]:
-    """Point each phase note owned by the old production at the new doc."""
-    vault_root = _vault_root()
-    if not vault_root.exists():
-        return []
-    production_file = _production_file_link(new_doc, vault_root.parent)
-    field = f"production_file: {json.dumps(production_file, ensure_ascii=False)}".encode("utf-8")
-    rewritten: list[Path] = []
-    for path in sorted(vault_root.glob("*/*.md")):
-        temporary: Path | None = None
-        try:
-            with _phase_note_lock(path.parent):
-                ownership = _note_ownership(path)
-                if not isinstance(ownership, NoteOwnership) or ownership.production != old_slug:
-                    continue
-                before = path.read_bytes()
-                lines = before.splitlines(keepends=True)
-                end = next(index for index in range(1, len(lines)) if lines[index].rstrip(b"\r\n") == b"---")
-                header: list[bytes] = [lines[0]]
-                has_link = False
-                for line in lines[1:end]:
-                    key, separator, _ = line.partition(b":")
-                    if separator and key.strip() == b"production":
-                        continue
-                    if separator and key.strip() == b"production_file":
-                        newline = line[len(line.rstrip(b"\r\n")):]
-                        line = field + newline
-                        has_link = True
-                    header.append(line)
-                if not has_link:
-                    header.append(field + lines[0][3:])
-                after = b"".join((*header, *lines[end:]))
-                if after == before:
-                    continue
-                with tempfile.NamedTemporaryFile(
-                    "wb", dir=path.parent, prefix=f".{path.name}.", delete=False
-                ) as handle:
-                    temporary = Path(handle.name)
-                    _ = handle.write(after)
-                    os.fchmod(handle.fileno(), path.stat().st_mode & 0o7777)
-                os.replace(temporary, path)
-                rewritten.append(path)
-        except OSError as error:
-            raise Refusal(f"cannot repair phase note {path}: {error}") from error
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-    return rewritten
-
-
-def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
+def _archive_note(candidate: Path, vault_root: Path, name: str) -> Path:
     """Move one generated phase note into the vault's archive and return its new path."""
     # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
-    folder = vault_root.parent / "archive" / candidate.parent.name / slug
+    folder = vault_root.parent / "archive" / candidate.parent.name / name
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -2024,123 +1841,97 @@ def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
 
 def archive(production_doc: Path) -> list[Path]:
     """Move a production's generated phase notes into the vault's archive."""
-    production = read_production(production_doc)
-    identity = production_identity(production)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = read_production(production_doc, resolver=resolver)
     vault_root = _vault_root()
     if not vault_root.parent.exists():
         return []
     archived: list[Path] = []
     for candidate in sorted(vault_root.glob("*/*.md")):
-        ownership = _note_ownership(candidate)
+        ownership = _note_ownership(candidate, resolver.record)
         if (
             not isinstance(ownership, NoteOwnership)
-            or not _owns_note(ownership, identity, ownership.unit)
+            or not _owns_note(ownership, production.name, ownership.unit, resolver.record)
         ):
             continue
-        archived.append(_archive_note(candidate, vault_root, production.slug))
+        archived.append(_archive_note(candidate, vault_root, production.name))
     return archived
 
 
 def prune(production_doc: Path) -> None:
     """Archive generated notes for units no longer live in a production."""
-    production = read_production(production_doc)
-    identity = production_identity(production)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = read_production(production_doc, resolver=resolver)
     live_units = {
-        unit_plan.unit for unit_plan in _production_unit_plans(production)
+        unit_plan.unit for unit_plan in _production_unit_plans(production, resolver=resolver)
     }
     vault_root = _vault_root()
     for candidate in vault_root.glob("*/*.md"):
-        ownership = _note_ownership(candidate)
+        ownership = _note_ownership(candidate, resolver.record)
         if (
             not isinstance(ownership, NoteOwnership)
-            or not _owns_note(ownership, identity, ownership.unit)
-            or ownership.unit in live_units
+            or not _owns_note(ownership, production.name, ownership.unit, resolver.record)
+            or any(row.id == ownership.unit and row.name in live_units
+                   for row in resolver.record.find(kind="unit"))
         ):
             continue
-        _ = _archive_note(candidate, vault_root, production.slug)
+        _ = _archive_note(candidate, vault_root, production.name)
 
 
-def owned_notes(production: ProductionIdentity | str, unit: str) -> list[Path]:
-    """List a unit's notes; a legacy slug alone checks only that exact production name."""
-    identity = ProductionIdentity(production, ()) if isinstance(production, str) else production
+def owned_notes(production: str, unit: str) -> list[Path]:
+    """List the generated notes for the staff production name and unit."""
+    record = staff.snapshot()
     return [candidate for candidate in sorted(_vault_root().glob("*/*.md"))
-            if _owns_note(_note_ownership(candidate), identity, unit)]
-
-
-def rename_unit(production: ProductionIdentity, old: str, new: str) -> list[Path]:
-    """Point a renamed unit's generated phase notes at its new id, so prune keeps them.
-
-    Only the `unit:` key changes; the unit's next refresh rewrites the rest of each note.
-    """
-    renamed: list[Path] = []
-    for candidate in owned_notes(production, old):
-        try:
-            lines = candidate.read_text(encoding="utf-8").splitlines(keepends=True)
-        except (OSError, UnicodeError) as error:
-            raise Refusal(f"cannot read phase note {candidate}: {error}") from error
-        end = next(index for index, line in enumerate(lines[1:], 1) if line.rstrip("\n") == "---")
-        lines[1:end] = [f"unit: {new}\n" if line.startswith("unit:") else line for line in lines[1:end]]
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=candidate.parent, prefix=f".{candidate.name}.", delete=False
-            ) as handle:
-                _ = handle.write("".join(lines))
-                os.fchmod(handle.fileno(), 0o644)
-            os.replace(handle.name, candidate)
-        except OSError as error:
-            raise Refusal(f"cannot write phase note {candidate}: {error}") from error
-        renamed.append(candidate)
-    return renamed
+            if _owns_note(_note_ownership(candidate, record), production, unit, record)]
 
 
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
-    record = build(session_dir)
-    reference = _production_reference(record.plan)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    record = build(session_dir, resolver=resolver)
+    reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
     vault_root = _vault_root()
     if not vault_root.parent.exists():
         return
-    production = read_production(_production_document(record.plan, reference))
-    identity = production_identity(production)
+    production = read_production(_production_document(record.plan, reference), resolver=resolver)
+    owner = resolver.record.by_doc(remote.local_machine(), production.doc)
+    from scripts.message import sessions
     try:
-        showrunner = showrunners.current_name(production.slug)
+        showrunner = next((item["name"] for item in sessions.live_sessions()
+                           if owner is not None and item["sessionId"] == owner.current_session), "")
     except OSError as error:
-        raise Refusal(
-            f"cannot look up the showrunner of {production.slug}: {error}"
-        ) from error
+        raise Refusal(f"cannot look up the showrunner of {production.name}: {error}") from error
     if showrunner:
         if showrunner in {".", ".."} or "/" in showrunner or "\0" in showrunner:
-            raise Refusal("production Showrunner session must be one directory name")
+            raise Refusal("showrunner name must be one directory name")
         folder = vault_root / showrunner
     else:
-        previous = _most_recent_owned_note(vault_root, identity, reference.unit)
+        previous = _most_recent_owned_note(vault_root, production.name, reference.unit, resolver.record)
         if isinstance(previous, NoOwnedPhaseNote):
-            raise Refusal(f"the showrunner of {production.slug} is not running")
+            raise Refusal(f"the showrunner of {production.name} is not running")
         folder = previous.path.parent
-    name = _phase_note_name(production.slug, reference.unit)
+    name = _phase_note_name(production.name, reference.unit, resolver=resolver)
     target = folder / f"{name}.md"
-    if target.exists() and not _owns_note(_note_ownership(target), identity, reference.unit):
+    if target.exists() and not _owns_note(_note_ownership(target, resolver.record), production.name, reference.unit, resolver.record):
         raise Refusal(
             "phase note target is not owned by "
-            + f"{production.slug}/{reference.unit}: {target}"
+            + f"{production.name}/{reference.unit}: {target}"
         )
-    _ensure_showrunners_excluded(vault_root)
     _write_note(
         target,
         _note_text(
             name,
-            folder.name,
-            _production_file_link(production.doc, vault_root.parent),
-            reference.unit,
+            next(row.id for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
+                 if row.name == unit_names.name(reference.unit)),
             record,
-            production.zone,
         ),
-        identity,
+        production.name,
         reference.unit,
+        resolver.record,
     )
-    _remove_stale_notes(vault_root, target, identity, reference.unit)
+    _remove_stale_notes(vault_root, target, production.name, reference.unit, resolver.record)
 
 
 def _build_parser() -> argparse.ArgumentParser:

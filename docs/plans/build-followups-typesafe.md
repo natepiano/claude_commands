@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-26.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
 
-> **Production: natedev** — unit `typesafe-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -143,12 +142,12 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
   - `scripts/prioritize/renumber.py` — score formula (lines ~420–436: `4*(alignment-1) + 3*(impact-1) + URGENCY_BONUSES[...] - (effort-1) + goal bonus`); imported by `evaluate.py`, never copied
 - **Test lanes:** `scripts/issue_score/test_*.py`; tests never call the live API, they replay recorded responses from `scripts/issue_score/fixtures/`
 - **Build:** none
-- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`
+- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`
 - **Lint:** `basedpyright scripts/issue_score` — pass is its `0 errors, 0 warnings` line
 - **Invariants:**
   - The scorer never writes inside `~/rust/hanadocs`.
   - A failed API call is an error, never an answer.
-  - All question text, criteria, option names and thresholds live in `questions.py`.
+  - Question text, criteria and option names live in `questions.py`; the numbers live in `config/issue_score.conf`.
   - Current field values are never sent in the state.
   - Live API calls only after the user's go (Questions for the user 1–2), only within the budget, and always as `with-typesafe <cmd>`.
   - The key is never read, printed, logged or stored. Code sees it only as `TYPESAFE_API_KEY` in its own environment.
@@ -368,13 +367,14 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - Run the full reassess: a fresh version-5 `score --fresh` run over every open issue, then `score_issues.py reassess <run-id>`.
 - Readiness gate: `complete=True` proves only scoring coverage. Fill `<run>-agent-proposals.json` for every row that waits on agent values, and run `reassess` again until every row reaches band routing (`test_unrated_and_default_issues_require_agent_values_before_provisional_score_and_band` shows this step). Fill only the fields the form generates: area is Jev-proposed now and is not in the form, and adding it is refused. Present the review only when the run reports `complete=True` and every row's routing status is `ready`; failed or unscored issues never become rows. Only then give the user the review file.
 - Record the user's approvals in an approvals file against that review's JSON snapshot, run `apply_labels.py`, then read back each written issue and check that its frontmatter holds the approved values.
+- Run `apply_labels.py` and the read-back from a `git archive` export of `0d33026e3`, the tree that made the review snapshot. Phase 8 added the sent request state to `content_hash`. The current tree therefore refuses every snapshot row with "content hash changed; rescore needed". The old tree checks the same issue content with the same formula, so no rescore or second review is needed. A review snapshot made after Phase 8 uses the current tree.
 
 **Files:**
 - `~/.local/state/issue-score/` — the run, the review file and the approvals file (outside the repository)
 - `~/rust/hanadocs/` — the approved frontmatter edits (outside the repository; absolute paths or `git -C`, never `cd`)
 
 **Constraints from prior phases:**
-- Phase 6 made the version-5 bump, so version-5 cache entries can exist now. The full reassess run uses `score --fresh` with no further bump (estimate about $0.20 for the vault). Before the run, read the current recorded and reserved spend against `questions.BUDGET_USD`, as `docs/typesafe.md` describes; the client refuses a call past the cap. Version-4 runs, `3015dbcf` included, are not reassess input.
+- Phase 6 made the version-5 bump, so version-5 cache entries can exist now. The full reassess run uses `score --fresh` with no further bump (estimate about $0.20 for the vault). Before the run, read the current recorded and reserved spend against `budget_usd` in `config/issue_score.conf` (`questions.budget_usd()`), as `docs/typesafe.md` describes; the client refuses a call past the cap. Version-4 runs, `3015dbcf` included, are not reassess input.
 - Live calls run as `with-typesafe <cmd>`; the key is never read, printed or logged.
 
 **Workers:** none — the unit director runs the live score, the reassess, the user review and `apply_labels.py`.
@@ -401,3 +401,25 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Binds later work:** The guide names `THRESHOLDS` and `JEV_FIELDS` in `questions.py` and copies no values, so "area threshold from the user's answer; run the reassess" changes them with no guide edit. The area table has two columns, and the loader refuses a three-column header. Project shorthands come only from the vault base files (`vault.load_project_names()`); `commands/issue.md` holds no copy. A new canonical project also needs a `PROJECT_ABOUT` entry in `questions.py`.
 
 **Gotchas:** The Mac vault is far behind origin. Its `conf/issue-areas.md` is an untracked copy of the published table, not a pulled file; a later pull can conflict with it. The guide's sure rule has one exception: below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, sure only when that passes the area threshold.
+
+### Phase 8 — tunable values move to config  · status: done
+
+#### As-built
+
+- `config/issue_score.conf` holds 30 issue-scoring values, each with its meaning and a limit, at the same value as before the move. It includes the model, endpoint, budget and spend settings, the threshold and evidence numbers, the body limits, the retry and worker counts, the state and vault roots, and the report counts (`blind_sample_count`, `disagreement_count`, `reliability_bucket_count`).
+- Each owning module reads its values at use through `scripts/lib/conf.py`. `questions.thresholds()` replaces the `THRESHOLDS` constant. Question text, criteria and option names stay in `questions.py`.
+- `selection.UseConfiguredValue.CURRENT` is the named default that means "read the current config" in the domain APIs, in place of `None`.
+- `content_hash` covers the exact request state that was sent. `_issue_judgments` hashes the state before either request, so a changed body limit misses the cache.
+- One storage resolver serves `score`, `propose` and `experiment`. An explicit `state_dir` keeps `spend.jsonl` beside its run; no `state_dir` uses the configured state root and spend ledger. A resolved ledger or state path inside the vault is refused before any request.
+- Tests set `CONF_DIR`. `test_config.py` pins every shipped key, its limit and its pre-move value, and checks that the readers see file edits without a reload.
+
+**Files:**
+- `config/issue_score.conf` — the 30 values
+- `scripts/issue_score/selection.py` — `UseConfiguredValue`
+- `scripts/issue_score/{questions,client,records,vault,score_issues,decide,evaluate,blind,apply_labels}.py` — the readers
+- `scripts/issue_score/test_config.py` and the changed `test_*.py` modules
+- `docs/typesafe.md` — names the config file and the readers
+
+**Binds later work:** A value change is a user decision through `/tune`; a move with the same value needs no approval. Code that names `questions.THRESHOLDS` or `questions.BUDGET_USD` now calls `questions.thresholds()` or `questions.budget_usd()`. Scores made before this phase carry the old `content_hash` formula: the current tree misses their cache and `apply_labels.py` refuses their review rows.
+
+**Gotchas:** `basedpyright` exits 3 in this repository because `.venv` is absent; the pass check is the `0 errors, 0 warnings, 0 notes` footer.

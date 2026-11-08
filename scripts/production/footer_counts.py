@@ -1,22 +1,20 @@
-"""The counts line: how much waits on the user, read at render time and never stored.
-
-The status line and the dailies report's own footer show it; no reply carries it (user,
-2026-10-18). Each count is the production's own: the showrunners above and below it count their
-own (user, 2026-10-27). Changes are the production's open rows from its current and earlier
-lists (change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
-lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
-lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
-"""
+"""Count the user's waiting items through the same staff routing as the change page."""
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
-import change_review
-import proposals_folder
-import proposals_table
-from production_units import Refusal, production_field
+from scripts.production import change_review
+from scripts.lib import conf
+from scripts.production import change_routing, staff
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
+from scripts.production.production_doc import Refusal, production_field
+
+if TYPE_CHECKING:
+    from scripts.production.update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -28,17 +26,31 @@ class FooterCounts(NamedTuple):
     proposals: int = 0
     questions: int = 0
     efficiency: int = 0
+    unrouted: int = 0
 
 
 def total(each: list[FooterCounts]) -> FooterCounts:
     return FooterCounts(*(sum(column) for column in zip(FooterCounts(), *each)))
 
 
-def changes(doc: Path) -> int:
+def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
+    """Count the production tab and the unrouted tab in one routed pass."""
     try:
-        return len(change_review.scope_rows(change_review.scope_list(doc), doc))
+        scope = change_review.review_scope(doc, False, record)
+        routed = change_review.routed_review_entries(change_review.scope_list(doc, record=record), doc, record=record)
+        return (sum(owner.tab in scope for _, owner, _ in routed),
+                sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
-        return 0
+        return 0, 0
+
+
+def changes(doc: Path) -> int:
+    return change_counts(doc, staff.snapshot())[0]
+
+
+def unrouted_changes(doc: Path) -> int:
+    """Count the same global unrouted tab as the change page."""
+    return change_counts(doc, staff.snapshot())[1]
 
 
 def proposals(doc: Path) -> int:
@@ -51,16 +63,12 @@ def open_efficiency(line: str) -> bool:
     return match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
 
 
-def _field_path(doc: Path, field: str) -> Path | None:
+def efficiency_ledger(doc: Path) -> Path | None:
+    """Read the configured efficiency ledger, or return None when it is unconfigured."""
     try:
-        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), field)).expanduser()
+        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
     except Refusal:
         return None
-
-
-def efficiency_ledger(doc: Path) -> Path | None:
-    """The ledger the doc's Efficiency ledger line names, or None when it names none."""
-    return _field_path(doc, EFFICIENCY_LEDGER_FIELD)
 
 
 def efficiency(doc: Path) -> int:
@@ -75,36 +83,61 @@ def efficiency(doc: Path) -> int:
     return sum(open_efficiency(line) for line in lines)
 
 
-def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
+def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc))
+        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot())
+        return FooterCounts(change_count, proposals(doc), questions, efficiency(doc), unrouted_count)
     except OSError:
         return FooterCounts(questions=questions)
 
 
-def sources(doc: Path) -> list[Path]:
-    """The files the counts read, so a copy of them can tell when it is out of date.
+def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
+    """Watch configuration, staff, review lists, and delivery records for count changes."""
+    root = change_routing.review_root()
+    record = record if record is not None else staff.snapshot()
+    lists = change_review.lists_directory()
+    return [conf.path("change_review"), conf.path("review_links"), lists, *lists.glob(change_review.PREFIX + "*.md"),
+            *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
-    A proposal closes in place, so each open one is named beside its folder, which a new one
-    changes.
-    """
+
+def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Watch the count sources and each open record."""
+    from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+                                     question_folder, question_records_for_document)
+
     try:
-        listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
-    except (change_review.ChangeReviewError, OSError):
+        if identities is None:
+            identities = QuestionStaff.read()
+        listed = [item.path for item in change_review.scope_lists(
+            change_review.scope_list(doc, record=identities.record), doc, record=identities.record)]
+    except (change_review.ChangeReviewError, staff.StaffRefused, OSError):
         listed = []
     folder = proposals_folder.issues_folder(doc)
+    queue = proposals_folder.ledger(doc)
     try:
-        queue = proposals_folder.ledger(doc)
         efficiency_queue = efficiency_ledger(doc)
     except OSError:
-        queue = None
         efficiency_queue = None
-    found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
+    found = [doc, *listed, *(path for path in (folder, queue) if path is not None)]
+    if efficiency_queue is not None:
+        found.append(efficiency_queue)
+    if folder is not None:
+        try:
+            found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        except OSError:
+            pass
     try:
-        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
-    except OSError:
-        pass
+        if identities is None:
+            identities = QuestionStaff.read()
+        questions = question_folder(doc, identities)
+        if isinstance(questions, QuestionFolder):
+            if questions.path not in found:
+                found.append(questions.path)
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
+    except (staff.StaffRefused, RegistrationFailure, OSError) as error:
+        print(f"questions: unavailable — {error}", file=sys.stderr)
     return found
 
 
@@ -122,5 +155,6 @@ def counts_line(counts: FooterCounts) -> str | None:
         (counts.questions, plural(counts.questions, "question")),
         (counts.changes, plural(counts.changes, "change")),
         (counts.efficiency, f"{counts.efficiency} efficiency"),
-        (counts.proposals, plural(counts.proposals, "proposal"))) if count]
+        (counts.proposals, plural(counts.proposals, "proposal")),
+        (counts.unrouted, f"{counts.unrouted} unrouted")) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None

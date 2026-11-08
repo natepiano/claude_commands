@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import unittest
-from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production.issues import frontmatter
 
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -31,7 +30,7 @@ class StylePlanTests(StylePlanFixture):
         row, = self.ledger().proposal_findings(issue)
         self.assertEqual((row.finding_id, row.path, row.line, row.state),
                          (finding.finding_id, destination, 4, style_ledger.Filed(issue)))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), ([destination], [finding.finding_id]))
         self.ledger().ticket_drop(ticket["id"])
         failed = source.replace("original", "failed").replace("second();", "different();").replace("third();", "changed();").replace("fourth();", "other();")
@@ -45,7 +44,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertNotIn("waived", output)
         row, = self.ledger().proposal_findings(issue)
         self.assertEqual((row.finding_id, row.path, row.state), (finding.finding_id, destination, style_ledger.Filed(issue)))
-        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open("names-unit")))
+        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open(ticket_owner_id("names"))))
         self.assertEqual(frontmatter(issue)["status"], ["open"])
 
     def test_decision_refill_tickets_a_finding_at_the_file_its_declaration_moved_to(self) -> None:
@@ -54,7 +53,7 @@ class StylePlanTests(StylePlanFixture):
         followed, = self.ledger().proposal_findings(issue)
         self.assertEqual((followed.finding_id, followed.path, followed.line, followed.state),
                          (finding.finding_id, "crates/alpha/src/parent.rs", 2, style_ledger.Filed(issue)))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]),
                          ("proposal", ["crates/alpha/src/parent.rs"], [finding.finding_id]))
 
@@ -79,17 +78,17 @@ class StylePlanTests(StylePlanFixture):
         _ = later.write_text(issue.read_text())
         self.finish_judging()
         ledger = self.ledger()
-        ledger.ticket_add("modules-unit-2", "modules-unit", "read", "names", "crates/alpha", [second], [rule])
-        ledger.ticket_assign("modules-unit-2", "style/main")
-        _ = ledger.ticket_base("modules-unit-2")
+        ledger.ticket_add("3002", ticket_owner_id("modules"), "read", "names", "crates/alpha", [second], [rule])
+        ledger.ticket_assign("3002", "style/main")
+        _ = ledger.ticket_base("3002")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        moves = ledger.hold(rule, second, 2, "old: u32,", "type", "before", "after", blob, "modules-unit-2")
+        moves = ledger.hold(rule, second, 2, "old: u32,", "type", "before", "after", blob, "3002")
         ledger.file_held(moves.finding_id, later)
-        ledger.ticket_drop("modules-unit-2")
+        ledger.ticket_drop("3002")
         _ = self.git("rm", "-q", second)
         self.commit_files({"crates/alpha/src/moved.rs": "pub struct Other {\n    old: u32,\n}\n"})
         self.assertNotIn("waived", self.refill_decisions())
-        self.assertEqual(set(self.ledger().ticket_open("names-unit")[0]["finding_ids"]), {stays.finding_id, moves.finding_id})
+        self.assertEqual(set(self.ledger().ticket_open(ticket_owner_id("names"))[0]["finding_ids"]), {stays.finding_id, moves.finding_id})
         followed, = self.ledger().proposal_findings(later)
         self.assertEqual((followed.finding_id, followed.path, followed.line), (moves.finding_id, "crates/alpha/src/moved.rs", 2))
 
@@ -108,7 +107,7 @@ class StylePlanTests(StylePlanFixture):
                       + "candidates: none; mapped site unresolved: source site deleted (1 finding)\n", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
-        self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
+        self.assertNotEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "proposal")
 
     def test_decision_refill_waits_on_a_finding_whose_declaration_is_gone_from_its_kept_file(self) -> None:
         site = self.sources[0]
@@ -119,7 +118,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn(f"waiting {issue}: {finding.path} outside rename not proved:", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(site, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
-        self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
+        self.assertNotEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "proposal")
         self.assertEqual(frontmatter(issue)["status"], ["open"])
 
     def test_decision_refill_waits_when_a_findings_trait_identity_is_uncertain(self) -> None:
@@ -132,7 +131,7 @@ class StylePlanTests(StylePlanFixture):
         output = self.refill_decisions()
         self.assertIn(f"waiting {issue}: {finding.path} trait identity uncertain (1 finding)\n", output)
         self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Filed(issue))
-        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open("names-unit")))
+        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open(ticket_owner_id("names"))))
 
 if __name__ == "__main__":
     _ = unittest.main()

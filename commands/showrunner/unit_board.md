@@ -1,5 +1,5 @@
 ---
-description: Show this production's units and the units of every production below it.
+description: Show unit board plugin instructions.
 argument-hint: "[<unit>|close]"
 ---
 

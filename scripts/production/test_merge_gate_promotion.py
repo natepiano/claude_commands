@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import unittest
 
 import json
@@ -11,24 +13,114 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from typing import final
+from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import MergeGateFixture, TEST_HANG_GUARD_SECS, wait_for_file
+from scripts.production import change_review, merge_gate, staff
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.shutdown import remote
+from scripts.production.gate_modules import GateRefused
+from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 @final
 class MergeGatePromotionTests(MergeGateFixture):
+    @override
+    def review_list(self) -> tuple[Path, Path]:
+        review, doc = super().review_list()
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            record = staff.snapshot()
+            owner = record.by_doc("natedev", doc)
+            assert owner is not None
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        return review, doc
+
+    def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
+        review, _ = self.review_list()
+        before = review.read_bytes()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready")
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                   + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
+        hook.chmod(0o755)
+        failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(review.read_bytes(), before)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        published = self.git(self.origin, "rev-parse", "integration")
+        hook.unlink()
+        retried = self.run_promote_only("--production", "fixture-showrunner")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), published)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["old", "Published"])
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[1], published[:8])
+        written = review.read_bytes()
+        self.assertEqual(self.run_promote_only("--production", "fixture-showrunner").returncode, 0)
+        self.assertEqual(review.read_bytes(), written)
+
+    def test_failed_mac_pull_leaves_rows_unlisted_until_the_next_good_promotion(self) -> None:
+        review, _ = self.review_list()
+        before = review.read_bytes()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live")
+        self.write(self.state / "mac-answer", "ff_rc=1\nfixture-head\n")
+        failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(review.read_bytes(), before)
+        published = self.git(self.origin, "rev-parse", "integration")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), published)
+        self.write(self.state / "mac-answer", "ff_rc=0\nfixture-head\n")
+        retried = self.run_promote_only("--production", "fixture-showrunner")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["old", "Installed"])
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[1], published[:8])
+
+    def test_remote_tracked_check_runs_without_repository_modules(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
+        empty = self.root / "isolated-python"
+        empty.mkdir()
+        index_path = Path(self.git(self.main, "rev-parse", "--git-path", "index"))
+        index = index_path.read_bytes()
+        isolation = """import sys
+class NoRepositoryModules:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "scripts" or fullname.startswith("scripts."):
+            raise ModuleNotFoundError("remote host has no repository modules")
+sys.meta_path.insert(0, NoRepositoryModules())
+"""
+        environment = {**self.environment, "GIT_DIR": self.git(self.main, "rev-parse", "--absolute-git-dir"),
+                       "GIT_WORK_TREE": str(self.main)}
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                if edited:
+                    self.write(self.main / "subject.txt", "remote local edit\n")
+                result = subprocess.run([sys.executable, "-I", "-c",
+                                         isolation + merge_gate.PROMOTION_TRACKED_CHECK, self.checkpoint],
+                                        cwd=empty, env=environment, text=True,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, int(edited), result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                if edited:
+                    self.assertIn('promotion refused: tracked edits overlap promotion: "subject.txt"', result.stdout)
+                else:
+                    self.assertEqual(result.stdout, "")
+                self.assertEqual(index_path.read_bytes(), index)
+
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
-        args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration", settings_blob=self.settings_blob,
+        args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
-        for failure in (subprocess.TimeoutExpired("fake-ssh", 25), merge_gate.GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
+        for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
-                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, self.settings_blob, "", "", self.base]) as checked, mock.patch.object(
+                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
+                    merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
                     subprocess, "run", side_effect=failure):
-                with self.assertRaisesRegex(merge_gate.GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
+                with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
                     merge_gate.promote(args)
             self.assertIn(mock.call(self.main, "push", "origin", "main"), checked.call_args_list)
 
@@ -38,12 +130,12 @@ class MergeGatePromotionTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "main"):
-                raise merge_gate.GateRefused("injected push failure")
+                raise GateRefused("injected push failure")
             return checked(repo, *arguments)
 
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
                 merge_gate, "checked_git", side_effect=stop_at_push):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "injected push failure"):
+            with self.assertRaisesRegex(GateRefused, "injected push failure"):
                 merge_gate.promote(args)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
@@ -73,16 +165,6 @@ class MergeGatePromotionTests(MergeGateFixture):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), local)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-
-    def test_settings_filter_rejects_changed_blob(self) -> None:
-        self.write(self.unit / "settings.json", '{"unexpected": true}\n')
-        self.checkpoint = self.commit(self.unit, "unapproved settings")
-        _ = self.git(self.unit, "push", "origin", "unit-phase")
-        result = self.run_gate()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("settings", (result.stdout + result.stderr).lower())
-        self.assert_not_pushed()
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
 
     def test_promote_fast_forwards_scratch_main_and_checks_mac_result(self) -> None:
         result = self.run_gate("--promote")
@@ -159,7 +241,7 @@ class MergeGatePromotionTests(MergeGateFixture):
         clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 70.0]), sleep=pause)
         with self.release_lock_held_by_child(), mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(merge_gate, "time", clock):
-            with self.assertRaisesRegex(merge_gate.GateRefused,
+            with self.assertRaisesRegex(GateRefused,
                     "^build-hold state stayed locked for 60 s; main promotion refused$"):
                 merge_gate.promote(args)
             pause.assert_called_once_with(0.2)
@@ -179,22 +261,25 @@ class MergeGatePromotionTests(MergeGateFixture):
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
-    def test_promote_refuses_unrelated_local_edits_and_keeps_untracked_files(self) -> None:
+    def test_promote_allows_unrelated_local_edits_and_keeps_untracked_files(self) -> None:
         _ = self.publish_for_promotion()
+        self.write(self.main / "subject.txt", "staged main\n")
+        _ = self.git(self.main, "add", "subject.txt")
         self.write(self.main / "subject.txt", "uncommitted main\n")
         self.write(self.main / "settings.json", "local settings\n")
         self.write(self.main / "accounts.lock", "untracked\n")
         result = self.run_promote_only()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('"subject.txt"', result.stderr)
-        self.assertIn('"settings.json"', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.main / "subject.txt").read_text(), "uncommitted main\n")
+        self.assertEqual(self.git(self.main, "show", ":subject.txt"), "staged main")
+        self.assertEqual((self.main / "settings.json").read_text(), "local settings\n")
         self.assertEqual((self.main / "accounts.lock").read_text(), "untracked\n")
-        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promotion_refuses_staged_edits_even_when_the_file_matches_head(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
         _ = self.publish_for_promotion()
         self.write(self.main / "subject.txt", "staged main\n")
         _ = self.git(self.main, "add", "subject.txt")
@@ -224,6 +309,8 @@ class MergeGatePromotionTests(MergeGateFixture):
                 _ = self.git(self.main, "update-index", "--no-" + flag, "subject.txt")
 
     def test_promotion_checks_edits_after_the_last_hold_wait(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
         args = self.publish_for_promotion()
         waits = 0
 
@@ -235,7 +322,7 @@ class MergeGatePromotionTests(MergeGateFixture):
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
-            with self.assertRaisesRegex(merge_gate.GateRefused, 'tracked edits differ from HEAD: "subject.txt"'):
+            with self.assertRaisesRegex(GateRefused, 'promotion refused: tracked edits overlap promotion: "subject.txt"'):
                 merge_gate.promote(args)
         self.assertEqual((self.main / "subject.txt").read_text(), "edited during hold\n")
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
@@ -252,10 +339,12 @@ class MergeGatePromotionTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_mac_promotion_checks_real_files_and_index_in_a_private_clone(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
         args = self.publish_for_promotion()
         self.write(self.bin / "ssh", f'#!{sys.executable}\nimport subprocess, sys\n'
                    + 'raise SystemExit(subprocess.call(["sh", "-c", sys.argv[-1]]))\n')
-        for state in ("modified", "staged", "assume-unchanged", "skip-worktree", "untracked", "clean"):
+        for state in ("modified", "staged", "assume-unchanged", "skip-worktree", "unrelated", "untracked", "clean"):
             with self.subTest(state=state):
                 mac = self.root / ("mac-" + state)
                 _ = self.git(self.root, "clone", "-q", "--branch", "main", str(self.origin), str(mac))
@@ -264,22 +353,29 @@ class MergeGatePromotionTests(MergeGateFixture):
                 args.mac_repo = str(mac)
                 if state in ("assume-unchanged", "skip-worktree"):
                     _ = self.git(mac, "update-index", "--" + state, "subject.txt")
-                if state not in ("untracked", "clean"):
+                if state == "unrelated":
+                    self.write(mac / "settings.json", "local settings\n")
+                    _ = self.git(mac, "add", "settings.json")
+                    self.write(mac / "settings.json", "more local settings\n")
+                elif state not in ("untracked", "clean"):
                     self.write(mac / "subject.txt", "Mac local contents\n")
                 if state == "staged":
                     _ = self.git(mac, "add", "subject.txt")
                 if state == "untracked":
                     self.write(mac / "local.lock", "keep\n")
                 with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
-                    if state in ("untracked", "clean"):
+                    if state in ("unrelated", "untracked", "clean"):
                         merge_gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.checkpoint)
                     else:
-                        with self.assertRaisesRegex(merge_gate.GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
+                        with self.assertRaisesRegex(GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
                             merge_gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.base)
                         self.assertEqual((mac / "subject.txt").read_text(), "Mac local contents\n")
                 self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+                if state == "unrelated":
+                    self.assertEqual((mac / "settings.json").read_text(), "more local settings\n")
+                    self.assertEqual(self.git(mac, "show", ":settings.json"), "local settings")
                 if state == "untracked":
                     self.assertEqual((mac / "local.lock").read_text(), "keep\n")
 

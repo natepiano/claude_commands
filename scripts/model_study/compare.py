@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import statistics
-import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -14,10 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
-from turns import Compaction, Turn
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.model_study.stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
+from scripts.model_study.turns import Compaction, Turn
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"

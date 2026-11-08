@@ -13,15 +13,14 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, scratch_accounts_config
 from scripts.accounts import accounts, new_account
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 
 
-def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
+def fixture_color_expectations(text: str) -> tuple[str, str, bytes]:
     account_colors: set[str] = set()
     role_colors: set[str] = set()
     account_lines: list[str] = []
@@ -42,9 +41,26 @@ def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
     return free[0], free[1], account_lines[-1].encode("utf-8")
 
 
-SHIPPED_STATUSLINE = (Path(__file__).resolve().parents[2] / "config/statusline.conf").read_bytes()
-FIRST_FREE_COLOR, SECOND_FREE_COLOR, LAST_SHIPPED_ACCOUNT_LINE = shipped_color_expectations(
-    SHIPPED_STATUSLINE.decode("utf-8"))
+# The tests own this config, so a new account in the shipped config/statusline.conf never changes them.
+FIXTURE_STATUSLINE = b"""# role.<role-with-hyphens> and account.<label> set field colors.
+role.showrunner=purple
+role.unit-director=yellow
+role.astra-designer=mauve
+role.astra-reviewer=bright-green
+
+account.claude1=brown
+account.claude2=magenta
+account.claude3=blue
+account.claude4=orange
+account.codex1=pink
+account.codex2=teal
+
+counts.questions=bright-red
+level.ok=bright-green
+tokens.warn=80
+"""
+FIRST_FREE_COLOR, SECOND_FREE_COLOR, LAST_FIXTURE_ACCOUNT_LINE = fixture_color_expectations(
+    FIXTURE_STATUSLINE.decode("utf-8"))
 
 
 class NewAccountTests(unittest.TestCase):
@@ -82,7 +98,7 @@ class NewAccountTests(unittest.TestCase):
         _ = nightly.write_text(json.dumps({"permissions": {"deny": ["Edit(~/.claude/**)"]}}))
         self.colors = self.home / ".claude/config/statusline.conf"
         self.colors.parent.mkdir()
-        _ = self.colors.write_bytes(SHIPPED_STATUSLINE)
+        _ = self.colors.write_bytes(FIXTURE_STATUSLINE)
 
     def write_settings(self, folders: list[str]) -> None:
         settings = {
@@ -207,7 +223,7 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue(stdout.endswith("claude4 is ready; /showrunner:accounts shows its row.\n"))
         self.assertIsInstance(accounts.account_directory_readiness("claude4"), accounts.AccountDirectoryReady)
 
-    def test_new_claude_account_inserts_the_first_free_color_after_the_last_shipped_account_without_changing_other_bytes(self) -> None:
+    def test_new_claude_account_inserts_the_first_free_color_after_the_last_account_without_changing_other_bytes(self) -> None:
         before = self.colors.read_bytes()
 
         _, stdout, stderr = self.run_cli("claude5")
@@ -217,8 +233,8 @@ class NewAccountTests(unittest.TestCase):
         self.assertLess(stdout.index("nightly review cannot edit ~/.claude5"),
                         stdout.index(f"status line color {FIRST_FREE_COLOR} for claude5"))
         self.assertEqual(self.colors.read_bytes(), before.replace(
-            LAST_SHIPPED_ACCOUNT_LINE,
-            LAST_SHIPPED_ACCOUNT_LINE + f"account.claude5={FIRST_FREE_COLOR}\n".encode("utf-8"), 1))
+            LAST_FIXTURE_ACCOUNT_LINE,
+            LAST_FIXTURE_ACCOUNT_LINE + f"account.claude5={FIRST_FREE_COLOR}\n".encode("utf-8"), 1))
 
     def test_next_claude_account_gets_the_second_free_color_after_the_first_is_taken(self) -> None:
         before = self.colors.read_bytes()
@@ -231,8 +247,8 @@ class NewAccountTests(unittest.TestCase):
         self.assertEqual(first.text, f"status line color {FIRST_FREE_COLOR} for claude5")
         self.assertEqual(second.text, f"status line color {SECOND_FREE_COLOR} for claude6")
         self.assertEqual(self.colors.read_bytes(), before.replace(
-            LAST_SHIPPED_ACCOUNT_LINE,
-            LAST_SHIPPED_ACCOUNT_LINE + (f"account.claude5={FIRST_FREE_COLOR}\n"
+            LAST_FIXTURE_ACCOUNT_LINE,
+            LAST_FIXTURE_ACCOUNT_LINE + (f"account.claude5={FIRST_FREE_COLOR}\n"
                 + f"account.claude6={SECOND_FREE_COLOR}\n").encode("utf-8"), 1))
 
     def test_adding_an_account_color_preserves_restrictive_config_permissions_under_a_looser_umask(self) -> None:
@@ -385,7 +401,7 @@ class NewAccountTests(unittest.TestCase):
               patch.object(new_account, "nixos_shell_module", return_value=module)):
             _, stdout, stderr = self.run_cli("claude", "claude5")
         self.assertEqual(stderr, "")
-        self.assertIn(f"for you: add to shellAliases in {module}, then rebuild:", stdout)
+        self.assertIn(f"done: anomaly: add to shellAliases in {module}, then rebuild:", stdout)
         self.assertIn('claude5 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude5";', stdout)
         self.assertEqual(module.read_text(), '  claude1 = "existing command";\n')
 
@@ -395,7 +411,7 @@ class NewAccountTests(unittest.TestCase):
                   patch.object(new_account, "nixos_shell_module", return_value=None)):
                 _, stdout, stderr = self.run_cli("claude", "claude5")
                 self.assertEqual(stderr, "")
-                self.assertIn("for you: no nixos shell module", stdout)
+                self.assertIn("done: anomaly: no nixos shell module", stdout)
                 self.assertIn("claude5 alias", stdout)
                 self.assertIn(f"modules/{folder}/shell.nix", stdout)
 
@@ -413,8 +429,8 @@ class NewAccountTests(unittest.TestCase):
         for platform in ("linux", "darwin"):
             with self.subTest(platform=platform), patch.object(sys, "platform", platform):
                 step = new_account.alias_step(account)
-                self.assertEqual(step, new_account.Step(False,
-                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                self.assertEqual(step, new_account.Step(True,
+                    f'anomaly: add to shellAliases in {self.nixos}, then rebuild:\n'
                     + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
 
     def test_codex_setup_appends_alias_on_both_platforms_only_after_success(self) -> None:
@@ -431,8 +447,8 @@ class NewAccountTests(unittest.TestCase):
                 alias.assert_called_once_with(account)
                 self.assertIn("set up ~/.codex3", steps[0].text)
                 self.assertIn("codex login", steps[1].text)
-                self.assertEqual(steps[-1], new_account.Step(False,
-                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                self.assertEqual(steps[-1], new_account.Step(True,
+                    f'anomaly: add to shellAliases in {self.nixos}, then rebuild:\n'
                     + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
 
     def test_codex_signed_in_check_appends_alias_on_both_platforms_only_after_success(self) -> None:
@@ -448,11 +464,44 @@ class NewAccountTests(unittest.TestCase):
                 steps = new_account.codex_steps(account)
                 alias.assert_called_once_with(account)
                 self.assertIn("set up and signed in", steps[0].text)
+                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers codex3",
+                              steps[0].text)
                 self.assertIn('codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";', steps[-1].text)
-                self.assertFalse(steps[-1].done)
+                self.assertTrue(steps[-1].done)
 
 
 class ShellModuleTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(scratch_accounts_config())
+
+    def test_path_roots_use_config_and_expand_the_scratch_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+            original = config.read_text()
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                _ = os.environ.pop("AGENT_NOTES_DIR", None)
+                self.assertEqual(new_account.notes_directory(), home / "rust/hanadocs/agents")
+                _ = config.write_text(original.replace("notes_directory=~/rust/hanadocs/agents",
+                    "notes_directory=~/custom-notes").replace("home_nixos_repository_root=~/nixos",
+                    "home_nixos_repository_root=~/custom-nixos").replace("nixos_repository_root=/etc/nixos",
+                    f"nixos_repository_root={home / 'missing-system'}"))
+                clear_notes_directory_cache()
+                self.assertEqual(new_account.notes_directory(), home / "custom-notes")
+                self.assertEqual(note_file.notes_dir(), home / "custom-notes")
+                account = new_account.parse_account("claude", "claude4")
+                self.assertTrue(new_account.note_step(account, new_account.HomeLogin("fixture")).done)
+                self.assertEqual(note_file.note_path(account.label), new_account.note_path(account))
+                self.assertEqual([note.label for note in note_file.read_notes()], [account.label])
+                folder = "darwin" if sys.platform == "darwin" else "linux"
+                module = home / "custom-nixos" / "modules" / folder / "shell.nix"
+                module.parent.mkdir(parents=True)
+                _ = module.write_text("# fixture\n")
+                self.assertEqual(new_account.nixos_shell_module(), module)
+                os.environ["AGENT_NOTES_DIR"] = str(home / "override-notes")
+                self.assertEqual(new_account.notes_directory(), home / "override-notes")
+
     def test_platform_module_lookup_prefers_etc_then_home_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -468,7 +517,7 @@ class ShellModuleTests(unittest.TestCase):
                     _ = module.write_text("# fixture\n")
             for platform, folder in (("darwin", "darwin"), ("linux", "linux"), ("freebsd", "linux")):
                 with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
-                      patch.object(accounts, "accounts_home", return_value=home),
+                      patch.dict(os.environ, {"HOME": str(home)}),
                       patch.object(new_account, "Path", side_effect=repository_path)):
                     expected = system_repository / f"modules/{folder}/shell.nix"
                     if not expected.exists():

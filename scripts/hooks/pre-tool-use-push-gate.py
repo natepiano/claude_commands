@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Allow a built-in push only with the recent failed send's reviewed text."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -15,22 +19,25 @@ from enum import Enum
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 
+from scripts.hooks._push_fallback import fallback_matches, marker_path, object_record, text
+
 if TYPE_CHECKING:
-    from ._push_fallback import fallback_matches, marker_path, object_record, text
-    from ..notify.review import ReleaseOutcome, posting_wait_seconds
+    from scripts.notify.review import ReleaseOutcome, posting_wait_seconds
+    from scripts.notify import push_texts
 else:
-    from _push_fallback import fallback_matches, marker_path, object_record, text
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     try:
-        from review import ReleaseOutcome, posting_wait_seconds
+        from scripts.notify.review import ReleaseOutcome, posting_wait_seconds
+        from scripts.notify import push_texts
     except Exception as error:
         print(f"push gate: {type(error).__name__}: {error}", file=sys.stderr)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+              "permissionDecisionReason": "The registered push gate could not load. Repair it before using PushNotification."}}))
         sys.exit(0)
 
 MARKER_MAX_AGE_SECONDS = 600
 ALREADY_SENT = "The held version of this push was already sent."
-UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
-    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+UNREVIEWED_FALLBACK = ("Only a reviewed blocked push with a registered template can use a fallback. "
+    "Use send.py with a registered template after you repair the delivery failure.")
 
 
 HELD_FALLBACK = "This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed."
@@ -43,8 +50,8 @@ class GateOutcome(Enum):
     UNREVIEWED = "unreviewed"
     HELD = "held"
 
-DENIAL = ("PushNotification is only the fallback for a failed send. Send with "
-          "~/.claude/scripts/message/send.py --to user (see /alert_user); it is reviewed for clarity first.")
+DENIAL = ("Use send.py --to user --text-id with decision.choices for choices, alert.blocked for emergencies, "
+          + "or nate.adhoc for notes. Only the exact rendered text of a reviewed blocked template can use this fallback.")
 
 
 class PushInput(TypedDict):
@@ -97,10 +104,7 @@ def release_hold(source: str, identity: str, machine: str, timeout: float, *,
                            capture_output=True, text=True, check=True, timeout=timeout)
         lines = result.stdout.strip().splitlines()
         return ReleaseOutcome(lines[-1] if lines else "")
-    notify = str(Path(__file__).resolve().parents[1] / "notify")
-    if notify not in sys.path:
-        sys.path.insert(0, notify)
-    reviewer = cast(HoldReview, cast(object, importlib.import_module("review")))
+    reviewer = cast(HoldReview, cast(object, importlib.import_module('scripts.notify.review')))
     return reviewer.release_if_matches(source, identity, timeout=timeout, clock=clock, sleep=sleep)
 
 
@@ -127,15 +131,31 @@ def matches_failed_push(raw: str, *, clock: Callable[[], float] = time.monotonic
         age = time.time() - stamp
         if not 0 <= age < MARKER_MAX_AGE_SECONDS:
             return GateOutcome.DENY
-        if not fallback_matches(message, record):
+        text_id = record.get("text_id")
+        if not isinstance(text_id, str) or not any(entry.id == text_id for entry in push_texts.catalog()):
+            return GateOutcome.DENY
+        expected = (f"Title: {text(record, 'title')}\n{text(record, 'message')}\n\n"
+                    + f"Sent by: {text(record, 'sender')} · Template: {text_id}")
+        if message != expected or not fallback_matches(message, record):
             return GateOutcome.DENY
         # PostToolUse consumes approval after delivery; an interrupted allow can retry.
-        if record.get("held") is True and record.get("need") != "blocked":
+        if record.get("held") is True:
             marker.unlink()
             return GateOutcome.HELD
-        if record.get("reviewed", True) is not True and record.get("need") != "blocked":
+        if record.get("reviewed") is not True:
             marker.unlink()
             return GateOutcome.UNREVIEWED
+        if record.get("need") != "blocked":
+            return GateOutcome.DENY
+    try:
+        return release_record(record, directory, marker, clock=clock, sleep=sleep)
+    except Exception as error:
+        print(f"push gate: {type(error).__name__}: {error}", file=sys.stderr)
+        return GateOutcome.ALLOW
+
+
+def release_record(record: dict[str, object], directory: Path, marker: Path, *,
+                   clock: Callable[[], float], sleep: Callable[[float], None]) -> GateOutcome:
     source = record.get("held_source")
     identity = record.get("held_identity")
     if isinstance(source, str) and source and isinstance(identity, str) and identity:
@@ -168,9 +188,8 @@ def main(*, clock: Callable[[], float] = time.monotonic,
     try:
         outcome = matches_failed_push(sys.stdin.read(), clock=clock, sleep=sleep)
     except Exception as error:
-        # A broken hook must never lose a push.
         print(f"push gate: {type(error).__name__}: {error}", file=sys.stderr)
-        return
+        outcome = GateOutcome.DENY
     if outcome is not GateOutcome.ALLOW:
         reason = {GateOutcome.DENY: DENIAL, GateOutcome.DELIVERED: ALREADY_SENT,
                   GateOutcome.UNREVIEWED: UNREVIEWED_FALLBACK, GateOutcome.HELD: HELD_FALLBACK}[outcome]

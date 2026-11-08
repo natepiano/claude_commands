@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
 import sys
@@ -10,9 +9,10 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from scripts.lib.process_group import send_process_group
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
-from test_renumber import GOALS, issue_text  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize.tests.test_renumber import GOALS, issue_text
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PRIORITIZE_DIR = Path(__file__).parents[1]
 RUN_WATCHER = PRIORITIZE_DIR / "run_watcher.sh"
@@ -85,7 +85,7 @@ raise SystemExit(2)
 
         content = RUN_WATCHER.read_text(encoding="utf-8")
         replacements = {
-            'PY="$HOME/.claude/scripts/lib/py"': f'PY="{sys.executable}"',
+            'PY="${BASH_SOURCE[0]%/*}/../lib/py"': f'PY="{PY_SHIM}"',
             'WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"': f'WRITER_LOCK_TOOL="{PRIORITIZE_DIR / "writer_lock.py"}"',
             'RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"': f'RUNNER_LOCK_TOOL="{RUNNER_LOCK}"',
             'SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"': (
@@ -138,11 +138,11 @@ raise SystemExit(2)
         return self.state / "last-status"
 
     def wait_for_runner_lock(self) -> None:
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             result = subprocess.run(
                 [
-                    sys.executable,
+                    str(PY_SHIM),
                     str(RUNNER_LOCK),
                     "status",
                     str(self.runner_lock_path),
@@ -175,7 +175,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
     def _start_lock_owner(self, command: list[str]) -> subprocess.Popen[bytes]:
         owner = subprocess.Popen(
             [
-                sys.executable,
+                str(PY_SHIM),
                 str(RUNNER_LOCK),
                 "run",
                 str(self.fixture.runner_lock_path),
@@ -200,7 +200,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
             self.assertTrue((self.fixture.state / "pending").exists())
         finally:
             owner.terminate()
-            _ = owner.wait(timeout=2)
+            _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_daemon_retries_after_busy_owner_fails(self) -> None:
         owner = self._start_lock_owner(
@@ -217,7 +217,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             while time.monotonic() < deadline:
                 if self.fixture.event_log.exists():
@@ -232,9 +232,9 @@ class RunWatcherTests(ScriptRepositoryTestCase):
                 )
 
             _ = self.fixture.owner_release.write_text("release\n", encoding="utf-8")
-            self.assertEqual(owner.wait(timeout=2), 2)
+            self.assertEqual(owner.wait(timeout=TEST_HANG_GUARD_SECS), 2)
 
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             status = ""
             while time.monotonic() < deadline:
                 log = self.fixture.event_log.read_text(encoding="utf-8")
@@ -257,10 +257,10 @@ class RunWatcherTests(ScriptRepositoryTestCase):
         finally:
             if owner.poll() is None:
                 owner.terminate()
-                _ = owner.wait(timeout=2)
+                _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                send_process_group(daemon.pid, signal.SIGTERM)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_daemon_absorbs_its_own_canonical_rank_writes(self) -> None:
         issue = self.fixture.issues / "issue.md"
@@ -299,7 +299,7 @@ raise SystemExit(0)
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             while time.monotonic() < deadline:
                 if self.fixture.event_log.exists():
@@ -316,8 +316,8 @@ raise SystemExit(0)
             self.assertNotIn("starting one fresh pass", log)
         finally:
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                send_process_group(daemon.pid, signal.SIGTERM)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def _make_filtered_git_vault(self) -> Path:
         """Turn the fixture root into a vault wired exactly like the real one.
@@ -459,10 +459,9 @@ raise SystemExit(0)
         _ = issue.write_text(issue_text(), encoding="utf-8")
         _ = self.fixture.goals.write_text(GOALS, encoding="utf-8")
         blocked = self.write(self.root / "export-blocked", "blocked\n")
-        _ = self.fixture.renumber.write_text(f'''import os, sys
+        _ = self.fixture.renumber.write_text(f'''import os
 from pathlib import Path
-sys.path.insert(0, {str(PRIORITIZE_DIR)!r})
-import renumber, writer_lock
+from scripts.prioritize import renumber, writer_lock
 root = Path({str(self.fixture.root)!r})
 renumber.PRODUCTION_SCOPE = renumber.Scope(root, root / "issues", root / "prioritization goals.md")
 acquire = writer_lock.acquire_writer_lock
@@ -570,7 +569,7 @@ raise SystemExit(0)
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             status = ""
             while time.monotonic() < deadline:
@@ -591,8 +590,8 @@ raise SystemExit(0)
             self.assertNotIn("error: renumber apply failed exit=3", log)
         finally:
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                send_process_group(daemon.pid, signal.SIGTERM)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

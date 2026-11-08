@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build the mechanical dailies input around the showrunner's judgment JSON."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -12,32 +16,29 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from zoneinfo import ZoneInfo
 
 from scripts.production import showrunners
-import showrunner_tree
-import unit_lookup
-from scripts.production import staff
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
-from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
-from dailies_counts import CountsFailure, production_counts
-from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
+from scripts.production import showrunner_tree
+from scripts.production import unit_lookup
+from scripts.production import staff, unit_names
+from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
+from scripts.production.dailies_counts import CountsFailure, production_counts
+from scripts.production.store_owner import showrunner_id
+from scripts.production.dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
-                            parse_style_summary, read_outstanding)
-from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
-from update_registration import (RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+                            parse_style_summary)
+from scripts.production.merge_checkpoint import git, merged_checkpoints
+from scripts.production.update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
                                  update_schedule)
-from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
+from scripts.production.waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-from build_hold import ActiveHolders, read_holders
-import override_guard
+from scripts.build_hold.build_hold import ActiveHolders, read_holders
+from scripts.build_hold import override_guard
 
 JsonMap = dict[str, object]
 LAST_REPORT = "dailies_last.json"
@@ -244,13 +245,18 @@ class JudgmentOutsideNumberedPlan(NamedTuple):
 JudgmentPlanPhase = JudgmentNumberedPlanPhase | JudgmentOutsideNumberedPlan
 
 
+class UnitRunUnavailable(NamedTuple):
+    reason: str
+
+
 class UnitRow(NamedTuple):
     name: str
-    # The unit's session name at this moment, read from its live session; empty when none runs.
-    # It addresses the unit and is never a key: every record is kept under the unit's name.
+    # The live session name addresses the unit. An empty value means no session runs.
     session: str
     # Read from the records of the unit's /unit:direct runs.
-    run: unit_lookup.UnitState
+    run: unit_lookup.UnitState | UnitRunUnavailable
+    # The fixed staff id keys stored unit data.
+    staff_id: staff.StaffId
 
 
 class DailiesFailure(Exception):
@@ -268,7 +274,7 @@ def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch:
     script = os.environ.get("DAILIES_BEVY_UPGRADE", str(
         Path(__file__).resolve().parent.parent / "bevy_upgrade/bevy_upgrade.py"))
     try:
-        result = subprocess.run([sys.executable, script, "--production", str(production.doc),
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "--production", production.name,
                                  "line", "--json"], capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired as error:
         stderr = error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
@@ -299,28 +305,28 @@ def bounded_bevy_update(text: str) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def units_from_doc(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> tuple[UnitRow, ...]:
-    record = record if record is not None else staff.snapshot()
-    live_rows = live_unit_table(lines, slug, record=record)
-    if unit_table(lines) and not live_rows:
-        raise DailiesFailure("production", "no live units: every Units row is retired")
+def report_units(owner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
+    rows = tuple(record.find(kind="unit", parent=owner.id))
+    live = [row for row in rows if not isinstance(row.worktree, staff.RemovedWorktree)]
+    if rows and not live:
+        raise DailiesFailure("production", "no live units: every unit is retired")
     try:
-        marked = unit_lookup.marked_units(slug, record=record)
+        marked = {unit_names.name(name): place
+                  for name, place in unit_lookup.labeled_sessions(owner.name, record=record).items()}
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
-        runs = unit_lookup.read_run_states()
+        runs = unit_lookup.read_run_states(record=record)
     except OSError as error:
-        raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
+        raise DailiesFailure("production", f"the run records of {owner.name} could not be read: {error}") from error
     units: list[UnitRow] = []
-    for cells in live_rows:
-        name = cell_value(cells.get("Unit", ""))
-        if not name:
-            raise DailiesFailure("production", f"invalid Units row: {cells}")
-        found = marked.get(name)
+    for row in live:
+        found = marked.get(row.name)
         claude = found.claude if found is not None else None
-        run = runs.state(Path(cell_value(cells.get("Worktree", ""))))
-        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
+        run = (runs.state(row.worktree.path) if isinstance(row.worktree, staff.PresentWorktree)
+               else UnitRunUnavailable("the unit has no present worktree"))
+        units.append(UnitRow(row.name,
+                             claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run, row.id))
     return tuple(units)
 
 
@@ -411,11 +417,10 @@ def in_report_zone(line: str, now: datetime, zone: ZoneInfo) -> str:
     return line[:found.start()] + clock + line[found.end():]
 
 
-def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, zone: ZoneInfo, *, held: bool) -> EtaState:
+def eta_state(block: StatusBlock, key: str, seen: JsonMap, now: datetime, zone: ZoneInfo, *, held: bool) -> EtaState:
     lines = list(dict.fromkeys(item.text for item in block.activity if "ETA" in item.text))
     if not lines:
         return EtaNone()
-    key = f"{block.session}|{phase}"
     prior = seen.get(key)
     requested = isinstance(eta_requested(seen, key), EtaRequested)
     record = cast(JsonMap, prior) if isinstance(prior, dict) else {}
@@ -571,7 +576,8 @@ def phase_table_path() -> Path:
 
 
 def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
-    result = command(phase_table_path(), "show", "--production-doc", str(production_doc), "--json")
+    result = command(Path(__file__).resolve().parents[1] / "lib/py", str(phase_table_path()),
+                     "show", "--production-doc", str(production_doc), "--json")
     if result.returncode:
         return PhaseTablesUnavailable(failure_detail(result))
     try:
@@ -747,7 +753,7 @@ def record_eta_value(
 
 
 def command(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    argv = [str(path), *args] if os.access(path, os.X_OK) else [sys.executable, str(path), *args]
+    argv = [str(path), *args] if os.access(path, os.X_OK) else [str(Path(__file__).resolve().parents[1] / "lib/py"), str(path), *args]
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
 
@@ -760,15 +766,23 @@ def next_due(output: str, now: datetime, zone: ZoneInfo) -> str:
     return due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
 
 
-def last_report_path(slug: str) -> Path:
+def last_report_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
     """Where a production saves what the showrunner above it shows of it."""
-    return showrunners.SHOWRUNNER_STATE_DIR / slug / LAST_REPORT
+    return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(
+        name, record=identities.record if identities else None) / LAST_REPORT
 
 
 def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, record: staff.StaffSnapshot | None = None) -> JsonMap:
     """One production directly below this one: its saved report, and what waits on the user in it and below it."""
+    identities = QuestionStaff.for_record(record) if record is not None else QuestionStaff.read()
+    return child_fields_with_questions(child, now, zone, expand=expand, identities=identities)
+
+
+def child_fields_with_questions(child: str, now: datetime, zone: ZoneInfo, *, expand: bool,
+                               identities: QuestionStaff) -> JsonMap:
+    """Read one child report with the command's shared question identities."""
     fields: JsonMap = {"name": child, "expand": expand}
-    path = last_report_path(child)
+    path = last_report_path(child, identities=identities)
     try:
         saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
         _ = parse_child_report(saved, str(path), zone)
@@ -779,24 +793,31 @@ def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, rec
         report("children", "unavailable", f"{child}: {error}")
     else:
         fields["report"] = saved
-    waiting = 0
-    unreadable: list[str] = []
-    for slug in (child, *showrunner_tree.descendants_of(child, record=record)):
-        try:
-            waiting += len(due(read_outstanding(outstanding_file(slug)), now))
-        except (InputError, OSError, ValueError):
-            unreadable.append(slug)
+    waiting, unreadable = child_question_counts(child, now, identities)
     fields["open"] = waiting
     if unreadable:
         fields["unreadable"] = unreadable
     return fields
 
 
+def child_question_counts(child: str, now: datetime, identities: QuestionStaff) -> tuple[int, list[str]]:
+    """Count descendant questions with one command's joined staff identities."""
+    waiting = 0
+    unreadable: list[str] = []
+    for name in identities.names(child, below=True):
+        try:
+            waiting += len(due(read_open_items(outstanding_file(name, identities=identities), identities=identities), now))
+        except (InputError, OSError, ValueError):
+            unreadable.append(name)
+    return waiting, unreadable
+
+
 def style_summary(production: Production) -> JsonMap:
     """Validate the ledger's summary while keeping every JSON field for the parent."""
     script = Path(__file__).resolve().parent.parent / "style/style_ledger.py"
     try:
-        result = command(script, "summary", "--repo", str(production.checkout), "--json")
+        result = command(Path(__file__).resolve().parents[1] / "lib/py", str(script),
+                         "summary", "--repo", str(production.checkout), "--json")
         if result.returncode:
             reason = f"summary: {failure_detail(result, lines=1)}"
             return {"unavailable": reason.replace("\n", "; ")}
@@ -818,8 +839,8 @@ def is_style_production(production: Production) -> bool:
         return False
 
 
-def save_last_report(slug: str, saved: JsonMap) -> Path:
-    path = last_report_path(slug)
+def save_last_report(name: str, saved: JsonMap, *, identities: QuestionStaff | None = None) -> Path:
+    path = last_report_path(name, identities=identities)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps(saved, indent=2) + "\n")
     return path
@@ -841,7 +862,7 @@ def validate_report(result: JsonMap, holders_path: Path, judgment_path: Path) ->
 
 
 def run(args: argparse.Namespace) -> int:
-    production_path = cast(Path, args.production)
+    production_name = cast(str, args.production)
     status_path = cast(Path, args.status)
     judgment_path = cast(Path, args.judgment)
     state_dir = cast(Path, args.state_dir)
@@ -854,17 +875,22 @@ def run(args: argparse.Namespace) -> int:
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
     staff_record = staff.snapshot()
-    production = read_production(production_path)
+    production = read_production(production_name, staff_record)
     # Before any state is read: a showrunner started before the state move gets its state copied here.
-    for line in adopt_moved_state(production):
+    for line in adopt_moved_state(production, record=staff_record):
         print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = units_from_doc(lines, production.slug, record=staff_record)
+    units = report_units(production.owner, staff_record)
     table_state = phase_tables(production.doc, production.zone)
+    if isinstance(table_state, PhaseTablesAvailable):
+        table_state = PhaseTablesAvailable(
+            {unit_names.name(unit): value for unit, value in table_state.units.items()},
+            {unit_names.name(unit): value for unit, value in table_state.could_start.items()},
+        )
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
-    instance = f"showrunner-{production.slug}"
+    instance = showrunners.timer_name(production.name, staff_record)
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
     # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,
@@ -879,7 +905,7 @@ def run(args: argparse.Namespace) -> int:
         report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
     if isinstance(table_state, PhaseTablesAvailable):
         for unit in units:
-            for phase in table_state.could_start.get(unit.name, ()):
+            for phase in table_state.could_start.get(unit_names.name(unit.name), ()):
                 print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
@@ -900,11 +926,19 @@ def run(args: argparse.Namespace) -> int:
     judgment = as_map(raw, str(judgment_path))
     supplied_units = as_list(judgment.get("units"), f"{judgment_path}.units")
     by_session: dict[str, JsonMap] = {}
+    owner_id = production.owner.id
     for index, supplied in enumerate(supplied_units):
         fields = as_map(supplied, f"{judgment_path}.units[{index}]")
-        unit_name = fields.get("unit")
-        if not isinstance(unit_name, str):
-            raise DailiesFailure("judgment", f"{judgment_path}.units[{index}].unit: required")
+        unit_id = fields.get("unit")
+        where = f"{judgment_path}.units[{index}].unit"
+        if not isinstance(unit_id, str):
+            raise DailiesFailure("judgment", f"{where}: fixed staff id required")
+        row = staff_record.by_id(staff.StaffId(unit_id))
+        if row is None or row.kind != "unit" or row.parent != staff.ReportsTo(owner_id):
+            raise DailiesFailure("judgment", f"{where}: no unit with this fixed id belongs to this production")
+        unit_name = row.name
+        if unit_name in by_session:
+            raise DailiesFailure("judgment", f"{where}: duplicate unit")
         by_session[unit_name] = fields
     seen_path = state_dir / "eta_seen.json"
     seen = as_map(cast(object, json.loads(seen_path.read_text())) if seen_path.exists() else {}, str(seen_path))
@@ -920,7 +954,8 @@ def run(args: argparse.Namespace) -> int:
         block = blocks_by_session[unit.name]
         fields = by_session.get(unit.name, {})
         result = dict(fields)
-        result["unit"] = unit.name
+        result["unit"] = unit.staff_id
+        result["name"] = unit.name
         for key in ("build_hold", "holds_builds"):
             if key in result:
                 raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].{key}: supplied by holder files")
@@ -932,11 +967,11 @@ def run(args: argparse.Namespace) -> int:
             result["needs_user"] = True
         phase = fields.get("phase")
         phase_text = phase if isinstance(phase, str) else ""
-        key = f"{unit.name}|{phase_text}"
+        key = f"{unit.staff_id}|{phase_text}"
         held = fields.get("held")
         phase_state: UnitPhaseState = (
             table_state.units.get(
-                unit.name,
+                unit_names.name(unit.name),
                 NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable("unit missing from phase-table output")),
             )
             if isinstance(table_state, PhaseTablesAvailable)
@@ -969,7 +1004,7 @@ def run(args: argparse.Namespace) -> int:
                         eta_request_candidates[key] = unit.name
                         cast(JsonMap, record)["requested"] = True
         else:
-            state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)), held=held_now)
+            state = eta_state(block, key, seen, now, ZoneInfo(str(production.zone)), held=held_now)
             if not isinstance(state, EtaNone):
                 eta_touched[key] = None
             requested = isinstance(eta_requested(seen, key), EtaRequested)
@@ -1009,8 +1044,6 @@ def run(args: argparse.Namespace) -> int:
                            "eta": "no ETA stated yet",
                            "needs_user": isinstance(upgrade, OpenBevyUpgradeWatch) and upgrade.needs_user})
         report("bevy upgrade", "ok" if isinstance(upgrade, OpenBevyUpgradeWatch) else "unavailable", update)
-    history = merge_branch_history(production.checkout, production.merge_branch)
-    last = history.last_merge()
     local = git(production.checkout, "rev-parse", production.merge_branch)
     remote = git(production.checkout, "rev-parse", f"origin/{production.merge_branch}")
     if local.returncode:
@@ -1019,9 +1052,9 @@ def run(args: argparse.Namespace) -> int:
     merge = as_map(judgment.get("merge", {}), f"{judgment_path}.merge")
     held, testing = merge.get("held"), merge.get("testing")
     if held or testing or not pushed:
-        latest = ("no checkpoint merged" if isinstance(last, NoMerge) else
-                  f"{last.child} style hand-off ({last.short})" if isinstance(last, ChildHandoffEntry) else
-                  f"{last.unit} phase {last.phase} ({last.short})")
+        checkpoints = merged_checkpoints(production)
+        latest = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase} ({checkpoints[-1].commit[:7]})" if checkpoints
+                  else "no checkpoint merged")
         details = [f"last merge: {latest}", "pushed" if pushed else "not pushed"]
         if held:
             details.append(f"held: {held}")
@@ -1032,23 +1065,25 @@ def run(args: argparse.Namespace) -> int:
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
                        "doc": str(production.doc)}
-    root = showrunner_tree.root_of(production.slug, record=staff_record)
-    if root != production.slug:
+    root = showrunner_tree.root_of(production.name, record=staff_record)
+    if root != production.name:
         result["reports_to"] = root
-    children = showrunner_tree.children_of(production.slug, record=staff_record)
+    children = showrunner_tree.children_of(production.name, record=staff_record)
     strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
     if strangers:
-        raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "
+        raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.name}; "
                              + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
                                 else "no production reports to it"))
     if children:
-        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand, record=staff_record)
+        identities = QuestionStaff.for_record(staff_record)
+        result["children"] = [child_fields_with_questions(child, now, production.zone,
+                              expand=EXPAND_ALL in expand or child in expand, identities=identities)
                               for child in children]
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
-        counts = production_counts(production.slug)
-    except CountsFailure as failure:
+        counts = production_counts(owner_id)
+    except (CountsFailure, staff.StaffRefused, staff.StaffUnreadable) as failure:
         report("counts", "unavailable", str(failure))
     else:
         if counts:
@@ -1110,7 +1145,7 @@ def run(args: argparse.Namespace) -> int:
         saved = last_report(result, render_state, at, cadence)
         if is_style_production(production):
             saved = {**saved, "style": style_summary(production)}
-        saved_at = save_last_report(production.slug, saved)
+        saved_at = save_last_report(owner_id, saved, identities=QuestionStaff.for_record(staff_record))
     except (InputError, OSError) as error:
         report("saved report", "unavailable", str(error))
     else:
@@ -1121,7 +1156,8 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "production/dailies_input.py")
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("production", "status", "judgment", "state-dir", "out"):
+    _ = parser.add_argument("--production", required=True)
+    for name in ("status", "judgment", "state-dir", "out"):
         _ = parser.add_argument(f"--{name}", required=True, type=Path)
     _ = parser.add_argument("--length", choices=("gantt", "simple", "page", "elaborate"), default="gantt")
     _ = parser.add_argument("--holders", type=Path)

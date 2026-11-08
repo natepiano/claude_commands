@@ -3,26 +3,33 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
 from scripts.usage import agents_log
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).with_name("agents_log.py")
 AT = datetime(2026, 10, 11, 17, 30, tzinfo=timezone.utc)
+ARCHIVED_THREAD = fixture_runtime_id("archived-thread")
+LIVE_THREAD = fixture_runtime_id("live-thread")
+FORMER_THREAD = fixture_runtime_id("former-thread")
+CONTRACT_THREAD = fixture_runtime_id("contract-thread")
+ADVERSARY_THREAD = fixture_runtime_id("adversary-thread")
 
 
 class AgentsLogTests(unittest.TestCase):
@@ -38,11 +45,13 @@ class AgentsLogTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.state = self.root / "state"
         self.log_path = self.state / "agents.jsonl"
-        self.enterContext(patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.state)}))
+        self.enterContext(patch.dict(os.environ, {
+            "USAGE_STATE_DIR": str(self.state), "STAFF_FILE": str(self.root / "staff.json"),
+        }))
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), *arguments],
             cwd=REPOSITORY,
             env=os.environ.copy(),
             capture_output=True,
@@ -55,32 +64,38 @@ class AgentsLogTests(unittest.TestCase):
         return [cast("dict[str, object]", json.loads(line))
                 for line in self.log_path.read_text(encoding="utf-8").splitlines()]
 
-    def backfill_fixture(self) -> tuple[Path, Path, datetime, datetime]:
+    def backfill_fixture(self) -> tuple[Path, Path]:
+        rows: list[staff.StaffRow] = []
+        for identity, role in ((ARCHIVED_THREAD, "review"), (LIVE_THREAD, "test"),
+                               (FORMER_THREAD, "fix"), (CONTRACT_THREAD, "review"),
+                               (ADVERSARY_THREAD, "review")):
+            parent = staff.native_id(fixture_runtime_id("owner:" + identity))
+            rows.append(staff.StaffRow(parent, "showrunner", "owner-" + identity,
+                                       staff.StaffRoot(), current_session=parent))
+            member = staff.native_id(identity)
+            rows.append(staff.StaffRow(member, "worker", role, staff.ReportsTo(parent),
+                                       current_session=member))
+        _ = (self.root / "staff.json").write_text(json.dumps({
+            "schema": 2, "rows": [row.to_json() for row in rows],
+        }), encoding="utf-8")
         archive = self.root / "archive"
         archived_run = archive / "archived-run"
         archived_run.mkdir(parents=True)
         roster = archived_run / "mesh_roster.json"
         _ = roster.write_text(json.dumps({
             "project-test": {
-                "thread_id": "archived-thread", "role": "review",
-                "previous_role": "impl", "status": "done",
+                "staff_id": ARCHIVED_THREAD, "status": "done",
             },
         }), encoding="utf-8")
         roster_stamp = 1_700_000_000
         os.utime(roster, (roster_stamp, roster_stamp))
-        _ = (archived_run / "review_status_adversary").write_text("reviewed\n", encoding="utf-8")
         _ = (archived_run / "review_agent_adversary.log").write_text(
             "Review worker project-test starts\n", encoding="utf-8")
-        workers = archived_run / "workers"
-        _ = workers.write_text("claude-one\tworker-one\nclaude-two\tworker-two\n", encoding="utf-8")
-        ledger_stamp = roster_stamp + 100
-        os.utime(workers, (ledger_stamp, ledger_stamp))
-
         live = self.root / "live"
         live_run = live / "live-run"
         live_run.mkdir(parents=True)
         _ = (live_run / "mesh_roster.json").write_text(json.dumps({
-            "project-impl": {"thread_id": "live-thread", "role": "test", "status": "done"},
+            "project-impl": {"staff_id": LIVE_THREAD, "status": "done"},
         }), encoding="utf-8")
         active = live / "active"
         active.mkdir()
@@ -89,11 +104,7 @@ class AgentsLogTests(unittest.TestCase):
         _ = (active / "mesh_roster.json").write_text(json.dumps({
             "fake": {"thread_id": "not-a-run", "role": "impl"},
         }), encoding="utf-8")
-        return (
-            archive, live,
-            datetime.fromtimestamp(roster_stamp, timezone.utc),
-            datetime.fromtimestamp(ledger_stamp, timezone.utc),
-        )
+        return archive, live
 
     def test_rerun_assignment_survives_cli_append_and_show(self) -> None:
         result = self.cli("append", "--id", "rerun-worker", "--role", "review", "--lens", "rerun")
@@ -318,7 +329,7 @@ print(json.dumps(register_default('shared-session', 'interactive', datetime.now(
         try:
             for _worker in range(6):
                 processes.append(subprocess.Popen(
-                    [sys.executable, "-c", script],
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script],
                     cwd=REPOSITORY, env=os.environ.copy(),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 ))
@@ -505,7 +516,7 @@ for index in range(20):
         try:
             for worker in range(4):
                 processes.append(subprocess.Popen(
-                    [sys.executable, "-c", script, str(worker)],
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(worker)],
                     cwd=REPOSITORY, env=os.environ.copy(),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True,
@@ -532,13 +543,41 @@ for index in range(20):
         self.assertTrue(all(record["role"] == "worker" for record in records))
         self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
+    def test_backfill_recovers_director_when_staff_is_unreadable(self) -> None:
+        staff_file = self.root / "staff.json"
+        _ = staff_file.write_bytes(b"\xff")
+        live = self.root / "live"
+        run = live / "run"
+        run.mkdir(parents=True)
+        active = live / "active"
+        active.mkdir()
+        marker = active / "director-session"
+        _ = marker.write_text(f"{run}\n", encoding="utf-8")
+        os.utime(marker, (AT.timestamp(), AT.timestamp()))
+        errors = io.StringIO()
+
+        with patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}), \
+                patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as snapshot, \
+                redirect_stderr(errors):
+            added = agents_log.backfill(self.root / "archive", live)
+
+        snapshot.assert_called_once_with()
+        self.assertEqual(added, 1)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(staff_file), errors.getvalue())
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.problems, ())
+        self.assertEqual(log.assignments, {
+            "director-session": (agents_log.Assignment(AT, "director", None, True),),
+        })
+
     def test_backfill_reads_runs_and_directors_under_both_run_folder_names(self) -> None:
-        archive, live, _roster_at, _ledger_at = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         former = self.root / "former"
         former_run = former / "former-run"
         former_run.mkdir(parents=True)
         _ = (former_run / "mesh_roster.json").write_text(json.dumps({
-            "project-fix": {"thread_id": "former-thread", "role": "fix", "status": "done"},
+            "project-fix": {"staff_id": FORMER_THREAD, "status": "done"},
         }), encoding="utf-8")
         (former / "active").mkdir()
         _ = (former / "active" / "former-director").write_text(f"{former_run}\n", encoding="utf-8")
@@ -547,35 +586,9 @@ for index in range(20):
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.assignments["former-thread"][0].role, "fix")
+        self.assertEqual(log.assignments[FORMER_THREAD][0].role, "fix")
         self.assertEqual(log.assignments["former-director"][0].role, "director")
         self.assertEqual(log.assignments["director-session"][0].role, "director")
-
-    def test_backfill_recovers_previous_role_workers_director_and_review_lens(self) -> None:
-        archive, live, roster_at, ledger_at = self.backfill_fixture()
-
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.problems, ())
-        self.assertEqual(set(log.assignments), {
-            "archived-thread", "live-thread", "claude-one", "claude-two", "director-session",
-        })
-        previous, current = log.assignments["archived-thread"]
-        self.assertEqual((previous.role, previous.lens), ("impl", None))
-        self.assertEqual((current.role, current.lens, current.at), ("review", "adversary", roster_at))
-        self.assertLess(previous.at, current.at)
-        self.assertEqual(agents_log.role_at(log, "archived-thread", roster_at), current)
-        for worker in ("claude-one", "claude-two"):
-            self.assertEqual(log.assignments[worker], (
-                agents_log.Assignment(ledger_at, "worker", None, True),
-            ))
-        self.assertEqual(log.assignments["director-session"][0].role, "director")
-        self.assertEqual(log.assignments["live-thread"][0].role, "test")
-        self.assertTrue(all(assignment.approximate for assignments in log.assignments.values()
-                            for assignment in assignments))
-        self.assertTrue(all(record["approximate"] is True for record in self.records()))
 
     def test_remote_role_reader_loads_without_a_worker_checkout(self) -> None:
         program = """import sys, types
@@ -594,25 +607,8 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_archive_backfill_links_the_old_ledger_and_preserves_its_timestamp(self) -> None:
-        archive, live, _, ledger_at = self.backfill_fixture()
-        run = archive / "archived-run"
-        current = run / "workers"
-        previous = run / "seats"
-        _ = current.rename(previous)
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertTrue(previous.samefile(current))
-        log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.assignments["claude-one"],
-                         (agents_log.Assignment(ledger_at, "worker", None, True),))
-        before = self.log_path.read_bytes()
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(self.log_path.read_bytes(), before)
-
     def test_backfill_rerun_adds_nothing_even_if_mtime_changes(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         arguments = ("backfill", "--archive", str(archive), "--live", str(live))
         first = self.cli(*arguments)
         self.assertEqual((first.returncode, first.stderr), (0, ""))
@@ -626,8 +622,8 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         self.assertEqual(self.log_path.read_bytes(), before)
 
     def test_backfill_preserves_exact_history_despite_a_newer_roster(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
-        agents_log.append("archived-thread", "review", "adversary", AT)
+        archive, live = self.backfill_fixture()
+        agents_log.append(ARCHIVED_THREAD, "review", "adversary", AT)
         roster = archive / "archived-run/mesh_roster.json"
         rewritten_at = (AT + timedelta(minutes=1)).timestamp()
         os.utime(roster, (rewritten_at, rewritten_at))
@@ -637,48 +633,34 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
         exact = agents_log.Assignment(AT, "review", "adversary", False)
-        self.assertEqual(log.assignments["archived-thread"], (exact,))
-        self.assertEqual(agents_log.role_at(log, "archived-thread", AT + timedelta(minutes=2)), exact)
+        self.assertEqual(log.assignments[ARCHIVED_THREAD], (exact,))
+        self.assertEqual(agents_log.role_at(log, ARCHIVED_THREAD, AT + timedelta(minutes=2)), exact)
         before = self.log_path.read_bytes()
         rerun = self.cli("backfill", "--archive", str(archive), "--live", str(live))
         self.assertEqual((rerun.returncode, rerun.stderr), (0, ""))
         self.assertEqual(self.log_path.read_bytes(), before)
 
     def test_backfill_skips_worker_and_director_ids_with_exact_history(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
-        for agent_id in ("claude-one", "director-session"):
+        archive, live = self.backfill_fixture()
+        for agent_id in (LIVE_THREAD, "director-session"):
             agents_log.append(agent_id, "showrunner", None, AT)
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
-        for agent_id in ("claude-one", "director-session"):
+        for agent_id in (LIVE_THREAD, "director-session"):
             self.assertEqual(log.assignments[agent_id], (
                 agents_log.Assignment(AT, "showrunner", None, False),
             ))
 
-    def test_backfill_fills_missing_roles_for_ids_with_only_approximate_history(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
-        agents_log.append("archived-thread", "review", "adversary", AT, approximate=True)
-
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        log = agents_log.assignments(self.log_path)
-        entries = log.assignments["archived-thread"]
-        self.assertEqual([assignment.role for assignment in entries], ["impl", "review"])
-        self.assertTrue(all(assignment.approximate for assignment in entries))
-        self.assertEqual(entries[1].at, AT)
-
     def test_backfill_recovers_swapped_review_lenses_from_logs_naming_each_worker(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         run = archive / "archived-run"
         _ = (run / "mesh_roster.json").write_text(json.dumps({
-            "project-test": {"thread_id": "contract-thread", "role": "review"},
-            "project-impl": {"thread_id": "adversary-thread", "role": "review"},
+            "project-test": {"staff_id": CONTRACT_THREAD},
+            "project-impl": {"staff_id": ADVERSARY_THREAD},
         }), encoding="utf-8")
-        _ = (run / "review_status_contract").write_text("reviewed\n", encoding="utf-8")
         _ = (run / "review_agent_adversary.log").write_text(
             "Review worker project-impl starts\n", encoding="utf-8")
         _ = (run / "review_agent_1_contract.log").write_text(
@@ -688,11 +670,11 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.assignments["contract-thread"][0].lens, "contract")
-        self.assertEqual(log.assignments["adversary-thread"][0].lens, "adversary")
+        self.assertEqual(log.assignments[CONTRACT_THREAD][0].lens, "contract")
+        self.assertEqual(log.assignments[ADVERSARY_THREAD][0].lens, "adversary")
 
     def test_backfill_uses_the_newest_review_log_that_names_the_full_worker(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         run = archive / "archived-run"
         old_log = run / "review_agent_adversary.log"
         newest_matching = run / "review_agent_2_contract.log"
@@ -706,11 +688,11 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
+        self.assertEqual(agents_log.assignments(self.log_path).assignments[ARCHIVED_THREAD][-1].lens,
                          "contract")
 
     def test_backfill_reads_review_logs_in_phase_directories(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         run = archive / "archived-run"
         old_log = run / "review_agent_adversary.log"
         # A worker seat's log carries its slot after the lens.
@@ -724,11 +706,11 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
+        self.assertEqual(agents_log.assignments(self.log_path).assignments[ARCHIVED_THREAD][-1].lens,
                          "contract")
 
     def test_backfill_leaves_review_lens_absent_without_a_log_naming_the_worker(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         run = archive / "archived-run"
         _ = (run / "review_agent_adversary.log").write_text(
             "Review worker another-test starts\n", encoding="utf-8")
@@ -737,42 +719,12 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
-        self.assertIsNone(log.assignments["archived-thread"][-1].lens)
+        self.assertIsNone(log.assignments[ARCHIVED_THREAD][-1].lens)
         review_rows = [row for row in self.records() if row["role"] == "review"]
         self.assertTrue(all("lens" not in row for row in review_rows))
 
-    def test_backfill_recovers_workers_when_the_same_runs_roster_is_truncated(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
-        roster = archive / "archived-run/mesh_roster.json"
-        _ = roster.write_text('{"project-test":', encoding="utf-8")
-
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn(str(roster), result.stderr)
-        log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.problems, ())
-        self.assertNotIn("archived-thread", log.assignments)
-        self.assertEqual(log.assignments["claude-one"][0].role, "worker")
-        self.assertEqual(log.assignments["claude-two"][0].role, "worker")
-
-    def test_backfill_recovers_roster_when_the_same_runs_workers_ledger_is_unreadable(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
-        workers = archive / "archived-run/workers"
-        _ = workers.write_bytes(b"\xff")
-
-        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn(str(workers), result.stderr)
-        log = agents_log.assignments(self.log_path)
-        self.assertEqual(len(log.assignments["archived-thread"]), 2)
-        self.assertNotIn("claude-one", log.assignments)
-
     def test_backfill_separates_a_truncated_tail_and_remains_idempotent(self) -> None:
-        archive, live, _, _ = self.backfill_fixture()
+        archive, live = self.backfill_fixture()
         agents_log.append("exact-thread", "impl", None, AT)
         with self.log_path.open("a", encoding="utf-8") as handle:
             _ = handle.write('{"id":"broken')
@@ -783,9 +735,9 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         log = agents_log.assignments(self.log_path)
         self.assertEqual(len(log.problems), 1)
         self.assertEqual(set(log.assignments), {
-            "exact-thread", "archived-thread", "live-thread", "claude-one", "claude-two", "director-session",
+            "exact-thread", ARCHIVED_THREAD, LIVE_THREAD, "director-session",
         })
-        self.assertEqual(len(log.assignments["archived-thread"]), 2)
+        self.assertEqual(len(log.assignments[ARCHIVED_THREAD]), 1)
         before = self.log_path.read_bytes()
         rerun = self.cli("backfill", "--archive", str(archive), "--live", str(live))
         self.assertEqual((rerun.returncode, rerun.stderr), (0, ""))

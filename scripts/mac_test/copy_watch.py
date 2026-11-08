@@ -12,6 +12,10 @@ first.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator
@@ -25,27 +29,17 @@ import re
 import select
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
-
-if TYPE_CHECKING:
-    from ..lib import process_start
-    from ..lib.atomic_file import write_text_atomic
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-    from scripts.lib.atomic_file import write_text_atomic
+from typing import Literal, TypedDict, cast
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import override_guard
-import mac_test
-import offload
+from scripts.lib import process_group
+from scripts.build_hold import override_guard
+from scripts.mac_test import mac_test, offload
+from scripts.lib import build_folders, process_start as process_identity
+from scripts.direct import step_record
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -75,6 +69,7 @@ class CliArguments(argparse.Namespace):
         self.package: str = ""
         self.call_id: str = ""
         self.call_started: str = ""
+        self.parent_pid: int = 0
         self.filter_run: bool = False
         self.nextest_words: list[str] = []
 
@@ -203,13 +198,9 @@ class StepProgress:
 
     def __init__(self, info: StepInfo | NoStepInfo) -> None:
         self.info: StepInfo | NoStepInfo = info
-        self.leader_start: process_start.ProcessStart | process_start.ProcessGone | process_start.ProcessReadError | NoStepInfo = NO_STEP_INFO
-        if isinstance(info, StepInfo):
-            try:
-                stat = process_start.read_stat(info.pgid)
-                self.leader_start = stat if isinstance(stat, process_start.ProcessGone) else stat.start
-            except process_start.ProcessReadError as error:
-                self.leader_start = error
+        self.leader_start: process_identity.ProcessStart = (
+            process_identity.process_start(info.pgid) if isinstance(info, StepInfo) else process_identity.Gone()
+        )
         self.offset: int = 0
         self.pending: bytes = b""
         self.cargo_started: float | None = None
@@ -239,15 +230,26 @@ class StepProgress:
                 self.cargo_started = time.monotonic()
 
     def leader_alive(self) -> bool:
-        """Only a matching group leader permits stopping this step's group."""
-        if isinstance(self.info, NoStepInfo) or not isinstance(self.leader_start, (process_start.ProcessStartTime, process_start.ProcessStartDate)):
+        """The step's group leader still runs: not reaped, not a zombie, not a reused pid."""
+        if isinstance(self.info, NoStepInfo) or not isinstance(self.leader_start, process_identity.Started):
             return False
-        if process_start.check_group_leader(self.info.pgid, self.leader_start) is not process_start.OwnerCheck.ALIVE:
+        pgid = self.info.pgid
+        if process_identity.process_start(pgid) != self.leader_start:
             return False
         try:
-            return os.getpgid(self.info.pgid) == self.info.pgid
+            return os.getpgid(pgid) == pgid
         except OSError:
             return False
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as output:
+        temporary = Path(output.name)
+        _ = output.write(text)
+    os.replace(temporary, path)
 
 
 def read_candidate(path: Path) -> CandidateRecord | None:
@@ -271,18 +273,16 @@ def read_candidate(path: Path) -> CandidateRecord | None:
 
 
 def newest_candidate(directory: Path) -> str | None:
-    """The newest candidate whose owner is not proven stale (start, then call id).
+    """The call id of the newest live candidate (latest start, then call id).
 
-    Remove proven stale records. Keep records with no start identity.
+    A record whose watcher no longer runs is removed.
     """
     newest: CandidateRecord | None = None
     for path in sorted(directory.glob("*.json")):
         record = read_candidate(path)
         if record is None:
             continue
-        if mac_test.check_recorded_owner(record["pid"], record["proc_start"]) in (
-            process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED
-        ):
+        if process_identity.process_start(record["pid"]) != process_identity.Started(record["proc_start"]):
             path.unlink(missing_ok=True)
             continue
         if newest is None or (record["call_started"], record["call_id"]) > (
@@ -328,7 +328,7 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
 def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     result.unlink(missing_ok=True)
     command = [
-        sys.executable, str(request.runner), "run", "--copy",
+        str(Path(__file__).resolve().parents[1] / "lib/py"), str(request.runner), "run", "--copy",
         "--repo-root", str(request.repo_root),
         "--package", request.package,
         "--call-id", request.call_id,
@@ -337,6 +337,8 @@ def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     ]
     if request.filter_run:
         command.append("--filter-run")
+    for name in os.environ.get("VERIFY_TEST_ENV_NAMES", "").split():
+        command.extend(("--env", name))
     command += ["--", *request.nextest_words]
     return RunningCopy(subprocess.Popen(command, stdin=subprocess.DEVNULL), result, time.monotonic())
 
@@ -385,9 +387,9 @@ def poll_seconds() -> float:
 class Wakeup:
     """Stop on TERM, HUP, INT or parent loss; signals end sleep at once."""
 
-    def __init__(self, read_fd: int) -> None:
+    def __init__(self, read_fd: int, parent_pid: int) -> None:
         self.read_fd: int = read_fd
-        self.parent_pid: int = os.getppid()
+        self.parent_pid: int = parent_pid
         self.stopped: bool = False
 
     @property
@@ -419,11 +421,11 @@ def note_child(signal_number: int, frame: FrameType | None) -> None:
 
 
 @contextmanager
-def wakeup_on_signals() -> Generator[Wakeup, None, None]:
+def wakeup_on_signals(parent_pid: int) -> Generator[Wakeup, None, None]:
     read_fd, write_fd = os.pipe()
     os.set_blocking(read_fd, False)
     os.set_blocking(write_fd, False)
-    wakeup = Wakeup(read_fd)
+    wakeup = Wakeup(read_fd, parent_pid)
     names = [signal.SIGTERM, signal.SIGHUP]
     if signal.getsignal(signal.SIGINT) != signal.SIG_IGN:
         names.append(signal.SIGINT)
@@ -494,7 +496,7 @@ class Watch:
             stopped = Path(f"{self.request.info}.stopped")
             stopped.touch()
             try:
-                os.killpg(self.step.info.pgid, signal.SIGTERM)
+                process_group.send_process_group(self.step.info.pgid, signal.SIGTERM)
             except OSError:
                 stopped.unlink(missing_ok=True)
             else:
@@ -506,24 +508,22 @@ class Watch:
     def update_candidate(self) -> bool:
         """Keep the candidate file in step with the call; true while it is a candidate."""
         wanted = not self.final and isinstance(self.copy, NoCopy) and self.step.compiling
+        live_step = step_record.read(self.request.call_id)
+        if isinstance(live_step, step_record.StepRecord):
+            wanted = wanted and step_record.mac_eligible(live_step) and live_step.state not in (
+                step_record.StepState.ON_SSH, step_record.StepState.ON_MAC)
+        elif not isinstance(live_step, step_record.MissingRecord):
+            wanted = False
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
-            try:
-                watcher_start = process_start.process_start(os.getpid())
-            except process_start.ProcessReadError:
-                return False
-            if isinstance(watcher_start, process_start.ProcessGone):
-                return False
+            identity = process_identity.process_start(os.getpid())
             record: CandidateRecord = {
                 "pid": os.getpid(),
-                "proc_start": watcher_start.text,
+                "proc_start": identity.start if isinstance(identity, process_identity.Started) else "",
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }
-            # Candidate state is ours to create; the result folder belongs to
-            # verify.sh and must never be recreated after it has been retired.
-            self.candidate.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(self.candidate, json.dumps(record) + "\n")
         return wanted
 
@@ -592,6 +592,7 @@ def parser() -> argparse.ArgumentParser:
                  "--call-started"):
         _ = root.add_argument(name, required=True)
     _ = root.add_argument("--filter-run", action="store_true")
+    _ = root.add_argument("--parent-pid", type=int, required=True)
     _ = root.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
 
@@ -625,22 +626,19 @@ def request_from_arguments(arguments: CliArguments) -> WatchRequest:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
-    request = request_from_arguments(parser().parse_args(namespace=CliArguments()))
-    with wakeup_on_signals() as wakeup, tempfile.TemporaryDirectory(prefix="copy-watch.") as work:
+    arguments = parser().parse_args(namespace=CliArguments())
+    request = request_from_arguments(arguments)
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
         repository = offload.repository_identity(request.repo_root)
         if isinstance(repository, offload.UnknownRepository):
             report = wait_for_stop(wakeup)
         else:
-            watch = Watch(request, repository, Path(work))
+            watch = Watch(request, repository, work)
             try:
                 report = watch.run(wakeup)
             finally:
                 watch.close()
-        try:
-            write_text_atomic(request.result, result_text(report), create_parent=False)
-        except OSError as error:
-            print(f"copy_watch.py: cannot publish result {request.result}: {error}", file=sys.stderr)
-            return 1
+        write_text_atomic(request.result, result_text(report))
     return 0
 
 

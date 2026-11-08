@@ -1,48 +1,22 @@
 #!/usr/bin/env python3
-"""Refuse a checkpoint commit that does not say what the user sees change.
+"""Check review trailers before a commit or merge.
 
-A Bash call that runs `git commit` with a checkpoint(...) subject must carry a line
-`Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`
-(three parts) or `Change-Review: none — <why nothing visible changes>`, in its -m text, its heredoc or
-its -F file. A checkpoint that stages only
-Markdown needs none, and every other commit passes untouched. The merge gate reads the same lines
-and refuses a unit checkpoint without one, so this hook is the early half of that gate.
-After that check, the assertion guard checks Rust and Python edits. It refuses
-unruled assertion removals, weaker assertions and disabled tests. A guard error
-also refuses the checkpoint. A broken payload does not block a call.
+The shared command parser reads messages without executing shell text.
+The review module owns the merge rule.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict
 
-if TYPE_CHECKING:
-    from ..production import change_review
-    from ..direct import assertion_guard
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
-    import change_review
-    import assertion_guard
-
-COMMIT = re.compile(r"\bgit\b(?P<options>[^\n;&|]*?)\bcommit\b")
-DIRECTORY = re.compile(r"(?:^|\s)-C\s*(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
-MESSAGE_FILE = re.compile(r"(?:-F|--file)[=\s]+(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\1[^\n]*\n(.*?)\n\2(?:\n|$)", re.DOTALL)
-SUBJECT = re.compile(r"(?:^|(?:-[a-zA-Z]*m|--message)[=\s]*[\"']?)(?P<subject>checkpoint\([^)\s]*\):[^\n\"']*)", re.MULTILINE)
-ALL = re.compile(r"\s(?:-[a-zA-Z]*a[a-zA-Z]*|--all)\b")
-LINE = re.compile(r"Change-Review:[ \t]*(?P<value>[^\n]*)")
-
-
-class HookPayload(TypedDict, total=False):
-    session_id: str
-    cwd: str
-    tool_name: str
-    tool_input: dict[str, object]
+from scripts.hooks import checkpoint_gate as commands
 
 
 class HookDecision(TypedDict):
@@ -55,22 +29,6 @@ class HookResponse(TypedDict):
     hookSpecificOutput: HookDecision
 
 
-def _path(text: str, cwd: Path) -> Path:
-    return (cwd / Path(text.strip("\"'")).expanduser()).resolve()
-
-
-def message_text(command: str, cwd: Path) -> str:
-    """The command's own text with the contents of any -F file it names."""
-    parts = [command]
-    for found in MESSAGE_FILE.finditer(command):
-        if found.group("path") != "-":
-            try:
-                parts.append(_path(found.group("path"), cwd).read_text(encoding="utf-8"))
-            except (OSError, UnicodeError):
-                continue
-    return "\n".join(parts)
-
-
 def staged(directory: Path, every: bool) -> tuple[str, ...]:
     """The files the commit takes: the index, or with -a every tracked change against HEAD."""
     result = subprocess.run(["git", "-C", str(directory), "diff", "--name-only", "HEAD" if every else "--cached"],
@@ -79,47 +37,52 @@ def staged(directory: Path, every: bool) -> tuple[str, ...]:
 
 
 def refusal(command: str, cwd: Path) -> str:
-    commit = COMMIT.search(command)
-    if commit is None:
-        return ""
-    text = message_text(command, cwd)
-    subject = SUBJECT.search(text)
-    if subject is None:
-        return ""
-    directory = DIRECTORY.search(commit.group("options"))
-    every = ALL.search(command[commit.end():].split("\n", 1)[0]) is not None
-    repo = _path(directory.group("path"), cwd) if directory else cwd
-    files = staged(repo, every)
-    values = "\n".join(f"{change_review.TRAILER}: " + found.group("value").rstrip().rstrip("\"')").rstrip()
-                       for found in LINE.finditer(text))
-    problem = change_review.problem(subject.group("subject").strip(), values, files or ("unknown",))
-    if problem or not any(path.endswith((".rs", ".py")) for path in files):
-        return problem
-    arguments = [sys.executable, str(Path(__file__).resolve().parents[1] / "direct" / "assertion_guard.py"),
-                 "--repo", str(repo), "--rulings", "-"]
-    if not every:
-        arguments.append("--staged")
     try:
-        for base in assertion_guard.commit_bases(repo):
-            arguments.extend(("--base", base))
-        result = subprocess.run(arguments, input=text, capture_output=True, text=True, check=False, timeout=10)
-    except (assertion_guard.GuardError, OSError, subprocess.TimeoutExpired) as error:
-        return f"assertion guard could not run: {error}"
-    if result.returncode == 1:
-        return "\n".join(result.stdout.splitlines()[-20:])
-    if result.returncode:
-        return "assertion guard could not run: " + (result.stderr.strip() or f"exit {result.returncode}")
+        for invocation in commands.git_invocations(command):
+            if isinstance(invocation, commands.UnreadableShellCommand):
+                if commands.possible_cargo_checkpoint(" ".join(invocation.words), cwd):
+                    return invocation.cause
+                continue
+            flags = commands.git_flags(invocation.arguments, invocation.subcommand)
+            from scripts.production import change_review
+
+            location = commands.commit_directory(invocation.options, cwd)
+            repo = location.path if isinstance(location, commands.KnownCommitDirectory) else cwd
+            resolve_repository = not (invocation.earlier or invocation.environment_override) and isinstance(location, commands.KnownCommitDirectory)
+            message = commands.invocation_message(invocation, repo, resolve_repository)
+            if reason := commands.trailer_problem(invocation, repo, resolve_repository, message):
+                return reason
+            merging = commands.merging_commit(invocation, repo, flags)
+            if isinstance(message, commands.UnreadableCommitMessage):
+                if merging or commands.possible_cargo_checkpoint(command, repo):
+                    return message.cause
+                continue
+            subject = message.text.partition("\n")[0]
+            checkpoint = subject.startswith("checkpoint(")
+            if checkpoint and (invocation.earlier or invocation.environment_override):
+                return commands.OWN_CALL_FIX
+            if checkpoint and isinstance(location, commands.UnknownCommitDirectory):
+                return location.cause
+            if reason := change_review.merge_review_problem(message.text, is_merge=merging):
+                return reason
+            if invocation.subcommand == "commit" and checkpoint:
+                if reason := checkpoint_problem(repo, message.text, subject, bool(flags & {"-a", "--all"}), merging):
+                    return reason
+    except Exception as error:
+        return f"Change-Review parser failed: {type(error).__name__}: {error}"
     return ""
 
 
+def checkpoint_problem(repo: Path, text: str, subject: str, every: bool, merging: bool) -> str:
+    from scripts.production import change_review
+
+    files = staged(repo, every)
+    return "" if merging else change_review.problem(subject, text, files or ("unknown",))
+
+
 def decide(raw: str) -> str:
-    payload = cast(HookPayload, json.loads(raw))
-    if payload.get("tool_name") != "Bash":
-        return ""
-    command = payload.get("tool_input", {}).get("command")
-    if not isinstance(command, str):
-        return ""
-    reason = refusal(command, Path(payload.get("cwd") or Path.cwd()))
+    command, cwd = commands.bash_command(raw)
+    reason = refusal(command, cwd)
     return f"Checkpoint refused: {reason}." if reason else ""
 
 

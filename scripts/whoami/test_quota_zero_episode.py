@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.production.staff_test_support import foreign_hostname
+
 import io
 import json
 import os
@@ -13,21 +14,22 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
-from push_texts import RenderedPush, render
+from scripts.whoami import quota_alert
+from scripts.notify.push_texts import RenderedPush, render
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, Quota
 from scripts.whoami import usage_store
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 
 from scripts.whoami.quota_alert_test_support import REGISTRY
 
-setUpModule = support.setUpModule
+def setUpModule() -> None:
+    support.setUpModule()
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
@@ -58,8 +60,8 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with self.assertRaises(accounts.AccountsError):
             _ = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")})
         (directory / ".claude.json").unlink()
-        with self.assertRaisesRegex(accounts.AccountsError, "claude and /login"):
-            _ = accounts.account_for_unscoped_launch({}, workers=True)
+        self.assertEqual(accounts.account_for_unscoped_launch({}, workers=True),
+                         accounts.NamedAccount("claude4", directory))
 
         # Recovery closes the shared route as well as the local fallback.
         with quota_alert.state_file() as state:
@@ -124,7 +126,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         for failed_step in ("edit", "confirmation"):
             with (self.subTest(failed_step=failed_step),
                   mock.patch.object(quota_alert, "STATE", self.root / f"{failed_step}-alerts.json"),
-                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-agents.conf")):
+                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-models.conf")):
                 _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
                 owner = self.readings(self.now).selected_account
                 assert isinstance(owner, agent_accounts.KnownCodexAccount)
@@ -173,15 +175,6 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with mock.patch.object(accounts, "datetime", wraps=datetime, now=mock.Mock(return_value=until)):
             self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
                              accounts.NamedAccount("claude2", accounts.account_dir("claude2")))
-
-    def test_queued_claude_account_with_no_folder_waits_with_setup_step(self) -> None:
-        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
-        head = next_moves.add_next_move("workers", 1, "claude4")
-        _ = self.alert(left=1)
-        self.assertEqual(next_moves.read_next_moves(), (head,))
-        self.swap.assert_not_called()
-        self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
-        self.assertTrue(any("accounts.py setup claude4" in text for text in self.relayed_texts()))
 
     def test_stale_workers_head_blocks_a_fresh_later_entry_and_notifies_once(self) -> None:
         head = next_moves.add_next_move("workers", 1, "codex3")
@@ -294,7 +287,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.relay.assert_not_called()
 
     def test_old_paid_notices_are_rebuilt_before_retry_from_the_current_reading(self) -> None:
-        from push_texts import render
+        from scripts.notify.push_texts import render
         for suffix in ("_credits", "_credits_last"):
             for queued in (False, True):
                 with self.subTest(suffix=suffix, queued=queued):
@@ -324,7 +317,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                         self.assertNotEqual(episode["phone"], "due")
 
     def test_old_paid_notice_keeps_the_earlier_reset_of_a_paid_only_spare(self) -> None:
-        from push_texts import render
+        from scripts.notify.push_texts import render
 
         _ = self.alert(selected=2, spare_accounts=((1, 0, "6370"),))
         fresh, = self.zero_pushes()
@@ -391,7 +384,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                 "destination": "then claude2 / codex2\nnext"})
 
     def test_no_room_uses_the_real_paid_credits_template_once(self) -> None:
-        from push_texts import catalog, render_entry, user_send_argv
+        from scripts.notify.push_texts import catalog, render_entry, user_send_argv
         entry = next(entry for entry in catalog() if entry.id == "quota.paid_credits")
         _ = self.alert()
         _ = self.alert(self.now + timedelta(minutes=2))
@@ -428,7 +421,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.swap.assert_not_called()
 
     def test_unmoved_included_room_during_an_open_fallback_uses_paid_credits(self) -> None:
-        from push_texts import render
+        from scripts.notify.push_texts import render
         owner = self.readings(self.now).selected_account
         assert isinstance(owner, agent_accounts.KnownCodexAccount)
         with quota_alert.state_file() as state:
@@ -507,7 +500,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         assert isinstance(push.action, ActionRequired)
         self.assertIn("use_credits: off", push.action.text)
         self.assertIn("codex1.md", push.action.text)
-        self.assertIn("natedev", push.action.text)
+        self.assertIn("gate-fixture", push.action.text)
         self.assertIn("Its plan refills", push.body)
         self.assertIn("paid credits", push.title + push.body)
         for minute in range(2, 32, 2):
@@ -584,7 +577,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                 queued_push = self.zero_pushes()[-1]
                 self.assertEqual(queued_push.id, "quota.paid_credits_queued")
                 self.assertNotIn("next_reset", queued_push.values)
-                from push_texts import render
+                from scripts.notify.push_texts import render
                 self.assertEqual(queued_push, render("quota.paid_credits_queued", **queued_push.values))
                 self.assertIn("wait for your queued move", queued_push.body)
                 with quota_alert.state_file() as state:
@@ -688,7 +681,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             _ = self.alert(spare_left=0)
             fallback.assert_called_once()
             self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
-            self.assertEqual(quota_alert.registry_assignments()["module_review"], "claude")
+            self.assertEqual(quota_alert.registry_assignments()["design_roles"], "claude")
             for minute in (2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=0)
             fallback.assert_called_once()
@@ -697,7 +690,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         routed = [entry for entry in moves.read_journal() if entry["kind"] == "routed to claude"]
         self.assertEqual(len(routed), 1)
         self.assertEqual(routed[0]["cause"], "credits off")
-        self.assertEqual(set(routed[0]["moved"]), {"direct", "module_review"})
+        self.assertEqual(set(routed[0]["moved"]), {"direct", "design_roles"})
         push = self.zero_pushes()[-1]
         self.assertIn("Claude", push.body)
         self.assertIn("codex1", push.body)
@@ -826,7 +819,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
 
     def test_codex_catalog_examples_equal_the_notices_emitted_for_their_scenarios(self) -> None:
         """F005: reviewed example values must be the values the real alert pass emits."""
-        from push_texts import catalog, render_entry
+        from scripts.notify.push_texts import catalog, render_entry
         from scripts.whoami import run_out
 
         self.now = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)

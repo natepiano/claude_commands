@@ -7,16 +7,25 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.feature_log import feature_log
 from scripts.issue_score import vault
 
 
-class VaultTests(unittest.TestCase):
+class VaultTests(ConfiguredTestCase):
     root: Path = Path()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_body_limit_changes_apply_to_the_next_state_without_a_reload(self) -> None:
+        path = self.configuration(body_character_limit="12")
+        body = "abcdefghijklmnopqrstuvwxyz"
+        self.assertEqual(vault.clean_body(body), body[:12])
+        self.change_configuration(path, body_character_limit="20")
+        self.assertEqual(vault.clean_body(body), body[:20])
 
     def issue(self, name: str, *, fields: str = "", body: str = "A useful change.\n") -> Path:
         path = self.root / (name + ".md")

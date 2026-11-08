@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from scripts.buildlog import record
 
 MacRunOutcome = Literal["passed", "passed_filter", "passed_full", "failed"]
 OffloadDeclineReason = Literal[
@@ -180,5 +185,49 @@ def is_mac_step(caller: object) -> bool:
     return caller == MAC_STEP_CALLER
 
 
+_report_identity: ContextVar[record.LocalStepIdentity | None] = ContextVar('report_identity', default=None)
+
+
+@contextmanager
+def target_predicate_scope() -> Generator[None, None, None]:
+    from scripts.buildlog import record
+
+    token = _report_identity.set(record.local_step_identity())
+    try:
+        yield
+    finally:
+        _report_identity.reset(token)
+
+
+def local_identity() -> record.LocalStepIdentity:
+    from scripts.buildlog import record
+
+    current = _report_identity.get()
+    return record.local_step_identity() if current is None else current
+
+
+def local_target_names() -> tuple[str, ...]:
+    return local_identity().targets
+
+
 def natedev_step_predicate(step: str = "steps") -> str:
-    return f"{step}.host = 'natedev'"
+    from scripts.buildlog import record
+
+    identity = local_identity()
+    targets = ','.join("'" + name.replace("'", "''") + "'" for name in identity.targets)
+    permitted = ' AND '.join(f"{step}.caller IS NOT '" + caller.replace("'", "''") + "'"
+                             for caller in record.NONLOCAL_STEP_CALLERS)
+    if set(identity.targets) == set(identity.hosts):
+        local = f"(CASE WHEN {step}.target > '' THEN {step}.target ELSE {step}.host END) IN ({targets})"
+    else:
+        local = f"CASE WHEN {step}.target > '' THEN {step}.target IN ({targets}) ELSE {natedev_host_predicate(step)} END"
+    return f"({local} AND {permitted})"
+
+
+def natedev_host_predicate(table: str = "steps") -> str:
+    prefix = table + "." if table else ""
+    hosts = local_identity().hosts
+    quoted = tuple("'" + name.replace("'", "''") + "'" for name in hosts)
+    if len(quoted) == 1:
+        return f"{prefix}host = {quoted[0]}"
+    return f"{prefix}host IN ({','.join(quoted)})"

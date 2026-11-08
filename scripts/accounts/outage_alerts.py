@@ -13,16 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+from scripts.lib import conf
+
 
 class AlertLedgerEntry(TypedDict):
     state: Literal["claimed", "delivered"]
     token: str
     pid: NotRequired[int]
     at: NotRequired[float]
-
-
-# Fifteen minutes exceeds the review, send and remote transport deadlines (under five minutes).
-CLAIM_LEASE_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -103,8 +101,9 @@ def claim(session_id: str) -> AlertClaim | AlertInFlight | AlertDelivered:
             if existing["state"] == "delivered":
                 return AlertDelivered()
             # Entries from before owner leases have no active owner.
-            if (time.time() - existing.get("at", 0) < CLAIM_LEASE_SECONDS
+            if (time.time() - existing.get("at", 0) < conf.read("accounts").whole("outage_claim_lease_seconds")
                     and _owner_alive(existing.get("pid", 0))):
+                print(f"already claimed by {existing["token"]}")
                 return AlertInFlight()
         token = uuid.uuid4().hex
         entries[session_id] = AlertLedgerEntry(state="claimed", token=token, pid=os.getpid(), at=time.time())

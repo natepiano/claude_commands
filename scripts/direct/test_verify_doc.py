@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 import unittest
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_doc_test_support import DocPassRecord, VerifyDocFixture
 
 
@@ -25,6 +26,8 @@ class VerifyDocTests(VerifyDocFixture):
         index_before = (self.repo / ".git/index").read_bytes()
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / "runtime/lint-sweep").exists(),
+                         "The doc fixture must not start a background sweep.")
         self.assertEqual((self.repo / ".git/index").read_bytes(), index_before)
         self.assertEqual(source.read_text(encoding="utf-8"), "pub fn unstaged() {}\n")
         self.assertEqual(other.read_text(encoding="utf-8"), "pub fn unrelated_unstaged() {}\n")
@@ -58,7 +61,7 @@ class VerifyDocTests(VerifyDocFixture):
 
 
     def test_doc_off_still_runs_the_workspace_check_and_explains_once(self) -> None:
-        _ = self.config.write_text("doc=off\nsweep=off\n", encoding="utf-8")
+        _ = write_config_fixture(self.config, "doc=off\nsweep=off\n")
         result = self.verify("--features", "alpha/extra")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = self.cargo_calls()

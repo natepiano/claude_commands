@@ -11,22 +11,23 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from collections.abc import Iterator
-from functools import partial
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 from scripts.lib.socket_test_support import short_socket_directory
-from test_support import ShutdownTestCase
-import sessions
+from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.message import sessions
+from scripts.message import process_identity
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 
 
 SCRIPT = Path(__file__).with_name("sessions.py")
 PY = Path(__file__).parents[1] / "lib" / "py"
+STAT_WITH_TRUNCATED_PROCESS_NAME = b"4242 (with ) spaces \xc3) " + b" ".join(
+    [b"S", *[b"0"] * 18, b"8675309", b"unused"]
+)
 
 
 class SessionLookupTests(ShutdownTestCase):
@@ -41,6 +42,9 @@ class SessionLookupTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+        })))
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
         self.addCleanup(self.socket.close)
@@ -84,16 +88,13 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(observed.pids, (os.getpid(), os.getpid()))
         self.assertEqual(absent, sessions.SessionProcesses(()))
 
-    def test_session_process_count_cannot_prove_uniqueness_with_unreadable_evidence(self) -> None:
+    def test_unreadable_record_does_not_change_a_session_answer(self) -> None:
         self.record("live.json", session_id="attached")
         _ = (self.sessions / "broken.json").write_text("{broken")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
-            observed = sessions.session_processes("attached")
-            legacy = sessions.session_liveness("attached")
-        self.assertIsInstance(observed, sessions.SessionLivenessUnknown)
-        assert isinstance(observed, sessions.SessionLivenessUnknown)
-        self.assertIn("broken.json", observed.reason)
-        self.assertEqual(legacy, sessions.LiveSessionProcess(os.getpid()))
+            self.assertEqual(sessions.session_processes("attached"), sessions.SessionProcesses((os.getpid(),)))
+            self.assertEqual(sessions.session_liveness("attached"), sessions.LiveSessionProcess(os.getpid()))
+            self.assertEqual(sessions.session_liveness("absent"), sessions.SessionNotLive())
 
     def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
         self.record(f"{os.getpid()}.json")
@@ -145,6 +146,62 @@ class SessionLookupTests(ShutdownTestCase):
         found = sessions.addressed("natedev", live)
         self.assertEqual(found["sessionId"] if found else None, "sid-session")
 
+    def test_a_direct_launch_with_a_relay_form_name_remains_visible(self) -> None:
+        name = relay_session_name("natedev")
+        self.record("real.json", name=name, session_id="sid-real", entrypoint="cli")
+        self.assertEqual(self.run_cli("address", name).stdout, f"uds:{self.socket_path}\n")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual([row["sessionId"] for row in sessions.running_sessions()], ["sid-real"])
+
+    def test_a_real_session_renamed_to_a_relay_form_keeps_both_names_reachable(self) -> None:
+        self.record("real.json", name="natedev", session_id="sid-real", entrypoint="cli")
+        path = self.sessions / "real.json"
+        record = sessions.read_session(path)
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        record["name"] = relay_session_name("natedev")
+        record["formerNames"] = ["natedev"]
+        _ = path.write_text(json.dumps(record))
+        for name in (record["name"], "session:sid-real"):
+            with self.subTest(name=name):
+                result = self.run_cli("address", name)
+                self.assertEqual((result.returncode, result.stdout), (0, f"uds:{self.socket_path}\n"))
+        self.assertEqual(self.run_cli("id", record["name"]).stdout, "sid-real\n")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            live = sessions.live_sessions()
+        self.assertEqual(sessions.addressed("natedev", live), record)
+
+    def test_a_saved_pid_identifies_a_live_relay_without_a_name_or_entrypoint_hint(self) -> None:
+        self.record("relay.json", name="ordinary-looking-name", session_id="sid-relay")
+        write_relay_record(self.root / "state/message", os.getpid(), "natedev")
+        self.assertEqual(self.run_cli("address", "ordinary-looking-name").returncode, 1)
+        self.assertEqual(self.run_cli("socket", "session:sid-relay").returncode, 1)
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.live_sessions(), [])
+            self.assertEqual(sessions.running_sessions(), [])
+
+    def test_a_reused_pid_does_not_hide_a_real_session_or_erase_the_saved_sender(self) -> None:
+        name = relay_session_name("natedev")
+        self.record("real.json", name=name, session_id="sid-real", entrypoint="cli")
+        directory = self.root / "state/message/relay_senders"
+        write_relay_record(self.root / "state/message", os.getpid(), "natedev")
+        path = directory / f"{os.getpid()}.identity"
+        original = cast(dict[str, str], json.loads(path.read_text()))
+        for field in ("started", "boot"):
+            with self.subTest(field=field):
+                stale = {**original, field: "previous-process-lifetime"}
+                _ = path.write_text(json.dumps(stale))
+                found = self.run_cli("address", name)
+                self.assertEqual((found.returncode, found.stdout), (0, f"uds:{self.socket_path}\n"))
+                self.assertEqual(read_relay_sender(os.getpid(), directory), SavedRelaySender("natedev"))
+
+    def test_a_legacy_sender_record_cannot_hide_a_real_session(self) -> None:
+        self.record("real.json", name="natedev", session_id="sid-real", entrypoint="cli")
+        directory = self.root / "state/message/relay_senders"
+        write_relay_record(self.root / "state/message", os.getpid(), "former-sender")
+        (directory / f"{os.getpid()}.identity").unlink()
+        self.assertEqual(self.run_cli("address", "natedev").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(read_relay_sender(os.getpid(), directory), SavedRelaySender("former-sender"))
+
     def test_newest_live_match_wins(self) -> None:
         other = socket.socket(socket.AF_UNIX)
         self.addCleanup(other.close)
@@ -155,14 +212,14 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(self.run_cli("socket", "same").stdout.strip(), str(other_path))
         self.assertEqual(self.run_cli("socket", "session:same-id").stdout.strip(), str(other_path))
 
-    def test_a_unit_id_and_its_bare_name_find_the_same_session(self) -> None:
+    def test_staff_names_match_exactly_without_suffix_aliases(self) -> None:
         def record(name: str, session_id: str) -> sessions.SessionRecord:
             return sessions.SessionRecord(pid=1, sessionId=session_id, name=name, messagingSocketPath="", updatedAt=1,
                                           tmux="", formerNames=[])
         records = [record("handler", "bare"), record("modules-unit", "suffixed"), record("modules", "exact")]
-        found = [sessions.named(name, records) for name in ("handler-unit", "handler", "modules-unit", "modules", "gone")]
+        found = [sessions.named(name, records) for name in ("handler", "handler-unit", "modules-unit", "modules", "gone")]
         self.assertEqual([None if item is None else item["sessionId"] for item in found],
-                         ["bare", "bare", "suffixed", "exact", None])
+                         ["bare", None, "suffixed", "exact", None])
 
     def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
@@ -174,15 +231,15 @@ class SessionLookupTests(ShutdownTestCase):
             )
 
     def test_running_records_include_socketless_sessions_but_live_records_do_not(self) -> None:
-        started = process_identity.process_start(os.getpid())
-        assert not isinstance(started, process_identity.ProcessGone)
+        started = sessions.process_start(os.getpid())
+        assert started is not None
         self.record("reachable.json", session_id="reachable", updated=10)
-        self.record("socketless.json", session_id="socketless", updated=20, proc_start=started.text)
+        self.record("socketless.json", session_id="socketless", updated=20, proc_start=started)
         path = self.sessions / "socketless.json"
         record = sessions.read_session(path)
         assert not isinstance(record, sessions.UnreadableSessionRecord)
         record["messagingSocketPath"] = ""
-        self.assertEqual(record.get("procStart"), started.text)
+        self.assertEqual(record.get("procStart"), started)
         _ = path.write_text(json.dumps(record))
         self.record("dead.json", pid=2**29 + os.getpid(), updated=30)
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
@@ -190,6 +247,20 @@ class SessionLookupTests(ShutdownTestCase):
             live = sessions.live_sessions()
         self.assertEqual([record["sessionId"] for record in running], ["socketless", "reachable"])
         self.assertEqual([record["sessionId"] for record in live], ["reachable"])
+
+    def test_session_activity_uses_the_shared_record_reader(self) -> None:
+        for state, expected in (("busy", "busy"), ("shell", "shell"), ("idle", "idle"),
+                                ("unknown", "unknown"), (None, ""), (42, "")):
+            with self.subTest(state=state):
+                self.record("activity.json")
+                path = self.sessions / "activity.json"
+                data = cast(dict[str, object], json.loads(path.read_text()))
+                if state is not None:
+                    data["status"] = state
+                _ = path.write_text(json.dumps(data))
+                result = sessions.read_session(path)
+                assert not isinstance(result, sessions.UnreadableSessionRecord)
+                self.assertEqual(result.get("status"), expected)
 
     def test_live_sessions_selects_records_through_the_live_session_predicate(self) -> None:
         self.record("fixture.json", pid=2**29 + os.getpid(), socket_path=self.root / "absent.sock")
@@ -211,7 +282,7 @@ class SessionLookupTests(ShutdownTestCase):
         with (
             mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
             mock.patch.object(os, "kill"),
-            mock.patch.object(process_identity, "process_start", return_value=process_identity.parse_start("new process start")) as start,
+            mock.patch.object(sessions, "process_start", return_value="new process start") as start,
         ):
             self.assertFalse(sessions.running_session(registered))
             self.assertFalse(sessions.live_session(registered))
@@ -219,7 +290,7 @@ class SessionLookupTests(ShutdownTestCase):
             self.assertEqual(sessions.live_sessions(), [])
         self.assertTrue(start.called)
         for call in start.call_args_list:
-            self.assertEqual(call.args, (4242, process_identity.PROC_ROOT))
+            self.assertEqual(call.args, (4242,))
 
     def test_record_with_socket_and_matching_process_start_is_live(self) -> None:
         self.record("matching.json", pid=4242, proc_start="recorded start")
@@ -227,7 +298,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(registered, sessions.UnreadableSessionRecord)
         with (
             mock.patch.object(os, "kill"),
-            mock.patch.object(process_identity, "process_start", return_value=process_identity.parse_start("recorded start")),
+            mock.patch.object(sessions, "process_start", return_value="recorded start"),
         ):
             self.assertTrue(sessions.running_session(registered))
             self.assertTrue(sessions.live_session(registered))
@@ -238,7 +309,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(registered, sessions.UnreadableSessionRecord)
         with (
             mock.patch.object(os, "kill"),
-            mock.patch.object(process_identity, "process_start", side_effect=process_identity.ProcessReadError("unreadable process")),
+            mock.patch.object(sessions, "process_start", return_value=None),
         ):
             self.assertFalse(sessions.running_session(registered))
             self.assertFalse(sessions.live_session(registered))
@@ -258,12 +329,16 @@ class SessionLookupTests(ShutdownTestCase):
             "different.json", session_id="different", socket_path=self.root / "absent.sock",
             proc_start="another start",
         )
-        proc = self.root / "proc"
-        stat_path = write_stat(proc, os.getpid(), start_ticks=8675309)
-        _ = stat_path.write_bytes(stat_path.read_bytes().replace(b"worker", b"with ) spaces \xc3"))
+        stat_path = self.root / "stat"
+        _ = stat_path.write_bytes(STAT_WITH_TRUNCATED_PROCESS_NAME)
+
+        def path_for_stat(value: str) -> Path:
+            return stat_path if value == f"/proc/{os.getpid()}/stat" else Path(value)
+
         with (
             mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
-            mock.patch.object(process_identity, "check_owner", partial(process_identity.check_owner, proc_root=proc)),
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(process_identity, "Path", wraps=Path, side_effect=path_for_stat),
         ):
             for reader, expected in (
                 (sessions.running_sessions, ["matching"]), (sessions.live_sessions, []),
@@ -295,7 +370,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(record, sessions.UnreadableSessionRecord)
         self.assertEqual(record.get("procStart"), "")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), \
-                mock.patch.object(process_identity, "process_start", side_effect=AssertionError("unexpected start read")):
+                mock.patch.object(sessions, "process_start", side_effect=AssertionError("unexpected start read")):
             self.assertEqual(sessions.live_sessions(), [record])
 
     def test_empty_readable_registry_returns_absent(self) -> None:
@@ -375,7 +450,7 @@ class SessionLookupTests(ShutdownTestCase):
         path = self.sessions / "rewriting.json"
         valid = path.read_text()
         for direct in (True, False):
-            with self.subTest(direct=direct), mock.patch.object(Path, "read_text", side_effect=["", "{", valid]) as read:
+            with self.subTest(direct=direct), mock.patch.object(Path, "read_text", side_effect=["{", valid]) as read:
                 with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
                     if direct:
                         result = sessions.read_session(path)
@@ -384,14 +459,31 @@ class SessionLookupTests(ShutdownTestCase):
                         self.assertEqual(len(registry.entries), 1)
                         result = registry.entries[0].record
                 self.assertNotIsInstance(result, sessions.UnreadableSessionRecord)
-                self.assertEqual(read.call_count, 3)
+                self.assertEqual(read.call_count, 2)
 
-    def test_persistently_unreadable_registry_read_has_only_three_tries(self) -> None:
+    def test_persistently_unreadable_registry_read_uses_the_configured_rereads(self) -> None:
+        policy = sessions.retry_policy()
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")) as read, \
              mock.patch.object(time, "sleep") as sleep:
             self.assertEqual(sessions.read_session(self.sessions / "bad.json"), sessions.UnreadableSessionRecord.FOUND)
-        self.assertEqual(read.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
+        self.assertEqual(read.call_count, policy.registry_reads)
+        self.assertEqual(sleep.call_args_list, [mock.call(policy.registry_delay_seconds)] * (policy.registry_reads - 1))
+
+    def test_unreadable_dead_pid_is_dropped_but_live_pid_stays_unknown(self) -> None:
+        path = self.sessions / "4242.json"
+        _ = path.write_text("{")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            for error, expected in ((ProcessLookupError(), ()), (PermissionError(), (path,)), (None, (path,))):
+                with self.subTest(error=error), mock.patch.object(os, "kill", side_effect=error):
+                    self.assertEqual(sessions.read_registry().unreadable, expected)
+                    self.assertEqual(sessions.session_liveness("stopped"), sessions.SessionNotLive())
+
+    def test_record_removed_between_unreadable_read_and_reread_is_dropped(self) -> None:
+        path = self.sessions / "4242.json"
+        _ = path.write_text("{")
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+              mock.patch.object(Path, "read_text", side_effect=["{", FileNotFoundError(path)])):
+            self.assertEqual(sessions.read_registry(), sessions.RegistryRead((), ()))
 
     def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
         self.record("good.json", name="kept")
@@ -413,52 +505,57 @@ class SessionLookupTests(ShutdownTestCase):
 class ProcessStartTests(ShutdownTestCase):
     def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        stat = write_stat(root, 4242, start_ticks=8675309)
-        _ = stat.write_bytes(stat.read_bytes().replace(b"worker", b"with ) spaces \xc3"))
-        with mock.patch.object(process_identity, "read_stat", wraps=process_identity.read_stat) as read:
-            self.assertEqual(process_identity.process_start(4242, root), process_identity.ProcessStartTime(8675309))
-        read.assert_called_once_with(4242, root)
+        stat_path = root / "stat"
+        _ = stat_path.write_bytes(STAT_WITH_TRUNCATED_PROCESS_NAME)
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(process_identity, "Path", return_value=stat_path) as path,
+        ):
+            self.assertEqual(sessions.process_start(4242), "8675309")
+        path.assert_called_once_with("/proc/4242/stat")
 
-    def test_linux_unreadable_or_malformed_stat_keeps_session_liveness_unknown(self) -> None:
+    def test_linux_unreadable_or_malformed_stat_returns_an_unknown_start(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        stat = write_stat(root, 4242, start_ticks=8675309)
-        valid = stat.read_bytes()
-        with mock.patch.object(process_identity, "check_owner", partial(process_identity.check_owner, proc_root=root)):
-            for contents in (b"", b"4242 (name) S", valid.replace(b")", b""),
-                             valid.replace(b"8675309", b"\xff"), valid.replace(b"8675309", b"not-digits")):
+        stat_path = root / "stat"
+        stat_bytes = STAT_WITH_TRUNCATED_PROCESS_NAME.replace(b"\xc3", b"x")
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(process_identity, "Path", return_value=stat_path),
+        ):
+            for contents in (
+                b"", b"4242 (name) S", stat_bytes.replace(b")", b""),
+                stat_bytes.replace(b"8675309", b"\xff"),
+                stat_bytes.replace(b"8675309", b"not-digits"),
+            ):
                 with self.subTest(contents=contents):
-                    _ = stat.write_bytes(contents)
-                    self.assertIsInstance(sessions.process_liveness(4242, "8675309"), sessions.SessionLivenessUnknown)
-            stat.unlink()
-            self.assertIsInstance(sessions.process_liveness(4242, "8675309"), sessions.SessionNotLive)
+                    _ = stat_path.write_bytes(contents)
+                    self.assertIsNone(sessions.process_start(4242))
+            stat_path.unlink()
+            self.assertIsNone(sessions.process_start(4242))
 
     def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
-        date = "Fri Oct  9 23:24:25 2026"
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"
+        )
         with (
-            mock.patch.object(Path, "stat", side_effect=FileNotFoundError),
-            mock.patch.object(subprocess, "run", side_effect=[
-                subprocess.CompletedProcess([], 0, date + "\n", ""),
-                subprocess.CompletedProcess([], 0, "S\n", ""),
-            ]) as run,
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=completed) as run,
         ):
-            started = process_identity.process_start(4242)
-        self.assertEqual(started, process_identity.ProcessStartDate(date))
-        self.assertEqual(run.call_args_list[0].args[0], ["ps", "-o", "lstart=", "-p", "4242"])
-        environment = cast(dict[str, str], run.call_args_list[0].kwargs["env"])
+            started = sessions.process_start(4242)
+
+        self.assertEqual(started, "Fri Oct  9 23:24:25 2026")
+        self.assertEqual(run.call_args.args[0], ("ps", "-o", "lstart=", "-p", "4242"))
+        environment = cast(dict[str, str], run.call_args.kwargs["env"])
         self.assertEqual((environment["LC_ALL"], environment["TZ"]), ("C", "UTC"))
 
-    def test_darwin_session_start_matches_the_stored_utc_date_with_day_padding(self) -> None:
-        date = process_identity.ProcessStartDate("Fri Oct  9 23:24:25 2026")
-        with mock.patch.object(process_identity, "process_start", return_value=date):
-            self.assertEqual(sessions.process_liveness(4242, "Fri Oct 9 23:24:25 2026"), sessions.LiveSessionProcess(4242))
-            self.assertIsInstance(sessions.process_liveness(4242, "Fri Oct 9 19:24:25 2026"), sessions.SessionLivenessUnknown)
-
     def test_linux_start_uses_field_twenty_two_after_the_process_name(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = write_stat(root, 4242, command="a process (with) spaces", start_ticks=8675309)
-        with mock.patch.object(process_identity, "read_stat", wraps=process_identity.read_stat) as read:
-            self.assertEqual(process_identity.process_start(4242, root), process_identity.ProcessStartTime(8675309))
-        read.assert_called_once_with(4242, root)
+        fields = [b"S", *[b"0"] * 18, b"8675309", b"unused"]
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(Path, "read_bytes", return_value=b"4242 (a process (with) spaces) " + b" ".join(fields)) as read,
+        ):
+            self.assertEqual(sessions.process_start(4242), "8675309")
+        read.assert_called_once_with()
 
 
 if __name__ == "__main__":

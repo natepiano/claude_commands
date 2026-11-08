@@ -9,22 +9,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, final
+from typing import final, override
 from unittest import mock
 from urllib import parse, request
 from urllib.error import URLError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import bevy_migration_dependency_check as checker
+from scripts.bevy_migration_plan import bevy_migration_dependency_check as checker
 
-import crates_io_pacer
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
+from scripts.bevy_upgrade import crates_io_pacer
 
 
 TARGET = "0.20.0"
@@ -59,9 +52,7 @@ class MigrationDependencyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        scratch = Path("/tmp/claude")
-        scratch.mkdir(parents=True, exist_ok=True)
-        folder = tempfile.TemporaryDirectory(prefix="migration-dependencies-", dir=scratch)
+        folder = tempfile.TemporaryDirectory(prefix="migration-dependencies-")
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         self.codebase = self.root / "project"

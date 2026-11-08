@@ -1,39 +1,42 @@
 Build queue · 10:46
 
-queue priority: cables (the user's bump)
-                                    free 4.4 │ taken 16.6
-budget 21.0                         ░░░░█████████████████
+queue priority: cables (captured priority)
+                                                   cap 26.6
+                                             █░░···│████████
 
- # showrunner unit      step    min need
- 1 tool-base… cables    mend     36 ██████▊ 6.8 ↑ ≤14.2 9:18
- 2▸tool-base… cables    nextest   6 ███████████▌ 11.5
- 3▸tool-base… cables    nextest   6 ███████████▌ 11.5
- 4 tool-base… hana-mig… mend     39 ███████▋ 7.6
- 5 cargo-lin… berth     clippy   37 ██▉ 2.9
- 6 tool-base… lfo       nextest  35 ██████████▊ 10.8
- 7 cargo-lin… modules   doc      35 ███▌ 3.5
- 8 cargo-lin… —         nextest  33 █▊ 1.8
- 9 performan… metrics-… mend     32 ███████▋ 7.6
-10 tool-base… —         clippy   31 ██████▊ 6.8
-11 cargo-lin… types     doc      31 ███▌ 3.5
-12 tool-base… geometry… nextest  30 █ 1.0
-13 tool-base… trunk     doc      30 ████▍ 4.4
-14 cargo-lin… handler   clippy   30 ███ 3.0
-15 tool-base… demo      clippy   27 ██████▊ 6.8
-16 tool-base… trunk     doc      24 ████▍ 4.4
-17 cargo-lin… port      mend     24 ███▎ 3.2
-18 cargo-lin… port      nextest  24 █▊ 1.8
-19 tool-base… inspecto… nextest  21 ███████████▌ 11.5
-20 tool-base… demo      mend     20 ███████▋ 7.6
-21 tool-base… startup   nextest  14 ██████████▊ 10.8
-22 tool-base… geometry… clippy   14 ██████▏ 6.1
-23 tool-base… hana-mig… nextest  10 ████████████▏ 12.1
-24 performan… metrics-… nextest  10 ████████████▏ 12.1
-25 cargo-lin… handler   nextest   9 █▊ 1.8
-26 performan… metrics-… nextest   8 ████████▌ 8.5
-27 performan… benchmark nextest   8 ████████████▏ 12.1
-28 cargo-lin… tile      nextest   6 ██████████▊ 10.8
-29 tool-base… lfo       nextest   3 █ 1.0
-30 tool-base… trunk     nextest   2 ██████████▊ 10.8
-31 tool-base… fastest   clippy    1 ██████▊ 6.8
-32 tool-base… assembly  clippy    0 ██████▊ 6.8
+Cap 26.6 GiB; anonymous use 5.1 GiB + free 24.5 GiB − safety
+  3.0 GiB; kept aside 6.0 GiB; room 15.5 GiB
+  # showr… unit    step         min pid      GiB: kept/use;…
+run tool-… widget  hana nextest   0 pid 900  █████ 6.0 / 5.1
+  1 tool-… ●cables mend          36 pid 1005 █████ 7.6 ↑
+  2▸tool-… ●cables nextest        6 pid 1001 █████ 6.8
+  3▸tool-… ●cables nextest        6 pid 1002 █████ 11.5
+  4 tool-… hana-m… mend          39 pid 1003 █████ 7.6
+  5 cargo… berth   clippy        37 pid 1004 ██▉ 2.9
+  6 tool-… lfo     nextest       35 pid 1006 █████ 10.8
+  7 cargo… modules doc           35 pid 1007 ███▌ 3.5
+  8 cargo… —       nextest       33 pid 1008 █▊ 1.8
+  9 perfo… metric… mend          32 pid 1009 █████ 7.6
+ 10 tool-… —       clippy        31 pid 1010 █████ 6.8
+ 11 cargo… types   doc           31 pid 1011 ███▌ 3.5
+ 12 tool-… geomet… nextest       30 pid 1012 █ 1.0
+ 13 tool-… trunk   doc           30 pid 1013 ████▍ 4.4
+ 14 cargo… handler clippy        30 pid 1014 ███ 3.0
+ 15 tool-… demo    clippy        27 pid 1015 █████ 6.8
+ 16 tool-… trunk   doc           24 pid 1016 ████▍ 4.4
+ 17 cargo… port    mend          24 pid 1017 ███▎ 3.2
+ 18 cargo… port    nextest       24 pid 1018 █▊ 1.8
+ 19 tool-… inspec… nextest       21 pid 1019 █████ 11.5
+ 20 tool-… demo    mend          20 pid 1020 █████ 7.6
+ 21 tool-… startup nextest       14 pid 1021 █████ 10.8
+ 22 tool-… geomet… clippy        14 pid 1022 █████ 6.1
+ 23 tool-… hana-m… nextest       10 pid 1023 █████ 12.1
+ 24 perfo… metric… nextest       10 pid 1024 █████ 12.1
+ 25 cargo… handler nextest        9 pid 1025 █▊ 1.8
+ 26 perfo… metric… nextest        8 pid 1026 █████ 8.5
+ 27 perfo… benchm… nextest        8 pid 1027 █████ 12.1
+ 28 cargo… tile    nextest        6 pid 1028 █████ 10.8
+ 29 tool-… lfo     nextest        3 pid 1029 █ 1.0
+ 30 tool-… trunk   nextest        2 pid 1030 █████ 10.8
+ 31 tool-… fastest clippy         1 pid 1031 █████ 6.8
+ 32 tool-… assemb… clippy         0 pid 1032 █████ 6.8

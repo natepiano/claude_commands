@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read phase costs and plan history. This command never updates a source store."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -11,7 +15,6 @@ import math
 import sqlite3
 import statistics
 import subprocess
-import sys
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -20,15 +23,15 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import cache
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "history"))
 from scripts.direct import plan_history  # noqa: E402
 from scripts.history import rounds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.style.git_process import GitBlob, read_batch_blob
 from scripts.usage import collect, weights  # noqa: E402
 
 
@@ -39,7 +42,7 @@ class HistoryLabels(Protocol):
     def _clean_label(self, label: str) -> str: ...
 
 
-history = cast(HistoryLabels, cast(object, importlib.import_module("history")))
+history = cast(HistoryLabels, cast(object, importlib.import_module('scripts.history.history')))
 MEASURE_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "pass_started",
                             "pass_finished", "activity_started", "activity_finished",
                             "finding_opened", "finding_batch_dispatched"))
@@ -1033,18 +1036,11 @@ def read_git_documents(root: Path, revisions: Sequence[DocumentRevision]) -> dic
     result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "cat-file", "--batch"],
                             input=requests.encode(), capture_output=True, timeout=8, check=False)
     documents: dict[str, str] = {}
-    offset = 0
+    replies = BytesIO(result.stdout)
     for revision in revisions:
-        end = result.stdout.find(b"\n", offset)
-        if end < 0:
-            break
-        header = result.stdout[offset:end].split()
-        offset = end + 1
-        if len(header) != 3 or header[1] != b"blob" or not header[2].isdigit():
-            continue
-        length = int(header[2])
-        documents[revision.sha] = result.stdout[offset:offset + length].decode("utf-8", errors="replace")
-        offset += length + 1
+        reply = read_batch_blob(replies)
+        if isinstance(reply, GitBlob):
+            documents[revision.sha] = reply.content.decode("utf-8", errors="replace")
     return documents
 
 

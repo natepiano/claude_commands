@@ -2,13 +2,16 @@
 """Report the pre-registered nextest-width switchback trial."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
 import json
 import random
 import sqlite3
-import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -17,12 +20,12 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import Literal, NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
-import store
-from memory_admit import expected_peak, git_identity, test_threads
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.buildlog import store
+from scripts.buildlog import index as buildlog_index
+from scripts.buildlog.step_outputs import indexed_argv
+from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
 WASHOUT_S = 900
@@ -96,23 +99,6 @@ def _epoch(stamp: object) -> float:
     return parsed.timestamp()
 
 
-def _argv(value: object) -> list[str]:
-    if not isinstance(value, str):
-        return []
-    try:
-        decoded = cast(object, json.loads(value))
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(decoded, list):
-        return []
-    arguments: list[str] = []
-    for item in cast(list[object], decoded):
-        if not isinstance(item, str):
-            return []
-        arguments.append(item)
-    return arguments
-
-
 def _filter_expression(argv: list[str]) -> str | None:
     for index, argument in enumerate(argv[:-1]):
         if argument == "-E":
@@ -148,7 +134,7 @@ def load_steps(index: Path, since: float, until: float, host: str) -> list[Step]
         request = _epoch(started_at) - wait
         if not since <= request < until:
             continue
-        argv = _argv(raw_argv)
+        argv = indexed_argv(raw_argv)
         duration = float(duration_s) if isinstance(duration_s, (int, float)) else None
         finished = float(finished_s) if isinstance(finished_s, (int, float)) else None
         steps.append({
@@ -353,7 +339,7 @@ def _test_timeouts(index: Path, step_ids: set[str]) -> int:
 
 
 def _uses_memory_gate(step_name: object, raw_argv: object) -> bool:
-    argv = _argv(raw_argv)
+    argv = indexed_argv(raw_argv)
     if step_name == "sweep" and any(argument.endswith("/sweep.py") for argument in argv):
         return False
     if argv and argv[0] == "taplo":
@@ -446,7 +432,9 @@ def _clock(epoch: float) -> str:
 
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:
     root = root if root is not None else store.root()
-    index = root / store.INDEX_NAME
+    index = buildlog_index.index_path_in(root)
+    if not index.exists():
+        _ = buildlog_index.update_in(root)
     steps = load_steps(index, since, until, host)
     arms: dict[int | None, list[Step]] = defaultdict(list)
     for step in steps:
@@ -485,8 +473,10 @@ def report(since: float, until: float, host: str = "natedev", root: Path | None 
     t_values = _value_by_arm(arms, t_stat)
     f_values = _value_by_arm(arms, f_stat)
     repository = git_identity(["cargo", "nextest", "run"], str(Path.home() / "rust/hana"))[0]
+    configuration = read_memory_config()
     r_values: dict[int | None, float | None] = {
-        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width).bytes / GIB
+        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width,
+                             first_peak_bytes=configuration.program_first_peaks["cargo"]).bytes / GIB
         for width in widths
     }
 

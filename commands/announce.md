@@ -1,11 +1,15 @@
 ---
-description: Send every showrunner, unit director, Codex worker and other agent on both machines a message at once. Args - `<message>`.
+description: Send a message to all agents.
 argument-hint: "<message>"
 ---
 
-`$ARGUMENTS` is the user's message. Send it as written, never rephrased, and show the output unchanged:
+## Message text
 
-`python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>, <HH:MM zone>): <message>"`
+Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the command output without changes.
+
+## Delivery
+
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>, <HH:MM zone>): <message>"`
 
 It reaches every showrunner, unit director, Claude or Codex worker, and freestanding agent on both machines. Each is told everyone has it, so nobody passes it on.
 

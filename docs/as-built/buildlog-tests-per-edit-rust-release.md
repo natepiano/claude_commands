@@ -2,7 +2,7 @@
 
 ## What it is
 
-Two additions to the build log. The first is a "Tests per edit" section in the daily `buildlog report`. It counts how many `verify.sh test` runs each agent worker makes per edit to its tree, compares that to a target of 0.5, and shows what testing too rarely costs: failures binned by edits since the last green test, with the average time back to green. It answers "are workers testing often enough?" without hiding the failures behind a single ratio. The second is a Rust release check on natedev's hourly build-log job. Once a day it reads the latest stable Rust and the toolchain hana pins. When a newer stable is out, it trial-builds hana with it at night, in a throwaway clone, while nothing else is building. It then texts the user once per version with the cost of adopting it: new clippy warnings, compiler errors, and whether cargo-mend still builds. The same result appears as one line in the daily report until hana's pin catches up.
+Two additions to the build log. The first is a "Tests per edit" section in the daily `buildlog report`. It counts how many `verify.sh test` runs each agent worker makes per edit to its tree, compares that to a target of 0.5, and shows what testing too rarely costs: failures binned by edits since the last green test, with the average time back to green. It answers "are workers testing often enough?" without hiding the failures behind a single ratio. The second is a Rust release check on natedev's hourly build-log job. Once a day it reads the latest stable Rust and the toolchain hana pins. When a newer stable is out, it trial-builds hana with it at night, in the standing `toolchain-trial` checkout, while nothing else is building. It then texts the user once per version with the cost of adopting it: new clippy warnings, compiler errors, and whether cargo-mend still builds. The same result appears as one line in the daily report until hana's pin catches up.
 
 ## How it works
 
@@ -41,7 +41,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 ### Rust release check
 
-**Hook.** `cli.hourly()` runs `sync.sync`, `ci.ci`, then `rust_release.check_release`, each in its own `try`. A job that raises prints one line, goes to `store.note_error("hourly <name>")` and sets exit 1; the others still run. `index.update()` runs last. The check runs with all defaults:
+**Hook.** `cli.hourly()` runs `sync.sync`, `vault_pull.vault`, `ci.ci`, the screenshot scan, then `rust_release.check_release`, each in its own `try`. A job that raises prints one line, goes to `store.note_error("hourly <name>")` and sets exit 1; the others still run. `index.update()` runs last. The check runs with all defaults:
 
 ```python
 def check_release(*, fetch_channel=fetch_channel_file, read_pin=pinned_version,
@@ -66,19 +66,19 @@ It returns 0, or 1 when the channel fetch or the text failed.
 
 Otherwise `waiting_reason()` returns the first failing reason (`build hold active`, `cargo build active`, `513 GiB free, needs 550`) and the state holds `TrialWaiting`. A later hourly run tries again. Only `waiting` trials run: a finished or failed trial is never repeated for the same version.
 
-**Trial steps.** `trial_release(version, run_command, held, trial_parent) -> TrialOutcome` uses the clone `<temp dir>/rust-release-trial-<version>`. It removes any stale clone first, and a `finally` removes the clone on every outcome.
+**Trial steps.** `trial_release(version, run_command, held) -> TrialOutcome` uses `copies.standing("toolchain-trial", HANA, sha)`. The checkout keeps its own ignored build files and releases its busy lock on every outcome.
 
 | Step name | Command | Timeout |
 | --- | --- | --: |
 | `toolchain` | `rustup toolchain install <ver> --profile minimal --component clippy --component rustc-dev` | 1800 s |
-| `clone` | `git clone --local --no-checkout ~/rust/hana <clone>` | 600 s |
-| `revision` | `git -C ~/rust/hana rev-parse origin/init/catalyst`, then `git -C <clone> checkout --detach <sha>` | 30 s, 600 s |
+| `checkout` | `copies.standing("toolchain-trial", HANA, sha)` resets the standing checkout | copies API |
+| `revision` | `git -C ~/rust/hana rev-parse origin/init/catalyst`; copies.py resets to that sha | 30 s |
 | `clippy` | in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json`, with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, enabling FMA; hana's `origin/main` CI still has mold-only flags (see [fused multiply-add](build-followups-mul-add.md)) | 7200 s |
-| `cargo-mend` | in the clone: `cargo +<ver> install --path ~/rust/cargo-liner/crates/cargo-mend --root <clone>/mend-root`, with `RUSTC_BOOTSTRAP=1` and `CARGO_TARGET_DIR=<clone>/mend-target` | 3600 s |
+| `cargo-mend` | in the clone: `cargo +<ver> install --path ~/rust/cargo-liner/crates/cargo-mend --root <clone>/target/mend-root`, with `RUSTC_BOOTSTRAP=1` and `CARGO_TARGET_DIR=<clone>/mend-target` | 3600 s |
 
 - `run_process()` starts each step in its own session (`start_new_session=True`). On timeout it sends `SIGKILL` to the whole process group, then raises `TimeoutExpired`.
 - `trial_environment()` copies the environment. It sets `CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"` when that variable is unset and `/dev/steve` is a readable, writable character device (natedev's jobserver, `modules/linux/jobserver.nix`).
-- `held()` is checked before and after every step. A hold returns `TrialWaiting` with `build hold active`, deletes the clone, and leaves the version pending.
+- `held()` is checked before and after every step. A hold returns `TrialWaiting` with `build hold active`, releases the checkout lock, and leaves the version pending.
 
 **Trial results.**
 - `diagnostic_counts(stdout)` reads the clippy JSON. It counts `compiler-message` entries at level `warning` or `error`, once per (package id, level, lint code, primary span), and returns warnings, warning crates, errors, error crates. Every warning counts as new.
@@ -100,9 +100,9 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 
 ## Invariants
 
-- Every outside effect of `check_release()` is a keyword parameter whose default is the real one: channel fetch, pin read, subprocess runner, clock, free space, hold check, cargo check, text sender, trial folder. A new outside effect gets a new parameter, and tests pass a fake.
-- Tests never touch the real build log, the real state file, hana, the network, `~/.local/state/build-hold/` or the user's config. `point_root_at()` points `BUILDLOG_DIR` at a temporary root; `LINT_CONFIG` and `tempfile.gettempdir` are patched. The only real subprocess in the suite is the `sh -c 'sleep 60 &'` that checks the group kill.
-- hana is only read: `git show` and `git rev-parse`. All building happens in a `git clone --local` under the temp dir, and the clone is deleted on every outcome, a hold included.
+- Channel fetch, pin read, trial subprocess runner, clock, free space, hold check, cargo check and text sender are keyword parameters of `check_release()`. Standing checkout preparation uses the shared copies API and its configuration.
+- Tests never touch the real build log, the real state file, hana, the network, `~/.local/state/build-hold/` or the user's config. `point_root_at()` points `BUILDLOG_DIR` at a temporary root; `LINT_CONFIG`, `HOME`, hana and `tempfile.gettempdir` are patched. Real Git prepares a private source repository and its standing checkout; trial build commands are fake. A real `sh -c 'sleep 60 &'` checks the group kill.
+- hana is only read: `git show` and `git rev-parse`. All building happens in `~/worktrees/gates/hana/toolchain-trial-gate` (or its second checkout), through copies.py; the target stays for the next trial.
 - One text per stable version. The trial and `text_sent` carry across days while the version is unchanged. A newer stable resets both. A pin that goes away keeps both, so a returning pin neither re-trials nor re-texts.
 - A failed trial is not retried. Only a `waiting` trial runs, and a killed step leaves the trial `waiting`.
 - A trial never starts outside 02:00–05:00 local, during a build hold, while the user runs cargo, rustc or cargo-nextest, or below floor plus headroom.
@@ -126,7 +126,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - The trial runs inside the hourly job, so sync, CI polling and the index update wait while it runs, at night only.
 - The hold is checked between steps, not during one. A hold that arrives during clippy waits for clippy to end, up to 2 h. `/build:hold` already waits for `pgrep` to print nothing before its test starts.
 - hana's `.#ci` shell carries no Rust toolchain. The job `PATH`'s `cargo` is the rustup proxy, which is why `cargo +<ver>` selects the trial toolchain inside `nix develop`.
-- The clone has no `origin/init/catalyst` ref. The sha is resolved in hana and checked out by sha in the clone; that works because `--local` hard-links hana's whole object store.
+- The clone has no `origin/init/catalyst` ref. The sha is resolved in hana and checked out by sha in the clone; copies.py fetches that commit from hana before checkout.
 - The trial toolchain stays installed for the bump. Nothing removes old trial toolchains.
 - The target sizes are summed apparent file sizes, not allocated blocks. They exist only to calibrate the headroom.
 - A finished trial with no warnings still says `0 new warnings in 0 crates`.
@@ -134,7 +134,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - Deleting `rust_release.json` forgets the trial and the sent text. The next run fetches, and the next quiet-hours run trials and texts again.
 - The check runs on natedev only, and sync does not copy the log root, so the Mac's report never shows the Rust line.
 - The hourly job runs `~/.claude` main's copy. Test a change with the worktree's `./scripts/...`.
-- basedpyright exits 3 on every checkout because `pyrightconfig` names a missing `.venv`. The bar is 0 errors and 0 warnings, not the exit code.
+- basedpyright exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

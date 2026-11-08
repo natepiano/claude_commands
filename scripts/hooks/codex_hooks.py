@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""Install and trust the Codex hooks: the Rust PostToolUse checks and the berth PreToolUse check on
-`apply_patch`, and the scratch and build-hold PreToolUse checks on `Bash`."""
+"""Install and trust Codex tool checks and the STE context hooks.
+
+The tool checks match `apply_patch` or `Bash`. STE runs at SessionStart and
+SubagentStart. Their `*` matchers cover every session source and subagent type.
+Session sources include startup, resume, clear and compact; they are not tool
+names. Listing and trust use the event, matcher, command and timeout together,
+so two events can share one script without sharing a trust identity.
+"""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import contextlib
 import json
@@ -39,17 +49,24 @@ class ShellHookFront(NamedTuple):
 
 
 class CodexHook:
-    """A named handler for one hook event and tool matcher that must be installed and trusted."""
+    """A named handler for one event and matcher that must be installed and trusted."""
 
-    __slots__: tuple[str, ...] = ("name", "command", "event", "timeout", "matcher")
+    __slots__: tuple[str, ...] = ("name", "command", "event", "_timeout", "matcher")
 
     def __init__(self, name: str, script: PythonHookScript | ShellHookFront, event: str = "PostToolUse", timeout: int = 10,
                  matcher: str = "apply_patch") -> None:
         self.name: str = name
         self.command: str = script.command()
         self.event: str = event
-        self.timeout: int = timeout
+        self._timeout: int = timeout
         self.matcher: str = matcher
+
+    @property
+    def timeout(self) -> float:
+        if self.name == "scratch-guard":
+            from scripts.copies.copy_guard import hook_timeout
+            return hook_timeout()
+        return self._timeout
 
     def handler(self) -> dict[str, object]:
         return {"type": "command", "command": self.command, "timeout": self.timeout}
@@ -64,8 +81,12 @@ HOOKS: tuple[CodexHook, ...] = (
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
     CodexHook("berth", PythonHookScript("pre-tool-use-berth.py"), "PreToolUse", 30),
     # Codex sends a shell command as tool `Bash`, as Claude Code does.
-    CodexHook("scratch-guard", PythonHookScript("pre-tool-use-scratch-guard.py"), "PreToolUse", 10, "Bash"),
+    CodexHook("scratch-guard", PythonHookScript("../copies/copy_guard.py"), "PreToolUse", matcher="Bash"),
     CodexHook("build-hold-guard", ShellHookFront("pre-tool-use-build-hold-guard.sh"), "PreToolUse", 10, "Bash"),
+    CodexHook("ste", PythonHookScript("session-start-ste.py"), "SessionStart", 10, "*"),
+    CodexHook("ste-subagent", PythonHookScript("session-start-ste.py"), "SubagentStart", 10, "*"),
+    CodexHook("queue-start", PythonHookScript("codex-queue-drain.py"), "SessionStart", matcher="*"),
+    CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
 )
 
 
@@ -396,11 +417,12 @@ def _restore_moved_trust(
 def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHook | MissingHook]:
     selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
     for entry in entries:
-        hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
+        hook = next((hook for hook in HOOKS
+                     if entry.get("command") == hook.command
+                     and entry.get("eventName") == hook.listed_event()
+                     and entry.get("matcher") == hook.matcher), None)
         if (
             hook is None
-            or entry.get("eventName") != hook.listed_event()
-            or entry.get("matcher") != hook.matcher
             or entry.get("handlerType") != "command"
             or entry.get("timeoutSec") != hook.timeout
         ):

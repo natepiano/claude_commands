@@ -1,6 +1,8 @@
 """Find a unit's review history through the command with disposable local and Mac roots."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import subprocess
@@ -11,14 +13,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import final, override
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, recorded_showrunner
 from scripts.usage.collect import MAC_HOST
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("unit_run.py")
 REPOSITORY = SCRIPT.resolve().parents[2]
 EPOCH = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
-UNIT = "review-pool-unit"
+UNIT = "review"
 SSH_STUB = r'''
 import json
 import os
@@ -60,7 +65,7 @@ class UnitRunTests(unittest.TestCase):
         self.history = self.root / "history"
         self.mac_history = self.root / "mac-history"
         self.production = self.root / "show-production.md"
-        self.worktree = self.root / "worktrees" / "review pool"
+        self.worktree = self.root / "worktrees" / "review"
         self.ssh_log = self.root / "ssh.jsonl"
         mac_home = self.root / "mac-home"
         mac_home.mkdir()
@@ -76,7 +81,6 @@ class UnitRunTests(unittest.TestCase):
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PATH": str(bin_directory) + os.pathsep + os.environ.get("PATH", ""),
             "UNIT_HISTORY_DIR": str(self.history),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "USAGE_STATE_DIR": str(self.root / "usage"),
             "UNIT_RUN_SSH_LOG": str(self.ssh_log),
             "UNIT_RUN_MAC_HOME": str(mac_home),
@@ -84,23 +88,30 @@ class UnitRunTests(unittest.TestCase):
             "UNIT_RUN_SSH_FAIL": "0",
             "CLAUDE_PYTHON": sys.executable,
         }
-        self.write_production(str(self.worktree))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        self.write_production()
+        owner = recorded_showrunner("show", self.production)
+        _ = fixture_member("unit", name="review", parent=owner.id,
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.worktree))
 
-    def write_production(self, worktree: str) -> None:
-        # Another table must not provide the unit's Worktree cell.
-        _ = self.production.write_text("\n".join([
-            "# Show", "", "## Notes", "| Unit | Worktree |", "| --- | --- |",
-            f"| {UNIT} | /other/table |", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| {UNIT} | `plan.md` | `{worktree}` | topic | director | — | scripts |",
-            "", "## Dependencies", "",
-        ]), encoding="utf-8")
+    def write_production(self) -> None:
+        _ = self.production.write_text("# Show\n", encoding="utf-8")
 
     def events(self, history: Path, run_id: str, *events: dict[str, object]) -> Path:
         runs = history / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         path = runs / f"{run_id}.jsonl"
+        owner = next(row for row in staff.snapshot().find(kind="showrunner"))
+        for event in events:
+            folder = event.pop("working_dir", None)
+            if event.get("event_type") == "run_started" and isinstance(folder, str):
+                normalized = Path(os.path.normpath(folder))
+                row = staff.snapshot().unit_by_worktree(remote.local_machine(), normalized)
+                if row is None:
+                    row = fixture_member("unit", name="history-" + run_id, parent=owner.id,
+                                         runtime_id=fixture_runtime_id("history:" + run_id),
+                                         worktree=staff.PresentWorktree(remote.local_machine(), normalized))
+                event["main_agent"] = {"family": "claude", "session_id": row.current_session}
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return path
 
@@ -112,9 +123,9 @@ class UnitRunTests(unittest.TestCase):
         })
 
     def run_script(self, *arguments: str, unit: str = UNIT) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.production),
+        return subprocess.run([sys.executable, str(SCRIPT), "--production", "show",
                                unit, *arguments], env=self.environment, capture_output=True,
-                              text=True, check=False, timeout=300)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def assert_match(self, result: subprocess.CompletedProcess[str], run_id: str,
                      machine: str, seconds: float) -> None:
@@ -134,6 +145,33 @@ class UnitRunTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn(json.dumps(MAC_HOST), calls[0])
 
+    def test_unfilled_staff_location_refuses(self) -> None:
+        owner = next(row for row in staff.snapshot().find(kind="showrunner"))
+        _ = fixture_member("unit", name="unfilled", parent=owner.id)
+        _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
+        result = self.run_script("--no-mac", unit="unfilled")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfilled", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_remote_staff_location_refuses(self) -> None:
+        member = next(row for row in staff.snapshot().find(kind="unit"))
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("mac", self.worktree), expected=member.worktree)
+        _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
+        result = self.run_script("--no-mac")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mac", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_run_history_follows_a_staff_folder_change_without_a_record_rewrite(self) -> None:
+        path = self.record(self.history, "staff-run", str(self.worktree), 10)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "review")
+        destination = self.root / "staff-folder"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
+        self.assert_match(self.run_script("--no-mac"), "staff-run", "natedev", 10)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_newest_start_wins_over_filename_and_file_modification_time(self) -> None:
         old = self.record(self.history, "zzz-old", str(self.worktree), 10)
         newest = self.record(self.history, "aaa-newest.session", str(self.worktree), 30.25)
@@ -148,12 +186,7 @@ class UnitRunTests(unittest.TestCase):
         _ = self.record(self.history, "elsewhere", str(self.root / "elsewhere"), 100)
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 
-    def test_a_trailing_slash_in_the_worktree_cell_is_normalized(self) -> None:
-        self.write_production(str(self.worktree) + "/")
-        _ = self.record(self.history, "matching", str(self.worktree), 10)
-        self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
-
-    def test_run_working_dir_is_normalized_without_resolving_the_filesystem(self) -> None:
+    def test_history_reader_uses_the_staff_folder_without_resolving_the_filesystem(self) -> None:
         _ = self.record(self.history, "matching", str(self.worktree) + "/missing/../", 10)
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 
@@ -178,10 +211,10 @@ class UnitRunTests(unittest.TestCase):
         _ = (self.history / "runs" / "invalid-text.jsonl").write_bytes(b"\xff\xfe")
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 
-    def test_no_units_row_reports_the_unit_and_does_not_call_ssh(self) -> None:
-        result = self.run_script(unit="absent-unit")
-        self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (1, "", "unit_run: no Units row for absent-unit\n"))
+    def test_no_staff_row_reports_the_unit_and_does_not_call_ssh(self) -> None:
+        result = self.run_script(unit="absent")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("absent", result.stderr)
         self.assertFalse(self.ssh_log.exists())
 
     def test_no_run_with_no_mac_reports_the_unit_and_worktree(self) -> None:

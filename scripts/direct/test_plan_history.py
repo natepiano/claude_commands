@@ -5,11 +5,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import override
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit
 
 from scripts.direct import plan_history
 
 
 class PlanDependencyTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+
     def read_dependencies(self, body: str) -> list[str] | None:
         with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.md"
@@ -37,7 +44,7 @@ class PlanDependencyTests(unittest.TestCase):
             ("Phase 9, Phase 10, Phase 12", ["9", "10", "12"]),
             ("Phase 64, Phase 62 (sequenced after it; no file overlap)", ["64", "62"]),
             ("Phase 8, and organon's b926ca727 (or its successor) landed on init/catalyst", ["8"]),
-            ("Phase 86; shutdown-unit's hold API (eb30ce4a)", ["86"]),
+            ("Phase 86; shutdown's hold API (eb30ce4a)", ["86"]),
             (
                 "Phases 5 and 7 (showrunner returns of C443, C446 and C447, "
                 + "2026-10-29: runs next, ...)",
@@ -48,7 +55,7 @@ class PlanDependencyTests(unittest.TestCase):
                 + "the Phase 3 and Phase 4 ...",
                 ["3", "4", "5"],
             ),
-            ("Phase 3 (resources-unit waits until 2026-10-29 00:00)", ["3"]),
+            ("Phase 3 (resources waits until 2026-10-29 00:00)", ["3"]),
         ]
         for line, expected in cases:
             with self.subTest(line=line):
@@ -84,53 +91,72 @@ class PlanDependencyTests(unittest.TestCase):
                     ["3", "4"],
                 )
 
-    def read_unit_dependencies(self, header: str, depends: str) -> list[str] | None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
+    def read_unit_dependencies(self, in_staff: bool, depends: str) -> list[str] | None:
+        with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.md"
             _ = plan.write_text(
-                "# Plan\n" + header + "\n### Phase 100 — Delivery · status: todo\n"
+                "# Plan\n\n### Phase 100 — Delivery · status: todo\n"
                 + "**Depends on:** " + depends + "\n",
                 encoding="utf-8",
             )
+            if in_staff:
+                document = plan.parent / "production.md"
+                _ = document.write_text("# Production\n")
+                _ = recorded_unit("sdlc-owner", "phases", plan.parent, document, plan=plan.name)
             phases = plan_history.plan_phases(plan)
         self.assertEqual(len(phases), 1)
         return phases[0]["depends_on"]
 
     def test_own_unit_qualified_phases_are_local_dependencies(self) -> None:
-        for header in (
-            "> **Production: sdlc** — unit `phases-unit`",
-            "> **Production:** sdlc — unit `phases-unit`",
-        ):
-            with self.subTest(header=header):
-                self.assertEqual(
-                    self.read_unit_dependencies(
-                        header, "phases-unit Phase 15; models-unit's Phase 4; phases-unit's Phase 16"
-                    ),
-                    ["15", "16"],
-                )
         self.assertEqual(
-            self.read_unit_dependencies("", "phases-unit Phase 15; Phase 7"), ["7"]
+            self.read_unit_dependencies(
+                True, "phases Phase 15; models's Phase 4; phases's Phase 16"
+            ),
+            ["15", "16"],
+        )
+        self.assertEqual(
+            self.read_unit_dependencies(False, "phases Phase 15; Phase 7"), ["7"]
         )
 
     def test_quoted_unit_qualifiers_preserve_dependency_ownership(self) -> None:
-        header = "> **Production: sdlc** — unit `phases-unit`"
         for quote in ("`", "'", '"', "**"):
             for possessive in ("", "'s", "’s"):
                 with self.subTest(quote=quote, possessive=possessive):
                     self.assertEqual(
                         self.read_unit_dependencies(
-                            header,
-                            f"{quote}models-unit{quote}{possessive} Phases 11 and 12; "
-                            + f"{quote}phases-unit{quote}{possessive} Phase 15; Phase 7",
+                            True,
+                            f"{quote}models{quote}{possessive} Phases 11 and 12; "
+                            + f"{quote}phases{quote}{possessive} Phase 15; Phase 7",
                         ),
                         ["15", "7"],
                     )
                     self.assertEqual(
                         self.read_unit_dependencies(
-                            "", f"{quote}models-unit{quote}{possessive} Phase 11"
+                            False, f"{quote}models{quote}{possessive} Phase 11"
                         ),
                         [],
                     )
+
+    def test_conjunctions_preserve_dependency_ownership(self) -> None:
+        cases = [
+            ("Phase 1 and beta Phase 99", ["1"]),
+            ("Phase 1 & beta's Phase 99", ["1"]),
+            ("Phase 1 and Phase 2", ["1", "2"]),
+            ("Phase 1, and Phase 2", ["1", "2"]),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            plan = Path(directory) / "plan.md"
+            document = plan.parent / "production.md"
+            _ = document.write_text("# Production\n")
+            _ = recorded_unit("sdlc-owner", "alpha", plan.parent, document, plan=plan.name)
+            for depends, expected in cases:
+                with self.subTest(depends=depends):
+                    _ = plan.write_text(
+                        "# Plan\n\n### Phase 100 — Delivery · status: todo\n"
+                        + "**Depends on:** " + depends + "\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(plan_history.plan_phases(plan)[0]["depends_on"], expected)
 
     def test_phase_keyword_case_does_not_relax_identifier_suffix_case(self) -> None:
         self.assertEqual(

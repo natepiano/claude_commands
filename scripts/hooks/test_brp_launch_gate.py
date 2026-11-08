@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
+from scripts.build_queue import admission_protocol as wire
+from scripts.lint import memory_admit as gate
+from unittest.mock import patch
+
 import json
 import os
 import subprocess
@@ -11,11 +16,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 HOOK = Path(__file__).with_name("pre-tool-use-brp-launch-gate.sh")
 SETTINGS = HOOK.parent.parent.parent / "settings.json"
@@ -44,6 +48,7 @@ class PendingLaunchCycle(TypedDict):
 
 
 class BrpLaunchGateTests(unittest.TestCase):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     root: Path = Path()
     environment: dict[str, str] = {}
     cycle_file: Path = Path()
@@ -67,6 +72,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -80,6 +86,9 @@ class BrpLaunchGateTests(unittest.TestCase):
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILDLOG_DIR": str(self.root / "buildlog"),
         }
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+        seed_interpreter_cache(self.root / "cache")
+        self.admission = caller_admission(self, self.root, self.environment)
 
     def write_cycle(self) -> None:
         now = datetime.now().astimezone().isoformat()
@@ -99,8 +108,16 @@ class BrpLaunchGateTests(unittest.TestCase):
         entries = cast(list[dict[str, object]], cycle["entries"])
         return entries[0]
 
-    def run_hook(self, session_id: str = "unit-worker", *, include_session: bool = True) -> subprocess.CompletedProcess[str]:
-        hook_input = {"tool_name": "mcp__brp__brp_launch"}
+    def run_hook(
+        self, session_id: str = "unit-worker", *, include_session: bool = True,
+        tool_input: dict[str, object] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        hook_input: dict[str, object] = {
+            "tool_name": "mcp__brp__brp_launch",
+            "tool_input": tool_input if tool_input is not None else {
+                "target_name": "hana", "env": {"HANA_TEST_PURPOSE": "memory launch admission"},
+            },
+        }
         if include_session:
             hook_input["session_id"] = session_id
         return subprocess.run(
@@ -113,11 +130,74 @@ class BrpLaunchGateTests(unittest.TestCase):
         lint = self.root / "lint"
         hooks.mkdir()
         lint.mkdir()
+        (self.root / "lib").symlink_to(HOOK.parent.parent / "lib", target_is_directory=True)
         self.hook = hooks / HOOK.name
         _ = self.hook.write_text(HOOK.read_text())
         _ = (lint / "memory_gate.sh").write_text(
             "buildlog_wait_for_memory() {\n" + body + "\n}\n"
         )
+
+    def test_hana_without_a_nonempty_purpose_is_denied_before_memory_wait(self) -> None:
+        self.use_memory_wait_stub("printf 'memory wait reached\\n' >&2\nreturn 0")
+        for environment in ({}, {"HANA_TEST_PURPOSE": ""}, {"HANA_TEST_PURPOSE": "   "}):
+            with self.subTest(environment=environment):
+                result = self.run_hook(tool_input={"target_name": "hana", "env": environment})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                response = cast(HookResponse, json.loads(result.stdout))
+                decision = response["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+                self.assertIn("HANA_TEST_PURPOSE", decision["permissionDecisionReason"])
+                self.assertIn("env", decision["permissionDecisionReason"])
+                self.assertNotIn("memory wait reached", result.stderr)
+
+    def test_hook_filename_in_its_folder_returns_the_denial(self) -> None:
+        self.use_memory_wait_stub("printf 'memory wait reached\\n' >&2\nreturn 0")
+        result = subprocess.run(
+            ["bash", self.hook.name], cwd=self.hook.parent, env=self.environment,
+            input=json.dumps({"tool_name": "mcp__brp__brp_launch",
+                              "tool_input": {"target_name": "hana", "env": {}}}),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = cast(HookResponse, json.loads(result.stdout))
+        self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("HANA_TEST_PURPOSE", response["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn("memory wait reached", result.stderr)
+
+    def test_hana_with_a_purpose_reaches_memory_wait(self) -> None:
+        self.use_memory_wait_stub("printf 'labelled Hana reached memory wait\\n' >&2\nreturn 0")
+        result = self.run_hook(tool_input={"target_name": "hana", "env": {"HANA_TEST_PURPOSE": "CI icon"}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "labelled Hana reached memory wait\n")
+
+    def test_another_app_needs_no_hana_purpose(self) -> None:
+        self.use_memory_wait_stub("printf 'other app reached memory wait\\n' >&2\nreturn 0")
+        result = self.run_hook(tool_input={"target_name": "other-app", "env": {}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "other app reached memory wait\n")
+
+    def test_aged_launch_without_a_reservation_still_holds_for_free_memory(self) -> None:
+        with self.admission.loop_turn():
+            busy = only_admitted(self.admission.server.handle_request(
+                self.admission.request(run=self.admission.run_owner())))
+            self.admission.allow_next_start()
+        self.admission.free(4 * gate.GIB)
+        self.admission.compiler(8 * gate.GIB)
+        self.environment.update(BUILDLOG_MEM_WAIT_LIMIT_S="0",
+            BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - admission_policy_fixture().timing.estimate_refresh_seconds - 1))
+        result = self.run_hook()
+        self.assert_denied(result,
+            "BRP launch memory check failed (exit 2): memory admission check failed "
+            + "(launch wait limit reached without admission); step refused")
+        with self.admission.loop_turn():
+            self.assertEqual([record.reservation_id for record in self.admission.server.reservations.values()],
+                             [busy.reservation])
+            self.assertEqual(self.admission.server.handle_request(
+                wire.ReleaseRequest("release-busy", busy.reservation, 0)), [wire.Ok()])
+        self.assertEqual(self.admission.server.reservations, {})
+        self.assertEqual(self.admission.server.waiters, {})
 
     def test_failed_memory_wait_denies_launch_with_its_last_reason_line(self) -> None:
         self.use_memory_wait_stub(
@@ -140,6 +220,11 @@ class BrpLaunchGateTests(unittest.TestCase):
             "live memory reading /proc/pressure/memory in a test; "
             + "fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
         )
+        with patch.dict(os.environ, {"BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(record),
+                                     "BUILDLOG_MEMORY_PRESSURE": "/proc/pressure/memory"}):
+            with self.assertRaises(gate.LiveMemoryReading):
+                _ = gate.read_pressure(policy=admission_policy_fixture())
+        self.admission.server.reply_filter = lambda reply: wire.Refused(reason)
         self.assert_denied(
             self.run_hook(),
             f"BRP launch memory check failed (exit 2): memory admission check failed ({reason}); step refused",
@@ -157,31 +242,28 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertEqual(result.stderr, "memory admitted\n")
 
     def test_low_memory_wait_leaves_old_release_record_unchanged(self) -> None:
+        with self.admission.loop_turn():
+            _ = only_admitted(self.admission.server.handle_request(
+                self.admission.request(run=self.admission.run_owner())))
+            self.admission.allow_next_start()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
-        stubs = self.root / "stubs"
-        stubs.mkdir()
-        sleeper = stubs / "sleep"
-        _ = sleeper.write_text(r'''#!/bin/sh
-python3 - "$CYCLE_FILE" "$WAIT_STATE_LOG" <<'PY'
-import json, sys
-entry = json.load(open(sys.argv[1]))["entries"][0]
-with open(sys.argv[2], "a") as output:
-    output.write(entry["state"] + "\n")
-PY
-printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
-''')
-        sleeper.chmod(0o755)
-        self.environment["PATH"] = f"{stubs}:{os.environ['PATH']}"
-        self.environment["CYCLE_FILE"] = str(self.cycle_file)
-        self.environment["WAIT_STATE_LOG"] = str(self.root / "wait-states")
+        states = self.root / "wait-states"
+
+        def free_after_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Wait):
+                _ = states.write_text(str(self.entry()["state"]) + "\n")
+                self.admission.free(60 * gate.GIB)
+            return reply
+
+        self.admission.server.reply_filter = free_after_wait
 
         before = self.cycle_file.read_bytes()
         result = self.run_hook()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("waiting for memory", result.stderr)
-        self.assertEqual((self.root / "wait-states").read_text().splitlines(), ["ReleasedAwaitingAdmission"])
+        self.assertEqual(states.read_text().splitlines(), ["ReleasedAwaitingAdmission"])
         self.assertEqual(self.cycle_file.read_bytes(), before)
 
     def assert_denied(self, result: subprocess.CompletedProcess[str], reason: str) -> None:

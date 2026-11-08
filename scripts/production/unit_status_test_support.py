@@ -1,6 +1,10 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 from contextlib import contextmanager
 from collections.abc import Generator
 import json
@@ -16,22 +20,23 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
-sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
-                for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
-from dailies_input import StatusBlock, UnitRow, status_blocks
-from unit_lookup import UnitState
-import fake_unit_host
-from fake_unit_host import HostedUnit
-from sessions import SessionRecord
-from fake_herdr import CommandResponse, pane_list
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.message.sessions_test_support import copy_session_modules
+from scripts.production import staff, unit_names
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
+)
+from scripts.production.dailies_input import StatusBlock, UnitRow, status_blocks
+from scripts.production.unit_lookup import UnitState
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.message.sessions import SessionRecord
+from scripts.herdr.fake_herdr import CommandResponse, pane_list
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
-SESSION_ID = "test-session"
 # Only bound fixture hangs; no tested wait uses a clock.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def setUpModule() -> None:
@@ -73,6 +78,7 @@ class UnitStatusFixture(unittest.TestCase):
     fixture_parent: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_case: ClassVar[Path]
+    unit_ids: dict[str, staff.StaffId] = {}
 
     @classmethod
     @override
@@ -84,24 +90,29 @@ class UnitStatusFixture(unittest.TestCase):
         script = root / "scripts/production/unit_status.sh"
         script.parent.mkdir(parents=True)
         _ = shutil.copy2(SCRIPT, script)
-        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         message = root / "scripts/message"
-        message.mkdir()
-        _ = shutil.copy2(SCRIPT.parents[1] / "message/sessions.py", message / "sessions.py")
+        copy_session_modules(message)
+        _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
+        (root / "config").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "unit_marks.py", "unit_names.py", "staff.py", "session_pane.py"):
+        for name in ("production_doc.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py", "store_owner.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
+        (root / "scripts/agents").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py"):
+        for name in ("herdr.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("atomic_file.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py", "process_start.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
+        _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         for name in ("active", "sessions"):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
@@ -151,6 +162,7 @@ class UnitStatusFixture(unittest.TestCase):
                 "NOTIFIER_SESSIONS_DIR": str(records),
                 "HERDR_BIN": str(root / "fake-herdr"),
                 "HERDR_PROC": str(root / "proc"),
+                "HERDR_PANE_RECORD_DIR": str(root / "panes"),
                 "HERDR_PLATFORM": "linux",
                 "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
                 "FAKE_HERDR_RESPONSES": str(responses_file),
@@ -159,15 +171,24 @@ class UnitStatusFixture(unittest.TestCase):
             for unit in units:
                 if unit not in retired_units:
                     _ = unit_membership("example", unit)
+            self.unit_ids = {row.name: row.id for row in staff.initial_snapshot().find(kind="unit")}
             pids: dict[str, int] = {}
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
-            rows: list[str] = []
             for unit in units:
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
-                _ = (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
-                plan = "(retired by the user)" if unit in retired_units else "docs/plan.md"
-                rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")
+                for arguments in (
+                    ["init", "--quiet", "-b", unit],
+                    ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+                ):
+                    _ = subprocess.run(["git", "-C", str(worktree), *arguments], check=True,
+                                       capture_output=True, text=True, env=environment,
+                                       timeout=TEST_HANG_GUARD_SECS)
+                if unit not in retired_units:
+                    member = unit_membership("example", unit)
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=member.worktree)
+                    write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
                 if unit in missing_units:
                     continue
                 if unit not in stopped_units:
@@ -175,7 +196,13 @@ class UnitStatusFixture(unittest.TestCase):
                     held = socket.socket(socket.AF_UNIX)
                     held.bind(str(address))
                     self.addCleanup(held.close)
-                    session_id = f"{SESSION_ID}-{unit}"
+                    if unit in retired_units:
+                        owner = showrunner_relationship("example")
+                        member = fixture_member("unit", name=unit, parent=owner.id,
+                                                worktree=staff.RemovedWorktree(remote.local_machine(), worktree))
+                    else:
+                        member = unit_membership("example", unit)
+                    session_id = member.id
                     if marker is not None:
                         _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
                     pids[unit] = self.live_pid()
@@ -185,26 +212,30 @@ class UnitStatusFixture(unittest.TestCase):
                     _ = (records / f"{unit}.json").write_text(
                         "{" if unit in unreadable_units else json.dumps(record))
             production_doc = root / "example-production.md"
-            _ = production_doc.write_text("\n".join((
-                "# Production", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                "| --- | --- | --- | --- | --- | --- |", *rows)), encoding="utf-8")
+            _ = production_doc.write_text("# Production\n", encoding="utf-8")
+            owner = showrunner_relationship("example")
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), production_doc))
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
             outputs: list[str] = []
             for pane_by_unit in panes:
                 hosted = [
-                    HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit},
-                               pane_by_unit.get(unit, "— holding: waiting on x\n"))
+                    labeled_host(unit, f"w{index}:p1", unit, production_name="example",
+                                 screen=pane_by_unit.get(unit, "— holding: waiting on x\n"))
                     for index, unit in enumerate(units, start=1) if unit not in missing_units]
+                for unit in hosted:
+                    if unit.session in stopped_units:
+                        unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
                 publish_host(environment, hosted)
                 for unit in hosted:
                     if unit.session in pids:
-                        fake_unit_host.place_process(environment, pids[unit.session], unit.pane)
+                        fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
                 result = subprocess.run(
-                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
-                    check=True, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", "example"],
+                    check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
@@ -222,8 +253,19 @@ class UnitStatusFixture(unittest.TestCase):
         )
         return outputs[0], calls
 
+    def unit_text(self, output: str, unit: str) -> str:
+        """One unit's status text, from its `== unit` line to the next unit; units print in staff row order."""
+        self.assertIn(f"\n== {unit}\n", output)
+        return f"== {unit}" + ("\n" + output.partition(f"\n== {unit}\n")[2]).partition("\n== ")[0]
+
+    def status_block(self, output: str, unit: str, units: tuple[str, ...]) -> StatusBlock:
+        """The parsed block of one unit; units print in staff row order."""
+        blocks = [block for block in self.parse_status(output, units) if block.session == unit]
+        self.assertEqual(len(blocks), 1, output)
+        return blocks[0]
+
     def parse_status(self, output: str, units: tuple[str, ...] = ("hook",)) -> tuple[StatusBlock, ...]:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.txt"
             _ = path.write_text(output, encoding="utf-8")
-            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING) for unit in units))
+            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING, self.unit_ids[unit_names.name(unit)]) for unit in units))

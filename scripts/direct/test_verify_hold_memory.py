@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+
 import json
 import subprocess
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 
 from scripts.direct.verify_hold_wait_test_support import (
     StepObservation,
@@ -20,6 +22,12 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.admission = caller_admission(self, self.fixture.root, self.fixture.environment)
+
     def test_holder_joining_during_memory_admission_delays_step_and_records_separate_waits(self) -> None:
         invoke = VERIFY.parent.parent / "lint" / "invoke.sh"
         memory_clock = self.fixture.root / "memory-clock"
@@ -90,7 +98,7 @@ run_once cargo check
         observer = Path(self.fixture.environment["CLAUDE_PYTHON"])
         source = observer.read_text().replace(
             'os.execv(os.environ["TEST_REAL_PYTHON"],',
-            '''if len(sys.argv) > 2 and sys.argv[1].endswith("/lint/memory_admit.py") and sys.argv[2] == "check":
+            '''if len(sys.argv) > 2 and sys.argv[1].endswith("/build_queue/admission_client.py") and sys.argv[2] == "admit":
     path = Path(os.environ["TEST_CYCLE_FILE"])
     if not path.exists():
         from datetime import datetime

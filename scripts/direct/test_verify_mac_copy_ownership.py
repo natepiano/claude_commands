@@ -4,17 +4,20 @@ from __future__ import annotations
 import unittest
 import subprocess
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim
+from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim, wait_for_marker_exit
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.direct.wait_for_test_state import wait_for_pid
 
 
 @final
 class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
     def test_a_stopped_call_leaves_no_step_or_copy_running(self) -> None:
         process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
-        cargo = int((self.runner_state / "cargo-compiling").read_text())
+        cargo = wait_for_pid(self.runner_state / "cargo-compiling", processes=(process,))
         # The step runs in its own process group, so a kill of verify's group alone misses it.
         self.assertNotEqual(os.getpgid(cargo), process.pid)
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
@@ -23,13 +26,15 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
         self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
         self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
-        self.stop_verify(process)
+        process.send_signal(signal.SIGTERM)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
         self.assertEqual(processes_carrying(self.child_marker()), set())
 
     def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:
         process, _ = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
         _ = (self.runner_state / "cargo-release").write_text("release\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
         self.assertFalse((self.runner_state / "cargo-stopped").exists())
@@ -44,9 +49,12 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.environment["BUILD_TARGETS_POLL_S"] = "3600"
         process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1", "TEST_COPY_CLAIM": mac_test_script})
 
+        admission = caller_admission(self, self.root, self.environment)
+
         def claim(*words: str) -> subprocess.CompletedProcess[str]:
-            return invoke_mac_claim([*words, "--pid", str(os.getpid())],
-                              self.environment, self.root)
+            with admission.loop_turn():
+                return invoke_mac_claim([*words, "--pid", str(os.getpid())],
+                                        self.environment, self.root)
 
         new_test = claim("claim", "--what", "nextest other", "--worktree", str(self.root))
         self.addCleanup(claim, "release")
@@ -58,7 +66,7 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.wait_for_reaped(copy, (process,))
         self.assertIsNone(process.poll())
         _ = (self.runner_state / "cargo-release").write_text("release\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertFalse((self.runner_state / "cargo-stopped").exists())
         self.assertEqual(len(self.saved_results()), 1)

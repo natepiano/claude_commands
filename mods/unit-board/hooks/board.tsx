@@ -213,7 +213,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
     })}</Box>;
   }
   return <Box flexDirection="column">
-    {boards.length === 0 && limit > 0 && wrappedLines('Run /showrunner:unit_board in a showrunner session.', width).slice(0, limit).map(line => <Text>{line}</Text>)}
+    {boards.length === 0 && limit > 0 && wrappedLines('This session is not on the staff list.', width).slice(0, limit).map(line => <Text>{line}</Text>)}
     {boards.map(board => <Box flexDirection="column" flexShrink={0}>
       {board.header.map((line, index) => drawLine(line, board.data.production, '', index))}
       {board.blocks.map(block => <Box flexDirection="column" flexShrink={0} marginTop={gap}>

@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import re
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-
-import rules
-import style_ledger
-from production_units import cell_value, unit_table
-from unit_files import unit_worktrees
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production import unit_config
+from scripts.style.unit_files import unit_worktrees
 
 
 @dataclass(frozen=True)
@@ -64,11 +60,13 @@ class MissingUnitPlan:
     pass
 
 
-def unit_plan_path(doc: Path, unit: str, worktree: Path) -> Path:
-    for row in unit_table(doc.read_text().splitlines()):
-        if cell_value(row["Unit"]) == unit:
-            return worktree / Path(cell_value(row["Plan"]))
-    raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+def unit_plan_path(unit: str, worktree: Path) -> Path:
+    """The plan file that the unit's `.unit.toml` names."""
+    match unit_config.read(worktree, cleanup=False):
+        case unit_config.UnitConfig(plan=unit_config.PlanFile(path)):
+            return worktree / path
+        case _:
+            raise style_ledger.LedgerError(f"{unit}: no plan file in {worktree / '.unit.toml'}")
 
 
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
@@ -78,10 +76,9 @@ def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]
         family = rules.style_family(row.unit)
         if isinstance(family, rules.NotStyleUnit):
             continue
-        plan = unit_plan_path(doc, row.unit, row.worktree)
         try:
-            texts[family] = plan.read_text()
-        except FileNotFoundError:
+            texts[family] = unit_plan_path(row.unit, row.worktree).read_text()
+        except (FileNotFoundError, style_ledger.LedgerError):
             texts[family] = MissingUnitPlan()
     return texts
 

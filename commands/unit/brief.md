@@ -1,5 +1,5 @@
 ---
-description: Show the next phase's briefing in a /unit:direct run, or give one a gate skipped.
+description: Show the next phase briefing.
 ---
 
 # Direct — briefing

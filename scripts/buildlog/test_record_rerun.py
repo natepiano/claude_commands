@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """An interrupted recorder keeps its original step until publication finishes."""
 
 from __future__ import annotations
@@ -7,33 +7,32 @@ import fcntl
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
-import sys
 import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, chdir, closing, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import health
-import launches
-import record
-import report
-import store
-import test_launch_recording as launch_tests
-import test_record as record_tests
-from test_index import point_root_at, step as indexed_step
-from test_launches import CLI
+from scripts.buildlog import index
+from scripts.buildlog import health, launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
+from scripts.buildlog.cgroup_test_support import CPU, save_scope_counters, write_cgroup
+from scripts.buildlog import test_launch_recording as launch_tests
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.test_index import point_root_at, step as indexed_step
+from scripts.buildlog.test_launches import CLI
+from scripts.buildlog.test_memory_window import configured_host_cli, configured_local_host
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
 
 
 class RecorderStopped(BaseException):
@@ -85,7 +84,9 @@ class RecordRerunTests(unittest.TestCase):
         self.fixture = record_tests.RecordTests()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         environment = self.fixture.environment(
+            **mac_natedev_environment(self.fixture.base / "config"),
             BUILDLOG_TRANSCRIPTS=str(self.fixture.base / "transcripts"),
             BUILDLOG_CALLER="verify",
             BUILDLOG_CALL_ID=record_tests.CALL_ID,
@@ -134,7 +135,7 @@ class RecordRerunTests(unittest.TestCase):
             TZ="UTC",
         )
         result = subprocess.run(
-            [sys.executable, str(CLI), *arguments], cwd=self.fixture.base,
+            configured_host_cli(CLI, *arguments), cwd=self.fixture.base,
             env=environment, capture_output=True, text=True, check=False, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -195,8 +196,10 @@ class RecordRerunTests(unittest.TestCase):
         fixture = launch_tests.LaunchRecordingTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        # Keep one build-log root while reusing the launch fixture's source writer.
+        # Keep the recorder's root and two-machine configuration for the launch source.
         point_root_at(self, self.fixture.root)
+        _ = self.enterContext(mock.patch.dict(  # pyright: ignore[reportAny]
+            os.environ, mac_natedev_environment(self.fixture.base / "config")))
         return fixture
 
     def assert_step_recovers(self, fault: StepRecordingFault) -> None:
@@ -307,6 +310,63 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(self.saved_logs()[0].read_bytes(), saved_log_bytes)
         self.assertEqual(index.update(), 0)
         self.assertEqual(list(pending.glob("*.json")), [])
+
+    def test_transient_scope_sidecar_read_keeps_sources_for_measured_retry(self) -> None:
+        scope = self.fixture.base / "scope-retry"
+        write_cgroup(scope)
+        captured = save_scope_counters(self.peak, scope)
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        read_text = Path.read_text
+        for suffix in (".cpu.stat", ".io.stat"):
+            sidecar = Path(str(self.peak) + suffix)
+
+            def transient_read(path: Path, *args: object, **kwargs: object) -> str:
+                if path == sidecar:
+                    raise PermissionError("fixture transient counter read")
+                return read_text(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+            with self.subTest(sidecar=suffix), mock.patch.object(Path, "read_text", transient_read):
+                self.assertEqual(self.run_step(), 0)
+            self.assertEqual(self.step_records(), [])
+            self.assertEqual(list(record.pending_steps_root().glob("*.json")), [])
+            self.assertTrue(self.held.is_file())
+            self.assertTrue(self.peak.is_file())
+            self.assertTrue(Path(str(self.peak) + ".cpu.stat").is_file())
+            self.assertTrue(Path(str(self.peak) + ".io.stat").is_file())
+        self.assertEqual(self.run_step(), 0)
+        rows = self.step_records()
+        self.assertEqual(len(rows), 1)
+        resources = cast(record_tests.Record, rows[0]["scope_resources"])
+        self.assertEqual(resources["cpu"], CPU)
+        self.assertEqual(cast(record_tests.Record, resources["io"])["state"], "measured")
+        self.assertFalse(Path(str(self.peak) + ".cpu.stat").exists())
+        self.assertFalse(Path(str(self.peak) + ".io.stat").exists())
+
+    def test_interrupted_step_keeps_saved_scope_counters_without_recapturing(self) -> None:
+        scope = self.fixture.base / "scope"
+        write_cgroup(scope, with_io=False)
+        _ = Path(str(self.peak) + ".cgroup").write_text(str(scope) + "\n")
+        captured = save_scope_counters(self.peak, scope)
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        with mock.patch.object(record, "keep_log", side_effect=OSError("fixture log save stopped")):
+            self.assertEqual(self.run_step(), 0)
+        pending_paths = list(record.pending_steps_root().glob("*.json"))
+        self.assertEqual(len(pending_paths), 1)
+        pending = pending_paths[0]
+        saved = cast(record_tests.Record, json.loads(pending.read_text()))
+        original = cast(record_tests.Record, cast(record_tests.Record, saved["row"])["scope_resources"])
+        self.assertEqual(original["cpu"], CPU)
+        self.assertEqual(original["io"], {"state": "unavailable"})
+        shutil.rmtree(scope)
+        Path(str(self.peak) + ".cpu.stat").unlink(missing_ok=True)
+        Path(str(self.peak) + ".io.stat").unlink(missing_ok=True)
+        with mock.patch.object(record, "scope_resources", side_effect=AssertionError("recovery reread scope counters")):
+            finished = record.finish_pending_step(pending)
+        self.assertIsNotNone(finished)
+        rows = self.step_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["scope_resources"], original)
+        self.assertFalse(pending.exists())
 
     def test_stop_after_failed_log_save_finishes_the_original_step_once(self) -> None:
         self.assert_step_recovers(StepRecordingFault.AFTER_LOG_SAVE)
@@ -742,8 +802,14 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         record_word = "record" if pending == 1 else "records"
         error_word = "error" if errors == 1 else "errors"
+        actions: list[str] = []
+        if errors:
+            actions.append("see ~/.local/state/buildlog/errors.log on natedev")
+        if pending:
+            actions.append("run buildlog launches on natedev")
+        advice = "; ".join(actions)
         self.assertRegex(lines[0],
-                         rf"^natedev: {pending} {record_word} the recorder has not finished; {errors} recorder {error_word} since .+ — run buildlog launches on natedev$")
+                         rf"^natedev: {pending} {record_word} the recorder has not finished; {errors} recorder {error_word} since .+ — {re.escape(advice)}$")
         rendered = self.report_text()
         self.assertEqual([line for line in rendered.splitlines() if "the recorder has not finished" in line], lines)
         return lines[0]
@@ -755,7 +821,7 @@ class RecordRerunTests(unittest.TestCase):
         replace = os.replace
 
         def refuse_pending_save(old: str | os.PathLike[str], new: str | os.PathLike[str]) -> None:
-            if Path(new).parent == record.pending_launches_root():
+            if Path(new).parent == record.pending_launch_root():
                 raise OSError("fixture pending save was refused")
             replace(old, new)
 
@@ -763,7 +829,7 @@ class RecordRerunTests(unittest.TestCase):
             self.assertFalse(record.launch(source, fixture.worktree))
         self.assertEqual(source.read_bytes(), original_source)
         self.assertEqual(self.fixture.records(), [])
-        self.assertEqual(list(record.pending_launches_root().glob("*.json")), [])
+        self.assertEqual(list(record.pending_launch_root().glob("*.json")), [])
         errors = self.fixture.root / store.ERRORS_NAME
         self.assertIn("fixture pending save was refused", errors.read_text())
         first_line = self.assert_health_line(0, 1)
@@ -780,7 +846,7 @@ class RecordRerunTests(unittest.TestCase):
         else:
             fixture = self.launch_fixture()
             source = fixture.saved_launch(15803, "2026-10-02T12:00:00+00:00")
-            pending = record.pending_launches_root()
+            pending = record.pending_launch_root()
             publisher = record
             method = "write_launch_line"
             action = lambda: record.launch(source, fixture.worktree)
@@ -844,7 +910,7 @@ class RecordRerunTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
             line = self.assert_health_line(0, 1)
         self.assertEqual(line,
-                         "natedev: 0 records the recorder has not finished; 1 recorder error since 2026-10-02 00:00:00 EDT — run buildlog launches on natedev")
+                         "natedev: 0 records the recorder has not finished; 1 recorder error since 2026-10-02 00:00:00 EDT — see ~/.local/state/buildlog/errors.log on natedev")
 
     def test_successful_step_removes_its_sources_without_saving_a_failure_log(self) -> None:
         self.assertEqual(self.run_step(status=0), 0)

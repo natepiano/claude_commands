@@ -15,7 +15,7 @@ class VerifyDocRecoveryTests(VerifyDocFixture):
                 before = self.verify()
                 self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
                 checkout = Path(self.cargo_calls()[-1]["cwd"])
-                index = checkout.parent / "index"
+                index = checkout / ".git/index"
                 self.assertTrue(index.is_file())
                 if damage == "missing":
                     index.unlink()

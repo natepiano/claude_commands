@@ -9,8 +9,27 @@ from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_ST
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+    def test_cache_reads_each_tool_version_once_per_run_and_rejects_a_changed_version(self) -> None:
+        _ = self.enable_cache()
+        events = self.root / "version-events"
+        self.environment["TEST_VERSION_EVENTS"] = str(events)
+        for version, recorded in (("before", False), ("before", True), ("after", False)):
+            with self.subTest(version=version, recorded=recorded):
+                events.unlink(missing_ok=True)
+                self.environment["TEST_VERSION_MEND"] = version
+                result = self.verify("lint", "sample")
+                self.assertEqual("(recorded)" in result.stdout, recorded)
+                self.assertEqual(events.read_text().splitlines(), ["TAPLO", "MEND", "RUSTFMT", "CLIPPY"])
+                self.assertEqual(self.clippy_ran(), not recorded)
+
+    def test_uncached_lint_reads_only_the_formatter_availability_version(self) -> None:
+        events = self.root / "version-events"
+        self.environment["TEST_VERSION_EVENTS"] = str(events)
+        _ = self.verify("lint", "sample")
+        self.assertEqual(events.read_text().splitlines(), ["RUSTFMT"])
+
     def test_clean_tree_runs_one_judgment_without_repairs_or_rustdoc(self) -> None:
-        result = self.verify("lint", "--workspace")
+        result = self.verify("lint")
         self.assertEqual(self.calls("clippy"), [[
             "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
         ]])
@@ -29,7 +48,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
         self.assertEqual(self.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "-p", "sample"],
-            ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "-p", "sample"],
         ])
         self.assertEqual(self.calls("doc"), [])
 

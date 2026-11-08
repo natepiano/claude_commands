@@ -8,10 +8,18 @@ import random
 from typing import cast
 from uuid import uuid4
 
-from . import evaluate, questions, vault
-from .records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, STATE_DIR
+from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
+
+from scripts.issue_score import evaluate, questions, vault
+from scripts.issue_score.records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, state_dir as configured_state_dir
 
 Disagreement = tuple[vault.Issue, str | int, str | int]
+
+
+def sample_count(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.whole("blind_sample_count")
 
 
 def _spread_choices(candidates: dict[str, list[Disagreement]], count: int) -> list[tuple[str, vault.Issue, str | int, str | int]]:
@@ -46,23 +54,28 @@ def _spread_choices(candidates: dict[str, list[Disagreement]], count: int) -> li
     return selected
 
 
-def _safe_directory(state_dir: Path, issues_dir: Path) -> Path:
+def _safe_directory(state_dir: Path, issues_dir: Path, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     directory = state_dir.expanduser().resolve()
-    if directory.is_relative_to(vault.VAULT_ROOT.resolve()) or directory.is_relative_to(issues_dir.resolve()):
+    if directory.is_relative_to(vault.vault_root(scoring_config=scoring_config).resolve()) or directory.is_relative_to(issues_dir.resolve()):
         raise ValueError("Blind files must be outside the issue vault")
     return directory
 
 
-def blind(run_id: str, count: int = 20, *, seed: int = 0,
-          issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR) -> BlindFiles:
+def blind(run_id: str, count: int | UseConfiguredValue = UseConfiguredValue.CURRENT, *, seed: int = 0,
+          issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> BlindFiles:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    issues_dir = vault.issue_directory(scoring_config=scoring_config) if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    state_dir = configured_state_dir(scoring_config=scoring_config) if isinstance(state_dir, UseConfiguredValue) else state_dir
+    count = sample_count(scoring_config=scoring_config) if isinstance(count, UseConfiguredValue) else count
     if count <= 0:
         raise ValueError("--count must be positive")
     name = run_id.removesuffix(".jsonl")
     if not name or Path(name).name != name or name in (".", ".."):
         raise ValueError("run-id must be a run filename without a directory")
-    state_dir = _safe_directory(state_dir, issues_dir)
+    state_dir = _safe_directory(state_dir, issues_dir, scoring_config=scoring_config)
     run = evaluate.load_run(state_dir / "runs" / f"{name}.jsonl")
-    rated = vault.load_rated_issues(issues_dir)
+    rated = vault.load_rated_issues(issues_dir, scoring_config=scoring_config)
     eligible = [issue for issue in rated.issues if not issue.is_style
                 and issue.path.stem not in questions.HISTORICAL_EFFORT_EXAMPLE_STEMS
                 and evaluate.in_split(issue.path, "holdout") and str(issue.path) in run.scored]
@@ -97,7 +110,7 @@ def blind(run_id: str, count: int = 20, *, seed: int = 0,
         jev_option = rng.choice(("A", "B"))
         first, second = (predicted, actual) if jev_option == "A" else (actual, predicted)
         items.append({"id": identifier, "field": field, "title": issue.title,
-                      "body": vault.clean_body(issue.body), "A": first, "B": second, "pick": ""})
+                      "body": vault.clean_body(issue.body, scoring_config=scoring_config), "A": first, "B": second, "pick": ""})
         assignments.append({"id": identifier, "field": field, "issue_path": str(issue.path),
                             "jev_option": jev_option, "A": first, "B": second})
     sheet: BlindSheet = {"run_id": name, "instructions": "Set each pick to A, B, or same. Leave other values unchanged.", "items": items}
@@ -128,9 +141,10 @@ def _entries(value: object) -> list[dict[str, object]]:
     return [_object(item) for item in cast(list[object], value)]
 
 
-def blind_score(sheet: Path) -> BlindScore:
+def blind_score(sheet: Path, *, scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> BlindScore:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
     sheet = sheet.expanduser().resolve()
-    if sheet.is_relative_to(vault.VAULT_ROOT.resolve()):
+    if sheet.is_relative_to(vault.vault_root(scoring_config=scoring_config).resolve()):
         raise ValueError("Blind files must be outside the issue vault")
     submitted = _object(cast(object, json.loads(sheet.read_text(encoding="utf-8"))))
     key = _object(cast(object, json.loads((sheet.parent / "keys" / sheet.name).read_text(encoding="utf-8"))))

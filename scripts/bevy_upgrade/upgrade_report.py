@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pins import Pin
-from upgrade_record import Announced, Entry, Record, on_target, target_fit
+from scripts.bevy_upgrade.pins import Pin
+from scripts.bevy_upgrade.upgrade_record import Announced, Entry, Record, on_target, target_fit
 
 State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]
 STATE_ORDER: tuple[State, ...] = (
@@ -152,7 +152,7 @@ def _row(name: str, entry: Entry, target: str) -> str:
 
 def table(record: Record, zone: ZoneInfo, now: datetime) -> str:
     lines = [
-        f"Bevy {record['target']} upgrade for {record['slug']}: {record['checkout']}, on Bevy {' and '.join(record['bevy'])}.",
+        f"Bevy {record['target']} upgrade for {record['production']}: {record['checkout']}, on Bevy {' and '.join(record['bevy'])}.",
         _upstream_line(record, zone, now),
         "",
         "| Dependency | Our pin | crates.io | Git | State | Next |",

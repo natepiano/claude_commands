@@ -1,35 +1,68 @@
-# Review regime trial — results (closed 2026-10-05)
+# Review regime records
 
-**Question:** do extra review workers pay for themselves? From 2026-10-01 (user decision), every phase that changes the screen got a UX reviewer, and every phase got a code-quality reviewer (the `craft` lens). Both judged by the three gods (`docs/decision_criteria.md`). On 2026-10-04 the user dropped the code-quality reviewer and kept the UX reviewer. A 12-phase watch then measured the result. The user acknowledged it on 2026-10-05.
+## What it is
 
-**Data:** `review-regime-trial.jsonl` beside this file is the full ledger as of the acknowledgment: 122 rows from the production logs, one per merged phase. The live ledger is `~/.claude/data/review_regime.jsonl`, which is not in git. `scripts/production/review_regime.py report` recomputes the table from either file.
+The review records connect each merged phase to its findings, review time, merge holds, and merge defects.
+`scripts/production/review_regime.py` writes `~/.claude/data/review_regime.jsonl` and reports means by regime.
 
-**Method:**
-- `before` = phases before 2026-10-01; `trial` = both extra reviewers; `after` = UX reviewer only.
-- `holds` = checkpoints the showrunner held.
-- `merge-defects` = defect rows that the merge design check found in the phase's own work.
-- Phases the comparison cannot use carry an `excluded` reason. These were marked from the logs on 2026-10-05, after build-tool phases skewed the first count: 46 changed nothing on screen, 17 had no merge design check, 3 had no check in the log, and 1 had no defect count. The table counts only the rest.
+## How it works
 
-| | before | trial | after |
-| --- | --- | --- | --- |
-| phases merged | 9 | 29 | 12 |
-| holds per phase (mean) | 1.3 | 0.2 | 0.1 |
-| merge design-check defects per phase (mean) | 8.0 | 3.2 | 2.8 |
-| hours, start to merge (median) | 13.9 | 8.1 | 6.3 |
-| review-worker minutes per phase (mean) | - | 62.0 | 48.7 |
-| screenshot check minutes per phase (mean) | - | 38.0 | 25.1 |
-| repair minutes after its findings per phase (mean) | - | 211.3 | 111.6 |
-| UX reviewer findings per phase (mean) | - | 5.7 | 2.5 |
-| code reviewer findings per phase (mean) | - | 4.1 | 0.3 |
+`progress_history.py review-trial --session-dir <run> [--phase-id <id>]` reports one phase instance.
+A named phase selects its open instance or its latest completed instance.
+Without `--phase-id`, the command selects the current phase, including a completed phase.
 
-**Learning:**
-- **The extra review workers paid for themselves.** Against `before`, review workers cut holds by about 6x and design-check defects by 2.5–3x, and phases merged in roughly half the time.
-- **The code-quality reviewer added nothing measurable on top of the UX reviewer.** Without it, every quality figure held or improved, and phases merged about 2 h faster.
-- **Keep the UX reviewer; leave the code-quality worker off.**
+The phase instance's findings ledger supplies both finding counts and the dispatched rounds.
+The current instance uses `findings_state.json`; a parked or closed instance uses `findings_state-<instance>.json`.
+The recorder uses the shared reader in `findings.py` to select the instance's ledger.
+It counts each ledger entry once for each applicable lens, including routed and closed entries.
+An entry counts even when its `finding_opened` event is missing.
+Review records and closure replies do not change the counts.
 
-**Limits:**
-- The samples are small (9 / 29 / 12).
-- `after` phases came later in mature plans.
-- Exclusions were judged from logs, not re-measured.
+| Field | Source |
+| --- | --- |
+| UX findings | Ledger entries whose lens names `ux`. |
+| Code findings | Ledger entries with no lens or any lens other than `ux`. |
+| Review-worker minutes | Finished review passes and UX review activities. |
+| UX check minutes | Finished `UX review` activities. |
+| UX repair minutes | Finished fix passes joined to ledger rounds that cover a UX finding. |
 
-**To re-run the comparison:** append rows with `review_regime.py add` and read `report`. From 2026-10-12 a row carries `plan`, the unit's plan path as its production doc names it, and `add` refuses a second row only for the same unit, plan and phase; a row written earlier has no `plan` and blocks nothing. The watch is acknowledged, so `watch` no longer alerts. From 2026-10-07 a row's code number is every code finding the phase's review raised, and `report` prints it as `code findings per phase (mean)`; the table above counts the code-quality reviewer's findings alone, so compare new rows with each other, not with that line of the table.
+The recorder rounds each time to the nearest whole minute.
+A ledger finding with several lenses contributes to each applicable count.
+
+The line has this form:
+
+```text
+review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
+```
+
+`scripts/production/merge_checkpoint.py` parses it with `review_numbers(line) -> ReviewTrial`.
+The checkpoint script passes the fields to `review_regime.py add`.
+The reader ignores unknown keys in old rows, including former simplify fields.
+
+`review_regime.Row` holds the unit, plan, phase, regime, times, holds, merge defects, findings, review minutes, and optional notes.
+The regime is `before`, `trial`, or `after`.
+`add` requires times with UTC offsets and refuses a merge time before the start time.
+It keeps an existing row for the same unit, plan, and phase.
+
+`report [--since <ISO date>]` excludes rows with an `excluded` reason.
+It reports means for findings, holds, defects, and review times.
+It reports the median elapsed hours from start to merge.
+A phase with zero UX check minutes receives `excluded: no visible change` unless a reason is supplied.
+
+## Calibration / gotchas
+
+The tracked `review-regime-trial.jsonl` contains a fixed data sample.
+The live ledger remains outside Git.
+Rows without a plan field do not identify the same key as rows that supply a plan.
+Missing metric fields do not mean zero.
+Older code counts can describe review records or opening events; current counts use the phase instance's ledger file.
+Compare records with the same count definition.
+
+`watch` waits for 12 eligible `after` phases, then returns 3 until `ack` records the user's acknowledgment.
+An acknowledged watch returns 0.
+
+## Why
+
+Phase-instance selection keeps reopened phases separate.
+The ledger preserves findings after routing and closure.
+The row key lets one unit run several plans without merging their phase numbers.

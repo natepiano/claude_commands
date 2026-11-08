@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """dailies_render.py's footer, report, and timeline through this worktree's CLI."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import json
 import sys
@@ -10,6 +12,8 @@ import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,11 +21,16 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import dailies_render
-from cli_fixture import invoke_cli
-from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
+)
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -35,6 +44,12 @@ AGENT_LINES = ["* none active"]
 def setUpModule() -> None:
     # The state check reads the build hold and mac_test state; no test sees the machine's own.
     scratch = tempfile.TemporaryDirectory()
+    staff_scope = isolated_staff_file(Path(scratch.name) / "staff.json", {})
+    _ = staff_scope.__enter__()
+    unittest.addModuleCleanup(staff_scope.__exit__, None, None, None)
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, source_environment(Path(scratch.name) / "sources"))))
+    _ = unittest.enterModuleContext(isolated_source_readers())
+    _ = fixture_member("showrunner", name="fixture")
     previous = {name: os.environ.get(name) for name in ("BUILD_HOLD_DIR", "MAC_TEST_STATE_DIR")}
     os.environ["BUILD_HOLD_DIR"] = str(Path(scratch.name) / "build-hold")
     os.environ["MAC_TEST_STATE_DIR"] = str(Path(scratch.name) / "mac-test")
@@ -115,8 +130,8 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
                    "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
     if subprocess_cli:
-        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
-                                capture_output=True, text=True, check=False, timeout=300)
+        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     else:
         result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
                             environment, Path(scratch), production_state=True)
@@ -147,18 +162,47 @@ def timeline(lines: list[str]) -> list[str]:
     return lines[opening + 1 : closing]
 
 
+@contextmanager
+def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Generator[Path]:
+    environment = {**source_environment(root / "sources"), "HOME": str(root / "home"),
+                   "HERDR_BIN": "/nonexistent/herdr"}
+    with (isolated_staff_file(root / "staff.json", environment),
+          mock.patch.dict(os.environ, environment), production_paths(environment)):
+        folder = root / "issues"
+        folder.mkdir(exist_ok=True)
+        doc = root / "reader-production.md"
+        _ = doc.write_text(f"# Production — reader\n- **Proposals:** {folder}\n")
+        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
+        timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-reader"
+        timer.mkdir(parents=True, exist_ok=True)
+        _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")
+        path = root / f"{owner.id}.json"
+        reminders: list[dict[str, object]] = []
+        for index, item in enumerate(entries):
+            if "question" not in item and "reviewed" not in item:
+                reminders.append(item)
+                continue
+            fields = {**item, "asked_by": str(owner.id)}
+            _ = (folder / f"question-{index}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
+        _ = path.write_text(json.dumps(reminders))
+        yield path
+
+
 class ReportFooterTests(unittest.TestCase):
     def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
         question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
-        with tempfile.TemporaryDirectory() as scratch:
-            path = Path(scratch) / "outstanding.json"
-            _ = path.write_text(json.dumps([
-                {"since": AT, "text": "reminder"},
-                {"since": AT, "text": "facts needed", "question": question},
-                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
-                {"since": AT, "text": "review failed", "question": question,
-                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
-            ]))
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "reminder"},
+            {"since": AT, "text": "facts needed", "question": question},
+            {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+            {"since": AT, "text": "review failed", "question": question,
+             "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+        ]
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
             items = dailies_render.read_outstanding(path)
             self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
             awaiting = items[1]
@@ -191,11 +235,9 @@ class ReportFooterTests(unittest.TestCase):
             {"question": "Choose now?", "reviewed": None},
             {"question": "Choose now?", "review_unavailable": None},
         ]
-        with tempfile.TemporaryDirectory() as scratch:
-            path = Path(scratch) / "outstanding.json"
-            for fields in cases:
-                with self.subTest(fields=fields):
-                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+        for fields in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as scratch:
+                with canonical_outstanding(Path(scratch), [{"since": AT, "text": "route", **fields}]) as path:
                     with self.assertRaises(dailies_render.InputError):
                         _ = dailies_render.read_outstanding(path)
 
@@ -242,23 +284,22 @@ class ReportFooterTests(unittest.TestCase):
             program = '''import os, sys
 from pathlib import Path
 from types import ModuleType
-sys.path.insert(0, str(Path.cwd()))
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli
 assert "scripts.production.showrunners" not in sys.modules
-assert "dailies_render" not in sys.modules
+assert "scripts.production.dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render
+    from scripts.production import dailies_render
     from scripts.production import showrunners
     from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
     assert note_file.notes_dir() == home / "rust/hanadocs/agents"
     assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
     assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
-    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.sessions_directory() == home / ".claude/sessions"
     assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
 for name in ("first", "second"):
     home = caller.parent / name
@@ -273,8 +314,8 @@ for name in ("first", "second"):
     assert sys.path == caller_path
     paths(caller)
 '''
-            result = subprocess.run([sys.executable, "-c", program], env=environment,
-                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+            result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program], env=environment,
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
@@ -472,7 +513,7 @@ class IdleGroupTests(unittest.TestCase):
         self.assertIn(message, result.error)
 
     def fields(self, length: str = "simple") -> dict[str, object]:
-        working = {**unit(False), "unit": "working-unit", "name": "working", "label": "working"}
+        working = {**unit(False), "unit": "working", "name": "working", "label": "working"}
         return {
             "length": length,
             "zone": ZONE,
@@ -878,13 +919,14 @@ class ChangedPhaseTitleTests(unittest.TestCase):
 class EtaResolutionTests(unittest.TestCase):
     def run_with_state(
         self, fields: dict[str, object], previous: dict[str, object], at: str,
+        *, unit_id: str = "widget-enhancements",
     ) -> tuple[Run, dict[str, object], str]:
         with tempfile.TemporaryDirectory() as scratch:
             input_path = Path(scratch) / "dailies_input.json"
             state_path = Path(scratch) / "dailies_state.json"
             log_path = Path(scratch) / "production.log"
             _ = input_path.write_text(json.dumps(fields), encoding="utf-8")
-            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            _ = state_path.write_text(json.dumps({unit_id: previous} if previous else {}), encoding="utf-8")
             result = run(
                 [str(input_path), "--at", at, "--state", str(state_path), "--log", str(log_path)],
                 scratch,
@@ -892,6 +934,21 @@ class EtaResolutionTests(unittest.TestCase):
             saved = cast(dict[str, object], json.loads(state_path.read_text(encoding="utf-8")))
             logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         return result, saved, logged
+
+    def test_fixed_unit_id_keeps_name_labels_and_log_names(self) -> None:
+        fixed_id = fixture_runtime_id("renderer-owner")
+        entry = {**unit(False), "unit": fixed_id, "name": "panel-ui"}
+        del entry["label"]
+        fields = {**report(False), "units": [entry]}
+        result, saved, logged = self.run_with_state(fields, {}, AT, unit_id=fixed_id)
+        self.assertEqual(result.code, 0, result.error)
+        text = "\n".join(result.lines)
+        self.assertIn("panel-ui", text)
+        self.assertNotIn(fixed_id, text)
+        self.assertIn("panel-ui Phase 2 of 3", logged)
+        self.assertNotIn(fixed_id, logged)
+        self.assertIn(fixed_id, saved)
+        self.assertNotIn("panel-ui", saved)
 
     def test_interrupted_state_publish_preserves_first_eta_and_same_command_reruns(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -910,7 +967,7 @@ class EtaResolutionTests(unittest.TestCase):
             self.assertEqual(expected.code, 0, expected.error)
             complete_state = state.read_bytes()
             _ = state.write_text(original, encoding="utf-8")
-            with mock.patch("atomic_file.os.replace", side_effect=OSError("stopped while saving")):
+            with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("stopped while saving")):
                 stopped = run(arguments, scratch)
             self.assertNotEqual(stopped.code, 0)
             self.assertEqual(state.read_text(), original)
@@ -1143,8 +1200,8 @@ class GanttTests(unittest.TestCase):
         self.assertEqual(self.above_chart(self.gantt([moved], {"widget-enhancements": last})), [])
 
     def test_a_unit_the_last_report_had_and_this_one_lacks_is_named(self) -> None:
-        state = {"widget-enhancements": self.last_report(), "retired-unit": self.last_report()}
-        self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired-unit: no longer in the report"])
+        state = {"widget-enhancements": self.last_report(), "retired": self.last_report()}
+        self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired: no longer in the report"])
 
 
 def saved_row(name: str, started: str = "", eta: str = "") -> dict[str, object]:
@@ -1330,7 +1387,7 @@ def style_summary(**changed: object) -> dict[str, object]:
 @final
 class StyleChildReportTests(unittest.TestCase):
     def saved_style(self, **changed: object) -> dict[str, object]:
-        return {**saved("2026-10-04T10:40", saved_row("names-unit")),
+        return {**saved("2026-10-04T10:40", saved_row("names")),
                 "style": style_summary(**changed)}
 
     def parsed(self, fields: dict[str, object]) -> dailies_render.ChildReport:
@@ -1342,7 +1399,7 @@ class StyleChildReportTests(unittest.TestCase):
         return result.lines
 
     def test_legacy_report_has_no_style_line_and_keeps_its_child_row(self) -> None:
-        fields = saved("2026-10-04T10:40", saved_row("names-unit"))
+        fields = saved("2026-10-04T10:40", saved_row("names"))
         self.assertIsInstance(self.parsed(fields).style, dailies_render.NoStyleSummary)
         lines = self.rendered(fields)
         self.assertEqual([line for line in lines if line.startswith("hana-style")],
@@ -1350,7 +1407,7 @@ class StyleChildReportTests(unittest.TestCase):
         self.assertFalse(any("rules done" in line or "style summary" in line for line in lines))
 
     def test_unavailable_summary_is_printed_directly_under_the_child_row(self) -> None:
-        fields = {**saved("2026-10-04T10:40", saved_row("names-unit")),
+        fields = {**saved("2026-10-04T10:40", saved_row("names")),
                   "style": {"unavailable": "ledger database is locked"}}
         parsed = self.parsed(fields).style
         self.assertIsInstance(parsed, dailies_render.StyleSummaryUnavailable)
@@ -1423,7 +1480,7 @@ class StyleChildReportTests(unittest.TestCase):
             _ = self.parsed(self.saved_style(invented=1))
 
     def test_style_child_expansion_keeps_all_four_unit_rows(self) -> None:
-        names = ("names-unit", "types-unit", "modules-unit", "structure-unit")
+        names = ("names", "types", "modules", "structure")
         fields = {**saved("2026-10-04T10:40", *(saved_row(name) for name in names), units=4),
                   "style": style_summary()}
         lines = self.rendered(fields, expand=True)

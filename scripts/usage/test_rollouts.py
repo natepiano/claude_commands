@@ -12,10 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.usage import rollouts
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
     return json.dumps({"timestamp": at, "type": record_type, "payload": payload})
@@ -121,7 +119,6 @@ class RolloutTests(unittest.TestCase):
         script = """
 import importlib.util
 import sys
-sys.path[:] = [path for path in sys.path if path and 'site-packages' not in path]
 assert not any(name == 'scripts' or name.startswith('scripts.') for name in sys.modules)
 spec = importlib.util.spec_from_file_location('fixture_rollouts', sys.argv[1])
 module = importlib.util.module_from_spec(spec)

@@ -1,5 +1,5 @@
 ---
-description: Send a message to one other running agent, named by its worktree or branch (or any part of its session name). Prefix with `respond` to have it answer back.
+description: Send a message to one running agent.
 ---
 
 # Agent Send

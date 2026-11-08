@@ -6,10 +6,10 @@ import os
 from pathlib import Path
 from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S as HANG_GUARD_S
 import ctypes
 import time
 from unittest import mock
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -49,7 +49,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
         self.release_local_hold()
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(len(self.runner_events()), 2)

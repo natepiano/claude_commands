@@ -1,5 +1,5 @@
 ---
-description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
+description: Report production progress to the user.
 argument-hint: "[gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]"
 ---
 
@@ -19,7 +19,7 @@ draws it with characters a code font has, for when you are remote, since the
 desktop app draws emoji wider than two columns. The mode lives in
 `~/.local/state/showrunner/dailies.conf`, which every showrunner's renderer
 reads, so no session remembers it. A mode argument sets it before the report:
-run `python3 ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
+run `~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
 So do your words: "ascii mode", "switch back to default". It holds until
 changed. User, 2026-10-03.
 
@@ -41,7 +41,7 @@ schedule runs: the builder touches no clock, the report names no next run,
 and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
-   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
+   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production <showrunner name> > <scratchpad>/unit_status.txt`.
    The input builder reads that file and prints `flags first:` for SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
    first in the report.
@@ -60,7 +60,7 @@ A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
 Read the current state, not memory, and check what you state the way
 `/showrunner:produce` checks a unit director's claims.
 
-1. **Time.** `TZ="$(python3 ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
+1. **Time.** `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
 3. **Each unit.** Use the saved status output for its latest activity. For a
    numbered open plan phase, the input builder takes its start and ETA from
@@ -81,7 +81,7 @@ Read the current state, not memory, and check what you state the way
    you and its footer. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
-   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <showrunner name> <unit> --ansi`
    shows a suggestion dimmed (`\e[2m`) on both hosts.
 4. **Merge branch.** The input builder reads the last merge and whether the
    branch is pushed. Supply anything held or testing in the judgment file.
@@ -116,17 +116,17 @@ the user as the failure message. Correct the named input before reporting.
 When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
 and needs `started` in its judgment. A dailies archives no notes: the
-agent-sessions snapshot timer prunes retired units' notes every 2 minutes.
+agent-notes job prunes retired units' notes on the schedule in `config/agent_notes.toml`.
 When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
 carries the topic with that reason.
 
 ```sh
-python3 ~/.claude/scripts/production/dailies_input.py \
-  --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
+~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_input.py \
+  --production <showrunner name> --status <scratchpad>/unit_status.txt \
   --judgment <STATE_DIR>/dailies_judgment.json --state-dir <STATE_DIR>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
   --render-state <STATE_DIR>/dailies_state.json [--user-run] [--expand <child|all>]
-python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
+~/.claude/scripts/lib/py ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <STATE_DIR>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
@@ -139,7 +139,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 - `--log` appends the `dailies ETAs:` line to `LOG`, so the next report can
   compare. Write no such line by hand.
 - Every builder run also saves
-  `~/.local/state/showrunner/<slug>/dailies_last.json`: this report's chart
+  `~/.local/state/showrunner/<staff id>/dailies_last.json`: this report's chart
   rows, its count of units and of units with a checkpoint not merged, and when
   it was written. The showrunner above yours draws your row from it. It prints
   `saved report: ok`; `saved report: unavailable` costs only that row, never
@@ -148,12 +148,11 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 ### Input
 
 The judgment file has `units` and optional `topics` and `merge`. Each unit
-has its Units table id in `unit`, never the session's current name; the builder
-joins run records and status blocks on that id. It has only the fields requiring judgment: `project`,
+has its staff row name in `unit` (`web`); the builder
+joins run records and status blocks on that name. It has only the fields requiring judgment: `project`,
 `goal` when measured, `phase`, `started`, `held`, `held_examples` when useful,
 `update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer, `idle`,
-`then`, `label` (up to eight characters; needed when the session name without
-`-unit` is longer), and ETA numbers (`percent`, `earliest`, `latest`, `first`, `fixes`,
+`then`, `label` (up to eight characters; needed when the staff name is longer), and ETA numbers (`percent`, `earliest`, `latest`, `first`, `fixes`,
 `why`) in `eta`. For a matching numbered open phase the builder takes an absent
 start and ETA fields from the run record; a judgment value wins. Otherwise it
 takes the ETA time from status. Write `merge.held`
@@ -199,13 +198,13 @@ The builder's output, which the renderer consumes:
 | `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
-| `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
+| `counts` | The builder reads `~/.claude/config/dailies.conf` with the fixed showrunner staff id. Each entry has `label` and `count`, or `not_found: true`. A production without configured counts has no counts line. |
 | `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
 | `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
 | `doc` | The builder's: the production doc, whose changes to review, efficiency and proposals the footer's counts line reads when the report renders. Leave it to the builder. |
-| `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
+| `unit` | The unit's staff row name (`web`). The builder joins on this name. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
-| `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
+| `label` | The timeline row name, at most 8 characters. Defaults to the staff name. |
 | `project` | The goal of the unit's whole plan, in a few words, from its plan doc's opening: what you get when every phase is done. Not this phase, and not a list. Example: `tools you build and edit in the 3D scene`. It is the section heading. |
 | `goal` | Required when the unit owns a measurable goal: `target` (the goal in words, its number included), `unit` (`ms`), and the measured `start`, `now` and `aim` from the unit's latest measured run. The renderer prints `goal: <target> - <x>% of <aim> <unit> target achieved`, x from the three numbers. A goal with no number yet gets one before the next report: ask the unit director for a measured baseline and settle the aim. User, 2026-10-04. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
@@ -253,9 +252,9 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 AST`.
-- **Counts:** the production's own counts from `dailies.conf`, on one line just above the chart in every
-  length, `gantt` included: `counts: nightly queue 8 · proposals 3`. A count whose file is missing reads
-  `not found`. None configured, no line. User, 2026-10-10.
+- **Counts:** The builder selects `dailies.conf` keys by the fixed showrunner staff id.
+  Every length shows the counts above the chart: `counts: nightly queue 8 · proposals 3`.
+  A missing source shows `not found`. A production without configured counts has no counts line. User, 2026-10-10.
 - **`gantt`:** the first line, the counts line, the chart and the last lines, and above the chart only two other things. A subject
   that needs the user keeps its full section. A unit that changed since the last report gets one line for each
   change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer
@@ -324,7 +323,7 @@ unless it names another plan's document. User, 2026-10-02.
   the build-holder files, the Mac block file, `OUTSTANDING` and whether any
   subject has `needed:`. A due item below this production also keeps it from
   saying `nothing needed`, and the two tree bullets (`reports to <root>`,
-  `<slug>: needs-user list unreadable`) appear there. No reply carries this
+  `<showrunner name>: needs-user list unreadable`) appear there. No reply carries this
   footer and no `Waiting on:` block follows it (user, 2026-10-18).
 
 ## Length

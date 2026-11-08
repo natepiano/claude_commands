@@ -10,18 +10,23 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import index
-import parse
-import test_record as record_tests
-from record import TARGET_DIR_UNSET
-from store import UNKNOWN_IDENTITY
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import parse
+from scripts.buildlog import repository
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.store import UNKNOWN_IDENTITY
+from scripts.buildlog.test_index import use_test_log
+
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
 
@@ -52,6 +57,12 @@ def fixture(name: str) -> str:
 
 def facts(step: str, name: str) -> parse.LogFacts:
     return parse.log_facts(step, fixture(name))
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
+    _ = write_config_fixture(root / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
 
 
 class ArgvTests(unittest.TestCase):
@@ -233,31 +244,37 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]
 
-    def test_target_dir_is_resolved_from_step_cwd_and_unset_is_explicit(self) -> None:
+    def test_target_dir_is_resolved_from_step_cwd_and_the_workspace_default(self) -> None:
+        _ = (self.fixture.repo / "Cargo.toml").write_text("[workspace]\n")
         absolute = str(self.fixture.base / "shared-target")
         cases: tuple[tuple[dict[str, str], str], ...] = (
             ({"CARGO_TARGET_DIR": "../shared-target"}, absolute),
             ({"CARGO_TARGET_DIR": absolute}, absolute),
-            ({"CARGO_TARGET_DIR": ""}, str(self.fixture.repo)),
-            ({}, TARGET_DIR_UNSET),
+            ({"CARGO_TARGET_DIR": ""}, str(self.fixture.repo / "target")),
+            ({}, str(self.fixture.repo / "target")),
         )
         for environment, expected in cases:
             with self.subTest(environment=environment):
-                row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST, environment)
+                folder = self.fixture.folder_context(record_tests.NEXTEST, extra=environment)
+                row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST,
+                                        {**environment, "BUILDLOG_TARGET_FOLDER": folder})
                 self.assertEqual(row["cwd"], str(self.fixture.repo))
                 self.assertEqual(row["target_dir"], expected)
 
     def test_repository_identity_uses_origin_or_the_root_commit(self) -> None:
         root_commit = self.fixture.git("rev-list", "--max-parents=0", "HEAD", cwd=self.fixture.repo)
+        self.assertEqual(repository.repository_key(str(self.fixture.repo)), "git-root:" + root_commit)
         row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
         self.assertEqual(row["repo_identity"], "git-root:" + root_commit)
         self.assertEqual(self.fixture.git("remote", "add", "origin", "git@GitHub.com:example/hana.git", cwd=self.fixture.repo), "")
+        self.assertEqual(repository.repository_key(str(self.fixture.repo)), "https://github.com/example/hana")
         row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
         self.assertEqual(row["repo_identity"], "https://github.com/example/hana")
 
     def test_step_outside_a_repository_records_unknown_identity(self) -> None:
         directory = self.fixture.base / "not-a-repository"
         directory.mkdir()
+        self.assertEqual(repository.repository_key(str(directory)), UNKNOWN_IDENTITY)
         result = self.fixture.record(
             "step", "0", str(record_tests.START), str(record_tests.START + 12.5),
             "0", "", "", *record_tests.NEXTEST, cwd=directory,
@@ -266,12 +283,12 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         row = self.fixture.records()[-1]
         self.assertEqual(row["cwd"], str(directory))
         self.assertEqual(row["repo_identity"], UNKNOWN_IDENTITY)
-        self.assertEqual(row["target_dir"], TARGET_DIR_UNSET)
+        self.assertEqual(row["target_dir"], "unresolved")
         self.assertEqual(index.update(), 1)
         with closing(index.read_only()) as connection:
-            indexed = cast(list[tuple[str, str, str]], connection.execute(
+            indexed = cast(list[tuple[str, str, str | None]], connection.execute(
                 "SELECT target_dir, repo_identity, target_folder FROM steps").fetchall())
-        self.assertEqual(indexed, [(TARGET_DIR_UNSET, UNKNOWN_IDENTITY, str(directory))])
+        self.assertEqual(indexed, [("unresolved", UNKNOWN_IDENTITY, None)])
 
     def test_scoped_step_keeps_the_recorder_repository_instead_of_phase_context(self) -> None:
         self.assertEqual(self.fixture.git("remote", "add", "origin", "https://example.com/actual/hana.git", cwd=self.fixture.repo), "")
@@ -287,6 +304,47 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         self.assertEqual(row["test_scope"], "filtered")
         self.assertEqual(row["filters"], ["one"])
         self.assertEqual(row["test_phase_peak_bytes"], 1700)
+
+    def test_step_loads_one_configuration_module_in_script_and_package_forms(self) -> None:
+        source = """\
+import json
+from pathlib import Path
+import os
+import runpy
+import sys
+
+mode, script, checkout, arguments = sys.argv[1:]
+path = Path(script)
+arguments = json.loads(arguments)
+if mode == "script":
+    os.chdir(checkout)
+    sys.argv = [script, *arguments]
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit as result:
+        assert result.code == 0, result.code
+else:
+    from scripts.buildlog import record
+    os.chdir(checkout)
+    assert record.main(arguments) == 0
+conf_path = path.parents[1] / "lib/conf.py"
+modules = {name: module for name, module in sys.modules.copy().items()
+           if getattr(module, "__file__", None)
+           and Path(module.__file__).resolve() == conf_path}
+assert len({id(module) for module in modules.values()}) == 1, list(modules)
+"""
+        for mode in ("script", "package"):
+            with self.subTest(mode=mode):
+                handoff = self.fixture.handoff().rename(self.fixture.base / f"handoff-{mode}.log")
+                arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
+                             "0", str(handoff), "", *record_tests.NEXTEST]
+                result = subprocess.run(
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, mode, str(record_tests.SCRIPT), str(self.fixture.repo), json.dumps(arguments)],
+                    cwd=Path(__file__).resolve().parents[2], env=self.fixture.environment(), capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.fixture.records()[-1]["step"], "nextest")
 
     def test_step_rows_keep_compiled_names_and_tty_rows_keep_them_unknown(self) -> None:
         for tty, expected in (("0", ["alpha", "beta"]), ("1", None)):
@@ -313,6 +371,17 @@ class SweepTests(unittest.TestCase):
 
 
 class NextestFormTests(unittest.TestCase):
+    def test_logs_without_test_results_do_not_require_the_nextest_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary)
+            _ = write_config_fixture(config / "test_times.conf")
+            _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((rows, summaries), ([], []))
+                with self.assertRaises(ValueError):
+                    _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
+
     def test_slow_and_timeout(self) -> None:
         result = parse.log_facts("nextest", NEXTEST_TIMEOUT)
         self.assertEqual(result["tests_run"], 3)

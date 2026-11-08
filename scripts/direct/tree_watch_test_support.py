@@ -22,13 +22,12 @@ from unittest import mock
 
 from scripts.direct import tree_watch
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 WATCHER = Path(tree_watch.__file__)
 WATCH_INTERVAL = 0.5
 # Preserve the real change-detection and parent-exit speed bound.
 WATCH_DEADLINE = WATCH_INTERVAL + 2
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 def write_workspace(root: Path) -> dict[str, object]:
     """A virtual workspace, including an unrelated member and a path dependency."""
@@ -198,20 +197,20 @@ class TreeWatchFixture(unittest.TestCase):
         scope = [] if package == "--workspace" else ["--package", package]
         return [*scope, "--"]
 
-    def key(self, package: str = "sample") -> str:
+    def key(self, package: str = "sample", *, start: str = "") -> str:
+        arguments = ["--watch-key", *(["--watch-start", start] if start else []), *self.key_arguments(package)]
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.metadata))):
-            result = invoke_cli(tree_watch, lambda: tree_watch.main(["--watch-key", *self.key_arguments(package)]),
+            result = invoke_cli(tree_watch, lambda: tree_watch.main(arguments),
                                 [], self.environment, self.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout.strip(), r"^[a-f0-9]{64}$")
         return result.stdout.strip()
 
     def start_watcher(self, parent: int, package: str = "sample", *, real_process: bool = False) -> tuple[EventWatcher | subprocess.Popen[str], Path, str]:
-        before = self.key(package)
         start = self.root / "start-key"
+        before = self.key(package, start=str(start))
         fired = self.root / "fired-key"
         fired.unlink(missing_ok=True)
-        _ = start.write_text(before + "\n")
         if real_process:
             process = subprocess.Popen([sys.executable, str(WATCHER), str(start), str(fired),
                                         str(parent), *self.key_arguments(package)],

@@ -1,10 +1,12 @@
 """A completion receipt is evidence only while its staff owner still exists."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import completion_receipt, staff
 from scripts.production.staff_test_support import StaffTestCase
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 
 
 class CompletionReceiptTests(StaffTestCase):
@@ -21,12 +23,13 @@ class CompletionReceiptTests(StaffTestCase):
         self.assertIn(str(path), str(refusal.exception))
         self.assertEqual(path.read_bytes(), before)
 
-    def test_retired_owner_cannot_complete_a_later_incarnations_request(self) -> None:
+    def test_missing_owner_cannot_complete_a_later_incarnations_request(self) -> None:
         path = self.root / "receipt.json"
-        owner = staff.ensure("showrunner", name="tools")
+        owner = fixture_member("showrunner", name="tools")
         completion_receipt.write_receipt(path, owner.id, {"session_id": "old-session"})
-        _ = staff.retire(owner.id)
-        replacement = staff.ensure("showrunner", name="tools")
+        self.forget_rows(owner.id)
+        replacement = fixture_member("showrunner", name="tools",
+                                     runtime_id=fixture_runtime_id("replacement-tools-session"))
         before = path.read_bytes()
         self.assertIsInstance(completion_receipt.read_receipt(path, staff.snapshot()), completion_receipt.NoReceipt)
         self.assertNotEqual(replacement.id, owner.id)
@@ -34,7 +37,7 @@ class CompletionReceiptTests(StaffTestCase):
 
     def test_live_owner_recovers_saved_request_fields_after_rename(self) -> None:
         path = self.root / "nested/receipt.json"
-        owner = staff.ensure("showrunner", name="tools")
+        owner = fixture_member("showrunner", name="tools")
         fields: dict[str, object] = {"session_id": "saved-session", "cwd": "/checkout"}
         completion_receipt.write_receipt(path, owner.id, fields)
         renamed = staff.rename(owner.id, "registry")

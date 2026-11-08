@@ -1,27 +1,18 @@
 """Staff-aware file-only session labels shared by queue readers and the roster."""
 from __future__ import annotations
 
-import contextlib
-import io
 import json
-import sys
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS / "lib", SCRIPTS.parent):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
-import production_units
-import unit_marks as unit_lookup
-import unit_runs
-from sessions import SessionRecord, running_sessions
-if TYPE_CHECKING:
-    import herdr
+from scripts.production import session_staff
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord, running_sessions
+from scripts.lib.user_zone import user_zone_name
 
 
 @dataclass(frozen=True)
@@ -104,7 +95,7 @@ class UnitLabels:
 def make_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
     production = " ".join(production_of(showrunner).split())
-    unit = short_unit(" ".join(unit_of(director).split()))
+    unit = " ".join(unit_of(director).split())
     return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
 
 
@@ -116,11 +107,6 @@ def production_of(showrunner: ShowrunnerRelationship) -> str:
 
 def unit_of(director: DirectorRelationship) -> str:
     return director.unit if isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)) else ""
-
-
-def short_unit(unit: str) -> str:
-    """The shown unit name: the unit id without its "-unit" suffix."""
-    return unit.removesuffix("-unit")
 
 
 @dataclass(frozen=True)
@@ -170,8 +156,6 @@ class MeshWorker(TypedDict, total=False):
     lens: str
     cwd: str
     held_design_id: str
-    transferring_role: dict[str, object]
-    role_redirect: dict[str, object]
 
 
 def as_string(value: object) -> str:
@@ -192,6 +176,44 @@ def problem(problems: list[str], source: str, error: BaseException | str) -> Non
         problems.append(message)
 
 
+@dataclass(frozen=True)
+class StaffRowAnomaly:
+    """Recorded facts are incomplete for this staff row."""
+
+    row: staff.StaffRow
+    reason: str
+
+    @property
+    def diagnostic(self) -> str:
+        return f"{self.row.name}: {self.reason}"
+
+
+@dataclass
+class StaffDiagnostics:
+    """Keep incomplete rows separate from reads that can hide sessions."""
+
+    problems: list[str] = field(default_factory=list)
+    anomalies: dict[staff.StaffId, StaffRowAnomaly] = field(default_factory=dict)
+
+    def anomaly(self, row: staff.StaffRow, reason: str) -> None:
+        _ = self.anomalies.setdefault(row.id, StaffRowAnomaly(row, reason))
+
+    def document(self, row: staff.StaffRow,
+                 result: session_staff.DocumentUnavailable | session_staff.LocationUnfilled) -> None:
+        if isinstance(result, session_staff.LocationUnfilled):
+            self.anomaly(row, result.reason)
+        else:
+            problem(self.problems, row.name, result.reason)
+
+    @property
+    def warnings(self) -> list[str]:
+        return [anomaly.diagnostic for anomaly in self.anomalies.values()]
+
+    @property
+    def excluded_sessions(self) -> set[str]:
+        return {anomaly.row.current_session for anomaly in self.anomalies.values()}
+
+
 def newest_sessions() -> list[SessionRecord]:
     newest: dict[str, SessionRecord] = {}
     for record in running_sessions():
@@ -200,131 +222,108 @@ def newest_sessions() -> list[SessionRecord]:
 
 
 def registered_showrunners(
-    environment: Mapping[str, str], problems: list[str],
+    diagnostics: StaffDiagnostics,
     *, known_sessions: Mapping[str, SessionRecord] | showrunners.DiscoverSessions = showrunners.DISCOVER_SESSIONS,
+    membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
+    resolver: session_staff.RowResolver | None = None,
 ) -> list[showrunners.Showrunner]:
-    state = Path(
-        environment.get(
-            "NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")
-        )
-    )
-    sessions_directory = Path(
-        environment.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions"))
-    )
-    showrunners.SESSIONS_DIR = sessions_directory
-    errors = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(errors):
-            registered = showrunners.registered_showrunners(state, known_sessions=known_sessions)
-    except (OSError, ValueError) as error:
-        problem(problems, "showrunners", error)
-        registered = []
-    for line in errors.getvalue().splitlines():
-        if line.strip():
-            problem(problems, "showrunners", line.strip())
+    record = (resolver.record if resolver is not None else
+              staff.snapshot() if isinstance(membership, showrunners.DiscoverMembership) else membership)
+    resolver = resolver if resolver is not None else session_staff.RowResolver(record)
+    records = (newest_sessions() if isinstance(known_sessions, showrunners.DiscoverSessions)
+               else list(known_sessions.values()))
+    sessions_by_id = {item["sessionId"]: item for item in records}
+    registered: list[showrunners.Showrunner] = []
+    for row in staff.active(record, "showrunner"):
+        doc = resolver.production_doc(row)
+        if not isinstance(doc, session_staff.ProductionDoc):
+            diagnostics.document(row, doc)
+            continue
+        try:
+            timer = showrunners.timer_for(row, record)
+        except (OSError, ValueError) as error:
+            problem(diagnostics.problems, row.name, error)
+            continue
+        live = sessions_by_id.get(row.current_session)
+        registered.append(showrunners.Showrunner(
+            name=row.name,
+            session=live["name"] if live is not None else "",
+            socket=live["messagingSocketPath"] if live is not None else "",
+            doc=str(doc.path),
+            zone=timer.zone if isinstance(timer, showrunners.TimerRegistration) else user_zone_name()))
     return registered
 
 
 def showrunner_ids(
-    records: list[SessionRecord], registered: Iterable[showrunners.Showrunner]
+    records: list[SessionRecord], registered: Iterable[showrunners.Showrunner],
+    *, membership: staff.StaffSnapshot | None = None,
 ) -> dict[str, showrunners.Showrunner]:
+    membership = membership if membership is not None else staff.snapshot()
+    by_id = {item["sessionId"]: item for item in records}
+    by_doc = {runner["doc"]: runner for runner in registered}
     found: dict[str, showrunners.Showrunner] = {}
-    for runner in registered:
-        if runner["socket"]:
-            match = next((record for record in records
-                          if record["messagingSocketPath"] == runner["socket"]), None)
-        else:
-            match = next((record for record in records
-                          if runner["session"] and record["name"] == runner["session"]), None)
-        if match is not None:
-            found[match["sessionId"]] = runner
+    for row in staff.active(membership, "showrunner"):
+        if not isinstance(row.doc, staff.LiveDoc):
+            continue
+        runner = by_doc.get(str(row.doc.path))
+        if row.current_session in by_id and runner is not None:
+            found[row.current_session] = runner
     return found
 
 
-def production_rows(doc: Path, slug: str, record: staff.StaffSnapshot) -> list[dict[str, str]]:
-    lines = doc.read_text(encoding="utf-8").splitlines()
-    return production_units.live_unit_table(lines, slug, record=record)
-
-
-def every_marked_unit(record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | OSError:
+def every_labeled_session(record: staff.StaffSnapshot | None = None, *,
+                      running: list[SessionRecord] | None = None) -> session_staff.LabeledProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
-    import unit_lookup as process_units
+    from scripts.production import unit_lookup as process_units
 
     try:
-        return process_units.every_marked_unit(record=record)
+        return process_units.every_labeled_session(record=record, running=running)
     except OSError as error:
         return error
 
 
-@dataclass(frozen=True)
-class DiscoverProductionMarks:
-    """The full roster discovers marks across all running panes."""
-
-
-DISCOVER_PRODUCTION_MARKS = DiscoverProductionMarks()
-
-
 def production_places(
-    records: list[SessionRecord], details: Mapping[str, ClaudeDetails],
-    registered: list[showrunners.Showrunner],
-    runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
-    problems: list[str],
-    *, record: staff.StaffSnapshot,
-    marks: unit_lookup.MarkedProductions | DiscoverProductionMarks = DISCOVER_PRODUCTION_MARKS,
+    records: list[SessionRecord],
+    ledger_workers: set[str],
+    diagnostics: StaffDiagnostics,
+    *, record: staff.StaffSnapshot, resolver: session_staff.RowResolver | None = None,
 ) -> dict[str, ProductionPlace]:
-    addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
+    """Join native session identities to their current staff parents."""
     places: dict[str, ProductionPlace] = {}
-    # One read of every production's marks serves every showrunner below.
-    every = (marks if isinstance(marks, unit_lookup.MarkedProductions)
-             else every_marked_unit(record) if registered else unit_lookup.MarkedProductions({}, {}))
-    # One process scan places every record; a scan per record took most of the roster's time.
-    record_places: dict[int, herdr.HerdrPlace] | None = None
-    for runner in registered:
-        doc = Path(runner["doc"])
-        runner_address = addresses.get(runner["slug"], "")
-        showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(runner["slug"], runner["session"], runner_address)
-            if runner["session"] and runner_address
-            else ProductionWithoutRunningShowrunner(runner["slug"])
-        )
-        try:
-            if isinstance(every, OSError):
-                raise every
-            if fault := every.production_fault(runner["slug"]):
-                problem(problems, f"unit hosts left out under {runner['slug']}", OSError(fault))
-            units = every.units.get(runner["slug"], {})
-        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
-            problem(problems, f"unit hosts for {runner['slug']} were not read", error)
-        else:
-            for unit_name, marked in units.items():
-                place = ProductionPlace(showrunner, DirectsUnit(unit_name))
-                if isinstance(marked.claude, unit_lookup.LiveClaude):
-                    _ = places.setdefault(marked.claude.session_id, place)
-                    continue
-                # A socketless director is still identified by its marked pane.
-                if record_places is None:
-                    import herdr
-
-                    record_places = herdr.herdr_places()
-                for session_record in records:
-                    same_place = record_places.get(session_record["pid"]) == marked.place
-                    if session_record["sessionId"] not in ledger_workers and same_place:
-                        _ = places.setdefault(session_record["sessionId"], place)
-                        break
+    resolver = resolver if resolver is not None else session_staff.RowResolver(record)
+    by_id = {item["sessionId"]: item for item in records}
+    readable_parents: set[staff.StaffId] = set()
+    unreadable_parents: set[staff.StaffId] = set()
+    for row in staff.active(record, "unit"):
+        identity = row.current_session
+        if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
             continue
-        # Worktree ownership is a fallback only when neither host could be read.
-        try:
-            rows = production_rows(doc, runner["slug"], record)
-        except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
-            problem(problems, f"units in {doc}", fallback_error)
+        parent = record.by_id(row.parent.id)
+        if parent is None or parent.kind != "showrunner":
+            problem(diagnostics.problems, row.name, "the staff parent is unavailable")
             continue
-        for row in rows:
-            unit_name = production_units.cell_value(row.get("Unit", ""))
-            worktree = production_units.cell_value(row.get("Worktree", ""))
-            for session_record in records:
-                if (session_record["sessionId"] not in ledger_workers and worktree
-                        and details[session_record["sessionId"]].cwd == worktree):
-                    _ = places.setdefault(session_record["sessionId"], ProductionPlace(showrunner, DirectsUnit(unit_name)))
+        if isinstance(parent.doc, staff.WrappedDoc):
+            continue
+        doc = resolver.production_doc(row)
+        if not isinstance(doc, session_staff.ProductionDoc):
+            diagnostics.document(row, doc)
+            continue
+        if parent.id in unreadable_parents:
+            continue
+        if parent.id not in readable_parents:
+            try:
+                _ = showrunners.timer_for(parent, record)
+            except (OSError, ValueError) as error:
+                problem(diagnostics.problems, parent.name, error)
+                unreadable_parents.add(parent.id)
+                continue
+            readable_parents.add(parent.id)
+        name = parent.name
+        owner = by_id.get(parent.current_session)
+        relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
+            UnderShowrunner(name, owner["name"], f"session:{parent.current_session}")
+            if owner is not None else ProductionWithoutRunningShowrunner(name))
+        places[identity] = ProductionPlace(relationship, DirectsUnit(row.name))
     return places
 
 
@@ -335,20 +334,27 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         return {}
     try:
         record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
         records = newest_sessions()
         problems: list[str] = []
-        registered = registered_showrunners(environment, problems,
-                                            known_sessions={record["sessionId"]: record for record in records})
-        runners = showrunner_ids(records, registered)
-        marks, directors = unit_lookup.session_unit_marks(records, environment, record=record)
-        places = production_places(records, {}, registered, runners, set(directors), problems, record=record, marks=marks)
-        names = {record["sessionId"]: record["name"] for record in records}
+        diagnostics = StaffDiagnostics(problems)
+        registered = registered_showrunners(diagnostics,
+                                            known_sessions={record["sessionId"]: record for record in records},
+                                            membership=record, resolver=resolver)
+        runners = showrunner_ids(records, registered, membership=record)
+        directors: dict[str, str] = {
+            row.current_session: parent.current_session for row in record.find(kind="worker")
+            if (parent := record.parent_of(row)) is not None}
+        places = production_places(records, set(directors), diagnostics,
+                                   record=record, resolver=resolver)
+        # Label readers stay silent and retain each session's recorded name.
+        names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():
             showrunner: ShowrunnerRelationship = NoShowrunner()
             director: DirectorRelationship = NoDirector()
             if session_id in runners:
-                showrunner = RunsProduction(runners[session_id]["slug"])
+                showrunner = RunsProduction(runners[session_id]["name"])
             elif session_id in places:
                 showrunner = places[session_id].showrunner
                 director = places[session_id].director
@@ -359,9 +365,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                 if place is not None:
                     showrunner = place.showrunner
                     unit = place.director.unit
-                director = UnderDirector(unit, names[owner], f"session:{owner}")
+                director = (UnderDirector(unit, names[owner], f"session:{owner}")
+                            if owner in names else UnitWithoutRunningDirector(unit))
             labels[session_id] = make_labels(names[session_id], showrunner, director)
-        labels.update(codex_unit_labels(wanted - labels.keys(), environment, records, places, problems))
+        labels.update(codex_unit_labels(wanted - labels.keys(), environment, records, places, problems, membership=record))
         return labels
     except Exception:
         return {}
@@ -413,21 +420,21 @@ def live_runs(
     ]
 
 
-def stopped_run_place(run: Path) -> RunPlace:
+def stopped_run_place(run: Path, record: staff.StaffSnapshot) -> RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
     try:
         state = read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return RunPlace(NoDirector(), NoShowrunner(), "")
+    from scripts.direct import plan_history
+    if state.get(unit_runs.OWNER_FIELD):
+        state = plan_history.staff_directory(state, record)
     cwd = as_string(state.get("working_dir"))
-    production, unit = as_string(state.get("production")), as_string(state.get("unit"))
-    if production and unit:
-        return RunPlace(UnitWithoutRunningDirector(unit), ProductionWithoutRunningShowrunner(production), cwd)
     # Older runs may keep their identity only in the plan. Import the history
     # reader for that fallback, not for every lookup of recorded labels.
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
 
-    identity = resolve_production_unit(state)
+    identity = resolve_production_unit(state, resolver=session_staff.RowResolver(record))
     if isinstance(identity, ProductionUnitIdentity):
         return RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)
@@ -451,13 +458,32 @@ def mesh_records(run: LiveRun, problems: list[str]) -> dict[str, MeshWorker]:
 
 
 def listed_mesh_worker(record: MeshWorker) -> bool:
-    return not (record.get("status") == "ended" or record.get("transferring_role")
-                or record.get("role_redirect") or record.get("held_design_id"))
+    return not (record.get("status") == "ended" or record.get("held_design_id"))
+
+
+def staff_relationships(membership: staff.StaffSnapshot, member: staff.StaffRow,
+                        names: Mapping[str, str], showrunners: Mapping[str, ShowrunnerRelationship]
+                        ) -> tuple[DirectorRelationship, ShowrunnerRelationship]:
+    parent = membership.parent_of(member)
+    if parent is None:
+        return NoDirector(), NoShowrunner()
+    if parent.kind == "showrunner":
+        return NoDirector(), UnderShowrunner(parent.name, names.get(parent.current_session, parent.name),
+                                             f"session:{parent.current_session}")
+    director: DirectorRelationship = (UnderDirector(parent.name, names[parent.current_session],
+                                                    f"session:{parent.current_session}")
+                                      if parent.current_session in names else UnitWithoutRunningDirector(parent.name))
+    showrunner = showrunners.get(parent.current_session, NoShowrunner())
+    if isinstance(showrunner, NoShowrunner) and (owner := membership.parent_of(parent)) is not None:
+        showrunner = UnderShowrunner(owner.name, names.get(owner.current_session, owner.name),
+                                    f"session:{owner.current_session}")
+    return director, showrunner
 
 
 def codex_unit_labels(
     wanted: set[str], environment: Mapping[str, str], records: list[SessionRecord],
     places: Mapping[str, ProductionPlace], problems: list[str],
+    *, membership: staff.StaffSnapshot,
 ) -> dict[str, UnitLabels]:
     if not wanted:
         return {}
@@ -473,26 +499,28 @@ def codex_unit_labels(
             continue
         for path in paths:
             run = LiveRun(path.parent, NoRunningDirector())
-            workers = {
-                thread: name for name, record in sorted(mesh_records(run, problems).items())
-                if (thread := as_string(record.get("thread_id"))) and thread in wanted and listed_mesh_worker(record)
-            }
+            workers: dict[str, str] = {}
+            for name, entry in sorted(mesh_records(run, problems).items()):
+                try:
+                    current = cast(Mapping[str, object], entry)
+                except staff.StaffUnreadable as error:
+                    problem(problems, f"Codex worker {path}:{name}", error)
+                    continue
+                thread = as_string(session_staff.worker_session(current, membership))
+                if thread in wanted and listed_mesh_worker(entry):
+                    workers[thread] = name
             if workers:
                 matches[path.parent.resolve()] = workers
     if not matches:
         return {}
-    names = {record["sessionId"]: record["name"] for record in records}
+    names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
     labels: dict[str, UnitLabels] = {}
-    for run in live_runs(roots, set(names), problems):
-        if run.path not in matches:
-            continue
-        if isinstance(run.director, DirectorSession) and run.director.session_id in names:
-            place = places.get(run.director.session_id)
-            showrunner: ShowrunnerRelationship = place.showrunner if place is not None else NoShowrunner()
-            director: DirectorRelationship = place.director if place is not None else NoDirector()
-        else:
-            stopped = stopped_run_place(run.path)
-            showrunner, director = stopped.showrunner, stopped.director
-        for thread, name in matches[run.path].items():
-            labels[thread] = make_labels(name, showrunner, director)
+    for workers in matches.values():
+        for thread in workers:
+            member = membership.by_current_session(thread)
+            if member is None or not isinstance(member.parent, staff.ReportsTo):
+                continue
+            director, showrunner = staff_relationships(membership, member, names,
+                                                        {key: place.showrunner for key, place in places.items()})
+            labels[thread] = make_labels(member.name, showrunner, director)
     return labels

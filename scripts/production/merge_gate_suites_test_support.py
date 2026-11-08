@@ -8,20 +8,21 @@ import select
 import sys
 from typing import override
 
-from scripts.lib import process_start
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, TEST_HANG_GUARD_SECS
+from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Keep the shared fixture unchanged for its other subjects. These jobs still run
 # in separate processes, but need no Python stub which only execs Python again.
 CONCURRENCY_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-            while not (state / (str(os.getpid()) + ".released")).exists():
+            while not (state / (str(os.getpgrp()) + ".released")).exists():
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)'''
-CONCURRENCY_EVENT = '''            sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+CONCURRENCY_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
             from scripts.direct.wait_for_test_state import wait_until
-            wait_until((state / (str(os.getpid()) + ".released")).exists,
+            wait_until((state / (str(os.getpgrp()) + ".released")).exists,
                        state, timeout=TEST_HANG_GUARD_SECS)'''
 OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while True:
@@ -32,7 +33,8 @@ OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 if time.monotonic() >= deadline:
                     self.fail("module processes never overlapped")
                 time.sleep(0.01)'''
-OVERLAP_EVENT = '''            sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+OVERLAP_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
             from scripts.direct.wait_for_test_state import wait_until
             def both_started():
                 with (state / "modules.jsonl").open() as source:
@@ -45,6 +47,7 @@ class GateSuitesFixture(MergeGateFixture):
     @override
     def bind_fixture(self, root: Path) -> None:
         super().bind_fixture(root)
+        self.environment["LINT_CONFIG_FILE"] = str(root / "lint.conf")
         self.environment["MERGE_GATE_PYTHON"] = sys.executable
 
     @override
@@ -60,7 +63,10 @@ class GateSuitesFixture(MergeGateFixture):
     @override
     def assert_process_stopped(self, pid: int) -> None:
         def stopped() -> bool:
-            return process_start.process_state(pid) is process_start.ProcessRunState.GONE
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+            except FileNotFoundError:
+                return True
 
         if stopped():
             return

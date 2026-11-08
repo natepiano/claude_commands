@@ -14,15 +14,14 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
 
-import hold_applies
-import build_hold
-import build_targets
+from scripts.build_hold import hold_applies
+from scripts.build_hold import build_hold
+from scripts.build_targets import build_targets
 
 SCRIPT = Path(__file__).with_name("hold_applies.py")
 REFUSAL = ("natedev builds are held by builder (for app test, release eta unknown). "
@@ -38,7 +37,7 @@ class TemporaryHoldTest(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.holders = self.root / "holders"
-        targets = self.root / "targets.conf"
+        targets = self.root / "build_targets.conf"
         _ = targets.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
@@ -48,7 +47,7 @@ class TemporaryHoldTest(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.root / "mac"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),
             "VERIFY_PROC_ROOT": str(self.root / "proc"),
-            "BUILD_TARGETS_CONFIG": str(targets),
+            "CONF_DIR": str(Path(targets).parent),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "caller",
             "UNIT_ACTIVE_DIR": str(self.root / "active"),

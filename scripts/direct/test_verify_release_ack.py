@@ -13,14 +13,16 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lint import memory_admit as gate
 from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "b" * 32
@@ -93,6 +95,8 @@ PY
             "SWEEP_SCRIPT": str(sweep),
         }
 
+        _ = caller_admission(self, self.root, self.environment)
+
     def reset_cycle(self) -> None:
         now = datetime.now().astimezone().isoformat()
         cycle: dict[str, object] = {
@@ -125,33 +129,24 @@ PY
         self.environment["UNIT_RUN_DIR"] = str(run)
         self.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
-    def release_memory_after_poll(self) -> None:
-        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 8388608 kB\n")
-        sleeper = self.root / "stubs" / "sleep"
-        sleeper.unlink()
-        _ = sleeper.write_text(r'''#!/bin/sh
-python3 - "$CYCLE_FILE" "$WAIT_STATE_LOG" <<'PY'
-import json, sys
-entry = json.load(open(sys.argv[1]))["entries"][0]
-with open(sys.argv[2], "a") as output:
-    output.write(json.dumps(entry) + "\n")
-PY
-printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
-''')
-        sleeper.chmod(0o755)
-        self.environment["WAIT_STATE_LOG"] = str(self.root / "wait-states")
+    def release_memory_after_wait(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        _ = admission.occupy_host()
+        admission.free(8 * gate.GIB)
+        recorded = False
 
+        def release_on_wait(reply: wire.Reply) -> wire.Reply:
+            nonlocal recorded
+            if isinstance(reply, wire.Wait) and not recorded:
+                recorded = True
+                _ = (self.root / "wait-states").write_text(json.dumps(self.entry()) + "\n")
+                admission.free(64 * gate.GIB)
+            return reply
 
-
-
-
-
-
-
-
+        _ = self.enterContext(mock.patch.object(admission.server, "reply_filter", side_effect=release_on_wait))
 
     def test_memory_wait_and_compile_leave_release_record_unchanged(self) -> None:
-        self.release_memory_after_poll()
+        self.release_memory_after_wait()
         before = self.cycle_file.read_bytes()
         result = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -181,6 +176,7 @@ class VerifyRoutingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
         self.addCleanup(self.fixture.tearDown)
         root = self.fixture.root
         self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root / "buildlog")}))

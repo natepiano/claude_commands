@@ -4,28 +4,34 @@
 Usage: unit_effort.py <level> [--check]
 
 Every unit director on this machine, whatever its production, is found by its host's marks
-(`unit_lookup.every_marked_unit`, the enumeration the account swap reads too). Each gets
+(`unit_lookup.every_labeled_session`, the enumeration the account swap reads too). Each gets
 `/effort <level>` through the host's typing interface, never C-c or Escape; typing
 while it is mid-turn is fine. A pane showing a form, prompt or menu, or a draft in its input line,
 is skipped and reported. The registry's `production.director` row keeps its model and takes the
-level, through agent_admin.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
+level, through default_models.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import unit_lookup
-from session_pane import HerdrFailure, read_place, type_place
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, read_place, type_place
+from scripts.lib import models_registry
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"
 USAGE = "usage: unit_effort.py <level> [--check]"
-READ_ROW = ('source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" '
-            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_agents_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
+READ_ROW = ('source "$1" && models_launch_configuration && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" '
+            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
 # How many lines up from the bottom a form is looked for when no input box is on screen.
 BOTTOM_LINES = 25
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
@@ -56,10 +62,11 @@ class Cell(NamedTuple):
     inverse: bool
 
 
-def director_row() -> DirectorRow:
+def director_row(base: models_registry.RegistryEditBase) -> DirectorRow:
     """The unit director launch row now. Raises OSError when the registry cannot resolve it."""
-    done = subprocess.run(["bash", "-c", READ_ROW, "_", str(AGENTS / "agents_config.sh")],
-                          capture_output=True, text=True, check=False)
+    done = subprocess.run(["bash", "-c", READ_ROW, "_", str(AGENTS / "models_config.sh")],
+                          capture_output=True, text=True, check=False,
+                          env=models_registry.LaunchModelConfiguration(*base).environment(os.environ))
     values = done.stdout.splitlines()
     if done.returncode != 0 or len(values) != 3 or not values[0]:
         errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
@@ -68,14 +75,15 @@ def director_row() -> DirectorRow:
     return DirectorRow(model, effort, [item.strip() for item in allowed.split(",") if item.strip()])
 
 
-def set_row(model: str, level: str) -> str:
+def set_row(model: str, level: str, base: models_registry.RegistryEditBase) -> str:
     """Publish the shared launch row at `<model>:<level>`; empty on success, else why not."""
-    done = subprocess.run(["bash", str(AGENTS / "agent_admin.sh"), ROW, f"{model}:{level}"],
-                          capture_output=True, text=True, check=False)
+    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{model}:{level}"],
+                          capture_output=True, text=True, check=False,
+                          env=base.environment(os.environ))
     if done.returncode == 0:
         return ""
     errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
-    return errors[0] if errors else f"agent_admin.sh exit {done.returncode}"
+    return errors[0] if errors else f"default_models.sh exit {done.returncode}"
 
 
 def _sgr(parameters: str, dim: bool, inverse: bool) -> tuple[bool, bool]:
@@ -147,20 +155,22 @@ def verdict(capture: str) -> Ready | Skipped:
     return Ready()
 
 
-def send(place: unit_lookup.Place, level: str) -> str:
+def send(place: unit_lookup.Place, level: str, *, target: str) -> str:
     """Type `/effort <level>` into the pane, then Enter; the empty string when both took, else why not."""
     try:
-        type_place(place, f"/effort {level}")
+        type_place(place, f"/effort {level}", target=target)
     except (OSError, HerdrFailure) as error:
         return str(error)
     return ""
 
 
-def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> str:
+def _director_line(marked: unit_lookup.LabeledSession, level: str, check: bool) -> str:
     claude = marked.claude
     if isinstance(claude, unit_lookup.ClaudeUnknown):
         return f"{marked.unit}: skipped — cannot tell whether Claude runs: {claude.reason}"
-    name = claude.name if isinstance(claude, unit_lookup.LiveClaude) and claude.name else marked.unit
+    if isinstance(claude, unit_lookup.ClaudeNotRunning):
+        return f"{marked.unit}: skipped — Claude is not running"
+    name = claude.name or marked.unit
     try:
         captured = read_place(marked.place, ansi=True)
     except (OSError, HerdrFailure) as error:
@@ -170,17 +180,15 @@ def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> s
         return f"{name}: skipped — {judged.reason}"
     if check:
         return f"{name}: would send"
-    problem = send(marked.place, level)
+    problem = send(marked.place, level, target=claude.session_id)
     return f"{name}: NOT sent — {problem}" if problem else f"{name}: sent"
 
 
-def director_lines(every: unit_lookup.MarkedProductions, level: str, check: bool) -> list[str]:
-    """One line per running unit director, every production's, then each production left out."""
+def director_lines(every: unit_lookup.LabeledProductions, level: str, check: bool) -> list[str]:
+    """Return one line per running unit director in every production."""
     lines = [_director_line(marked, level, check)
-             for slug in sorted(every.units) for _, marked in sorted(every.units[slug].items())
+             for production_name in sorted(every.units) for _, marked in sorted(every.units[production_name].items())
              if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)]
-    lines.extend(f"{slug}: skipped {fault}" for slug, units in sorted(every.faults.items())
-                 for _, fault in sorted(units.items()))
     return lines or ["no unit director is running"]
 
 
@@ -195,7 +203,8 @@ def registry_line(row: DirectorRow, level: str, check: bool) -> str:
 def run(level: str, check: bool) -> int:
     """Exit 0 when every director that could take it was sent it, 1 when a send or the registry failed."""
     try:
-        row = director_row()
+        base = models_registry.edit_base({})
+        row = director_row(base)
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1
@@ -203,11 +212,11 @@ def run(level: str, check: bool) -> int:
         print(f"unit_effort: {row.model} takes {', '.join(row.allowed) or 'no effort'}, not {level}", file=sys.stderr)
         return 2
     try:
-        every = unit_lookup.every_marked_unit()
+        every = unit_lookup.every_labeled_session()
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1
-    problem = "" if check or row.effort == level else set_row(row.model, level)
+    problem = "" if check or row.effort == level else set_row(row.model, level, base)
     if problem:
         print(f"unit_effort: nothing sent; {ROW} was not changed: {problem}", file=sys.stderr)
         return 1

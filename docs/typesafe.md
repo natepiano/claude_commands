@@ -1,6 +1,6 @@
 # TypeSafe here
 
-Use this guide from `~/.claude`. Ask `typesafe-unit` for anything it does not cover.
+Use this guide from `~/.claude`. Ask `typesafe` for anything it does not cover.
 
 ## Access and data
 
@@ -21,17 +21,22 @@ from scripts.issue_score import client, questions, vault
 response = client.system_one(vault.build_state(issue), questions.main_questions())
 ```
 
-Here `issue` is a `vault.Issue`; run the caller under `with-typesafe`. `system_one(state, questions, model=questions.MODEL, *, ledger_path=client.SPEND_LEDGER)` validates typed answers, retries transient errors and reserves spend.
+Here `issue` is a `vault.Issue`. Run the caller under `with-typesafe`.
+`system_one(state, questions)` validates typed answers, retries transient errors and reserves spend.
+The call reads the configured model and ledger when callers omit those arguments.
+`UseConfiguredValue.CURRENT` names this choice in API defaults.
 Catch `client.TypeSafeError` (including `BudgetExceeded`) as an error. A failed call is never an answer.
 Keep exact payloads, probabilities, usage and the returned model, as [score_issues.py](../scripts/issue_score/score_issues.py) does.
 
-[questions.py](../scripts/issue_score/questions.py) owns wording, criteria, option names, `MODEL`, `QUESTION_SET_VERSION`, `THRESHOLDS` and `JEV_FIELDS`.
-Read those constants for current policy; do not copy a threshold or proposal-field list into another tool.
+[questions.py](../scripts/issue_score/questions.py) owns wording, criteria, option names, policy kinds, `QUESTION_SET_VERSION` and `JEV_FIELDS`.
+[config/issue_score.conf](../config/issue_score.conf) owns tunable numbers, paths and the model.
+Module readers use `scripts/lib/conf.py` at each use.
+Read `questions.thresholds()` for current policy. Do not copy a threshold or proposal-field list into another tool.
 Bump the question version for adopted wording; retest a model change against the pinned model.
-[records.py](../scripts/issue_score/records.py) owns saved shapes and `STATE_DIR` (`~/.local/state/issue-score/`).
+[records.py](../scripts/issue_score/records.py) owns saved shapes and the `state_dir()` reader.
 [decide.py](../scripts/issue_score/decide.py) owns the shared sure rule; [evaluate.py](../scripts/issue_score/evaluate.py) uses it too.
 `Supported(threshold)` gates by the decision's confidence (the selected median level's probability for Scores); `MinimumGap(gap)` gates by the top-two averaged probability gap (or `1 - fits` minus `fits` for the area fallback); `Unsupported` keeps a field agent-only, and `ReportOnly` reports it without a sure gate.
-Split distributions, disagreeing Choice orders and an unresolved goal dependency stay unsure. One exception: when the `area_fits` Noul is below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, judged by that Noul instead of the area Choice orders, and it is sure only when the configured policy passes (`is_sure()`); a gap policy compares `1 - fits` against `fits`; an `area_fits` between `EVIDENCE_ABSENT` and `EVIDENCE_PRESENT` keeps area unsure. Cached raw answers get new decisions under current policy.
+Split distributions, disagreeing Choice orders and an unresolved goal dependency stay unsure. One exception: when the `area_fits` Noul is below `questions.evidence_absent()`, area becomes `unfiled` with confidence `1 - fits`, judged by that Noul instead of the area Choice orders, and it is sure only when the configured policy passes (`is_sure()`); a gap policy compares `1 - fits` against `fits`; an `area_fits` between `questions.evidence_absent()` and `questions.evidence_present()` keeps area unsure. Cached raw answers get new decisions under current policy.
 
 ## Question rules
 
@@ -113,24 +118,24 @@ Select thresholds only on complete tune runs; validate configured values once on
 
 ## Spend and interrupted calls
 
-At the configured $0.042/M input tokens, a planning estimate of 3.6M tokens is about $0.15 per pass; state size and variants change the total. Read actual usage from `spend.jsonl`.
+At the unchanged input rate, a planning estimate of 3.6M tokens is about $0.15 per pass; state size and variants change the total. Read actual usage from `spend.jsonl`.
 `spend.jsonl` records cost. `spend.pending.json` holds UUID-to-dollar reservations; killed processes leave them in place (fail closed).
 `BudgetExceeded` can occur below $20 recorded spend: recorded + reserved + the next request's bound exceeds the cap. To recover, stop all TypeSafe callers, keep copies of both files, and compare these totals with service billing:
 
 ```sh
 scripts/lib/py - <<'PY'
 from scripts.issue_score import client
-p = client.SPEND_LEDGER
+p = client.spend_ledger()
 print("recorded USD", client._spent(p))
 print("reservations USD", client._pending(p.with_suffix(".pending.json")))
 PY
 ```
 
-Reconcile billed but unrecorded requests with `typesafe-unit` first; keep unresolved reservations. For a confirmed stale reservation, replace `STALE_ID` below with its UUID. Clear only that entry, under the client's lock and atomic writer:
+Reconcile billed but unrecorded requests with `typesafe` first; keep unresolved reservations. For a confirmed stale reservation, replace `STALE_ID` below with its UUID. Clear only that entry, under the client's lock and atomic writer:
 
 ```python
 from scripts.issue_score import client
-p = client.SPEND_LEDGER
+p = client.spend_ledger()
 with client._ledger_lock(p):
     pending_path = p.with_suffix(".pending.json")
     pending = client._pending(pending_path)

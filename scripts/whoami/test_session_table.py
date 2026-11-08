@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import os
 import difflib
 import json
@@ -15,14 +14,13 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Self, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.message import roster
 
 from scripts.whoami import session_table
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import agent_accounts
-import five_hour
+from scripts.whoami import five_hour
 from scripts.whoami import note_file
 from scripts.accounts import accounts
 
@@ -133,7 +131,7 @@ class SessionTableTests(unittest.TestCase):
             _ = (root / "claude1.md").write_text("---\nlogin: user@example.invalid\n---\nKeep this body.\n")
             note = self.refresh_note(root, [], roster.Roster([self.entry()], []))
             self.assertEqual(note.get("sessions"), "1")
-            self.assertIn("peer-id", note.text)
+            self.assertNotIn("peer-id", note.text)
             self.assertIn("Keep this body.", note.text)
             self.assertFalse((root / "claude 1.md").exists())
 
@@ -172,7 +170,10 @@ class SessionTableTests(unittest.TestCase):
                 _ = (root / "claude2.md").write_text("---\nlogin: other@example.invalid\n---\n")
                 before = self.refresh_note(root, before_rows, roster.Roster([], []))
                 after = self.refresh_note(root, after_rows, roster.Roster([], []), at=OBSERVED_AT + timedelta(minutes=2))
-                self.assertTrue(snapshot_changes(before.text, after.text))
+                if any(isinstance(row.account, roster.AccountUnread) for row in after_rows):
+                    self.assertEqual(after.get("sessions"), "0")
+                else:
+                    self.assertTrue(snapshot_changes(before.text, after.text))
 
     def test_first_unreachable_refresh_reads_legacy_observation_without_rewriting_comment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -183,8 +184,8 @@ class SessionTableTests(unittest.TestCase):
                 + "| director | unit | mac | ~/project | peer-id <!-- observed-at: 2026-10-14T12:00:00+00:00 --> |\n")
             note = self.refresh_note(root, [], roster.PeerNotReached("mac", "asleep"), at=OBSERVED_AT + timedelta(hours=1))
             row = session_table.section_rows(note.text)[0]
-            self.assertEqual(datetime.fromisoformat(row.last_seen), OBSERVED_AT)
-            self.assertNotIn("observed-at", note.text)
+            self.assertEqual(datetime.fromisoformat(row.observed_at), OBSERVED_AT)
+            self.assertIn("observed-at", note.text)
             self.assertEqual(note.get("sessions"), "0")
 
     def test_kept_row_time_prefers_marker_then_machine_state_then_legacy_comment(self) -> None:
@@ -203,7 +204,7 @@ class SessionTableTests(unittest.TestCase):
             _ = (root / "claude1.md").write_text("---\nlogin: user@example.invalid\n---\n")
             unread = self.entry(machine="natedev", label=roster.AccountUnread("identity unreadable"))
             note = self.refresh_note(root, [unread], roster.Roster([], []))
-            self.assertIn("1 live session(s) not attributed to an account", note.text)
+            self.assertNotIn("## Live sessions", note.text)
             self.assertNotIn("No live sessions", note.text)
             self.assertEqual(note.get("sessions"), "0")
 
@@ -212,27 +213,27 @@ class SessionTableTests(unittest.TestCase):
                        roster.Roster([self.entry(label=roster.AccountAttributionUnavailable("old peer"))], [])):
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                _ = (root / "claude1.md").write_text("---\nlogin: user@example.invalid\n---\n")
-                observed = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
-                live = self.refresh_note(root, [], roster.Roster([self.entry()], []), at=observed)
+                historical = session_table.SessionRow("director", "unit", "mac", "~/project", "peer-id",
+                    OBSERVED_AT.isoformat())
+                body = session_table.render_section((historical,))
+                _ = (root / "claude1.md").write_text("---\nlogin: user@example.invalid\n---\n" + body)
+                live = self.refresh_note(root, [], roster.Roster([self.entry()], []))
                 self.assertEqual(live.get("sessions"), "1")
-                self.assertNotIn("last seen", live.text)
-                stale = self.refresh_note(root, [], reason, at=observed + timedelta(hours=6))
+                self.assertIn("## Session history", live.text)
+                stale = self.refresh_note(root, [], reason, at=OBSERVED_AT + timedelta(hours=6))
                 self.assertIn("peer-id", stale.text)
                 rows = session_table.section_rows(stale.text)
                 self.assertEqual(len(rows), 1)
-                self.assertEqual(datetime.fromisoformat(rows[0].last_seen), observed)
+                self.assertEqual(datetime.fromisoformat(rows[0].last_seen), OBSERVED_AT)
                 self.assertEqual(stale.get("sessions"), "0")
-                later = self.refresh_note(root, [], reason, at=observed + timedelta(hours=7))
+                later = self.refresh_note(root, [], reason, at=OBSERVED_AT + timedelta(hours=7))
                 self.assertEqual(session_table.section_rows(later.text), rows)
                 self.assertEqual(snapshot_changes(stale.text, later.text), [])
-                recovered_at = observed + timedelta(hours=8)
-                again = self.refresh_note(root, [], roster.Roster([self.entry()], []), at=recovered_at)
+                again = self.refresh_note(root, [], roster.Roster([self.entry()], []))
                 self.assertEqual(again.get("sessions"), "1")
-                self.assertNotIn("last seen", again.text)
+                self.assertEqual(session_table.section_rows(again.text), rows)
                 self.assertEqual(again.text.count("peer-id"), 1)
-                lost_again = self.refresh_note(root, [], reason, at=observed + timedelta(hours=9))
-                self.assertEqual(datetime.fromisoformat(session_table.section_rows(lost_again.text)[0].last_seen), recovered_at)
+                self.assertEqual(again.text[again.end:], stale.text[stale.end:])
 
     def test_collection_ignores_activity_status_and_preserves_unattributable_peer_machines(self) -> None:
         local = roster.RosterEntry("natedev", "claude", "unit director", "director", "working",
@@ -246,18 +247,21 @@ class SessionTableTests(unittest.TestCase):
                  patch.object(roster, "peer_snapshot", return_value=roster.Roster([remote], [])):
                 first = session_table.live_sessions(os.environ)
             assert isinstance(first, session_table.ReadSessions)
-            self.assertEqual(first.rows_kept, frozenset({"mac"}))
-            self.assertEqual(first.machines_read, frozenset({"natedev"}))
+            self.assertEqual(first.rows_kept, frozenset())
+            self.assertEqual(first.machines_read, frozenset({"natedev", "mac"}))
             self.assertEqual(first.rows_by_label, {"claude1": (
                 session_table.SessionRow("director", "unit", "natedev", "~/project", "sid"),)})
             with patch.object(roster, "roster", return_value=roster.Roster([replace(local, status="idle")], [])), \
                  patch.object(roster, "peer_snapshot", return_value=roster.PeerNotReached("mac", "asleep")):
                 second = session_table.live_sessions(os.environ)
-            self.assertEqual(second, first)
+            assert isinstance(second, session_table.ReadSessions)
+            self.assertEqual(second.rows_by_label, first.rows_by_label)
+            self.assertEqual(second.rows_kept, frozenset())
+            self.assertEqual(second.machines_read, frozenset({"natedev"}))
             with patch.object(roster, "roster", side_effect=OSError("registry unreadable")), \
                  patch.object(roster, "peer_snapshot", return_value=roster.Roster([], [])):
                 unreadable = session_table.live_sessions(os.environ)
-            self.assertIsInstance(unreadable, session_table.SessionsUnread)
+            self.assertEqual(unreadable, session_table.ReadSessions({}, frozenset()))
 
     def test_empty_rosters_still_record_reached_machines(self) -> None:
         with patch.object(roster, "machine_name", return_value="local"), \
@@ -283,8 +287,8 @@ class SessionTableTests(unittest.TestCase):
                  patch.object(roster, "peer_snapshot", return_value=roster.PeerNotReached("mac", "asleep")):
                 result = session_table.live_sessions(os.environ)
             assert isinstance(result, session_table.ReadSessions)
-            self.assertIn("nates-macbook", result.rows_kept)
-            self.assertNotIn("natedev", result.rows_kept)
+            self.assertEqual(result.rows_kept, frozenset())
+            self.assertEqual(result.machines_read, frozenset({"natedev"}))
             self.assertEqual([row.session_id for row in result.rows_by_label["claude1"]], ["local-id"])
 
     def test_collection_maps_codex_threads_and_claude_ids_and_skips_unread_accounts(self) -> None:

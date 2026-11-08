@@ -3,15 +3,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 SYNC_SCRIPT="$SCRIPT_DIR/sync_codex_catalog.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-codex-catalog.XXXXXX")"
 # The unwritable-state-directory case chmods a directory read-only, and rm needs
 # it writable again to clear the tree.
 trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null; rm -rf "$TEST_DIR"' EXIT
 
-AGENTS="$TEST_DIR/agents.conf"
-export AGENTS_CONFIG_PUBLISH=0
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
+
+AGENTS="$TEST_DIR/models.conf"
+export MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG="$TEST_DIR/config.toml"
 MODELS_CACHE="$TEST_DIR/models_cache.json"
 SYNC_STATE="$TEST_DIR/state/last_success"
@@ -42,7 +45,7 @@ fail() {
 
 run_sync() {
     PATH="$FAKE_BIN:$PATH" \
-    AGENTS_CONFIG_FILE="$AGENTS" \
+    MODELS_CONFIG_FILE="$AGENTS" \
     CODEX_CONFIG_FILE="$CODEX_CONFIG" \
     CODEX_MODELS_CACHE_FILE="$MODELS_CACHE" \
     CODEX_CATALOG_SYNC_STATE_FILE="${SYNC_STATE_OVERRIDE:-$SYNC_STATE}" \
@@ -86,6 +89,13 @@ test_model_families() (
         claude.families/opus=opus \
         claude.families/sonnet=sonnet \
         claude.families/haiku=haiku
+    "$SCRIPT_DIR/../lib/py" - "$AGENTS" <<'PYTHON'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+path.write_text(re.sub(r"^(direct|gpt-[^=\n]*)=", r"\1 = ", path.read_text(), flags=re.MULTILINE))
+PYTHON
     printf '%s\n' 'model = "gpt-9-sol"' > "$CODEX_CONFIG"
     cat > "$MODELS_CACHE" <<'EOF'
 {"models":[
@@ -367,9 +377,9 @@ run_sync >/dev/null 2>"$STDERR_FILE"
 stderr_text="$(<"$STDERR_FILE")"
 assert_contains "$stderr_text" "direct.impl is assigned to 'gpt-retired'" \
     "stale impl row warning did not name the row"
-assert_contains "$stderr_text" "/agent direct.impl <agent>[:<effort>]" \
+assert_contains "$stderr_text" "/default_models direct.impl <agent>[:<effort>]" \
     "stale row warning did not name the task reconfiguration command"
-assert_contains "$stderr_text" "/agent direct <family>" \
+assert_contains "$stderr_text" "/default_models direct <family>" \
     "stale row warning did not name the family reconfiguration command"
 assert_contains "$stderr_text" "direct.test is assigned to 'gpt-retired'" \
     "sync did not warn once for each stale assigned row"
@@ -404,13 +414,15 @@ grep -q '^gpt-current=medium,high$' <(effective_registry) \
 # the catalog and the state file itself.
 mkdir -p "$(dirname "$SYNC_STATE")"
 mkdir "$(dirname "$SYNC_STATE")/sync.lock"
+registry_read_probe "$TEST_DIR" "$AGENTS"
 run_sync >"$TEST_DIR/stdout" 2>"$STDERR_FILE" || fail "a held lock did not exit 0"
+[[ ! -s "$TEST_REGISTRY_READS" ]] || fail "a sync without sync.lock read the registry: $(cat "$TEST_REGISTRY_READS")"
 assert_contains "$(<"$TEST_DIR/stdout")" "already running" \
     "a held lock was not reported as contention"
 rmdir "$(dirname "$SYNC_STATE")/sync.lock"
 
 # A sandboxed caller can create nothing under the state directory. Reporting
-# that as a busy peer exits 0, and agents_config.sh then uses whatever stale
+# that as a busy peer exits 0, and models_config.sh then uses whatever stale
 # catalog is on disk with no warning -- so it has to be told apart from
 # contention and reported as the failure it is.
 readonly_state="$TEST_DIR/readonly-state"
@@ -439,9 +451,11 @@ assert_contains "$(<"$STDERR_FILE")" "cannot create the sync state directory" \
 before="$TEST_DIR/before-invalid.conf"
 cp "$AGENTS" "$before"
 printf '%s\n' '{invalid' > "$MODELS_CACHE"
+: > "$TEST_REGISTRY_READS"
 if run_sync >/dev/null 2>&1; then
     fail "invalid cache unexpectedly succeeded"
 fi
+[[ -s "$TEST_REGISTRY_READS" ]] || fail "the invalid-cache sync did not read the registry"
 cmp "$before" "$AGENTS" || fail "invalid cache changed the registry"
 
 # Updating the shared catalog must keep the registry and its mode

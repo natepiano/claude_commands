@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -13,9 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
+from scripts.production import session_staff, staff
+from scripts.production.production_doc import cell_value
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
+from scripts.shutdown import remote
 
 
 @dataclass(frozen=True)
@@ -38,53 +42,64 @@ def git_text(repo: Path, *arguments: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def cell_value(value: str) -> str:
-    quoted = re.search(r"`([^`]+)`", value)
-    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
+def production_owners(production_docs: Path, record: staff.StaffSnapshot) -> Iterator[staff.StaffRow]:
+    """Yield the showrunners with documents in the production folder."""
+    return (owner for owner in record.find(kind="showrunner")
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and owner.doc.path.parent == production_docs)
 
 
-def production_paths(path: Path) -> tuple[Path, ...]:
+def production_paths(owner: staff.StaffRow, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    """Read the worktrees for a showrunner with a recorded document."""
+    path = cast(staff.LiveDoc | staff.WrappedDoc, owner.doc).path
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         return ()
-    paths: list[Path] = []
-    for line in lines:
-        if line.startswith("- **Repository:** "):
-            value = cell_value(line.removeprefix("- **Repository:** "))
-            if value:
-                paths.append(Path(value).expanduser())
+    headers = tuple(Path(value).expanduser() for line in lines if line.startswith("- **Repository:** ")
+                    if (value := cell_value(line.removeprefix("- **Repository:** "))))
     try:
-        units = lines.index("## Units")
-    except ValueError:
-        return tuple(paths)
-    headings: list[str] = []
-    for line in lines[units + 1:]:
-        if not line.startswith("|"):
-            if headings:
-                break
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        rows = resolver.record.find(kind="unit", parent=owner.id)
+    except staff.StaffUnreadable as error:
+        print(f"outcomes: {path}: {error}", file=sys.stderr)
+        return headers
+    paths: list[Path] = []
+    found_main = False
+    for row in rows:
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            print(f"outcomes: {row.name}: the worktree is not recorded", file=sys.stderr)
             continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if not headings:
-            headings = cells
+        if tree.machine != remote.local_machine():
             continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        if "Worktree" not in headings:
-            break
-        values = dict(zip(headings, cells, strict=False))
-        worktree = cell_value(values.get("Worktree", ""))
-        if worktree:
-            paths.append(Path(worktree).expanduser())
+        folder = tree.path
+        worktrees = git_text(folder, "worktree", "list", "--porcelain")
+        if worktrees:
+            first = worktrees.splitlines()[0]
+            if first.startswith("worktree "):
+                main = Path(first.removeprefix("worktree "))
+                if main not in paths:
+                    paths.append(main)
+                found_main = found_main or main != folder
+        if folder not in paths:
+            paths.append(folder)
+    if not found_main:
+        paths = [*(header for header in headers if header not in paths), *paths]
     return tuple(paths)
 
 
-def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
+def repositories(claude_repo: Path, production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    except staff.StaffUnreadable as error:
+        print(f"outcomes: {error}", file=sys.stderr)
+        resolver = session_staff.RowResolver(staff.StaffSnapshot(()))
     candidates = [claude_repo]
     candidates.extend(
         path
-        for document in sorted(production_docs.glob("*-production.md"))
-        for path in production_paths(document)
+        for owner in production_owners(production_docs, resolver.record)
+        for path in production_paths(owner, resolver=resolver)
     )
     unique: dict[str, Path] = {}
     for candidate in candidates:
@@ -347,14 +362,21 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
     state: LocalReadState = CompleteSourceRead()
     added = 0
     try:
-        candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in production_paths(document)))
+        try:
+            record = staff.snapshot()
+        except staff.StaffUnreadable as error:
+            print(f"outcomes: {error}", file=sys.stderr)
+            record = staff.StaffSnapshot(())
+            state = PartialSourceRead()
+        resolver = session_staff.RowResolver(record)
+        candidates = (claude_repo, *(path for owner in production_owners(production_docs, record)
+                                   for path in production_paths(owner, resolver=resolver)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:
             if candidate.exists() and git_text(candidate, "rev-parse", "--git-common-dir") is None:
                 state = PartialSourceRead()
-        repos = repositories(claude_repo, production_docs)
+        repos = repositories(claude_repo, production_docs, resolver=resolver)
         if not repos:
             state = PartialSourceRead()
         for repo in repos:

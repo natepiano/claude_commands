@@ -6,7 +6,7 @@ from scripts.direct.verify_mac_offload_test_support import RUNNER_STUB
 from typing import final
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S as HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -29,7 +29,7 @@ class VerifyMacHolderHistoryTests(VerifyMacOffloadFixture):
                     build_hold.holder_path(build_hold.holder_directory(), "hana").unlink()
                 _ = (fixture.runner_state / "continue-retry").write_text("continue\n")
                 _ = (fixture.runner_state / "continue-sleep-2").write_text("continue\n")
-                output, errors = process.communicate(timeout=HANG_GUARD_S)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual(fixture.last_call()["mac_reason"], expected)
                 self.assertEqual(fixture.last_call()["mac_holder"], "")

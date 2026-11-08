@@ -1,139 +1,113 @@
-"""Read worker state after converting names from earlier runs."""
+"""Read task settings and lock worker claims."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
+import os
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, TypedDict, cast
+from typing import TextIO, cast
+
+from scripts.agents import worker_lifecycle
+from scripts.lib import process_start
 
 
-class WorkerLaunchRecord(TypedDict, total=False):
-    name: str
-    slot: str
-    family: str
-    model: str
-    worker_id: str
-    worker: str
+ROSTER_LIVE = frozenset({"running", "starting"})
+
+
+@dataclass(frozen=True)
+class HeldWorkerClaim:
+    """The launcher still holds the claim, or its start is unreadable."""
     pid: int
-    turn_id: str
-    seat_id: str
-    seat: str
-    role: str
 
 
-def _move_old_name(previous: Path, current: Path) -> Path:
-    if not current.exists() and previous.exists():
-        try:
-            current.hardlink_to(previous)
-        except (FileNotFoundError, FileExistsError):
-            # Another reader completed the same conversion.
-            pass
-        else:
-            previous.unlink(missing_ok=True)
-    return current
+@dataclass(frozen=True)
+class EndedWorkerClaim:
+    """The recorded launcher no longer holds the claim."""
 
 
-def _link_live_name(previous: Path, current: Path) -> Path:
-    """Keep both paths on one inode for launchers running across the update."""
+@dataclass(frozen=True)
+class NoWorkerClaim:
+    """No launcher is recorded."""
+
+
+def publish_worker_claim(path: Path, worker: str) -> None:
+    """Publish the launcher identity with its start when available."""
+    record: dict[str, object] = {"pid": os.getpid(), "worker": worker}
+    started = process_start.process_start(os.getpid())
+    if isinstance(started, process_start.Started):
+        record["started"] = started.start
+    else:
+        print(f"anomaly: {path}: launcher start is unavailable", file=sys.stderr)
+    worker_lifecycle.WorkerStateFile(path).publish(json.dumps(record))
+
+
+def read_worker_claim(path: Path) -> HeldWorkerClaim | EndedWorkerClaim | NoWorkerClaim:
+    """Compare the recorded launcher start with the live process."""
     try:
-        current.hardlink_to(previous)
-    except (FileNotFoundError, FileExistsError):
-        pass
-    return current
+        record = worker_lifecycle.read_worker_state(path)
+    except worker_lifecycle.WorkerStateUnreadable:
+        return NoWorkerClaim()
+    pid, started = record.get("pid"), record.get("started")
+    if not isinstance(pid, int) or pid <= 0:
+        return NoWorkerClaim()
+    if isinstance(started, str) and started:
+        current = process_start.process_start(pid)
+        if isinstance(current, process_start.Unreadable) or (
+                isinstance(current, process_start.Started) and current.start == started):
+            return HeldWorkerClaim(pid)
+    return EndedWorkerClaim()
 
 
-def worker_ledger(run: Path) -> Path:
-    """Read the worker ledger while old launchers can still append to it."""
-    return _link_live_name(run / "seats", run / "workers")
+def worker_status_paths(run: Path, pattern: str = "*_status*") -> list[Path]:
+    """Find status files only in the run and its phase folders."""
+    return [*run.glob(pattern), *run.glob(f"phases/*/{pattern}")]
 
 
-def _convert_record(path: Path) -> None:
-    try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return
-    if not isinstance(value, dict):
-        return
-    record = cast(WorkerLaunchRecord, cast(object, value))
-    changed = False
-    if "seat_id" in record:
-        if "worker_id" not in record:
-            record["worker_id"] = record["seat_id"]
-        del record["seat_id"]
-        changed = True
-    if "seat" in record:
-        if "worker" not in record:
-            record["worker"] = record["seat"]
-        del record["seat"]
-        changed = True
-    if changed:
-        scratch = path.with_suffix(".tmp")
-        _ = scratch.write_text(json.dumps(record), encoding="utf-8")
-        _ = scratch.replace(path)
+def worker_status_path(run: Path, slot: str) -> Path:
+    """Select the newest status for a slot, or its unwritten root path."""
+    return max(worker_status_paths(run, f"impl_status_{slot}"),
+               key=lambda path: path.stat().st_mtime, default=run / f"impl_status_{slot}")
 
 
-def worker_record_path(run: Path, name: str, slot: str, *, role: str = "") -> Path:
-    """Find a worker by its address; a later assignment never changes its identity path."""
+def worker_record_path(run: Path, name: str, slot: str) -> Path:
+    """Find task settings through the fixed staff reference."""
+    record = worker_lifecycle.read_worker_state(run / "mesh_roster.json")
+    entry = record.get(name)
+    reference = str(cast(dict[str, object], entry).get("staff_id", "")) if isinstance(entry, dict) else ""
     for path in sorted(run.glob("impl_worker_*.json")):
         try:
             value = cast(object, json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             continue
-        if isinstance(value, dict) and cast(dict[str, object], value).get("name") == name:
+        if reference and isinstance(value, dict) and cast(dict[str, object], value).get("staff_id") == reference:
             return path
-    try:
-        roster = cast(dict[str, object], json.loads((run / "mesh_roster.json").read_text(encoding="utf-8")))
-        record = roster.get(name)
-        if not role and isinstance(record, dict):
-            stored_role = cast(dict[str, object], record).get("role")
-            role = stored_role if isinstance(stored_role, str) else ""
-    except (OSError, ValueError):
-        pass
-    key = "fix" if role == "fix" else slot
-    candidate = run / f"impl_worker_{key}.json"
-    if candidate.exists():
-        # Slot paths are retained for earlier callers. An occupied slot belongs
-        # to another address, so give the new worker a separate stable key.
-        return run / f"impl_worker_name_{name.encode().hex()}.json"
-    return candidate
+    return run / f"impl_worker_{slot}.json"
 
 
 def worker_slot(run: Path, name: str) -> str | None:
-    """The team role the named worker's durable identity was recorded under; None when no record names it."""
-    for path in sorted(run.glob("impl_worker_*.json")):
-        try:
-            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        record = cast(WorkerLaunchRecord, cast(object, value))
-        slot = record.get("slot")
-        if record.get("name") == name and isinstance(slot, str) and slot:
-            return slot
+    path = worker_record_path(run, name, name)
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return None
+    if isinstance(value, dict):
+        slot = cast(dict[str, object], value).get("slot")
+        return slot if isinstance(slot, str) and slot else None
     return None
-
-
-def migrate_worker_records(run: Path) -> None:
-    """Convert durable identity names and claim fields under the launch lock."""
-    _ = worker_ledger(run)
-    for previous in run.glob("impl_seat_*.json"):
-        _ = _move_old_name(previous, previous.with_name(previous.name.replace("impl_seat_", "impl_worker_", 1)))
-    for pattern in ("impl_worker_*.json", "impl_claim_*.json"):
-        for path in run.glob(pattern):
-            _convert_record(path)
 
 
 @contextmanager
 def worker_claim_lock(run: Path) -> Generator[TextIO, None, None]:
-    """Keep the old lock path so an earlier launcher can reopen the same inode."""
-    path = _link_live_name(run / "impl_seat_claim.lock", run / "impl_worker_claim.lock")
-    with path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        migrate_worker_records(run)
+    with (run / "impl_worker_claim.lock").open("a+") as lock:
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         yield lock
 
 

@@ -1,11 +1,11 @@
 ---
-description: Show style coverage, held changes and pending hand-offs
+description: Report style coverage and pending work.
 argument-hint: "[rule|crate]"
 ---
 
 Run in the style showrunner or any showrunner above it. Find your production
 with `showrunners.py` (`~/.claude/scripts/production/`); inspect its on-disk doc
-for `**Kind:** style`. Otherwise walk `showrunners.py children <slug>` recursively
+for `**Kind:** style`. Otherwise walk `showrunners.py children <showrunner name>` recursively
 and inspect each child's doc from `showrunners.py list`. Report every style
 production found, naming each when there is more than one. With none, say so.
 

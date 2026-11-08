@@ -2,6 +2,10 @@
 """Keep a terminal available while its Claude child stops and resumes."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -13,15 +17,52 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
+
+from scripts.herdr import herdr
+from scripts.production import staff, worker
+from scripts.shutdown import pane_record
+from scripts.shutdown.launch_names import LaunchNames
+from scripts.lib.agent_program import resolve_program
+from scripts.lib.models_registry import agent_environment
+from scripts.lib.resume_message import NO_WORKERS, resume_message
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
 POLL_SECONDS = 0.5
 
 
+def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Restore only this pane's resumed conversation; explicit prompts remain unchanged."""
+    if not argv or Path(argv[0]).name != "claude" or environment.get("HERDR_ENV") != "1":
+        return argv, environment
+    parsed = pane_record.parse_claude_arguments(argv)
+    identity = parsed.value(pane_record.RESUME_FLAGS)
+    if not identity:
+        return argv, environment
+    place = herdr.HerdrPlace(environment.get("HERDR_SESSION", "default"),
+                            environment.get("HERDR_PANE_ID", ""))
+    entry = pane_record.matching_launch(place, identity)
+    if entry is None:
+        return argv, environment
+    restored = {**environment, **LaunchNames.read().environment(entry)}
+    restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
+    if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
+        workers = NO_WORKERS
+        try:
+            record = staff.snapshot()
+            row = record.by_current_session(identity)
+            if row is not None:
+                workers = worker.resume_workers(row.id, record)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers)]
+    return argv, restored
+
+
 class RelaunchRequest(TypedDict):
     argv: list[str]
-    cwd: str
+    cwd: NotRequired[str]
     environment: dict[str, str]
     unset: list[str]
     written_at: str
@@ -76,9 +117,11 @@ def _request(value: object) -> RelaunchRequest:
         for key, item in cast(dict[object, object], environment).items()
     ):
         raise ValueError("relaunch request environment must contain strings")
-    for key in ("cwd", "written_at", "note"):
+    for key in ("written_at", "note"):
         if not isinstance(values.get(key), str):
             raise ValueError(f"relaunch request {key} must be a string")
+    if "cwd" in values and not isinstance(values["cwd"], str):
+        raise ValueError("relaunch request cwd must be a string")
     return cast(RelaunchRequest, cast(object, values))
 
 
@@ -90,19 +133,27 @@ def _execute_request(path: Path) -> None:
     for key in request["unset"]:
         _ = environment.pop(key, None)
     environment.update(request["environment"])
-    os.chdir(request["cwd"])
+    if "cwd" in request:
+        os.chdir(request["cwd"])
     print(" ".join(request["note"].splitlines()), flush=True)
     script = str(Path(__file__).resolve())
     os.execvpe(sys.executable, [sys.executable, script, "run", "--", *request["argv"]], environment)
 
 
+def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Build the exact child arguments and environment for a supervisor launch."""
+    program = ""
+    if argv and argv[0] in ("claude", "codex"):
+        program = resolve_program("claude" if argv[0] == "claude" else "codex")
+    argv, environment = restored_launch(argv, environment)
+    if program:
+        argv = [program, *argv[1:]]
+    return argv, environment
+
+
 def run(argv: list[str]) -> int:
     """Run a child on this terminal, then consume a restart or wait under a hold."""
-    if argv and argv[0] in ("claude", "codex"):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from scripts.accounts.accounts import resolve_program
-
-        argv = [resolve_program("claude" if argv[0] == "claude" else "codex"), *argv[1:]]
+    argv, environment = child_launch(argv, dict(os.environ))
     child: subprocess.Popen[bytes] | None = None
 
     def ignore(_number: int, _frame: FrameType | None) -> None:
@@ -125,7 +176,7 @@ def run(argv: list[str]) -> int:
             _ = signal.signal(number, ignore)
         for number in (signal.SIGTERM, signal.SIGHUP):
             _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env={**os.environ, "RELAUNCH_SUPERVISED": "1"})
+        child = subprocess.Popen(argv, env=agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"}))
         code = child.wait()
     finally:
         for number, handler in previous.items():
