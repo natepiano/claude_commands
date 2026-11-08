@@ -130,7 +130,7 @@ class QueueTests(NotificationGuardedTestCase):
             rows = text.splitlines()
             running = [line for line in rows if line.lstrip().startswith("run")]
             self.assertEqual(len(running), 3)
-            self.assertTrue(all("builds" in row and "queue-unit" in row and "merge-gate" in row for row in running))
+            self.assertTrue(all("builds" in row and "queue-unit" in row and read_step_names().shown("merge-gate") in row for row in running))
             self.assertTrue(all("0.9 / 5.1" in row for row in running))
             positions = re.findall(r"^\s*(\d+)[ ▸]", text, re.MULTILINE)
             self.assertEqual(positions, [str(index) for index in range(1, 33)])

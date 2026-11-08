@@ -1475,7 +1475,7 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 
 An unchanged index update writes nothing, a read leaves no side file, and a list reads during an ordinary refresh.
 
-- `open_for_update()` uses the rollback journal and sets `PRAGMA cache_spill` from `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. A transaction up to about 256 MiB of changed pages takes the exclusive lock only at commit.
+- `open_for_update()` uses the rollback journal and sets `PRAGMA cache_spill` from `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. SQLite reads that value through 8 bits (65536 & 255 = 0), so cache spill is off: no index update spills, and every update takes the exclusive lock only at commit (builds report Phase 35, 2026-11-08).
 - `update_in()` writes the `meta` key `updated_at` only when the transaction changed rows or `has_numeric_update_time()` is false. `rows as of` names the last update that changed rows.
 - `complete_gate_index_in()` waits up to `INDEX_READ_WAIT_SECONDS=1` while it selects an index. The `show.py` report connection waits `BUSY_TIMEOUT_MS`, 30 s, so a writer that takes the exclusive lock after selection does not stop the report.
 - A list during a refresh on a scratch index of 100 gates takes 0.111 CPU s, 0.187 wall s and 5 processes. That refresh peaks at 66.9 MiB RSS.
@@ -1488,7 +1488,7 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 - `commands/test_times.md` — the time line
 - `config/buildlog.conf` — the two keys
 
-**Gotchas:** `cache_spill` is not a hard memory limit. A refresh above the spill size blocks readers from the first spill until commit, up to the 30 s wait. Memory for a full build at live scale is not measured.
+**Gotchas:** with cache spill off, an update keeps all its changed pages in memory until commit; no size limit applies. A value that keeps spill on must not reduce to 0 in 8 bits. Memory for a full build at live scale is not measured; report measures the value, and any value change goes to the user first.
 
 **Ruled out:** WAL, because an unchanged update and a read then change the index files; a 1 s wait on the report connection, because a commit after selection then stops the report.
 
@@ -1879,3 +1879,82 @@ A find with no code change; the builds showrunner closed it so on 2026-11-08. At
 
 **Ruled out:**
 - A gate cap on a module's `TMPDIR` size: it is a new check that needs the user's approval, and verify Phase 41r fixes the cause.
+
+### Phase 93 — The build queue shows a merge gate as "merge gate", with no hyphen  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-08, follow-up to change row C1227. The queue table's step column and a card heading still show `merge-gate`, because `config/build_steps.conf` gives a shown name only to `targeted-test`.
+
+**Goal:** The queue table's step column, the cloud rows and every card heading show a merge gate as `merge gate`, so every step name in the queue view is plain words.
+
+**Spec:**
+1. `config/build_steps.conf` `[names]` has the new key `names.merge-gate=merge gate` (the director made this edit already). Keep it.
+2. Update the build queue tests that expect `merge-gate` in rendered table rows or card headings to expect `merge gate`. The recorded step stays `merge-gate`: request fixtures, queue records and `wire.Identity` values do not change.
+3. Some tests split a table row on whitespace, and a two-word step breaks that split (`['run', 'builds', 'queue-unit', 'merge']`). Read those cells by column, as the targeted test rows already must, or compare the whole row.
+4. Cloud rows and cloud cards show the step through `StepNames.shown` too (`queue_view.py` near line 386 writes `field(identity.step)`). Update the cloud goldens and tests.
+5. Keep the golden files: update `unit_override_card.txt` and `unit_override_view.txt` and keep the tests that read them. Test expectations read step names through `read_step_names()`, never a hard-coded mapping.
+6. Golden rows and headings change only in the step text and its column width.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/test_queue_card.py`
+- `scripts/build_queue/test_build_queue.py`
+- `scripts/build_queue/queue_view.py`
+- `scripts/build_queue/queue_card.py`
+- `scripts/build_queue/golden/`
+
+**Workers:** 1 writer; three small test files with one cause do not split
+- `impl` — `test_queue_view.py`, `test_queue_card.py`, `test_build_queue.py`, `queue_view.py`, `queue_card.py`, `golden/`
+
+**Constraints from prior phases:**
+- Phase 57: `StepNames.shown` gives a step's table and heading name; `StepNames.prose` gives its sentence name. Readers use the current values in `config/build_steps.conf`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- With the new key, these modules pass: `test_queue_card`, `test_queue_view`, `test_build_queue`, `test_queue_lines`, `test_queue_evidence`, `test_head_facts`, `test_queue_place`. Before the edit, 8 failures and 1 error.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user, 2026-11-08, via sdlc and builds: "yes do that" to the merge gate memory stop. The builds showrunner added: the limit and the retry count go in config, not in code; add rows to the existing merge_gate tests. Background: Phase 92 found a verify module that grew to 27,000.8 MiB in a gate. `SampledRSSAdmission.admits` (`scripts/production/merge_gate.py` near line 291) admits a module with no limit when no other job runs, and nothing stops a module that grows after it starts.
+
+**Goal:** A merge gate stops a test module whose own memory goes above the gate's memory limit, runs it again once alone, fails the gate on a second overrun, and tells sdlc each time.
+
+**Spec:**
+1. The limit is the gate's existing memory limit, `merge_gate_governor_gib` in `config/build_admission.conf` (4 GiB now). Read it through the existing `merge_gate_governor_gib()`. Do not add a second limit key.
+2. In the sampling loop, compare each running test module's own sample (`process_memory_mib`: resident plus swapped memory of the module and its descendants) with the limit. When a module goes above it, stop it the way the module time limit does: set `killed_for` to a plain reason that names its peak and the limit, call `stop_gate_jobs([job])`, and print the line. The check applies to every running test module, alone or beside others. The type check job is out of scope.
+3. A memory-stopped module runs again alone, once, through the existing rerun pass. The number of such reruns is a new key in `config/merge_gate.conf`, read at use (`memory_stop_reruns=1`, a whole number of at least 0). A memory stop does not count toward `RERUN_LIMIT`'s "real breakage" count. A module stopped again after its last rerun fails the gate, with its reason in the result.
+4. Each stop sends one peer message to sdlc through `scripts/message/send.py` (`--to sdlc`), the way other scripts send a peer message. The text names the gate (its mode and branch or checkpoint), the module, its peak memory in GiB, the limit, and what happens next: "runs again alone" or "the gate fails". A failed send prints one line in the gate output and does not change the gate result. No stop is silent.
+5. A memory-stopped run does not record its peak in `module_peak_mib.json`, as a killed job does now.
+6. Update the `merge_gate.py` module docstring (line 8 says a memory peak does not kill a job), `config/README.md` (`merge_gate.conf` section), and `docs/as-built/merge-gate-and-test-speed.md` to state the stop, the rerun and the message.
+7. Add rows to the existing tests in `scripts/production/test_merge_gate_suites_resources.py` and `scripts/production/test_merge_gate_suites_reruns.py`: a module above the limit is stopped and passes on its rerun; a module above the limit twice fails the gate; a module beside others above the limit is stopped; a module below the limit is not stopped; each stop sends one message to sdlc with the module, peak and gate; a failed send does not change the result. Use a fake `send.py`, and give the tests a fake memory sample through a test hook in the fixture. Tests never send a real message or read live state.
+8. Add no other guard, refusal or check (user rule, 2026-11-05). This check is the one the user approved.
+
+**Files:**
+- `scripts/production/merge_gate.py`
+- `config/merge_gate.conf`
+- `config/README.md`
+- `docs/as-built/merge-gate-and-test-speed.md`
+- `scripts/production/test_merge_gate_suites_resources.py`
+- `scripts/production/test_merge_gate_suites_reruns.py`
+- `scripts/production/merge_gate_test_support.py`
+
+**Workers:** 1 writer; the stop, its rerun and its tests share one runner loop and one fixture
+- `impl` — `merge_gate.py`, `merge_gate.conf`, `config/README.md`, the as-built doc, both test files, hub: `merge_gate_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 92: gate `TMPDIR` is `/dev/shm`; `finish_gate_job` kills a module's process group and removes its `TMPDIR` when the module ends.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The new rows fail without the change and pass with it.
+- `test_merge_gate_suites_resources`, `test_merge_gate_suites_reruns` and every other `test_merge_gate*` module pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
