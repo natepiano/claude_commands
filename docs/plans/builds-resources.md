@@ -1867,38 +1867,12 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - The regression test fails before the fix and passes after it.
 - The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
 
-### Phase 82 — The Mac keeps its disk floor without waiting for a test run  · status: todo
-**Depends on:** none. Merge `origin/builds` first.
+### Phase 82 — The Mac keeps its disk floor without waiting for a test run  · status: done
+**Approved:** builds showrunner, 2026-11-08. Checkpoint `ab051b13a`.
 
-**Approved:** builds showrunner, 2026-11-08 ("go for Phase 82: add /usr/sbin to the Mac jobPath, and add a periodic Mac floor job on the same leased path as the on-demand sweep").
-
-#### Work Order
-
-**Goal:** the Mac disk stays at or above its 150 GiB sweep floor without a test run to start the sweep, and the Mac's scheduled cleanup jobs can find `lsof`.
-
-**Measured (Phase 81 rounds 1 and 4, 2026-11-08):** the Mac sat at 126 GiB free from about 00:19 UTC with no floor scan.
-1. No periodic floor job exists for the Mac. natedev has `nate.jobs.disk-floor` (`modules/linux/disk-floor.nix`, every 120 s). The Mac has no job in launchd or cron.
-2. The only Mac trigger is `offload.ensure_mac_disk_floor()`. It starts `sweep.py --floor-only --host mac` only below `free_floor_gib` (100 GiB). The sweep then trims to `sweep_floor_gib` (150 GiB).
-3. The Mac job PATH (`jobPath` in `modules/darwin/nate-backend.nix`) has no `/usr/sbin`. `tmp_sweep.lsof_paths()` then returns `ProcessUsesUnavailable`, and tmp-sweep, folder-audit and codex-mesh-sweep remove nothing.
-
-**Spec:**
-1. Add a periodic job that keeps the Mac at its sweep floor. It uses the same leased path as the on-demand sweep in `ensure_mac_disk_floor()`: the same mirror leases, claim locks and floor lock. It runs where those leases live. It trims only the shortfall below `sweep_floor_gib`, as the on-demand sweep does. Keep the 100 GiB on-demand trigger unchanged.
-2. Add `/usr/sbin` to the Mac `jobPath`, after `/usr/bin:/bin`.
-3. Write the nixos changes as one patch file, `phases/82/nixos.patch` in the run folder, against nixos `main`. The director applies it on a nixos branch. Do not edit `/etc/nixos` or any nixos checkout.
-4. Add a test for the new periodic entry point, if the fix adds one in this repository.
-5. Update the as-built doc that calls the Mac floor job a future job.
-
-**Files:**
-- `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py` — the periodic entry point, only if one is needed.
-- `scripts/mac_test/test_floor_sweep.py`, `scripts/mac_test/test_mac_test.py` — its test.
-- `docs/as-built/build-memory-admission.md` — the Mac floor job.
-- `modules/darwin/nate-backend.nix`, `modules/linux/disk-floor.nix` — in the nixos repository, through the patch file only. A new nixos module is allowed.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the source files, the patch file and the as-built doc, and runs the final suites.
-- `test` owns the test files.
-
-**Acceptance gate:**
-- The patch applies cleanly to nixos `main`, and `nix-instantiate --parse` accepts each changed `.nix` file.
-- The periodic job calls the same leased sweep path as `ensure_mac_disk_floor()`. A test shows it, if the entry point is in this repository.
-- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+#### As-built
+- nixos branch `resources-mac-floor` (`efdf8bfc1`, on nixos main `064af4a3c`) adds `modules/darwin/disk-floor.nix`: `nate.jobs.disk-floor` runs `sweep.py --floor-only --host mac` on the Mac every 120 s. It is the same command as the on-demand sweep in `offload.ensure_mac_disk_floor()`, so it takes the same mirror leases, both claim locks and the floor lock, and trims only the shortfall below `sweep_floor_gib` (150 GiB). The 100 GiB on-demand trigger is unchanged.
+- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep, folder-audit and codex-mesh-sweep kept every entry.
+- `docs/as-built/build-memory-admission.md` describes the Mac floor job.
+- The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
+- No Python change and no new test: the job calls an existing entry point.
