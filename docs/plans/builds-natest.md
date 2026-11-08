@@ -1712,37 +1712,20 @@ The lint cache version and step state tests use 66% less CPU, with all 13 tests 
 ### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the Phase 79 architect review add-on, settled "current, after 67 and 68" by the showrunner on 2026-11-07.
+The style ledger ticket and finding tests use 49% less CPU, with all tests kept. Same-time pairs on `/dev/shm`: 89.4 to 45.2 CPU s. `test_style_ledger_tickets.py` 45.4 to 22.7, `test_style_ledger_findings.py` 44.0 to 22.5.
 
-**Goal:** `style/test_style_ledger_tickets.py` (44.9 CPU s per gate on 2026-11-07, 195 tests) and `style/test_style_ledger_findings.py` (43.8 CPU s, 139 tests) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Both modules spend their time in tests, not in imports: about 0.3 s for each test.
-2. Find what each test pays for: the `LedgerTestCase` setup, a Git repository, or a process start. Share an expensive seed per class and copy it for each test where the test changes it.
-3. These modules have many tests. Run the trivial-test sweep from the Speed method: tests with the same setup and the same assertion target, then `coverage_overlap.py`.
-4. Add no guard, refusal or check (user rule, 2026-11-05).
+- Each module runs `style_staff_fixture` once per class and copies the staff record to each test with its own paths.
+- Each module stops Git maintenance in its fixture repository, so no background repack writes during cleanup.
 
 **Files:**
-- `scripts/style/test_style_ledger_tickets.py`
-- `scripts/style/test_style_ledger_findings.py`
+- `scripts/style/test_style_ledger_tickets.py` — class staff seed, copied per test.
+- `scripts/style/test_style_ledger_findings.py` — class staff seed, copied per test.
 
-**Workers:** 2 writers; each module is its own file set
-- `impl` — `test_style_ledger_tickets.py`, role impl
-- `test` — `test_style_ledger_findings.py`, opens as impl
-
-**Constraints from prior phases:**
-- `scripts/style/ledger_test_support.py` and `scripts/production/staff_test_support.py` are not natest's to edit (standing rule). A gain that needs a change there goes to the director as an architecture proposal with its measured gain.
-- Phase 81: a fixture that commits in a tempdir repository sets `maintenance.auto false` before its first commit.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. Each removed test names its covering test or its reason.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- Each changed file passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- The per-test cost is in `LedgerTestCase.setUp`, which six modules share. Phase 90 moves the seed there and removes the two module copies.
+- A text replace of paths misses a JSON-escaped path. Phase 90 decodes the JSON to rewrite them.
 
 ### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: todo
 **Depends on:** none
@@ -1901,16 +1884,18 @@ The lint cache version and step state tests use 66% less CPU, with all 13 tests 
 3. Rewrite paths in the copied staff record by decoding the JSON, changing the path fields, and serializing it again. A literal text replace misses an escaped path, for example a non-ASCII `TMPDIR` (Phase 85 F001).
 4. Set `maintenance.auto false` in the template repository before its first commit, in one place (Phase 81). Remove the two idioms in the Phase 85 modules (F003).
 5. Remove the `setUpClass`, `copy_staff_seed` and `copied_staff_fixture` overrides and the `git` override from `test_style_ledger_tickets.py` and `test_style_ledger_findings.py` (F002).
-6. Every importer of `ledger_test_support.py` stays green: `test_style_ledger.py`, `test_style_ledger_tickets.py`, `test_style_ledger_findings.py`, `test_style_ledger_corrections.py`, `test_style_ledger_sites.py`, `test_refill_speed.py`.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+6. Every direct and indirect test importer of `ledger_test_support.py` stays green. The Phase 85 architect review counted 36 direct importers, among them `style_plan_test_support.py`, `test_bulk_rename.py`, `test_style_proposals.py` and `test_style_sync.py`. Find them with `grep -rlE "scripts\.style(\.| import )ledger_test_support" scripts`, then add the importers of each support file in that list.
+7. `test_style_ledger_sites.py` opens three SQLite connections that it does not close (lines 541, 568 and 621). Wrap each in `closing(...)` and keep its transaction context (Phase 85 architect review).
+8. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
 - `scripts/style/ledger_test_support.py`
 - `scripts/style/test_style_ledger_tickets.py`
 - `scripts/style/test_style_ledger_findings.py`
+- `scripts/style/test_style_ledger_sites.py`
 
-**Workers:** 1 writer; the shared fixture is the hub and the two module edits are removals
-- `impl` — `test_style_ledger_tickets.py`, `test_style_ledger_findings.py`, hub: `ledger_test_support.py`
+**Workers:** 1 writer; the shared fixture is the hub and the module edits are removals or `closing(...)` wraps
+- `impl` — `test_style_ledger_tickets.py`, `test_style_ledger_findings.py`, `test_style_ledger_sites.py`, hub: `ledger_test_support.py`
 
 **Constraints from prior phases:**
 - The showrunner gave natest `ledger_test_support.py` for this phase on 2026-11-07. `scripts/production/staff_test_support.py` stays outside natest.
@@ -1920,7 +1905,8 @@ The lint cache version and step state tests use 66% less CPU, with all 13 tests 
 
 **Acceptance gate:**
 - No assertion is removed.
-- CPU s before and after for all six importers, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- Every importer of `ledger_test_support.py` passes, and runs with no `ResourceWarning` for an unclosed database.
+- CPU s before and after for the six `LedgerTestCase` modules (`test_style_ledger.py`, `test_style_ledger_tickets.py`, `test_style_ledger_findings.py`, `test_style_ledger_corrections.py`, `test_style_ledger_sites.py`, `test_refill_speed.py`), from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Every direct and indirect test importer of `ledger_test_support.py` passes, and runs with no `ResourceWarning` for an unclosed database.
+- A temporary run, not committed, with non-ASCII seed and copy paths shows that each copy's `doc.path` and `worktree.path` name its own repository, and that the copies' staff records are independent.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`

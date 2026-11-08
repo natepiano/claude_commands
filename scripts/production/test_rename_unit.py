@@ -20,6 +20,151 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_review_refuses_a_branch_that_differs_from_the_pending_move(self) -> None:
+        from scripts.production import unit_move
+
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        with saved_fixture(self.root) as restore:
+            for pending_name in ("", "alpha"):
+                with self.subTest(pending_name=pending_name):
+                    restore()
+                    unit_move.prepare_move(row, folder, "pending-branch", pending_name)
+                    before = file_versions(self.root)
+                    result = self.invoke(["apply", "alpha", "alpha", "--to-branch", "cargo-liner-handler"])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("finish the pending move to branch pending-branch", result.stderr)
+                    self.assertEqual(file_versions(self.root), before)
+
+    def test_review_push_uses_an_explicit_refspec_for_the_move_and_retry(self) -> None:
+        from scripts.production import unit_move
+
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        branch = "cargo-liner-handler"
+        with saved_fixture(self.root) as restore:
+            for recovering in (False, True):
+                with self.subTest(recovering=recovering):
+                    restore()
+                    _ = self.git("config", "remote.origin.push", f"refs/heads/{branch}:refs/heads/unwanted")
+                    if recovering:
+                        unit_move.prepare_move(row, folder, branch, row.name)
+                        _ = self.git("branch", "-m", branch, cwd=folder)
+                    git = unit_move.git
+                    pushes: list[tuple[str, ...]] = []
+
+                    def record(checkout: Path, *arguments: str) -> str:
+                        if arguments[:1] == ("push",):
+                            pushes.append(arguments)
+                        return git(checkout, *arguments)
+
+                    with mock.patch.object(unit_move, "git", side_effect=record):
+                        result = self.invoke(["apply", "alpha", "alpha", "--to-branch", branch])
+                    self.assert_ok(result)
+                    self.assertEqual(pushes, [("push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")])
+                    self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", branch),
+                                     self.git("rev-parse", "HEAD", cwd=folder))
+                    self.assertEqual(self.git("--git-dir", str(self.origin), "for-each-ref", "refs/heads/unwanted"), "")
+
+    def test_name_change_pushes_the_branch_with_its_new_suffix(self) -> None:
+        folder = self.rust / "claude-demo-alpha"
+        tip = self.git("rev-parse", "HEAD", cwd=folder)
+        self.assert_ok(self.rename("apply"))
+        destination = self.rust / "claude-demo-gamma"
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "demo-gamma")
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "demo-gamma"), tip)
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "@{upstream}", cwd=destination), "origin/demo-gamma")
+
+    def test_to_branch_keeps_the_unit_name_and_folder_and_resumes_its_session(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        tip = self.git("rev-parse", "HEAD", cwd=folder)
+        self.write(self.home / f".claude/projects/fixture/{row.current_session}.jsonl", "{}\n")
+        session = FolderSessionFixture(row, live=True)
+        with session.installed(), RenameDisplays(row).installed():
+            self.assert_ok(self.invoke(["apply", "alpha", "alpha", "--to-branch", "cargo-liner-handler"]))
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=folder), "cargo-liner-handler")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=folder), tip)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "cargo-liner-handler"), tip)
+        self.assertEqual(session.stops, [row.current_session])
+        self.assertEqual([resumed.id for resumed in session.starts], [row.id])
+
+    def test_to_branch_with_a_name_change_moves_the_folder_suffix_and_preserves_work(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        destination = self.rust / "claude-demo-gamma"
+        tip = self.git("rev-parse", "HEAD", cwd=folder)
+        self.write(folder / "draft.md", "Keep the draft.\n")
+        self.assert_ok(self.invoke(["apply", "alpha", "gamma", "--to-branch", "cargo-liner-handler"]))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual((renamed.name, renamed.worktree), ("gamma", staff.PresentWorktree("natedev", destination)))
+        self.assertFalse(folder.exists())
+        self.assertEqual((destination / "draft.md").read_text(), "Keep the draft.\n")
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "cargo-liner-handler")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=destination), tip)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "cargo-liner-handler"), tip)
+
+    def test_to_branch_plan_describes_the_unit_branch_without_writes(self) -> None:
+        before = file_versions(self.root)
+        result = self.invoke(["plan", "alpha", "alpha", "--to-branch", "cargo-liner-handler"])
+        self.assert_ok(result)
+        self.assertIn("Rename branch demo-alpha -> cargo-liner-handler", result.stdout)
+        self.assertEqual(file_versions(self.root), before)
+
+    def test_to_branch_refuses_an_existing_target_for_units_and_showrunners(self) -> None:
+        for arguments in (["alpha", "alpha"], ["demo", "demo", "--to-doc", str(self.doc)]):
+            with self.subTest(arguments=arguments):
+                before = file_versions(self.root)
+                result = self.invoke(["apply", *arguments, "--to-branch", "demo-mul-add"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("branch already exists: demo-mul-add", result.stderr)
+                self.assertEqual(file_versions(self.root), before)
+
+    def test_to_branch_and_suffix_rename_reruns_finish_an_interrupted_push(self) -> None:
+        from scripts.production import unit_move
+
+        with saved_fixture(self.root) as restore:
+            for name, branch, options in (("alpha", "cargo-liner-handler", ["--to-branch", "cargo-liner-handler"]),
+                                          ("gamma", "cargo-liner-handler", ["--to-branch", "cargo-liner-handler"]),
+                                          ("gamma", "demo-gamma", [])):
+                with self.subTest(name=name, branch=branch):
+                    restore()
+                    row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+                    displays = RenameDisplays(row)
+                    arguments = ["apply", "alpha", name, *options]
+                    git = unit_move.git
+
+                    def interrupted(checkout: Path, *arguments: str) -> str:
+                        if arguments[:1] == ("push",):
+                            raise OSError("The push stopped.")
+                        return git(checkout, *arguments)
+
+                    with displays.installed():
+                        with mock.patch.object(unit_move, "git", side_effect=interrupted):
+                            failed = self.invoke(arguments)
+                        self.assertNotEqual(failed.returncode, 0)
+                        self.assertIn("The push stopped.", failed.stderr)
+                        destination = self.rust / f"claude-demo-{name}"
+                        self.assertEqual(self.git("branch", "--show-current", cwd=destination), branch)
+                        self.assert_ok(self.invoke(arguments))
+                        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", branch),
+                                         self.git("rev-parse", "HEAD", cwd=destination))
+                        before = file_versions(self.root)
+                        rerun = self.invoke(arguments)
+                        self.assert_ok(rerun)
+                        self.assertEqual(rerun.stdout.strip(), "unchanged")
+                        self.assertEqual(file_versions(self.root), before)
+
+    def test_to_branch_does_not_allow_a_unit_document_move(self) -> None:
+        before = file_versions(self.root)
+        result = self.invoke(["apply", "alpha", "alpha", "--to-doc", str(self.doc)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--to-doc is only for showrunners", result.stderr)
+        self.assertEqual(file_versions(self.root), before)
+
     def test_bare_unit_name_renames_the_unit_folder_and_branch(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         with RenameDisplays(row).installed():

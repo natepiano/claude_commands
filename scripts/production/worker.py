@@ -577,23 +577,28 @@ class PaneWorkerStates:
     runs: list[Path]
 
 
-def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot) -> MeshWorkerRows | PaneWorkerStates:
-    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
+def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
+                  scanned: dict[str, list[str]] | None = None) -> MeshWorkerRows | PaneWorkerStates:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), scanned=scanned, record=record)
     if runs and unit_runs.parent_transport(str(parent.current_session),
             scanned={str(parent.current_session): runs}, record=record) == "mesh":
         return MeshWorkerRows(board_json.workers(Path(runs[0]), set(), record=record))
     return PaneWorkerStates(worker_panes.observe(parent.id, record), [Path(run) for run in runs])
 
 
-def restore(parent: StaffId) -> ExitCode:
-    record = staff.snapshot()
-    holder = record.by_id(parent)
+def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
+            runs: dict[str, list[str]] | None = None,
+            codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> ExitCode:
+    record = staff.snapshot() if record is None else record
+    holder = next(row for row in record.rows if row.id == parent)
     changed = False
     outcome = ExitCode.OK
-    observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
+    observed = _read_workers(holder, record, scanned=runs)
     if isinstance(observed, MeshWorkerRows):
-        print("unchanged")
+        print(f"{holder.name}: workers unchanged")
         return ExitCode.OK
+    runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
+    run = worker_panes.worker_run(holder, record=record, scanned=runs)
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
             if isinstance(state, worker_panes.OpenWorker):
@@ -602,9 +607,6 @@ def restore(parent: StaffId) -> ExitCode:
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                if holder is None:
-                    continue
-                run = worker_panes.worker_run(holder)
                 active = progress_history.active_dispatch(state.row.id, run)
                 if isinstance(active, progress_history.ActiveDispatchUnavailable):
                     print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
@@ -614,7 +616,7 @@ def restore(parent: StaffId) -> ExitCode:
                     continue
                 if not isinstance(state, worker_panes.OpenWorker):
                     role = worker_panes.dispatch_role(state.row)
-                    result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role, runs=runs, codex=codex)
                     code = startup_result(WorkerName.parse(state.row.name), result)
                     if code != ExitCode.OK:
                         outcome = code
@@ -627,7 +629,7 @@ def restore(parent: StaffId) -> ExitCode:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
-        print("done" if changed else "unchanged")
+        print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")
     return outcome
 
 

@@ -313,6 +313,8 @@ class FolderRenameFixture(StaffTestCase):
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
         _ = self.git("init", "-b", "main")
+        _ = self.git("init", "--bare", str(self.root / "origin.git"))
+        _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
         _ = self.git("config", "user.name", "Folder Rename Test")
         _ = self.git("config", "user.email", "rename@example.invalid")
         _ = self.git("config", "gc.auto", "0")
