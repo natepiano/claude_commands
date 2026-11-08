@@ -47,7 +47,8 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
 
 # This program runs inside the instance's tool shell, not on natedev.
 GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
-root = pathlib.Path(os.environ.get('GATE_BOX_DIR', '/var/lib/gate-trial'))
+root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
+os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
 if links.get('production'):
     gate_request = json.loads((root / 'request.json').read_text())

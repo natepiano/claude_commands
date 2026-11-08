@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from decimal import Decimal
 from io import StringIO
+import base64
 import gzip
 import json
 import os
@@ -253,9 +254,8 @@ class CloudGateTests(CostFixture):
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
             'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': ''}])
-        encoded = ledger.text(self.fake.launches[0], 'UserData')
-        import base64
-        data = base64.b64decode(encoded).decode()
+        data = ledger.text(self.fake.launches[0], 'UserData')
+        self.assertTrue(data.startswith('#!/bin/sh\n'))
         links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
         for key in ('guest', 'request', 'source', 'log', 'result', 'boot_error'):
             parsed = urlsplit(ledger.text(links, key))
@@ -267,7 +267,7 @@ class CloudGateTests(CostFixture):
         self.assertEqual(urlsplit(ledger.text(links, 'log')).path, '/artifacts/attempt/gate.log')
         self.assertNotIn('fixture-secret', data)
         self.assertNotIn('s3://', data)
-        self.assertLess(len(encoded), 25600)
+        self.assertLess(len(base64.b64encode(data.encode())), 25600)
         self.assertNotIn('test_module_0000.py', data)
         self.assertIn('requests/attempt.guest.py', data)
         self.assertIn('requests/attempt.json', data)
@@ -524,6 +524,7 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(sidecar, folder / 'reservation.cgroup')
         self.assertIn('--setenv=AWS_SHARED_CREDENTIALS_FILE=' + str(self.root / '.config/aws-build/credentials'), commands[0])
         self.assertIn('--property=KillMode=control-group', commands[0])
+        self.assertIn('--working-directory=' + str(self.root / '.claude'), commands[0])
         self.assertEqual(ledger.mapping(cast(object, json.loads(destination.read_text())))['host'], 'remote-host')
 
     def test_absent_stack_needs_no_service_or_aws_call(self) -> None:
