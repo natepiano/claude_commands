@@ -1828,3 +1828,77 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Ruled out:**
 - A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.
+
+### Phase 81 — A Mac test build never links stale objects from an old build  · status: todo
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 ("a Mac build fault from hana, as your next phase now").
+
+#### Work Order
+
+**Goal:** find why Mac test builds of hana failed to link with undefined ThinLTO-promoted symbols, and fix the cause in the build tooling. No `incremental = false`, and no other workaround.
+
+**Measured (demo via hana, 2026-11-07 23:59 to 2026-11-08 01:18 EST):** three Mac runs failed the same way. Log on natedev: `/tmp/claude/unit/11db7b37-3b59-4a18-a50c-f71ae8c8b561/evidence/mac-link-undefined-llvm-symbols.log`.
+1. The command was `verify.sh test hana_catalyst`. verify.sh ran on natedev and sent a copy to the Mac mirror `/Users/natemccoy/.local/state/mac-test/mirror/hana` (`mac_test: running a copy on the Mac while natedev compiles`).
+2. The linker printed `Undefined symbols for architecture arm64`. The missing names have `.llvm.<hash>` suffixes: `World::get_resource::<CascadeCombine<hana_diegetic::render::HairlineFade>>`, referred from `hana_diegetic::panel::lifecycle::prepare_cascade_seed::<HairlineFade>` in `libhana_diegetic-46693889639531b7.rlib`, and `_anon.07f7ce924af2bea6e273f39da1024b91.146` to `.150`.
+3. `incremental = false` in `[profile.dev]` made the run pass. demo reverted that change.
+
+**Spec:**
+1. Find the cause first, with read-only commands only. Write the report to `phases/81/mac_link_report.md` in the run folder. Change no Mac setting and start no Mac test for measurement.
+   - Read the log. Find which target folder, profile and toolchain the Mac build used, and what the offload copies or removes in it.
+   - Check each candidate and give its evidence: stale incremental objects in the Mac target; a partial target removal by the Mac post-run cleanup (Phase 75) or the floor sweep (Phase 78) while a build used the target; two toolchains or two builds that share one target folder at the same time; a copy of build output from natedev into the Mac target.
+   - Give one line for each proven cause with its evidence. Say which candidates you ruled out and how.
+2. Fix the proven cause where it lives in the build tooling, so a Mac build never links objects that a different or interrupted build left. If the cause lives in verify.sh or the offload and another unit owns that code, name the owner in the report and post blocked.
+3. Add a test that fails without the fix and passes with it.
+4. Update the as-built doc that describes the changed tooling.
+
+**Files:**
+- `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
+- `scripts/mac_test/floor_claims.py` — the floor claims, when the cause is there.
+- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/test_floor_sweep.py`, `scripts/mac_test/test_offload.py` — the regression test.
+- `docs/as-built/build-memory-admission.md` — the changed rule.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the report, the source files and the as-built doc, and runs the final suites.
+- `test` owns the test files.
+
+**Acceptance gate:**
+- The report names each proven cause with its evidence, or states that no cause could be proven and what was ruled out.
+- The regression test fails before the fix and passes after it.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+
+### Phase 82 — The Mac keeps its disk floor without waiting for a test run  · status: todo
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 ("go for Phase 82: add /usr/sbin to the Mac jobPath, and add a periodic Mac floor job on the same leased path as the on-demand sweep").
+
+#### Work Order
+
+**Goal:** the Mac disk stays at or above its 150 GiB sweep floor without a test run to start the sweep, and the Mac's scheduled cleanup jobs can find `lsof`.
+
+**Measured (Phase 81 rounds 1 and 4, 2026-11-08):** the Mac sat at 126 GiB free from about 00:19 UTC with no floor scan.
+1. No periodic floor job exists for the Mac. natedev has `nate.jobs.disk-floor` (`modules/linux/disk-floor.nix`, every 120 s). The Mac has no job in launchd or cron.
+2. The only Mac trigger is `offload.ensure_mac_disk_floor()`. It starts `sweep.py --floor-only --host mac` only below `free_floor_gib` (100 GiB). The sweep then trims to `sweep_floor_gib` (150 GiB).
+3. The Mac job PATH (`jobPath` in `modules/darwin/nate-backend.nix`) has no `/usr/sbin`. `tmp_sweep.lsof_paths()` then returns `ProcessUsesUnavailable`, and tmp-sweep, folder-audit and codex-mesh-sweep remove nothing.
+
+**Spec:**
+1. Add a periodic job that keeps the Mac at its sweep floor. It uses the same leased path as the on-demand sweep in `ensure_mac_disk_floor()`: the same mirror leases, claim locks and floor lock. It runs where those leases live. It trims only the shortfall below `sweep_floor_gib`, as the on-demand sweep does. Keep the 100 GiB on-demand trigger unchanged.
+2. Add `/usr/sbin` to the Mac `jobPath`, after `/usr/bin:/bin`.
+3. Write the nixos changes as one patch file, `phases/82/nixos.patch` in the run folder, against nixos `main`. The director applies it on a nixos branch. Do not edit `/etc/nixos` or any nixos checkout.
+4. Add a test for the new periodic entry point, if the fix adds one in this repository.
+5. Update the as-built doc that calls the Mac floor job a future job.
+
+**Files:**
+- `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py` — the periodic entry point, only if one is needed.
+- `scripts/mac_test/test_floor_sweep.py`, `scripts/mac_test/test_mac_test.py` — its test.
+- `docs/as-built/build-memory-admission.md` — the Mac floor job.
+- `modules/darwin/nate-backend.nix`, `modules/linux/disk-floor.nix` — in the nixos repository, through the patch file only. A new nixos module is allowed.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the source files, the patch file and the as-built doc, and runs the final suites.
+- `test` owns the test files.
+
+**Acceptance gate:**
+- The patch applies cleanly to nixos `main`, and `nix-instantiate --parse` accepts each changed `.nix` file.
+- The periodic job calls the same leased sweep path as `ensure_mac_disk_floor()`. A test shows it, if the entry point is in this repository.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
