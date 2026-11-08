@@ -8,7 +8,6 @@ import os
 import secrets
 import stat
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +18,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("pre-tool-use-scratch-guard.py")
-sys.path.insert(0, str(HOOK.parent))
 remake_session_temp = cast(Callable[[str], None],
-                           importlib.import_module(HOOK.stem).remake_session_temp)
+                           importlib.import_module(f"scripts.hooks.{HOOK.stem}").remake_session_temp)
 
 
 class HookDecision(TypedDict):
@@ -94,7 +92,7 @@ class ScratchGuardTests(unittest.TestCase):
         self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
 
     def test_copies_root_allows_a_new_pair_and_copy(self) -> None:
-        guard = importlib.import_module(HOOK.stem)
+        guard = importlib.import_module(f"scripts.hooks.{HOOK.stem}")
         private = self.temp / "claude"
         loose_folder = cast(Callable[[Path], Path | None], guard.loose_folder)
 

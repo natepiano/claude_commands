@@ -4,6 +4,8 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import fcntl
 import io
 import os
@@ -66,6 +68,7 @@ DEMO_ID = fixture_runtime_id("showrunner::demo")
 def setUpModule() -> None:
     """The pin on the row `show` printed and the scratch folders a verdict removes are in a temporary
     folder, never ~/.local/state/next, /tmp/claude/scratch or ~/rust/repro."""
+    unittest.enterModuleContext(foreign_hostname())
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
@@ -148,7 +151,6 @@ class ProducerFixture(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "NEXT_STATE_DIR": str(self.root / "next")}))
-        _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Producer fixture")
         _ = self.git("config", "user.email", "producer@example.invalid")

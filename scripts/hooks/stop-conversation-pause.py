@@ -2,6 +2,10 @@
 """Record when a session reply finishes during an update pause."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -69,7 +73,7 @@ def main() -> None:
     _ = signal.signal(signal.SIGALRM, budget_spent)
     _ = signal.alarm(budget)
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
         if records_scheduled_prompts:
             conversation_pause.record_scheduled_prompts(

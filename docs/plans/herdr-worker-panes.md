@@ -2879,7 +2879,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Ruled out:** a new check on the close result (sdlc: add no check).
 
-### Phase 19 — Delete the mesh and rename the detached runs  · status: todo
+### Phase 19 — Delete the mesh and rename the detached runs  · status: moved: hierarchies-unit (sdlc, 2026-11-07)
 
 **Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, and the drain gate below (sdlc, 2026-11-07: Phase 27, Phase 28 and Phase 29 land first).
 Phase 26 meets the drain gate, and this phase follows it at once (sdlc, 2026-11-07). The Phase 26 one-off program ran from the director's scratch folder; it is not in the repository, so this phase deletes nothing for it. End state (user): assign uses panes only, and no record of a mode exists.
@@ -2928,6 +2928,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
     Update every caller in the Files below. Add no forwarder and no new check.
 12. **Types.** `mesh_runs._run_worker` (`:209`) returns `StaffRow | None`: use a found worker and an unavailable worker with a reason. `result_text` and `deliver` take `int | None`, where `None` means that the supervisor disappeared: use one type for a completed command and one for a lost supervisor, and convert the record field at the reader. `worker_panes.start_or_resume` (`:685`) and `worker.dispatch` (`:236`) take `policy: LaunchPolicy | None`, where `None` means "resolve the role policy": use `UseRolePolicy | LaunchPolicy`. Keep the tests for the role default and the explicit Astra policy.
 13. **Tell queue-unit at landing (queue-unit, 2026-11-06).** When this phase is on the builds branch, tell queue-unit. queue-unit then sets the group name `builds-detached.slice` in the renamed script. This phase changes nothing for it.
+14. **Astra reviews run in an owned pane worker (builds, via sdlc [0a14929b], 2026-11-07).** `/astra_review` from the builds showrunner ran on a `codex_mesh` app-server with no owner (`/tmp/claude/astra/20261107T184024Z-115551/codex.log`: "this run has no owner because progress_history_state.json and mesh_roster.json name no unit, production or staff row"). The cause is the pin that `astra_review.run_review` writes (`scripts/astra/astra_review.py:106`) from `unit_runs.parent_transport`. With the pin gone (Spec item 6), a `staff-worker` review goes through the herdr pane worker, with the calling session's staff row as the parent of its `astra-reviewer<pid>` worker. All astra callers (`astra_review.py`, `astra_work.py` and `design_roles.py`) use this one path; the roles unit that owned astra is retired, so herdr owns it. A test proves that a review called from a showrunner session opens a pane worker whose parent is that showrunner's row, and reaches no `codex_mesh` code.
 
 **Files:**
 - `scripts/production/worker_fill.py`, `scripts/production/test_worker_fill.py`, `scripts/production/migrate_staff_ids.py`, `scripts/production/test_migrate_staff_ids.py` — delete the one-time tools after the completeness and history proofs.
@@ -2935,7 +2936,8 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
   Phase 8k of `docs/plans/sdlc-devtools-tests.md` removed the `agent_bg.sh` call to `worker_fill.py coordinate-claude` and the `assign_gate.PYTHON_HOPS` entry. The worker command replaces `scripts/direct/claude_worker.py`.
 - `scripts/ask_a_friend/test_end_friend.py` — retire only the remaining `worker_fill` command tests with that tool; preserve shared consumer tests.
 - `scripts/astra/astra_roles.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py` — Spec item 9.
-- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — Spec item 6: remove the `worker_transport` pin write (`astra_review.py:106`).
+- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — Spec item 6: remove the `worker_transport` pin write (`astra_review.py:106`); Spec item 14: the owned pane worker test.
+- `scripts/astra/astra_work.py`, `scripts/astra/test_astra_work.py` — Spec item 14: any astra Codex turn uses the same owned path.
 - `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — delete the mesh allocation, launch, follow-claim and server paths retained for pinned runs; Spec item 10 first.
 - `scripts/direct/end_session.sh`, `scripts/direct/test_end_session.py` — `end_session.sh:38` and `:92` call `codex_mesh.py`; delete those calls with the mesh.
 - `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — own the sandbox constants after mesh deletion. Remove any remaining mesh-pinned phase-lock checks; retain the fixed-id worker lock. Test startup without `codex_mesh` and preserve each role's sandbox. Update the detached-run read (`:482-483`) and the inline sandbox imports (`:537`, `:549`, `:558`, `:564`). Keep `astra_review_policy` (fixed read-only Codex with the supplied model and effort, `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS`) and the held-role `launch_policy` with their tests.
@@ -2979,6 +2981,10 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 24: a worker's herdr agent is `<unit>-<worker>` (`worker_panes._start_locked`, `agent_name=`); `_agent_name` hashes a name above 32 characters. Keep the staff lookup on the session id and the worker name.
 - Phase 25: a herdr launch with a phase runs `assign_claude.claim_phase` before `worker.py assign` (not for `review`). Keep the one claim call when the launch path changes.
 - Phase 26: every unfinished run pins herdr; a finished run can still hold a `mesh` pin file. Phase 19 removes the reader, so no pin file is read after it.
+- Phase 30: herdr adds no draft restore step after a submit; Claude keeps the draft itself. A draft lost in a stop and resume is the agents unit's fix.
+- Phase 27: only a worker with an active dispatch reopens on restore, restart or a move; an idle worker stays closed until its next assign. Keep this rule when the mesh branch goes.
+- Phase 33: `worker_pass` picks the newest matching pass by `started_at`, never the last in dict order. Keep this when the short mesh slots go.
+- Phase 32: every launch destination runs `unalias <kind>` through `Herdr.run_in_pane` before `agent start`. Keep the one step when the launch path changes; a test fake pane shows an empty shell first.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3171,31 +3177,23 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 
 **Ruled out:** a code-only switch of the pin under a live run (`mesh_runs.deliver` reads the pin when a detached run delivers).
 
-### Phase 27 — Only working workers hold a pane  · status: todo
+### Phase 27 — Only working workers hold a pane  · status: done
 
-**Depends on:** Phase 24 and Phase 25 (they edit `scripts/herdr` and `scripts/direct` files that this phase reads). Its order against Phase 19 is sdlc's call.
+#### As-built
 
-The user (2026-11-07): "given we can stop and resume workers, there isn't much point to keeping idle ones open in panes - we should just resume workers so we get their context back - when we need them and not just keep them in open panes. actual work should be what is open in panes - unit directors should coordinate this and it should be part of their unit direct instructions to do this". This replaces the rule that a unit's named workers stay open (user, 2026-10-10 and 2026-10-28): a worker still lasts as long as its unit, but as a saved conversation, not as an open pane. The tools exist: `worker_panes.py close <name>` stops the agent and closes its pane, and keeps the staff row and its thread (`worker_panes.close`, `scripts/herdr/worker_panes.py:899`; it refuses a busy worker). The next `assign.sh --to <name>` runs `codex resume <thread>` in a new pane (`_start_locked`).
+A pane holds a worker only while it works. After a director accepts a pass and starts no fix round or next dispatch at once, it closes the pane with `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`. The close keeps the staff row and the thread; the next `assign.sh --to <name>` resumes that thread in a new pane on the current role account. A busy worker or a live detached run keeps its pane until that work ends.
 
-#### Work Order
+- `worker.restore` (`scripts/production/worker.py`) reopens only a worker with an `ActiveDispatch` from `progress_history.active_dispatch`, through `_resume_launcher`; an idle worker stays closed. `ActiveDispatchUnavailable` prints an anomaly and makes the result `UNCERTAIN`. The shutdown restart and `pane_restore` reach this same function.
+- `pane_moves._move_locked` (`scripts/accounts/pane_moves.py`) moves only a worker with an active dispatch. It closes an idle worker's open or stopped pane and returns `nothing to move`.
 
-**Goal:** a pane holds a worker only while it works. When a worker's pass ends and the director has no next dispatch for it now, the director closes its pane. The next assign resumes its same conversation.
+**Files:**
+- `scripts/production/worker.py` — `restore` with the active-dispatch rule.
+- `scripts/accounts/pane_moves.py` — the move rule for idle workers.
+- `commands/unit/direct.md`, `commands/unit/worker.md` — the close-after-accept rule.
+- `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md` — the same rule.
+- `scripts/production/test_worker.py`, `scripts/accounts/test_accounts.py`, `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_restart.py` — busy and idle restore and move cases.
 
-**Spec:**
-
-1. `commands/unit/direct.md` <LongLivedWorkers/>: when a worker's pass is accepted and the director sends it no next dispatch now (no fix round, no next phase work), close its pane with `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`. The thread and the staff row stay. A refusal (a busy worker or a live detached run) keeps the pane; close it after that work ends. Replace each text that tells the director to keep idle workers open.
-2. Restore, resume and account moves reopen only a worker with an active dispatch (`BusyPass`). An idle worker stays closed and resumes at its next assign. Find each path that reopens idle pane workers (`worker.py restore`, the shutdown restart, the account move) and change it in its one shared place.
-3. `docs/as-built/herdr-adoption.md` and `docs/as-built/long-lived-workers.md` say the same.
-4. Add no check, refusal or validation that this list does not name.
-
-**Files:** `commands/unit/direct.md`, `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md`, and the one shared reopen place of Spec item 2 with its tests. The writer names the reopen file in the summary before editing it. When that file belongs to the shutdown unit or the accounts unit, sdlc settles who edits it.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- The tests of the reopen place pass. They show that a restore of a unit with one busy and one idle worker reopens the busy one only.
-- The full gate passes.
-- Director proof: in a test run, a worker closed after its pass resumes its same thread at the next assign.
+**Gotchas:** a test that expects a worker to reopen needs an active dispatch with a `launcher_command` (`progress_history.begin_dispatch`) and a patched `worker._resume_launcher`; without a live director session, `_resume_launcher` prints "director session is unavailable".
 
 ### Phase 28 — A director answers a worker's question in its pane  · status: todo
 
@@ -3240,7 +3238,7 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 **Spec:**
 
 1. `worker_run` takes the worker row. It returns the run of the worker's newest pass from the existing worker-to-run evidence (`session_staff.worker_run_index` or the reader under it). Do not add a second index.
-2. A worker with no pass in any run keeps today's answer (the director's first held run, else the fallback folder).
+2. A worker with no pass in any run keeps today's answer (the director's first held run, else the fallback folder). `start_or_resume` picks a run before a new worker row exists: keep a parent path for `NewWorkerSlot`, and use the worker evidence only for an existing row.
 3. Change every caller of `worker_run` to pass the worker row: `mesh_runs.caller_from_environment`, `worker.py restore`, `worker_panes.close` (its `HolderRun.CURRENT` default), `pane_moves.run_for_worker`, and each other caller that `grep -rn "worker_run(" scripts` finds.
 4. Add no check, refusal or validation that this list does not name.
 
@@ -3249,36 +3247,23 @@ aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exite
 **Workers:** `1 writer`.
 
 **Acceptance gate:**
-- New tests: a director with two runs whose names sort with the worker's run second; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
+- New tests: a director with two runs whose names sort with the worker's run second; a first admission of a new worker while the director holds two runs; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
 - The changed test modules pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
 - The full gate passes.
 
 
-### Phase 30 — A stashed draft comes back after a delivered prompt  · status: todo
+### Phase 30 — A stashed draft comes back after a delivered prompt  · status: done
 
-**Depends on:** Phase 23 and Phase 24 (the same two files). sdlc (2026-11-07): it lands right after Phase 24 and Phase 25, before Phase 27.
+#### As-built
 
-Defect (natedev and accounts, through sdlc [d4982d9a], 2026-11-07): at 11:52 EST the move path delivered fastest's resume message. `wait_for_prompt_input` (`scripts/herdr/herdr.py:2161`) sent `ctrl+s` and stashed the user's draft 'restart impl2 now, don't wait for herdr'. After the turn ended at 11:53 the composer was empty, and the draft was not in the transcript. So the Phase 23 claim "Claude puts the stashed draft back after a submit that is not a slash command" fails live. That claim came from a read of the Claude Code 2.1.319 source, not from a live proof. The resume message was a multi-line script prompt, which Claude shows as pasted content. sdlc: "a user's lost typing is a fault the user sees."
+`Herdr.submit_opening_prompt` adds no draft restore step. A live measurement of Claude Code 2.1.319 in 7 cases with no stop (idle, generating, SessionStart hooks, a running tool, two queued prompts) shows that Claude keeps or restores a stashed draft by itself after a submit. `PromptSubmissionTests.test_proved_submission_returns_without_waiting_for_the_turn_or_restoring_the_stash` proves that a proved submission returns at once: it does not wait for the turn and does not send `ctrl+s` again.
 
-#### Work Order
+**Files:**
+- `scripts/herdr/test_herdr.py` — the submission test above.
 
-**Goal:** when herdr stashes a draft to deliver a prompt, the user sees the same draft in the composer after the turn.
+**Gotchas:** a stop and resume loses the draft: the SIGTERM in `stop_resume._stop` (`scripts/shutdown/stop_resume.py:332`) ends the Claude process that holds it. The agents unit owns that fix (its pause and exit phase); herdr adds only a pane-read helper if that unit asks for one.
 
-**Spec:**
-
-1. Find the cause live before any edit, in a throwaway Claude pane (Acceptance gate). Measure the composer just after the submit, during the turn and after the turn, for a multi-line script prompt and a one-line prompt. Read the Claude Code 2.1.319 stash restore condition in its source. Record the cause in the summary.
-2. Fix in the one submit path (`Herdr.submit_opening_prompt` and `wait_for_prompt_input`). When this call stashed a draft and the submit is proved, put the draft back with Claude's own stash key: `ctrl+s` on an empty composer restores the stash. Send it once, only when the composer is empty. If step 1 shows that this does not restore the draft, post blocked with the measured evidence.
-3. Add no check, refusal, validation or retry that this list does not name.
-
-**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- A unit test: a submit that stashed a draft sends `ctrl+s` again once after the proved submit when the composer is empty, and sends nothing when the composer holds the draft.
-- A live proof in a throwaway pane: draft in the composer, a multi-line script prompt submitted through `submit_opening_prompt`, the same draft in the composer after the turn. The pane is a tab named `zz-proof-draft` in the agents herdr session, with its working directory under `/home/natepiano/scratch/herdrcheck/`. Close only the ids that the proof opened.
-- `PromptSubmissionTests` and `HerdrTests` pass; basedpyright on both files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
-
+**Ruled out:** a `ctrl+s` restore after a proved submit — it made each delivery wait for the turn end.
 
 ### Phase 31 — A message to a pane worker goes to its pane  · status: todo
 
@@ -3286,7 +3271,88 @@ Defect (natedev and accounts, through sdlc [d4982d9a], 2026-11-07): at 11:52 EST
 
 sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane worker fails with exit 3, `FAILED: codex_mesh.py send: codex_mesh: tool-based-ui-demo-fix2 is ended; message not delivered`. `send.py` (`codex`, `scripts/message/send.py:2234`) still sends every Codex message through `codex_mesh.py send`, which reads the old mesh roster entry as ended. sdlc's rule: `send.py` delivers to a pane worker through the one pane delivery function that assign uses, with no second copy. The `codex_mesh` route goes with Phase 19.
 
+Second case (sdlc [099e44fb], 2026-11-07): `send.py --to morty` returns `QUEUED: no live session answers to session:01a18dbb-...`, and `--to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` returns `FAILED: no live Codex daemon has thread 01a18dbb... loaded; checked ~/.codex, ~/.codex1, ~/.codex2`, while that Codex session runs in a herdr pane. `send.py` looks only for app-server daemons. This phase also delivers to a Codex session in a pane by its thread id: `herdr agent list` names the pane whose `agent_session.value` is that id, and the message goes through the one submit path. A test covers a Codex pane session with no staff row and no app-server.
+
+**Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A test fake pane shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
+
 The Work Order is written at the phase start.
+
+### Phase 33 — A worker's newest pass decides its close  · status: done
+
+#### As-built
+
+`worker_pass` (`scripts/herdr/worker_panes.py:450`) returns the matching recorder pass with the largest `started_at`. It still matches on `worker_name` or `team_slot`. A pass with no number for `started_at` counts as the oldest. So an older pass under a pre-handoff short slot (for example `test`) no longer hides the newer pass under the full worker name, and `close` accepts an idle worker after a mesh handoff.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `worker_pass`.
+- `scripts/herdr/test_worker_panes.py` — `test_close_uses_the_newest_pass_when_an_older_short_slot_is_last`, with subtests for a numeric, a missing and a text `started_at`.
+
+**Gotchas:** dict order in the recorder `pass` map is insertion order, not start order; never take the last match.
+
+### Phase 35 — A long worker thread does not compact in a loop  · status: todo
+
+**Depends on:** Phase 33 (the same file). It runs right after the Phase 33 checkpoint.
+
+Defect (demo-unit, 2026-11-07): pane worker `tool-based-ui-demo-test` (Codex thread `01a142f0-…`, pane w14:pX) compacted every 90 s from about 11:18 EST for 2.5 hours and made no edit. After each compaction its context is about 95,400 tokens; one tool call takes it to about 99,700. Cause: `worker_panes._policy_arguments` passes `-c model_auto_compact_token_limit=<UNIT_COMPACT_ABOVE_TOKENS>` (`scripts/herdr/worker_panes.py:585`), so Codex compacts inside a turn at 100,000 tokens. `config/direct.conf:65` says the value is for a different rule: "Compact an idle Codex worker before new work above this recorded context size." A long thread whose floor after compaction is near the limit compacts again at once.
+
+#### Work Order
+
+**Goal:** a pane worker never compacts inside a turn because of `UNIT_COMPACT_ABOVE_TOKENS`.
+
+**Spec:**
+
+1. Remove the `model_auto_compact_token_limit` argument from `_policy_arguments`. Codex keeps its own limit for a turn that fills the model window.
+2. Remove `LaunchPolicy.compact_above_tokens` and `ClaudeCompaction` if nothing else reads them; `ASTRA_REVIEW_COMPACT_ABOVE_TOKENS` follows the same rule.
+3. The idle-before-new-work compaction that `config/direct.conf:65` describes goes into Phase 34 (it changes `worker.dispatch`, which the agents unit owns until its phase 15b merges). Until then no between-turn compaction runs.
+4. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:** `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py`, and any test that names the removed argument.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- A unit test: the Codex launch arguments do not contain `model_auto_compact_token_limit`.
+- `scripts.herdr.test_worker_panes` passes; basedpyright on the changed files reads `0 errors, 0 warnings, 0 notes`; the full gate passes.
+
+### Phase 32 — A launch keeps the caller's Codex home  · status: done
+
+#### As-built
+
+`launch_prepared_agent` (`scripts/herdr/herdr.py`) runs `unalias <kind> 2>/dev/null;` through `Herdr.run_in_pane` in the destination pane before `agent start`, for an `ExistingPane`, a `NewTab` and a `SplitPane`. An `ExistingPane` also gets the environment exports in the same script and its terminal. Cause: the pane's interactive zsh has `alias codex='… accounts.py exec workers'`, and `accounts.exec_account` sets `CODEX_HOME` to the workers account. Before, only `ExistingPane` removed the alias, so a new tab or split started Codex on the workers account. A live proof ran in `zz-proof-codexhome` with its folders under `~/scratch/herdrcheck/codexhome-*` (13:17 and 13:20 EST).
+
+**Files:**
+- `scripts/herdr/herdr.py` — `launch_prepared_agent`.
+- `scripts/herdr/test_herdr.py` — the `NewTab` and `SplitPane` launches remove the alias through the same step.
+- Test fixtures: `scripts/production/add_showrunner_test_support.py` and `add_unit_test_support.py` make a fake zsh process for each new pane (`STUB_STATE/pane-shell`) and report the agent only when its parent is that shell. `scripts/herdr/test_herdr_sessions.py`, `scripts/lib/test_nix_env_launches.py`, `scripts/shutdown/test_pane_restore.py`, `test_restart.py` and `scripts/production/test_add_showrunner.py` patch `Herdr.run_in_pane` in setUp.
+
+**Gotchas:** `run_in_pane` waits until the pane shows an empty shell. A fake pane that answers `pane process-info` with the agent already in the foreground fails with "would send keys to … other live work".
+
+### Phase 34 — A worker's turn end tells the director; no shell waits  · status: todo
+
+**Depends on:** Phase 28 (the question path), and the agents unit's phase 15b on sdlc (sdlc [4bc87048], 2026-11-07: 15b owns `scripts/production/worker.py` and its test until it merges; build this phase's `worker.py` edits on it). sdlc accepted both launch-line hook calls. Phase 19 moved to hierarchies-unit and does not wait for this phase (sdlc [e5bdea18], 2026-11-07): hierarchies moves the Stage 2 file watchers out of `codex_mesh` under its Spec item 5. Build this phase's wait-loop deletion on that move.
+
+The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - keeping a sahell around to watch is inelegant and doesn't satisfy my beauty requirements". sdlc's design:
+
+1. A turn-end hook saves the worker's result and sends the director a message. For Codex it is the `notify` program, given on the launch command line (`-c notify=[...]`), not in `~/.codex*/config.toml`. A Claude worker gets the same through its Stop hook, given at launch with `--settings`, not in a settings file.
+2. A turn that ends without the dispatch `DONE` line is a question: the same hook sends the director the question (herdr pane state confirms the worker waits).
+3. `assign.sh` types the job into the pane and returns at once. No shell waits on the worker.
+4. Every caller moves at once; no record keeps the waiting-shell mode. Delete the wait loop in this phase (`worker._wait_for_dispatch` and `_wait_for_ready`, `scripts/production/worker.py:290-316`).
+5. **Compact an idle worker before new work (Phase 35).** Before `worker.dispatch` types a job, compact a Codex worker whose recorded context is above `UNIT_COMPACT_ABOVE_TOKENS` (`config/direct.conf:65`), between turns. Phase 35 removed the in-turn limit that made long threads compact in a loop.
+6. **The pass rule of Phase 22 (C1210) under the hook (user, through sdlc [41b8d0c7], 2026-11-07).** A `DONE` pass whose only open runs are finished completes, with one `run <id> finished, but its result is not in the transcript` line.
+    1. The hook decides that a pass is done with the one rule in `worker._dispatch_turn` (`dispatch_receipt`). Call it; do not write a second copy.
+    2. A turn end with `DONE` while a background run still runs is not a result yet. The run's own completion checks the pass again when it finishes.
+    3. A finished run whose result never reached the transcript puts the anomaly line in the director's message, and the pass completes.
+    4. One test for each of 6.1, 6.2 and 6.3.
+
+7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held.
+8. **One completion rule (plan review after Phase 32).** The C1210 exception is in `_dispatch_turn` after a quiet wait, not in `dispatch_receipt`, which returns `DispatchWaitingForRuns` when a finished run's result is absent. Extract one completion decision before the wait is deleted. The hook and a detached run's completion both call it; 6.4's tests go through both.
+9. **Default policy is a named state.** `worker.dispatch` and `worker_panes.start_or_resume` take `LaunchPolicy | None`, where `None` means the role's configured policy. When this phase changes those signatures, replace `None` with a named state (for example `ConfiguredRolePolicy`).
+
+**Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A hook launch fixture shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
+
+**Restructure (sdlc [a3ae4ca3], 2026-11-07):** fix-rounds-unit cuts `commands/unit/direct.md` to a core and moves mode-only sections to files read on demand. Merge sdlc after it lands, then put this phase's `direct.md` edits into the new layout.
+
+**Files (first list; the Work Order at the phase start settles it):** `scripts/production/worker.py` and `test_worker.py`; `scripts/direct/assign.py`, `assign.sh`, `progress_history.py` and their tests; `scripts/herdr/worker_panes.py` and `test_worker_panes.py`; one new turn-end hook script in `scripts/herdr/` with its test; `commands/unit/direct.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`; `docs/as-built/long-lived-workers.md` and `herdr-adoption.md`.
 
 ## Reference
 
