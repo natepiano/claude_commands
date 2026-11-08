@@ -14,6 +14,8 @@ Test clones on either machine use `copies.py clone <source> --task gate:<id>`
 task before Git starts and prints the checkout inside its scratch folder.
 `scratch.py end --task gate:<id>` removes the clone. A failed clone remains
 owned by its task, so the same end command removes a partial copy.
+Clones inherit Claude trust when any account trusts the source checkout.
+Task completion, sweeps, and `copies.py mirror-remove` clear that clone trust before deletion.
 `mac_run.sh` uses one gate task per run. On exit, `hana-instances stop-checkout <path>`
 stops its test Hanas through the identity-checked stop path, confirms they
 exited, and checks for surviving builds and examples through the audit's

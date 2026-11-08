@@ -61,6 +61,7 @@ from scripts.message import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.shutdown.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable, StaffId
 
@@ -209,11 +210,8 @@ def stop(session: str, kind: str = "", *, deadline: float = math.inf,
 
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
-            if runs is not None:
-                return _stop_recorded(session, kind, codex=codex, runs=runs)
-            if codex is not None:
-                return _stop_recorded(session, kind, codex=codex)
-            return _stop_recorded(session, kind)
+            shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+            return _stop_recorded(session, kind, **shared)
     except TimeoutError as error:
         reason = str(error)
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
@@ -234,7 +232,7 @@ def _stop_recorded(session: str, kind: str = "", *,
     from scripts.lib import unit_runs
     parent = record.parent_of(row) if row is not None else None
     pane_worker = row is not None and row.kind == "worker" and (parent is None or
-        unit_runs.worker_transport(_worker_run(parent, record, runs)) == "herdr")
+        unit_runs.worker_transport(worker_panes.worker_run(parent, record=record, scanned=runs)) == "herdr")
     before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -364,6 +362,8 @@ def _stop(session: str, kind: str = "", *,
                     return StopFailed(identity, "process identity changed; no signal sent")
             except ProcessLookupError:
                 return Stopped(identity, live.pid)
+            except herdr.NativeRegistryUnavailable:
+                pass
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
             else:
@@ -385,18 +385,6 @@ def _stop(session: str, kind: str = "", *,
         return StopFailed(identity, reason)
 
 
-def _worker_run(parent: StaffRow, record: StaffSnapshot, runs: dict[str, list[str]] | None) -> Path:
-    """Resolve a worker run from the command's shared index when supplied."""
-    from scripts.herdr import worker_panes
-    from scripts.lib import unit_runs
-
-    if runs is None:
-        return worker_panes.worker_run(parent, record=record)
-    held = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), scanned=runs, record=record)
-    return (Path(held[0]) if held else Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR")
-            else unit_runs.state_dir() / "staff" / "workers" / parent.id)
-
-
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       codex: herdr.CodexConversations | None = None,
                       runs: dict[str, list[str]] | None = None) -> list[str]:
@@ -412,7 +400,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
     try:
         deadline = worker_lifecycle.effective_deadline()
         if holder is not None:
-            run = _worker_run(holder, record, runs)
+            run = worker_panes.worker_run(holder, record=record, scanned=runs)
             if unit_runs.worker_transport(run) == "mesh":
                 from scripts.agents import codex_mesh
 
@@ -423,14 +411,10 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
         client = herdr.Herdr(herdr.shared_session())
-        def stop_worker(row: StaffRow) -> bool:
-            if runs is not None:
-                return restart.stop_row(row, client, deadline=deadline, codex=codex, runs=runs)
-            if codex is not None:
-                return restart.stop_row(row, client, deadline=deadline, codex=codex)
-            return restart.stop_row(row, client, deadline=deadline)
+        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(stop_worker, item.row)) for item in live]
+            futures = [(item, pool.submit(restart.stop_row, item.row, client,
+                deadline=deadline, **shared)) for item in live]
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
@@ -530,7 +514,14 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     settings = conf.read("shutdown")
     start_seconds = settings.number("START_SECONDS")
     _ = settings.number("STAY_SECONDS")
+    transcript = herdr.SessionTranscript(Path(entry["config_dir"]), entry["session_id"])
+    cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+    if message:
+        cursor = herdr.TranscriptCursor(transcript, datetime.now(timezone.utc))
+        cursor.skip_existing_turns()
     launched_at = datetime.now(timezone.utc)
+    if isinstance(cursor, herdr.TranscriptCursor):
+        cursor.since = launched_at
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + operation_deadline.remaining(start_seconds)
@@ -553,7 +544,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     if identity != entry["session_id"]:
         print(f"{entry['session_id']}: prompt identity anomaly: observed {identity}", file=sys.stderr)
         return live
-    opening = herdr.OpeningPrompt(message, herdr.SessionTranscript(Path(entry["config_dir"]), identity))
+    opening = herdr.OpeningPrompt(message, transcript, cursor=cursor)
     outcome = client.submit_opening_prompt(tab.pane_id, opening, launched_at, int(operation_deadline.remaining(start_seconds) * 1000))
     if isinstance(outcome, herdr.PromptNotSubmitted):
         print(f"{identity}: prompt anomaly: {outcome.reason}", file=sys.stderr)

@@ -53,6 +53,7 @@ export function snapshotPaths(snapshot: BoardSnapshot<BoardData>): RefreshPaths[
   return [
     ...snapshot.files.map((board, index): RefreshPaths => ({ kind: 'board', board, sources: snapshot.boards[index]?.sources ?? [] })),
     { kind: 'discovery', sources: snapshot.watch, loadedAt: snapshot.loadedAt },
+    ...(snapshot.boards.some(board => board.live) ? [{ kind: 'liveness' } as const] : []),
   ];
 }
 

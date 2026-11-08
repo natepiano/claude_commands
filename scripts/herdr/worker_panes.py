@@ -19,6 +19,7 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import partial
 from importlib import import_module
 from typing import Literal, cast, final
 
@@ -424,8 +425,9 @@ def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *
 
 
 def worker_run(parent: staff.StaffRow, *,
-               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
-    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
+               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+               scanned: dict[str, list[str]] | None = None) -> Path:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)
     if runs:
         return Path(runs[0])
     return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
@@ -682,7 +684,8 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
-                    policy: LaunchPolicy | None = None) -> WorkerStart:
+                    policy: LaunchPolicy | None = None, runs: dict[str, list[str]] | None = None,
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -692,7 +695,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
-    run = worker_run(owner)
+    run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
@@ -707,7 +710,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if not held.active or held.parent != parent or held.name != name:
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
             with worker_admission.worker_operation(allowed):
-                return _start_locked(owner, name, role, policy, account, allowed, held)
+                return _start_locked(owner, name, role, policy, account, allowed, held, codex)
     except (worker_admission.AdmissionRefused, staff.StaffRefused) as error:
         return AdmissionRefused(str(error))
 
@@ -746,7 +749,8 @@ def _codex_start_session(client: herdr.Herdr, pane: str, *,
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
-                  allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold) -> WorkerStart:
+                  allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead) -> WorkerStart:
     started = time.monotonic()
     try:
         start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
@@ -855,7 +859,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     try:
-        launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
+        launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
+        launched = launch(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:

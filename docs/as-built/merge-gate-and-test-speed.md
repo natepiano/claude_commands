@@ -290,7 +290,23 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The gate releases the reservation on every exit while its private empty-scope sidecar still exists.
   Release writes the run's `merge-gate` or `targeted-test` history row for reports.
   Admission does not use that history to size the gate.
-- **Shared CPU slots.** Every module and the `types` job takes one byte from `/dev/steve` before launch and returns that byte after its process group ends, including on a failure, kill or interruption. The pool accepts a FIFO or a character device, including steve's CUSE device. The launch loop checks readiness with a zero timeout before a non-blocking read, so a token wait still samples memory, reaps jobs and checks holds. An absent pool keeps the existing behavior; `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests. Launch and cleanup registration defer cancellation together; the child restores its signal mask before exec. The per-gate job limit still applies. Admission and token waits stay inside the checkout's shared busy lock. Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
+- **Shared CPU slots.** Each module and the `types` job takes one byte from `/dev/steve` before launch.
+  The gate returns the byte after the process group ends, including after failure, kill, or interruption.
+  The pool accepts a FIFO or a character device, including steve's CUSE device.
+  A gate with running jobs uses the existing non-blocking read.
+  It continues to sample memory, collect results, and check holds.
+  An idle gate with a pending job waits in a blocking read, in line with cargo.
+  The gate keeps a separate blocking descriptor open for the pool lifetime.
+  It prints `waits for a CPU slot` once, then prints the elapsed wait when the wait ends.
+  Stop signals interrupt the wait without a masked blocking read.
+  Cleanup returns all registered slots.
+  Steve recovers a byte at process exit if a signal interrupts its registration after the read.
+  The gate checks holds again after the blocking read.
+  If a hold prevents admission, the gate returns the slot before it waits for the hold.
+  An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
+  Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
+  The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
+  Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
 - Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
   The runner reads the output and removes the temporary folder when the job ends.

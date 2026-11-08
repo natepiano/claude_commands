@@ -894,6 +894,18 @@ def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) ->
     return {**source, "projects": projects}
 
 
+def without_project_entries(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Remove project entries for the exact folder keys. Preserve all other entries and settings."""
+    if not folders:
+        return source
+    raw_projects = source.get("projects", {})
+    if not isinstance(raw_projects, dict):
+        raise ValueError("projects must be an object")
+    projects = cast(dict[str, object], raw_projects)
+    remaining = {folder: project for folder, project in projects.items() if folder not in folders}
+    return {**source, "projects": remaining} if len(remaining) != len(projects) else source
+
+
 @contextmanager
 def _account_home_lock(home: Path) -> Generator[None]:
     """Serialize account-file publication with setup's directory flock."""
@@ -930,13 +942,14 @@ def claude_config_lock(path: Path) -> Generator[None]:
         yield
 
 
-def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+def _change_trust_file(home: Path, path: Path,
+                       change: Callable[[dict[str, object]], dict[str, object]]) -> bool:
     with _account_home_lock(home), claude_config_lock(path):
         while True:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
             original = read_json_object(io.StringIO(before.decode("utf-8")))
-            updated = with_trusted_folders(original, configuration.folders)
+            updated = change(original)
             if updated == original:
                 return False
             published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
@@ -950,19 +963,76 @@ def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bo
                 # Preserve changes from writers that do not use the lock.
 
 
+def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+    return _change_trust_file(home, path, lambda source: with_trusted_folders(source, configuration.folders))
+
+
+@dataclass(frozen=True)
+class AccountTrustFile:
+    """The trust file and account home used for locked publication."""
+
+    label: str
+    home: Path
+    path: Path
+
+
+def _account_trust_files() -> list[AccountTrustFile]:
+    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
+    return [AccountTrustFile(home.label, home.dir,
+                            accounts_home() / ".claude.json" if home.dir == main_config_dir()
+                            else home.dir / ".claude.json") for home in homes]
+
+
+def source_has_claude_trust(source: Path) -> bool:
+    """Return whether any account trusts the source through the shared Claude trust check."""
+    from scripts.herdr import herdr
+
+    try:
+        files = _account_trust_files()
+    except (OSError, ValueError) as error:
+        print(f"accounts: anomaly: cannot list trust files ({type(error).__name__})", file=sys.stderr)
+        return False
+    for account_file in files:
+        try:
+            if isinstance(herdr.claude_trust(source, account_file.path), herdr.Trusted):
+                return True
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {account_file.path}: cannot check trust ({type(error).__name__})", file=sys.stderr)
+    return False
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
+    """Trust a folder or remove its project entry in every existing account file. Report each failed home independently."""
+    try:
+        key = str(folder.resolve())
+        files = _account_trust_files()
+    except (OSError, ValueError) as error:
+        print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
+        return
+    change = with_trusted_folders if trusted else without_project_entries
+    for account_file in files:
+        try:
+            _ = account_file.path.stat()
+            _ = _change_trust_file(account_file.home, account_file.path, lambda source: change(source, (key,)))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__})", file=sys.stderr)
+
+
 def trust_accounts() -> int:
     """Apply configured trust to each home independently without inspecting identity."""
     configuration = trust_configuration()
-    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
     failures = False
-    for home in homes:
-        path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
+    for account_file in _account_trust_files():
         try:
-            changed = _trust_file(home.dir, path, configuration)
+            changed = _trust_file(account_file.home, account_file.path, configuration)
             state = "updated" if changed else "unchanged"
-            print(f"{home.label}: trust {state}")
+            print(f"{account_file.label}: trust {state}")
         except (OSError, ValueError) as error:
-            print(f"{home.label}: trust failed: {error}", file=sys.stderr)
+            print(f"{account_file.label}: trust failed: {error}", file=sys.stderr)
             failures = True
     return int(failures)
 
@@ -3716,27 +3786,24 @@ class NoRoleCount:
 
 
 @dataclass(frozen=True)
-class UnknownShellCount:
-    """The worker roster does not report shell activity."""
-
-
-@dataclass(frozen=True)
 class RoleSessionCounts:
     """Distinct members of one role, grouped by activity."""
 
     busy: int
-    shell: int | UnknownShellCount
     idle: int
+    paused: int
+    exited: int
 
     @property
     def total(self) -> int:
-        return self.busy + (self.shell if isinstance(self.shell, int) else 0) + self.idle
+        return self.busy + self.idle + self.paused + self.exited
 
 
 class RoleSessionCountsDocument(TypedDict):
     busy: int
-    shell: int | None
     idle: int
+    paused: int
+    exited: int
     total: int
 
 
@@ -3903,7 +3970,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
             role_counts=[RoleSessionCountsDocument(busy=count.busy,
-                shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+                idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
             role_counts_by_machine=row.role_counts_by_machine,
@@ -4729,6 +4796,30 @@ class LocalRoleSessions:
     continuation_lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CodexRoleProcess:
+    pid: int
+    activity: Literal["busy", "idle"]
+
+
+def _local_codex_processes() -> dict[str, CodexRoleProcess]:
+    """Read native Codex conversations and pane activity once for this board."""
+    from scripts.herdr import herdr
+
+    try:
+        agents = herdr.Herdr(herdr.shared_session()).agents()
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+        agents = []
+    activities: dict[str, Literal["busy", "idle"]] = {
+        agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
+        for agent in agents if agent.get("agent") == "codex"
+        and isinstance(agent["agent_session"], herdr.ReportedAgentSession)
+    }
+    wanted = next(iter(activities), "")
+    return {identity: CodexRoleProcess(pids[0], activities.get(identity, "idle"))
+            for identity, pids in herdr.codex_conversations(wanted=wanted).live.items() if pids}
+
+
 def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.NoAccountSetting | account.ProcessEnvironmentUnread:
     """Read the account setting without a subprocess for each Mac member."""
     if sys.platform != "darwin":
@@ -4742,7 +4833,8 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
 
 
 def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]:
-    observed = _read_local_role_sessions(GroupAccounts())
+    with role_map.stored_role_map():
+        observed = _read_local_role_sessions(group_accounts())
     return observed.counts, observed.inputs
 
 
@@ -4755,7 +4847,7 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
 
 
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
-    """Read local registries without account checks or host discovery."""
+    """Read local membership, processes, and activity for counts and moves."""
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
@@ -4780,6 +4872,15 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
     inputs.update(Path(path) for path in membership.inputs)
+    machine = _session_counts_machine()
+
+    def local_member(member: staff.StaffRow) -> bool:
+        owner = (membership.parent_of(member) or member) if member.kind == "worker" else member
+        if isinstance(owner.doc, staff.LiveDoc):
+            return owner.doc.machine == machine
+        location = owner.worktree
+        return not isinstance(location, staff.PresentWorktree) or location.machine == machine
+
     for path in sessions.sessions_dir().glob("*.json"):
         inputs.add(path)
     live = {session["sessionId"]: session for session in sessions.running_sessions()}
@@ -4814,36 +4915,44 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             counts.setdefault((directory, role), {})[identity] = "busy" if session.get("status") == "busy" else "idle"
-    # A stopped member stays on its last observed account, never the requested account.
+    # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner")):
-        if member.current_session in live:
-            continue
-        candidates = [launch for reference, launch in launches.items()
-                      if reference in (member.id, member.current_session)]
-        if not candidates:
-            continue
-        launch = max(candidates, key=lambda launch: launch["written_at"])
-        if pane_launch.agent_kind(launch) != "claude" or not launch["config_dir"]:
+        if member.current_session in live or not local_member(member):
             continue
         role = "units" if member.kind == "unit" else "showrunners"
-        directory = Path(launch["config_dir"])
-        counts.setdefault((directory, role), {})[member.current_session] = "shell"
-        label = claude_config_label(directory)
-        suffix = _moving_role_suffix(role, label, groups)
-        session_lines.append(f"session {member.current_session} ({member.name}): {label}; shell{suffix}")
+        selected = group_label(groups, role)
+        if not isinstance(selected, str):
+            continue
+        directory = account_dir(selected)
+        counts.setdefault((directory, role), {})[str(member.id)] = "exited"
+        session_lines.append(f"session {member.current_session} ({member.name}): {selected}; exited")
     from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
 
     continuation_lines: list[str] = []
+    observed_workers = set(live)
     for run, name, entry, home in (_worker_status_records(inputs) if include_workers else ()):
         if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
             counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
                 "busy" if entry.get("status") in ("running", "starting") else "idle")
+            observed_workers.update(str(entry.get(key, "")) for key in ("staff_id", "thread_id", "session_id"))
         if entry.get("continuation_owed") is True:
             reason = entry.get("continuation_reason")
             if not isinstance(reason, str):
                 reason = ("waiting for capacity on the selected account" if entry.get("status") == "waiting_capacity"
                           else "quota refusal; waiting for account recovery or a confirmed move")
             continuation_lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
+    unobserved_workers = [member for member in staff.active(membership, "worker")
+        if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
+        and isinstance(membership.backends.get(member.id), staff.CodexBackend) and local_member(member)]
+    if unobserved_workers:
+        codex_processes = _local_codex_processes()
+        for member in unobserved_workers:
+            if process := codex_processes.get(member.current_session):
+                setting = account.process_codex_home(process.pid)
+                if isinstance(setting, account.ProcessEnvironmentUnread):
+                    continue
+                directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
+                counts.setdefault((directory, "workers"), {})[member.current_session] = process.activity
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), tuple(continuation_lines))
 
@@ -4891,7 +5000,7 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> 
         tool = "codex" if label.startswith("codex") else "claude"
         count = _role_session_counts(tuple(members.values()), tool)
         values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
-            shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     return document
@@ -4914,15 +5023,13 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
-            busy, shell, idle, total = (count.get(key) for key in ("busy", "shell", "idle", "total"))
-            if (type(busy) is not int or type(idle) is not int or type(total) is not int
-                    or (shell is not None and type(shell) is not int)):
+            busy, idle, paused, exited, total = (count.get(key) for key in ("busy", "idle", "paused", "exited", "total"))
+            if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
                 raise ValueError("invalid activity counts")
-            if min(busy, idle, total, shell or 0) < 0 or busy + (shell or 0) + idle != total:
+            busy, idle, paused, exited, total = (cast(int, value) for value in (busy, idle, paused, exited, total))
+            if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
                 raise ValueError("invalid count total")
-            if (label.startswith("codex")) != (shell is None):
-                raise ValueError("invalid shell count")
-            checked[label][role] = RoleSessionCountsDocument(busy=busy, shell=shell, idle=idle, total=total)
+            checked[label][role] = RoleSessionCountsDocument(busy=busy, idle=idle, paused=paused, exited=exited, total=total)
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
@@ -4979,7 +5086,7 @@ def _machine_role_counts(
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
-            shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
             for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts)}
         machines = {local: local_counts}
         if available:
@@ -4992,8 +5099,9 @@ def _machine_role_counts(
             counts = [machine[role] for machine in machines.values() if role in machine]
             combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
                 busy=sum(count["busy"] for count in counts),
-                shell=sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else UnknownShellCount(),
-                idle=sum(count["idle"] for count in counts)))
+                idle=sum(count["idle"] for count in counts),
+                paused=sum(count["paused"] for count in counts),
+                exited=sum(count["exited"] for count in counts)))
         counted.append(replace(row, roles=roles, role_counts=tuple(combined), role_counts_by_machine=machines))
     return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
@@ -5007,17 +5115,14 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
     if not isinstance(count, RoleSessionCounts):
         return role + selected
-    busy, idle, total = count.busy, count.idle, count.total
-    shell = count.shell if isinstance(count.shell, int) else None
-    activity = f"busy {busy}, " + (f"shell {shell}, " if shell is not None else "") + f"idle {idle}"
-    return f"{role}{selected} {total} ({activity})"
+    activity = f"busy {count.busy}, idle {count.idle}, paused {count.paused}, exited {count.exited}"
+    return f"{role}{selected} {count.total} ({activity})"
 
 
-def _role_session_counts(states: tuple[str, ...], tool: Literal["claude", "codex"]) -> RoleSessionCounts:
-    """Treat unknown activity as idle without changing role membership."""
-    busy = states.count("busy")
-    shell = states.count("shell") if tool == "claude" else 0
-    return RoleSessionCounts(busy, shell if tool == "claude" else UnknownShellCount(), len(states) - busy - shell)
+def _role_session_counts(states: tuple[str, ...], _tool: Literal["claude", "codex"]) -> RoleSessionCounts:
+    """Treat unknown live activity as idle without changing role membership."""
+    busy, paused, exited = (states.count(state) for state in ("busy", "paused", "exited"))
+    return RoleSessionCounts(busy, len(states) - busy - paused - exited, paused, exited)
 
 
 def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str, object], str]]:
