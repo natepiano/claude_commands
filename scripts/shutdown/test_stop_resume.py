@@ -1250,7 +1250,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-            herdr.RolloutThread("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
+            herdr.PaneSessionReport("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))
         _ = self.enterContext(patch.object(os, "kill", self.kill))
         # Stop tests supply signals; guard tests restore the shared function.
@@ -2197,7 +2197,7 @@ class StopResumeTests(unittest.TestCase):
             processes = herdr.json_items(self.client.process_info["foreground_processes"], "fixture foreground processes")
             if herdr.json_object(processes[0], "fixture Codex process")["argv"] != ["codex", "resume", identity]:
                 raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
-            return herdr.NativeAgentProcess(herdr.RolloutThread(identity), "generation-1", {})
+            return herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "generation-1", {})
         def pane_activity(pane: str) -> herdr.PaneRunning:
             self.assertEqual(pane, "w1:p2")
             return herdr.PaneRunning(("codex",))
@@ -2287,7 +2287,7 @@ class StopResumeTests(unittest.TestCase):
                 def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
                     if self.kill.called:
                         raise error
-                    return herdr.NativeAgentProcess(herdr.RolloutThread(identity), "generation-1", {})
+                    return herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "generation-1", {})
 
                 def start(*_command: str) -> str:
                     self.assertGreaterEqual(self.clock.elapsed, 3)

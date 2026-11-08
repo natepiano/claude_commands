@@ -977,13 +977,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
-        with herdr.launch_rollout_proof():
-            if row is None and policy.settings.kind == "codex":
-                if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                    return UnpublishedWorker(launched.pane, launched.outcome.reason)
-                identity = _codex_start_session(client, launched.pane)
-            else:
-                identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        if row is None and policy.settings.kind == "codex":
+            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                return UnpublishedWorker(launched.pane, launched.outcome.reason)
+            identity = _codex_start_session(client, launched.pane)
+        else:
+            identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
         if row is not None and identity != row.current_session:
             return _uncertain(row, "launch proves another native session; pane retained")
         if row is None:
@@ -994,8 +993,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 else UnpublishedWorker(launched.pane, str(error)))
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason)
-    with herdr.launch_rollout_proof():
-        fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+    fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
     return result if isinstance(result, (OpenWorker, ProcessUnknownWorker, UncertainWorker)) else _uncertain(row, "agent launch is incomplete")

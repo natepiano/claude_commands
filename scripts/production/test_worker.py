@@ -557,33 +557,20 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
         self.assertEqual(self.agent.row("w2:p7"), foreign)
 
-    def test_named_assign_resumes_while_its_codex_rollout_opens(self) -> None:
+    def test_named_assign_resumes_with_its_reported_codex_thread(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", live=False)
         native_process = self.fixture.world.native_process
-        stat = Path.stat
-        metadata_reads = 0
         published: list[str] = []
-
-        def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            nonlocal metadata_reads
-            value = stat(path, follow_symlinks=follow_symlinks)
-            if path.name == "3" and path.parent.name == "fd":
-                metadata_reads += 1
-                if metadata_reads == 2:
-                    (path.parent / "4").symlink_to(os.readlink(path))
-                    published.append(str(row.current_session))
-            return value
 
         def read_process(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
             observed = native_process(pid, kind, reported)
-            if kind == "codex":
-                identity = herdr.codex_rollout_thread(pid)
-                return herdr.NativeAgentProcess(herdr.RolloutThread(identity), observed.started, observed.environment)
+            if kind == "codex" and observed.current_identity not in published:
+                published.append(observed.current_identity)
             return observed
 
         with (patch.object(herdr, "native_process", side_effect=read_process),
-              patch.object(Path, "stat", read_metadata), redirect_stderr(io.StringIO()) as errors):
+              redirect_stderr(io.StringIO()) as errors):
             code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
                 slot="impl", phase="8", kind="impl", name="impl", launcher_command=["assign.sh"], reply=self.reply)
         self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
@@ -1073,7 +1060,7 @@ class WorkerCommandTests(unittest.TestCase):
                     _ = self.fixture.world.locations[opened.pane].pop("agent_session", None)
                     pid = self.fixture.world.foreground[opened.pane][0]
                     process = self.fixture.world.processes[pid]
-                    self.fixture.world.processes[pid] = replace(process, identity=herdr.RolloutThread(opened.row.current_session))
+                    self.fixture.world.processes[pid] = replace(process, identity=herdr.UnreportedResume(opened.row.current_session))
                 self.assertEqual(self.command("answer", "impl", "--text", answer_text), (0, "done\n", ""))
                 self.assertEqual(len(self.agent.answers), index)
                 self.assertEqual(self.agent.answers[-1][0], opened.pane)

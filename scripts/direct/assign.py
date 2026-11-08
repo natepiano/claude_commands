@@ -896,8 +896,18 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
             return 0
         opened = current
         client = herdr.Herdr(herdr.shared_session())
+        deadline = time.monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS
+        while True:
+            try:
+                thread = client.native_session(current.pane, "codex", max(0, deadline - time.monotonic()))
+                break
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise
+                _ = threading.Event().wait(max(0, min(0.1, deadline - time.monotonic())))
         process = client.pane_agent_process(current.pane, current.terminal)
-        source = herdr.codex_transcript(process.pid)
+        home = Path(herdr.process_environment(process.pid).get("CODEX_HOME") or Path.home() / ".codex")
+        source = worker_admission.codex_transcript_source(thread, home)
         reply = staff_worker.consultation_reply(client, current.pane, source, question)
         write_text_atomic(Path(args.summary), reply + "\n")
         result = 0
