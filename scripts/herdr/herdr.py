@@ -2207,7 +2207,10 @@ class Herdr:
             arguments = _foreground_arguments(process)
             if any(_is_agent_process(arguments, kind) for kind in ("claude", "codex")):
                 pid = cast(int, process["pid"])
-                processes.append(reader.identity(pid))
+                try:
+                    processes.append(reader.identity(pid))
+                except _StartupProcessGone as error:
+                    raise HerdrFailure(f"{pane}: {error}") from error
         if len(processes) != 1:
             raise HerdrFailure(f"{pane}: expected one foreground agent process")
         row = self.pane_row(pane)

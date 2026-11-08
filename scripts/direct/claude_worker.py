@@ -296,7 +296,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
             _ = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=dispatch,
-                                               cleanup=lambda identity: None, request=request)
+                                               cleanup=lambda identity: worker_admission.NoDestinationToStop(), request=request)
             return delivered
         except _LaunchFailed as error:
             return NotDelivered(error.code)

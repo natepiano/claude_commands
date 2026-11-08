@@ -720,7 +720,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
 
-### Phase 30a — Close the family-switch gaps for a worker with a closed pane  · status: todo
+### Phase 30a — Close the family-switch gaps for a worker with a closed pane  · status: done
 
 **Depends on:** Phase 30
 

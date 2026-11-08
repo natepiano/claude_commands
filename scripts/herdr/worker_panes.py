@@ -601,7 +601,7 @@ def stage_two_completion_id(dispatch_id: str) -> str:
     return dispatch_id + "-2"
 
 
-def can_close(worker: OpenWorker | StoppedWorker, *,
+def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     from scripts.direct import progress_history
@@ -611,7 +611,7 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     if parent is None:
         return Kept("worker parent is unavailable")
     directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
-    if isinstance(worker, StoppedWorker):
+    if isinstance(worker, (StoppedWorker, ClosedWorker)):
         return _idle_checks(worker.row, directory, lock)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
@@ -931,7 +931,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             closable = can_close(current, lock=lock)
             if isinstance(closable, Kept):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    if switching and isinstance(current, (OpenWorker, StoppedWorker)):
+    if switching and current is not None:
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
@@ -970,6 +970,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not switching and not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     launches: list[herdr.AgentLaunched] = []
+    launch_terminals: dict[str, str] = {}
+    launch_processes: dict[str, herdr.AgentProcessIdentity] = {}
 
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
@@ -979,6 +981,17 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_arguments(policy, identity, directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
         launches.append(launched)
+        if switching:
+            pane = client.pane_row(launched.pane)
+            if isinstance(pane, herdr.NoPane) or not (terminal := pane.get("terminal_id", "")):
+                raise herdr.HerdrFailure("launched terminal is missing")
+            if isinstance(destination, herdr.ExistingPane) and terminal != destination.terminal:
+                raise herdr.HerdrFailure("launched terminal changed")
+            launch_terminals[launched.pane] = terminal
+            process = client.pane_agent_process(launched.pane, terminal)
+            if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
+                raise herdr.HerdrFailure(process.start_ticks.reason)
+            launch_processes[launched.pane] = process
         with herdr.launch_rollout_proof():
             if not identity and policy.settings.kind == "codex":
                 if isinstance(launched.outcome, herdr.PromptNotSubmitted):
@@ -986,13 +999,30 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 return _codex_start_session(client, launched.pane)
             return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
 
-    def cleanup(identity: str) -> str | None:
-        if isinstance(destination, herdr.ExistingPane):
-            try:
-                client.quit_agent(destination.pane, destination.terminal, identity, start_seconds)
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                return f"; destination cleanup failed: {error}"
-        return None
+    def cleanup(identity: str) -> worker_admission.CleanupOutcome:
+        if not launches:
+            return worker_admission.NoDestinationToStop()
+        pane = launches[-1].pane
+        try:
+            terminal = launch_terminals.get(pane, "")
+            observed = client.pane_row(pane)
+            if not terminal or isinstance(observed, herdr.NoPane) or not observed.get("terminal_id"):
+                raise herdr.HerdrFailure("launched terminal is missing")
+            if observed.get("terminal_id") != terminal:
+                raise herdr.HerdrFailure("launched terminal changed")
+            with herdr.launch_rollout_proof():
+                proved = client.native_session(pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=observed)
+            if identity and proved != identity:
+                raise herdr.HerdrFailure("launched agent identity changed")
+            process = launch_processes.get(pane)
+            if process is None:
+                raise herdr.HerdrFailure("launched process identity is unavailable")
+            if client.pane_agent_process(pane, terminal) != process:
+                raise herdr.HerdrFailure("launched agent process changed")
+            client.quit_agent(pane, terminal, proved, start_seconds)
+        except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            return worker_admission.DestinationRetained(pane, str(error))
+        return worker_admission.DestinationStopped()
 
     try:
         if switching:

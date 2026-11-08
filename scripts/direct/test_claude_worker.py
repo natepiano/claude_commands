@@ -405,13 +405,22 @@ if len(sys.argv) > 1 and sys.argv[0] == "-c":
         self.assertEqual(len(self.backend_calls()), 1)
 
     def test_publication_refusal_stops_only_the_created_backend_and_reports_failed_cleanup(self) -> None:
-        result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT="1")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn(self.fixture.identity, result.stderr)
-        calls = self.backend_calls()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
-        self.assertFalse(self.fixture.sent.exists())
-        self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
-        self.assertIn("cleanup unproved", result.stderr)
-        self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)
+        for stop_exit in (1, 0):
+            with self.subTest(stop_exit=stop_exit):
+                lock = self.staff_file.with_name(self.staff_file.name + ".lock")
+                if lock.is_dir():
+                    lock.rmdir()
+                self.fixture.backend_log.unlink(missing_ok=True)
+                result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT=str(stop_exit))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(self.fixture.identity, result.stderr)
+                calls = self.backend_calls()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
+                self.assertFalse(self.fixture.sent.exists())
+                self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
+                if stop_exit:
+                    self.assertIn("cleanup unproved", result.stderr)
+                else:
+                    self.assertNotIn("cleanup unproved", result.stderr)
+                self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)

@@ -102,6 +102,27 @@ class PublishedWorker:
     handoff: FamilyHandoff = field(default_factory=NoFamilyHandoff)
 
 
+@dataclass(frozen=True)
+class DestinationStopped:
+    """Cleanup stopped the destination agent and kept its shell."""
+
+
+@dataclass(frozen=True)
+class DestinationRetained:
+    """Cleanup could not safely stop the destination agent."""
+
+    pane: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class NoDestinationToStop:
+    """No destination started, or the caller owns its cleanup."""
+
+
+CleanupOutcome = DestinationStopped | DestinationRetained | NoDestinationToStop
+
+
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None) -> staff.StaffRow:
@@ -340,13 +361,20 @@ def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchStat
 
 
 def publish_created(allowed: WorkerStartAllowed, identity: str,
-                    cleanup: Callable[[str], str | None]) -> PublishedWorker:
-    try:
+                    cleanup: Callable[[str], CleanupOutcome]) -> PublishedWorker:
+    with _cleanup_on_failure(cleanup, identity):
         return publish(allowed, identity)
+
+
+@contextmanager
+def _cleanup_on_failure(cleanup: Callable[[str], CleanupOutcome], identity: str = "") -> Generator[None]:
+    """Use the same cleanup for failed launch proof and failed publication."""
+    try:
+        yield
     except BaseException as error:
-        detail = cleanup(identity)
-        if detail and isinstance(error, AdmissionRefused):
-            raise AdmissionRefused(f"{error}{detail}") from error
+        outcome = cleanup(identity)
+        if isinstance(outcome, DestinationRetained) and isinstance(error, Exception):
+            raise AdmissionRefused(f"{error}; destination pane {outcome.pane} retained: {outcome.reason}") from error
         raise
 
 
@@ -371,7 +399,7 @@ def worker_operation(allowed: WorkerStartAllowed) -> Generator[None]:
 def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                   start: Callable[[FamilyHandoff], str],
                   dispatch: Callable[[PublishedWorker], SwitchState] | DispatchOwner,
-                  cleanup: Callable[[str], str | None], request: str = "") -> PublishedWorker:
+                  cleanup: Callable[[str], CleanupOutcome], request: str = "") -> PublishedWorker:
     """Hold the row through publication and dispatch acceptance, then release it."""
     with worker_operation(allowed):
         handoff: FamilyHandoff = NoFamilyHandoff()
@@ -411,7 +439,9 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                 retry = True
             if retry and prior.assignment_id != request:
                 record_dispatch(allowed, request, SwitchState.CREATION_INTENT_RECORDED)
-            row = publish_created(allowed, start(handoff), cleanup).row
+            with _cleanup_on_failure(cleanup):
+                identity = start(handoff)
+            row = publish_created(allowed, identity, cleanup).row
         published = PublishedWorker(row, handoff)
         if not isinstance(dispatch, DispatchOwner):
             state = dispatch(published)

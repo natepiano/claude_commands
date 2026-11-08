@@ -152,11 +152,27 @@ class NativePaneSessionTests(StaffTestCase):
         process = self.root / "proc" / str(pid)
         process.mkdir(parents=True)
         write_text_atomic(process / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
-        with patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")}), patch.object(
-                herdr, "_PLATFORM", "linux"), patch.object(
-                world, "native_pane_process", side_effect=AssertionError("no native identity")):
-            self.assertEqual(world.pane_agent_process("w1:p1", "friend-terminal"), herdr.AgentProcessIdentity(pid, 1))
-        self.assertEqual(world.process_reads, ["w1:p1"])
+        process_info = world.result
+        for exited in (False, True):
+            with self.subTest(exited=exited):
+                world.process_reads.clear()
+
+                def read_process_info(*arguments: str) -> dict[str, object]:
+                    reply = process_info(*arguments)
+                    if exited and arguments[:2] == ("pane", "process-info"):
+                        write_text_atomic(process / "stat", f"{pid} (fixture) Z " + "0 " * 18 + "1\n")
+                    return reply
+
+                with (patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")}),
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(world, "result", side_effect=read_process_info),
+                      patch.object(world, "native_pane_process", side_effect=AssertionError("no native identity"))):
+                    if exited:
+                        with self.assertRaisesRegex(herdr.HerdrFailure, f"w1:p1: process {pid}: exited"):
+                            _ = world.pane_agent_process("w1:p1", "friend-terminal")
+                    else:
+                        self.assertEqual(world.pane_agent_process("w1:p1", "friend-terminal"), herdr.AgentProcessIdentity(pid, 1))
+                self.assertEqual(world.process_reads, ["w1:p1"])
         del world.foreground["w1:p1"]
         with self.assertRaisesRegex(herdr.HerdrFailure, "expected one foreground agent"):
             _ = world.pane_agent_process("w1:p1", "friend-terminal")
