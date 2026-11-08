@@ -45,7 +45,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
   - `scripts/direct/progress_history.py` — a unit's phase records and durations
   - `scripts/buildlog/index.py` — build and test runs by repository
   - `scripts/usage/usage_report.py`, `collect.py` — tokens by session
-  - `scripts/agents/codex_mesh.py` — the worker roster
+  - `scripts/production/worker.py` (`list`) — the worker roster
   - `scripts/lib/user_zone.py` — user-facing times
   - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/direct.md` — the role contracts
   - `~/.claude/docs/decision_criteria.md` — what reaches the user
@@ -699,24 +699,30 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 30 — Delete the mesh and rename the detached runs  · status: done
 
-Moved from herdr-unit (sdlc, 2026-11-07 14:22 EST, user: "have some other unit do this work right now"). The Work Order is `### Phase 19 — Delete the mesh and rename the detached runs` in `docs/plans/herdr-worker-panes.md`. Read that section; this phase copies none of its text.
+#### As-built
 
-#### Work Order
-
-**Goal:** the goal of herdr Phase 19: the mesh, the old worker records and `WORKER_TRANSPORT` are gone, and no live name holds the word mesh.
-
-**Spec:** follow the Spec, the drain gate, the constraints and the three acceptance gates of `docs/plans/herdr-worker-panes.md` → Phase 19. sdlc rulings (2026-11-07):
-1. herdr Phase 34 is not a prerequisite. Under Spec item 5, move the Stage 2 file watchers that `worker._wait_for_dispatch` reads out of `codex_mesh.py` to one kept owner. herdr Phase 34 later deletes the wait loop.
-2. Start on files no running phase holds. Take `scripts/herdr/worker_panes.py` (herdr 32, 33, 35), `scripts/production/worker.py` (agents 15b), `scripts/direct/assign.py` (herdr 28, 29), `scripts/shutdown/stop_resume.py` and `scripts/shutdown/restart.py` (agents 15) only after their holders merge, and build on their trees.
-3. devtools 3t is done. models-unit reviews the retained `workers.py` and `codex_mesh.py` code and owns `config/models.conf`; send it the `[direct.options]` change.
-4. At landing, tell queue-unit (Spec item 13).
+- `codex_mesh.py` and `test_codex_mesh.py` are deleted. No live name holds the word mesh.
+- Detached runs have their own name: `scripts/agents/detached_runs.py`, `scripts/agents/detached_run_process.py`, `config/detached_runs.conf`, and run records in `<run>/detached_runs/`.
+- Shared Codex test fixtures live in `scripts/agents/codex_test_support.py`.
+- A rerun after an unfinished turn keeps the pass and only waits for it. An automatically selected worker gets its pass closed under its real name.
+- A pane family switch (Claude to Codex or back) refuses a busy source and a source with a live detached run, for open and stopped sources. A publication failure stops an `ExistingPane` destination.
+- Native switch records live in their own file. Claude child resume reads only launcher records.
 
 **Files:**
-- `docs/plans/herdr-worker-panes.md` — every path in the Files list of its Phase 19.
+- `scripts/agents/detached_runs.py` — starts and supervises detached runs, and delivers their results.
+- `scripts/agents/detached_run_process.py` — identifies a live supervisor process.
+- `config/detached_runs.conf` — `LIVE_RUN_LIMIT` and the run settings.
+- `scripts/agents/codex_test_support.py`, `scripts/agents/test_codex_test_support.py` — shared Codex fixtures and their tests.
+- `scripts/herdr/worker_panes.py` — pane worker start, close and family switch.
+- `scripts/production/worker_admission.py` — admission, publication and switch records.
 
-**Workers:** the Workers line of `docs/plans/herdr-worker-panes.md` → Phase 19.
+**Gotchas:** detached-run readers do not see `mesh_runs.py` supervisors that started before the rename. Those supervisors finish and deliver. An old prompt that calls `mesh_runs.py start` fails visibly.
+
+**Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
 
 ### Phase 30a — Close the family-switch gaps for a worker with a closed pane  · status: todo
+
+**Depends on:** Phase 30
 
 Moved out of Phase 30 under the hard landing (sdlc, 2026-11-08). Neither gap is a regression against main: main has no pane family switch, and a closed-pane family change there ends uncertain. Phase 30's closure review 3 is `<run>/phases/30/claude-build-followups-hierarchies-review2_summary_1.txt`; the Astra review of the approach is `<run>/phases/30/astra_review_F011_F012.md`.
 
@@ -725,14 +731,33 @@ Moved out of Phase 30 under the hard landing (sdlc, 2026-11-08). Neither gap is 
 **Goal:** a family switch (Claude to Codex or back) of a worker whose pane is closed is as safe as one with an open or stopped pane.
 
 **Spec:**
-1. F011: a family switch of a closed worker passes the same busy-worker and live detached-run checks as an open or stopped worker. `can_close` accepts a closed worker through its stopped-worker branch; the open-worker status and transcript checks stay.
+1. F011: a family switch of a closed worker passes the same busy-worker and live detached-run checks as an open or stopped worker. `can_close` accepts a closed worker through its stopped-worker branch; the open-worker status and transcript checks stay. Check the source worker's own run, which can differ from the destination run that `_start_locked` selects (`scripts/herdr/worker_panes.py` near line 797). Keep the existing `WorkerLockHold` held through the checks, source release, and publication.
 2. F012: when publication fails after the new agent starts, cleanup stops the agent that `start` launched, for every destination kind (a closed source launches into a new split pane). Read and check the launched pane's terminal; a missing or changed terminal is a cleanup failure, never a silent success. Stop no agent without proof of its identity.
-3. State the boundary for a failed native-session proof after launch (`switch_worker` runs `start` before `publish_created`): recover it, or record it as a known limit.
-4. Tests: add a source-state column to the existing table at `scripts/herdr/test_worker_panes.py` (refusal table, about line 1493) that can omit the pane. Cover a closed source with a live detached run and with an unfinished dispatch: refusal comes before source release or launch. For a publication failure, check destination shutdown, unchanged staff identity, kept shell, and a retry that succeeds with no second split. Cover an idle closed source that switches. Each new case fails without its repair.
+3. Replace the cleanup callback's `str | None` result in `scripts/production/worker_admission.py` (`publish_created`, `switch_worker`) with a named outcome type: the destination stopped; the destination retained, with its pane and the reason; or no destination to stop (the caller owns cleanup). Update every caller: `scripts/herdr/worker_panes.py`, `scripts/direct/claude_worker.py`, `scripts/production/staff_test_support.py`, and the tests that pass a cleanup.
+4. A failed native-session proof after launch (`switch_worker` runs `start` before `publish_created`, `worker_admission.py` near line 414) goes through the same cleanup as a failed publication. When cleanup cannot prove the agent, the refusal names the retained pane and the reason, and staff still names the source.
+5. Tests: add rows to the existing tables in `scripts/herdr/test_worker_panes.py` (refusal table near line 1493, publication-failure test near line 1541) and `scripts/production/test_worker_admission.py`. Add a source-state column that can omit the pane.
+   - A closed source with a live detached run, with an unfinished dispatch, and with a live detached run in an earlier source run while the destination run has none: refusal comes before source release or launch.
+   - A publication failure and a failed native proof, for both destination kinds: the destination stops, staff identity is unchanged, the shell is kept, and a retry succeeds with no second split.
+   - A missing or changed terminal at cleanup, for both destination kinds: no input goes to the unproved agent, staff is unchanged, and the refusal names the retained pane.
+   - An idle closed source switches.
+   Each new row fails without its repair.
+
+**Constraints from prior phases:**
+- Phase 30 renamed the detached runs. The live-run check reads only `<run>/detached_runs/`, and `detached_run_process.supervises` matches only `detached_runs.py`. A `mesh_runs.py supervise` process started before the rename is not seen. These end before Phase 30 lands on main; the director confirms with one `ps` read on natedev and the Mac at landing. Add no code for them.
 
 **Files:**
 - `scripts/herdr/worker_panes.py`
 - `scripts/herdr/test_worker_panes.py`
-- `scripts/production/worker_admission.py` (item 3 only)
+- `scripts/production/worker_admission.py`
+- `scripts/production/test_worker_admission.py`
+- `scripts/production/staff_test_support.py`
+- `scripts/direct/claude_worker.py`
+- `scripts/direct/test_claude_worker.py`
 
-**Workers:** one Codex writer.
+**Test:** from the worktree root, `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/herdr test_worker_panes.py`, `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/production test_worker_admission.py`, and `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/direct test_claude_worker.py`.
+
+**Lint:** `basedpyright` on every changed file gives `0 errors, 0 warnings, 0 notes`.
+
+**Workers:** 1 writer + 1 tester.
+- `impl` owns `worker_panes.py`, `worker_admission.py`, `claude_worker.py` and `staff_test_support.py`.
+- `test` owns `test_worker_panes.py`, `test_worker_admission.py` and `test_claude_worker.py`.
