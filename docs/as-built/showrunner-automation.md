@@ -18,15 +18,22 @@ The problem it solves is the number of manual steps a showrunner has to carry. E
   The reader takes `Merge branch`, `Showrunner checkout` and `Log` from that document.
   `Log` must remain relative to the showrunner checkout.
 
-- **Retired units** (`retire_unit.py`, `resume_unit.py`): the staff row records a completed retirement as a `RemovedWorktree`. The row stays in `staff.json`, and no caller's command line changes. `unit_lookup.doc_units(doc, record)` returns every unit row of the production in staff row order. A caller that needs live units keeps the rows with a `PresentWorktree`. `unit_status.sh`, the dailies builder, `waiting.py` and the stall watch skip a retired unit. `merge_checkpoint.py`, `ci_points.py` and `production_lifecycle.py` read every row.
+- **Retired units**: `agents retire NAME` records a completed retirement as a `RemovedWorktree`.
+  The row stays in `staff.json` with its fixed identity and parent.
+  Status, the board, dailies, waits, and the stall watch exclude retired units.
+  `unit_lookup.doc_units(doc, record)` returns every recorded unit in staff order.
+  `merge_checkpoint.py`, `ci_points.py`, and `production_lifecycle.py` retain access to retired rows.
+  `agents resume NAME` refuses a retired unit and names `--retired`.
+  `agents resume NAME --retired` restores the worktree, director, and retained workers.
+  The showrunner asks the user yes or no before it runs `--retired`.
 
-`retire_unit.py` finds the unit and its workers in one staff snapshot.
+`agents retire NAME` finds the unit and its workers in one staff snapshot.
 It stops each row's `current_session` through `stop_resume.stop`.
 Uncommitted work and commits outside the merge branch prevent removal.
 The recorder's only added `Project started` line does not count as uncommitted work.
 Retire releases build holds, berth reservations, and Mac claims.
 It reports other cleanup failures as anomalies.
-It removes the worktree, the branch, and any remaining Units row.
+It removes the worktree and branch.
 The staff row stays with a `RemovedWorktree` location.
 Unit settings remain parked under the staff id.
 Retire writes no retired note or saved branch ref.

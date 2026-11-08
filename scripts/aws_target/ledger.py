@@ -64,6 +64,47 @@ class ComputeRequest:
 
 
 @dataclass(frozen=True)
+class GateLaunchPending:
+    """The launch has no confirmed instance identity."""
+
+
+@dataclass(frozen=True)
+class GateRunning:
+    instance_id: str
+
+
+@dataclass(frozen=True)
+class GateAbsent:
+    at: int
+
+
+@dataclass(frozen=True)
+class GateTerminated:
+    at: int
+    instance_id: str
+
+
+@dataclass(frozen=True)
+class GateReservation:
+    attempt: str
+    at: int
+    expires: int
+    usd_per_hour: Decimal
+    allowance_usd: Decimal
+    state: GateLaunchPending | GateRunning | GateAbsent | GateTerminated = GateLaunchPending()
+
+
+@dataclass(frozen=True)
+class GateReserved:
+    reservation: GateReservation
+
+
+@dataclass(frozen=True)
+class GateCapReached:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PriceSample:
     at: int
     usd_per_hour: Decimal
@@ -237,6 +278,7 @@ class LedgerEvidence:
     decision: dict[str, object] = field(default_factory=dict)
     charge_refresh_at: int = 0
     compute_requests: list[ComputeRequest] = field(default_factory=list)
+    gate_reservations: list[GateReservation] = field(default_factory=list)
 
 
 class ObservationRejected(ValueError):
@@ -322,6 +364,24 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         raise LedgerUnavailable('duplicate compute request identity')
     if sum(isinstance(r.resolution, ComputeUnconfirmed) for r in evidence.compute_requests) > 1:
         raise LedgerUnavailable('multiple unconfirmed compute requests')
+    for item in rows(row, 'gate_reservations') if 'gate_reservations' in row else ():
+        status = mapping(item['state'])
+        kind = text(status, 'kind')
+        if kind == 'pending':
+            gate_state = GateLaunchPending()
+        elif kind == 'running':
+            gate_state = GateRunning(text(status, 'instance_id'))
+        elif kind == 'absent':
+            gate_state = GateAbsent(instant(status, 'at'))
+        elif kind == 'terminated':
+            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
+        else:
+            raise LedgerUnavailable('unknown gate reservation state')
+        evidence.gate_reservations.append(GateReservation(
+            text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
+            money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state))
+    if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
+        raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
         if not names or len(set(names)) != len(names):
@@ -362,6 +422,14 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                     "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
         "charge_refresh_at": state.charge_refresh_at,
+        'gate_reservations': [
+            {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
+             'allowance_usd': str(r.allowance_usd), 'state':
+             {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
+             {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
+             {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
+             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
+            for r in state.gate_reservations],
         "compute_requests": [
             {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
              'request_id': r.request_id,
@@ -484,6 +552,16 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         for left, right in _days(start, end, settings.accounting_zone):
             intervals.append(ChargedInterval(left, right, rate * Decimal(right - left)
                                              / Decimal(3600), 'unconfirmed compute request', 'instance'))
+    for reservation in state.gate_reservations:
+        if isinstance(reservation.state, GateAbsent):
+            continue
+        end = min(pricing_end, reservation.state.at) if isinstance(reservation.state, GateTerminated) else pricing_end
+        for left, right in _days(max(reservation.at, window_start), end, settings.accounting_zone):
+            intervals.append(ChargedInterval(left, right, reservation.usd_per_hour * Decimal(right - left)
+                                             / Decimal(3600), 'gate:' + reservation.attempt, 'instance'))
+        if window_start <= reservation.at < pricing_end:
+            intervals.append(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
+                                             'gate storage and transfer:' + reservation.attempt, 'fixed'))
     interval = settings.cost_explorer_interval_seconds
     origin = state.charge_refresh_at + interval if state.charge_refresh_at else inventories[0].at
     first_read = origin + max(0, (window_start - origin + interval - 1) // interval) * interval
@@ -532,7 +610,8 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
         [r for r in state.observations if r.at <= pricing_end], [r for r in state.prices if r.at <= pricing_end],
         [r for r in state.inventories if r.at <= pricing_end], reconciliations,
         charge_refresh_at=state.charge_refresh_at,
-        compute_requests=[r for r in state.compute_requests if r.at <= pricing_end])
+        compute_requests=[r for r in state.compute_requests if r.at <= pricing_end],
+        gate_reservations=[r for r in state.gate_reservations if r.at <= pricing_end])
     return _charges(snapshot, settings, now, current_window=current_window, require_fresh=False,
                     window=window, pricing_end=pricing_end)
 
@@ -571,6 +650,32 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
                            and datetime.fromtimestamp(r.start, settings.accounting_zone).strftime("%Y-%m") == costs.monthly.month), Decimal(0))
     return (max(Decimal(0), monthly * Decimal(day_end - day_start) / denominator - daily_accrued),
             max(Decimal(0), monthly - monthly_accrued))
+
+
+def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: int) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+    """Reserve each open gate across all affected days and months."""
+    daily: dict[str, Decimal] = {}
+    monthly: dict[str, Decimal] = {}
+    for reservation in state.gate_reservations:
+        if isinstance(reservation.state, (GateAbsent, GateTerminated)):
+            continue
+        for left, right in _days(max(now, reservation.at), reservation.expires, settings.accounting_zone):
+            cost = reservation.usd_per_hour * Decimal(right - left) / Decimal(3600)
+            day = datetime.fromtimestamp(left, settings.accounting_zone).strftime('%Y-%m-%d')
+            daily[day] = daily.get(day, Decimal(0)) + cost
+            monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + cost
+        if reservation.at >= now:
+            day = datetime.fromtimestamp(reservation.at, settings.accounting_zone).strftime('%Y-%m-%d')
+            daily[day] = daily.get(day, Decimal(0)) + reservation.allowance_usd
+            monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + reservation.allowance_usd
+    return daily, monthly
+
+
+def gate_future_costs(state: LedgerEvidence, settings: SpendingSettings, now: int) -> tuple[Decimal, Decimal]:
+    """Return open reservations for the current accounting periods."""
+    daily, monthly = gate_future_periods(state, settings, now)
+    day = datetime.fromtimestamp(now, settings.accounting_zone).strftime('%Y-%m-%d')
+    return daily.get(day, Decimal(0)), monthly.get(day[:7], Decimal(0))
 
 
 def send_limit_event(event: LimitEvent) -> bool:
@@ -647,6 +752,35 @@ class CostLedger:
         document = _encode(state)
         _ = _decode(document)
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
+
+    def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached:
+        """Reserve gate costs under the shared Rust accounting lock."""
+        with self._locked() as state:
+            for previous in state.gate_reservations:
+                if previous.attempt == request.attempt:
+                    return GateReserved(previous)
+            settings = read_settings(settings_path)
+            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+            state.gate_reservations.append(request)
+            daily, monthly = gate_future_periods(state, settings, request.at)
+            fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
+            for day, amount in daily.items():
+                accrued = costs.daily.usd if day == costs.daily.day else Decimal(0)
+                if accrued + amount + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
+                    return GateCapReached('daily_limit')
+            for month, amount in monthly.items():
+                accrued = costs.monthly.usd if month == costs.monthly.month else Decimal(0)
+                if accrued + amount + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd:
+                    return GateCapReached('monthly_limit')
+            self._save(state)
+            return GateReserved(request)
+
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated) -> None:
+        """Release a reservation only after AWS confirms its final state."""
+        with self._locked() as state:
+            state.gate_reservations = [replace(r, state=outcome) if r.attempt == attempt else r
+                                       for r in state.gate_reservations]
+            self._save(state)
 
     def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:
         if observation.state == "unknown":
@@ -741,10 +875,10 @@ class CostLedger:
         self._save(state)
 
     def refresh_charges(self, settings_path: Path, now: int,
-                        fetch: Callable[[int, int], Decimal]) -> ChargeRead | MeasurementUnavailable:
+                        fetch: Callable[[int, int], Decimal], *, gate_workload: bool = False) -> ChargeRead | MeasurementUnavailable:
         """Recover the newest saved reply before another scheduled query."""
         configuration = conf.read(settings_path)
-        if not offload_enabled(configuration):
+        if not gate_workload and not offload_enabled(configuration):
             return MeasurementUnavailable('disabled')
         settings = read_settings(configuration)
         day = charge_period_day(now)
@@ -758,9 +892,11 @@ class CostLedger:
                     return previous
             if state.charge_refresh_at and now < state.charge_refresh_at + settings.cost_explorer_interval_seconds:
                 return MeasurementUnavailable('charge read is not due')
-            costs = costs_from_evidence(state, settings, end,
-                                        window=datetime.fromtimestamp(start, settings.accounting_zone).date())
-            estimated = period_cost(costs.intervals, start, end)
+            estimated = Decimal(0)
+            if not gate_workload or not state.inventories or any(inventory.at <= end for inventory in state.inventories):
+                costs = costs_from_evidence(state, settings, end,
+                                            window=datetime.fromtimestamp(start, settings.accounting_zone).date())
+                estimated = period_cost(costs.intervals, start, end)
             actual = fetch(start, end)
             if not actual.is_finite() or actual < 0:
                 raise ValueError('Cost Explorer reply must contain finite nonnegative USD')
@@ -805,6 +941,9 @@ class CostLedger:
             if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
                 raise LedgerUnavailable("instance state evidence is missing")
             daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
+            gate_daily, gate_monthly = gate_future_costs(state, settings, now)
+            daily_fixed += gate_daily
+            monthly_fixed += gate_monthly
             evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily_fixed, monthly_fixed)
             reason = ""
             for period, key, total, limit in (

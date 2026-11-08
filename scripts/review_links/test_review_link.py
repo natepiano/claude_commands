@@ -623,7 +623,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", side_effect=list("taken1fresh2"))):
+                  patch.object(secrets, "token_hex", side_effect=["taken1", "fresh2"])):
                 urls = review_link.snapshot([source])
             self.assertEqual(urls, ["http://natedev:8765/fresh2/source.txt"])
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
@@ -639,10 +639,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", return_value="a") as choose):
+                  patch.object(secrets, "token_hex", return_value="aaaaaa") as token_hex):
                 with self.assertRaisesRegex(FileExistsError, "after 10 tries"):
                     _ = review_link.snapshot([source])
-                self.assertEqual(choose.call_count, 60)
+                self.assertEqual(token_hex.call_count, 10)
             self.assertEqual(set(snapshots.iterdir()), {old, snapshots / ".index.lock"})
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
 

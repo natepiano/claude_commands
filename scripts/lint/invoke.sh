@@ -376,6 +376,8 @@ run_step_attempt() {
     if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
         nextest_share_claim "$@"
         set -- "${LINT_NEXTEST_SHARED_ARGV[@]}"
+    elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        nextest_thread_report "$@"
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
@@ -593,21 +595,34 @@ run_nextest_shared() {
     return "$status"
 }
 
+# Print the same line for a run that does not claim a shared width.
+nextest_thread_report() {
+    buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
+}
+
 # nextest_share_claim ARGV... (`cargo nextest run --test-threads WIDTH ...`)
 # Called by run_once once the memory gate has admitted the step. It opens the
 # run's marker on fd 9, claims a share of WIDTH, and leaves the argv to run in
 # LINT_NEXTEST_SHARED_ARGV. A narrower share is written into the step's memory
 # reservation, so its peak is recorded against the width it ran at.
 nextest_share_claim() {
-    local shared="" width=$5
+    local claim="" shared="" width=$5
     LINT_NEXTEST_SHARED_ARGV=("$@")
     [[ "${4:-}" == --test-threads && "$width" =~ ^[1-9][0-9]*$ ]] || return 0
-    { exec 9>>"$LINT_NEXTEST_SHARE.new"; } 2>/dev/null || return 0
-    shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "${LINT_NEXTEST_SHARE%/*}" \
-        "${LINT_NEXTEST_SHARE##*/}" "$width" 9 2>/dev/null)" || shared=""
-    [[ "$shared" =~ ^[1-9][0-9]*$ && "$shared" != "$width" ]] || return 0
+    { exec 9>>"$LINT_NEXTEST_SHARE.new"; } 2>/dev/null || {
+        nextest_thread_report "$@"
+        return 0
+    }
+    claim="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "${LINT_NEXTEST_SHARE%/*}" \
+        "${LINT_NEXTEST_SHARE##*/}" "$width" 9 --show-load 2>/dev/null)" || claim=""
+    shared="${claim%%$'\n'*}"
+    [[ "$shared" =~ ^[1-9][0-9]*$ ]] || {
+        nextest_thread_report "$@"
+        return 0
+    }
+    printf '%s\n' "${claim#*$'\n'}"
+    [[ "$shared" != "$width" ]] || return 0
     LINT_NEXTEST_SHARED_ARGV=("${@:1:4}" "$shared" "${@:6}")
-    printf 'nextest: %s of %s test threads, shared with the runs in flight\n' "$shared" "$width"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
         buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" width "$BUILDLOG_MEM_RESERVATION" "$shared" \
             >/dev/null 2>&1 || true
@@ -631,7 +646,7 @@ run_nextest() {
                 --)
                     break
                     ;;
-                --test-threads|--test-threads=*|-j|-j*)
+                --test-threads|--test-threads=*|--jobs|--jobs=*|-j|-j*)
                     run cargo nextest run "$@"
                     return
                     ;;

@@ -167,14 +167,14 @@ A showrunner rename with a document move preserves staged document bytes separat
 Recovery restores the staged destination entry before removing the source index entry.
 It completes the pending move without staging the working edits.
 
-Run `/showrunner:retire_unit <unit>` from the showrunner session to remove its worktree and branch.
+Run `/agents retire NAME` to remove the unit worktree and branch.
 Uncommitted work or an unmerged checkpoint prevents removal.
 Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
 It releases holds, reservations, and Mac claims.
 It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
 Only an existing run pinned to `mesh` uses the retained worker-end path.
-`--dry-run` lists the work without changes.
-`/showrunner:resume_unit <unit>` restores the worktree from the merge branch and resumes the director and its retained workers.
+`/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
+The showrunner asks the user yes or no before it runs `--retired`.
 
 A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
 skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same

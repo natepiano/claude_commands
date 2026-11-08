@@ -1244,7 +1244,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
                       runtime_id: str = "",
                       record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
-    """Admit a unit with its location; only resume_unit reactivates a removed row."""
+    """Admit a unit with its location; only agents resume --retired reactivates a removed row."""
     record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record,
                                 identity=session_staff.LiveSession(runtime_id) if runtime_id else session_staff.NO_SESSION)

@@ -548,8 +548,8 @@ class FastTrackTests(MergeCheckpointFixture):
                 self.assert_refused(self.fast_track("scripts/sample/entry.py"), "scripts/production/add_unit.py")
         self.assertEqual(self.observations("types"), [])
 
-    def test_resume_unit_cannot_bypass_the_staff_writer_refusal(self) -> None:
-        path = "scripts/production/resume_unit.py"
+    def test_agents_cannot_bypass_the_staff_writer_refusal(self) -> None:
+        path = "scripts/shutdown/shutdown.py"
         self.write(self.unit, path, "from add_unit import VALUE\n")
         self.assert_refused(self.fast_track(path), "refused path")
 
@@ -1096,7 +1096,7 @@ class FastTrackTests(MergeCheckpointFixture):
         paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
                       ".local/state/staff/staff.json", "scripts/production/staff.py",
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/production/retire_unit.py",
+                      "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
                       "scripts/accounts/moves.py", "scripts/production/rename.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",

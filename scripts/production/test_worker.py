@@ -371,7 +371,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 
     def test_resume_workers_names_the_active_pass_and_idle_worker(self) -> None:
-        from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume
+        from scripts.lib.resume_message import UnsubmittedAssignment, IdleWorker, PaneWorkerResume
 
         busy = self.opened()
         idle = self.opened("review", "review")
@@ -381,15 +381,15 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
-        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
+        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, UnsubmittedAssignment("dispatch-impl", ("assign.sh", "same command"))),
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
-        from scripts.lib.resume_message import BusyPass, NO_OWN_PASS
+        from scripts.lib.resume_message import UnsubmittedAssignment, NO_OWN_PASS
 
         opened = self.opened()
-        for active, expected in ((progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), BusyPass("own-dispatch")),
+        for active, expected in ((progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), UnsubmittedAssignment("own-dispatch", ("assign.sh",))),
                                  (progress_history.NoActiveDispatch(), NO_OWN_PASS),
                                  (progress_history.ActiveDispatchUnavailable("record unreadable"), NO_OWN_PASS)):
             with (self.subTest(active=active),

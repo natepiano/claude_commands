@@ -13,12 +13,12 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from contextlib import closing, contextmanager, redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from dataclasses import replace
-from typing import ClassVar, cast, final, override
+from typing import cast, final
 from unittest import mock
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -28,7 +28,6 @@ from scripts.lib import berth_board
 from scripts.style import coverage_report
 from scripts.style import style_proposals
 from scripts.style import unit_files
-from scripts.style import ledger_test_support
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
@@ -38,35 +37,6 @@ from scripts.style.ledger_test_support import (remove_finding_anchor_schema, rem
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
-    staff_seed: ClassVar[str] = ""
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        # Disable maintenance before the Git seed's first commit.
-        with mock.patch.dict(os.environ, {
-            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false",
-        }):
-            super().setUpClass()
-        fixture = cls()
-        fixture.repo = cls.template_repo
-        _ = fixture.git("config", "maintenance.auto", "false")
-        # Build the staff record once through the shared fixture.
-        with ledger_test_support.style_staff_fixture(cls.template_repo.parent, cls.template_repo):
-            cls.staff_seed = (cls.template_repo.parent / "staff.json").read_text()
-        _ = cls.enterClassContext(mock.patch.object(
-            ledger_test_support, "style_staff_fixture", cls.copy_staff_seed))
-
-    @classmethod
-    @contextmanager
-    def copy_staff_seed(cls, root: Path, repo: Path) -> Generator[None]:
-        record = cls.staff_seed.replace(str(cls.template_repo), str(repo)).replace(
-            str(cls.template_repo.parent), str(root))
-        with isolated_staff_file(root / "staff.json", {}), \
-                mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
-            _ = (root / "staff.json").write_text(record)
-            yield
-
     def fixed_style_units(self) -> tuple[staff.StaffRow, staff.StaffRow]:
         _ = self.enterContext(isolated_staff_file(self.root / "identity-staff.json", {}))
         owner = fixture_member("showrunner", name="style-owner")
