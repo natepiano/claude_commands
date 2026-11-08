@@ -372,7 +372,8 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
         text = f"{field(unit)} · {field(identity.step)} · {state} · {modules} · {size} · elapsed {elapsed}"
         if isinstance(progress, cloud_progress.CloudProgress):
             if progress.failed_modules:
-                text += f" · {progress.failed_modules} failed modules"
+                noun = "module" if progress.failed_modules == 1 else "modules"
+                text += f" · {progress.failed_modules} failed {noun}"
             if isinstance(interval, CloudPushInterval):
                 stale_after = reading.cloud_gate_stale_pushes * interval.seconds
                 if now - progress.updated_at >= stale_after:
