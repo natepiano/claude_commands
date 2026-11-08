@@ -1847,14 +1847,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tests_only:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
-        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
+        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        with rollback_signals(), scratch.copy_lock(checkout):
             if args.nightly:
                 return nightly(args)
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)
                 if review_list is not None:
-                    record_changes(Path(args.repo).expanduser().resolve(), review_list, production, args.merge_branch)
+                    record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
             return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
