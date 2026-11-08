@@ -4795,7 +4795,7 @@ raise SystemExit(int(os.environ[variable]))
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
                              sweep.FloorChannelOutcome.DELIVERED)
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [183, 358])
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
