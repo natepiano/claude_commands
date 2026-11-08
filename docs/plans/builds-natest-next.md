@@ -126,6 +126,5 @@ These are wall floors from before 2026-11-06, not CPU floors. A wall floor does 
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
 | `style/test_crate_run.py` | Phase 77 CPU floor: 53.25 s | Production Git wrappers cost 40.8 CPU s; natedev-style owns reuse of the validated checkout | 77 |
 | `direct/test_verify_mac_only.py` | 185.8 (load 52-70) | `build_targets.py` process starts through the `build_hold` chain; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41, 42 |
-| `direct/test_verify_lint_cache_versions.py` | 135.9 (clean rounds, no pairs) | `verify.sh lint` route: `step_record.py` 486 starts and 23.1 of 94.0 CPU s | 45 |
 | `direct/test_verify_ssh_targets_retained.py` | 35.5 (load 52-65) | child process starts and the coordination imports through `build_hold.py`; no fixed waits remain | 56 |
 | `direct/test_verify_ssh_targets_retry.py` | 42.1 (load 52-65) | the same starts and imports; `recovery_start_seconds` stays 5 s | 56 |
