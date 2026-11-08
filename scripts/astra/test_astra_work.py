@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once

@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail

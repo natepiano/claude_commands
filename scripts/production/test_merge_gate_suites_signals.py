@@ -34,7 +34,8 @@ import signal
 import sys
 from contextlib import contextmanager
 
-sys.path.insert(0, {str(Path(merge_gate.__file__).parents[2])!r})
+with open(Path({str(Path(merge_gate.__file__).parents[2])!r}) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {{"__file__": package_root.name}})
 from scripts.lib import build_folders
 from scripts.production import merge_gate
 from scripts.production.merge_gate_test_support import MergeGateFixture

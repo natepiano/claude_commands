@@ -13,16 +13,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import showrunners
 
-if TYPE_CHECKING:
-    from ..hooks import showrunner_footer as showrunner_footer
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from scripts.hooks import showrunner_footer as showrunner_footer
+from scripts.hooks import showrunner_footer as showrunner_footer
 
 
 ActionState = Literal["untouched", "attempted", "done", "skipped"]

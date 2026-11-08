@@ -70,7 +70,7 @@ import os
 from pathlib import Path
 import sys
 
-sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 if sys.argv[1:3] == ["nextest", "run"]:
     from scripts.direct.test_verify_step_state import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])

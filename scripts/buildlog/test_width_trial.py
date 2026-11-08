@@ -15,7 +15,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, override
+from typing import NamedTuple, cast, override
 from unittest.mock import patch
 
 from scripts.buildlog import store
@@ -23,10 +23,7 @@ from scripts.buildlog import index
 from scripts.buildlog import width_trial as trial
 from scripts.buildlog.test_index import configure_cleanup, encode, step, use_test_log
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 use_test_log()
 

@@ -27,10 +27,6 @@ def fake_cargo_output_roots(
 ) -> Generator[None]:
     """Use supplied mappings and report unavailable for every other checkout."""
     reader = cargo_output.read_cargo_output_roots
-    bare_module = sys.modules.get("cargo_output")
-    readers = (reader,) if bare_module is None else (
-        reader, vars(bare_module).get("read_cargo_output_roots"),
-    )
 
     def read(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
              environment: Mapping[str, str] | None = None) -> CargoOutputRoots | CargoOutputUnavailable:
@@ -51,22 +47,19 @@ def fake_cargo_output_roots(
             )
             # Python children enter the same boundary mock before loading their scripts.
             _ = (startup / "sitecustomize.py").write_text(
-                "import sys\nfrom pathlib import Path\n"
-                + f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
+                "from pathlib import Path\n"
                 + "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots, CargoOutputRoots\n"
                 + f"_cargo_output_fixture = fake_cargo_output_roots({arguments})\n"
                 + "_cargo_output_fixture.__enter__()\n"
             )
-            python_path = os.pathsep.join(filter(None, (str(startup), os.environ.get("PYTHONPATH", ""))))
+            python_path = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[2]),
+                                                       str(startup), os.environ.get("PYTHONPATH", ""))))
             previous = os.environ.get("PYTHONPATH")
             os.environ["PYTHONPATH"] = python_path
             _ = stack.callback(restore_environment, "PYTHONPATH", previous)
-        if bare_module is None:
-            sys.modules["cargo_output"] = cargo_output
-            _ = stack.callback(sys.modules.pop, "cargo_output", None)
-        # Patch existing aliases too. Later imports receive the patched reader.
+        # Patch each imported reader binding.
         for module in tuple(sys.modules.values()):
             binding = vars(module).get("read_cargo_output_roots")
-            if binding is not None and any(binding is candidate for candidate in readers):
+            if binding is reader:
                 _ = stack.enter_context(patch.object(module, "read_cargo_output_roots", side_effect=read))
         yield

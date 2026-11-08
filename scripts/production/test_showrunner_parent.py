@@ -11,9 +11,7 @@ from typing import cast
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase

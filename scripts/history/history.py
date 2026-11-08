@@ -39,7 +39,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 

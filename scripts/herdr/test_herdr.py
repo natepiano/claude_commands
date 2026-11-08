@@ -227,7 +227,7 @@ class NativePaneSessionTests(StaffTestCase):
             with self.assertRaisesRegex(ValueError, "native process start changed"):
                 _ = client.codex_launch("w1:p1", arguments)
 
-    def test_bare_codex_launch_uses_the_tabs_current_staff_thread(self) -> None:
+    def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "agent", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
@@ -238,7 +238,11 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))),
               patch.object(client, "result", return_value=info)):
             entry = client.codex_launch("w1:p1")
-        self.assertEqual(entry["session_id"], owner.current_session)
+            (self.root / "codex-launch-proc/998070/fd/7").unlink()
+            with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                _ = client.codex_launch("w1:p1")
+        self.assertEqual(entry["session_id"], fixture_runtime_id("herdr-codex-launch"))
+        self.assertNotEqual(entry["session_id"], owner.current_session)
         self.assertEqual(entry["cwd"], str(self.root))
         self.assertEqual(entry.get("pid"), 998070)
 

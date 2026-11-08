@@ -23,11 +23,6 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_SCRIPTS = REPOSITORY_ROOT / "scripts" / "production"
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.direct import plan_history
 from scripts.lib import unit_runs

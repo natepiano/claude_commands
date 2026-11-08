@@ -1,7 +1,6 @@
 """Staff rows supply reporting trees and parent commands."""
 from __future__ import annotations
 
-from pathlib import Path
 import io
 import os
 import subprocess
@@ -10,8 +9,6 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import showrunner_parent
 from scripts.production import showrunner_tree

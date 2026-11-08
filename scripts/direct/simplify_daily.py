@@ -15,7 +15,6 @@ import sys
 from typing import cast
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.direct import simplify_result
 from scripts.lib import conf, scratch, user_zone

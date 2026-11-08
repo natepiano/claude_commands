@@ -122,7 +122,7 @@ class UnitTransferFixture(StaffTestCase):
                                "--session agents pane list": {"stdout": '{"result": {"panes": []}}', "code": 0}}))
         self.write(self.root / "fake_send.py",
                    "import json, os, sys\nfrom pathlib import Path\n"
-                   + f"sys.path.insert(0, {str(SCRIPT.parents[2])!r})\n"
+                   + f'with open(Path({str(SCRIPT.parents[2])!r}) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {{"__file__": package_root.name}})\n'
                    + "from scripts.lib.atomic_file import write_text_atomic\n"
                    + "path = Path(os.environ['TRANSFER_MESSAGE_LOG'])\n"
                    + "previous = path.read_text() if path.exists() else ''\n"

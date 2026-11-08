@@ -183,6 +183,9 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
+        for folder in ("lib", "copies"):
+            (self.root / ".claude/scripts" / folder).symlink_to(
+                Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
         self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         self.environment = {
@@ -557,19 +560,6 @@ class LinuxShellTests(unittest.TestCase):
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         self.assertEqual(other.read_text(), "another slot\n")
-
-        with self.subTest(execution="child", folder="new-build"):
-            child_home = self.root / "child-home"
-            scripts = child_home / ".claude/scripts"
-            scripts.parent.mkdir(parents=True)
-            scripts.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
-            environment = {
-                **self.environment, "HOME": str(child_home), "PYTHONPATH": "",
-                "BUILDLOG_WORKSPACE": str(self.mirror),
-            }
-            with chdir(self.root):
-                status = linux_runner.trim_build_folder(self.mirror / "new-build", environment)
-            self.assertEqual(status, 0)
 
     def test_budget_trims_old_output_and_keeps_recent_output_until_the_disk_floor(self) -> None:
         self.use_real_sweep = True
