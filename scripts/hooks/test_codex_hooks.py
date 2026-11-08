@@ -312,6 +312,15 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.state()["cwd"], str(self.home))
         self.assertEqual(self.state()["argv"], ["app-server"])
 
+    def test_installed_hooks_file_carries_integer_timeouts(self) -> None:
+        result = self.run_installer("install")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = {hook.event for hook in codex_hooks.HOOKS}
+        timeouts = [cast(dict[str, object], handler)["timeout"] for event in sorted(events)
+                    for group in self.groups(event) for handler in cast(list[object], group["hooks"])]
+        self.assertEqual(len(timeouts), len(codex_hooks.HOOKS))
+        self.assertEqual([type(timeout) for timeout in timeouts], [int] * len(timeouts))
+
     def test_existing_mac_groups_keep_their_indexes(self) -> None:
         old_groups = [
             {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "random-ack", "timeout": 5}]},

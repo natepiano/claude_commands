@@ -54,7 +54,7 @@ Test row: another fetch of a different branch between the fetch and the read doe
 
 **Acceptance gate:** `scripts.agents.test_models_conf_publish` passes, with the new row; the merge gate passes.
 
-### Phase 2 — Codex can read the hooks file again  · status: todo
+### Phase 2 — Codex can read the hooks file again  · status: done
 
 **Depends on:** none. Phase 3 depends on it: the herdr `SessionStart` hook reports a new pane's thread only when Codex can parse the hooks file.
 

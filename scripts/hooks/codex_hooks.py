@@ -16,6 +16,7 @@ except FileNotFoundError:
 
 import contextlib
 import json
+import math
 import os
 import selectors
 import shutil
@@ -62,10 +63,11 @@ class CodexHook:
         self.matcher: str = matcher
 
     @property
-    def timeout(self) -> float:
+    def timeout(self) -> int:
+        """Whole seconds: Codex refuses the whole hooks file when a timeout is not an integer."""
         if self.name == "scratch-guard":
             from scripts.copies.copy_guard import hook_timeout
-            return hook_timeout()
+            return math.ceil(hook_timeout())
         return self._timeout
 
     def handler(self) -> dict[str, object]:
