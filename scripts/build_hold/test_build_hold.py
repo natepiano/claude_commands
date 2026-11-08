@@ -10,6 +10,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -35,6 +36,20 @@ from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.lib import test_hang_guard
+
+
+class ImportTests(unittest.TestCase):
+    def test_clean_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.build_queue.admission_service", "scripts.message.sessions")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.build_hold import build_hold; "
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):

@@ -1799,7 +1799,7 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 - `test` — Spec 8 and 9, hub: `staff_test_support.py`, opens as impl
 
 **Constraints from prior phases:**
-- Phase 87: rule 2 removal gave no CPU gain in these modules. The cost is the temporary Git repository that each test builds.
+- Phase 87: rule 2 removal gave no CPU gain in these modules. The first pass (above) measured no Git setup gain; the staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s). Keep the real lock and process boundaries.
 - The showrunner assigned `scripts/production/staff_test_support.py` to this phase (2026-11-07). The checkpoint notice says `also touches staff_test_support.py (owner sdlc), tested against origin/main`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
@@ -1869,3 +1869,22 @@ The six `LedgerTestCase` modules use 28% less CPU, with all tests kept. Same-loa
 
 **Gotchas:**
 - Path rewrites use `relative_to(template_repo.parent)` on the decoded JSON, never a text replace: a non-ASCII `TMPDIR` is escaped in the JSON text.
+
+### Phase 91 — The SSH result tests pass under load, whatever time an admission pass takes  · status: done
+**Depends on:** none
+
+#### As-built
+
+The eight SSH result tests no longer depend on how long an admission pass takes. `VerifySshTargetsFixture.control_admission_clock()` runs the admission client with a frozen monotonic clock (`ADMISSION_BEFORE_RETRY`), so no leave pass can fire before local admission. `test_verify_ssh_targets_results.py` calls it in `setUp`. No interval changed, and all 47 assertions and exact attempt counts stay. Under load: 20 of 20 passes. Module CPU 59.9 to 49.9 s.
+
+**Files:**
+- `scripts/direct/verify_ssh_targets_test_support.py` — the fixture; `install_admission_client(script)` routes `lib/py .../admission_client.py` to a test script (the frozen clock or the memory-hook observer)
+- `scripts/direct/test_verify_ssh_targets_results.py` — the result tests
+
+**Gotchas:**
+- While a local step waits for admission, the leave hook retries a free non-Mac target at each running pass. This is the intended production policy (verify-unit, 2026-11-08): fix such flakes in the tests, not in `verify.sh`.
+- The frozen clock also freezes the client's failure, silence and outage timers. An unreachable admission service in a result test ends at the test hang guard.
+
+**Ruled out:**
+- A longer `running_pass_seconds`: the frozen clock removes the dependence without a slower interval.
+- Live failure deadlines under the frozen clock: only a broken admission service reaches them, and the test still fails.

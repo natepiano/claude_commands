@@ -100,15 +100,17 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
 from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.production import staff, session_staff  # noqa: E402
 from scripts.shutdown import remote
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 GIB = 1 << 30
 HOUR_SECONDS = 3600
@@ -737,6 +739,8 @@ class ReadPaneRuns(Enum):
 
 
 def read_pane_runs() -> PaneRunUse | PaneRunsUnreadable:
+    from scripts.production import staff
+
     try:
         return pane_run_use()
     except (staff.StaffUnreadable, OSError, ValueError) as error:
@@ -744,6 +748,8 @@ def read_pane_runs() -> PaneRunUse | PaneRunsUnreadable:
 
 
 def pane_run_use() -> PaneRunUse:
+    from scripts.production import staff, session_staff
+
     record = staff.snapshot()
     parents = session_staff.pane_parents(record)
     active: set[staff.StaffId] = set()
@@ -765,6 +771,8 @@ def pane_run_use() -> PaneRunUse:
 
 
 def run_pane_owner(folder: Path, use: PaneRunUse) -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    from scripts.production import staff
+
     selected = unit_runs.run_pin(folder)
     if selected == "mesh":
         return unit_runs.RunOwnerUnrecorded("mesh run")
@@ -784,6 +792,8 @@ def run_pane_owner(folder: Path, use: PaneRunUse) -> staff.StaffRow | unit_runs.
 
 def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                       workers: PaneRunUse) -> dict[str, RunKeepReason]:
+    from scripts.production import staff
+
     folders = [entry.path for root in roots.runs for entry in listing(root)
                if entry.name != RUN_MARKERS and entry.is_dir(follow_symlinks=False)]
     try:
@@ -851,6 +861,8 @@ class WorkerUse:
 
 def worker_use(guarded: dict[str, RunKeepReason], use: PaneRunUse) -> WorkerUse:
     """Read working folders and live thread ids only from runs that must stay."""
+    from scripts.production import staff, session_staff
+
     folders: set[str] = set()
     threads: set[str] = set()
     unreadable: list[str] = []
@@ -1049,6 +1061,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
+    from scripts.production import staff
+
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):

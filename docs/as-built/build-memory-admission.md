@@ -289,6 +289,10 @@ It imports live reservations, saved intents, waiter places, token handoffs, prio
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
+`build_hold` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
+Importing `build_hold` or `build_targets` does not load the admission service.
+`ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
+The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
