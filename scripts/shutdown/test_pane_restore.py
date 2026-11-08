@@ -90,6 +90,8 @@ class FakeClient(herdr.Herdr):
                               "label": row["label"], "pane_count": 1} for row in self.rows]}
         if arguments[:2] == ("pane", "process-info"):
             return {"process_info": self.process_info}
+        if arguments[:2] == ("agent", "list"):
+            return {"agents": []}
         raise AssertionError(arguments)
 
     @contextmanager
@@ -570,7 +572,8 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.object(sessions, "running_sessions", return_value=[]),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
-        self.assertEqual(len(launches), 3)
+        self.assertEqual(len(launches), 2)
+        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
         self.assertEqual(active, [])
 
 
@@ -685,6 +688,11 @@ class RestoreStaffNamesTests(StaffTestCase):
             f"-U {uid} -o pid=,command=": {"stdout": "42 zsh", "code": 0},
             "-o tpgid= -p 42": {"stdout": "42", "code": 0},
         }
+        for pid in range(992000, 992010):
+            process_responses[f"-o lstart=,tty= -p {pid}"] = {"stdout": "Mon Nov 2 10:00:00 2026 ??\n", "code": 0}
+            process_responses[f"-o command= -p {pid}"] = {"stdout": "claude\n", "code": 0}
+            process_responses[f"eww -o command= -p {pid}"] = {
+                "stdout": f"claude CLAUDE_CONFIG_DIR={config}\n", "code": 0}
         with (self.machine("mac"), mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.object(restart_records, "RECORD_DIR", directory),
               mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),
@@ -703,12 +711,13 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 6)
+        self.assertEqual(len(self.ssh_commands()), 8)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
-        self.assertEqual(order.call_count, 3)
-        self.assertEqual(started, ["renamed", "impl1", "models"])
+        self.assertEqual(order.call_count, 2)
+        self.assertEqual(started, ["renamed", "models"])
+        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
-                         ["impl1", "models", "renamed"])
+                         ["models", "old-worker-label", "renamed"])
 
 
 class CodexPaneRestoreTests(FolderMoveFixture):

@@ -1,11 +1,11 @@
-"""Vault automation with local fake transports, never a real vault or Mac."""
+"""Sync temporary vault repositories and file questions through a local stand-in."""
 
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -13,187 +13,547 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 
+from scripts.buildlog import ci
 from scripts.buildlog import cli
 from scripts.lib import conf
-from scripts.buildlog import rust_release, sync, vault_pull
+from scripts.buildlog import sync
+from scripts.buildlog import vault_pull
 from scripts.buildlog.test_index import point_root_at
-
-if TYPE_CHECKING:
-    from scripts.notify.push_texts import RenderedPush
+from scripts.lib.git_test_support import commit_repository
 
 
-# Run the production remote script against this one fake Git implementation.
-# No command in this fixture ever invokes Git or writes a repository.
-FAKE_GIT = r'''#!/bin/sh
-printf '%s\n' "$*" >> "$VAULT_TEST_GIT_LOG"
-[ "$1" = -C ] && [ "$2" = rust/hanadocs ] || exit 90
-case "$3" in
-  symbolic-ref) [ "$VAULT_TEST_SCENARIO" = branch ] && echo feature || echo main ;;
-  status) [ "$VAULT_TEST_SCENARIO" = tracked ] && echo ' M note.md'; exit 0 ;;
-  merge-base) [ "$VAULT_TEST_SCENARIO" != diverged ] ;;
-  rev-list) printf '%s\n' "$VAULT_TEST_COMMITS" ;;
-  merge)
-    tries=0
-    while IFS= read -r command; do
-      case "$command" in *" merge "*) tries=$((tries + 1)) ;; esac
-    done < "$VAULT_TEST_GIT_LOG"
-    case "$VAULT_TEST_SCENARIO" in
-      locked|lock_clears)
-        if [ "$VAULT_TEST_SCENARIO" = locked ] || [ "$tries" -lt 3 ]; then
-          echo "error: Unable to create '/Users/fixture/rust/hanadocs/.git/index.lock': File exists." >&2
-          exit 128
-        fi ;;
-    esac
-    case "$VAULT_TEST_SCENARIO" in
-      untracked) echo 'error: The following untracked working tree files would be overwritten by merge:' >&2; exit 1 ;;
-      merge_refused) echo 'fatal: Not possible to fast-forward, aborting.' >&2; exit 128 ;;
-      lock_name_only) echo 'fatal: cannot read index.lock' >&2; exit 128 ;;
-      lock_exists_only) echo 'fatal: other.lock: File exists' >&2; exit 128 ;;
-      remote_failed) echo 'fatal: fixture remote failure' >&2; exit 128 ;;
-      *) echo 'Updating old..new' ;;
-    esac ;;
-  *) echo 'unsafe or unexpected git command' >&2; exit 91 ;;
-esac
+QUESTION_STAND_IN = '''import json, pathlib, sys
+folder = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+with (folder / "attempts.jsonl").open("a") as stream:
+    stream.write(json.dumps(args) + "\\n")
+status = int((folder / ("withdraw_exit" if args[0] == "withdraw" else "question_exit")).read_text())
+if status == 0 and args[0] == "ask":
+    with (folder / "questions.jsonl").open("a") as stream:
+        stream.write(json.dumps(args) + "\\n")
+raise SystemExit(status)
+'''
+
+GIT_STAND_IN = '''#!/bin/sh
+if [ "$3" = "$VAULT_TEST_OPERATION" ]; then
+  count=0
+  [ ! -f "$VAULT_TEST_COUNTER" ] || read -r count < "$VAULT_TEST_COUNTER"
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$VAULT_TEST_COUNTER"
+  if [ "$count" -le "$VAULT_TEST_LOCK_FAILURES" ]; then
+    echo "$VAULT_TEST_FAILURE_DETAIL" >&2
+    exit 128
+  fi
+fi
+exec "$VAULT_TEST_GIT" "$@"
 '''
 
 
+GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+    "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def option(args: list[str], flag: str) -> str:
+    return args[args.index(flag) + 1]
+
+
 class VaultPullTests(unittest.TestCase):
-    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    bin: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    git_log: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    scenario: str = "clean"
-    commits: int = 7
+    folder: Path = Path()
+    root: Path = Path()
+    github: Path = Path()
+    local: Path = Path()
+    mac: Path = Path()
     now: float = 1_800_000_000.0
-    send_ok: bool = True
-    commands: list[list[str]] = []
-    pushes: list[RenderedPush] = []
+    unreachable: bool = False
+    warm: bool = True
+    reject_push: bool = False
+    lock_operation: str = ""
+    lock_failures: int = 0
+    unknown_remote_error: bool = False
+    lock_detail: str = "fatal: Unable to create 'rust/hanadocs/.git/index.lock': File exists"
+    push_rejection: str = "[rejected]"
+    template: Path = Path()
+
+    @override
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.commands: list[list[str]] = []
+        self.github_update: dict[str, str] = {}
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        cls.template = Path(temporary.name)
+        github = cls.template / "github.git"
+        local = cls.template / "natedev"
+        mac = cls.template / "mac"
+        with mock.patch.dict(os.environ, GIT_IDENTITY):
+            _ = cls.command(["git", "init", "--bare", "--initial-branch=main", str(github)])
+            _ = cls.command(["git", "init", "--initial-branch=main", str(local)])
+            _ = (local / "shared.md").write_text("base\n")
+            _ = commit_repository(local, "base")
+            _ = cls.command(["git", "-C", str(local), "remote", "add", "origin", str(github)])
+            _ = cls.command(["git", "-C", str(local), "push", "-u", "origin", "main"])
+            _ = cls.command(["git", "clone", str(github), str(mac)])
 
     @override
     def setUp(self) -> None:
-        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.root = folder / "buildlog"
-        self.bin = folder / "bin"
-        self.bin.mkdir()
-        git = self.bin / "git"
-        _ = git.write_text(FAKE_GIT)
-        git.chmod(0o700)
-        sleep = self.bin / "sleep"
-        _ = sleep.write_text('#!/bin/sh\n[ "$1" = 0.0 ] || exit 92\n')
-        sleep.chmod(0o700)
-        config = folder / "config"
-        config.mkdir()
-        settings = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
-        _ = (config / "build_targets.conf").write_text(
-            "# whole: 0..10\nvault.lock_retries=2\n"
-            + "# range: 0..5\nvault.lock_retry_delay_s=0\n" + settings.read_text())
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
-        self.git_log = folder / "git.log"
+        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = self.folder / "buildlog"
+        self.github = self.folder / "github.git"
+        self.local = self.folder / "natedev"
+        self.mac = self.folder / "mac-host/rust/hanadocs"
+        self.mac.parent.mkdir(parents=True)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.folder), "BUILDLOG_PEER": "fixture-mac",
+            **GIT_IDENTITY,
+        }))
+        for name, destination in (("github.git", self.github), ("natedev", self.local), ("mac", self.mac)):
+            _ = shutil.copytree(self.template / name, destination)
+        for repository in (self.local, self.mac):
+            _ = self.git(repository, "remote", "set-url", "origin", str(self.github))
+        settings = self.folder / "config"
+        settings.mkdir()
+        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
+        _ = (settings / "build_targets.conf").write_text(
+            "# whole: 0..10\nvault.lock_retries=2\n# range: 0..5\nvault.lock_retry_delay_s=0\n"
+            + production.read_text())
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(settings)}))
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(folder), "BUILDLOG_PEER": "fixture-mac"}))
-        self.commands = []
-        self.pushes = []
-        self.scenario = "clean"
-        self.commits = 7
-        self.now = 1_800_000_000.0
-        self.send_ok = True
-        _ = self.enterContext(mock.patch.object(vault_pull, "run", new=self.run_transport))
+        script = self.folder / "update_registration.py"
+        _ = script.write_text(QUESTION_STAND_IN)
+        _ = (self.folder / "question_exit").write_text("0")
+        _ = (self.folder / "withdraw_exit").write_text("0")
+        shim = self.folder / "bin"
+        shim.mkdir()
+        _ = (shim / "git").write_text(GIT_STAND_IN)
+        (shim / "git").chmod(0o700)
+        _ = (shim / "sleep").write_text("#!/bin/sh\nexit 0\n")
+        (shim / "sleep").chmod(0o700)
+        _ = self.enterContext(mock.patch.object(vault_pull, "LOCAL_VAULT", self.local))
+        _ = self.enterContext(mock.patch.object(vault_pull, "REGISTRATION", script))
         _ = self.enterContext(mock.patch.object(time, "time", side_effect=lambda: self.now))
-        _ = self.enterContext(mock.patch.object(rust_release, "send_release_text", new=self.send))
+        _ = self.enterContext(mock.patch.object(vault_pull, "run", new=self.run_transport))
+        _ = self.enterContext(mock.patch.object(ci, "warm", new=self.credentials_warm))
+
+    @staticmethod
+    def command(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, capture_output=True, text=True, check=True, timeout=10)
+
+    def git(self, repo: Path, *args: str) -> str:
+        return self.command(["git", "-C", str(repo), *args]).stdout.strip()
+
+    def commit(self, repo: Path, files: dict[str, str]) -> str:
+        for name, text in files.items():
+            file = repo / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            _ = file.write_text(text)
+        return commit_repository(repo, "fixture edits")
+
+    def credentials_warm(self) -> bool:
+        if self.github_update:
+            publisher = self.folder / "publisher"
+            _ = self.command(["git", "clone", str(self.github), str(publisher)])
+            _ = self.commit(publisher, self.github_update)
+            _ = self.git(publisher, "push", "origin", "main")
+            self.github_update = {}
+        return self.warm
 
     def run_transport(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+        self.assertEqual(timeout, vault_pull.COMMAND_TIMEOUT_S)
         self.commands.append(args)
+        if args[0] == "ssh":
+            if self.unreachable:
+                return subprocess.CompletedProcess(args, 255, "", "Mac unreachable")
+            if self.unknown_remote_error:
+                return subprocess.CompletedProcess(args, 0, "VAULT_OUTCOME=failed\n", "fixture remote error")
+            environment = {
+                **os.environ, "PATH": str(self.folder / "bin") + os.pathsep + os.environ["PATH"],
+                "VAULT_TEST_GIT": shutil.which("git") or "git",
+                "VAULT_TEST_OPERATION": self.lock_operation,
+                "VAULT_TEST_COUNTER": str(self.folder / "lock_count"),
+                "VAULT_TEST_LOCK_FAILURES": str(self.lock_failures),
+                "VAULT_TEST_FAILURE_DETAIL": self.lock_detail,
+            }
+            result = subprocess.run(["/bin/sh", "-c", args[-1]], cwd=self.mac.parents[1], env=environment,
+                                    capture_output=True, text=True, check=False, timeout=timeout)
+            # Mac login can report success after a failed remote command.
+            return subprocess.CompletedProcess(args, 0, result.stdout, result.stderr)
         if args[0] == "git":
-            if self.scenario == "push_refused":
-                return subprocess.CompletedProcess(args, 1, "", "! [rejected] main -> main (non-fast-forward)")
-            if self.scenario == "push_unreachable":
+            self.assertEqual(args[2], str(self.local))
+            if self.unreachable and "fixture-mac:rust/hanadocs" in args:
                 return subprocess.CompletedProcess(args, 128, "", "ssh: connect: Connection refused")
-            if self.scenario == "command_failed":
-                return subprocess.CompletedProcess(args, 128, "", "fatal: fixture transport configuration is invalid")
-            return subprocess.CompletedProcess(args, 0, "", "")
-        self.assertEqual(args[0], "ssh", "external commands must stay inside the fake transport")
-        if self.scenario == "unreachable":
-            return subprocess.CompletedProcess(args, 255, "", "Mac unreachable")
-        if self.scenario == "timeout":
-            return None
-        if self.scenario == "no_marker":
-            return subprocess.CompletedProcess(args, 0, "login banner only\n", "")
-        result = subprocess.run(
-            ["/bin/sh", "-c", args[-1]], cwd=self.bin.parent,
-            env={**os.environ, "PATH": str(self.bin), "VAULT_TEST_SCENARIO": self.scenario,
-                 "VAULT_TEST_COMMITS": str(self.commits), "VAULT_TEST_GIT_LOG": str(self.git_log)},
-            capture_output=True, text=True, timeout=timeout, check=False,
-        )
-        # /usr/bin/login on the Mac hides the remote shell's exit status.
-        return subprocess.CompletedProcess(args, 0, result.stdout, result.stderr)
-
-    def send(self, push: RenderedPush) -> bool:
-        self.pushes.append(push)
-        return self.send_ok
+            if self.reject_push and "push" in args and "origin" in args:
+                return subprocess.CompletedProcess(args, 1, f"!\tmain:main\t{self.push_rejection} (fetch first)\n", "")
+            args = [str(self.mac) if arg == "fixture-mac:rust/hanadocs" else arg for arg in args]
+        else:
+            self.assertEqual(args[:2], ["python3", str(self.folder / "update_registration.py")])
+        return subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout)
 
     def hour(self) -> tuple[int, str]:
         output = StringIO()
         with redirect_stdout(output):
             status = vault_pull.vault()
         lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 1, "each hourly vault run prints one line")
+        self.assertEqual(len(lines), 1)
         return status, lines[0]
 
-    def remote_commands(self) -> list[list[str]]:
-        return [shlex.split(line) for line in self.git_log.read_text().splitlines()]
+    def questions(self, name: str = "questions.jsonl") -> list[list[str]]:
+        file = self.folder / name
+        return [cast(list[str], json.loads(line)) for line in file.read_text().splitlines()] if file.exists() else []
 
-    def test_clean_fast_forward_reports_the_commit_count_and_saves_last_good(self) -> None:
-        self.assertEqual(self.hour(), (0, "buildlog vault: pulled 7 commits"))
-        self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(
-            vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
-        self.assertEqual(self.pushes, [])
-        self.assertEqual(self.remote_commands()[-1], ["-C", "rust/hanadocs", "merge", "--ff-only", "--no-overwrite-ignore", "refs/remotes/origin/main"])
+    def withdrawals(self) -> list[list[str]]:
+        return [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
 
-    def test_printed_outcomes_survive_a_successful_ssh_exit_for_every_cause(self) -> None:
-        cases = (
-            ("clean", vault_pull.Pulled), ("tracked", vault_pull.TrackedFilesChanged),
-            ("branch", vault_pull.NotOnMain), ("diverged", vault_pull.HistoryDiverged),
-            ("untracked", vault_pull.UntrackedWouldBeOverwritten),
-            ("remote_failed", vault_pull.VaultCommandFailed),
-        )
-        for scenario, expected in cases:
-            with self.subTest(scenario=scenario):
-                self.scenario = scenario
-                self.assertIsInstance(vault_pull.pull(), expected)
+    def question(self) -> str:
+        return option(self.questions()[-1], "--question")
 
-    def test_busy_lock_clears_on_a_later_try_and_pulls(self) -> None:
-        self.scenario = "lock_clears"
-        self.assertEqual(self.hour(), (0, "buildlog vault: pulled 7 commits"))
-        self.assertEqual(sum(command[2] == "merge" for command in self.remote_commands()), 3)
-        self.assertEqual(self.pushes, [])
+    def conflict(self) -> tuple[str, str]:
+        local = self.commit(self.local, {"shared.md": "natedev edit\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        mac = self.commit(self.mac, {"shared.md": "Mac edit\n"})
+        return local, mac
 
-    def test_busy_lock_on_every_try_has_its_own_stop_and_detail(self) -> None:
-        self.scenario = "locked"
+    def test_mac_commits_tracked_and_untracked_edits_and_publishes_both(self) -> None:
+        _ = (self.mac / "shared.md").write_text("Mac edit\n")
+        _ = (self.mac / "note.md").write_text("new note\n")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.github, "show", "main:shared.md"), "Mac edit")
+        self.assertEqual(self.git(self.github, "show", "main:note.md"), "new note")
+        self.assertEqual(self.git(self.mac, "log", "-1", "--format=%s"), "vault: Mac edits")
+        self.assertEqual(self.git(self.mac, "status", "--porcelain"), "")
+        self.assertEqual(self.questions(), [])
+
+    def test_different_files_merge_on_the_mac_and_reach_github(self) -> None:
+        local = self.commit(self.local, {"from-natedev.md": "natedev\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        mac = self.commit(self.mac, {"from-mac.md": "Mac\n"})
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.git(self.mac, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        for ancestor in (local, mac):
+            _ = self.git(self.github, "merge-base", "--is-ancestor", ancestor, "main")
+        self.assertEqual(self.git(self.github, "show", "main:from-mac.md"), "Mac")
+        self.assertEqual(self.git(self.github, "show", "main:from-natedev.md"), "natedev")
+
+    def test_concurrent_github_edits_merge_in_the_natedev_object_store(self) -> None:
+        _ = (self.mac / "mac.md").write_text("Mac\n")
+        self.github_update = {"github.md": "GitHub\n"}
+        before = self.git(self.local, "rev-parse", "HEAD")
+        _ = (self.local / "shared.md").write_text("uncommitted natedev edit\n")
+        _ = (self.local / "staged.md").write_text("staged natedev edit\n")
+        _ = self.git(self.local, "add", "staged.md")
+        index_before = (self.local / ".git/index").read_bytes()
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.local, "rev-parse", "HEAD"), before)
+        self.assertEqual((self.local / "shared.md").read_text(), "uncommitted natedev edit\n")
+        self.assertEqual((self.local / ".git/index").read_bytes(), index_before)
+        self.assertEqual(self.git(self.github, "show", "main:mac.md"), "Mac")
+        self.assertEqual(self.git(self.github, "show", "main:github.md"), "GitHub")
+        self.assertEqual(len(self.git(self.github, "rev-list", "--parents", "-n", "1", "main").split()), 3)
+
+    def test_same_lines_keep_both_commits_abort_the_mac_merge_and_file_one_question(self) -> None:
+        local, mac = self.conflict()
         status, line = self.hour()
         self.assertEqual(status, 0)
-        self.assertIn("index.lock", line)
-        self.assertEqual(sum(command[2] == "merge" for command in self.remote_commands()), 3)
+        self.assertIn("stopped:", line)
+        self.assertEqual(self.git(self.github, "rev-parse", "main"), local)
+        self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), mac)
+        self.assertEqual(self.git(self.mac, "status", "--porcelain"), "")
+        self.assertFalse((self.mac / ".git/MERGE_HEAD").exists())
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("shared.md", self.question())
+        self.assertIn("In a terminal on the Mac", self.question())
+        self.assertIn("I recommend choice 1", self.question())
+        self.assertFalse(any("push" in args and "origin" in args for args in self.commands))
+        self.assertFalse(any("pushover" in " ".join(args) or "send.py" in " ".join(args) for args in self.commands))
+
+    def test_open_mac_merge_files_a_conflict_question_without_changing_the_commit_or_file(self) -> None:
+        local, mac = self.conflict()
+        _ = self.git(self.mac, "fetch", "origin", "main")
+        merged = subprocess.run(["git", "-C", str(self.mac), "merge", "--no-edit", "origin/main"],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(merged.returncode, 1)
+        text = (self.mac / "shared.md").read_text()
+        self.assertIn("<<<<<<< HEAD", text)
+        self.assertEqual(self.git(self.mac, "rev-parse", "MERGE_HEAD"), local)
+
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                if staged:
+                    _ = self.git(self.mac, "add", "shared.md")
+                status = self.git(self.mac, "status", "--porcelain")
+                self.assertEqual(self.hour()[0], 0)
+                self.assertEqual(len(self.questions()), 1)
+                self.assertIn("shared.md", self.question())
+                self.assertIn("In a terminal on the Mac", self.question())
+                self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), mac)
+                self.assertEqual(self.git(self.mac, "rev-parse", "MERGE_HEAD"), local)
+                self.assertEqual((self.mac / "shared.md").read_text(), text)
+                self.assertEqual(self.git(self.mac, "status", "--porcelain"), status)
+                self.assertEqual(self.git(self.github, "rev-parse", "main"), local)
+
+    def test_natedev_conflict_defers_until_the_mac_files_the_conflict_question(self) -> None:
+        _ = (self.mac / "shared.md").write_text("Mac\n")
+        self.github_update = {"shared.md": "GitHub\n"}
+        head = self.git(self.local, "rev-parse", "HEAD")
+        outage = vault_pull.OpenOutage("command_failed", self.now - 3600, False, "previous error")
+        vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), outage))
+        self.assertEqual(self.hour(), (0, "buildlog vault: GitHub main conflicts with the Mac; the next hour merges it on the Mac"))
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(vault_pull.read_state().last_good, vault_pull.LastGoodPull(self.now))
+        self.assertEqual(vault_pull.read_state().outage, outage)
+        self.now += 3600
+        self.assertEqual(self.hour(), (0, "buildlog vault: stopped: The hanadocs merge has a conflict on Mac. Files: shared.md."))
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("conflict on Mac", self.question())
+        self.assertIn("shared.md", self.question())
+        self.assertIn("In a terminal on the Mac", self.question())
+        self.assertEqual(self.git(self.local, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.mac, "show", "HEAD:shared.md"), "Mac")
+        self.assertEqual(self.git(self.github, "show", "main:shared.md"), "GitHub")
+        self.assertFalse((self.local / ".git/MERGE_HEAD").exists())
+
+    def test_a_second_stop_in_one_outage_files_no_second_question(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertEqual(len(self.questions("attempts.jsonl")), 1)
+
+    def test_a_good_run_closes_the_outage_and_a_later_stop_files_a_new_question(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        first = self.questions()[0]
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        withdrawals = self.withdrawals()
+        self.assertEqual(len(withdrawals), 1)
+        self.assertEqual(withdrawals[0], [
+            "withdraw", "--production", option(first, "--production"),
+            "--item", option(first, "--text"),
+        ])
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 2)
+        second = self.questions()[1]
+        self.assertNotEqual(option(second, "--text"), option(first, "--text"))
+        _ = self.git(self.mac, "switch", "main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        withdrawals = self.withdrawals()
+        self.assertEqual(len(withdrawals), 2)
+        self.assertEqual(option(withdrawals[1], "--item"), option(second, "--text"))
+
+    def test_a_changed_cause_withdraws_the_original_question_text(self) -> None:
+        _ = self.conflict()
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        first = self.questions()[0]
+        _ = self.git(self.mac, "switch", "main")
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
         outage = vault_pull.read_state().outage
-        self.assertIsInstance(outage, vault_pull.OpenOutage)
         assert isinstance(outage, vault_pull.OpenOutage)
-        self.assertEqual(outage.cause, "vault_locked")
-        self.assertIn("index.lock", outage.detail)
-        self.assertIn("File exists", outage.detail)
-        self.assertEqual(len(self.pushes), 1)
-        self.assertIn(
-            "Another git process held ~/rust/hanadocs/.git/index.lock on the Mac for every try.",
-            self.pushes[0].message)
-        self.assertIn(
-            "In a terminal on the Mac, check that no git process uses ~/rust/hanadocs; "
-            + "if none does, remove ~/rust/hanadocs/.git/index.lock.", self.pushes[0].message)
-        self.assertNotIn("The update failed with an error the job does not know.", self.pushes[0].message)
+        self.assertEqual(outage.cause, "conflict")
+        self.assertEqual(len(self.questions()), 1)
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.assertEqual(self.hour()[0], 0)
+        withdrawals = self.withdrawals()
+        self.assertEqual(len(withdrawals), 1)
+        self.assertEqual(option(withdrawals[0], "--item"), option(first, "--text"))
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
+    def test_a_good_run_inside_the_unreachable_grace_withdraws_no_question(self) -> None:
+        self.unreachable = True
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertFalse(outage.asked)
+        self.unreachable = False
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions("attempts.jsonl"), [])
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
+    def assert_withdraw_does_not_retry(self) -> None:
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        attempts = self.questions("attempts.jsonl")
+        self.assertEqual(len(self.withdrawals()), 1)
+        self.assertEqual(self.hour(), (0, "buildlog vault: current"))
+        self.assertEqual(self.questions("attempts.jsonl"), attempts)
+
+    def test_a_failed_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        _ = self.git(self.mac, "switch", "main")
+        _ = (self.folder / "withdraw_exit").write_text("2")
+        self.assertEqual(self.hour(), (0, "buildlog vault: current; the question was not withdrawn"))
+        self.assertEqual(len(self.questions()), 1)
+        self.assert_withdraw_does_not_retry()
+
+    def test_a_timed_out_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+
+        def timed_out_withdraw(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            result = self.run_transport(args, timeout)
+            if "withdraw" in args:
+                self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+                return None
+            return result
+
+        with mock.patch.object(vault_pull, "run", new=timed_out_withdraw):
+            self.assertEqual(self.hour(), (0, "buildlog vault: synced 0 incoming commits; the question was not withdrawn"))
+        self.assert_withdraw_does_not_retry()
+
+    def test_a_deferral_keeps_the_question_until_the_first_good_sync(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.read_state().outage
+        attempts = self.questions("attempts.jsonl")
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.warm = False
+        self.assertEqual(self.hour(), (0, "buildlog vault: GitHub credentials are cold; the next hour retries"))
+        self.assertEqual(vault_pull.read_state().outage, outage)
+        self.assertEqual(self.questions("attempts.jsonl"), attempts)
+        self.warm = True
+        self.assertEqual(self.hour()[0], 0)
+        withdrawals = self.withdrawals()
+        self.assertEqual(len(withdrawals), 1)
+        first = self.questions()[0]
+        self.assertEqual(option(withdrawals[0], "--item"), option(first, "--text"))
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
+    def test_not_on_main_files_one_question_without_committing_edits(self) -> None:
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        _ = (self.mac / "note.md").write_text("keep\n")
+        head = self.git(self.mac, "rev-parse", "HEAD")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), head)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("not on main", self.question())
+        self.assertIn("In a terminal on the Mac", self.question())
+
+    def test_unreachable_window_files_one_question_at_twenty_four_hours(self) -> None:
+        self.assertEqual(self.hour()[0], 0)
+        self.unreachable = True
+        self.assertEqual(self.hour(), (0, "buildlog vault: stopped: Mac unreachable; the next hour retries"))
+        self.now += vault_pull.UNREACHABLE_GRACE_S - 1
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions(), [])
+        self.now += 1
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("24 hours", self.question())
+        self.assertIn("Mac", self.question())
+
+    def test_unreachable_without_a_good_run_uses_the_outage_start(self) -> None:
+        self.unreachable = True
+        self.assertEqual(self.hour()[0], 0)
+        self.now += vault_pull.UNREACHABLE_GRACE_S
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+
+    def test_failed_or_held_questions_retry_until_the_command_succeeds(self) -> None:
+        _ = self.conflict()
+        _ = (self.folder / "question_exit").write_text("2")
+        self.assertEqual(self.hour()[0], 1)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertFalse(outage.asked)
+        _ = (self.folder / "question_exit").write_text("0")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+        attempts = self.questions("attempts.jsonl")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions("attempts.jsonl")), 2)
+
+    def test_question_command_names_the_cause_date_production_and_urgency(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        args = self.questions()[0]
+        self.assertEqual(args[0], "ask")
+        self.assertEqual(option(args, "--production"), str(vault_pull.PRODUCTION))
+        self.assertIn("conflict", option(args, "--question"))
+        self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
+        self.assertEqual(option(args, "--urgency"), "soon")
+        self.assertEqual(option(args, "--due"), "2027-01-16")
+
+    def test_cold_credentials_defer_without_a_question_or_an_origin_fetch(self) -> None:
+        self.warm = False
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        self.assertEqual(self.hour(), (0, "buildlog vault: GitHub credentials are cold; the next hour retries"))
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
+        self.assertFalse(any("fetch" in args and "origin" in args for args in self.commands))
+        self.assertFalse(any("push" in args and "origin" in args for args in self.commands))
+        self.assertEqual(self.git(self.mac, "show", "HEAD:note.md"), "Mac")
+
+    def test_rejected_github_push_defers_and_the_next_run_publishes(self) -> None:
+        self.reject_push = True
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        outage = vault_pull.OpenOutage("not_on_main", self.now - 3600, True, "previous question")
+        vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), outage))
+        self.assertEqual(self.hour(), (0, "buildlog vault: GitHub main changed; the next hour retries"))
+        self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), outage))
+        self.assertEqual(self.questions(), [])
+        self.reject_push = False
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.github, "show", "main:note.md"), "Mac")
+
+    def test_unknown_remote_errors_keep_exit_one_after_the_question_is_filed(self) -> None:
+        self.unknown_remote_error = True
+        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("fixture remote error", self.question())
+        self.assertIn("error on Mac", self.question())
+        self.assertIn("In the natedev session on natedev", self.question())
+
+    def locked_hour(self, operation: str, failures: int) -> tuple[int, str]:
+        self.lock_operation = operation
+        self.lock_failures = failures
+        (self.folder / "lock_count").unlink(missing_ok=True)
+        _ = (self.mac / "note.md").write_text(operation + "\n")
+        return self.hour()
+
+    def test_commit_and_merge_retry_index_locks_and_then_complete(self) -> None:
+        for operation in ("commit", "merge"):
+            with self.subTest(operation=operation):
+                self.assertEqual(self.locked_hour(operation, 2)[0], 0)
+                self.assertEqual((self.folder / "lock_count").read_text().strip(), "3")
+                self.assertEqual(self.git(self.github, "show", "main:note.md"), operation)
+                self.assertEqual(self.questions(), [])
+
+    def test_exhausted_commit_and_merge_locks_file_a_question(self) -> None:
+        for operation in ("commit", "merge"):
+            with self.subTest(operation=operation):
+                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
+                self.assertEqual(self.locked_hour(operation, 3)[0], 0)
+                self.assertEqual((self.folder / "lock_count").read_text().strip(), "3")
+                self.assertIn("index.lock", self.question())
+        self.assertEqual(len(self.questions()), 2)
 
     def test_vault_retry_delay_limit_stays_below_one_minute(self) -> None:
-        production = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
-        for settings in (production, Path(os.environ["CONF_DIR"]) / "build_targets.conf"):
+        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
+        for settings in (production, self.folder / "config/build_targets.conf"):
             with self.subTest(settings=settings):
                 conf.check(settings, "vault.lock_retries", "10")
                 conf.check(settings, "vault.lock_retry_delay_s", "5")
@@ -202,61 +562,231 @@ class VaultPullTests(unittest.TestCase):
                 with self.assertRaises(conf.Unusable):
                     conf.check(settings, "vault.lock_retries", "11")
 
-    def test_zero_retries_stops_after_the_first_busy_lock(self) -> None:
-        settings = Path(os.environ["CONF_DIR"]) / "build_targets.conf"
-        _ = settings.write_text(settings.read_text().replace("vault.lock_retries=2", "vault.lock_retries=0"))
-        self.scenario = "locked"
+    def test_ignored_file_is_preserved_by_the_real_git_merge(self) -> None:
+        _ = self.commit(self.local, {"protected.txt": "incoming\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        _ = (self.mac / ".git/info/exclude").write_text("protected.txt\n")
+        _ = (self.mac / "protected.txt").write_text("keep this ignored file\n")
+        base = self.git(self.mac, "rev-parse", "HEAD")
         outcome = vault_pull.pull()
-        self.assertIsInstance(outcome, vault_pull.VaultLocked)
-        self.assertEqual(sum(command[2] == "merge" for command in self.remote_commands()), 1)
+        self.assertIsInstance(outcome, vault_pull.VaultCommandFailed)
+        assert isinstance(outcome, vault_pull.VaultCommandFailed)
+        self.assertIn("would be overwritten by merge", outcome.detail)
+        self.assertIn("protected.txt", outcome.detail)
+        self.assertEqual((self.mac / "protected.txt").read_text(), "keep this ignored file\n")
+        self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), base)
+        status, line = self.hour()
+        self.assertEqual(status, 1)
+        self.assertIn("would be overwritten by merge", line)
+        self.assertIn("protected.txt", self.question())
 
-    def test_other_merge_errors_do_not_retry(self) -> None:
-        for scenario in ("remote_failed", "lock_name_only", "lock_exists_only"):
-            with self.subTest(scenario=scenario):
-                self.scenario = scenario
-                _ = self.git_log.write_text("")
-                self.assertIsInstance(vault_pull.pull(), vault_pull.VaultCommandFailed)
-                self.assertEqual(sum(command[2] == "merge" for command in self.remote_commands()), 1)
+    def test_no_state_save_after_a_filed_question_can_make_the_next_hour_repeat_it(self) -> None:
+        _ = self.conflict()
+        save = vault_pull.write_state
 
-    def test_command_failure_saves_detail_in_state(self) -> None:
-        self.scenario = "command_failed"
-        self.assertEqual(self.hour()[0], 1)
-        saved = cast(dict[str, dict[str, object]], json.loads(vault_pull.state_path().read_text()))
-        self.assertEqual(saved["outage"]["detail"], "fatal: fixture transport configuration is invalid")
+        def fail_after_question(state: vault_pull.VaultState) -> None:
+            if self.questions():
+                raise OSError("state disk unavailable after delivery")
+            save(state)
+
+        with mock.patch.object(vault_pull, "write_state", side_effect=fail_after_question):
+            self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(vault_pull.read_state().outage, vault_pull.OpenOutage(
+            "conflict", self.now, True, vault_pull.stop_details(vault_pull.VaultConflict(("shared.md",)))[1]))
+        self.now += 3600
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertEqual(len(self.questions("attempts.jsonl")), 1)
         outage = vault_pull.read_state().outage
         assert isinstance(outage, vault_pull.OpenOutage)
-        self.assertEqual(outage.detail, saved["outage"]["detail"])
-        self.assertIn(str(vault_pull.state_path()), self.pushes[0].message)
-        self.assertIn("journalctl --user -u buildlog.service | grep 'buildlog vault'", self.pushes[0].message)
+        self.assertEqual(outage.cause, "not_on_main")
+        self.assertTrue(outage.asked)
 
-    def test_older_outage_without_detail_still_reads(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        _ = vault_pull.state_path().write_text(json.dumps({
-            "last_good": self.now - 3600,
-            "outage": {"cause": "command_failed", "since": self.now, "alerted": True},
-        }))
+    def test_a_failed_pre_question_state_save_does_not_run_ask(self) -> None:
+        _ = self.conflict()
+        save = vault_pull.write_state
+
+        def fail_question_intent(state: vault_pull.VaultState) -> None:
+            if isinstance(state.outage, vault_pull.OpenOutage) and state.outage.asked:
+                raise OSError("cannot save question intent")
+            save(state)
+
+        with mock.patch.object(vault_pull, "write_state", side_effect=fail_question_intent):
+            with self.assertRaises(OSError):
+                _ = self.hour()
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(self.questions("attempts.jsonl"), [])
+
+    def test_days_of_cold_credentials_keep_the_next_unreachable_hour_inside_the_grace(self) -> None:
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.OpenOutage("not_on_main", self.now, True, "previous question")
+        vault_pull.write_state(vault_pull.VaultState(vault_pull.LastGoodPull(self.now), outage))
+        self.warm = False
+        for day in (1, 2, 3):
+            with self.subTest(day=day):
+                self.now += 24 * 3600
+                self.assertEqual(self.hour()[0], 0)
+                self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), outage))
+        last_good = self.now
+        self.unreachable = True
+        self.now += 3600
+        self.assertEqual(self.hour(), (0, "buildlog vault: stopped: Mac unreachable; the next hour retries"))
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(vault_pull.read_state().last_good, vault_pull.LastGoodPull(last_good))
+
+    def test_mac_transfer_succeeds_with_a_connection_warning_on_stderr(self) -> None:
+        _ = self.commit(self.local, {"note.md": "incoming note\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        hook = self.mac / ".git/hooks/post-receive"
+        _ = hook.write_text("#!/bin/sh\nprintf 'connection refused\\n' >&2\n")
+        hook.chmod(0o700)
+
+        result = vault_pull.mac_git("push", "fixture-mac:rust/hanadocs",
+                                    f"{vault_pull.ORIGIN_MAIN}:{vault_pull.ORIGIN_MAIN}")
+
+        self.assertIsInstance(result, subprocess.CompletedProcess)
+        assert isinstance(result, subprocess.CompletedProcess)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("connection refused", result.stderr)
+        self.assertEqual(self.git(self.mac, "show", "origin/main:note.md"), "incoming note")
+
+    def test_mac_push_and_fetch_share_the_unreachable_rule(self) -> None:
+        transport = self.run_transport
+        for operation in ("push", "fetch"):
+            for status, detail in ((255, ""), (128, "connection timed out"), (128, "connection refused"),
+                                   (128, "could not resolve hostname"), (128, "no route to host"),
+                                   (128, "network is unreachable"), (128, "connection closed"),
+                                   (128, "permission denied (publickey")):
+                with self.subTest(operation=operation, status=status, detail=detail):
+                    def disconnected(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+                        if operation in args and "fixture-mac:rust/hanadocs" in args:
+                            return subprocess.CompletedProcess(args, status, "", detail)
+                        return transport(args, timeout)
+
+                    with mock.patch.object(vault_pull, "run", new=disconnected):
+                        self.assertIsInstance(vault_pull.pull(), vault_pull.MacUnreachable)
+                        self.assertEqual(self.hour()[0], 0)
+                    self.assertEqual(self.questions(), [])
+
+    def test_timed_out_mac_push_script_and_fetch_are_unreachable(self) -> None:
+        transport = self.run_transport
+        for operation in ("push", "ssh", "fetch"):
+            with self.subTest(operation=operation):
+                def timed_out(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+                    if args[0] == operation or (operation in args and "fixture-mac:rust/hanadocs" in args):
+                        return None
+                    return transport(args, timeout)
+
+                with mock.patch.object(vault_pull, "run", new=timed_out):
+                    self.assertIsInstance(vault_pull.pull(), vault_pull.MacUnreachable)
+                    self.assertEqual(self.hour()[0], 0)
+                self.assertEqual(self.questions(), [])
+
+    def test_zero_retries_stops_after_the_first_busy_lock(self) -> None:
+        settings = self.folder / "config/build_targets.conf"
+        _ = settings.write_text(settings.read_text().replace("vault.lock_retries=2", "vault.lock_retries=0"))
+        self.assertEqual(self.locked_hour("merge", 3)[0], 0)
+        self.assertEqual((self.folder / "lock_count").read_text().strip(), "1")
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertEqual(outage.cause, "vault_locked")
+
+    def test_other_merge_errors_do_not_retry(self) -> None:
+        for detail in ("fatal: fixture remote failure", "fatal: cannot read index.lock", "fatal: other.lock: File exists"):
+            with self.subTest(detail=detail):
+                self.lock_detail = detail
+                self.assertEqual(self.locked_hour("merge", 3)[0], 1)
+                self.assertEqual((self.folder / "lock_count").read_text().strip(), "1")
+                outage = vault_pull.read_state().outage
+                assert isinstance(outage, vault_pull.OpenOutage)
+                self.assertEqual(outage.cause, "command_failed")
+                self.assertIn(detail, outage.detail)
+
+    def test_mac_transport_options_do_not_apply_to_github(self) -> None:
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        self.assertEqual(self.hour()[0], 0)
+        for args in self.commands:
+            if args[0] == "git":
+                with self.subTest(command=args):
+                    has_transport = any(arg.startswith("core.sshCommand=") for arg in args)
+                    self.assertEqual(has_transport, "fixture-mac:rust/hanadocs" in args)
+                    if "origin" in args and "push" in args:
+                        self.assertIn("--porcelain", args)
+
+    def test_remote_rejected_push_is_a_command_failure(self) -> None:
+        self.reject_push = True
+        self.push_rejection = "[remote rejected]"
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertIn("[remote rejected]", self.question())
+        self.assertEqual(vault_pull.read_state().outage, vault_pull.OpenOutage(
+            "command_failed", self.now, True,
+            "The hanadocs sync has an unknown command error on natedev. Detail: stdout: !\tmain:main\t[remote rejected] (fetch first)"))
+
+    def test_rejection_text_without_a_porcelain_rejected_line_is_a_command_failure(self) -> None:
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        transport = self.run_transport
+        for output, detail in (("", "[rejected] non-fast-forward; fetch first"),
+                               ("error: [rejected]", "")):
+            with self.subTest(output=output, detail=detail):
+                def rejected(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+                    if "push" in args and "origin" in args:
+                        return subprocess.CompletedProcess(args, 1, output, detail)
+                    return transport(args, timeout)
+
+                with mock.patch.object(vault_pull, "run", new=rejected):
+                    self.assertIsInstance(vault_pull.pull(), vault_pull.VaultCommandFailed)
+
+    def test_command_failures_keep_both_output_streams_and_the_machine(self) -> None:
+        transport = self.run_transport
+        for operation in ("fetch", "commit-tree"):
+            with self.subTest(operation=operation):
+                def failed(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+                    if operation in args and ("origin" in args or operation == "commit-tree"):
+                        return subprocess.CompletedProcess(args, 128, "fixture stdout", "fixture stderr")
+                    return transport(args, timeout)
+
+                if operation == "commit-tree":
+                    _ = (self.mac / "mac.md").write_text("Mac\n")
+                    self.github_update = {"github.md": "GitHub\n"}
+                with mock.patch.object(vault_pull, "run", new=failed):
+                    outcome = vault_pull.pull()
+                self.assertEqual(outcome, vault_pull.VaultCommandFailed("stderr: fixture stderr\nstdout: fixture stdout"))
+                assert isinstance(outcome, vault_pull.VaultCommandFailed)
+                self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
+
+    def test_each_stop_cause_survives_an_atomic_state_write(self) -> None:
+        for cause in vault_pull.STOP_CAUSES:
+            with self.subTest(cause=cause):
+                state = vault_pull.VaultState(vault_pull.LastGoodPull(self.now),
+                                             vault_pull.OpenOutage(cause, self.now, True, "saved detail"))
+                vault_pull.write_state(state)
+                self.assertEqual(vault_pull.read_state(), state)
+                self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_outage_lock_covers_every_transport_call(self) -> None:
+        transport = self.run_transport
+
+        def locked_transport(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            with vault_pull.state_path().with_suffix(".lock").open("a+b") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return transport(args, timeout)
+
+        with mock.patch.object(vault_pull, "run", new=locked_transport):
+            self.assertEqual(self.hour()[0], 0)
+
+    def test_pause_preserves_the_outage_and_makes_no_transport_calls(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         state = vault_pull.read_state()
-        self.assertEqual(state.last_good, vault_pull.LastGoodPull(self.now - 3600))
-        assert isinstance(state.outage, vault_pull.OpenOutage)
-        self.assertEqual(state.outage.cause, "command_failed")
-        self.assertEqual(state.outage.since, self.now)
-        self.assertTrue(state.outage.alerted)
-        self.assertEqual(state.outage.detail, "")
-
-    def test_missing_marker_with_successful_ssh_is_a_command_failure(self) -> None:
-        self.scenario = "no_marker"
-        self.assertIsInstance(vault_pull.pull(), vault_pull.VaultCommandFailed)
-
-    def test_pause_preserves_outage_state_and_makes_no_transport_calls(self) -> None:
-        state = vault_pull.VaultState(vault_pull.NeverPulled(),
-                                      vault_pull.OpenOutage("tracked_files_changed", self.now, False,
-                                                            vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
-        vault_pull.write_state(state)
+        self.commands.clear()
         with redirect_stdout(StringIO()):
             self.assertEqual(sync.pause("fixture hold"), 0)
         self.assertEqual(self.hour(), (0, "buildlog vault: paused (fixture hold); buildlog sync resume ends it"))
         self.assertEqual(self.commands, [])
-        self.assertEqual(self.pushes, [])
         self.assertEqual(vault_pull.read_state(), state)
 
     def test_contact_holds_the_same_lock_as_sync_pause(self) -> None:
@@ -270,262 +800,53 @@ class VaultPullTests(unittest.TestCase):
 
         with mock.patch.object(vault_pull, "run", new=locked_transport):
             self.assertEqual(self.hour()[0], 0)
-        self.assertEqual([args[0] for args in self.commands], ["git", "ssh"])
 
-    def test_ignored_file_is_preserved_by_the_real_git_merge(self) -> None:
-        # All Git commands use a new temporary repo, with no remotes or network.
-        repo = self.bin.parent / "rust" / "hanadocs"
-        repo.mkdir(parents=True)
+    def test_old_alerted_state_is_not_a_filed_question(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        _ = vault_pull.state_path().write_text(json.dumps({
+            "last_good": self.now - 3600,
+            "outage": {"cause": "tracked_files_changed", "since": self.now, "alerted": True},
+        }))
+        state = vault_pull.read_state()
+        self.assertEqual(state.last_good, vault_pull.LastGoodPull(self.now - 3600))
+        assert isinstance(state.outage, vault_pull.OpenOutage)
+        self.assertFalse(state.outage.asked)
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(len(self.questions()), 1)
+        saved = cast(dict[str, dict[str, object]], json.loads(vault_pull.state_path().read_text()))
+        self.assertTrue(saved["outage"]["asked"])
+        self.assertNotIn("alerted", saved["outage"])
 
-        def git(*args: str) -> str:
-            result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
-                                    text=True, check=True, timeout=10)
-            return result.stdout.strip()
+    def test_output_marker_controls_the_remote_outcome(self) -> None:
+        commit = self.git(self.mac, "rev-parse", "HEAD")
+        self.assertEqual(vault_pull.remote_outcome(subprocess.CompletedProcess(
+            [], 255, f"login banner\nVAULT_OUTCOME=merged:2:{commit}\n", "")), vault_pull.MacMerged(2))
+        self.assertEqual(vault_pull.remote_outcome(subprocess.CompletedProcess(
+            [], 0, "VAULT_OUTCOME=merged:3:" + "a" * 64 + "\n", "")), vault_pull.MacMerged(3))
+        for output in ("", "VAULT_OUTCOME=merged:0\n", "VAULT_OUTCOME=merged:-1:" + commit + "\n",
+                       "VAULT_OUTCOME=merged:0:" + "a" * 39 + "\n", "VAULT_OUTCOME=merged:0:" + "g" * 40 + "\n", "VAULT_OUTCOME=failed\n",
+                       f"VAULT_OUTCOME=branch\nVAULT_OUTCOME=merged:0:{commit}\n"):
+            with self.subTest(output=output):
+                self.assertIsInstance(vault_pull.remote_outcome(subprocess.CompletedProcess([], 0, output, "fixture error")),
+                                      vault_pull.VaultCommandFailed)
+        self.assertIsInstance(vault_pull.remote_outcome(subprocess.CompletedProcess([], 255, "", "")),
+                              vault_pull.MacUnreachable)
 
-        _ = git("init", "--initial-branch=main")
-        _ = git("config", "user.name", "Fixture")
-        _ = git("config", "user.email", "fixture@example.invalid")
-        _ = (repo / ".gitignore").write_text("protected.txt\n")
-        _ = git("add", ".gitignore")
-        _ = git("commit", "-m", "base")
-        base = git("rev-parse", "HEAD")
-        _ = git("switch", "-c", "incoming")
-        _ = (repo / "protected.txt").write_text("incoming\n")
-        _ = git("add", "--force", "protected.txt")
-        _ = git("commit", "-m", "incoming")
-        _ = git("update-ref", "refs/remotes/origin/main", "HEAD")
-        _ = git("switch", "main")
-        _ = (repo / "protected.txt").write_text("keep this ignored file\n")
-        result = subprocess.run(["/bin/sh", "-c", vault_pull.REMOTE_PULL], cwd=self.bin.parent,
-                                capture_output=True, text=True, check=False, timeout=10)
-        self.assertEqual(result.stdout, "VAULT_OUTCOME=untracked\n")
-        self.assertEqual((repo / "protected.txt").read_text(), "keep this ignored file\n")
-        self.assertEqual(git("rev-parse", "HEAD"), base)
-
-    def test_already_current_is_success_and_refreshes_last_good(self) -> None:
-        self.commits = 0
+    def test_current_run_saves_last_good_and_uses_the_expected_transport(self) -> None:
         self.assertEqual(self.hour(), (0, "buildlog vault: current"))
-        self.assertEqual(vault_pull.read_state().last_good, vault_pull.LastGoodPull(self.now))
-        self.assertEqual(self.pushes, [])
-
-    def test_tracked_changes_stop_before_merge_and_name_the_safe_fix(self) -> None:
-        self.scenario = "tracked"
-        status, line = self.hour()
-        self.assertEqual(status, 0)
-        self.assertIn("Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", line)
-        self.assertFalse(any(command[2] == "merge" for command in self.remote_commands()))
-        self.assertEqual(len(self.pushes), 1)
-        self.assertIn("commit", self.pushes[0].message)
-        self.assertIn("Mac", self.pushes[0].message)
-        self.assertIsInstance(vault_pull.pull(), vault_pull.TrackedFilesChanged)
-
-    def test_tracked_changes_exit_zero_and_print_the_stop_line(self) -> None:
-        self.scenario = "tracked"
-        self.assertEqual(self.hour(), (
-            0,
-            "buildlog vault: stopped: Some files in ~/rust/hanadocs on the Mac have changes that are not committed.",
-        ))
-        self.assertEqual(len(self.pushes), 1)
-        outage = vault_pull.read_state().outage
-        assert isinstance(outage, vault_pull.OpenOutage)
-        self.assertEqual(outage.cause, "tracked_files_changed")
-        self.assertTrue(outage.alerted)
-
-    def test_command_failure_exits_one_after_a_recorded_user_action_stop(self) -> None:
-        self.scenario = "tracked"
-        self.assertEqual(self.hour()[0], 0)
-        self.scenario = "command_failed"
-        self.assertEqual(self.hour(), (
-            1, "buildlog vault: stopped: fatal: fixture transport configuration is invalid",
-        ))
-        self.assertEqual(len(self.pushes), 1)
-        outage = vault_pull.read_state().outage
-        assert isinstance(outage, vault_pull.OpenOutage)
-        self.assertEqual(outage.cause, "command_failed")
-        self.assertTrue(outage.alerted)
-
-    def test_user_action_stops_exit_zero_after_sent_or_recorded_alerts(self) -> None:
-        for scenario, cause in (
-            ("tracked", "tracked_files_changed"), ("branch", "not_on_main"),
-            ("diverged", "history_diverged"), ("push_refused", "history_diverged"),
-            ("untracked", "untracked_would_be_overwritten"), ("locked", "vault_locked"),
-        ):
-            with self.subTest(scenario=scenario):
-                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
-                self.pushes.clear()
-                self.scenario = scenario
-                status, line = self.hour()
-                self.assertEqual(status, 0)
-                self.assertTrue(line.startswith("buildlog vault: stopped: "))
-                outage = vault_pull.read_state().outage
-                assert isinstance(outage, vault_pull.OpenOutage)
-                self.assertEqual(outage.cause, cause)
-                self.assertTrue(outage.alerted)
-                self.assertEqual(len(self.pushes), 1)
-                self.assertEqual(self.hour(), (0, line))
-                self.assertEqual(len(self.pushes), 1)
-
-    def test_user_action_stops_exit_one_when_the_alert_fails(self) -> None:
-        self.send_ok = False
-        for scenario in ("tracked", "branch", "diverged", "untracked", "locked"):
-            with self.subTest(scenario=scenario):
-                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
-                self.pushes.clear()
-                self.scenario = scenario
-                status, line = self.hour()
-                self.assertEqual(status, 1)
-                self.assertTrue(line.startswith("buildlog vault: stopped: "))
-                outage = vault_pull.read_state().outage
-                assert isinstance(outage, vault_pull.OpenOutage)
-                self.assertFalse(outage.alerted)
-                self.assertEqual(len(self.pushes), 1)
-
-    def test_non_main_branch_stops_before_status_or_merge(self) -> None:
-        self.scenario = "branch"
-        self.assertIsInstance(vault_pull.pull(), vault_pull.NotOnMain)
-        self.assertEqual([command[2] for command in self.remote_commands()], ["symbolic-ref"])
-
-    def test_push_and_merge_divergence_are_typed_stops(self) -> None:
-        for scenario in ("push_refused", "diverged", "merge_refused"):
-            with self.subTest(scenario=scenario):
-                self.scenario = scenario
-                self.commands.clear()
-                self.assertIsInstance(vault_pull.pull(), vault_pull.HistoryDiverged)
-                self.assertEqual(sum(command[0] == "ssh" for command in self.commands), 0 if scenario == "push_refused" else 1)
-
-    def test_untracked_file_in_the_way_is_not_removed_and_stops_the_merge(self) -> None:
-        self.scenario = "untracked"
-        self.assertIsInstance(vault_pull.pull(), vault_pull.UntrackedWouldBeOverwritten)
-        status, line = self.hour()
-        self.assertEqual(status, 0)
-        self.assertIn("An update would replace a file on the Mac that git does not track.", line)
-        self.assertIn("move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs", self.pushes[0].message)
-
-    def test_command_failure_prints_its_detail_without_putting_it_in_the_push(self) -> None:
-        self.scenario = "command_failed"
-        self.assertEqual(self.hour(), (1, "buildlog vault: stopped: fatal: fixture transport configuration is invalid"))
-        self.assertEqual(len(self.pushes), 1)
-        push = self.pushes[0]
-        self.assertEqual(push.title, "Mac vault copy is not updating")
-        self.assertIn("The update failed with an error the job does not know.", push.message)
-        self.assertIn(f"read the detail in {vault_pull.state_path()}", push.message)
-        self.assertNotIn("fatal: fixture transport configuration is invalid", push.title + push.message)
-
-    def test_unreachable_within_twenty_four_hours_does_not_alert_but_older_does(self) -> None:
-        self.assertEqual(self.hour()[0], 0)
-        good = self.now
-        self.scenario = "unreachable"
-        for age in (3600, 24 * 3600):
-            self.now = good + age
-            self.assertEqual(self.hour()[0], 0)
-            self.assertEqual(self.pushes, [])
-        self.now = good + 24 * 3600 + 1
-        self.assertEqual(self.hour()[0], 1)
-        self.assertEqual(len(self.pushes), 1)
-        self.assertIn("Wake the Mac", self.pushes[0].message)
-        self.assertEqual(vault_pull.read_state().last_good, vault_pull.LastGoodPull(good))
-
-    def test_unreachable_before_the_first_good_pull_gets_a_twenty_four_hour_grace(self) -> None:
-        self.scenario = "unreachable"
-        self.assertEqual(self.hour()[0], 0)
-        self.now += 24 * 3600 + 1
-        self.assertEqual(self.hour()[0], 1)
-        self.assertEqual(len(self.pushes), 1)
-
-    def test_push_connection_failure_and_timeout_are_unreachable(self) -> None:
-        for scenario in ("push_unreachable", "timeout"):
-            with self.subTest(scenario=scenario):
-                self.scenario = scenario
-                self.assertIsInstance(vault_pull.pull(), vault_pull.MacUnreachable)
-
-    def test_one_alert_per_outage_survives_hours_until_a_good_pull_closes_it(self) -> None:
-        self.scenario = "tracked"
-        self.assertEqual(self.hour()[0], 0)
-        first = vault_pull.read_state().outage
-        self.assertIsInstance(first, vault_pull.OpenOutage)
-        for scenario in ("tracked", "branch", "untracked"):
-            self.scenario = scenario
-            self.now += 3600
-            self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.pushes), 1)
-        self.scenario = "clean"
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(vault_pull.read_state().outage, vault_pull.NoOutage())
-        self.scenario = "tracked"
-        self.now += 3600
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.pushes), 2)
-        self.assertNotEqual(vault_pull.read_state().outage, first)
-
-    def test_failed_send_retries_next_hour_and_marks_alerted_only_after_success(self) -> None:
-        self.scenario = "tracked"
-        self.send_ok = False
-        self.assertEqual(self.hour()[0], 1)
-        self.assertEqual(vault_pull.read_state().outage, vault_pull.OpenOutage("tracked_files_changed", self.now, False,
-                                                            vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
-        since = self.now
-        self.send_ok = True
-        self.now += 3600
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.pushes), 2)
-        self.assertEqual(vault_pull.read_state().outage, vault_pull.OpenOutage("tracked_files_changed", since, True,
-                                                            vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
-        self.now += 3600
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.pushes), 2)
-
-    def test_no_state_save_after_a_sent_alert_can_make_the_next_hour_repeat_it(self) -> None:
-        self.scenario = "tracked"
-        save = vault_pull.write_state
-
-        def fail_after_send(state: vault_pull.VaultState) -> None:
-            if self.pushes:
-                raise OSError("state disk unavailable after delivery")
-            save(state)
-
-        with mock.patch.object(vault_pull, "write_state", side_effect=fail_after_send):
-            self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(vault_pull.read_state().outage,
-                         vault_pull.OpenOutage("tracked_files_changed", self.now, True,
-                                              vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
-        self.now += 3600
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.pushes), 1)
-
-    def test_a_failed_pre_send_state_save_does_not_send_an_alert(self) -> None:
-        self.scenario = "tracked"
-        save = vault_pull.write_state
-
-        def fail_alert_commit(state: vault_pull.VaultState) -> None:
-            if isinstance(state.outage, vault_pull.OpenOutage) and state.outage.alerted:
-                raise OSError("cannot save alert intent")
-            save(state)
-
-        with mock.patch.object(vault_pull, "write_state", side_effect=fail_alert_commit):
-            with self.assertRaises(OSError):
-                _ = self.hour()
-        self.assertEqual(self.pushes, [])
-
-    def test_transport_uses_one_ssh_git_c_and_no_destructive_commands(self) -> None:
-        self.assertIsInstance(vault_pull.pull(), vault_pull.Pulled)
-        push, ssh = self.commands
-        self.assertEqual(push[:3], ["git", "-C", "/home/natepiano/rust/hanadocs"])
-        self.assertIn("push", push)
-        self.assertEqual(push[-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
-        self.assertNotIn("--force", push)
+        self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
+        self.assertEqual(self.commands[0][-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
+        ssh = next(args for args in self.commands if args[0] == "ssh")
         self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options(), "fixture-mac"])
-        tokens = shlex.split(ssh[-1])
-        for forbidden in ("cd", "stash", "reset", "checkout"):
-            self.assertNotIn(forbidden, tokens)
-        for command in self.remote_commands():
-            self.assertEqual(command[:2], ["-C", "rust/hanadocs"])
-        self.assertIn(["-C", "rust/hanadocs", "status", "--porcelain", "--untracked-files=no"], self.remote_commands())
+        for args in self.commands:
+            if args[0] == "git":
+                self.assertFalse(any(token in args for token in ("checkout", "reset", "merge", "rebase", "stash")))
 
-    def test_manual_vault_command_uses_the_same_state_and_transport(self) -> None:
+    def test_manual_vault_command_uses_the_same_transport(self) -> None:
         with redirect_stdout(StringIO()):
             self.assertEqual(cli.main(["vault"]), 0)
         self.assertEqual(vault_pull.read_state().last_good, vault_pull.LastGoodPull(self.now))
-        self.assertEqual(len(self.commands), 2)
 
 
 if __name__ == "__main__":

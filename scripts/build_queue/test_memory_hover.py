@@ -8,6 +8,8 @@ import unittest
 from typing import cast
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import test_memory_feed as feed_tests
+from scripts.build_queue.admission_records import reason_phrase
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
@@ -28,19 +30,10 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertIn("suites:1, 80% done", text)
         self.assertIn("0.5 GiB", text)
         self.assertIn("highest anonymous use in the next 20%", text)
-        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        functions = html[html.index("function visibleDetail("):html.index("const tip =")]
-        javascript = functions + "\nconst f1 = (n) => n.toFixed(1);\n" + (
-            "const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" +
-            "process.stdout.write(JSON.stringify(tipText('row:0', data)));\n")
-        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        result = subprocess.run([executable, "-e", javascript], input=json.dumps({"walk": [{
+        hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
             "name": "merge-gate", "unit": "fixture", "showrunner": "fixture-production",
             "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
-            "progress": memory_feed.row_progress(inputs.running)}]}),
-            text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        hover = cast(list[str], json.loads(result.stdout))
+            "progress": memory_feed.row_progress(inputs.running)}]}))
         self.assertEqual(hover[0], "merge-gate · fixture-production")
         for expected in ("suites:1, 80% done", "0.5 GiB", "highest anonymous use in the next 20%",
                          "The queue holds this memory for the run.", "\nfixture",
@@ -48,3 +41,47 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, hover[1])
 
+
+    def page_expression(self, expression: str, data: object) -> object:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        functions = html[html.index("const TIPS ="):html.index("const tip =")]
+        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
+            "process.stdout.write(JSON.stringify(" + expression + "));\n")
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], input=json.dumps(data),
+            text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return cast(object, json.loads(result.stdout))
+
+    def test_each_wait_state_has_a_page_hover_reason(self) -> None:
+        for reason, expected in (
+            (gate.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
+            (gate.StartSpacingWait(110), "start spacing"),
+            (gate.BehindHead("first", 1, "head-session"), "behind"),
+        ):
+            with self.subTest(reason=reason):
+                reading = feed_tests.with_wait_reason(feed_tests.captured_reading(), reason)
+                waiter = reading.view.waiting[0]
+                hover = self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[{
+                    "name":waiter.step, "unit":"", "showrunner":"", "need":1, "since":waiter.since,
+                    "reason":reason_phrase(reason, reading.view.waiting)}]})
+                self.assertIn(expected, str(hover))
+
+    def test_missing_run_use_has_a_page_hover_reason(self) -> None:
+        hover = self.page_expression("tipText('row:0', data)", {"read_at":200_000, "walk":[{
+            "name":"fixture", "unit":"", "showrunner":"", "used":{
+                "kind":"RunUseUnavailable", "reason":"private memory.stat is missing"},
+            "reserved":4, "counted":4, "queued":True, "keep_text":"full reservation", "progress":{
+                "kind":"NoProgress", "reason":"no counter"}}]})
+        self.assertIn("private memory.stat is missing", str(hover))
+        self.assertNotIn("NaN", str(hover))
+
+    def test_missing_pressure_keeps_the_other_limit_readings(self) -> None:
+        result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
+            "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
+            "limits":{"some":25,"full":5,"swap":85}, "pressure":"none", "cap":20,
+            "swap_used":0,"swap_total":8,"cap_text":"fixture room"})
+        self.assertIn("neutral", str(result))
+        self.assertIn("1.0", str(result))
+        self.assertIn("20.0 GiB", str(result))

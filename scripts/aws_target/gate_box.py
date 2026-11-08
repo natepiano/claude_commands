@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
 
 from scripts.lib import conf
+from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True, repr=False)
@@ -319,7 +320,6 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.aws_target.ledger import mapping, rows, text
     from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
-    from scripts.test_times import gate_record
     import math
     from typing import cast
 
@@ -353,20 +353,23 @@ def decode_run(value: object) -> GateRun:
                    row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions')))
 
 
+def execution_records(value: GateRun) -> list[gate_record.Execution]:
+    """Keep every attempt's output for the gate record writer."""
+    return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
+                                  job.returncode, job.restart, job.times, job.output)
+            for job in value.executions or value.jobs]
+
+
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
                       started: float, ended: float, mode: str) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     from datetime import UTC
     from scripts.buildlog import record
     from scripts.production.merge_gate import GateRun
-    from scripts.test_times import gate_record
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
-    modules = gate_record.module_runs([
-        gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
-                              job.returncode, job.restart, job.times)
-        for job in value.executions or value.jobs], gate_record.slow_test_s())
+    modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
                'status': int(any(job.returncode for job in value.jobs if job.suite == suite))}
               for suite in sorted({job.suite for job in value.jobs})]
