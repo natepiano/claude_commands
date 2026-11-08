@@ -79,6 +79,10 @@ class ShellTests(unittest.TestCase):
         self.assert_atoms(f'{BOARD} post /tmp/board impl status "build started"', StatusAtom())
         self.assert_atoms(f'board.sh post /tmp/board impl status "tests; then review"', StatusAtom())
 
+    def test_status_post_without_folder_needs_the_status_kind(self) -> None:
+        self.assert_atoms(f'{BOARD} post impl status "build started"', StatusAtom())
+        self.assert_atoms(f'{BOARD} post impl note "build started"', WorkAtom())
+
     def test_neutral_words_and_control_words(self) -> None:
         self.assert_atoms("cd /tmp && echo ready", NeutralAtom(), NeutralAtom())
         self.assert_atoms("while ! test -f /tmp/job.done; do sleep 5; done",

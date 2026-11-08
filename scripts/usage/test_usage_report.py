@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import unittest
 from unittest import mock
 from contextlib import closing
@@ -98,7 +99,7 @@ class ReportFixture(OutcomeFixture):
             owner = recorded_showrunner(filename, self.production_docs / filename)
             for name, tree in entries:
                 _ = fixture_member("unit", name=name, parent=owner.id,
-                                   worktree=staff.PresentWorktree("natedev", Path(tree)))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), Path(tree)))
         _ = self.commit("checkpoint(report-plan): phase 7 — First", "2026-10-10T21:37:00Z")
         _ = self.commit("checkpoint(report-plan): phase 7 — Second", "2026-10-10T21:38:00Z")
         _ = self.commit("checkpoint(other-plan): phase 7 — Unmapped", "2026-10-11T07:01:00Z")
@@ -110,13 +111,13 @@ class ReportFixture(OutcomeFixture):
         return environment
 
     def report(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(REPORT), "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), str(REPORT), "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def report_script(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -168,7 +169,8 @@ class ReportFixture(OutcomeFixture):
             (self.root / "outside-checkout").mkdir()
             (self.root / "bin").mkdir()
             ssh = self.root / "bin/ssh"
-            _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+            _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+                "${HOME}/.claude/scripts/lib/py", str(REPOSITORY / "scripts/lib/py")))
             ssh.chmod(0o700)
         report_path = self.root / "ssh-report.json"
         self.assertFalse(report_path.exists())
@@ -482,10 +484,10 @@ raise SystemExit(result)
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:
-        owner = staff.snapshot().by_doc("natedev", self.production_docs / "other-production.md")
+        owner = staff.snapshot().by_doc(remote.local_machine(), self.production_docs / "other-production.md")
         assert owner is not None
         _ = fixture_member("unit", name="Wrong", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", Path("/invented/loos")))
+                           worktree=staff.PresentWorktree(remote.local_machine(), Path("/invented/loos")))
         self.assert_report("unit", "weighted", "--by", "unit")
 
     def test_reports_read_only_store_after_every_source_is_removed(self) -> None:

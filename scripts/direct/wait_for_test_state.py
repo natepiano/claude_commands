@@ -1,6 +1,10 @@
 """Wait for disposable fixture state without a fixed polling delay."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -11,13 +15,14 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.direct.local_release_wait import IntervalReleasePolling, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
+from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST_HANG_GUARD_SECS,
-               *, processes: Sequence[subprocess.Popen[str] | subprocess.Popen[bytes]] = ()) -> None:
+               *, processes: Sequence[subprocess.Popen[str] | subprocess.Popen[bytes]] = (),
+               watch_writes: bool = False) -> None:
     deadline = time.monotonic() + timeout
     descriptors: list[int] = []
     poll_processes = False
@@ -34,7 +39,8 @@ def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST
                 if error.errno not in (errno.ENOSYS, errno.ENOTSUP):
                     raise
                 poll_processes = True
-        with local_release_waiter(directory, directory) as events:
+        mask = RELEASE_CHANGES | inotify.IN_MODIFY if watch_writes else RELEASE_CHANGES
+        with local_release_waiter(directory, directory, mask) as events:
             while True:
                 # Subscribe before checking: an already completed write is visible,
                 # and any write racing the check is queued for the next iteration.

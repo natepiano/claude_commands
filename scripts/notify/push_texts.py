@@ -5,23 +5,16 @@ import hashlib
 import importlib
 import json
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib.conf import UseConfiguredValue
-    from ..message import session_send
-    from ..message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
-else:
-    from scripts.lib.conf import UseConfiguredValue
-    from scripts.message import session_send
-    from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+from scripts.lib.conf import UseConfiguredValue
+from scripts.message import session_send
+from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
@@ -98,7 +91,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")

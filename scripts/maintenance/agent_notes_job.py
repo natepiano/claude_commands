@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run independent, bounded maintenance parts; never collect recovery snapshots."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import re
@@ -16,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 from scripts.lib import process_group
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
 from scripts.maintenance.settings import Part, Schedule, settings
@@ -43,7 +46,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
     remaining = min(cadence.timeout_seconds, deadline - started)
     if remaining <= 0:
         return PartResult(part, Outcome.TIMED_OUT, 0, 124)
-    command = [sys.executable, str(Path(__file__).resolve()), "--part", part.value]
+    command = [str(ROOT / "scripts/lib/py"), str(Path(__file__).resolve()), "--part", part.value]
     try:
         with subprocess.Popen(command, cwd=ROOT, start_new_session=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True) as child:
@@ -102,24 +105,19 @@ def perform(part: Part) -> int:
 
 
 def _perform(part: Part) -> int:
-    # Match the sibling imports the existing command-line tools use.
-    sys.path[:0] = [str(ROOT / "scripts/whoami"), str(ROOT / "scripts/production")]
     if part in (Part.NOTES, Part.QUOTA, Part.PACER):
         if TYPE_CHECKING:
             from scripts.whoami import agent_notes, codex_pacer
         else:
-            import agent_notes
-            import codex_pacer
+            from scripts.whoami import agent_notes
+            from scripts.whoami import codex_pacer
         from scripts.whoami import note_file
         if part is Part.NOTES:
             for line in agent_notes.update(include_warnings=False):
                 print(line)
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
-            if TYPE_CHECKING:
-                from scripts.whoami import quota_alert
-            else:
-                import quota_alert
+            from scripts.whoami import quota_alert
             from scripts.whoami import agent_accounts, usage_store
             # Quota uses the notes' saved usage, never a second live account probe.
             workers = agent_accounts.observe_workers_home()
@@ -136,10 +134,7 @@ def _perform(part: Part) -> int:
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
     elif part is Part.REFUSALS:
-        if TYPE_CHECKING:
-            from scripts.whoami import agent_notes
-        else:
-            import agent_notes
+        from scripts.whoami import agent_notes
         from scripts.accounts import accounts, refusal_watch
         from scripts.whoami import agent_accounts, note_file
         def refresh_refusal_usage() -> None:

@@ -14,7 +14,6 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import snapshot_codec as codec, step_estimator
@@ -108,14 +107,15 @@ class AdmissionClientWaitTests(unittest.TestCase):
     def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
         command = ('set -e; source "$1"; buildlog_memory_python() { '
             + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
-            + 'shift; python3 "$TEST_WAIT_CLIENT" --wait-client "$@"; else python3 "$@"; fi; }; '
+            + 'shift; "$TEST_PY" "$TEST_WAIT_CLIENT" --wait-client "$@"; else "$TEST_PY" "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
             + 'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '
             + 'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"')
         return subprocess.run(["bash", "-c", command, "test",
             str(Path(__file__).parents[1] / "lint/memory_gate.sh"), *([] if launch else ["/bin/true"])],
             env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
-                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve())},
+                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve()),
+                 "TEST_PY": str(Path(__file__).resolve().parents[1] / "lib/py")},
             cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
 
     def calls(self) -> list[CheckerCall]:

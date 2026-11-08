@@ -7,11 +7,11 @@ import runpy
 import shutil
 from collections.abc import Sequence
 from types import ModuleType
-import dailies_input
-import fake_unit_host
-import fake_herdr
-import dailies_render
-from cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
+from scripts.production import dailies_input
+from scripts.production import fake_unit_host
+from scripts.herdr import fake_herdr
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
 import os
 import subprocess
 import sys
@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import ClassVar, IO, cast, override
 from unittest import mock
 
-from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
+from scripts.production.dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
-from unit_lookup import UnitState
+from scripts.production.unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
@@ -33,6 +33,7 @@ from scripts.production.staff_test_support import (
 
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
+SHIM = SCRIPT.parents[1] / "lib/py"
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
 WAITING = SCRIPT.with_name("waiting.py")
@@ -80,7 +81,7 @@ import sys
 if sys.argv[1:2] != ["watch"]:
     raise SystemExit(99)
 request = subprocess.run([
-    sys.executable,
+    "__SHIM__",
     os.environ["DAILIES_RACE_WAITING"],
     "eta-request",
     os.environ["DAILIES_RACE_UNIT"],
@@ -276,8 +277,9 @@ class DailiesInputFixture(unittest.TestCase):
                 self.assertIsNotNone(env, "herdr must supply its sanitized child environment")
                 return invoke_cli(fake_herdr, lambda: fake_herdr.main(list(argv[1:])),
                                   list(argv[1:]), environment, directory)
-            script = Path(argv[1] if argv[0] == sys.executable and len(argv) > 1 else argv[0])
-            arguments = list(argv[2:] if argv[0] == sys.executable else argv[1:])
+            python = argv[0] in (sys.executable, str(SHIM))
+            script = Path(argv[1] if python else argv[0])
+            arguments = list(argv[2:] if python else argv[1:])
             if script == RENDERER:
                 return invoke_cli(dailies_render, lambda: dailies_render.main(arguments),
                                   arguments, environment, directory, production_state=True)
@@ -295,8 +297,7 @@ class DailiesInputFixture(unittest.TestCase):
                 module.__file__ = str(script)
 
                 def main() -> int:
-                    with mock.patch.object(sys, "path", [str(script.parent), *sys.path]):
-                        _ = runpy.run_path(str(script), run_name="__main__")
+                    _ = runpy.run_path(str(script), run_name="__main__")
                     return 0
 
                 return invoke_cli(module, main, arguments, environment, directory)
@@ -376,7 +377,7 @@ class DailiesInputFixture(unittest.TestCase):
              "--holders", str(self.holders), "--notifier", str(self.notifier),
              "--at", AT, *state_args, *extra]
         if subprocess_cli:
-            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+            return subprocess.run([str(SHIM), str(SCRIPT), *arguments], cwd=self.checkout,
                                   env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         return invoke_cli(dailies_input, dailies_input.main, arguments, self.env, self.checkout, production_state=True)
 
@@ -476,12 +477,12 @@ class DailiesInputFixture(unittest.TestCase):
                 if events.exists() else [])
 
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", "example",
+        return subprocess.run([str(SHIM), str(CI_POINTS), "watch", "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
+        return subprocess.run([str(SHIM), str(WAITING), "eta-request", ALPHA,
                                "--phase", phase, "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -569,7 +570,7 @@ class DailiesInputFixture(unittest.TestCase):
 
     def style_ledger_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         ledger = SCRIPT.parent.parent / "style/style_ledger.py"
-        result = subprocess.run([sys.executable, str(ledger), *arguments, "--repo", str(self.checkout)],
+        result = subprocess.run([str(SHIM), str(ledger), *arguments, "--repo", str(self.checkout)],
                                 env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result

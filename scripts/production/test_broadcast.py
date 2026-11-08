@@ -8,7 +8,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import io
 import json
 import os
-import sys
 import shlex
 import tempfile
 import unittest
@@ -19,10 +18,10 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import broadcast
-import codex_daemon
-import process_table
-import roster
+from scripts.production import broadcast
+from scripts.message import codex_daemon
+from scripts.message import process_table
+from scripts.message import roster
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -83,7 +82,7 @@ class BroadcastTests(unittest.TestCase):
         (self.root / "peer-log").mkdir()
         peer_driver = binaries / "ssh"
         _ = peer_driver.write_text(
-            f"#!{sys.executable}\n"
+            f"#!{Path(__file__).resolve().parents[1] / 'lib/py'}\n"
             + "import json, os, shlex, sys\n"
             + "from pathlib import Path\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -95,9 +94,7 @@ class BroadcastTests(unittest.TestCase):
             + "    if item.startswith(('BROADCAST_SEND=', 'BROADCAST_CLOSING_MACHINES=')): key, value = item.split('=', 1); os.environ[key] = value\n"
             + "os.environ.pop('CODEX_THREAD_ID', None); os.environ.pop('CLAUDE_CODE_SESSION_ID', None)\n"
             + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-            + "import broadcast, roster\n"
+            + "from scripts.production import broadcast\nfrom scripts.message import roster\n"
             + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
             + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"

@@ -18,31 +18,27 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import quota_alert
-from push_texts import RenderedPush
+from scripts.whoami import quota_alert
+from scripts.notify.push_texts import RenderedPush
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import session_table
 from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-import send
-# send puts scripts/notify on the path.
-from user_action import ActionRequired, UserAction, parse_user_action
+from scripts.message import send
+from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
@@ -198,7 +194,7 @@ always=natedev
                     options = send.parse(command[2:])
                 except SystemExit:
                     self.fail(f"send.py refused {command[2:]}: {refusal.getvalue().strip().splitlines()[-1]}")
-            from push_texts import render
+            from scripts.notify.push_texts import render
             values = dict(value.split("=", 1) for value in command[command.index("--text-id") + 2:] if "=" in value)
             push = render(command[command.index("--text-id") + 1], **values)
             options = options._replace(summary=push.title, action=push.action)
@@ -469,7 +465,7 @@ always=director
             self.assertIn("codex1", push.body)
             for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
                 self.assertNotIn(forbidden, push.body)
-            from push_texts import render
+            from scripts.notify.push_texts import render
             self.assertEqual(push, render("quota.paid_credits_queued", **push.values))
             self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill"})
             self.assertIn("workers stop and wait for your queued move", push.body)

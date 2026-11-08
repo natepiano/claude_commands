@@ -45,7 +45,7 @@ printf 'free_gib=%s\\nhost=test-mac\\nrc=0\\n' "$(cat '{available}')"
             record = step_record.read(paths[0].stem)
         if not isinstance(record, step_record.StepRecord):
             self.fail(f"Expected a live step record, got {record!r}")
-        self.assertEqual(record.runs_on, step_record.NatedevOnly("disk"))
+        self.assertEqual(record.runs_on, step_record.AnyTarget(("mac", "natedev"), ("mac",)))
         self.assertEqual(len(list((self.root / "mac-idle/calls").glob("*.json"))), 1)
         self.assertEqual(len(self.runner_events()), 1)
         _ = available.write_text("1000\n")

@@ -1,6 +1,8 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 import json
@@ -18,23 +20,20 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import broadcast
-import codex_winddown
-import fake_unit_host
-import fake_showrunner
+from scripts.production import broadcast
+from scripts.production import codex_winddown
+from scripts.production import fake_unit_host
+from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.herdr import worker_panes
-import herdr
-import roster
-import process_table
-from process_table import Process
-from sessions import SessionRecord
+from scripts.herdr import herdr, worker_panes
+from scripts.message import process_table, roster
+from scripts.message.process_table import Process
+from scripts.message.sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -116,7 +115,7 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return [sys.executable, str(self.state / "fake-send.py")]
 
-        with (mock.patch("push_texts.user_send_argv", side_effect=prepare),
+        with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
             codex_winddown.announce_quiet(0)
         self.assertFalse((self.state / codex_winddown.QUIET).exists())
@@ -240,7 +239,7 @@ class NoticeRetryTests(unittest.TestCase):
                 self.assertEqual(codex_winddown.read_projections(), {
                     "unit": codex_winddown.ZeroNoticeOwed(codex_winddown.ProjectionAnswerOwed()),
                 })
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", answer), 0)
                 self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ZeroNoticeOwed(expected)})
                 with mock.patch.object(broadcast, "send", return_value="") as send:
@@ -303,7 +302,7 @@ class NoticeRetryTests(unittest.TestCase):
                         showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
                     mock.call("unit", "runner", zero_notice),
                 ])
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return observed
 
@@ -321,7 +320,7 @@ class NoticeRetryTests(unittest.TestCase):
 
     def test_an_eta_recorded_during_ask_is_not_replaced_with_answer_owed(self) -> None:
         def answer_during_send(_unit: str, _sender: str, _message: str) -> str:
-            with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+            with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                 self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return ""
 
@@ -464,7 +463,7 @@ class CountTests(unittest.TestCase):
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
-                 30: Process(30, 20, "bash", "bash implement.sh"), 40: Process(40, 30, "python3", f"{MESH} start"),
+                 30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "python3", f"{MESH} start"),
                  50: Process(50, 1, "codex", "codex exec")}
         counts = codex_winddown.agent_counts(table, {10: "showrunner", 20: "trunk"})
         self.assertEqual(counts, {"trunk": 1, codex_winddown.NO_SESSION: 1})
@@ -587,7 +586,7 @@ class MessageTests(unittest.TestCase):
         )
         runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
         _ = unit_membership("show", "trunk")
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
             labeled_host("trunk", "w1:p1", "trunk", production_name="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
@@ -597,7 +596,7 @@ class MessageTests(unittest.TestCase):
         _ = (self.root / "ps").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, capture_output=True,
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.environment, capture_output=True,
                               text=True, check=False)
 
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
@@ -694,7 +693,7 @@ class MessageTests(unittest.TestCase):
 
 class PaneCountTests(StaffTestCase):
     def test_five_states_count_only_working_codex_and_name_uncertainty(self) -> None:
-        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id, backend=staff.CodexBackend(self.root / "codex"))
         cases: tuple[tuple[worker_panes.WorkerPane, int, str], ...] = (
             (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.WORKING), 1, ""),
@@ -719,7 +718,7 @@ class PaneCountTests(StaffTestCase):
                 self.assertIn(reason, error.getvalue())
 
     def test_mesh_counts_keep_process_ownership_without_a_pane_read(self) -> None:
-        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id)
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "codex", "codex exec task")}
         with mock.patch.object(unit_runs, "parent_transport", return_value="mesh"), mock.patch.object(

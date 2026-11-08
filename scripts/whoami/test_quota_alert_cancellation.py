@@ -12,7 +12,7 @@ from unittest import mock
 from scripts.lib.process_group import send_process_group
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 INJECTED_EDIT_TIMEOUT_SECS = 300

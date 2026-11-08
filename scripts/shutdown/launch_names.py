@@ -4,15 +4,12 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from functools import cached_property
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
-import pane_record  # noqa: E402
-import pane_launch  # noqa: E402
-from pane_launch import PaneLaunch  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
+from scripts.herdr import pane_launch  # noqa: E402
+from scripts.herdr.pane_launch import PaneLaunch  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.production import session_staff, staff

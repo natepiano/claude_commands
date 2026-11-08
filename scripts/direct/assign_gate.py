@@ -8,21 +8,18 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN_LAUNCHERS = frozenset({"assign.sh", "assign.py"})
-WORKER_LAUNCHERS = ASSIGN_LAUNCHERS | {"implement.sh", "review.sh"}
+WORKER_LAUNCHERS = ASSIGN_LAUNCHERS | {"review.sh"}
 ASSIGN = ROOT / 'scripts/direct/assign.py'
 LAUNCHERS = {
-    ROOT / 'scripts/direct/implement.sh',
     ROOT / 'scripts/direct/review.sh',
-    ROOT / 'scripts/agents/agent_bg.sh',
     ROOT / 'scripts/agents/agent_exec.sh',
 }
-PYTHON_HOPS = {ROOT / 'scripts/production/worker_fill.py'}
 REFUSAL = 'Start workers through assign.sh from the director session.'
 
 
 def assign_role(role: str) -> str:
     """Return the role name accepted by assign.sh."""
-    return "implement" if role == "impl" else role
+    return {"impl": "implement", "astra-designer": "implement", "astra-reviewer": "review"}.get(role, role)
 
 
 def assign_command(run_dir: str, worker: str, role: str, options: list[tuple[str, str]]) -> str:
@@ -49,8 +46,7 @@ def called_by_assign() -> bool:
             if script == ASSIGN and Path(words[0]).name.startswith('python'):
                 return True
             shell_hop = script in LAUNCHERS and Path(words[0]).name in ('bash', 'zsh', 'sh')
-            python_hop = script in PYTHON_HOPS and Path(words[0]).name.startswith('python')
-            if not shell_hop and not python_hop:
+            if not shell_hop:
                 return False
             pid = int(parent)
         except (OSError, ValueError, subprocess.CalledProcessError):

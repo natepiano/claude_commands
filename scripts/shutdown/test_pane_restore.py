@@ -28,14 +28,13 @@ from scripts.lib import unit_runs
 from scripts.shutdown import pane_record as restart_records
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
-import unit_move
+from scripts.production import unit_move
 
-import pane_restore  # first: it puts the herdr scripts on the path
-import herdr  # noqa: E402
-import pane_record  # noqa: E402
-import pane_launch
-import sessions  # noqa: E402
-from test_support import conversation_liveness
+from scripts.shutdown import pane_restore
+from scripts.herdr import herdr  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
+from scripts.herdr import pane_launch
+from scripts.message import sessions  # noqa: E402
 
 END_HOOK = Path(__file__).resolve().parent.parent / "hooks/session-end-pane-record.py"
 SETTINGS = '{"disableAgentView": true}'
@@ -154,8 +153,9 @@ class FakeClient(herdr.Herdr):
         _ = pane, command, terminal
 
     @override
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
-        del kind, timeout
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
+        del kind, timeout, pane_row
         if self.start_error is not None:
             raise self.start_error
         if pane not in self.native_ids:
@@ -214,7 +214,7 @@ class PaneRestoreTests(unittest.TestCase):
             write_text_atomic(configuration / source.name, source.read_text())
 
         _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((self.row,))))
-        _ = self.enterContext(mock.patch("remote.local_machine", return_value="natedev"))
+        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("demo", "alpha")))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
@@ -238,7 +238,6 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.dict(os.environ, {"HOME": str(self.root),
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
-                        mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
                         mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
@@ -399,20 +398,27 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(client.closed, ["w1:p2"], output)
 
     def test_restore_reuses_worker_shell(self) -> None:
+        from scripts.direct import progress_history
         from scripts.herdr import test_worker_panes, worker_panes
+        from scripts.production import worker
 
         fixture = test_worker_panes.WorkerPaneTests("runTest")
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", side_effect=staff.snapshot))
         row = fixture.worker(family="codex")
         fixture.world.add(row, "w1:p1", live=False, family="codex")
-        fixture.dispatch(row, "impl", completed=True)
-        write_text_atomic(fixture.root / "run/worker_transport", "herdr\n")
+        run = fixture.run_state()
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        _ = progress_history.begin_dispatch(run, slot=row.name, phase="earlier", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["bash", "assign.sh", "impl", str(prompt)],
+            prompt=prompt, kind="impl", lens="")
         pane_record.write("agents", pane_record.launch("w1:p1", str(row.current_session), str(fixture.root),
             {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)]))
         before = fixture.world.panes()
-        with (mock.patch.object(staff, "initial_snapshot", side_effect=staff.snapshot),
-              mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+              mock.patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
@@ -445,6 +451,11 @@ class PaneRestoreTests(unittest.TestCase):
 
 @final
 class RestoreStaffNamesTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "run_in_pane"))
+
     def saved_batch(self, *, machine: Literal["natedev", "mac"] = "natedev") -> tuple[Path, FakeClient]:
         parent, unit, worker = self.tree()
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
@@ -469,11 +480,10 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc))
         _ = self.enterContext(mock.patch.object(restart_records, "RECORD_DIR", self.root / "saved-panes"))
         _ = self.enterContext(mock.patch.object(accounts, "accounts_home", return_value=self.root))
-        _ = self.enterContext(mock.patch("remote.local_machine", return_value=machine))
+        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value=machine))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
-        _ = self.enterContext(mock.patch.object(FakeClient, "run_in_pane"))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
         unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))

@@ -1,6 +1,10 @@
 """Stop a session, or resume it on its account in its herdr tab."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import math
 import os
@@ -27,20 +31,17 @@ from typing import TYPE_CHECKING, Literal, Never, Protocol, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
 
-import herdr
+from scripts.herdr import herdr
 from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS,
     ResumeWorkers as ResumeWorkers,
@@ -56,7 +57,7 @@ from scripts.shutdown.stop_results import (
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
-import sessions
+from scripts.message import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
@@ -409,11 +410,15 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
+    kind = pane_launch.agent_kind(entry)
+    program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
+    if kind == "codex":
+        environment["CODEX_HOME"] = entry["config_dir"]
+        program = ["codex"]
     return ["env", *(argument for key in unset for argument in ("-u", key)),
             *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
-            sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
+            *program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
@@ -421,7 +426,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     """Replace the foreground command with the saved account launch."""
     command = _pane_command(tab, entry, account)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, *([message] if message else [])])
+    os.execvp(command[0], [*command, *([message] if message and pane_launch.agent_kind(entry) == "claude" else [])])
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
@@ -531,7 +536,7 @@ def _member_machine(member: StaffRow) -> str:
 
 def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
     """Select close names from local units and showrunners."""
-    import remote
+    from scripts.shutdown import remote
 
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
@@ -614,7 +619,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     if len(matches) > 1:
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
-        import remote
+        from scripts.shutdown import remote
 
         member = matches[0]
         machine = _member_machine(member)
@@ -699,9 +704,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["environment"] = names.environment(entry)
         from scripts.whoami.account import named_account_environment
 
-        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
+        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
@@ -882,9 +887,9 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
     from datetime import datetime, timezone
-    import quota_alert
-    from probe_session import PROBE_ENV
-    import remote
+    from scripts.whoami import quota_alert
+    from scripts.lib.probe_session import PROBE_ENV
+    from scripts.shutdown import remote
 
     try:
         record = staff.snapshot()

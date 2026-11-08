@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Write a production's board snapshot from its durable records."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -18,12 +22,8 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-import display_cells
+from scripts.production import display_cells
 
 from scripts.agents import worker_lifecycle
 from scripts.direct import phase_table, plan_history

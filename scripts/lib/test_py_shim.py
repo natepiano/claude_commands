@@ -90,7 +90,8 @@ class PythonShimTests(unittest.TestCase):
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [str(script.parent), self.environment["PYTHONPATH"]])
+        self.assertEqual(result.stdout.splitlines(),
+                         [str(script.parent), f"{ROOT}{os.pathsep}{self.environment['PYTHONPATH']}"])
 
 
 if __name__ == "__main__":

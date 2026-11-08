@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import index
-import mac_outcome as outcome
-from test_index import call, encode, point_root_at
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome as outcome
+from scripts.buildlog.test_index import call, encode, point_root_at
 
 
 class MacOutcomeTests(unittest.TestCase):

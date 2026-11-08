@@ -5,6 +5,10 @@ A running Codex agent is one live `codex_mesh.py start|follow` turn or one plain
 `codex exec`. It belongs to the nearest ancestor that is a named Claude session.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -27,13 +31,13 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import broadcast
-import process_table
+from scripts.production import broadcast
+from scripts.message import process_table
 from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget
 from scripts.lib.process_failure import failure_detail
-from live_units import live_unit_names
-from sessions import SessionRecord, live_sessions
+from scripts.production.live_units import live_unit_names
+from scripts.message.sessions import SessionRecord, live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
@@ -410,8 +414,8 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                 return
         machine = socket.gethostname()
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-        from push_texts import render, user_send_argv
-        import review
+        from scripts.notify.push_texts import render, user_send_argv
+        from scripts.notify import review
 
         push = render("codex.reset_ready", machine=machine)
         command = user_send_argv(push)

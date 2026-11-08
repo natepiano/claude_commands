@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build and inspect Claude and Codex account directories; select Claude roles."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import asyncio
@@ -34,8 +38,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPOSITORY_ROOT / "scripts"
 # Direct CLI and imported callers share the picker's domain variants.
 _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
-sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
@@ -55,7 +57,6 @@ from scripts.accounts.refusals import (  # noqa: E402
 
 from scripts.accounts import next_moves
 from scripts.shutdown import remote, stop_results
-sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
@@ -1568,7 +1569,7 @@ def renew_login(label: str, *, account_config: conf.ConfigRead | ReadCurrentAcco
     directory = claude_account_dir(label)
     timeout_seconds = account_config.whole("login_probe_timeout_seconds")
     try:
-        probe = subprocess.run([sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
+        probe = subprocess.run([str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "accounts" / "accounts.py"),
             "exec", "--probe", label, "-p", "hello"], cwd=account_config.text("login_probe_directory"), stdin=subprocess.DEVNULL,
             timeout=timeout_seconds, capture_output=True)
     except subprocess.TimeoutExpired:
@@ -1627,7 +1628,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
     try:
         program = resolve_program("claude", environment=environment)
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
-            os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
+            os.execvpe(str(SCRIPTS / "lib" / "py"), [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
                                       "run", "--", program, *arguments], models_registry.agent_environment(environment))
         else:
             os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
@@ -2701,7 +2702,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
 
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
@@ -2790,10 +2791,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
     """Resume pane workers on the destination; keep mesh-pinned workers on their existing path."""
     from scripts.production import staff, session_staff
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
-    if TYPE_CHECKING:
-        from scripts.herdr import herdr
-    else:
-        import herdr
+    from scripts.herdr import herdr
 
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
@@ -2927,7 +2925,6 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     """Select the group after target checks, then stop and resume each owner."""
     account_config = read_account_settings(account_config)
     del alerts
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
     target = note_file.canonical_label(target)
     now = datetime.now(timezone.utc)
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
@@ -2942,7 +2939,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
         if TYPE_CHECKING:
             from scripts.shutdown import inventory
         else:
-            inventory = import_module("inventory")
+            inventory = import_module("scripts.shutdown.inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
             f"{runner.name}: no session runs under the id its update timer names; "
@@ -2981,11 +2978,10 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
     try:
         now = datetime.now(timezone.utc)
         checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
@@ -4760,7 +4756,6 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
 
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local registries without account checks or host discovery."""
-    sys.path.insert(0, str(SCRIPTS / "herdr"))
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
@@ -4953,7 +4948,7 @@ def _start_session_counts_fetch() -> bool:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return True
-            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+            _ = subprocess.Popen([str(SCRIPTS / "lib" / "py"), str(Path(__file__).resolve()),
                 "session-counts-fetch", "--counts-lock", str(lock.fileno())],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, pass_fds=(lock.fileno(),))

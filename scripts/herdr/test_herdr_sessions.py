@@ -15,16 +15,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import patch
 
-import herdr
-import herdr_sessions
-import sessions
-from fake_herdr import CommandResponse
-from sessions import SessionRecord, UnreadableSessionRecord, read_session
+from scripts.herdr import herdr
+from scripts.herdr import herdr_sessions
+from scripts.message import sessions
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -578,6 +577,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         }, clear=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())

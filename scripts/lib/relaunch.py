@@ -2,6 +2,10 @@
 """Keep a terminal available while its Claude child stops and resumes."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -17,11 +21,11 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
-from scripts.production import session_staff
+from scripts.production import session_staff, staff, worker
 from scripts.shutdown import pane_record
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment
-from scripts.lib.resume_message import resume_message
+from scripts.lib.resume_message import NO_WORKERS, resume_message
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
@@ -45,7 +49,15 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     restored = {**environment, **entry["environment"]}
     restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
-        argv = [*argv, resume_message("you were stopped and resumed")]
+        workers = NO_WORKERS
+        try:
+            record = staff.snapshot()
+            row = record.by_current_session(identity)
+            if row is not None:
+                workers = worker.resume_workers(row.id, record)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers)]
     return argv, restored
 
 

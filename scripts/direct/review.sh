@@ -38,7 +38,7 @@
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
-#   <session_dir>/heartbeat.log        — shared with implement.sh: role header at
+#   <session_dir>/heartbeat.log        — shared with assign.py: role header at
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log.

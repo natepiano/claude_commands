@@ -106,7 +106,7 @@ run_dry() {
 }
 
 # Keep command discovery independent of the machine's installed Claude binary.
-claude_command="$HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
+claude_command="$SCRIPT_DIR/../lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
@@ -129,7 +129,7 @@ assert_equal "claude readonly command is wrong" \
     "$claude_readonly"
 
 simplify_readonly="$(run_dry direct.simplify readonly)"
-python3 - "$simplify_readonly" <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_readonly" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -145,7 +145,7 @@ assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
 simplify_session="$(AGENT_EXEC_EXTRA_ARGS='--session-id abcdef12-0000-4000-8000-000000000001' run_dry direct.simplify readonly)"
-python3 - "$simplify_session" <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_session" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -299,29 +299,27 @@ _ = (root / "staff-environment").write_text("".join(
 PYTHON
 source "$TEST_DIR/staff-environment"
 cat > "$TEST_DIR/send.py" <<'PYTHON'
-import os, sys
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+import os
 from scripts.production import staff
 assert staff.by_id(staff.StaffId(os.environ["FAKE_CLAUDE_SESSION_ID"])) is not None
 print("SENT: fixture")
 PYTHON
-export AGENT_BG_SEND_SCRIPT="$TEST_DIR/send.py"
+export CLAUDE_WORKER_SEND_SCRIPT="$TEST_DIR/send.py"
 run_background_fixture() {
-    "$SCRIPT_DIR/../lib/py" - "$TEST_DIR/assign-parent" "$SCRIPT_DIR/../.." "$@" <<'PYTHON'
-import os, subprocess, sys
+    "$SCRIPT_DIR/../lib/py" - "$@" <<'PYTHON'
+import os, sys
 from pathlib import Path
-root = Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(root))
-from scripts.direct.assign_launcher_test_support import backend_fixture_command
-command, environment = backend_fixture_command(
-    Path(sys.argv[1]), ["bash", str(root / "scripts/agents/agent_bg.sh"), *sys.argv[3:]], dict(os.environ))
-raise SystemExit(subprocess.call(command, env=environment))
+from scripts.direct import claude_worker
+name, run, cwd, prompt, summary, log, workers = sys.argv[1:]
+turn = claude_worker.ClaudeTurn(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log),
+    "", "", "", "", workers == "1", dict(os.environ))
+result = claude_worker.open_worker(turn)
+raise SystemExit(result.code if isinstance(result, claude_worker.NotDelivered) else 0)
 PYTHON
 }
 cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
-printf '%s\n' "${AGENT_BG_WORKERS+set}" > "$TEST_CLAUDE_WORKERS_FLAG_FILE"
 "$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
 from scripts.production.staff_test_support import record_fixture_claude_start
@@ -330,19 +328,16 @@ PYTHON
 printf '%s\n' 'backgrounded · abcdef12 · fixture-worker'
 EOF
 chmod +x "$TEST_DIR/bin/claude-bg"
-export TEST_CLAUDE_WORKERS_FLAG_FILE="$TEST_DIR/claude-workers-flag"
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000001
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_WORKERS=1 AGENT_BG_DETACH=1 run_background_fixture \
-    --run "$WORKING_DIR" fixture-worker "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE"
+CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
+    fixture-worker "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE" 1
 assert_equal "background worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-worker | cut -d " " -f2)"
-assert_equal "background worker passed its route opt-in to its children" "" "$(cat "$TEST_CLAUDE_WORKERS_FLAG_FILE")"
 
 # A caller's helper does not opt in to the workers route.
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
-unset AGENT_BG_WORKERS
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_DETACH=1 run_background_fixture \
-    --run "$WORKING_DIR" fixture-friend "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE"
+CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
+    fixture-friend "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE" 0
 assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-friend | cut -d " " -f2)"
 

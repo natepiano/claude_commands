@@ -1,5 +1,9 @@
 """The single admission loop owns reservations and durable queue state."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections import deque
@@ -7,7 +11,8 @@ from collections.abc import Generator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 import errno
-from dataclasses import dataclass, field, replace
+import json
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
@@ -17,10 +22,8 @@ import struct
 import subprocess
 import sys
 import threading
-from typing import TYPE_CHECKING, Callable, Protocol, cast
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from types import MappingProxyType
+from typing import Callable, Protocol, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
@@ -35,12 +38,12 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    import store
+from scripts.buildlog import store
+from scripts.lib import test_phase
 
-from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
+from scripts.build_queue.scope_activity import (
+    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, ScopeActivityReader, ScopeProcesses,
+)
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
@@ -344,6 +347,334 @@ class ServiceState:
 
 
 @dataclass(frozen=True)
+class SystemReadingPlan:
+    """The reader owns these records until it publishes the next reading."""
+    config: gate.MemoryConfig
+    reservations: tuple[ReservationRecord, ...]
+    runs: tuple[wire.RunPlace, ...]
+    waiting: bool
+
+
+@dataclass(frozen=True)
+class MissingSample:
+    """The sampler has not written this file."""
+
+
+@dataclass(frozen=True)
+class UnreadableSample:
+    """The sampler file could not be read."""
+
+
+@dataclass(frozen=True)
+class SampleFile:
+    text: str | MissingSample | UnreadableSample
+    modified_at: float | gate.PeakTimeUnknown
+
+
+def sample_file(path: Path) -> SampleFile:
+    try:
+        text: str | MissingSample | UnreadableSample = path.read_text()
+    except FileNotFoundError:
+        text = MissingSample()
+    except (OSError, UnicodeError):
+        text = UnreadableSample()
+    try:
+        modified: float | gate.PeakTimeUnknown = path.stat().st_mtime
+    except OSError:
+        modified = gate.PeakTimeUnknown()
+    return SampleFile(text, modified)
+
+
+@dataclass(frozen=True)
+class ReservationEvidence:
+    """Physical memory and sampler observations without a policy charge."""
+    memory: gate.StepMemory
+    peak: SampleFile
+    wave: SampleFile
+    phase: test_phase.ObservedTestPhase | test_phase.UnobservedTestPhase
+    scope: str
+
+
+def raw_reservation_memory(record: ReservationRecord, row: gate.Reservation,
+                           lifetime: gate.StepLifetime, processes: dict[int, gate.ProcessIdentity],
+                           proc: Path) -> gate.StepMemory:
+    _ = record
+    if isinstance(lifetime, gate.EndedStep):
+        return gate.GoneMemory()
+    if isinstance(lifetime, gate.PopulatedStepScope):
+        try:
+            return gate.process_memory(lifetime, proc)
+        except FileNotFoundError:
+            identity = processes.get(row["pid"])
+            if identity is None or identity.start != row["start_time"]:
+                return gate.GoneMemory()
+    return gate.tree_memory(row["pid"], row["start_time"], processes, proc)
+
+
+def reservation_charge(evidence: ReservationEvidence, row: gate.Reservation,
+                       now: float, policy: gate.AdmissionPolicy) -> gate.StepMemory:
+    """Apply the current reservation and policy to unchanged physical evidence."""
+    memory = gate.step_promise(row, evidence.memory)
+    phase = gate.test_phase_history(row, memory, evidence.phase)
+    if isinstance(memory, gate.MeasuredMemory) and isinstance(phase, gate.TestPhaseStarted):
+        return replace(memory, peak_history=phase)
+    try:
+        if isinstance(evidence.peak.text, UnreadableSample):
+            raise ValueError("unreadable peak")
+        peak = 0 if isinstance(evidence.peak.text, MissingSample) else int(evidence.peak.text)
+        if peak < 0:
+            raise ValueError("negative peak")
+    except ValueError:
+        return (replace(memory, unknown_peak_promise=row["need"], peak_history=gate.PeakFileUnreadable(row["need"]))
+                if isinstance(memory, gate.MeasuredMemory) else memory)
+    last_near_peak = now
+    peak_at = evidence.peak.modified_at if peak > 0 else gate.PeakTimeUnknown()
+    peak_time: float | gate.PeakTimeUnknown = gate.PeakTimeUnknown()
+    old_sampler = False
+    if isinstance(evidence.wave.text, MissingSample) and peak > 0:
+        old_sampler = True
+        if isinstance(peak_at, float):
+            last_near_peak = peak_at
+            peak_time = peak_at
+    elif isinstance(evidence.wave.text, str):
+        try:
+            sampled, recorded = map(int, evidence.wave.text.split())
+            if sampled == peak and recorded >= 0:
+                last_near_peak = recorded
+                peak_time = recorded
+        except ValueError:
+            pass
+    history: gate.PeakHistory = (gate.PeakSoFar(peak, peak_at, peak_time, old_sampler)
+                                if peak > 0 else gate.NoPeakRecorded())
+    hold = policy.peak_hold.seconds_for(row.get("step", ""))
+    if not gate.release_build(row) and now - last_near_peak >= hold:
+        history = gate.PeakDecayed(0, peak, last_near_peak, last_near_peak + hold, old_sampler)
+        peak = 0
+    if isinstance(memory, gate.MeasuredMemory):
+        return replace(memory, observed_peak=peak, peak_history=history)
+    if isinstance(memory, gate.PromisedMemory):
+        return gate.PromisedMemory(max(memory.bytes, peak))
+    return memory
+
+
+@dataclass(frozen=True)
+class SystemEvidence:
+    read_at: float
+    started_monotonic: float
+    processes: Mapping[int, gate.ProcessIdentity]
+    accounts: Mapping[int, int | OwnerProcessGone]
+    lifetimes: Mapping[str, gate.StepLifetime]
+    reservations: Mapping[str, ReservationEvidence]
+    runs: Mapping[int, LiveBuildRun | NoLiveBuildRun]
+    unowned: tuple[gate.UnownedSliceMemory, ...]
+    scope_members: Mapping[str, frozenset[int]]
+    scope_process_memory: Mapping[int, gate.MeasuredMemory]
+    scope_workers: Mapping[str, frozenset[int]]
+    between: tuple[gate.RunningStep, ...]
+    host: gate.HostMemory | gate.ReadingUnavailable
+    pressure: gate.Pressure
+    compilers: tuple[gate.StepMemory, ...]
+
+
+def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
+                reservation_reader: Callable[[ReservationRecord, gate.Reservation, gate.StepLifetime,
+                    dict[int, gate.ProcessIdentity], Path], gate.StepMemory] = raw_reservation_memory) -> SystemEvidence:
+    """Read operating-system evidence without access to mutable service state."""
+    started_monotonic = clock.monotonic()
+    now = clock.now()
+    processes = proc.processes()
+    activity = ScopeActivityReader(processes, proc.path,
+        tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since) for place in plan.runs))
+    lifetimes: dict[str, gate.StepLifetime] = {}
+    reservations: dict[str, ReservationEvidence] = {}
+    for record in plan.reservations:
+        row = reservation_row(record)
+        live = proc.owner_start(record.owner.pid) == LiveOwnerIdentity(record.owner.start_time)
+        lifetime = proc.lifetime(row, live)
+        lifetimes[record.episode] = lifetime
+        memory = reservation_reader(record, row, lifetime, processes, proc.path)
+        if isinstance(memory, gate.MeasuredMemory):
+            memory = replace(memory, promise=gate.NoPromise(), observed_peak=0,
+                             unknown_peak_promise=0, peak_history=gate.NoPeakRecorded())
+        scope = ""
+        if record.sidecar:
+            try:
+                scope = Path(record.sidecar).read_text().strip()
+            except OSError:
+                pass
+        reservations[record.episode] = ReservationEvidence(memory,
+            sample_file(Path(record.path).with_suffix(".max")),
+            sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
+    # Capture every scope before the loop applies current reservation ownership.
+    unowned = gate.unowned_slice_memory([], processes, proc.path,
+        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+    members: dict[str, frozenset[int]] = {}
+    workers: dict[str, frozenset[int]] = {}
+    for reading in unowned:
+        if not reading.cgroup:
+            continue
+        try:
+            members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
+        except (OSError, ValueError):
+            members[reading.cgroup] = frozenset()
+        if not isinstance(reading.job_state, NotServiceSlice):
+            programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
+            workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
+    scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
+                            for pid in {member for group in members.values() for member in group}}
+    between: list[gate.RunningStep] = []
+    represented = {(row.activity.run.pid, row.activity.run.start_time) for row in unowned
+                   if isinstance(row.activity, ScopeProcesses) and isinstance(row.activity.run, LiveBuildRun)}
+    represented.update((record.run.pid, record.run.start_time) for record in plan.reservations
+                       if isinstance(record.run, wire.RunIdentity))
+    for place in plan.runs:
+        run = place.run
+        if (run.pid, run.start_time) in represented:
+            continue
+        identity = processes.get(run.pid)
+        if identity is None or identity.start != run.start_time:
+            continue
+        evidence = activity.scope({run.pid})
+        if not isinstance(evidence, ScopeProcesses):
+            continue
+        live_run = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
+        measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
+        if isinstance(measured, gate.GoneMemory):
+            continue
+        memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
+                                         pid=run.pid, activity=replace(evidence, run=live_run))
+        between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
+            evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=place.unit))
+    host = readings.host()
+    # Retain all pressure values so a pending policy can use the same reading.
+    pressure_policy = replace(plan.config.policy,
+        pressure=replace(plan.config.policy.pressure, full_avg10_limit=-1))
+    pressure = readings.pressure(host if isinstance(host, gate.HostMemory) else
+                                 gate.HostMemory(0, gate.UnknownHostTotal()), pressure_policy)
+    return SystemEvidence(now, started_monotonic, MappingProxyType(processes),
+        MappingProxyType({pid: process_uid(pid, proc.path) for pid in processes}),
+        MappingProxyType(lifetimes), MappingProxyType(reservations),
+        MappingProxyType({pid: activity.run(pid) for pid in processes}),
+        tuple(unowned), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
+        tuple(between), host, pressure, tuple(readings.compilers()))
+
+
+@dataclass(frozen=True)
+class NoReadingFailure:
+    """The reader has no exception for the loop."""
+
+
+class SystemReader(Protocol):
+    @property
+    def latest(self) -> SystemEvidence: ...
+    def update(self, plan: SystemReadingPlan) -> None: ...
+    def request_read(self) -> None: ...
+    def raise_failure(self) -> None: ...
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class NoSystemReader:
+    """Direct callers collect evidence before a pass; the serving loop uses a reader."""
+
+
+class OperatingSystemReader:
+    """One thread publishes complete readings at the existing pass cadence."""
+
+    def __init__(self, plan: SystemReadingPlan, initial: SystemEvidence,
+                 readings: Readings, proc: Proc, clock: Clock, wake: int) -> None:
+        self.plan: SystemReadingPlan = plan
+        self.reading: SystemEvidence = initial
+        self.readings: Readings = readings
+        self.proc: Proc = proc
+        self.clock: Clock = clock
+        self.wake: int = wake
+        self.lock: threading.Lock = threading.Lock()
+        self.stopped: threading.Event = threading.Event()
+        self.requested: threading.Event = threading.Event()
+        self.failure: Exception | NoReadingFailure = NoReadingFailure()
+        self.thread: threading.Thread = threading.Thread(target=self._read, name="admission-readings", daemon=True)
+        self.thread.start()
+
+    @property
+    def latest(self) -> SystemEvidence:
+        with self.lock:
+            return self.reading
+
+    def update(self, plan: SystemReadingPlan) -> None:
+        with self.lock:
+            faster = plan.waiting and not self.plan.waiting
+            self.plan = plan
+            if faster:
+                self.requested.set()
+
+    def request_read(self) -> None:
+        self.requested.set()
+
+    def raise_failure(self) -> None:
+        with self.lock:
+            failure, self.failure = self.failure, NoReadingFailure()
+        if isinstance(failure, Exception):
+            raise failure
+
+    def _read(self) -> None:
+        while not self.stopped.is_set():
+            with self.lock:
+                plan = self.plan
+            interval = plan.config.waiting_pass_seconds if plan.waiting else plan.config.running_pass_seconds
+            _ = self.requested.wait(interval)
+            self.requested.clear()
+            if self.stopped.is_set():
+                return
+            with self.lock:
+                plan = self.plan
+            try:
+                reading = read_system(plan, self.readings, self.proc, self.clock)
+            except Exception as error:
+                with self.lock:
+                    self.failure = error
+            else:
+                with self.lock:
+                    self.reading = reading
+            os.eventfd_write(self.wake, 1)
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.requested.set()
+        self.thread.join()
+
+
+@dataclass(frozen=True)
+class DurableRecordEncoding:
+    value: object
+    encoded: str
+    key: str
+
+
+def durable_copy(value: object) -> object:
+    """Retain a comparison value even when a nested record can change."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(value, **{member.name: durable_copy(cast(object, getattr(value, member.name)))
+                                  for member in fields(value) if member.init})
+    if isinstance(value, Mapping):
+        return {key: durable_copy(item) for key, item in cast(Mapping[str, object], value).items()}
+    if isinstance(value, tuple):
+        return tuple(durable_copy(item) for item in cast(tuple[object, ...], value))
+    if isinstance(value, list):
+        return [durable_copy(item) for item in cast(list[object], value)]
+    return value
+
+
+@dataclass
+class PublishedReplies:
+    view: wire.ViewReply
+    explain: wire.ExplainReply
+    view_bytes: bytes = b""
+    explain_bytes: bytes = b""
+    mine_bytes: bytes = b""
+
+
+@dataclass(frozen=True)
 class NoConnection:
     pass
 
@@ -404,6 +735,13 @@ class Connection:
     sending: bytes = b""
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
+
+
+@dataclass(frozen=True)
+class DeferredOwnerRequest:
+    request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest
+    connection: Connection
+    arrived_monotonic: float
 
 
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
@@ -583,6 +921,12 @@ class AdmissionServer:
         self.last_diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
         self._pending_replies: dict[str, list[wire.Reply]] = {}
         self._persisted: str = ""
+        self.durable_encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
+        self.published: PublishedReplies | NoPass = NoPass()
+        self.system_reader: SystemReader | NoSystemReader = NoSystemReader()
+        self.system_evidence: SystemEvidence | NoPass = NoPass()
+        self.reader_requested: bool = False
+        self.deferred_requests: list[DeferredOwnerRequest] = []
         self.override_reconnect_until: ReconnectDeadline | ReconnectAwaitingListener | NoReconnectGrace = NoReconnectGrace()
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
@@ -590,6 +934,8 @@ class AdmissionServer:
         self.epoll: select.epoll = select.epoll()
         self.priority_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.epoll.register(self.priority_events, select.EPOLLIN)
+        self.reading_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.epoll.register(self.reading_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
         self.stopped: bool = False
         self.closed: bool = False
@@ -642,14 +988,14 @@ class AdmissionServer:
         self.persist()
         for episode, record in list(self.reservations.items()):
             if not self._end_if_finished(episode, record):
-                lifetime = self.proc.lifetime(reservation_row(record), self._live(record.owner))
+                lifetime = self._lifetime(record)
                 self._watch_owner(record.owner)
                 self._watch_scope(lifetime, episode)
         self._prune_places()
         self._finish_priority()
 
     def _end_if_finished(self, episode: str, record: ReservationRecord) -> bool:
-        lifetime = self.proc.lifetime(reservation_row(record), self._live(record.owner))
+        lifetime = self._lifetime(record)
         if (not isinstance(record.finalization, NoFinalizationIntent)
                 or not isinstance(record.ending, NotEnding) or isinstance(lifetime, gate.EndedStep)):
             with retry_cleanup(Path(record.path)):
@@ -684,9 +1030,30 @@ class AdmissionServer:
                            if isinstance(entry.ended_at, LiveGrant) or key in self.reservations
                            or entry.reservation in live_reservations
                            or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
-        encoded = wire.encode_record(ServiceState(
-            self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
-            self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox))
+        state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
+            self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox)
+        encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
+
+        def encoded_record(name: str, key: str, value: object) -> DurableRecordEncoding:
+            previous = self.durable_encodings.get((name, key))
+            if previous is None or previous.value != value:
+                previous = DurableRecordEncoding(durable_copy(value), wire.encode_record(value),
+                    previous.key if previous is not None else json.dumps(key, ensure_ascii=False))
+            encodings[name, key] = previous
+            return previous
+
+        parts = ['"kind":"ServiceState"']
+        for member in fields(state):
+            value = cast(object, getattr(state, member.name))
+            if isinstance(value, dict):
+                records = (encoded_record(member.name, key, item)
+                           for key, item in cast(dict[str, object], value).items())
+                encoded_value = "{" + ",".join(record.key + ":" + record.encoded for record in records) + "}"
+            else:
+                encoded_value = encoded_record(member.name, "", value).encoded
+            parts.append(json.dumps(member.name) + ":" + encoded_value)
+        encoded = "{" + ",".join(parts) + "}"
+        self.durable_encodings = encodings
         if encoded != self._persisted:
             write_text_atomic(self.state_dir / "state.json", encoded)
             self._persisted = encoded
@@ -717,7 +1084,7 @@ class AdmissionServer:
 
     def _watch_scope(self, lifetime: gate.StepLifetime,
                      episode: str) -> None:
-        if not isinstance(lifetime, gate.PopulatedStepScope):
+        if not isinstance(self.system_reader, NoSystemReader) or not isinstance(lifetime, gate.PopulatedStepScope):
             return
         path = lifetime.directory / "cgroup.events"
         for descriptor, watch in list(self.watchers.items()):
@@ -827,7 +1194,15 @@ class AdmissionServer:
             self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
     def _live(self, owner: wire.Owner) -> bool:
+        if not isinstance(self.system_reader, NoSystemReader):
+            identity = self.system_reader.latest.processes.get(owner.pid)
+            return identity is not None and identity.start == owner.start_time
         return self.proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time)
+
+    def _account(self, pid: int) -> int | OwnerProcessGone:
+        if not isinstance(self.system_reader, NoSystemReader):
+            return self.system_reader.latest.accounts.get(pid, OwnerProcessGone())
+        return process_uid(pid, self.proc.path)
 
     def _run_alive(self, run: wire.RunIdentity | LiveBuildRun) -> bool:
         return self._live(wire.Owner(run.pid, run.start_time))
@@ -853,6 +1228,7 @@ class AdmissionServer:
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
             "need_basis": gate.need_basis_record(profile.peak.basis), "test_scope": profile.scope,
+            "repository_name": profile.repo,
         }
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
@@ -862,7 +1238,7 @@ class AdmissionServer:
                 row["token_back_at"] = request.token_back_at
         if isinstance(profile.repository, gate.RepositoryIdentity):
             row["repo_identity"] = profile.repository.key
-            row["repository_name"] = profile.repository.name
+            row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
         if isinstance(request, wire.AdmitRequest):
             row["package"] = gate.test_package(list(request.argv))
@@ -887,16 +1263,30 @@ class AdmissionServer:
                    and matches_build_estimate(record.repo, record.repo_identity, record.shape, profile, shape)
                    for record in self.reservations.values())
 
+    def _reading_plan(self, config: gate.MemoryConfig) -> SystemReadingPlan:
+        return SystemReadingPlan(config, tuple(replace(record, queue_waiter=record.queue_waiter.copy())
+            for record in self.reservations.values()), tuple(self.run_places.values()), bool(self.waiters))
+
+    def _lifetime(self, record: ReservationRecord) -> gate.StepLifetime:
+        if not isinstance(self.system_reader, NoSystemReader):
+            return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
+        return self.proc.lifetime(reservation_row(record), self._live(record.owner))
+
     def _inputs(self, config: gate.MemoryConfig) -> gate.QueueInputs:
         now = self.clock.now()
-        policy = config.policy
-        lifetimes = {episode: self.proc.lifetime(reservation_row(record),
-            self._live(record.owner))
-            for episode, record in self.reservations.items()}
-        processes = self.proc.processes()
-        activity = ScopeActivityReader(processes, self.proc.path,
-            tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since)
-                  for place in self.run_places.values()))
+        plan = self._reading_plan(config)
+        if isinstance(self.system_reader, NoSystemReader):
+            def direct_memory(record: ReservationRecord, row: gate.Reservation, lifetime: gate.StepLifetime,
+                              processes: dict[int, gate.ProcessIdentity], proc: Path) -> gate.StepMemory:
+                return (gate.GoneMemory() if isinstance(lifetime, gate.EndedStep) else
+                    self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
+                                              processes, proc, config.policy))
+            evidence = read_system(plan, self.readings, self.proc, self.clock, reservation_reader=direct_memory)
+        else:
+            self.system_reader.raise_failure()
+            self.system_reader.update(plan)
+            evidence = self.system_reader.latest
+        self.system_evidence = evidence
         memories: list[tuple[gate.Reservation, gate.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.finalization, dict) or not isinstance(record.ending, NotEnding):
@@ -906,13 +1296,13 @@ class AdmissionServer:
                     continue
             row = reservation_row(record)
             if "build_run" not in row:
-                row["build_run"] = activity.run(record.owner.pid)
+                row["build_run"] = evidence.runs.get(record.owner.pid, NoLiveBuildRun())
                 row["run_origin"] = gate.FoundRun(row["build_run"])
             elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = gate.CallerRun(NoLiveBuildRun())
-            memory = (gate.GoneMemory() if isinstance(lifetimes[episode], gate.EndedStep) else
-                      self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
-                                                processes, self.proc.path, policy))
+            captured = evidence.reservations.get(episode)
+            memory = (reservation_charge(captured, row, now, config.policy) if captured is not None
+                      else gate.PromisedMemory(record.need))
             if isinstance(memory, gate.GoneMemory):
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
@@ -921,47 +1311,60 @@ class AdmissionServer:
                 if isinstance(memory.anonymous, gate.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
             memories.append((row, memory))
-            self._watch_scope(lifetimes[episode], episode)
+            self._watch_scope(evidence.lifetimes.get(episode, gate.LiveOwnerProcess()), episode)
         for waiting in self.waiters.values():
             waiting.row["build_history_current"] = not self._build_estimate_expired(waiting.request)
             request = waiting.request
             if "build_run" not in waiting.row:
                 waiting.row["build_run"] = (_live_run(request.run)
                     if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity)
-                    else activity.run(request.owner.pid))
-        host = self.readings.host()
-        pressure = self.readings.pressure(host if isinstance(host, gate.HostMemory) else
-                                         gate.HostMemory(0, gate.UnknownHostTotal()), policy)
-        readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.spacing,
-                                             self.readings.compilers(), policy=policy)
+                    else evidence.runs.get(request.owner.pid, NoLiveBuildRun()))
+        pressure = evidence.pressure
+        if isinstance(pressure, gate.MemoryPressure):
+            pressure = gate.pressure_from_readings(pressure.full_avg10, pressure.some_avg10,
+                                                  pressure.swap_used_percent, config.policy)
+        readings = gate.QueueSnapshotReadings(dict(evidence.processes), {}, evidence.host,
+            pressure, self.spacing, list(evidence.compilers), policy=config.policy)
         ordered, priority = self._queue_order()
-        unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
-                                           activity_reader=activity, ci_memory_slice=config.ci_memory_slice)
+        unowned = self._unowned_memory(evidence, [row for row, _memory in memories])
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
-        between: list[gate.RunningStep] = []
-        for place in self.run_places.values():
-            run = place.run
-            if (run.pid, run.start_time) in represented:
-                continue
-            identity = processes.get(run.pid)
-            if identity is None or identity.start != run.start_time:
-                continue
-            evidence = activity.scope({run.pid})
-            if not isinstance(evidence, ScopeProcesses):
-                continue
-            live = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
-            measured = gate.tree_memory(run.pid, run.start_time, processes, self.proc.path)
-            if isinstance(measured, gate.GoneMemory):
-                continue
-            memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
-                                             pid=run.pid, activity=replace(evidence, run=live))
-            between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid, unit=place.unit))
+        between = tuple(step for step in evidence.between
+                        if isinstance(step.run, LiveBuildRun) and (step.run.pid, step.run.start_time) not in represented)
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), processes, policy)
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes), config.policy)
+
+    def _unowned_memory(self, evidence: SystemEvidence, rows: list[gate.Reservation]
+                        ) -> tuple[gate.UnownedSliceMemory, ...]:
+        owned: set[str] = set()
+        scopes: dict[str, str] = {}
+        for record in self.reservations.values():
+            captured = evidence.reservations.get(record.episode)
+            if captured is not None and captured.scope:
+                owned.add(captured.scope)
+                scopes[record.reservation_id] = captured.scope
+        roots = {row["pid"]: row["start_time"] for row in rows if not scopes.get(row.get("reservation_id", ""))}
+        tree_pids = gate.process_tree(roots, dict(evidence.processes))
+        result: list[gate.UnownedSliceMemory] = []
+        for memory in evidence.unowned:
+            required = not isinstance(memory.job_state, NotServiceSlice)
+            if not required and memory.cgroup in owned:
+                continue
+            duplicate = [evidence.scope_process_memory[pid]
+                         for pid in evidence.scope_members.get(memory.cgroup, frozenset()) & tree_pids
+                         if pid in evidence.scope_process_memory]
+            use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, gate.AnonymousRunUse)
+                      else item.bytes for item in duplicate)
+            job = memory.job_state
+            workers = evidence.scope_workers.get(memory.cgroup, frozenset())
+            if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
+                               dict(evidence.processes)).intersection(tree_pids) for pid in workers):
+                job = IdleService()
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
+                                  swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in duplicate))))
+        return tuple(result)
 
     def _sample_runner(self, record: ReservationRecord, use: int, now: float) -> None:
         maximum = Path(record.path).with_suffix(".max")
@@ -1100,6 +1503,7 @@ class AdmissionServer:
             self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
                                       if isinstance(self.last_usable_configuration, gate.MemoryConfig) else float("inf"))
             self.last_inputs = self.last_result = self.last_policy = NoPass()
+            self.published = NoPass()
             self.last_diagnostics = ()
             for episode, record in list(self.reservations.items()):
                 if self._end_if_finished(episode, record):
@@ -1165,7 +1569,42 @@ class AdmissionServer:
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
+        self._publish_replies()
+        if self.reader_requested:
+            self.start_reader()
+        if not isinstance(self.system_reader, NoSystemReader):
+            self.system_reader.update(self._reading_plan(config))
         return result
+
+    def _publish_replies(self) -> None:
+        if (not isinstance(self.last_inputs, gate.QueueInputs)
+                or not isinstance(self.last_policy, gate.AdmissionPolicy)
+                or not isinstance(self.last_result, gate.PassResult)):
+            return
+        reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
+                          diagnostics=self.last_diagnostics)
+        view = wire.ViewReply(reading)
+        explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
+        self.published = PublishedReplies(view, explain)
+
+    def reply_bytes(self, reply: wire.Reply) -> bytes:
+        published = self.published
+        if isinstance(published, PublishedReplies):
+            if reply is published.view:
+                if not published.view_bytes:
+                    published.view_bytes = wire.encode_reply(reply).encode()
+                return published.view_bytes
+            if reply is published.explain:
+                if not published.explain_bytes:
+                    published.explain_bytes = wire.encode_reply(reply).encode()
+                return published.explain_bytes
+            if isinstance(reply, wire.MineReply) and reply.reading is published.view.reading:
+                if not published.mine_bytes:
+                    published.mine_bytes = self.reply_bytes(published.view).replace(
+                        b'"type":"view","data":{"kind":"ViewReply",',
+                        b'"type":"mine","data":{"kind":"MineReply",', 1)
+                return published.mine_bytes
+        return wire.encode_reply(reply).encode()
 
     def _effects(self, spacing: gate.StartSpacing, override: gate.OverrideKept | gate.OverrideEnded,
                  decision: gate.AdmissionDecision, preserve_override: bool) -> None:
@@ -1288,7 +1727,7 @@ class AdmissionServer:
         self.persist()
         row = reservation_row(record)
         if isinstance(ending, (OwnerExited, NotEnding)):
-            lifetime = self.proc.lifetime(row, self._live(record.owner))
+            lifetime = self._lifetime(record)
             if isinstance(lifetime, gate.PopulatedStepScope):
                 self._watch_scope(lifetime, episode)
                 return
@@ -1337,10 +1776,10 @@ class AdmissionServer:
         if not key.startswith(f"uid:{uid}:"):
             return "request belongs to another account"
         if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
-            if process_uid(request.owner.pid, self.proc.path) != uid or not self._live(request.owner):
+            if self._account(request.owner.pid) != uid or not self._live(request.owner):
                 return "owner belongs to another account or no longer exists"
             if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
-                if process_uid(request.run.pid, self.proc.path) != uid or not self._run_alive(request.run):
+                if self._account(request.run.pid) != uid or not self._run_alive(request.run):
                     return "run belongs to another account or no longer exists"
             return ""
         if key in self.ledger:
@@ -1397,17 +1836,20 @@ class AdmissionServer:
                     self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
                     self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
                 self.pass_stale = False
+                self._publish_replies()
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, gate.QueueInputs)
                     or not isinstance(self.last_policy, gate.AdmissionPolicy)):
                 raise RuntimeError("service has no pass")
-            reading = gate.queue_read_from_pass(self.last_inputs, self.last_policy,
-                cast(gate.PassResult, self.last_result))
-            reading = replace(reading, diagnostics=self.last_diagnostics)
+            published = self.published
+            if not isinstance(published, PublishedReplies):
+                raise RuntimeError("service has no published pass")
             if isinstance(request, wire.ExplainRequest):
-                return [wire.ExplainReply(reading.explanation, self.last_diagnostics)]
-            return [wire.MineReply(reading) if isinstance(request, wire.MineRequest) else wire.ViewReply(reading)]
+                return [published.explain]
+            if isinstance(request, wire.ViewRequest):
+                return [published.view]
+            return [wire.MineReply(published.view.reading)]
         key = request.episode if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) else request.request_id
         replay = self.ledger.get(key)
         if replay is not None:
@@ -1597,8 +2039,10 @@ class AdmissionServer:
     def _send(self, connection: Connection, reply: wire.Reply) -> None:
         if connection.finished:
             return
-        connection.sending += wire.encode_reply(reply).encode()
+        connection.sending += self.reply_bytes(reply)
         connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+        if connection.finished:
+            self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
                           else select.EPOLLIN | select.EPOLLOUT)
 
@@ -1641,7 +2085,12 @@ class AdmissionServer:
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
 
+    def _drop_deferred_requests(self, connection: Connection) -> None:
+        self.deferred_requests = [pending for pending in self.deferred_requests
+                                  if pending.connection is not connection]
+
     def _disconnect(self, connection: Connection) -> None:
+        self._drop_deferred_requests(connection)
         descriptor = connection.socket.fileno()
         if descriptor < 0:
             return
@@ -1666,6 +2115,7 @@ class AdmissionServer:
         return changed
 
     def _refuse_connection(self, connection: Connection, reason: str) -> None:
+        self._drop_deferred_requests(connection)
         _ = self._detach_admission(connection)
         connection.received = b""
         connection.sending = b""
@@ -1676,7 +2126,11 @@ class AdmissionServer:
             return
         pid, uid, gid = struct.unpack("3i", connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         del uid, gid
-        identity = self.proc.owner_start(pid)
+        if isinstance(self.system_reader, NoSystemReader):
+            identity = self.proc.owner_start(pid)
+        else:
+            process = self.system_reader.latest.processes.get(pid)
+            identity = LiveOwnerIdentity(process.start) if process is not None else OwnerProcessGone()
         if isinstance(identity, LiveOwnerIdentity):
             self.caller_versions[gate.run_owner(pid, identity.start_time)] = request.code_version
             self.persist()
@@ -1712,6 +2166,13 @@ class AdmissionServer:
                         raise ValueError("one request for admission per connection")
                     connection.request = request
                 connection.received = b""
+                if (not isinstance(self.system_reader, NoSystemReader)
+                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
+                        and ((process := self.system_reader.latest.processes.get(request.owner.pid)) is None
+                             or process.start != request.owner.start_time)):
+                    self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic()))
+                    self.system_reader.request_read()
+                    return
                 replies = self.handle_request(request, connection)
                 # Admission replies were delivered as part of the pass.
                 for reply in replies:
@@ -1846,6 +2307,22 @@ class AdmissionServer:
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
         if any(descriptor == self.priority_events for descriptor, _events in ready):
             _ = os.eventfd_read(self.priority_events)
+        if any(descriptor == self.reading_events for descriptor, _events in ready):
+            _ = os.eventfd_read(self.reading_events)
+            if not isinstance(self.system_reader, NoSystemReader):
+                self.system_reader.raise_failure()
+            self.next_pass = self.clock.monotonic()
+            deferred, self.deferred_requests = self.deferred_requests, []
+            for pending in deferred:
+                connection = pending.connection
+                if not connection.finished and connection.socket.fileno() >= 0:
+                    if (not isinstance(self.system_reader, NoSystemReader)
+                            and self.system_reader.latest.started_monotonic < pending.arrived_monotonic):
+                        self.deferred_requests.append(pending)
+                        continue
+                    for reply in self.handle_request(pending.request, connection):
+                        if not connection.sending:
+                            self._send(connection, reply)
         configuration_changed = (any(descriptor == self.config_events for descriptor, _events in ready)
                                  and self._configuration_changed())
         if self.clock.monotonic() >= self.next_config_watch_retry:
@@ -1908,7 +2385,21 @@ class AdmissionServer:
             if connection.socket.fileno() in readable and not connection.finished:
                 self._connection_event(connection, select.EPOLLIN)
 
+    def start_reader(self) -> None:
+        """Start the reader when a usable configuration exists."""
+        self.reader_requested = True
+        if isinstance(self.system_reader, NoSystemReader) and isinstance(self.last_usable_configuration, gate.MemoryConfig):
+            plan = self._reading_plan(self.last_usable_configuration)
+            initial = self.system_evidence
+            if not isinstance(initial, SystemEvidence):
+                initial = read_system(plan, self.readings, self.proc, self.clock)
+            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock, self.reading_events)
+            for descriptor, watch in list(self.watchers.items()):
+                if isinstance(watch, ScopeWatch):
+                    self._unwatch(descriptor)
+
     def serve_forever(self) -> None:
+        self.start_reader()
         watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
         timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
         while not self.stopped:
@@ -1919,11 +2410,15 @@ class AdmissionServer:
             return
         self.closed = True
         self.stopped = True
+        if not isinstance(self.system_reader, NoSystemReader):
+            self.system_reader.close()
+        os.close(self.reading_events)
         os.close(self.config_events)
         os.close(self.priority_events)
         for connection in list(self.connections.values()):
             connection.socket.close()
         self.connections.clear()
+        self.deferred_requests.clear()
         for descriptor in self.watchers:
             os.close(descriptor)
         self.watchers.clear()
@@ -1940,6 +2435,7 @@ ADMISSION_CALLERS = {
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
     "merge_gate.py": "production/merge_gate.py",
+    "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
 }
 

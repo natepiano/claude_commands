@@ -4,8 +4,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import re
-from typing import Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 from scripts.lib.terminal_cells import terminal_width
+
+if TYPE_CHECKING:
+    from scripts.build_queue.admission_records import RunningStep, WaitingStep
+    from scripts.lib.build_steps import StepNames
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -36,6 +40,16 @@ class QueueLines(TypedDict):
 
 def field(text: str) -> str:
     return " ".join(text.split())
+
+
+def step_text(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's shown name when the project is known."""
+    return field(f"{step.project} {names.shown(step.step)}")
+
+
+def step_prose(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's sentence name when the project is known."""
+    return field(f"{step.project} {names.prose(step.step)}")
 
 
 def age(since: float, now: float) -> int:

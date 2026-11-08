@@ -11,10 +11,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 from pathlib import Path
 
-import index
-import mac_outcome
-import moments
-import store
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import moments
+from scripts.buildlog import store
 
 
 type Cause = Literal["Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs", "Cancelled CI", "Mac idle while natedev waits"]
@@ -73,7 +73,7 @@ def machine_name(target: str | None, host: str | None, legacy_hosts: dict[str, s
     if target:
         return target
     if not legacy_hosts:
-        import record
+        from scripts.buildlog import record
 
         values = record.sync_config()
         targets = set(record.configured_targets()) | {
@@ -89,7 +89,7 @@ def finished_phases(start: datetime, end: datetime) -> tuple[moments.ProgressFin
 
 
 def mac_hold_events(connection: sqlite3.Connection, start: datetime, end: datetime) -> MacHoldEvents:
-    import holds
+    from scripts.buildlog import holds
 
     current = holds.CurrentHolds("", holds.NatedevHoldsNow(()), holds.MacHoldsNow(()))
     history = holds.read_hold_history(connection, current, end)
@@ -421,7 +421,7 @@ def render_costs(build_costs: BuildCosts) -> str:
 
 
 def main(args: list[str]) -> int:
-    from number_option import positive_window
+    from scripts.buildlog.number_option import positive_window
 
     window = positive_window(args, "--days", 7, "costs", integer=True)
     if window is None:

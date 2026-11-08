@@ -54,7 +54,6 @@ class AssignClaudeDoorTests(AssignLauncherFixture):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
             "CLAUDE_BIN": str(backend),
-            "UNIT_WORKER_WAIT_ATTEMPTS": "1",
             "UNIT_WORKER_POLL_SECS": "0",
         })))
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -94,12 +93,6 @@ class AssignClaudeDoorTests(AssignLauncherFixture):
         self.assertIn("requires a live Claude or Codex ancestor", result.stderr)
         self.assertFalse(self.backend_log.exists())
 
-    def test_direct_implement_refuses_before_the_stub(self) -> None:
-        result = self.run_launcher(["bash", str(ROOT / "scripts/direct/implement.sh")], family="claude")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stderr.strip(), assign_gate.REFUSAL)
-        self.assertEqual(result.stdout, "")
-        self.assertFalse(self.backend_log.exists())
 
 
 if __name__ == "__main__":

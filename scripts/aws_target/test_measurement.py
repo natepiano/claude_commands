@@ -11,7 +11,7 @@ import os
 import re
 import time
 import subprocess
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest import mock
 import unittest
 
@@ -20,12 +20,7 @@ from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, Meas
 from scripts.aws_target.ledger_test_support import instant
 from scripts.aws_target.control_test_support import AwsReplies
 
-if TYPE_CHECKING:
-    from ..buildlog import aws_report, index, report
-else:
-    import aws_report
-    import index
-    import report
+from scripts.buildlog import aws_report, index, report
 
 
 class MeasurementTests(MeasurementFixture):

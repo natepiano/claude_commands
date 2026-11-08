@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for pushover.py: keys, request fields, and outcomes, with no network."""
 
 from __future__ import annotations
@@ -16,26 +16,23 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import pushover
-import review
-import push_texts
-import push_reference
-if TYPE_CHECKING:
-    from ..production import review_regime
-else:
-    from scripts.production import review_regime
-import silence
-from test_review import FakeReviewer, verdict, with_footer
-from user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
+from scripts.notify import pushover
+from scripts.notify import review
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.production import review_regime
+from scripts.notify import silence
+from scripts.notify.test_review import FakeReviewer, verdict, with_footer
+from scripts.notify.user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 
 REAL_REVIEW = review.review
 PARENT = "python test_pushover.py"
 
-from push_test_support import registered_send
+from scripts.notify.push_test_support import registered_send
 
 
 def footed(message: str, sender: str = PARENT, template: str = "fixture.admitted") -> str:
@@ -98,7 +95,7 @@ class ParentSourceTests(unittest.TestCase):
     def test_parent_source_reads_and_limits_the_parent_command(self) -> None:
         command = "python3 a-very-long-parent-command " + "x" * 100
         completed = subprocess.CompletedProcess(["ps"], 0, stdout=command + "\n", stderr="")
-        with mock.patch("pushover.subprocess.run", return_value=completed) as run:
+        with mock.patch("scripts.notify.pushover.subprocess.run", return_value=completed) as run:
             self.assertEqual(pushover.parent_source(), command[:80])
         self.assertEqual(run.call_args.args[0][:3], ["ps", "-o", "args="])
 
@@ -109,6 +106,12 @@ class PushoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        binary = folder / "bin"
+        binary.mkdir()
+        claude = binary / "claude"
+        _ = claude.write_text("#!/bin/sh\nexit 99\n")
+        claude.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
         self.keys = folder / "env"
         _ = self.keys.write_text("# comment\nPUSHOVER_USER=u123\nPUSHOVER_TOKEN='a456'\n")
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", folder / "log"))

@@ -5,28 +5,23 @@ import fcntl
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pins
-import upgrade_record
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
 from scripts.production.production_doc import Production, read_production
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_staff_file,
 )
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)
@@ -114,14 +109,14 @@ class RecordTests(unittest.TestCase):
         shutdown = directory.parent / "shutdown"
         script = (
             "import sys\nfrom pathlib import Path\n"
-            + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "from scripts.shutdown import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
             + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )
-        result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        result = subprocess.run([str(directory.parent / "lib/py"), "-c", script, str(directory), str(shutdown)],
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                     "PYTHONPATH": str(shutdown)},
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 

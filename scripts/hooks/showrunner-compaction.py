@@ -6,16 +6,16 @@ Only a session named by a production update timer receives this text.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
-PRODUCTION = Path(__file__).resolve().parent.parent / "production"
-sys.path.insert(0, str(PRODUCTION))
 from scripts.production import showrunners  # noqa: E402
 
 

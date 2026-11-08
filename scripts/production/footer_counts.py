@@ -6,15 +6,15 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-import change_review
+from scripts.production import change_review
 from scripts.lib import conf
 from scripts.production import change_routing, staff
-import proposals_folder
-import proposals_table
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
 from scripts.production.production_doc import Refusal, production_field
 
 if TYPE_CHECKING:
-    from update_registration import QuestionStaff
+    from scripts.production.update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -103,7 +103,7 @@ def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
 
 def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Watch the count sources and each open record."""
-    from update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+    from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
                                      question_folder, question_records_for_document)
 
     try:

@@ -19,7 +19,7 @@ Codex fix workers apply the repairs.
 | File | Role |
 | --- | --- |
 | `docs/direct/phase_end.md` | Starts the daily run after the code ready notice. |
-| `commands/unit/direct.md` | Assigns findings to a repair phase and records decisions. |
+| `docs/direct/repair_rounds.md` | Assigns findings to a repair phase and records decisions. |
 | `scripts/direct/assign.py` | Sends `--role simplify` to the daily launcher. |
 | `scripts/direct/simplify_daily.py` | Claims the day, saves the diff, starts Claude, and updates the last successful tip. |
 | `scripts/direct/simplify_result.py` | Prepares the prompt and checks the report and agent results. |

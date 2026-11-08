@@ -413,7 +413,7 @@ class HanaShotTest(BuildLogIsolatedTest):
         self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -423,7 +423,7 @@ class HanaShotTest(BuildLogIsolatedTest):
 
     def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -1051,33 +1051,21 @@ class LaunchRecordRecoveryTests(HanaShotTest):
                 _ = signal.signal(number, handler)
         return exit_code, diagnostics.getvalue()
 
-    def test_launch_and_cleanup_keep_real_buildlog_unchanged(self) -> None:
+    def test_launch_and_cleanup_leave_the_default_buildlog_absent(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch / "home")}))
         isolated_root = store.root()
         self.assertTrue(isolated_root.is_relative_to(self.scratch))
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("BUILDLOG_DIR", None)
-            real_root = store.root()
-        real_paths = (real_root / store.ERRORS_NAME, real_root / store.host_name())
+            default_root = store.root()
 
-        def real_log_metadata() -> dict[Path, tuple[int, int]]:
-            metadata: dict[Path, tuple[int, int]] = {}
-            for base in real_paths:
-                for path in (base, *base.rglob("*")):
-                    try:
-                        reading = path.stat()
-                    except FileNotFoundError:
-                        continue
-                    metadata[path] = (reading.st_size, reading.st_mtime_ns)
-            return metadata
-
-        before = real_log_metadata()
         self.stop_fake_listener()
         state = self.launch_without_starting_hana()
         self.restart_fake_listener()
         with mock.patch.object(hana_shot, "process_alive", return_value=False):
             exit_code, diagnostics = self.shutdown_command()
 
-        self.assertEqual(real_log_metadata(), before)
+        self.assertFalse(default_root.exists())
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertFalse(self.state_path.exists())
         self.assertFalse(Path(state["scratch"]).exists())
@@ -1307,7 +1295,7 @@ class PortGuardTests(HanaShotTest):
         environment = self.script_environment()
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, "-B", "-E", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
             cwd=self.scratch, env=environment, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -1758,8 +1746,8 @@ class ShotTests(HanaShotTest):
 
     def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
         with (
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             brp = hana_shot.Brp(self.port)
             first = brp.diagnostics()
@@ -1781,7 +1769,7 @@ class ShotTests(HanaShotTest):
         with (
             mock.patch.object(time, "sleep", side_effect=tick),
             mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             hana_shot.wait_ready(brp, process, log)
         self.assertEqual(readings.call_count, 3)
@@ -1792,7 +1780,7 @@ class ShotTests(HanaShotTest):
             mock.patch.object(hana_shot.Brp, "call", return_value=None),
             mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
             mock.patch.object(time, "sleep"),
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
             redirect_stderr(io.StringIO()),
         ):
             hana_shot.shutdown(self.port)
@@ -2121,8 +2109,7 @@ class RemoteTests(HanaShotTest):
             "import os",
             "import signal",
             "import sys",
-            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
-            "import hana_shot",
+            "from scripts.hana_shot import hana_shot",
             "",
             setup,
             "",

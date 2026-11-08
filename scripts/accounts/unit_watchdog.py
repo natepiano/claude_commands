@@ -1,5 +1,9 @@
 """Restore stopped production units from current staff rows."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -17,9 +21,7 @@ from datetime import datetime, timedelta
 from importlib import import_module
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, Protocol, cast
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from typing import NotRequired, TypedDict, Protocol, cast
 
 from scripts.accounts import outage_alerts, role_map
 from scripts.production import showrunners, staff
@@ -27,22 +29,13 @@ from scripts.whoami import account
 from scripts.shutdown import stop_results
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("production", "shutdown", "herdr", "message", "whoami"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
 from scripts.shutdown.remote import local_machine
 
-if TYPE_CHECKING:
-    from scripts.production import live_units, unit_lookup
-    from scripts.herdr import herdr
-    from scripts.shutdown import pane_record
-    from scripts.message import sessions
-else:
-    herdr = import_module("herdr")
-    live_units = import_module("live_units")
-    unit_lookup = import_module("unit_lookup")
-    pane_record = import_module("pane_record")
-    sessions = import_module("sessions")
+from scripts.herdr import herdr
+from scripts.production import live_units, unit_lookup
+from scripts.shutdown import pane_record
+from scripts.message import sessions
 from scripts.lib.user_zone import user_zone
 
 
@@ -221,7 +214,7 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
     # The child resolves the staff reference before the start.
     command = [os.environ.get("SHUTDOWN_SYSTEMD_RUN", "systemd-run"), "--user", "--collect", "--quiet", "--no-block",
         "--property=RuntimeMaxSec=" + str(_recovery_seconds()), "--working-directory=" + str(SCRIPTS.parent),
-        "--", sys.executable, "-m", "scripts.accounts.unit_watchdog", "--recover",
+        "--", str(SCRIPTS / "lib/py"), "-m", "scripts.accounts.unit_watchdog", "--recover",
         source.label, source.identity, job["result"], source.identity]
     try:
         child = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,

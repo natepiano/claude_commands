@@ -25,9 +25,9 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import promote, request_from
-import merge_checkpoint
+from scripts.production.merge_checkpoint import promote, request_from
+from scripts.production import merge_checkpoint
+from scripts.production import change_review
 from scripts.production.production_doc import Production
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
@@ -48,6 +48,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         if with_review:
+            self.promotions = str(self.promote)
             self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -86,6 +87,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
     def test_completed_handoff_repairs_missing_publication_records(self) -> None:
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.promotions = str(self.promote)
         self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -97,7 +99,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         receipts = self.receipts()
         notices = self.events("style_sync.py")
         review.unlink()
-        merge_checkpoint.checkpoint_step_record(self.checkout, merge_head, "change-review").unlink()
         (self.root / "history/merge_receipts.jsonl").unlink()
         repaired = self.run_handoff(checkpoint)
         self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
@@ -109,6 +110,32 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((duplicate.returncode, duplicate.stdout, duplicate.stderr),
                          (0, f"hand-off {checkpoint[:7]} already merged as {merge_head[:7]}\n", ""))
         self.assertEqual(self.receipts(), receipts)
+
+    def test_failed_main_push_adds_no_row_and_a_good_retry_adds_it_once(self) -> None:
+        self.promotions = str(self.promote)
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.production_doc(change_review=review)
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): published\n\nChange-Review: Published | Read | Ready")
+        hook = self.origin / "hooks/pre-receive"
+        self.executable(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                        + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
+        failed = self.run_checkpoint(checkpoint)
+        self.assertNotEqual(failed.process.returncode, 0, failed.process.stdout + failed.process.stderr)
+        self.assertEqual(change_review.pending(review), [])
+        published = self.git("rev-parse", "production", cwd=self.origin)
+        receipt, = self.receipts()
+        self.assertEqual(receipt["merge_commit"], published)
+        self.assertEqual(len(self.events("style_sync.py")), 1)
+        hook.unlink()
+        retried = self.run_checkpoint(checkpoint)
+        self.assertEqual(retried.process.returncode, 0, retried.process.stdout + retried.process.stderr)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), published)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["Published"])
+        written = review.read_bytes()
+        self.assertEqual(self.run_checkpoint(checkpoint).process.returncode, 0)
+        self.assertEqual(review.read_bytes(), written)
+        self.assertEqual(self.receipts(), [receipt])
+        self.assertEqual(len(self.events("style_sync.py")), 1)
 
     def test_failed_style_notice_retries_until_delivery_succeeds(self) -> None:
         checkpoint = self.checkpoint()
@@ -235,8 +262,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             receipt, = self.receipts()
             self.assertEqual(receipt["source_checkpoint"], checkpoint)
             self.assertEqual(receipt["merge_commit"], merge_head)
-            self.assertTrue(review.exists(), "a published merge must register its changes before promotion succeeds")
-            self.assertEqual(review.read_text().count("The published change remains recorded"), 1)
+            self.assertEqual(change_review.pending(review), [], "a failed promotion must not add a row")
             notices = self.events("style_sync.py")
             self.assertEqual(len(notices), 1, "promotion retries must not duplicate the publication notice")
             self.assertIn(merge_head, notices[0])
@@ -247,10 +273,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertEqual(self.events("send.py"), [], "a failed promotion must not acknowledge completion")
             if attempt == 0:
                 receipts = self.receipts()
-                rows = review.read_bytes()
+                rows = change_review.read(review).encode()
             else:
                 self.assertEqual(self.receipts(), receipts)
-                self.assertEqual(review.read_bytes(), rows)
+                self.assertEqual(change_review.read(review).encode(), rows)
         if mac_failure:
             _ = (self.state / "mac-rc").write_text("0\n")
         else:
@@ -259,7 +285,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             retried = invoke()
             self.assertEqual(retried.returncode, 0, f"retry {attempt}: {retried.stdout}{retried.stderr}")
             self.assertEqual(self.receipts(), receipts)
-            self.assertEqual(review.read_bytes(), rows)
+            self.assertEqual(review.read_text().count("The published change remains recorded"), 1)
+            if attempt == 0:
+                rows = review.read_bytes()
+            else:
+                self.assertEqual(review.read_bytes(), rows)
             self.assertEqual(len(self.events("style_sync.py")), 1)
         self.assertTrue(self.log.exists())
 
@@ -672,7 +702,7 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("merge_checkpoint.datetime", wraps=datetime, now=now):
+        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)

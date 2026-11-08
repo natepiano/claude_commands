@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """File style decisions and track their answers and builds."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -22,30 +26,29 @@ from typing import Protocol, cast
 from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
 
-import coverage_report
-import rules
-import style_footprint
-import style_ledger
-import style_rules
-from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
+from scripts.style import coverage_report
+from scripts.style import rules
+from scripts.style import style_footprint
+from scripts.style import style_ledger
+from scripts.style import style_rules
+from scripts.style.approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
                               approved_rename, binding_rename, BindingScopeReader)
-from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
-from declarations import declaration_line
-from issues import Issue, frontmatter, open_issues, plain
+from scripts.style.add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
+from scripts.style.declarations import declaration_line
+from scripts.production.issues import Issue, frontmatter, open_issues, plain
 from scripts.production import session_staff, staff, unit_config, unit_lookup
-from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
+from scripts.production.proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
-from unit_files import file_text, git, unit_file_holders
-from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
-from process_failure import failure_detail
-from user_zone import user_zone
+from scripts.style.unit_files import file_text, git, unit_file_holders
+from scripts.style.unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
 
 
 def proposal_command(*arguments: str) -> None:
     result = subprocess.run(
-        [sys.executable, str(SCRIPTS / "production/proposal_issue.py"), *arguments],
+        [str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/proposal_issue.py"), *arguments],
         capture_output=True, text=True, check=False,
     )
     if result.returncode:
@@ -53,7 +56,7 @@ def proposal_command(*arguments: str) -> None:
 
 
 def renumber() -> None:
-    result = subprocess.run([sys.executable, str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
+    result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
                             capture_output=True, text=True, check=False)
     if result.returncode:
         raise style_ledger.LedgerError(failure_detail(result))

@@ -75,6 +75,7 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
+        write_text_atomic(self.session / "worker_transport", "mesh\n")
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
         self.stack.enter_context(patch.dict(os.environ, {
                                                         "HOME": str(self.root),
@@ -115,7 +116,7 @@ class MeshRunsTests(unittest.TestCase):
     def test_current_runtime_selects_the_fixed_staff_member_without_a_roster_thread_copy(self) -> None:
         fixture = StaffTestCase()
         fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
+        _ = self.stack.callback(fixture.doCleanups)
         _, unit, _ = fixture.tree()
         worker = fixture_worker("impl2", unit.id,
                                 backend=staff.CodexBackend(self.root / "codex-home"))
@@ -144,6 +145,7 @@ class MeshRunsTests(unittest.TestCase):
         role_root = self.root / "astra/design-roles"
         mesh = role_root / "design-one/mesh"
         mesh.mkdir(parents=True)
+        write_text_atomic(mesh / "worker_transport", "mesh\n")
         worker = self.record_worker("lasting-designer", LASTING_THREAD)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"lasting-designer": {
             "staff_id": worker.id, "status": "idle", "launcher_pid": 0}}))
@@ -1039,7 +1041,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              for line in path.read_text().splitlines()) + "\n")
         self.run_dir.mkdir()
         write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
-        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"unit": self.fixture.parent.name}))
+        write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
         marker = unit_runs.marker(self.fixture.parent.current_session)
         marker.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(marker, str(self.run_dir) + "\n")
@@ -1255,12 +1257,15 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session, "BUILDLOG_SCOPE": "0"}), \
                 patch.object(mesh_runs, "subprocess", SimpleNamespace(
                     Popen=start_supervisor, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT)):
+            _ = os.environ.pop("UNIT_RUN_DIR", None)
+            _ = os.environ.pop("PLAN_DELEGATE_BOARD_DIR", None)
             self.assertEqual(mesh_runs.main(["start", "--label", "private result", "--",
                                              sys.executable, "-c", "print('result after launcher exit')"]), 0)
         paths = list((self.run_dir / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(paths), 1)
         record = cast(mesh_runs.RunRecord, json.loads(paths[0].read_text()))
         self.assertEqual(record["staff_id"], row.id)
+        self.assertEqual(record["session_dir"], str(self.run_dir))
         self.assertIn("supervise", str(supervisors))
 
         self.assertEqual(mesh_runs.main(["supervise", str(paths[0])]), 0)

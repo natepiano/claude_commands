@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import os
 import subprocess
 import sys
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.shutdown import remote
 from scripts.production import log_backup, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -22,6 +25,10 @@ SCRIPT = Path(__file__).with_name("log_backup.py")
 CHECK = Path(__file__).with_name("production_check.sh")
 ZONE = ZoneInfo("America/Los_Angeles")
 NOON = datetime(2026, 10, 12, 12, 0, tzinfo=ZONE)
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class LogBackupTests(unittest.TestCase):
@@ -48,7 +55,7 @@ class LogBackupTests(unittest.TestCase):
             "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
             "SHOWRUNNER_STATE_DIR": str(self.state),
         })))
-        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc("natedev", self.doc))
+        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
         _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
         self.owner_id = owner.id
         self.backups = self.state / owner.id / "log-backups"

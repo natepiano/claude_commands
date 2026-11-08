@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import errno
 import subprocess
-import sys
 import tempfile
 import unittest
-from pathlib import Path
+from io import BytesIO
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from git_process import GitExitAnswers, GitReadFailed, run_git
+from scripts.style.git_process import (GitBlob, GitExitAnswers, GitReadFailed, MalformedBlobReply, MissingBlob,
+                         TruncatedBlobReply, parse_status_z, read_batch_blob, run_git)
 
 
 class GitProcessTests(unittest.TestCase):
@@ -64,6 +63,42 @@ class GitProcessTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             _ = output.seek(0)
             self.assertEqual(output.read(), b"ce013625030ba8dba906f756967f9e9ca394464a\n")
+
+    def test_batch_blob_preserves_bytes_and_leaves_the_next_reply(self) -> None:
+        content = b"line\n\0\xff"
+        replies = BytesIO(b"abc blob 7\n" + content + b"\ndef blob 0\n\n")
+        self.assertEqual(read_batch_blob(replies), GitBlob("abc", content))
+        self.assertEqual(read_batch_blob(replies), GitBlob("def", b""))
+
+    def test_missing_blob_leaves_the_next_reply(self) -> None:
+        replies = BytesIO(b"HEAD:path with spaces missing\nabc blob 1\nx\n")
+        self.assertIsInstance(read_batch_blob(replies), MissingBlob)
+        self.assertEqual(read_batch_blob(replies), GitBlob("abc", b"x"))
+
+    def test_malformed_blob_headers(self) -> None:
+        for header in (b"", b"abc\n", b"abc tree 3\nxyz\n", b"abc blob -1\n", b"abc blob size\n"):
+            with self.subTest(header=header):
+                self.assertIsInstance(read_batch_blob(BytesIO(header)), MalformedBlobReply)
+
+    def test_truncated_blob_body_or_separator(self) -> None:
+        for reply in (b"abc blob 3\nab", b"abc blob 3\nabc", b"abc blob 3\nabc!"):
+            with self.subTest(reply=reply):
+                self.assertIsInstance(read_batch_blob(BytesIO(reply)), TruncatedBlobReply)
+
+    def test_unreadable_blob_lengths_return_malformed_replies(self) -> None:
+        for digits in (30, 5000):
+            with self.subTest(digits=digits):
+                replies = BytesIO(b"abc blob " + b"9" * digits + b"\n")
+                self.assertIsInstance(read_batch_blob(replies), MalformedBlobReply)
+        with self.subTest(digits=18), tempfile.TemporaryFile() as replies:
+            _ = replies.write(b"abc blob " + b"9" * 18 + b"\n")
+            _ = replies.seek(0)
+            self.assertIsInstance(read_batch_blob(replies), MalformedBlobReply)
+
+    def test_status_retains_both_rename_and_copy_paths_and_untracked_paths(self) -> None:
+        output = "R  new name.py\0old name.py\0 C copied.py\0source.py\0?? untracked file.py\0"
+        self.assertEqual(parse_status_z(output),
+                         {"new name.py", "old name.py", "copied.py", "source.py", "untracked file.py"})
 
 
 if __name__ == "__main__":

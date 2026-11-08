@@ -6,14 +6,11 @@ from scripts.production.cli_fixture import process_boundary
 import json
 import unittest
 from datetime import datetime
-from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import staff
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
+from scripts.bevy_upgrade.cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
 
 
 @final
