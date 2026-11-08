@@ -488,6 +488,10 @@ def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBra
     return _move_folder(unit, destination, branch=branch)
 
 
+def _push_moved_branch(checkout: Path, branch: str) -> None:
+    _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
+
+
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Stop live rows, move the worktree and branch, and resume those rows."""
     destination = destination.expanduser().resolve()
@@ -548,6 +552,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if member.id not in live:
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         if move_complete:
+            if isinstance(branch, str):
+                _push_moved_branch(folder, branch)
             staff.folder_move_path(unit).unlink(missing_ok=True)
             return True
         if isinstance(pending, NoPendingMove):
@@ -590,6 +596,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
+            if isinstance(branch, str):
+                _push_moved_branch(folder, branch)
         finally:
             if not old.exists() and destination.exists():
                 folder = destination
@@ -631,9 +639,11 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                                         _ = client.close_retained_pane(pane, terminal=terminal)
                             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                                 restart_notice(latest, error)
-                        if not _wait_folder_rows(observe, live - reported, running=True):
+                        # Worker restore proves active starts and leaves idle workers closed.
+                        expected = {member.id for member in members if member.kind != "worker"} & (live - reported)
+                        if not _wait_folder_rows(observe, expected, running=True):
                             for member in members:
-                                if member.id in live - observed_live:
+                                if member.id in expected - observed_live:
                                     restart_notice(member, "restart is incomplete")
                 except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                     for member in members:

@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import fcntl
 import os
+import socket
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import override
 
 # The floor engages only past 8 runs on natedev (32 / 8 = 4), where the cores
 # are full anyway: thinner runs would each take longer without freeing a core,
@@ -74,11 +77,76 @@ def claim(directory: Path, name: str, full: int, fd: int, now: float | None = No
         return shared_width(full, runs)
 
 
+@dataclass(frozen=True)
+class SpecifiedTestWidth:
+    """A known nextest width specification, including symbolic values."""
+
+    value: str
+
+    @override
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class UnknownTestWidth:
+    """The run has no readable width specification or CPU count."""
+
+    @override
+    def __str__(self) -> str:
+        return "unknown"
+
+
+TestWidth = SpecifiedTestWidth | UnknownTestWidth
+
+
+def thread_line(granted: TestWidth, requested: TestWidth) -> str:
+    """Report the granted width and the machine load at claim time."""
+    try:
+        load = f"{os.getloadavg()[0]:.2f}"
+    except OSError:
+        load = "unknown"
+    cpus = os.cpu_count()
+    host = socket.gethostname().split(".", 1)[0]
+    shared = "; shared with the runs in flight" if granted != requested else ""
+    return (f"nextest: {granted} of {requested} test threads; load {load} "
+            + f"on {cpus if cpus is not None else 'unknown'} CPUs ({host}){shared}")
+
+
+def requested_threads(argv: list[str]) -> TestWidth:
+    """Read each nextest width option, then the environment or CPU default."""
+    arguments = iter(argv)
+    for word in arguments:
+        if word == "--":
+            break
+        if word in ("--test-threads", "--jobs", "-j"):
+            value = next(arguments, None)
+            return SpecifiedTestWidth(value) if value is not None else UnknownTestWidth()
+        if word.startswith(("--test-threads=", "--jobs=")):
+            return SpecifiedTestWidth(word.split("=", 1)[1])
+        if word.startswith("-j") and len(word) > 2:
+            return SpecifiedTestWidth(word[2:].removeprefix("="))
+    value = os.environ.get("NEXTEST_TEST_THREADS")
+    if value is not None:
+        return SpecifiedTestWidth(value)
+    cpus = os.cpu_count()
+    return SpecifiedTestWidth(str(cpus)) if cpus else UnknownTestWidth()
+
+
 def main() -> None:
-    _, action, directory, name, full, fd = sys.argv
+    _, action, *arguments = sys.argv
+    if action == "report":
+        requested = requested_threads(arguments)
+        print(thread_line(requested, requested))
+        return
     if action != "claim":
         raise SystemExit(f"unknown action {action}")
-    print(claim(Path(directory), name, int(full), int(fd)))
+    directory, name, full, fd, *options = arguments
+    requested = SpecifiedTestWidth(str(int(full)))
+    granted = claim(Path(directory), name, int(full), int(fd))
+    print(granted)
+    if "--show-load" in options:
+        print(thread_line(SpecifiedTestWidth(str(granted)), requested))
 
 
 if __name__ == "__main__":

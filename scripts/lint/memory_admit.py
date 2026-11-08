@@ -253,7 +253,7 @@ from scripts.build_queue.step_estimator import (
     expected_peak as expected_peak,
     filter_expressions as filter_expressions,
     filter_set as filter_set,
-    filtered_peak as filtered_peak,
+    read_estimate_history as read_estimate_history,
     fresh_test_peak as fresh_test_peak,
     git_identity as git_identity,
     history_arguments as history_arguments,
@@ -684,6 +684,9 @@ def blocker_fields(blocker: Blocker) -> dict[str, str]:
 @dataclass(frozen=True)
 class UsableAdmissionConfiguration:
     config: MemoryConfig
+    cloud_gate_slots: int
+    cloud_gate_stale_pushes: int
+    progress_profile_rank: int
 
 
 @dataclass(frozen=True)
@@ -694,7 +697,15 @@ class UnusableAdmissionConfiguration:
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
     """Resolve one pass without preventing cleanup when a setting is unavailable."""
     try:
-        return UsableAdmissionConfiguration(read_memory_config(report=False))
+        with conf.diagnostics(report=False) as messages:
+            settings = conf.read("build_admission")
+            cloud_gate_slots = settings.whole("cloud_gate_slots")
+            cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
+            progress_profile_rank = settings.whole("progress_profile_rank")
+        config = read_memory_config(report=False)
+        return UsableAdmissionConfiguration(replace(config,
+            diagnostics=(*config.diagnostics, *configuration_diagnostics(messages))),
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -1604,6 +1615,45 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
     return tuple(sorted(steps, key=lambda step: (step.since, step.pid, step.start_time)))
 
 
+@dataclass(frozen=True)
+class QueueSourceCounts:
+    """Admission sources, logical memory waits, and missing lifecycle evidence."""
+
+    admissions: Mapping[NeedSource, int]
+    memory_waits: tuple[float, ...]
+    incomplete_memory_waits: int
+    unsampled_intervals: int
+    open_intervals: int
+    completed_steps: int
+
+
+def count_queue_sources(lifetimes: Sequence[QueueStepLifetime]) -> QueueSourceCounts:
+    """Count interval sources and each logical step's memory wait once."""
+    admissions: dict[NeedSource, int] = {}
+    waits: list[float] = []
+    incomplete = 0
+    unsampled = 0
+    opened = 0
+    completed = 0
+    for lifetime in lifetimes:
+        if isinstance(lifetime.memory_wait_s, MemoryWaitIncomplete):
+            incomplete += 1
+        else:
+            waits.append(lifetime.memory_wait_s)
+        if isinstance(lifetime.end, ReservationEnded) and isinstance(lifetime.end.end_kind, StepEnd):
+            completed += 1
+        for interval in lifetime.intervals:
+            source = interval.need_source
+            admissions[source] = admissions.get(source, 0) + 1
+            if isinstance(interval.end, StepStillOpen):
+                opened += 1
+            elif isinstance(interval.end.peak, NoPositiveSample):
+                unsampled += 1
+    return QueueSourceCounts(admissions=admissions, memory_waits=tuple(waits),
+                             incomplete_memory_waits=incomplete, unsampled_intervals=unsampled,
+                             open_intervals=opened, completed_steps=completed)
+
+
 def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: int) -> Path:
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
@@ -2478,7 +2528,8 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
         sidecar = Path(row["sidecar"])
-        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"), sidecar):
+        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
+                       Path(str(sidecar) + ".cloud.json"), sidecar):
             try:
                 sample.unlink(missing_ok=True)
             except PermissionError:

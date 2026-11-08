@@ -472,7 +472,6 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module
@@ -687,6 +686,20 @@ run() {
 }
 
 run_step() {
+    if [[ "${STEP_ELIGIBILITY_READY:-0}" == 2 ]]; then
+        local eligibility_answer eligibility_status=0 probe_mark
+        if [[ -f "$HOLD_WAIT_DIR/probe-marks" ]]; then
+            while IFS= read -r probe_mark; do
+                [[ -f "$probe_mark" ]] || continue
+                eligibility_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${STEP_ELIGIBILITY_ARGUMENTS[@]}") || eligibility_status=$?
+                if (( eligibility_status != 0 )); then return "$eligibility_status"; fi
+                STEP_TARGET_TABLE=${eligibility_answer#*$'\n'}
+                break
+            done < "$HOLD_WAIT_DIR/probe-marks"
+        fi
+    elif [[ "${STEP_ELIGIBILITY_READY:-0}" == 1 ]]; then
+        STEP_ELIGIBILITY_READY=2
+    fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
@@ -837,7 +850,7 @@ except (OSError, ValueError):
     sys.exit(2)
 print(",".join(features))
 if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    sys.path.insert(0, str(Path(sys.argv[3]).resolve().parents[2]))
+    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.result_environment import read_policy
     policy = read_policy()
     print(" ".join(policy.forwarded_names))
@@ -1381,7 +1394,7 @@ import sys
 from uuid import UUID
 
 kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-sys.path.insert(0, str(Path(recorder).resolve().parents[2]))
+with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 
 
 def text(value):
@@ -1820,7 +1833,7 @@ doc_tree() {
     VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.copies import copies
 print(copies.staged_tree(Path.cwd()))
 PYDOC
@@ -2087,7 +2100,6 @@ with open(3, "rb") as handoff:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
 sys.argv = sys.argv[1:]
-sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (
@@ -2245,13 +2257,15 @@ check_routing_hold() {
 initialize_step_record() {
     local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target"
     local eligible_names="" mac_names="" mac_disk_exclusions=""
-    local arguments=(eligible --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
+    local arguments=(eligible --new-step --probe-marks-file "$HOLD_WAIT_DIR/probe-marks" --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
     if [[ "$CMD" == final ]]; then arguments+=(--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds"); fi
     PKG="${ARGS[0]:-}"
     arguments+=(--package "$PKG")
     if [[ "$MAC_ONLY" == 1 ]]; then arguments+=(--mac); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
+    STEP_ELIGIBILITY_ARGUMENTS=("${arguments[@]}")
+    STEP_ELIGIBILITY_READY=1
     answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
@@ -2532,6 +2546,7 @@ ssh_reserve_hook() {
     remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
         --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+    if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
     if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }
 
@@ -2698,7 +2713,7 @@ route_test() {
             step_can_retry || continue
             if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
-            if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
+            if [[ "$(ssh_reserve_hook "$name" "$settings" "$retry")" == false ]]; then continue; fi
             remote_candidates=1
             if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" && "$platform" == macos ]]; then
                 retry_ready=0
@@ -2715,7 +2730,7 @@ route_test() {
             fi
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
-            eval "$(ssh_reserve_hook "$name" "$settings")" || reservation_status=$?
+            eval "$(ssh_reserve_hook "$name" "$settings" "$retry")" || reservation_status=$?
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 ]] \
                 && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then
@@ -3541,7 +3556,7 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
@@ -3608,10 +3623,29 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
-        trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP
+        local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
+        # Bash can retain pipeline jobs that this subshell cannot wait for.
+        # Stop and collect only the sleep that this renewer started.
+        trap '
+            trap "" INT TERM HUP
+            # Bash sets $! before it can run this trap after the sleep starts.
+            if (( renew_sleep_starting )) && [[ "${!:-}" != "$renew_previous_pid" ]]; then
+                renew_sleep_pid=$!
+            fi
+            if [[ -n "$renew_sleep_pid" ]]; then
+                kill "$renew_sleep_pid" 2>/dev/null || true
+                wait "$renew_sleep_pid" 2>/dev/null || true
+            fi
+            exit 0
+        ' INT TERM HUP
         while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            renew_previous_pid=${!:-}
+            renew_sleep_starting=1
             sleep "$TOKEN_RENEW_S" &
-            wait "$!" || break
+            renew_sleep_pid=$!
+            renew_sleep_starting=0
+            wait "$renew_sleep_pid" || break
+            renew_sleep_pid=""
             renew_token || break
         done
     ) &
@@ -4236,9 +4270,10 @@ case "$CMD" in
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
             VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[1])
-from final_pass import clean_tree
+with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.final_pass import clean_tree
 clean_tree()
 ' "${FINAL_PASS_SCRIPT%/*}" || exit 2
         fi

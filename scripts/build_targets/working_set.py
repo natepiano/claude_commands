@@ -22,7 +22,6 @@ from datetime import date
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import session_staff, staff
 from scripts.shutdown import remote
 

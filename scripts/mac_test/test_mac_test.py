@@ -1484,8 +1484,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         source = """
 import sys
 from datetime import datetime, timedelta, timezone
-sys.path.insert(0, sys.argv[1])
-import mac_test
+from scripts.mac_test import mac_test
 
 class Clock(datetime):
     tick: int = 0
@@ -1504,7 +1503,7 @@ for arguments in (
     sys.argv = ["mac_test.py", *arguments]
     assert mac_test.main() == 0
 """
-        result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
+        result = subprocess.run([str(SCRIPT.parents[2] / "scripts/lib/py"), "-c", source, str(SCRIPT.parent)],
                                 env=self.environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                 pass_fds=(self.writer_write_fd,))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

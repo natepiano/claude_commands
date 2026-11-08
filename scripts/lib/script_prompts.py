@@ -15,12 +15,8 @@ from datetime import datetime, timezone
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from . import conf
-else:
-    from scripts.lib import conf
+from scripts.lib import conf
 
 
 def root() -> Path:

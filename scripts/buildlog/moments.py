@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,7 +12,6 @@ from enum import Enum
 from pathlib import Path
 from typing import ClassVar, Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import unit_runs
 
 

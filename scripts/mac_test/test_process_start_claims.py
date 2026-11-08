@@ -10,15 +10,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from typing import TYPE_CHECKING
 import sys
 
-if TYPE_CHECKING:
-    from . import mac_test
-    from ..lib import process_start as identity
-else:
-    from scripts.mac_test import mac_test
-    from scripts.lib import process_start as identity
+from scripts.mac_test import mac_test
+from scripts.lib import process_start as identity
 
 
 class ClaimProcessStartTests(unittest.TestCase):

@@ -13,18 +13,10 @@ except FileNotFoundError:
     pass
 
 import sys
-from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from ..direct import phase_table
-    from . import showrunners, staff
-    from .production_doc import Refusal
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.direct import phase_table
-    from scripts.production import showrunners, staff
-    from scripts.production.production_doc import Refusal
+from scripts.direct import phase_table
+from scripts.production import showrunners, staff
+from scripts.production.production_doc import Refusal
 
 from scripts.shutdown import remote
 

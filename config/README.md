@@ -154,7 +154,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
 | `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
 | `sweep_push_text_limit` | Maximum length of a phone alert. |
-| `sweep_page_paths` | Maximum paths in a phone alert. |
+| `sweep_crossing_repeat_minutes` | Delivery key lifetime for a disk crossing, in minutes. |
 | `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
 | `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
 | `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
@@ -453,7 +453,7 @@ The AWS mapping permits `aws-build` records without activating the AWS target.
 Each exchange reads these settings again.
 Vault transfers use the same configured SSH connection timeout.
 
-`vault.lock_retries` sets the extra fast-forward tries after a busy vault index lock.
+`vault.lock_retries` sets the extra tries after a busy vault index lock.
 The default is 5; the allowed whole numbers are 0 through 10.
 `vault.lock_retry_delay_s` sets the seconds between these tries.
 The default is 3; the allowed range is 0 through 5.
@@ -471,6 +471,22 @@ Transfers exclude admission and pending state directories.
 Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
+
+## memory_feed.conf
+
+`scripts/build_queue/memory_feed.py` reads these settings through `scripts/lib/conf.py` when the service starts.
+`CONF_DIR` selects another configuration folder.
+
+| Key | Value | Use |
+| --- | --- | --- |
+| `output_folder` | `~/.local/share/review-links/h7uj5c` | Publish `memory_live.html` and `memory.json` in this folder. |
+| `interval_seconds` | `3` | Set the interval between readings and the page refresh interval. |
+| `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
+| `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
+| `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
+
+The service publishes the repository page with an atomic write at each start.
+The service retains the last successful reading when the admission service does not answer.
 
 ## test_times.conf
 

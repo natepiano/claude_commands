@@ -274,14 +274,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 published = True
                 if not created:
                     if worker_admission.dispatch_record(allowed.run, allowed.name, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
-                        try:
-                            source = worker_admission.transcript_source(worker.row, staff.ClaudeBackend())
-                        except ValueError as error:
-                            if str(error) != "no source transcript found":
-                                raise
-                            entries = ()
-                        else:
-                            entries = worker_admission.transcript_entries(source, set())
+                        entries = worker_admission.conversation_entries(worker.row, staff.ClaudeBackend(), set())
                         torn = False
                         for entry in entries:
                             if isinstance(entry, worker_admission.TornTranscriptRecord):

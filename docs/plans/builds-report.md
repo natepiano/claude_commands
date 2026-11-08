@@ -72,7 +72,7 @@ The build report is too long for the user and is not used for analysis. Retire i
 - **Layout:** `scripts/buildlog/` (index, report, cli).
 - **Key files:** `scripts/buildlog/report.py` — `power_profile_section`, `profile_changes` and `profile_step_durations` hold today's one before-and-after comparison; `scripts/buildlog/index.py` — the `steps` and `samples` tables; `scripts/buildlog/cli.py` — commands; `~/.local/state/plan-delegate/runs/*.jsonl` — progress history (`event_type` `phase_finished`, `status` `completed`, `timestamp_epoch`, `phase_instance_id`, `working_dir`).
 - **Test lanes:** `scripts/buildlog/test_*.py`.
-- **Test:** `PYTHONPATH=scripts/buildlog env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest <module>` from the worktree root.
+- **Test:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/buildlog -p '<module>.py'` from the worktree root.
 - **Lint:** `basedpyright <the slot's own Python files>`; the footer must read `0 errors, 0 warnings, 0 notes`.
 - **Invariants:** build-log `.jsonl` files are appended and never edited. The report reads the index read-only. Never write the live build log or the live progress history.
 
@@ -537,23 +537,26 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 **Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
 
 **Spec:**
-- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 270) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
+- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
 - Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
 - `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
 - Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
+- A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
+- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
 
 **Files:**
+- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
 - `scripts/buildlog/cli.py` — no `costs` command.
 - `scripts/buildlog/costs.py` — no text output.
 - `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
-- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — tests for removed output go; new link tests.
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — assertions about removed output go; calculation assertions stay on the typed data; new link tests.
 - `docs/as-built/buildlog-memory-stalls.md` — Definitions.
 
 **Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's.
+**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line.
 
 **Acceptance gate:**
 - A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
@@ -562,38 +565,26 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
 - `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
 
-### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: todo
-**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 on builds (its recorded-root reader)
+### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: done
 
-From the builds showrunner (not the user), 2026-11-05, defect from resources-unit: `index.add_step` does not keep the output pair unknown when the recorder left it out. After resources' Phase 66, an override row whose metadata failed gives sweep `(workspace, folder, folder)`, so `build_directory` is wrong when Cargo's build-dir differs. No natedev row has it today. Ruling: store unknown, not a made-up pair; put it in a phase after 24-25.
+#### As-built
 
-Director decision: a record with no pair is unknown for both columns, old records too. Records from before the pair and records whose metadata failed carry the same fields (`v` is 1 for both), so a fallback for one is a made-up pair for the other.
-
-#### Work Order
-
-**Goal:** A step row has a real Cargo output pair or `unknown` for both folders. The index never builds the pair from `target_dir`.
-
-**Spec:**
-- `scripts/buildlog/index.py` `add_step` (about line 834): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
-- Column text (about line 164): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
-- The existing index must not keep made-up pairs. Confirm that the changed column text (or a `SCHEMA_VERSION` bump) makes `index.update()` rebuild every step row. Report the rebuild time on the live index.
-- Readers: `scripts/lint/build_shape.py` `recorded_root` reads `unknown` as `UnknownRecordedRoot`, and `recorded_output_roots` skips a row whose `target_folder` differs from `target_directory`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
+A step row has the Cargo output pair from its record, or `unknown` in both folders. The index never builds the pair from `target_dir`.
+- `index.add_step` reads `target_directory` and `build_directory` only from the record. When either one is absent, it stores `store.UNKNOWN_IDENTITY` in both. `target_dir`, `target_folder` and `build_history_group` still read `target_dir`.
+- Column text: `target_directory` is "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` is "resolved Cargo intermediate root; unknown when the record has no output pair".
+- `SCHEMA_VERSION` is 35, so `index.update()` rebuilds every old step row once. Column text alone does not change the index file name, because `schema_statements()` leaves out the descriptions.
+- Readers: `step_outputs.recorded_output_roots` gives an `UnknownRecordedRoot` for an unknown pair, and `sweep.discover_cargo_outputs` skips it.
 
 **Files:**
 - `scripts/buildlog/index.py` — `add_step` and the column text.
-- `scripts/buildlog/test_index.py` — pair tests.
+- `scripts/buildlog/test_index.py` — the pair table (legacy, override, target-only and build-only rows read unknown), the reader test through `recorded_output_roots` and `discover_cargo_outputs`, and the schema-bump rebuild test.
 
-**Workers:** 1 writer — `rowcpu` owns both files.
+**Gotchas:**
+- Records from before the pair and records whose Cargo metadata failed have the same fields (`v` is 1 for both). A fallback for one is a made-up pair for the other.
+- On the live log (2026-11-08), 102,951 of 109,321 steps read unknown; the rebuild took 6.0 s.
 
-**State:** none.
-
-**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree.
-
-**Acceptance gate:**
-- `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
-- A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
-- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
-- `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- A pair made from `target_dir` for old records: it is wrong when Cargo's build folder differs.
 
 ### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
 
@@ -618,64 +609,163 @@ Director decision: a record with no pair is unknown for both columns, old record
 **Ruled out:**
 - Reading the test-path metadata without an export, and an export through a `verify_metadata.py` request: routed to verify-unit, which owns `verify.sh`.
 
-### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: todo
-**Depends on:** none (urgent, from the user via natedev and the builds showrunner, 2026-11-05)
+### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: done
 
-The Mac copy of `~/rust/hanadocs` stopped at 2026-11-04 17:58 EST, 233 commits behind. Obsidian on the Mac saved column widths in `home-base/vault map.base`, and the hourly fast-forward stops on any uncommitted change.
+#### As-built
 
-From the user (via natedev and the showrunner), 2026-11-05: "hanadocs not working should just be an issue you raise as a question with me - it should not be a message sent via pushover." And: "we need a permanent fix for handling synchronization of hanadocs across mac and natedev." And: "it should be just an issue of managing merges and conflicts".
-
-Director decisions:
-- From natedev (not the user), 2026-11-05: design approved as written, with three notes. (a) When the Mac's main is not a fast-forward of GitHub's main, natedev merges it in the same run, with the same rules. (b) The first run commits the Mac's current change in `home-base/vault map.base`; that is the wanted result. (c) The conflict question names the files and says where the user acts (machine and session).
-- natedev merges in the object store (`git merge-tree --write-tree`, then `git commit-tree`), so no uncommitted edit in natedev's vault changes. `hanadocs-push` brings the result into natedev's main, as today.
-- natedev's `hanadocs-push` does not change.
-- From the builds showrunner (from natedev, not the user), 2026-11-05: change row C927 (the Mac's hanadocs vault updates itself each hour, ddf835c4) came back with the user's words "this is an issue that is happening right now". This phase closes it; no separate fix. The checkpoint carries a new Change-Review line for it.
-- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
-- From natedev (not the user), 2026-11-05: a good run clears the question with a separate `withdraw` verb that sdlc adds to `update_registration.py`. Do not import its internals; file with the public `ask` command. If this phase lands before `withdraw` is on main, leave the clear out; natedev clears the question by hand until then.
-
-#### Work Order
-
-**Goal:** Each hour, the Mac commits its local vault changes and merges natedev's copy of GitHub's main. natedev carries the Mac's main to GitHub. Only a true conflict (or a Mac that is not on main, unreachable for 24 h, or an unknown git error) stops the sync. A stop files one question on natedev's open-questions list and sends no phone push. The next good run clears that question.
-
-**Spec:**
-- `scripts/buildlog/vault_pull.py`:
-  1. natedev pushes its `refs/remotes/origin/main` to the Mac's `refs/remotes/origin/main`, as today.
-  2. The ssh script on the Mac:
-     1. Stops with `branch` when the vault is not on main.
-     2. Runs `git add -A`. When the index differs from HEAD, it commits once with the message `vault: Mac edits`.
-     3. Runs `git merge --no-edit refs/remotes/origin/main` (a real merge, not `--ff-only`).
-     4. On a conflict, it reads `git diff --name-only --diff-filter=U`, runs `git merge --abort`, and prints the conflict outcome with the file names.
-     5. Keeps the `index.lock` retries (`vault.lock_retries`, `vault.lock_retry_delay_s`) for the commit and the merge.
-     6. Prints the merged count and the Mac's main commit in the `VAULT_OUTCOME=` marker.
-  3. natedev fetches the Mac's main into `refs/remotes/mac/main`. It then runs `git fetch origin main`, after `github-warm-status` exits 0.
-     - Cold credentials: one printed line, exit 0; the next hour tries again. No question.
-  4. When `mac/main` is already in `origin/main`: nothing to push.
-  5. When `mac/main` is a fast-forward of `origin/main`: push it to GitHub `main`.
-  6. Else: `git merge-tree --write-tree origin/main mac/main`. With no conflict, `git commit-tree` with both parents, then push that commit to GitHub `main`. A conflict stops with the file names, machine `natedev`.
-  7. A rejected push (GitHub moved) is not a stop: the next hour tries again.
-- Stop causes after this phase: `conflict` (files, machine), `not_on_main`, `mac_unreachable` (after 24 h), `vault_locked`, `command_failed`. Remove `tracked_files_changed`, `untracked_would_be_overwritten` and `history_diverged`.
-- A stop files one question with `python3 ~/.claude/scripts/production/update_registration.py ask --production ~/.claude/docs/plans/natedev-production.md --text <one line> --question <full text> --urgency soon`, run as a subprocess with a timeout. It is filed once per outage; the state file keeps that it was filed. A failed or held `ask` leaves it not filed, and the next hour tries again. The question names the cause, the files (for a conflict), the machine, where the user acts, and the choices.
-- A good run closes the outage. `withdraw` is not on main at dispatch (2026-11-05 12:50 EST), so the clear is left out; natedev clears the question by hand.
-- Remove the `vault.stopped` push: `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, its test in `scripts/notify/test_push_texts.py`, and the push call in `vault_pull.py`.
-- `scripts/buildlog/cli.py`: the usage line says the job syncs the Mac's vault.
+`buildlog vault` syncs the Mac's `~/rust/hanadocs` with GitHub each hour, from natedev. A stop files one question on natedev's open-questions list and sends no phone push (user, 2026-11-05).
+- natedev pushes its `refs/remotes/origin/main` to the Mac. The Mac script (`REMOTE_PULL`) stops with `branch` off main, and stops with the conflict outcome on an open merge (`MERGE_HEAD`: the unmerged files, else the files that differ from HEAD; no abort, add or commit; the user chose this check, 2026-11-05). It then runs `git add -A`, commits once (`vault: Mac edits`) and runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main`. A conflict prints the `--diff-filter=U` files and runs `git merge --abort`. The commit and the merge retry a busy `index.lock` (`vault.lock_retries`, `vault.lock_retry_delay_s`). The `VAULT_OUTCOME=` marker gives the outcome, because Mac login can hide the exit status.
+- natedev fetches the Mac's main into `refs/remotes/mac/main`, then `origin main` after `ci.warm()`. It pushes a fast-forward, or a `git merge-tree --write-tree` plus `git commit-tree` merge made in the object store, to GitHub `main`. A natedev merge-tree conflict, cold credentials and a rejected push (`git push --porcelain`) are deferrals: one printed line, exit 0. The next hour's Mac merge files the conflict question.
+- `mac_git` alone applies the Mac ssh options. A nonzero exit 255, or connection text on a nonzero exit, is `MacUnreachable`; a timeout is too.
+- `PullOutcome = Pulled | Current | DeferredSync | PullStop`; `PullStop = VaultConflict | NotOnMain | MacUnreachable | VaultLocked | VaultCommandFailed`; `StopCause` is the `Literal` of `conflict`, `not_on_main`, `mac_unreachable`, `vault_locked`, `command_failed`.
+- State (`store.root()/vault_pull.json`): `VaultState(last_good: LastGoodPull | NeverPulled, outage: OpenOutage | NoOutage)`, `OpenOutage(cause, since, asked, detail)`, written with `write_text_atomic` under `file_lock.exclusive`. An outage files one question with `update_registration.py ask --urgency soon --due <since + 1 day>`; `asked` is saved before `ask` and reset when `ask` fails. `MacUnreachable` files only after `UNREACHABLE_GRACE_S` (24 h) from `last_good`; a deferral after a Mac contact refreshes `last_good` and keeps the outage. A good run deletes the local outage; the question stays open until natedev clears it by hand.
+- The `vault.stopped` push is gone from `push_catalog.py`, `push_texts_reviewed.json` and `test_push_texts.py`.
 
 **Files:**
-- `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`
-- `scripts/buildlog/cli.py`
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`
+- `scripts/buildlog/vault_pull.py` — the job, the Mac script, the state and the question.
+- `scripts/buildlog/test_vault_pull.py` — real-git tests (a GitHub bare repo, a natedev clone and a Mac clone, built once per class and copied for each test).
+- `scripts/buildlog/test_target_sync.py` — the vault stand-in uses the marker and the Mac transport calls.
+- `scripts/buildlog/cli.py` — the usage line.
+- `config/build_targets.conf`, `config/README.md` — the lock retry text.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py` — no `vault.stopped`.
 
-**Workers:** 1 writer owns all files.
+**Gotchas:**
+- A successful git transfer can print connection text on stderr (hooks). The unreachable rule applies only to a nonzero exit.
+- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
+- The first run committed the Mac's `home-base/vault map.base` change; that was the wanted result.
 
-**State:** the vault state file (`store.root()/<STATE_NAME>`) keeps `last_good` and the open outage; `alerted` becomes `asked`. Read an old file with `alerted` as not asked.
+**Ruled out:**
+- A phone push for a vault stop (user, 2026-11-05).
+- A natedev question for a merge-tree conflict: no working tree holds natedev's merge.
+- Importing `update_registration.py` internals: the job runs the public `ask` command.
 
-**Acceptance gate:**
-- Tests with real git repositories in a temporary folder (a GitHub bare repo, a natedev clone, a Mac clone; ssh replaced at the `run` boundary):
-  1. A Mac with an uncommitted tracked change and an untracked note: the run commits both, merges, and GitHub gets them.
-  2. Both sides changed different files: the run merges on the Mac or on natedev, and GitHub gets both.
-  3. Both sides changed the same lines: no commit is lost, the merge is aborted, one question is filed with the file names, and no push is sent.
-  4. A second stop in the same outage files no second question.
-  5. The next good run closes the outage; a later stop files a new question.
-  6. Not on main and Mac unreachable for 24 h each file one question; unreachable for less than 24 h files none.
-- `scripts.buildlog.test_vault_pull`, `scripts.notify.test_push_texts`, and each module that imports `vault_pull`, with and without `PYTHONPATH`.
-- `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
-- After landing: one `buildlog vault` run on natedev commits the Mac's `vault map.base` change and brings the Mac to GitHub's main.
+### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: done
+
+#### As-built
+
+One idle episode sends one showrunner message and at most one phone push. A changed cause or holder in the same episode sends one new message.
+- `mac_idle.mac_work` reads `run.json` first, then `mac_test.read_claims(mac_test.StatePaths(paths.mac_state))`, filtered by `run_is_live`. The claims folder time no longer moves the episode start.
+- `watch_once` ends the episode when the Mac runs natedev work, or when a live claim that started before the episode start has a `work_idle_since` later than that start. `mac_test` writes one activity answer for each host into every live claim, so this holds for every cause, blocked included, and another repository's claim does not restart the episode. No claim path is saved.
+- The alert record saves `changed`, the time the current cause and holder started. `SavedAlert.changed: float` is required, and `read_alert` validates it like `since`; a record without it is unreadable, so the next pass starts clean.
+- `outage_key(saved)` gives the message key `mac-idle-showrunner-<since>-<changed>`, so a cause that returns to an earlier value also sends. `messaged` is kept when the key does not change. The phone push stays once per episode (`mac-idle-<since>`).
+- `cleared --since` and the push `--clears-when` are unchanged.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py` — `mac_work`, `watch_once`, `outage_key`; `OutageMessage` carries `key`.
+- `scripts/buildlog/mac_idle_alert.py` — `SavedAlert.changed`.
+- `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/test_mac_idle_alert.py`, `scripts/buildlog/mac_idle_test_support.py` — the 12:50-13:09 repeat case, cause changes, a returning cause, a blocked episode that ends on Mac work, another repository's claim that sorts first, `test_own_claim_work_restarts_the_idle_interval`.
+
+**Ruled out:**
+- Saving the episode's claim path: it missed work in a blocked episode and took another repository's claim.
+- A cause-and-holder message key: it did not send when a cause came back.
+
+### Phase 31 — A vault sync that works again closes its open question by itself  · status: done
+
+#### As-built
+
+A good vault sync closes the question that its outage filed, through the public `withdraw` command. This replaces the earlier rule that natedev clears the question by hand.
+- `question_text(since: float) -> str` in `vault_pull.py` is the one source of the short line: `Hanadocs vault sync stopped, <opened iso>`. The cause is only in `--question`, because a cause can change inside one outage and `withdraw` needs the exact text.
+- `registration(command: str, *args: str) -> bool` runs `update_registration.py <command> --production <PRODUCTION> <args>` through `run(..., COMMAND_TIMEOUT_S)`. `ask_question(reason, choices, since)` files the text through it, and `withdraw_question(since) -> bool` runs `withdraw --item <text>` through it.
+- In `_vault_locked`, a `Pulled` or `Current` outcome writes `VaultState(LastGoodPull(now), NoOutage())` first. It then withdraws once when the earlier outage is an `OpenOutage` with `asked=True`.
+- A failed or timed-out withdraw still exits 0 and keeps `NoOutage`. The sync line ends `; the question was not withdrawn`, and nothing retries.
+- A `DeferredSync` keeps the outage and withdraws nothing. An outage with `asked=False` withdraws nothing. `VaultState` and `vault_pull.json` keep their form.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — `question_text`, `withdraw_question`, `ask_question`, `_vault_locked`.
+- `scripts/buildlog/test_vault_pull.py` — `QUESTION_STAND_IN` keeps withdraw calls apart from ask calls; real-git tests for each case above.
+
+**Gotchas:**
+- A question the user already answered gives the same exit 2 as a real withdraw failure, so a rare failure leaves a stale question for natedev to clear.
+- The live check waits for the next real outage on natedev, because a forced outage files a real question on the user's list.
+
+**Ruled out:**
+- Saving the filed text in the state file: `question_text` rebuilds it from `since`.
+- A retry of a failed withdraw: an answered question would retry for ever.
+- A withdraw on a deferral: a deferral is not a good sync.
+- A migration: the live state had no outage and no open hanadocs question.
+
+### Phase 32 — One shared helper merges overlapping time spans  · status: done
+
+#### As-built
+
+`scripts/lib/intervals.py` is the one place that merges overlapping time spans. All four callers use it and keep no merge loop of their own.
+- `merged_spans(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]` returns the spans sorted by start, with each overlapping or touching span merged into the one before it.
+- `union_seconds(spans: Iterable[tuple[float, float]]) -> float` returns the duration that at least one span covers.
+- `hold_duration` in `scripts/buildlog/holds.py` passes each span as whole microseconds from the requested start, and converts the result back through a `timedelta`. `MICROSECOND` is the unit.
+- `source_coverage` in `scripts/buildlog/costs.py` groups spans by machine and builds its rows from `merged_spans`. The order stays machine, then start.
+- `_elapsed_union` in `scripts/history/history.py` returns `union_seconds` and keeps its `started_at > 0` filter.
+- `_work_seconds` in `scripts/direct/progress_history.py` walks `merged_spans` and keeps its idle grace.
+
+**Files:**
+- `scripts/lib/intervals.py` — `merged_spans`, `union_seconds`.
+- `scripts/lib/test_intervals.py` — one table of six cases, and one generator test.
+- `scripts/buildlog/holds.py` — `hold_duration`, `MICROSECOND`.
+- `scripts/buildlog/test_holds.py` — fractional hold seconds total a full minute.
+- `scripts/buildlog/costs.py` — `source_coverage`.
+- `scripts/history/history.py` — `_elapsed_union`. Owner: sdlc.
+- `scripts/direct/progress_history.py` — `_work_seconds`. Owner: sdlc.
+
+**Gotchas:**
+- Float timestamps lose precision: holds at second offsets [0,20.1], [30,50.1], [60,79.8] add up to 59.99999976158142 seconds and read `0:00`. Pass whole numbers to the helper when an exact total matters.
+- `costs.py` and `vault_pull.py` get `scripts/lib` on their path through another module's import. The root fix is one shared path setup for `scripts/buildlog`.
+
+**Ruled out:**
+- A key argument on the helper: all callers fit plain float pairs.
+- A `sys.path` line in `costs.py` and `vault_pull.py`: each adds one more copy of that line.
+
+### Phase 33 — scripts/buildlog imports from the repo root  · status: done
+
+#### As-built
+
+All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form. Behavior does not change.
+- A module or test module imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`, and another script folder as `from scripts.lib.y import z`.
+- No module in `scripts/buildlog` has a `sys.path` line. The seven modules that run by path (`cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`) start with the shared `scripts/lib/package_root.py` bootstrap that devtools 3z added (merge of builds f7e3cbce3).
+- A patch string names the root form: `mock.patch("scripts.buildlog.record.x")`. A code string that a test runs in a subprocess imports through the repo root.
+- Outside `scripts/notify`, no file imports a `scripts/notify` module by a bare name.
+- `_register_module_aliases` and `test_store_identity.py` do not exist. `scripts/buildlog/__init__.py` holds only a docstring; it adopts no bare module, and basedpyright needs it to resolve `scripts.buildlog` to this checkout.
+
+**Files:**
+- `scripts/buildlog/` — every module and test module, in the root form.
+- `scripts/buildlog/test_repo_root_imports.py` — `test_entry_scripts_import_without_pythonpath` runs each by-path module with `PYTHONPATH` removed and an unrelated `scripts` package in the working folder; `test_entry_scripts_load_each_shared_module_once` checks that a shared module loads under one name.
+- `scripts/aws_target/`, `scripts/build_hold/`, `scripts/build_queue/`, `scripts/build_targets/`, `scripts/lint/`, `scripts/mac_test/`, `scripts/test_times/` — outside importers of buildlog modules.
+- `docs/as-built/build-followups.md`, `docs/as-built/build-targets.md` — the path line of `disk.py` and the rule on shared module names.
+
+**Binds later work:** A buildlog import, patch string or test code string uses the root form. A library module adds no `sys.path` line.
+
+**Gotchas:**
+- A caller suite list misses test strings in modules outside the list; the merge gate finds them.
+- The type check of the gate passes `--pythonpath` with a pinned venv, so that `bpy` and `PIL` resolve. Bare `basedpyright` differs from it.
+- `merge_gate.py --tests-only` runs no type check unless `--type-dirs` names folders.
+- Another unit can add a bare import of a buildlog module until it merges this phase.
+
+**Ruled out:**
+- A path module for `scripts/buildlog`: the repo already has one way, and a per-folder module is a second way.
+- Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
+
+### Phase 34 — A failed merge gate module keeps its failure text  · status: done
+
+#### As-built
+
+A failed merge gate attempt keeps the end of its output in the build log, for local and cloud gates. A passing or restarted attempt keeps no log. Nothing prunes the logs; the per-file limit bounds the growth.
+- `gate_record.Execution` has a required `output: str`, and `ModuleRun` has `log: str`: the kept log's path relative to the build log root, or empty.
+- `gate_record.keep_failure_logs(record_id, host, epoch, modules, executions)` pairs modules with executions by `zip(..., strict=True)`. For each attempt with a non-zero `status` and an empty `restart`, it writes the last `GATE_FAILURE_LOG_KIB` KiB through `record.keep_log`, after one line that gives the count of cut bytes. The log name is the record id plus a sha256 of (suite, module, attempt). A failed write goes to `report_not_written`; the verdict and the record stay.
+- `write_gate_run(run, executions)` takes its executions with no default and calls `keep_failure_logs`. `merge_gate.record_gate_run` passes each `job.output`.
+- Cloud: `gate_box.execution_records(run)` builds the one `Execution` list, with output, from `run.executions or run.jobs`; `completion_record` uses it. `cloud_gate.import_record` decodes `row['gate']` and calls `keep_failure_logs` on natedev with the record's id, host and start epoch before it appends the box's record.
+- `index.py`: `gate_modules.log` column, `SCHEMA_VERSION` 36. A record without `log` indexes the column as NULL.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `Execution.output`, `ModuleRun.log`, `keep_failure_logs`, `write_gate_run`.
+- `scripts/test_times/gate_record_test_support.py` — `fixture_executions`, the one fixture that builds executions from module rows.
+- `config/test_times.conf` — `GATE_FAILURE_LOG_KIB=64`.
+- `scripts/production/merge_gate.py` — passes the output.
+- `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py` — the cloud list builder and the import that keeps the logs.
+- `scripts/buildlog/index.py` — the `log` column.
+- Tests: `test_gate_record.py`, `test_merge_gate_test_times.py`, `test_gate_index.py` (`test_query_recovers_failure_log_paths_after_an_index_rebuild`), `test_cloud_gate.py` (`test_import_uses_real_remote_host_and_appends_once` with a failed first attempt), `test_gate_box.py`, `test_show.py`.
+- `docs/as-built/merge-gate-and-test-speed.md` — "Failed module output": the `buildlog query` for the path, then `zcat`.
+
+**Gotchas:**
+- The cloud gate builds its record on the box, so the box cannot write a natedev log; the import on natedev keeps the logs.
+- A new required field on `Execution` or `write_gate_run` reaches every test fixture that builds a gate record; type-check every file that names `gate_record`.
+
+**Ruled out:**
+- Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).

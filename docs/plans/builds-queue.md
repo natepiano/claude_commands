@@ -146,18 +146,16 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 #### As-built
 
-- One process holds one `store` module object, whichever name imports it first. The buildlog and lint modules import the bare `store`; `head_facts.py`, `admission_service.py`, `admission_client.py` and `merge_gate.py` import `scripts.buildlog.store`.
-- `scripts/buildlog/store.py` registers itself as `sys.modules["store"]` when it loads. It registers `scripts.buildlog.store` and sets the package attribute `store` only when `scripts.buildlog` is already loaded. It searches for and imports nothing at load.
-- `scripts/buildlog/__init__.py` makes `scripts.buildlog` a regular package. At load it adopts a bare `store` module from its own directory: it registers it as `scripts.buildlog.store` and sets the package attribute. A `store` from another checkout is not adopted.
+- Phase 33 replaces the two module names with `scripts.buildlog.store` in every caller.
+- Phase 33 removes the aliases and `scripts/buildlog/__init__.py`.
+- `scripts/buildlog/test_repo_root_imports.py` checks the script entries from an unrelated working folder.
 
 **Files:**
-- `scripts/buildlog/store.py` — registers its module under both names.
-- `scripts/buildlog/__init__.py` — adopts a bare-first store from the same directory.
-- `scripts/buildlog/test_store_identity.py` — six fresh-interpreter cases: bare first, package first, `import sweep`, bare then dotted attribute, the index import order from a cwd outside the repository, and an unrelated raising `scripts/__init__.py`.
+- `scripts/buildlog/store.py` — callers use its repository module name.
 
-**Binds later work:** packaging or import changes in `scripts/buildlog` keep `__init__.py` and both import forms (`import store` and `from scripts.buildlog import store`).
+**Binds later work:** callers import `scripts.buildlog.store` from the repo root.
 
-**Gotchas:** a namespace package runs no code at load. A dotted child already in `sys.modules` makes `import scripts.buildlog.store` skip the parent's initializer, so store.py adds the dotted name only after the package exists. Deleting an alias from `sys.modules` and importing again makes a new module (a reload); no caller does that.
+**Gotchas:** `scripts.buildlog` is a namespace package. It has no initializer or module aliases.
 
 **Ruled out:** record.py's `__package__` check (head_facts keeps a set `__package__` under sweep); a `find_spec` search or package import from store.py (it shadows modules through `sys.path` and runs an unrelated `scripts/__init__.py` from the cwd).
 
@@ -629,12 +627,96 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Ruled out:** a nonzero send as the cause of the repeats; a new config key for the steady run.
 
-### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
+### Phase 26 — A cloud gate holds a cloud slot and shows its modules done  · status: done
+
+**Depends on:** none. aws builds the runner (builds-aws-up phase 5) and calls this phase's publish function. Priority over 27 (builds, 2026-11-07).
+
+1. **The ask (user ruling 2026-11-07, through builds; builds-aws-up phase 6).** Merge gates and targeted tests run on cloud Spot boxes as soon as possible. The queue tracks each cloud gate as one cloud slot and charges it no natedev memory. Up to 9 cloud gates run at once, and later ones wait. The HTML page and `/build:queue` show modules done of total for each cloud gate. Every tunable is in config.
+2. **Admission.** `AdmitRequest` gets a place: `LocalPlace` or `CloudPlace(target)`. The natedev route process admits through `admission_client` with step `merge-gate` or `targeted-test` and `CloudPlace("aws")`. Its pid is the run identity, so a dead route frees its slot. A cloud row needs no memory, takes no memory room, and gets no progress-memory adjustment. It waits only for a free cloud slot.
+3. **Slots.** `config/build_admission.conf` gets `cloud_gate_slots=9`, read at use. A waiting cloud gate names its wait: all cloud slots are in use, with the count.
+4. **Progress data (agreed with aws-unit, 2026-11-07).** The route writes `modules` done and total with `progress_profile.publish_counter(sidecar, ...)`, the file `merge_gate.py` writes today. A new module `scripts/build_queue/cloud_progress.py` holds `CloudProgress` (state `requesting|setup|running|uploading` as a named type, `size_vcpus`, `failed_modules` count, `updated_at`), its atomic writer `publish(sidecar, progress)` and its reader. The file is `<sidecar>.cloud.json`. A missing or unreadable file is a named state, not `None`.
+5. **View.** `queue_view` and `/build:queue` show cloud rows in their own group, with slots used of the total. Each row shows unit, step, state, modules done of total, vCPUs and elapsed time. A row with no update for `cloud_gate_stale_pushes` push intervals shows its age. `cloud_gate_stale_pushes=3` is a new key in `config/build_admission.conf` (builds, 2026-11-07). The push interval is aws's key `log_push_s=5` in `config/cloud_gate.conf`; the view reads it with `conf.read("cloud_gate").number("log_push_s")`; aws-unit names `conf.read_or_repository`, which is on builds-aws only (aws-unit correction, 2026-11-07). Until aws's route lands, a missing key is a named state and the view shows no stale age.
+6. **The HTML page.** The memory page shows the same cloud group. It changes the page files after the legend change ends (the same files).
+7. **Fallback.** A gate that falls back to natedev ends its cloud row and admits again as a local gate.
+8. **Proof.** Tests by behavior: a cloud admit charges no memory; the tenth cloud gate waits and names its wait; a dead route frees its slot; the view and card show the progress, the missing-file state and the stale age. Goldens for the card and view. Change-Review: a fake cloud row on a private service shows on the card.
+
+**Files:** `scripts/build_queue/admission_protocol.py`, `admission_client.py`, `admission_service.py`, `cloud_progress.py` (new), `queue_view.py`, `queue_card.py`, `scripts/lint/memory_admit.py`, `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf`, their tests and goldens, `docs/as-built/build-memory-admission.md`.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** the merge gate; basedpyright 0/0/0 on each changed file; adversary and contract reviews.
+
+### Phase 27 — The build memory page feed is a boot service  · status: todo
+
+**Depends on:** the memory page legend change now with the impl worker (the same two files). 10m keeps its other items.
+
+1. **The ask (user, 2026-11-07).** "we need to make this a service that runs outside of agent shells - a service that starts on boot so probably gets added to nixos". Today the feed runs in a queue-unit shell from the session folder, and it stops when that shell stops.
+2. **The files move into the repository.** `memory_feed.py` and `memory_live.html` move from the design folder to `scripts/build_queue/`. This is 10m item 2, pulled forward. The open command and its name stay in 10m.
+3. **Config.** The new file `config/memory_feed.conf` holds the output folder (the review link folder for `h7uj5c`) and the update interval (3 s). The feed reads both at start. No path or interval stays in code. All keys are new (builds, 2026-11-07: a new key needs no go; a moved or changed key does).
+4. **The service.** `/etc/nixos/modules/linux/development.nix` gets `systemd.services.build-memory-feed`, next to `build-admission`. It starts at boot (`wantedBy = [ "multi-user.target" ]`), runs as the user, restarts on failure, and has `ConditionPathExists` on the feed script. It runs outside `builds.slice`. The nixos change goes on a branch; the branch and hash go to builds, and natedev pushes it.
+5. **Cut-over.** After the deploy, the queue unit stops its shell copy of the feed. One feed writes the folder.
+6. **Proof.** The feed's tests pass from the repository path, with a test for the config read. After the deploy, `systemctl status build-memory-feed` is active, and the page's update time moves. Change-Review: the page updates with no agent shell running.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** build_queue suites pass; basedpyright 0/0/0; `nixos-rebuild build` passes on the branch.
+
+### Phase 28 — A reservation matches the memory a run really uses  · status: done
+
+1. **The ask.** The user, 2026-11-07 17:30: "this is completely busted - we've been running with about 1.2GiB reserved for merge gates for the last few days - this is completely unacceptable", and of a hana build "reserving 15.6GiB and using 0.2GiB - it is ridiculous".
+2. **Facts found.** The need for a run with progress is the highest anonymous use any recorded run of the same key had in the next 20% of progress, over 14 days (`progress_profile.merge_profiles`, `HISTORY_DAYS`). Two full merge gates today recorded 17.3 GiB (builds, 16:28) and 16.0 GiB (herdr, 16:58) in one 5% bin. Their own gate samplers saw at most 2.8 GiB for the whole job tree. The other 263 gate runs have a median of 0.9 GiB in those bins. The director moved the two records to `$SD/evidence/bad-gate-profiles-20261107/` (17:33). Hana `build:1` profiles show 10 to 15 GiB at the end of a build.
+3. **Cause, as found (research 17:50).** Hana's memory is real: one live hana scope read 5.89 GiB `anon` and 5.89 GiB summed process `RssAnon` (difference under 1 MiB), almost all in one `rustc`; the same build later reached 10.9 GiB. The gate outliers are not explained by the saved records, which hold no process list or reading source. The likely cause: test helpers that leave the gate's process tree stay in its scope; the scope reader (`memory_admit.py` `slice_working_set`) counts them and the gate sampler (`merge_gate.py`) does not. To prove it, each saved profile records its reading source, and at the run's highest bin the scope's processes (pid, command, `RssAnon`). The next outlier then names the process. Fix its lifetime where it lives in a later phase.
+4. **One run never sets the need.** Per bin, the need uses the Nth-highest recorded run, with N from a new config key `progress_profile_rank` (start 2). A key with fewer than N runs uses its lowest run in that bin. Director's call: N=2 keeps hana's end at 12.9 GiB (3 runs: 15.2, 12.9, 10.2) and stops any one bad run; the risk is a run 2.3 GiB over its reservation.
+5. **Proof.** The two moved records, put back in a test copy, give a gate need under 3 GiB. A replay of today's live profiles shows each step's need before and after.
+
+**Workers:** 1 writer, 1 tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
+### Phase 29 — A gate with no running module waits in line for a CPU slot  · status: done
+
+The stall of 2026-11-07 18:20 to 19:20: six merge gates were admitted by the memory queue. The fix-rounds gate ran 60 minutes with no module, while a gate that started 30 minutes later held 11 CPU slots. Each gate takes a slot from the shared pool `/dev/steve` (32 slots) before each module (`merge_gate.py` `SharedCPUPool.try_acquire`). When no slot is free, the gate sleeps 0.05 s and tries again, and it logs nothing. cargo and rustc wait in a blocking read, so the pool gives them each freed slot first. Builds ruled (a) and the request timing on 2026-11-07 19:30; it ruled out a cap on full gates.
+
+1. **Wait in line.** A gate with no running module and a pending module waits in a blocking read on the pool, in line with cargo. A gate with a running module keeps its present non-blocking try, so it still samples memory and collects results.
+2. **One wait line.** The gate prints `waits for a CPU slot` once when such a wait starts, and the wait time when it ends.
+3. **Signals.** A stop signal during the wait stops the gate at once and returns every slot it holds. A slot read just as the signal comes is returned.
+4. **Request timing.** `admission_service.py` logs the wall time and the CPU time of each request that takes longer than a configured limit (new key; start 0.25 s). The log line names the request kind. The next "no answer in 0.5 s" then shows whether the time goes to CPU work in the service or to a wait.
+5. **Proof.** Tests with a fake pool: a gate with no running module blocks and starts its module when a slot comes back; the wait line prints once; a stop signal during the wait returns the slots. A service test logs a slow request and logs no fast one.
+
+### Phase 30 — A build target command does not load the admission service  · status: done
+
+Builds asked on 2026-11-08 (verify 41p facts; the build_hold import chain item of 11-06). `build_targets.py` eligible, reserve and release-wait import `admission_service` through `mac_test.py` → `build_hold.py`. `build_hold.py:38` imports it at module top, and its only use is `admission_service.read_state` in `admitted_processes()` (`build_hold.py:567`). `admission_service` loads records, protocols, estimators, queue snapshots and the memory admission code at module top; the estimator loads SQLite and the build-log modules. The import costs eligible 310 ms, reserve 203 ms and release-wait 267 ms wall (about 110 ms under load).
+
+1. **build_hold.** `build_hold.py` no longer imports `admission_service`. `admitted_processes()` reads the service state through the smallest module that holds `read_state` and `ServiceState`. If those two move out of `admission_service.py`, `admission_service` imports them from there; one definition stays. If a move costs more than it saves, import inside `admitted_processes()`.
+2. **admission_service top-level imports.** Find each top-level import that only a rare path uses. Move it to its user when the gain is measurable for a service client or `build_targets.py`. Do not change the service's hot path.
+3. **Measure.** CPU time (user + system) and wall time per `build_targets.py` start for eligible, reserve and release-wait, before and after, at the same load: interleave the runs, 15 each. Also `python3 -X importtime` for the top modules.
+4. **Proof.** A test proves `build_hold` and `build_targets` import without `scripts.build_queue.admission_service` in `sys.modules`. The existing build_hold, build_targets and admission service tests pass.
+
+### Phase 31 — A build target command starts with only the imports it uses  · status: done
+
+After Phase 30, `build_targets.py` eligible, reserve and release-wait still use about 530 ms of CPU per start. Builds asked on 2026-11-08: trace the rest now; base the measure and every edit on verify phase 41p, which changes `build_targets.py` imports (ETA 06:30 on builds). The queue unit edits only queue-owned files and sends facts on other owners' files to builds.
+
+1. **Trace.** `python3 -X importtime` and a CPU profile of each command's start. List each import over 10 ms cumulative: the module, its cost, which caller pulls it in, whether the command uses it, and the owner of the file that imports it.
+2. **Queue-owned edits.** For each queue-owned module on the path that the command does not use, move the import to its user. Queue-owned: `scripts/build_queue/`, `scripts/lint/memory_admit.py`, and the files earlier queue phases changed.
+3. **Facts to builds.** For each import in another owner's file, send builds the module, its cost and the proposed move.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, on top of 41p.
+5. **Proof.** An import test for each moved import. The existing tests of each changed module pass.
+
+### Phase 32 — A merge gate claims the memory its runs used  · status: done
+
+1. **The ask (builds, 2026-11-08 06:50).** `step_estimator.py:244` `program_peak_estimate` returns `FirstProgramPeak` for every `merge-gate`, so admission claims the fixed 4 GiB. A herdr merge gate peaked at 26.4 GiB anonymous while admission counted 4 GiB; natedev went into earlyoom and hana's gate was killed twice. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
+2. **Measured claims.** A merge-gate claim uses the measured anonymous peak history of its host, as other programs do. The fixed value applies only when no history exists.
+3. **Outliers never set the claim.** The claim is the 90th percentile of the host's merge-gate peaks in 14 days, the rule other programs use. The research (phases/32/notes/research.md) withdrew the first rule, the 2nd-highest peak: 1,348 of 1,352 rows are 4.5-4.8 GiB, and 4 runaway rows (16.7-26.4 GiB, all after 2026-11-07 21:00) would set every gate's claim near 21 GiB for 14 days. The p90 is 4.65 GiB. The gate keeps itself near its own 4 GiB start limit (`merge_gate_governor_gib`), so a runaway test module is a gate defect, not a sizing input: verify fixes the tests, and a module memory limit in `merge_gate.py` belongs to its owner.
+4. **tmpfs is not in this phase.** The builds slice held up to 27 GiB of shmem in the same minutes, and no reservation counts it. Builds ruled (2026-11-08): `scripts/lint/memory_admit.py` is a resources file, so resources adds shmem to the slice's used memory. Verify fixes the two runaway tests.
+5. **Research first.** Why `merge-gate` was excluded (`a4d4c9988`, Phase 10o), where merge-gate peaks are written, and how gate claims and Phase 28 progress profiles relate.
+6. **Proof.** Tests: no history gives the fixed value; history gives the Nth-highest; one runaway peak does not set the claim. A replay of today's records shows the herdr gate claim before and after.
+
+**Workers:** 1 researcher, then 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
+### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: done
 
 **Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.
 
 1. **The ask (user, 2026-11-04, change reviews C959 and C969, through builds).** C959: "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". C969: leftover-process ages on the queue board, "this should be the case on the new html page too".
-2. **The page.** The Build Memory page (memory_live.html, fed by memory_feed.py) is today a prototype in the queue unit's session folder, served by review link h7uj5c. It moves into the repository with its feed and one command to open it. The command name needs the user's approval. New board features go on this page. report-unit's cost and chart views land on this page too, not on a second one.
+2. **The page.** The Build Memory page (memory_live.html, fed by memory_feed.py) is served by review link h7uj5c. Phase 27 moved the page, the feed and the hover test to `scripts/build_queue/`, and the boot service `build-memory-feed` runs the feed from there. 10m adds one command to open the page. The command name needs the user's approval. New board features go on this page. report-unit's cost and chart views land on this page too, not on a second one.
 3. **report-unit's sections (report-unit, 2026-11-04; C950 and C948).** The page gets two sections: the build history charts and a top-3 cost list. report-unit owns the data: one function in `scripts/buildlog`, `charts.page_data(days, n=3)`, returns typed data for both sections, no HTML, read in under 1 s for 7 days (builds ruling, 2026-11-05). The feed calls the function and the page draws its data. There is no JSON file between them.
 4. **Leftover-process ages.** The page shows each leftover process with the same readable age as the queue board ("45 min", "19 h", "2 d"), from the same formatter.
 5. **/build:queue.** It gets no new work. It stays for reference until the page covers it; 10n retires it.
@@ -642,10 +724,10 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 7. **Proof.** The feed's tests pass, with feed and page tests for each of the three wait states. A pixel check of the page shows the cap, the room, the leftover ages and report-unit's sections. Each item returns as its own Change-Review row.
 
 8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`, and `MemoryPage.cap` uses `None`). 10s already keeps the rows with no cap line (`memory_feed.py:295`, `memory_live.html:354`); this item replaces the `None` fields. Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text, for both `CapUnavailable(runs=())` (an old record) and named unavailable runs.
-9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`, `test_memory_hover.py`). It moves to `scripts/build_page/` (page, feed and tests). The feed takes `--code-root`, reads `captured.ci_use`, `captured.cap_use` and `room_text(captured)`, and imports `snapshot_codec`; its hover shows phase, percent done, keep-aside and reason. `memory_feed.pre10x.py` is deleted at the 10x deploy and does not move. The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
+9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`, `test_memory_hover.py`). Phase 27 moved them to `scripts/build_queue/` (`memory_feed.py`, `memory_live.html`, `test_memory_feed.py`, `test_memory_hover.py`); they stay there, because the boot service runs that path. The feed takes `--code-root`, reads `captured.ci_use`, `captured.cap_use` and `room_text(captured)`, and imports `snapshot_codec`; its hover shows phase, percent done, keep-aside and reason. `memory_feed.pre10x.py` is deleted at the 10x deploy and does not move. The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
 10. **Prototype behavior to keep (2026-11-06).** The Running table shows a Machine column after Duration and before Unit, from `scripts.buildlog.store.host_name()` (page round 16, the user's ask). When one view read misses the client's 0.5 s limit, the feed writes the last good reading plus `read_error` and `error_at`, and the page keeps its data; only the first read of a feed with no good reading shows "The queue did not answer" (page round 17, the user's blank-page report).
 11. **Browser proof (architect review of 18, 2026-11-06).** The browser proof today is `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/adhoc/memory_page7/verify.mjs`: Machine column order, a first read with no answer, a kept reading, and the stale-reading messages. It moves with the page, and the tester owns it.
-12. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The page command restarts the feed when the installed admission code changes. Test: a feed that started before a schema update reads the new record after the restart.
+12. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The feed notices when the installed admission code changes and exits with a failure status; the boot service (`Restart=on-failure`) starts it again with the new decoder. Test: a feed that started before a schema update reads the new record after the restart.
 
 13. **Project names.** The feed prints each running and waiting step with `queue_lines.step_text`, not the raw step (`memory_feed.py:398` and `:471` today). Feed tests: a known project, a missing project, and an absolute path repository that shows the step alone.
 14. **Progress line and row list.** The running rows keep the thin progress line. A browser test keeps a walk whose row list shrinks between two readings.
@@ -666,7 +748,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
     14. Open Legend values sit about 850 px from their labels: put them in a column near the longest label.
     15. "Next step room" puts its value on a second line: keep it on the first line, right-aligned to the label column end.
 
-**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
+**Workers:** `impl` owns `scripts/build_queue/memory_feed.py` and `scripts/build_queue/memory_live.html`; `test` owns `scripts/build_queue/test_memory_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
 ### Phase 10n — /build:queue retires when the build page covers it  · status: todo
 

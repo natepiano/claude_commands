@@ -254,7 +254,7 @@ The build queue reads process memory every ten seconds while open.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
 - Accounts: `AccountsView(elements, columns, status, zone, now)` uses the pane's width.
-  The columns are the access mark, `account`, `left`, `role`, `busy`, `shell`, `idle`, `total`, `resets`, `credits`, and `enabled`.
+  The columns are the access mark, `account`, `left`, `role`, `busy`, `idle`, `paused`, `exited`, `total`, `resets`, `credits`, and `enabled`.
   The table omits the `read` and `in use` columns.
   Account labels are bold, and numbers align to the right.
   Each role has a separate row with its own counts.
@@ -264,7 +264,9 @@ The build queue reads process memory every ten seconds while open.
   The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
   A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
-  Codex shell counts remain unknown; they do not become zero.
+  Units and showrunners without live sessions count as exited on their selected role account.
+  Workers count only while live; their paused and exited counts stay zero.
+  Paused stays zero until agents status supplies that state.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
   Low allowance uses error below 10 percent and warning below 25 percent.
   Tables use the widest cell or header, with two spaces between columns.

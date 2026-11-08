@@ -112,7 +112,7 @@ if "NESTED_LAUNCH" not in os.environ:
     Path(os.environ["MODELS_CONFIG_FILE"]).write_text(os.environ["NEXT_REGISTRY"])
     command = ["bash", os.environ["AGENT_EXEC"], "sample.task", "readonly", os.getcwd(),
                os.environ["PROMPT"], os.environ["NESTED_OUTPUT"], os.environ["NESTED_LOG"]]
-    sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+    with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.assign_launcher_test_support import backend_fixture_command
     command, environment = backend_fixture_command(
         Path(os.environ["NESTED_LOG"]).parent / "nested-assign-parent", command,

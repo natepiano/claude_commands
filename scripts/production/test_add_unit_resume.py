@@ -113,13 +113,15 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
         self.assertIn("Run /unit:direct", self.opening_prompt())
 
-    def test_resume_checks_session_cwd_instead_of_worktree(self) -> None:
+    def test_resume_writes_trust_for_session_cwd_instead_of_worktree(self) -> None:
         prior = self.root / "untrusted-session"
         prior.mkdir()
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(prior), "--account", "claude2")
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertIn(f"alpha: trust anomaly: Claude has not trusted {prior}", result.stderr)
+        with patch.dict(os.environ, self.env):
+            self.assertIsInstance(herdr.claude_trust(prior, Path(self.env["HOME"]) / ".claude2/.claude.json"), herdr.Trusted)
+        self.assertNotIn("trust anomaly:", result.stderr)
         self.assertIn("alpha started:", result.stdout)
         self.assertEqual(self.opened()[7], str(prior))
 

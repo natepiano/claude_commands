@@ -8,11 +8,9 @@ except FileNotFoundError:
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file
 from scripts.production import staff
 

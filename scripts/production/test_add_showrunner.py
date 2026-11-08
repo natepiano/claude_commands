@@ -9,7 +9,6 @@ import io
 import json
 import math
 import os
-import shlex
 import subprocess
 import sys
 import unittest
@@ -139,7 +138,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual((rows[0].id, rows[0].current_session), (registry["sessionId"], registry["sessionId"]))
 
     def test_showrunner_and_unit_add_paths_share_the_live_doc_admission_writer(self) -> None:
-        import add_unit
+        from scripts.production import add_unit
 
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         original = add_showrunner.ensure_staff_showrunner
@@ -481,7 +480,11 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             screen = "────────\n❯ \n────────"
             turn(meta=False)
 
-        def native_process(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        def native_process(command: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+                           environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if command[0] == "git":
+                return subprocess.run(command, env=environment, capture_output=True, text=True,
+                                      check=False, timeout=timeout)
             self.assertEqual(command[-4:], ["pane", "process-info", "--pane", "destination:p1"])
             self.assertGreater(timeout, 0)
             return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"process_info": {
@@ -603,21 +606,24 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertFalse(local.is_symlink())
         self.assertEqual(local.read_text(), "local skills data")
 
-    def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
+    def test_picked_named_account_writes_trust_despite_default_trust(self) -> None:
         directory = self.named_account()
         _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
         home = Path(self.env["HOME"])
-        _ = (home / ".claude.json").write_text(json.dumps({
+        write_text_atomic(home / ".claude.json", json.dumps({
             "oauthAccount": {"emailAddress": "main@example.invalid"},
             "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
-        _ = (directory / ".claude.json").write_text(json.dumps({
+        write_text_atomic(directory / ".claude.json", json.dumps({
             "oauthAccount": {"emailAddress": "target@example.invalid"}, "projects": {}}))
         now = datetime.now(timezone.utc)
         with patch.dict(os.environ, self.env):
             stored_room("target@example.invalid", 1, now + timedelta(days=1))
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude3. Run:")
-        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", self.opened())
+        with patch.dict(os.environ, self.env):
+            self.assertIsInstance(herdr.claude_trust(self.root / "kid-checkout", directory / ".claude.json"), herdr.Trusted)
 
     def test_showrunner_resume_refuses_unconfigured_directory_before_reading_its_trust(self) -> None:
         """F004: a retained directory cannot override group configuration."""
@@ -914,17 +920,18 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = edge.write_text(parent + "\n", encoding="utf-8")
         self.refused(self.run_command("grand"), "top already reports to grand, directly or through others")
 
-    def test_an_untrusted_start_folder_is_refused_naming_it_and_nothing_from_the_config(self) -> None:
+    def test_an_untrusted_start_folder_writes_trust_and_starts_without_config_contents(self) -> None:
         checkout = self.root / "kid-checkout"
         _ = self.doc("kid")
-        self.trust(self.root, extra={"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"})
-        result = self.run_command("kid", "--check")
-        self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on claude2. "
-                     + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
-                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
-                     + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude")
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        write_text_atomic(config, json.dumps({"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"}))
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("SECRET", result.stdout + result.stderr)
-        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(self.started()[2:4], ["agent", "start"])
+        with patch.dict(os.environ, self.env):
+            self.assertIsInstance(herdr.claude_trust(checkout, config), herdr.Trusted)
 
     def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:
         main = self.root / "main"
@@ -940,18 +947,29 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                 result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(folder), "--account", "claude2", "--check")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_a_trusted_parent_folder_does_not_cover_a_repository_below_it(self) -> None:
+    def test_a_repository_below_a_trusted_parent_gets_its_own_trust_key(self) -> None:
         _ = self.doc("kid")
-        _ = subprocess.run(["git", "init", "-q", str(self.root / "kid-checkout")], check=True, capture_output=True)
-        self.trust(self.root)
-        self.refused(self.run_command("kid", "--check"), "kid: Claude is not trusted in")
+        checkout = self.root / "kid-checkout"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        write_text_atomic(config, json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        settings = cast(dict[str, dict[str, dict[str, bool]]], json.loads(config.read_text()))
+        self.assertTrue(settings["projects"][str(checkout.resolve())]["hasTrustDialogAccepted"])
+        self.assertTrue(settings["projects"][str(self.root)]["hasTrustDialogAccepted"])
+        self.assertEqual(self.started()[2:4], ["agent", "start"])
 
-    def test_an_unreadable_config_refuses_without_its_contents(self) -> None:
-        _ = (self.root / "claude.json").write_text('{"oauthAccount": "SECRET-EMAIL", ', encoding="utf-8")
-        result = self.run_command("kid", "--check")
-        self.refused(result, f"kid: cannot read {self.root / 'claude.json'} to check Claude trust (JSONDecodeError)")
+    def test_an_unreadable_account_config_prints_one_anomaly_without_starting(self) -> None:
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        write_text_atomic(config, '{"oauthAccount": "SECRET-EMAIL", ')
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, add_showrunner.SESSION_NOT_READY, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(f"{self.root / 'kid-checkout'}: trust anomaly: {config}: JSONDecodeError", result.stderr)
         self.assertNotIn("SECRET", result.stderr)
-        self.assertEqual(self.herdr_calls(), [])
+        self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:
         self.env["CODEX_THREAD_ID"] = fixture_runtime_id("unattached-showrunner-caller")
