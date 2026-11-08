@@ -8,10 +8,9 @@ write_test_registry() {
 }
 
 registry_read_probe() {
-    eval "$(python3 - "$TEST_MODELS_REGISTRY_DIR/../.." "$1" "$2" <<'PYTHON'
+    eval "$("$TEST_MODELS_REGISTRY_DIR/py" - "$TEST_MODELS_REGISTRY_DIR/../.." "$1" "$2" <<'PYTHON'
 import os, shlex, sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
 from scripts.lib.test_models_registry import RegistryReadProbe
 environment = RegistryReadProbe(Path(sys.argv[2]), Path(sys.argv[3])).environment(os.environ)
 for name in ("TEST_REGISTRY_PATH", "TEST_REGISTRY_READS", "PYTHONPATH"):

@@ -2,14 +2,11 @@
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 import unittest
-from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import autocompact
 
 

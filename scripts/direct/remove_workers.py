@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle
 from scripts.production import session_staff, staff, worker_admission
 from scripts.lib import unit_runs

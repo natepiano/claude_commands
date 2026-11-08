@@ -83,6 +83,7 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         super().setUp()
         source = self.runner.read_text().replace('request = offload.request_from_arguments(args)',
             'request = offload.request_from_arguments(args)\n'
+            + 'import sys\n'
             + 'with (Path(os.environ["TEST_RUNNER_STATE"]) / "received-arguments").open("a") as output:\n'
             + '    output.write(json.dumps(sys.argv[1:]) + "\\n")')
         _ = self.runner.write_text(source)
@@ -182,7 +183,7 @@ class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        observe = f'''sys.path.insert(0, {str(VERIFY.parents[2])!r})
+        observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
 from scripts.mac_test import offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)
@@ -251,7 +252,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
 
     def test_final_exports_the_test_environment_to_a_copy_runner(self) -> None:
         # The Cargo consumer starts a real copy runner with the final step's environment.
-        copy = f'''    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+        copy = f'''    with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
     from scripts.mac_test import copy_watch
     request = copy_watch.WatchRequest(
         info=root / "info", result=root / "copy-result",

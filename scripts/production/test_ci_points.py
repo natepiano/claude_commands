@@ -984,7 +984,6 @@ def observed_lock(fd, operation):
         fcntl.flock = original
     return original(fd, operation)
 fcntl.flock = observed_lock
-sys.path.insert(0, os.path.dirname(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
         self.state.mkdir(exist_ok=True)

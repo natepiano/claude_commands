@@ -7,14 +7,12 @@ import os
 import io
 import time
 import subprocess
-import sys
 from contextlib import closing, redirect_stderr
 from datetime import timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.buildlog import costs
 from scripts.buildlog import index
@@ -171,15 +169,15 @@ class CostTests(unittest.TestCase):
             hold_event("ended", "held", fixtures.END.isoformat(), "mac"),
         )):
             pass
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import costs,holds,index; "
+        command = ("import sys; from scripts.buildlog import costs, holds, index; "
                    + "from datetime import UTC,datetime; "
                    + "assert costs.machine_name('mac','replacement',{}) == 'mac'; "
                    + "current=holds.CurrentHolds('',holds.NatedevHoldsNow(()),holds.MacHoldsNow(())); "
                    + "connection=index.read_only(); "
                    + "history=holds.read_hold_history(connection,current,datetime.now(UTC)); "
                    + "connection.close(); assert len(history.intervals) == 1; "
-                   + "assert not any(name in sys.modules for name in ('record','targets','build_hold','mac_test'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.build_targets.targets', 'scripts.build_hold.build_hold', 'scripts.mac_test.mac_test'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -301,9 +299,9 @@ class CostTests(unittest.TestCase):
         self.assertIn("usage: buildlog costs", errors.getvalue())
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import cli; cli.main(['help']); "
-                   + "assert not any(name in sys.modules for name in ('record','report','costs','launches'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+        command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.buildlog.report', 'scripts.buildlog.costs', 'scripts.buildlog.launches'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 

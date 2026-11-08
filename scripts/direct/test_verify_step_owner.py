@@ -106,7 +106,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-sys.path.insert(0, sys.argv[1])
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 
 signal.signal(signal.SIGTERM, signal.SIG_DFL)

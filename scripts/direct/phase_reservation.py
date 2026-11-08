@@ -61,14 +61,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import recorder_state  # noqa: E402
 
 PHASES_DIR = "phases"

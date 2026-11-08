@@ -22,12 +22,9 @@ class RegistrationTests(RegistrationFixture):
         harness = """
 import runpy
 import sys
-from pathlib import Path
 from unittest.mock import patch
 
 script, *arguments = sys.argv[1:]
-sys.path.insert(0, str(Path(script).parent))
-sys.path.insert(0, str(Path(script).parents[2]))
 from scripts.usage import agents_log
 sys.argv = [script, *arguments]
 with patch.object(agents_log, 'append', side_effect=RuntimeError('recording failed\\ntry later')):
