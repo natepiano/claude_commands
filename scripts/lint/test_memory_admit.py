@@ -5275,10 +5275,27 @@ class QueueLeaveTests(unittest.TestCase):
             fcntl.flock(other, fcntl.LOCK_EX)
             result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"nextest: {shared} of {width} test threads, shared with the runs in flight", result.stdout)
+        self.assertRegex(result.stdout,
+            rf"(?m)^nextest: {shared} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs "
+            + r"\([^()\n]+\); shared with the runs in flight$")
         self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
         self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
         self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+
+    def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
+        ran_args, reservation = self.root / "args", self.root / "reservation"
+        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
+        step = ('nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; '
+                + self.nextest_step(ran_args, reservation))
+        result = self.run_step(None, free, step)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        thread_lines = [line for line in result.stdout.splitlines() if line.startswith("nextest:")]
+        self.assertEqual(len(thread_lines), 1)
+        self.assertRegex(thread_lines[0],
+            r"\Anextest: 12 of 12 test threads; load \d+\.\d{2} on [1-9]\d* CPUs \([^()\n]+\)\Z")
+        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", "12"])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 12)
 
 
 class QueueExplanationTests(MemoryQueueFixture):
