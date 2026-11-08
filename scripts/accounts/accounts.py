@@ -41,7 +41,7 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, conf, unit_runs, models_registry  # noqa: E402
+from scripts.lib import atomic_file, conf, file_lock, unit_runs, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -934,17 +934,9 @@ def trust_configuration() -> TrustConfiguration:
     return TrustConfiguration(_trusted_folders(document))
 
 
-@contextmanager
-def claude_config_lock(path: Path) -> Generator[None]:
-    """Wait for the kernel lock until the current holder releases it."""
-    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        yield
-
-
 def _change_trust_file(home: Path, path: Path,
                        change: Callable[[dict[str, object]], dict[str, object]]) -> bool:
-    with _account_home_lock(home), claude_config_lock(path):
+    with _account_home_lock(home), file_lock.claude_config_lock(path):
         while True:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
