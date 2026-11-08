@@ -1825,7 +1825,7 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 - Each candidate names its covering test or its reason.
 - The director checks ten candidates from each report against the code.
 
-### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: todo
+### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: done
 **Depends on:** none
 
 #### Work Order
