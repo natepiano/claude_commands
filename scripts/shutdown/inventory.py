@@ -14,7 +14,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -169,6 +169,7 @@ class ShowrunnerRegistration:
 @dataclass(frozen=True)
 class ShowrunnerRegistrations:
     entries: tuple[ShowrunnerRegistration, ...]
+    retired_sessions: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -369,7 +370,9 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
         except (OSError, UnicodeError):
             continue
         found.append(ShowrunnerRegistration(target[8:], owner.name, str(doc.path)))
-    return ShowrunnerRegistrations(tuple(found))
+    retired = frozenset(str(identity) for row in record.rows if isinstance(row.worktree, staff.RemovedWorktree)
+                        for identity in (row.id, row.current_session))
+    return ShowrunnerRegistrations(tuple(found), retired)
 
 
 def unregistered_showrunners(
@@ -945,8 +948,9 @@ def inventory(
     candidates = [
         (record, _listed_session(record, productions, units, home_state))
         for record in records
-        if not only or _string(record.get("sessionId")) in only
-        or worker_owners.get(_string(record.get("sessionId"))) in only
+        if _string(record.get("sessionId")) not in timers.retired_sessions
+        and (not only or _string(record.get("sessionId")) in only
+             or worker_owners.get(_string(record.get("sessionId"))) in only)
     ]
     has_sessions = any(
         isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
