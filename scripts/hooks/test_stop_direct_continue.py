@@ -91,7 +91,8 @@ class DirectorStopTests(unittest.TestCase):
         self.assertIn(
             "Compaction runs when the context reaches 167,000 tokens. It does not run while the session is idle.\n"
             + "Take the next workflow action now. Do not wait for compaction.\n"
-            + "Read ~/.claude/commands/unit/direct.md after compaction.\n"
+            + "After compaction, read ~/.claude/commands/unit/direct.md in full.\n"
+            + "Then read each stub file whose moment is live.\n"
             + "If you need a user decision, state it in one line and end the turn.\n", result.stderr)
 
     def assert_allowed(self, result: subprocess.CompletedProcess[str]) -> None:

@@ -24,6 +24,7 @@ from typing import NamedTuple, TypedDict, cast, override
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
+from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -31,7 +32,7 @@ SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
-SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or session_send.SEND_SCRIPT)
 PARENT_FILE = "parent"
 from scripts.lib.user_zone import user_zone_name  # noqa: E402
 from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
@@ -526,8 +527,8 @@ class NoticeDelivery:
 def send_to_address(address: str, key: str, text: str, *, recipient: str,
                     sender: str = "showrunners") -> NoticeDelivery:
     """Send to a known session address with the same report as production notices."""
-    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", sender, "--key", key,
-                           "--text", text], capture_output=True, text=True, check=False)
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", sender, "--key", key,
+                           "--text", text, send_script=SEND), capture_output=True, text=True, check=False)
     if sent.returncode != 0:
         return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
                               failed=(recipient,))

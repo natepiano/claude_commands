@@ -33,7 +33,8 @@ the last stream per recipient stays in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Mesh `worker:` addresses keep their existing queues.
 Staff worker addresses use the run's pinned transport.
-Other `codex:` addresses queue through the shared Codex daemon.
+Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
+An absent staff recipient keeps its queue without selecting a session family.
 One staff snapshot selects each staff recipient.
 Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
@@ -141,6 +142,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
+from scripts.herdr.place import HerdrPlace
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start, unit_runs
@@ -612,11 +614,25 @@ class CodexSessionRecipient:
 
 
 @dataclass(frozen=True)
+class CodexPaneRecipient:
+    address: str
+    place: HerdrPlace
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class QueuedStaffRecipient:
+    address: str
+    name: str
+    session_id: str
+
+
+@dataclass(frozen=True)
 class PaneWorkerRecipient:
     row: staff.StaffRow
 
 
-SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
+SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient | CodexPaneRecipient
 
 
 @dataclass(frozen=True)
@@ -655,7 +671,7 @@ class TransportQueueOwner:
 TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
 
 
-DeliveryRoute = SessionRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+DeliveryRoute = SessionRecipient | QueuedStaffRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -1798,6 +1814,8 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
             usage_error(f"{address} is not assigned to a Codex worker")
         return CodexWorkerRecipient(address, entry.name, entry.assignment.session_dir)
     if address.startswith("codex:"):
+        if isinstance(entry.pane, HerdrPlace):
+            return CodexPaneRecipient(address, entry.pane, address.removeprefix("codex:"))
         if not isinstance(entry.daemon, codex_daemon.CodexDaemon):
             usage_error(f"{address} has no owning Codex daemon")
         return CodexSessionRecipient(
@@ -2044,7 +2062,10 @@ def resolve_recipient(
             return RecipientLookupFailed(
                 f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
         if isinstance(member, staff.StaffRow):
-            return ClaudeRecipient(f"session:{member.current_session}")
+            address = f"session:{member.current_session}"
+            if sessions.addressed(address, records or []) is not None:
+                return ClaudeRecipient(address)
+            return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
         usage_error(f"no staff row or live session for {to!r}")
@@ -2984,6 +3005,14 @@ def send(options: Options) -> Result:
         return _send(options, membership=membership)
 
 
+def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -> None:
+    """Submit text and require the selected pane to start a turn."""
+    from scripts.herdr import herdr
+
+    herdr.Herdr(place.session).prompt(
+        place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "") -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
@@ -2997,8 +3026,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
             try:
-                herdr.Herdr(herdr.shared_session()).prompt(
-                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
+                _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
+                             target=str(worker.current_session), timeout=timeout)
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr.HerdrFailure, OSError) as error:
                 reason = str(error)
@@ -3054,7 +3083,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                  else UserDelivery())
     else:
         route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
-    destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -3140,6 +3169,18 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
+    elif isinstance(route, CodexPaneRecipient):
+        from scripts.herdr import herdr
+
+        try:
+            _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
+            result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
+        except (herdr.HerdrFailure, OSError) as error:
+            result = Result("failed", str(error))
+    elif isinstance(route, QueuedStaffRecipient):
+        result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
+                        + " so it is kept for it")
+        enqueue(message, result.detail, started, recipient=stable, order=order)
     elif isinstance(route, PaneWorkerRecipient):
         result = deliver_worker_text(route.row, membership, agent_text(message),
                                      sender=message.sender, timeout=options.timeout)

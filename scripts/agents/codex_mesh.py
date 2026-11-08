@@ -49,7 +49,7 @@ from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
 from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceReleaseUnknown
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
-from scripts.message import sessions, process_table
+from scripts.message import sessions, process_table, session_send
 from scripts.message import repeat_guard
 from scripts.message import send_budget
 from scripts.whoami import account
@@ -8552,10 +8552,6 @@ def command_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
-# Delivers the sign-in change notice to the session holding a run.
-SEND_SCRIPT = Path(__file__).resolve().parent.parent / "message" / "send.py"
-
-
 def _marker_sessions(roots: tuple[Path, ...], folder: Path) -> list[str]:
     """The sessions whose run-active marker names `folder`: the marker's file name is the session id."""
     actives = [root / "active" for root in roots]
@@ -8613,8 +8609,8 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
 def _notify_holder(session_id: str, line: str) -> None:
     try:
         sent = subprocess.run(
-            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-sign-in",
-             "--summary", "Codex sign-in changed", "--text", line],
+            session_send.send_argv("--to", f"session:{session_id}", "--from", "codex-sign-in",
+                                   "--summary", "Codex sign-in changed", "--text", line),
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:

@@ -154,7 +154,8 @@ class FolderMoveBackend:
         ]
 
     def agents(self) -> list[herdr.AgentOccupant]:
-        return ([{"pane_id": "w1:p1", "agent": self.kind, "agent_status": herdr.AgentStatus.RUNNING}]
+        return ([{"pane_id": "w1:p1", "agent": self.kind, "agent_status": herdr.AgentStatus.RUNNING,
+                  "agent_session": herdr.NoReportedAgentSession()}]
                 if self.live else [])
 
     def observed_processes(self, **_options: object) -> list[herdr.HerdrProcess]:

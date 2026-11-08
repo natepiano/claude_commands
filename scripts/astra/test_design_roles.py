@@ -11,7 +11,6 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.server_test_support import owned_server_record
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import conf
 
 import ast
 import io
@@ -235,8 +234,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
             self.assertEqual(arguments[arguments.index(permission_flag) + 1], permission)
             if family == "codex":
                 self.assertIn(f'model_reasoning_effort="{effort}"', arguments)
-                compact = conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                self.assertIn(f"model_auto_compact_token_limit={compact}", arguments)
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
             self.assertNotIn("STAFF_ID", environment)
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id)), 2)
 
