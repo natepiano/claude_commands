@@ -2990,6 +2990,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 39: a Codex pane with no herdr `agent_session` gets its thread from `native_pane_process(...).current_identity` in `roster._herdr_codex_panes`. When the `codex_mesh` route goes, keep that fallback; a pane address does not need a daemon.
 - Phase 38: an assign judges one worker with `worker_panes.observe_worker` over one full identity scan. When the `codex_mesh` route goes, keep that rule; the mesh selection must not filter panes by label.
 - Phase 40: a Codex worker's thread comes only from its pane process, and `close --interrupt` quits before the worker lock. When the `codex_mesh` route goes, keep both; no lookup by tab name.
+- Phase 29: `worker_run` takes the worker row and returns the run of the worker's newest own pass; only a director-run question passes the director row. When the mesh records go, keep it, and add no scan of every run folder to a per-worker path.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3232,47 +3233,26 @@ The user decided worker question item 9 (through sdlc, 2026-11-07): "When a Code
 
 ### Phase 29 — A worker's run is the run of its own dispatch  · status: done
 
-**Depends on:** Phase 27 (it edits `scripts/production/worker.py` and `scripts/accounts/pane_moves.py`, which call `worker_run`). It lands before Phase 28 and Phase 19 (herdr, 2026-11-07: a live defect).
+#### As-built
 
-aws-unit, 2026-11-07 (through sdlc [4c690675]): a dispatch in run 8bf65047 exited 3 while its worker kept working, the worker's detached runs went to run 2b37ffed, and `worker_panes.py close` then refused with "launcher has not recorded a completed pass". One cause: `worker_panes.worker_run(parent)` (`scripts/herdr/worker_panes.py:431`) returns `unit_runs.held(...)[0]`, the director's first held run in folder-name order. A director with two run folders gets the wrong one for every caller: `mesh_runs.caller_from_environment` (`scripts/agents/mesh_runs.py:178`), `worker.py restore`, `worker_panes.close`, and the account moves (`pane_moves.run_for_worker`). The existing index `session_staff.worker_run_index(record)` (`scripts/production/session_staff.py:212`) already maps each worker row to the runs that hold its passes.
+`worker_panes.worker_run(member, *, record, scanned)` takes a staff row. For a worker row it reads the director's held runs and the fallback, and returns the run that holds the worker's newest own pass (`worker_pass`, newest `started_at`). With no pass it returns the director's first held run, else `RUN_DIR`, else the staff workers folder. A pass belongs to the worker its `worker_id` or `worker_name` names; `team_slot` counts only when the pass names no worker. For a director row it keeps the old lookup and reads no staff snapshot. It does not read `session_staff.worker_run_index`: that index holds only mesh-era records and scanned every run folder on each call.
 
-#### Work Order
+Worker callers pass the worker row: `send.resolve_recipient`, `worker.own_pass`, `worker.resume_workers` and `worker.restore` (one lookup per row), `worker_panes.can_close` and `close`, `pane_moves.run_for_worker`, and `mesh_runs.caller_from_environment`. `start_or_resume` keeps an existing worker's run only while its pass is `active` or `refused`; otherwise it takes the director's run, so a run handoff resumes in place. Callers that ask only about the director's run keep the director form: `restart.pane_workers`, `restart._observations`, `stop_resume.stop`, `stop_resume.stop_unit_workers`, `retire_unit.retire` and `production_lifecycle.wrap`.
 
-**Goal:** each caller reads a worker's run from that worker's own dispatch, never from the order of run folders.
+`claude_config_lock` moved from `accounts.py` to `scripts/lib/file_lock.py`; `accounts.py` and `herdr.py` import it there. This removed the basedpyright import cycle `accounts -> shutdown/inventory -> herdr -> accounts` (sdlc [97f69480]).
 
-**Spec:**
-
-1. `worker_run` takes the worker row. It returns the run of the worker's newest pass from the existing worker-to-run evidence (`session_staff.worker_run_index` or the reader under it). Do not add a second index.
-2. A worker with no pass in any run keeps today's answer (the director's first held run, else the fallback folder). `start_or_resume` picks a run before a new worker row exists: keep a parent path for `NewWorkerSlot`, and use the worker evidence only for an existing row.
-3. Change every caller of `worker_run` to pass the worker row: `mesh_runs.caller_from_environment`, `worker.py restore`, `worker_panes.close` (its `HolderRun.CURRENT` default), `pane_moves.run_for_worker`, and each other caller that `grep -rn "worker_run(" scripts` finds. A caller that asks only about the director's own run (such as the transport checks in `stop_resume.py` and `restart.py`) keeps the parent form; name each such caller in your summary (herdr, 2026-11-08).
-4. Add no check, refusal or validation that this list does not name.
+The merge of sdlc 9b30ae594 (agents 12) at the Phase 28 start joined restore: each worker is restored under its lock; a held lock gives `REFUSED`; a busy open worker is left unchanged; an idle open worker continues its dispatch in its conversation.
 
 **Files:**
-- `scripts/herdr/worker_panes.py`
-- `scripts/herdr/test_worker_panes.py`
-- `scripts/agents/mesh_runs.py`
-- `scripts/agents/test_mesh_runs.py`
-- `scripts/production/worker.py`
-- `scripts/production/test_worker.py`
-- `scripts/accounts/pane_moves.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/message/send.py`
-- `scripts/message/test_send.py`
-- `scripts/production/retire_unit.py`
-- `scripts/production/test_retire_unit.py`
-- `scripts/shutdown/restart.py`
-- `scripts/shutdown/test_restart.py`
-- `scripts/shutdown/stop_resume.py`
-- `scripts/shutdown/test_stop_resume.py`
-- `scripts/production/staff_test_support.py`
+- `scripts/herdr/worker_panes.py` — `worker_run`, `worker_pass`, `start_or_resume`, `can_close`, `close`.
+- `scripts/production/worker.py` — `own_pass`, `resume_workers`, `restore`.
+- `scripts/accounts/pane_moves.py`, `scripts/agents/mesh_runs.py`, `scripts/message/send.py`, `scripts/shutdown/restart.py`.
+- `scripts/lib/file_lock.py` — `claude_config_lock`; `scripts/accounts/accounts.py`, `scripts/herdr/herdr.py` import it.
+- Tests: `test_worker_panes.py` (two runs with the worker's run second; a foreign `test2` pass in slot `test`), `test_mesh_runs.py` (explicit `--to test` and implicit caller), `test_worker.py`, `test_accounts.py`, `test_restart.py`, `test_stop_resume.py`, `staff_test_support.py`.
 
-**Workers:** `1 writer`.
+**Binds later work:** a lookup for a worker passes the worker row; only a caller that asks about the director's own run passes the director row. Do not add a global run scan to a per-worker path.
 
-**Acceptance gate:**
-- New tests: a director with two runs whose names sort with the worker's run second; a first admission of a new worker while the director holds two runs; a detached run start routes to the worker's run; close reads the completed pass there and closes; restore and a move read the active dispatch there.
-- The changed test modules pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
-
+**Gotchas:** the gate found five faults the named tests missed (a director-row snapshot read, a stale restore text, an unreadable-state anomaly, a stale stop_resume call, a lost in-place resume). A change to a shared lookup needs every caller's tests run, not only the new ones.
 
 ### Phase 30 — A stashed draft comes back after a delivered prompt  · status: done
 
@@ -3376,12 +3356,12 @@ Live check on 2026-11-07 22:56 EST: herdr reported no session for morty's pane w
 
 A Codex launch reads its thread only from its own process (`native_process(pid, "codex")`). `Herdr.codex_client_session`, which read the staff row named by the tab, is gone; it bound new workers to another row's thread (the `01a1b` reports from cargo-liner). `pane_record.seed` uses the same process read. Under `launch_rollout_proof`, `native_process` does not fall back to a herdr-reported session.
 
-`_dispatch_turn` reads the dispatch receipt before the busy check, so a prompt delivered during the settle keeps its follower and never exits 6. `_start_locked` lets a done worker take another role. `worker.py restore` skips open workers. `mesh_runs.seat_name` resolves a herdr slot through its active pass first (`worker_name`, `worker_id`), then by name. `phase_reservation` claims read the recorded phase checkout.
+`_dispatch_turn` reads the dispatch receipt before the busy check, so a prompt delivered during the settle keeps its follower and never exits 6. `_start_locked` lets a done worker take another role. `worker.py restore` leaves a busy open worker unchanged (Phase 29's sdlc merge: an idle open worker continues its dispatch under its lock). `mesh_runs.seat_name` resolves a herdr slot through its active pass first (`worker_name`, `worker_id`), then by name. `phase_reservation` claims read the recorded phase checkout.
 
 **Files:**
 - `scripts/herdr/worker_panes.py` — `_completed_turn`, `_close_target`, `close(..., interrupt=)`, `close --interrupt`.
 - `scripts/herdr/herdr.py` — `Herdr.quit_agent`; `_codex_launch` reads the process only.
-- `scripts/production/worker.py` — receipt before the busy check; restore skips open workers.
+- `scripts/production/worker.py` — receipt before the busy check; restore leaves a busy open worker unchanged.
 - `scripts/agents/mesh_runs.py` — `seat_name`.
 - `scripts/direct/phase_reservation.py` — `_claim_command` reads the recorded checkout.
 - `scripts/shutdown/pane_record.py` — `seed` reads the pane's process.
@@ -3462,6 +3442,17 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 **Restructure (sdlc [a3ae4ca3], 2026-11-07):** fix-rounds-unit cuts `commands/unit/direct.md` to a core and moves mode-only sections to files read on demand. Merge sdlc after it lands, then put this phase's `direct.md` edits into the new layout.
 
 **Files (first list; the Work Order at the phase start settles it):** `scripts/production/worker.py` and `test_worker.py`; `scripts/direct/assign.py`, `assign.sh`, `progress_history.py` and their tests; `scripts/herdr/worker_panes.py` and `test_worker_panes.py`; one new turn-end hook script in `scripts/herdr/` with its test; `commands/unit/direct.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`; `docs/as-built/long-lived-workers.md` and `herdr-adoption.md`.
+
+### Phase 42 — A renamed unit keeps its workers  · status: todo
+
+**Depends on:** Phase 28 (it runs after 28; sdlc [1a1bc926], 2026-11-08).
+
+cargo-liner, 2026-11-08 [ad9ed854], after the handler unit rename (`remove-running-section-handler` to `cargo-liner-handler`, `rename_unit.py`):
+
+1. The relaunch resumed two retained Codex reviewers (`cargo-liner-handler-review` w12:p22, `review2` w12:p23) without `--sandbox` and `--ask-for-approval`. `worker_panes._live_policy` now refuses each dispatch to them with "running launch policy is incomplete".
+2. After the rename the unit name stays `handler`, but the workers are named `cargo-liner-handler-*`. `assign.sh --to review` (a short name) opened new panes `handler-review` and `handler-review2` (w12:p2D, w12:p2E). Publication was refused, so these panes hold idle Codex with no staff row.
+
+Fix each defect where it lives. If the resume without the policy flags comes from `rename.py` or the agents restart path, tell sdlc, which sends that part to agents-unit. The Work Order is written at the phase start. Send the Phase 42 ETA to sdlc when Phase 28 is out, and send cargo-liner the main hash.
 
 ## Reference
 
