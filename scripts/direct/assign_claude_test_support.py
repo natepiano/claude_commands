@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import ClassVar, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.direct.assign_launcher_test_support import changed_files, snapshot_files
 from scripts.lib.atomic_file import write_text_atomic
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -169,17 +170,15 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         key = "repair" if repair else "first"
         session = self.root / "first-launch"
         if key not in self.completed_setups:
-            before = {path.relative_to(self.root): path.read_bytes()
-                      for path in self.root.rglob("*") if path.is_file() and not path.is_symlink()}
+            before = snapshot_files(self.root)
             if repair:
                 session, result = self.first_worker_launch()
                 self.open_repair_round(session)
             else:
                 session = self.start_phase("first-launch")
                 result = self.worker_launch(session)
-            files = tuple(LauncherSetupFile(path.relative_to(self.root), path.read_bytes(), path.stat().st_mode)
-                          for path in self.root.rglob("*") if path.is_file() and not path.is_symlink()
-                          and before.get(path.relative_to(self.root)) != path.read_bytes())
+            files = tuple(LauncherSetupFile(artifact.relative, artifact.content, artifact.mode)
+                          for artifact in changed_files(self.root, before))
             self.completed_setups[key] = CompletedLauncherSetup(self.root, files, result, self.staff_parent)
         else:
             completed = self.completed_setups[key]
