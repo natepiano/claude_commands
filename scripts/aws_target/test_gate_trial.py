@@ -27,6 +27,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.production import merge_gate
 from scripts.lib import conf
+from scripts.lint.memory_test_support import config_environment
 
 
 def trial_config() -> str:
@@ -293,6 +294,7 @@ class GateTrialTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for command in (['git', 'init', '-q', str(self.repo)],
@@ -501,21 +503,36 @@ class GateTrialTests(unittest.TestCase):
 
     def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
         main_thread = threading.get_ident()
+        schedule = trial.GateTrial.schedule
         for number in trial.TRIAL_SIGNALS:
             with self.subTest(number=number):
                 self.fake = FakeAws(self.clock)
-                barrier = threading.Barrier(2, timeout=10)
+                waiting: set[str] = set()
+                sent = False
                 def result(key: str) -> None:
-                    _ = barrier.wait()
-                    if key.startswith('8-'):
-                        # Wake the Python handler's thread instead of an unrelated helper thread.
-                        signal.pthread_kill(main_thread, number)
                     command = self.command
                     assert command is not None
                     with command.changed:
+                        waiting.add(key)
+                        command.changed.notify_all()
                         self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
+                def schedule_with_signal(command: trial.GateTrial, step: str, sizes: Sequence[int], runs: int,
+                                         reserve: float, vcpus: int) -> None:
+                    wait = command.changed.wait
+                    def deliver_signal(timeout: float | None = None) -> bool:
+                        nonlocal sent
+                        if threading.get_ident() == main_thread and len(waiting) == 2 and not sent:
+                            # Deliver the signal after both worker reads block, from the scheduler thread.
+                            sent = True
+                            signal.raise_signal(number)
+                            return True
+                        return wait(timeout)
+                    with mock.patch.object(command.changed, 'wait', side_effect=deliver_signal):
+                        schedule(command, step, sizes, runs, reserve, vcpus)
                 self.fake.before_result = result
-                command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
+                with mock.patch.object(trial.GateTrial, 'schedule', new=schedule_with_signal):
+                    command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
+                self.assertTrue(sent)
                 self.assertEqual(self.fake.launches, 2)
                 self.assertTrue(command.interrupted)
                 self.assertEqual([row.verdict for row in command.attempts].count('cancelled'), 2)
@@ -630,6 +647,22 @@ class GateTrialTests(unittest.TestCase):
         self.assertEqual(request['InstanceMarketOptions'], {'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time'}})
         self.assertNotIn('authorize-security-group-ingress', self.operations())
         self.assertNotIn('iam', [service for service, _, _ in self.fake.calls])
+
+    def test_fixture_uses_repository_packages_when_live_config_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            live = home / '.claude/config'
+            live.mkdir(parents=True)
+            _ = (live / 'cloud_gate.conf').write_text('packages=live-only-package\n')
+            environment = {key: value for key, value in os.environ.items() if key != 'CONF_DIR'}
+            environment['HOME'] = str(home)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(conf.read_or_repository('cloud_gate').words('packages'), ('live-only-package',))
+                case = GateTrialTests('test_user_data_schedules_shutdown_first_and_contains_only_url_credentials')
+                result = unittest.TestResult()
+                _ = case.run(result)
+                self.assertTrue(result.wasSuccessful(), str(result.errors + result.failures))
+                self.assertEqual(result.testsRun, 1)
 
     def test_user_data_schedules_shutdown_first_and_contains_only_url_credentials(self) -> None:
         _ = self.run_trial()
@@ -1030,6 +1063,11 @@ class GateTrialTests(unittest.TestCase):
 
 @final
 class GuestTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
+
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
         url = prefix + 'a' * (400 - len(prefix))
