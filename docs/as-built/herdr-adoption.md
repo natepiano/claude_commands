@@ -162,7 +162,9 @@ Exit 6 means busy before submission.
 2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
 3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
 
-The answer uses the existing herdr pane input path.
+A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
+Herdr checks the target before each key.
+Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
 

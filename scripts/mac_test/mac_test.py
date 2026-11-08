@@ -24,15 +24,13 @@ import sys
 import tempfile
 import time
 import threading
-from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
 from scripts.build_hold import override_guard
-from scripts.build_hold import build_hold
 from scripts.mac_test import offload
 from scripts.lib import conf
-from scripts.lint import sweep
 from scripts.lib.user_zone import user_zone
 
 from scripts.message import session_send
@@ -40,6 +38,9 @@ from scripts.lib import process_start as process_identity
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
+
+if TYPE_CHECKING:
+    from scripts.build_hold import build_hold
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -765,6 +766,8 @@ def read_claim_block(paths: StatePaths) -> MacBlockState:
 
 def blocking_claim_block(paths: StatePaths) -> MacBlockState:
     """Return the block that prevents this session from starting new work."""
+    from scripts.build_hold import build_hold
+
     block = read_claim_block(paths)
     if isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()):
         return NO_MAC_BLOCK
@@ -1979,6 +1982,8 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
+    from scripts.build_hold import build_hold
+
     owner = build_hold.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
@@ -1991,6 +1996,8 @@ def block_belongs_to(
     block: PendingMacBlock | ActiveMacBlock,
     owner: build_hold.OwningSession | build_hold.NoOwningSession,
 ) -> bool:
+    from scripts.build_hold import build_hold
+
     return (
         isinstance(owner, build_hold.OwningSession)
         and isinstance(block.delivery, RecordedSession)
@@ -2042,6 +2049,8 @@ def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
+    from scripts.build_hold import build_hold
+
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
@@ -2290,6 +2299,8 @@ def free_now(
     claim gives way to a new test, so it holds the scope only for another copy
     (`copy`).
     """
+    from scripts.lint import sweep
+
     if not offload.read_config(settings).enabled:
         return "off"
     backoff = (offload.read_backoff(time.time()) if paths.target == "mac"
