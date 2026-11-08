@@ -308,6 +308,24 @@ def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
     return UncertainWorker(row, reason)
 
 
+def agent_name(owner: staff.StaffRow, name: str) -> str:
+    """Use the owner name to distinguish workers on the shared server."""
+    return f"{owner.name}-{name}"
+
+
+def rename_workers(owner: staff.StaffRow, client: herdr.Herdr) -> None:
+    """Rename worker panes before the owner name changes."""
+    record = staff.snapshot()
+    if not record.find(kind="worker", parent=owner.id):
+        return
+    for observed in _evidence(owner.id, record, client).states:
+        if isinstance(observed, (OpenWorker, StoppedWorker)):
+            name = agent_name(owner, observed.row.name)
+            if isinstance(observed, OpenWorker):
+                _ = client.run("agent", "rename", observed.pane, name)
+            _ = client.retitle(observed.pane, name, tab=False)
+
+
 def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
     """Read agent status for worker and freestanding displays."""
     return client.agents()
@@ -360,9 +378,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
             else:
                 states.append(OpenWorker(row, identity, terminal, statuses.get(identity, herdr.AgentStatus.UNKNOWN)))
             continue
-        labels = {row.name}
-        if isinstance(selection, SelectedWorkers) and parent_row is not None:
-            labels.add(f"{parent_row.name}-{row.name}")
+        labels = {row.name, agent_name(parent_row, row.name)} if parent_row else {row.name}
         labelled = [pane for pane in panes if pane.get("label") in labels
                     and _text(pane, "tab_id") in parent_tabs]
         related_unknown = [item for item in scan.unknown if any(
@@ -464,6 +480,16 @@ def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *
     if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
         raise ValueError(f"{label}: terminal identity is missing or duplicated")
     return pane
+
+
+def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
+                         owner: staff.StaffRow, name: str) -> Mapping[str, object] | herdr.NoPane:
+    """Find the full worker label, or a retained short label."""
+    for label in (agent_name(owner, name), name):
+        pane = labelled_pane(panes, tab, label)
+        if not isinstance(pane, herdr.NoPane):
+            return pane
+    return herdr.NoPane(name)
 
 
 def worker_run(member: staff.StaffRow, *,
@@ -715,8 +741,9 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         return _uncertain(parent, "parent pane is unavailable or duplicated")
     parent_pane = parents[0]
     tab = _text(parent_pane, "tab_id")
+    label = agent_name(parent, name)
     try:
-        pane = labelled_pane(evidence.panes, tab, name)
+        pane = worker_labelled_pane(evidence.panes, tab, parent, name)
     except ValueError as error:
         return _uncertain(parent, str(error))
     if not isinstance(pane, herdr.NoPane):
@@ -730,7 +757,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     workers.update(_text(pane, "pane_id") for pane in evidence.panes
                    if _text(pane, "terminal_id") in evidence.layout_terminals and _text(pane, "tab_id") == tab)
     if not workers:
-        return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, name)
+        return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, label)
     layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
     nodes = [layout.get("root")]
     ordered: list[str] = []
@@ -743,7 +770,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
             nodes.extend((node.get("second"), node.get("first")))
     if not ordered:
         return _uncertain(parent, "worker panes are absent from the split tree")
-    return herdr.SplitPane(ordered[-1], "down", ratio, name)
+    return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
@@ -838,7 +865,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         parents = evidence.scan.found.get(owner.id, [])
         tab = _text(parents[0], "tab_id") if len(parents) == 1 else ""
         try:
-            pane = labelled_pane(evidence.panes, tab, name.value) if tab else herdr.NoPane(name.value)
+            pane = worker_labelled_pane(evidence.panes, tab, owner, name.value) if tab else herdr.NoPane(name.value)
         except ValueError as error:
             return _uncertain(owner, str(error))
         if not isinstance(pane, herdr.NoPane):
@@ -932,7 +959,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         launched = launch(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
+            int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
