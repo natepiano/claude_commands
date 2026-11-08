@@ -264,7 +264,7 @@ The guard distinguishes no forbidden operation, a specific detected repository-t
 | --- | --- |
 | `scripts/copies/copies.py` | Creates fresh checkouts, standing checkouts, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
-| `scripts/production/resume_unit.py` | Restores original unit worktrees. |
+| `scripts/shutdown/shutdown.py` | Restores original unit worktrees. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |

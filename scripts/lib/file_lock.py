@@ -36,6 +36,14 @@ def exclusive(path: Path, *, wait: bool = True) -> Generator[LockResult]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def claude_config_lock(path: Path) -> Generator[None]:
+    """Wait for the kernel lock until the current holder releases it."""
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
 def device_key(path: str | Path) -> str:
     """Identify the device and inode used by the kernel lock table."""
     status = os.stat(path)

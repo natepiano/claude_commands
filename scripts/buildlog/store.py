@@ -19,7 +19,6 @@ import json
 import mmap
 import os
 import socket
-import sys
 import traceback
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
@@ -27,18 +26,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, cast
 
-
-def _register_module_aliases() -> None:
-    """Share this module through both import names and its package attribute."""
-    module = sys.modules[__name__]
-    sys.modules["store"] = module
-    package = sys.modules.get("scripts.buildlog")
-    if package is not None:
-        sys.modules["scripts.buildlog.store"] = module
-        setattr(package, "store", module)
-
-
-_register_module_aliases()
 
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"

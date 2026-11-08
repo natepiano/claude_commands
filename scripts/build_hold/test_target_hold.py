@@ -5,18 +5,12 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
 import io
-from pathlib import Path
 import subprocess
-import sys
-from typing import TYPE_CHECKING, override
+from typing import override
 from unittest import mock
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
-if TYPE_CHECKING:
-    from ..mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
-else:
-    from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
+from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
 
 ORIGINAL_RUN = subprocess.run
 ORIGINAL_POPEN = subprocess.Popen

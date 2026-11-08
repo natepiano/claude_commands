@@ -55,7 +55,7 @@ def units_of(production_name: str) -> list[LiveUnit]:
 
 
 def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> list[LiveUnit]:
-    statuses = {row.name: "paused" if isinstance(row.paused, staff.Paused) else "active" for row in rows}
+    statuses = {row.name: "exited" if isinstance(row.exited, staff.Exited) else "paused" if isinstance(row.paused, staff.Paused) else "active" for row in rows}
     return [unit._replace(status=statuses.get(unit.unit, "active")) for unit in units]
 
 

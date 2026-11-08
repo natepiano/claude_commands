@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal
 from scripts.lib import conf, file_lock
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims
 from scripts.lint import tmp_sweep
@@ -397,6 +398,9 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
 
     def probe_command(self) -> subprocess.CompletedProcess[str]:
+        scripts = self.root / ".claude/scripts"
+        scripts.parent.mkdir(exist_ok=True)
+        scripts.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
         tools = self.root / "probe-tools"
         tools.mkdir()
         log = self.root / "probe-calls"
@@ -415,14 +419,17 @@ def trace(frame, event, argument):
             with log.open('a') as output:
                 output.write(frame.f_code.co_name + '\\n')
 sys.setprofile(trace)
-program = sys.argv[2]
-sys.argv = sys.argv[2:]
+program_index = sys.argv.index("-c") + 1
+program = sys.argv[program_index]
+sys.argv = sys.argv[program_index:]
 exec(compile(program, '<remote-probe>', 'exec'))
 """)
         python.chmod(0o755)
+        seed_interpreter_cache(self.root / "probe-cache", python)
         return subprocess.run(["/bin/sh", "-c", copies.mirror_probe_setup(str(self.mirror))],
                               env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                   "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+                                   "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                                   "XDG_CACHE_HOME": str(self.root / "probe-cache"), "CLAUDE_PYTHON": ""},
                               capture_output=True, text=True, timeout=10)
 
     def test_marked_probe_starts_no_remote_python(self) -> None:
@@ -442,7 +449,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
-        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "production/resume_unit.py",
+        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "shutdown/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
 
