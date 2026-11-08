@@ -44,6 +44,7 @@ class UnitRunsTest(StaffTestCase):
         for run in (first, second):
             run.mkdir()
             write_text_atomic(run / unit_runs.STATE_FILE, "{}")
+            write_text_atomic(run / "fixture-impl_status", "running\n")
         record = staff.snapshot()
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             for run in (first, second, first, second):

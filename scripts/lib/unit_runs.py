@@ -246,7 +246,7 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
         return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
     except missing_owner as error:
         if _has_resumable_workers(run, record=record):
-            print(f"anomaly: {run}: {error}", file=sys.stderr)
+            report_anomaly(f"anomaly: {run}: {error}")
         return ""
     except (OSError, ValueError) as error:
         report_anomaly(f"anomaly: {run}: {error}")
