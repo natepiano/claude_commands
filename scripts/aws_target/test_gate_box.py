@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import base64
-import gzip
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 from types import SimpleNamespace
 from typing import Self, cast
 import unittest
@@ -33,6 +33,7 @@ class GateBoxTests(unittest.TestCase):
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+                 'guest': 's3://fixture/requests/attempt.guest.py', 'request': 's3://fixture/requests/attempt.json',
                  'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json',
                  'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log'}
         script = gate_box.user_data(links, 'fixture-revision', 20, 5, 1800)
@@ -47,8 +48,42 @@ class GateBoxTests(unittest.TestCase):
         result = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True,
                                 timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        encoded = script.split("printf '%s' ", 1)[1].split(' | base64', 1)[0]
-        self.assertEqual(gzip.decompress(base64.b64decode(shlex.split(encoded)[0])).decode(), gate_box.GUEST)
+        self.assertNotIn('base64 -d', script)
+        self.assertNotIn(gate_box.GUEST, script)
+        self.assertIn('aws s3 cp s3://fixture/requests/attempt.guest.py /var/lib/gate-trial/guest.py', script)
+        self.assertIn('aws s3 cp s3://fixture/requests/attempt.json /var/lib/gate-trial/request.json', script)
+        session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
+        self.assertLess(session.index('aws s3 cp s3://fixture/requests'), session.index('exec python3'))
+
+    def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
+        modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
+        links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+                 'attempt': 'a' * 32, 'commit': 'b' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
+                 'origin': 'https://example.invalid/team/project.git', 'source': 's3://fixture/source/' + 'd' * 64 + '.bundle',
+                 'guest': 's3://fixture/requests/attempt.guest.py', 'request': 's3://fixture/requests/attempt.json',
+                 'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log',
+                 'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json'}
+        script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
+        self.assertLess(len(base64.b64encode(script.encode())), 25600)
+        self.assertNotIn('test_module_', script)
+        self.assertNotIn('"modules"', script)
+        self.assertNotIn(base64.b64encode(gate_box.GUEST.encode()).decode(), script)
+        session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
+        downloads = session[session.index('aws s3 cp s3://fixture/requests'):session.index('ln -sf')]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _ = (root / 'source.py').write_text(gate_box.GUEST)
+            _ = (root / 'manifest.json').write_text(json.dumps({'modules': modules}))
+            aws = root / 'aws'
+            _ = aws.write_text('#!/bin/sh\ncase "$3" in *.guest.py) cp "$FIXTURE/source.py" "$4" ;;'
+                               + ' *.json) cp "$FIXTURE/manifest.json" "$4" ;; *) exit 1 ;; esac\n')
+            aws.chmod(0o700)
+            result = subprocess.run(['sh', '-ec', downloads.replace('/var/lib/gate-trial', str(root))],
+                env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root)},
+                text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
+            self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3)

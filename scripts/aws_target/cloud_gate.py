@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import cast, final
+from typing import Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
@@ -78,6 +78,11 @@ def aws_down(reason: str) -> bool:
 def image_missing(reason: str) -> bool:
     return any(code in reason for code in ('NoSuchBucket', 'InvalidAMIID.NotFound', 'InvalidAMIID.Unavailable',
                                            'InvalidLaunchTemplateId.NotFound'))
+
+
+def launch_error_code(reason: str) -> str:
+    code = re.search(r'\(([A-Za-z0-9_.-]+)\)', reason) or re.match(r'[A-Za-z0-9_.-]+', reason)
+    return code[1] if code and code.lastindex else code[0] if code else ''
 
 
 def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
@@ -215,6 +220,17 @@ class GateWorker:
                 if self.api.observe(instance, int(self.clock())).state == 'terminated':
                     self.book.resolve_gate(reservation.attempt, ledger.GateTerminated(int(self.clock()), instance))
 
+    def record_launch(self, request: dict[str, object], size: str, zone: str,
+                      result: Literal['launched', 'refused'], reason: str = '') -> None:
+        error_code = launch_error_code(reason)
+        row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
+            'vcpus': self.size_vcpus, 'availability_zone': zone, 'result': result,
+            'error_code': error_code, 'reason': reason}
+        with store.locked_append(self.book.directory / 'cloud-gate-launches.jsonl') as handle:
+            store.append_locked(handle, row)
+        if result == 'refused':
+            print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
@@ -231,7 +247,10 @@ class GateWorker:
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = ledger.text(deployment, 'artifact_prefix') + '__INSTANCE_ID__/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
-                links.update(production='true', step='size', expires=str(request['expires']), modules=json.dumps(request['modules']),
+                bucket = 's3://' + ledger.text(deployment, 'bucket')
+                links.update(production='true', step='size', expires=str(request['expires']),
+                             guest=bucket + '/requests/' + ledger.text(request, 'attempt') + '.guest.py',
+                             request=bucket + '/requests/' + ledger.text(request, 'attempt') + '.json',
                              source='s3://' + ledger.text(deployment, 'bucket') + '/' + ledger.text(request, 'source_key'),
                              log='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/gate.log',
                              result='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/result.json')
@@ -269,10 +288,16 @@ class GateWorker:
                 for retry in range(settings().whole('launch_reply_tries')):
                     try:
                         reply = self.api.call('run-instances', '--cli-input-json', json.dumps(arguments))
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'launched')
                         break
                     except AwsUnavailable as error:
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused', str(error))
                         if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
                             raise
+                    except subprocess.SubprocessError as error:
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused',
+                                           type(error).__name__ + ': ' + str(error))
+                        raise
                 else:
                     raise AssertionError('The launch retry count must be positive')
             except AwsUnavailable as error:
@@ -281,10 +306,8 @@ class GateWorker:
                     launch = {}
                     save(path, {'variant': offset + 1})
                     continue
-                if image_missing(str(error)):
-                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                    return LocalFallback('image or stack is absent')
-                raise
+                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                return LocalFallback(f'{size} in {ledger.text(subnet, "zone")}: {launch_error_code(str(error))}')
             instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
@@ -312,6 +335,9 @@ class GateWorker:
                     bucket = ledger.text(deployment, 'bucket')
                     self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
                     self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
+                    guest = folder / 'guest.py'
+                    _ = guest.write_text(gate_box.GUEST)
+                    self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
                 except AwsUnavailable as error:
                     if aws_down(str(error)) or image_missing(str(error)):
                         self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))

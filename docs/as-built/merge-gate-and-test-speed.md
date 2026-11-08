@@ -45,6 +45,11 @@ The route selects targeted modules on natedev.
 It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
 The guest verifies the tree and runs only the supplied paths from that checkout.
 The trial and route share `scripts/aws_target/gate_box.py`.
+The boot script downloads the guest program before Python starts.
+Production also downloads the request that contains the module list.
+User data contains the download links instead of the program or module paths.
+Production uses the instance role and S3 inside the tools shell.
+The trial uses signed HTTPS links for its program and source bundle.
 The guest performs no type check and installs no basedpyright package.
 An explicit type request and the nightly checker remain local.
 
@@ -53,13 +58,21 @@ Both sizes use one-time Spot with termination on interruption and shutdown.
 Termination deletes the root volume.
 A guest deadline and an independent expiry Lambda bound normal attempt lifetimes.
 The route confirms termination before it releases unused cost reservation.
-An uncertain reply retains the saved launch token, arguments, and reservation across restart.
+A launch timeout retains the saved launch token, arguments, and reservation across restart.
 
-Local fallback requires AWS failure, an absent image or stack, a shared spending cap, or capacity refusal at both sizes.
+Every AWS launch refusal permits local fallback.
+Capacity refusals first exhaust the configured sizes and zones.
+Other fallback causes include AWS failure, an absent image or stack, and a shared spending cap.
+The route releases the cost reservation and cloud slot before local admission.
 A remote failure remains red. A dead instance without a final result also remains red.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once under the real remote host.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
+The AWS state folder retains `cloud-gate-launches.jsonl`.
+Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
+Local fallback prints `Cloud gate uses natedev: <reason>`.
+These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.
 It checks the existing $20 daily cap, $400 monthly cap, and safety reserve under one cost lock.

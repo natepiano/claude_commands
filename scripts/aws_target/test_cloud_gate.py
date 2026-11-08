@@ -40,6 +40,7 @@ class FakeGateAws:
         self.terminated: bool = False
         self.confirm_termination: bool = True
         self.upload_error: str = ''
+        self.launch_timeouts: int = 0
 
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
@@ -54,6 +55,9 @@ class FakeGateAws:
             error = self.upload_error
         elif operation == 'run-instances':
             self.launches.append(ledger.mapping(cast(object, json.loads(args[args.index('--cli-input-json') + 1]))))
+            if self.launch_timeouts:
+                self.launch_timeouts -= 1
+                raise subprocess.TimeoutExpired('aws run-instances', 1)
             error = self.refusals.pop(0) if self.refusals else ''
             reply = {'Instances': [{'InstanceId': 'i-fixture'}]}
         elif operation == 'get-object':
@@ -211,8 +215,46 @@ class CloudGateTests(CostFixture):
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
         self.fake.refusals = ['InsufficientInstanceCapacity'] * 4
-        self.assertEqual(self.execute()['status'], 'fallback')
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(self.execute()['status'], 'fallback')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        rows = [ledger.mapping(cast(object, json.loads(line)))
+                for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row['result'] == 'refused' for row in rows))
+        self.assertEqual(output.getvalue().count('Cloud gate refused:'), 4)
+
+    def test_rejected_parameter_falls_back_and_records_a_refusal(self) -> None:
+        reason = ('An error occurred (InvalidParameterValue) when calling the RunInstances operation: '
+                  + 'Encoded User data is limited to 25600 bytes; account 123456789012 subnet-fixture i-private')
+        self.fake.refusals = [reason]
+        with redirect_stdout(StringIO()) as output:
+            outcome = self.execute()
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn('InvalidParameterValue', str(outcome['reason']))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        rows = [ledger.mapping(cast(object, json.loads(line)))
+                for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'error_code': 'InvalidParameterValue', 'reason': reason}])
+        self.assertEqual(output.getvalue(), 'Cloud gate refused: m7a.8xlarge in a: InvalidParameterValue\n')
+        for private in ('123456789012', 'subnet-fixture', 'i-private', 'RED'):
+            self.assertNotIn(private, output.getvalue() + str(outcome))
+
+    def test_launched_box_records_vcpus_and_download_links(self) -> None:
+        self.assertEqual(self.execute()['status'], 'complete')
+        rows = [ledger.mapping(cast(object, json.loads(line)))
+                for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': ''}])
+        encoded = ledger.text(self.fake.launches[0], 'UserData')
+        import base64
+        data = base64.b64decode(encoded).decode()
+        self.assertLess(len(encoded), 25600)
+        self.assertNotIn('test_module_0000.py', data)
+        self.assertIn('requests/attempt.guest.py', data)
+        self.assertIn('requests/attempt.json', data)
+        self.assertEqual((self.folder / 'guest.py').read_text(), gate_box.GUEST)
 
     def test_aws_outage_before_launch_allows_fallback(self) -> None:
         self.fake.upload_error = 'EndpointConnectionError'
@@ -235,7 +277,7 @@ class CloudGateTests(CostFixture):
         self.assertEqual(self.fake.launches[0], self.fake.launches[1])
 
     def test_uncertain_launch_retains_reservation_and_recovers_after_restart(self) -> None:
-        self.fake.refusals = ['EndpointConnectionError'] * 2
+        self.fake.launch_timeouts = 1
         self.assertEqual(self.execute()['status'], 'pending')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
         self.assertEqual(self.execute()['status'], 'complete')

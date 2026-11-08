@@ -6,8 +6,6 @@ from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import BytesIO, StringIO
-import base64
-import gzip
 import json
 import os
 import pathlib
@@ -399,8 +397,8 @@ class GateTrialTests(unittest.TestCase):
                 prices = trial.Prices(**command.attempts[0].prices)
                 lifetime = 30 * 60
                 uploads = lifetime // 15 * boots
-                self.assertEqual(command.puts, 1 + 2 * boots + uploads)
-                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (4 + uploads)
+                self.assertEqual(command.puts, 2 + 2 * boots + uploads)
+                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (5 + uploads)
                             + prices.get * (lifetime * 2 / command.option('poll_pause_s') + 100))
                 self.assertAlmostEqual(command.projection(prices, step), expected)
                 self.assertIn('while sleep 15; do', self.fake.payloads[-1])
@@ -660,10 +658,12 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
         self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
-        encoded = data.split("printf '%s' ", 1)[1].split(' | base64', 1)[0]
-        guest = gzip.decompress(base64.b64decode(shlex.split(encoded)[0])).decode()
-        self.assertEqual(guest, trial.GUEST)
-        self.assertIn('machine=merge_gate.WholeMachine(timings)', guest)
+        self.assertEqual(self.fake.bundles[-1].decode(), trial.GUEST)
+        self.assertIn('guest.py?X-Amz-', data)
+        self.assertIn('-o /var/lib/gate-trial/guest.py', data)
+        self.assertNotIn('base64 -d', data)
+        self.assertNotIn(trial.GUEST, data)
+        self.assertIn('machine=merge_gate.WholeMachine(timings)', trial.GUEST)
         self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
         self.assertNotIn('admission_service.py', data)
         self.assertNotIn('governor_gib', data)
@@ -1033,12 +1033,12 @@ class GuestTests(unittest.TestCase):
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
         url = prefix + 'a' * (400 - len(prefix))
         links = {'step': 'size', 'commit': 'a' * 40,
-                 **dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
+                 **dict.fromkeys(('source', 'guest', 'log', 'result', 'ready-cold', 'ready-warm', 'module_seconds'), url)}
         data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         self.assertLessEqual(len(data.encode()), 16384)
 
     def tool_session(self) -> str:
-        links: dict[str, str] = dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
+        links: dict[str, str] = dict.fromkeys(('source', 'guest', 'log', 'result', 'ready-cold', 'ready-warm'), 'https://fixture.invalid/object')
         links['step'] = 'size'
         data = trial.user_data(links, 'f' * 40, 30, 30, 600)
         return shlex.split(data[data.index('nix --extra-experimental-features'):])[-1]
@@ -1110,7 +1110,8 @@ class GuestTests(unittest.TestCase):
             mount = tools / 'mount'
             _ = mount.write_text('#!/bin/sh\ncp -a "$2"/. "$3"/\n')
             mount.chmod(0o700)
-            setup = self.tool_session().split('chown -R', 1)[0]
+            session = self.tool_session()
+            setup = session[session.index('ln -sf'):].split('chown -R', 1)[0]
             setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('/run/gate-trial-bin', str(root / 'profile'))
             setup = setup.replace('/bin/bash', str(root / 'bash')).replace('/bin/zsh', str(root / 'zsh'))
             _ = subprocess.run(['bash', '-ec', setup], check=True, capture_output=True, text=True, timeout=10,

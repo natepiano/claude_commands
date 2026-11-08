@@ -220,14 +220,16 @@ The guest sets an absolute systemd shutdown deadline.
 One EventBridge schedule invokes an expiry Lambda each minute.
 The function terminates only expired instances with this deployment's gate tags.
 Normal completion requests termination and waits for confirmed termination.
-An uncertain launch or termination keeps its cost reservation.
+A launch timeout or uncertain termination keeps its cost reservation.
+An AWS launch refusal releases its cost reservation before local fallback.
 An AWS outage can delay termination and its final charge.
 
 | Event | Result |
 | --- | --- |
 | Complete result and final log | Validate the result and import its measurements. |
 | Guest death, deadline, or Spot interruption without a final result | Return red. |
-| Lost launch reply | Recover the saved request before any new launch. |
+| Launch timeout | Recover the saved request before any new launch. |
+| AWS launch refusal | Record the refusal and use natedev after capacity retries. |
 | Natedev death | Recover the saved attempt; the guest and Lambda retain their deadlines. |
 | No capacity at either size | Use the existing local runner. |
 
@@ -237,7 +239,12 @@ A quota does not guarantee free capacity in any zone.
 
 ## Exact tree delivery
 
-The gate bucket holds source bundles, request manifests, results, and logs.
+The gate bucket holds source bundles, guest programs, request manifests, results, and logs.
+The boot script downloads the guest program before Python starts.
+Production also downloads the request that contains the module list.
+User data carries neither the program nor the module paths.
+Production downloads through S3 inside the tools shell, where `aws` is available.
+The trial downloads its program and source bundle through signed HTTPS links.
 Instances use HTTPS and temporary role credentials. They need no SSH or Tailscale connection.
 Each public subnet has an internet gateway route. The gate security group has no inbound rule.
 
@@ -246,8 +253,10 @@ Each public subnet has an internet gateway route. The gate security group has no
 3. Export a Git bundle with HEAD, `origin/main`, and the current branch history.
 4. Upload the bundle under its content digest.
 5. Save the request with its selected paths, source identity, and absolute expiry.
-6. Launch the instance with that request and the recorded deployment settings.
-7. Clone the bundle and verify the exact tree before tests.
+6. Upload the guest program beside the request.
+7. Launch the instance with download links and the recorded deployment settings.
+8. Download the program and request before Python starts.
+9. Clone the bundle and verify the exact tree before tests.
 
 The guest imports the bundle's `origin/main` reference and sets the public origin URL.
 The bundle contains no local Git configuration, hooks, credential helper, or untracked file.
@@ -770,3 +779,15 @@ The cloud state records the phase, vCPU count, failed module count, and update t
 The phases are `requesting`, `setup`, `running`, and `uploading`.
 The route releases cloud admission before local fallback requests memory.
 The route requests no local memory for a cloud gate.
+
+## Launch refusal measurements
+
+The AWS state folder retains `cloud-gate-launches.jsonl`.
+Each launch call appends its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Capacity refusals first try the remaining zones and sizes.
+Every AWS launch refusal permits local fallback.
+The route releases its cost reservation and cloud slot before local admission.
+A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
+Fallback prints `Cloud gate uses natedev: <reason>`.
+These lines contain no account, instance, or subnet identifier.
+Failures after launch keep their existing result behavior.
