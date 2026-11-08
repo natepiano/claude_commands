@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import io
 import ctypes
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 import os
@@ -324,7 +324,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
     def assert_target_survives_closed_descriptor(self, stage: Literal[
-            "listing", "read", "final listing", "new descriptor"]) -> None:
+            "listing", "read", "final listing", "new descriptor", "launch descriptor"]) -> None:
         identity = fixture_runtime_id("descriptor-current-thread")
         other = fixture_runtime_id("descriptor-other-thread")
         proc = self.root / "descriptor-proc"
@@ -354,7 +354,7 @@ class NativePaneSessionTests(StaffTestCase):
         def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
             nonlocal reads
             value = stat(path, follow_symlinks=follow_symlinks)
-            if path == closing and stage in ("final listing", "new descriptor"):
+            if path == closing and stage in ("final listing", "new descriptor", "launch descriptor"):
                 reads += 1
                 if reads == 2:
                     if stage == "final listing":
@@ -377,7 +377,8 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(os, "readlink", side_effect=read_descriptor),
               patch.object(Path, "open", read_rollout),
               patch.object(Path, "stat", read_metadata)):
-            with redirect_stderr(io.StringIO()) as output:
+            proof = herdr.launch_rollout_proof() if stage == "launch descriptor" else nullcontext()
+            with proof, redirect_stderr(io.StringIO()) as output:
                 allowed = herdr.check_target(identity, action="keys", client=client,
                     pane_info=pane, place=herdr.HerdrPlace("fixture", "w1:p1"))
             if stage == "new descriptor":
@@ -401,6 +402,9 @@ class NativePaneSessionTests(StaffTestCase):
 
     def test_target_proof_refuses_a_new_descriptor_before_the_final_listing(self) -> None:
         self.assert_target_survives_closed_descriptor("new descriptor")
+
+    def test_launch_proof_accepts_a_rollout_descriptor_opening_during_the_read(self) -> None:
+        self.assert_target_survives_closed_descriptor("launch descriptor")
 
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")

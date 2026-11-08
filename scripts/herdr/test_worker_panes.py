@@ -1787,6 +1787,8 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual((observed.row, observed.pane, observed.terminal, observed.status),
                          (row, "w2:p9", "terminal-w2:p9", herdr.AgentStatus.IDLE))
         self.assertEqual(self.world.process_reads.count("w2:p9"), 1)
+        selected = worker_panes.observe_worker(self.parent.id, row, staff.snapshot())
+        self.assertEqual(selected, observed)
 
     def test_a_former_native_identity_does_not_prove_the_current_worker_live(self) -> None:
         row = self.worker()
