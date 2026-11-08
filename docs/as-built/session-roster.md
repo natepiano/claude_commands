@@ -171,7 +171,9 @@ The `--to user` outcomes in full, including `SENT: … rewritten:` and `sent des
 
 Usage errors, the stderr-only refusals above, an unreadable `--file` and an empty message also exit 2.
 
-Delivery mechanics: for a Claude recipient found in the live registry, `send.py` first tries the local postmaster. It waits up to 3 s for a result, withdrawing the entry before checking for a claim; an existing claim allows another 2 s for a result. A confirmed `delivered` result reports `SENT: postmaster; …`. Each miss requires the relay: `absent` (no heartbeat), `stale` (unreadable, older than 2 s or no live postmaster identity), `self` (recipient is the postmaster), `unclaimed` (withdrawn without a delivery), `outbox-error` (entry write failed), `failed`, `expired`, `claimed-no-result` (delivery unknown), and `relay-only-sender` (`shutdown`). A recipient not in the live registry uses the relay directly and logs `unresolved`. With no fresh heartbeat, the relay outcome, queue and text stay as before. After an attempt, the relay receives `max(1.0, options.timeout - attempt.seconds)`; a recipient not in the registry gets the original timeout.
+Delivery mechanics: `send.py` first tries the local postmaster for a Claude recipient in the live registry. It waits up to 3 seconds, withdraws the entry, and checks its claim. A claim allows another 15 seconds for the receipt, from `claim_grace_seconds` in `config/postmaster.conf`. A confirmed receipt reports `SENT: postmaster; …`. A claimed send without confirmation reports `FAILED` with exit 3. The message may already have arrived; the sender must not resend it by hand. The client starts no relay and queues no copy for that result. A key for that attempt stays pending across repeat windows and caller exits.
+
+A proved miss permits the relay: `absent`, `stale`, `self`, `unclaimed`, `outbox-error`, `failed`, `expired`, or `relay-only-sender` (`shutdown`). A recipient outside the live registry uses the relay directly and logs `unresolved`. A proved miss gives the relay `max(1.0, options.timeout - attempt.seconds)`. A recipient outside the registry gets the original timeout.
 
 The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
@@ -238,9 +240,44 @@ Either `session.start` or `session.receive` starts one shared worker promise, re
 
 `$.fs` has no rename or remove, so a claim file decides who delivers and the mod removes nothing. Per entry the mod reads it, writes `claimed/<id>.json`, then checks that `outbox/<id>.json` still exists. Gone → `withdrawn`; malformed → `failed` (`unreadable entry`); `deadline_ms` past → `expired`; else the mod registers the reply route and makes one `session.send({ to: { sessionId }, text })` with the text byte for byte. `isDelivered: true` → `delivered`; `isDelivered: false` → `failed` with the engine's reason in `detail`; a throw before the send → `failed`, a throw from the send → `abandoned`, with the error text in `detail`. `failed` therefore also covers a file step that failed before any send, and the client relays at once on it. An unwritten result stays in memory and is rewritten on later polls without a second send.
 
-The client writes `outbox/.<id>.json.tmp` and publishes it as `outbox/<id>.json` with `os.replace`, `deadline_ms` now + 3 s, then polls `results/<id>.json` every 50 ms. At its deadline it takes the entry out (renamed to `outbox/.<id>.withdrawn`, then removed) before checking the claim; a claim check that fails on a filesystem error counts as a claim. When no claim exists the mod cannot send it; when the mod sees the entry gone it writes `withdrawn`, which sends the client to the relay. These two orders give one delivery through the mod or the relay when a result arrives. A send throw (`abandoned`), a claim with no result after the 2 s grace period, or a withdrawal that fails on a filesystem error becomes `claimed-no-result`: the client relays, accepting a possible second copy to avoid a lost message. After a failed withdrawal the deadline has passed, so the mod answers `expired` instead of sending. An explicit refused send becomes `failed`; its route is removed from memory, its file becomes `withdrawn`, and a failed file write is retried on later polls.
+The client writes `outbox/.<id>.json.tmp` and publishes `outbox/<id>.json` with `os.replace`. Its deadline comes from `wait_seconds`. The client polls `results/<id>.json` at the configured interval. At the deadline, it withdraws the entry before checking the claim. A filesystem error during the claim check counts as a possible claim. A successful withdrawal without a claim proves that the mod cannot send. A `withdrawn` receipt also proves nondelivery. Both permit the relay.
 
-A delivered result's hash sets `verbatim`; a mismatched hash is still reported as sent with `NOT VERBATIM`. Unreadable result files remain pending. An unparsable heartbeat is read up to three times 20 ms apart, since an overwrite through `$.fs.write` can be read torn; one that parses but fails validation, a heartbeat without a non-empty string `run` included, counts as `stale` at once, so a mod older than the `run` field reads as not running. Every return after the heartbeat and `self` checks attempts entry cleanup before temp, withdrawn, claim and result cleanup. If entry removal fails, the client keeps the claim and result to prevent another mod send. Each such attempt also prunes `outbox/`, `claimed/` and `results/` files older than 10 minutes (a claim or result whose entry still exists stays) and `delivered/` files older than 30 minutes, since a new worker restores `open` routes inside `REPLY_WINDOW_MS`. `postmaster.py status` performs that cleanup and removes errors older than seven days; its first line reads `postmaster: running, heartbeat <age> s old, worker <run>; errors: <count>; replies: <count>`, with age to one decimal, or `postmaster: not running; errors: <count>; replies: <count>`. It also prints today's route counts in `user_zone()`, exiting 0 for a fresh live heartbeat and 1 otherwise.
+A keyed send stores one postmaster stage record under the registered recipient's session ID.
+Different addresses for that session use the same record.
+The record contains the entry ID, owner PID, process start time, and stage.
+The key file replacement syncs its content and directory before the next step starts.
+
+1. `reserved` is durable before publication work starts. Only this stage permits unpublished cancellation or recovery after the owner's death.
+2. `publishing` is durable before `os.replace()` exposes the entry. Exceptions retain the entry and claim evidence; owner death never releases this stage as unpublished.
+3. `relaying` is durable before any relay fallback starts, including a miss before publication. It keeps the entry ID and owner under the session ID.
+4. `resolved` records a definite postmaster or relay result before completion. Delivered or queued completes delivery; a definite failure permits another attempt.
+
+A failed stage write stops the send before its next step.
+A concurrent retry reads the saved stage and receipt.
+A publishing reservation without a receipt or file evidence reports unconfirmed delivery with exit 3.
+It never starts another send.
+A replacement reservation prevents the earlier sender from starting a relay or queued copy.
+A live `relaying` owner keeps a same-key retry pending through every address of that session.
+A dead `relaying` owner without a definite result leaves delivery unconfirmed with exit 3.
+The retry never sends again from that uncertain stage.
+A definite relay result is saved and synced before fallback ownership ends.
+Delivered or queued acceptance is then saved under the canonical session identity while the resolved session record still exists.
+Completion also saves the stable recipient alias, which preserves repeat windows across staff or named-session restarts.
+The same lock protects both saves and the later removal of the resolved session record.
+The accepted session timestamp remains after that removal, so a retry through another address reads the same acceptance.
+An unstaffed session uses its canonical identity for the claim, repeat guard and queue owner.
+Its socket address does not create another acceptance key.
+An explicit logical recipient also checks the canonical session's repeat window.
+A canonical claim retains its previous acceptance timestamp and restores it if the new attempt fails.
+Postmaster delivery also saves stable acceptance before queued-copy cleanup.
+An interruption before ordinary bookkeeping cannot permit another delivery.
+The postmaster wait and grace stop at the sender's `--timeout` deadline.
+If that deadline ends first, the sender reports unconfirmed delivery with exit 3 and starts no relay.
+A claim gives the postmaster ownership until a receipt proves delivery or nondelivery. A missing receipt after the configured grace becomes `DeliveryUnconfirmed`. An `abandoned` receipt or failed withdrawal also leaves delivery unconfirmed. The client never starts another transport for that uncertainty. An explicit `failed`, `expired`, or `withdrawn` receipt proves nondelivery and permits a relay retry. An explicit refused send becomes `failed`; the mod withdraws its reply route and retries an unwritten route withdrawal on later polls.
+
+A delivered result's hash sets `verbatim`. A mismatched hash still reports delivery with `NOT VERBATIM`. Unreadable result files remain pending. The client retries an unparsable heartbeat up to three times, 20 milliseconds apart, because an overwrite can produce incomplete JSON. An invalid heartbeat or a heartbeat without a non-empty `run` counts as `stale`.
+
+The client saves and syncs `resolved` before it removes a definite receipt. A failed stage write keeps that receipt for a retry. Confirmed outcomes then attempt entry cleanup before removing temporary files, claims, and results. An unconfirmed outcome retains its claim and result evidence. A failed entry removal also retains that evidence, which prevents another mod send. Each published attempt first prunes old files through the existing retention rules. Outbox entries, claims, and results expire after 10 minutes; claims and results stay while their entry exists. Delivered reply routes expire after 30 minutes. `postmaster.py status` also removes errors older than seven days. It prints heartbeat status, worker identity, error and reply counts, and today's route counts in `user_zone()`. It exits 0 for a fresh live heartbeat and 1 otherwise.
 
 `RELAY_ONLY_SENDERS = frozenset({"shutdown"})` bypasses all postmaster file access. Shutdown messages use the relay's explicit `Shown sender: shutdown` attribution; these messages keep the relay during the trial. The mod delivery share below excludes them. Removing `shutdown` from the set is the one change once recipients are shown to read the real sender from the first line.
 
@@ -469,7 +506,7 @@ Release recalculates the priority of a kept decision.
 
 - A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
 
-- The mod writes its claim before checking the outbox entry; the client takes the entry out before checking its claim. No confirmed delivery means relay or the existing queue, with a possible second copy on `claimed-no-result`.
+- The mod writes its claim before checking the outbox entry. The client withdraws the entry before checking the claim. An unconfirmed claimed send gets no relay or queued copy.
 
 - Postmaster is folder-loaded, with no marketplace installation or settings change. Its file access stays under `STATE/postmaster/`, and it starts no process and makes no network call.
 
@@ -565,7 +602,7 @@ Release recalculates the priority of a kept decision.
 
 - In the postmaster: a rename deciding who delivers (`$.fs` has none; a claim file decides); reaching `node:fs` through a dynamic import (the validator refuses it); `$.clock.every` for the poll (not measured live, `setInterval` was); pacing sends in the mod; a sweep or a session-registry lookup in the mod; a durable withdrawal-recovery step in the mod; any file rewritten whole as it grows.
 
-- In the client: removing `delivered/` files at 10 minutes (drops routes a new worker still restores); `enqueue` instead of a relay on `claimed-no-result` (a lost message is worse than a second copy); raising `quota_alert.py`'s timeout (the budget belongs in `send.py`).
+- In the client: removing `delivered/` files at 10 minutes, because a new worker still restores those routes. A relay or queued copy on `claimed-no-result` can duplicate delivery. `quota_alert.py`'s timeout belongs in `send.py`.
 
 ## Why
 
