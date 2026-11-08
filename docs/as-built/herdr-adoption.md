@@ -190,7 +190,7 @@ Exit codes are 0 for success, 1 for an absent unit, 2 for usage, and 3 for unava
 - The launcher uses the production workspace and the requested directory.
   `AgentExited` closes the new tab.
 
-Before starting the agent, add_unit saves its exact opening, conversation id, account directory and start time in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears this pending record only after prompt submission is proved. A rerun with that same marked conversation checks the live transcript and submits an absent opening to its existing pane, including a live `--resume` and a retry through `resume_unit`. A pending record for a closed conversation is removed; a different live conversation still refuses. It starts no second session. Brief stubs and unit configuration writes use the shared atomic writer.
+Before starting the agent, add_unit saves its exact opening, conversation id, account directory and start time in `add-unit-openings/<unit>.json` in the checkout's Git directory. It clears this pending record only after prompt submission is proved. A rerun with that same marked conversation checks the live transcript and submits an absent opening to its existing pane, including a live `--resume` and a retry through `agents resume NAME --retired`. A pending record for a closed conversation is removed; a different live conversation still refuses. It starts no second session. Brief stubs and unit configuration writes use the shared atomic writer.
 
 `add_unit.main` selects the account and runs preflight before it writes launch state.
 A running native session refuses a plain resume and names `--attach` as the next action.
