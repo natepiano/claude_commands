@@ -38,7 +38,7 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
-from scripts.shutdown import pane_record
+from scripts.shutdown import member_account, pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -50,8 +50,8 @@ from scripts.lib.resume_message import (
     resume_worker_command as resume_worker_command,
 )
 from scripts.shutdown.stop_results import (
-    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed, NoRoleAccount, NO_ROLE_ACCOUNT,
-
+    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
+    SESSION_WITHOUT_STAFF_ROW,
     StopUnproved as StopUnproved,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
@@ -577,21 +577,6 @@ def _codex_name_ids(name: str) -> list[str]:
         return []
 
 
-def resume_account(kind: Literal["claude", "codex"], row: StaffRow | NoRoleAccount = NO_ROLE_ACCOUNT,
-                   *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection | NoRoleAccount:
-    """Keep an account selection or select the requested label or role account."""
-    if isinstance(to, (accounts.NamedAccount, accounts.CodexWorkersAccount)):
-        return to
-    if to:
-        return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
-                if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))
-    if kind == "codex":
-        return accounts.role_account("workers")
-    if not isinstance(row, NoRoleAccount) and row.kind in ("unit", "showrunner"):
-        return accounts.role_account(row.kind)
-    return NO_ROLE_ACCOUNT
-
-
 def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
     """Read the native resume arguments and the folder from the rollout metadata."""
     path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
@@ -706,23 +691,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
 
         source = Path(entry["config_dir"])
         source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
-        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
+        selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
             account_environment = {"CODEX_HOME": str(target_dir)}
         else:
-            target_dir = (selected.dir if isinstance(selected, accounts.NamedAccount) else
-                          Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
-            label = selected.label if isinstance(selected, accounts.NamedAccount) else accounts.claude_config_label(target_dir)
+            target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
             trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
             copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
-        if not isinstance(selected, NoRoleAccount) and original is not None and Path(original.entry["config_dir"]) != target_dir:
+        if original is not None and Path(original.entry["config_dir"]) != target_dir:
             try:
-                pane_record.write(client.session, entry)
+                pane_record.write(client.session, pane_launch.without_staff_labels(entry))
             except (OSError, ValueError) as error:
                 print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
@@ -753,14 +736,15 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        message = resume_message(why, move=AccountMove(source_label, label) if not isinstance(selected, NoRoleAccount) else NO_ACCOUNT_MOVE,
+        message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
                                  workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
                                      row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
                 entries = pane_record.read_strict(client.session)
-                pending = entry.copy()
-                pending["session_id"] = identity
+                pending = pane_launch.without_staff_labels(entry)
+                pending["session_id"] = original.entry["session_id"] if original is not None else (
+                    row.id if row is not None else identity)
                 entries[tab.pane_id] = pending
                 pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
@@ -823,7 +807,7 @@ def _watch_resume(identity: str, pane: str, account: str,
             pid = started.pid
         generation = sessions.process_start(pid)
         if generation:
-            _detach(["stay", "--session", identity, "--pane", pane,
+            _ = _detach(["stay", "--session", identity, "--pane", pane,
                      "--account", account, "--pid", str(pid), "--generation", generation, "--why", why,
                      *(["--requester", requester] if requester else [])], "stay")
         else:
@@ -832,8 +816,11 @@ def _watch_resume(identity: str, pane: str, account: str,
         print(f"{identity}: observer anomaly: {error}", file=sys.stderr)
 
 
-def _detach(arguments: list[str], task: str) -> None:
-    """One detached process boundary for batch coordination and the post-start check."""
+_STOP_RESUME_PROGRAM = Path(__file__).resolve()
+
+
+def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM) -> Path:
+    """Run lifecycle work outside the caller's stop boundary."""
     from scripts.production import showrunners
 
     # Capture the registry identity before the child loses the caller's session id.
@@ -847,7 +834,7 @@ def _detach(arguments: list[str], task: str) -> None:
     log = logs / f"{task}-{uuid4().hex}.log"
     environment = dict(os.environ)
     _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
-    command = [sys.executable, str(Path(__file__).resolve()), arguments[0], "--log", str(log), *arguments[1:]]
+    command = [sys.executable, str(program), arguments[0], "--log", str(log), *arguments[1:]]
     if sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -856,12 +843,16 @@ def _detach(arguments: list[str], task: str) -> None:
                             "env", "-u", "CLAUDE_CODE_SESSION_ID", *command],
                            env=environment, stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, check=True, timeout=15)
+    return log
+
+
+detach = _detach
 
 
 def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int, cause: moves.MoveCause,
                    source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> None:
     # Options precede the positional list so session names cannot become options.
-    _detach(["batch", "--target", target, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
+    _ = _detach(["batch", "--target", target, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
              *(arg for identity, label in source_accounts.items() for arg in ("--source-account", f"{identity}={label}")),
              "--", *selected], "move")
 
@@ -917,9 +908,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             next_step = f"watchdog could not recover it: {error}"
     else:
-        command = shlex.join(["python3", "scripts/shutdown/shutdown.py", "resume", name,
-                              "--to", account, "--why", why or "retry after early exit"])
-        next_step = f"resume it: cd ~/.claude && {command}"
+        command = "agents resume " + shlex.join([name, "--to", account, "--why", why or "retry after early exit"])
+        next_step = f"resume it: {command}"
     cause = (f"{name}: resume on {account} failed: {failure}; {next_step}" if failure else
              f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}")
     try:

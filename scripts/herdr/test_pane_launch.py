@@ -14,9 +14,9 @@ from scripts.herdr import herdr
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
-    def test_launch_retains_prefixed_environment_for_its_existing_contract(self) -> None:
+    def test_launch_does_not_retain_staff_environment(self) -> None:
         entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
-        self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
+        self.assertEqual(entry["environment"], {})
 
     def test_shutdown_launch_removes_retired_identity_before_the_locked_launch(self) -> None:
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
