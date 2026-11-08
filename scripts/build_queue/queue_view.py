@@ -1,7 +1,7 @@
 """The compact queue view and the checks shared with one-step cards."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field as dataclass_field
 from functools import cache, cached_property
 import os
@@ -318,6 +318,20 @@ def leftover_age(minutes: int) -> str:
     return f"{minutes // (24 * 60)} d"
 
 
+def leftover_processes(steps: Sequence[gate.RunningStep]) -> list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]]:
+    """Return the process scopes whose builds have ended."""
+    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
+    for step in steps:
+        if not isinstance(step.measured, gate.UnownedSliceMemory):
+            continue
+        activity = step.measured.activity
+        if not isinstance(step.measured.job_state, NotServiceSlice):
+            continue
+        if isinstance(activity, ScopeProcesses) and not isinstance(activity.run, LiveBuildRun):
+            ended.append((step, step.measured, activity))
+    return ended
+
+
 @dataclass(frozen=True)
 class CloudPushInterval:
     seconds: float
@@ -372,7 +386,8 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
         text = f"{field(unit)} · {field(identity.step)} · {state} · {modules} · {size} · elapsed {elapsed}"
         if isinstance(progress, cloud_progress.CloudProgress):
             if progress.failed_modules:
-                text += f" · {progress.failed_modules} failed modules"
+                noun = "module" if progress.failed_modules == 1 else "modules"
+                text += f" · {progress.failed_modules} failed {noun}"
             if isinstance(interval, CloudPushInterval):
                 stale_after = reading.cloud_gate_stale_pushes * interval.seconds
                 if now - progress.updated_at >= stale_after:
@@ -535,15 +550,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         lines.extend([(), (Span("Services", bold=True),)])
         for memory in services:
             append_row((Span("   " + queue_evidence.service_text(memory, explanation.now)),))
-    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
-    for step in model.reading.view.running:
-        if not isinstance(step.measured, gate.UnownedSliceMemory):
-            continue
-        activity = step.measured.activity
-        if not isinstance(step.measured.job_state, NotServiceSlice):
-            continue
-        if isinstance(activity, ScopeProcesses) and not isinstance(activity.run, LiveBuildRun):
-            ended.append((step, step.measured, activity))
+    ended = leftover_processes(model.reading.view.running)
     if ended:
         count = sum(activity.count for _, _, activity in ended)
         total = sum(memory.bytes for _, memory, _ in ended)

@@ -31,7 +31,6 @@ done
 PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
-sys.path.insert(0, sys.argv[1])
 from scripts.production import staff
 from scripts.production.showrunners import owner_for
 arguments = sys.argv[2:]
@@ -65,7 +64,6 @@ state_record() {
 import sys
 import time
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
 from scripts.lib.atomic_file import write_text_atomic
 action, filename, identity = sys.argv[2:5]
 path = Path(filename)

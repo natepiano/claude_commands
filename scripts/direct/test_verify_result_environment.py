@@ -40,8 +40,7 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
             + '    raise',
         )
         self.write_executable(self.bin_directory / "cargo", cargo)
-        observe = f'''sys.path.insert(0, {str(VERIFY.parents[2])!r})
-sys.path.insert(0, {str(VERIFY.parent.parent / "mac_test")!r})
+        observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
 from scripts.mac_test import offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)

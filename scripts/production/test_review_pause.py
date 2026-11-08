@@ -9,19 +9,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
-import review_pause
+from scripts.production import review_pause
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-if TYPE_CHECKING:
-    from ..hooks import showrunner_footer
-else:
-    from scripts.hooks import showrunner_footer
+from scripts.hooks import showrunner_footer
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.

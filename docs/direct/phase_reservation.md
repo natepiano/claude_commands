@@ -13,7 +13,7 @@ durable before dispatch. The verbs:
 | --- | --- |
 | Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
 | First touch to `Active` | The Codex worker hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
-| Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase, validates berth's mapped reservation on its live board and restores `Active` from the phase baseline; no live reservation exits 2 with enroll/claim commands. A finished phase exits 2 with `progress_history.py start-phase` to reopen it; a checkpoint-released phase refuses repair. |
+| Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase. It restores `Active` from a live mapped reservation and the phase baseline. Without that mapping, a recorded `Active` reservation in `CHECKPOINT_RELEASED` returns to `enrolled_awaiting_first_touch`. Repair logs and posts the change, then prints `claim`. Other reservation-bearing records stay unchanged. Missing records without a live mapping exit 2 with enroll/claim commands. A finished phase prints `progress_history.py start-phase`. A phase with its own release marker refuses repair. |
 | `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>`; a style ticket adds `--ticket <ticket>`, and the record then also names the ticket and the worktree, so the reservation stays held until that ticket's merge |
 | Held reservation released at ticket merge | `style_ledger.py ticket merge` runs `phase_reservation.py release-held --session-dir <run> --phase <id> --ticket <ticket> --merged <style branch tip>`: it releases an `active` reservation from the recorded worktree at the checkpoint, confirms on the board a release whose protected tip is the checkpoint, or a later commit that descends from it and that the merged commit contains, and clears the record as `clear --released` does; a record not held for that ticket is a no-op, and a moved worktree or an unconfirmed release exits 2 and keeps it |
 | Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` leaves `reservation_released` with the commit; the phase leaves edit attribution while its plan review finishes. |
@@ -46,12 +46,24 @@ CheckpointReleaseConfirmationPending)}`. Do not represent any of them as an
 absent record or a bare optional value.
 
 `ActivePhaseReservation` is orchestration memory: never reconstruct it from a
-marker, rendered prose, or conversation. Only a recorder-open phase can have a lost
-record; finished or checkpoint-released phases are not candidates. Reopening a finished
-phase removes its release marker with the restored enrolled state. To restore a lost record, use `repair`:
-it reads berth's phase-session mapping (the director's bare session only when no
-other phase is open), confirms `active` on the board, and logs and posts the repair.
-Never supply reservation or run ids by hand; an existing live record stays unchanged.
+marker, rendered prose, or conversation. Only a recorder-open phase can have a lost record.
+Finished phases and phases with their own release marker cannot use repair.
+Reopening a finished phase removes its release marker with the restored enrolled state.
+Use `repair` to restore a lost record.
+It reads berth's phase-session mapping, or the director's bare session when no other phase is open.
+It confirms `active` on the board, then restores `Active` and logs and posts the repair.
+Without a live mapping, repair resets an `Active` record whose reservation has board status `outstanding` or `released_after_checkpoint`.
+The new state is `enrolled_awaiting_first_touch`.
+The kept board answer and baselines stay unchanged.
+The repair log and board post name the released reservation and its board status.
+The reset writes the new state only after the log append and board post succeed.
+If either fails, the record stays unchanged and repair prints no `claim` command.
+Repair prints the phase's `claim` command and returns 0 when the board post succeeds.
+The director then runs that command to acquire a new reservation.
+Pending release, a release marker, or any other board status prevents this reset.
+An unreadable board for either the recorded reservation or a mapped reservation also prevents this reset.
+Never supply reservation or run ids by hand.
+An existing live record stays unchanged.
 `CheckpointReleaseConfirmationPending` is durable proof that the
 checkpoint commit succeeded and only release confirmation remains: never create
 or reconstruct it from conversation or from `git rev-parse HEAD` read at a later

@@ -6,7 +6,6 @@ from scripts.production.cli_fixture import process_boundary
 
 import json
 import shutil
-import sys
 import unittest
 from pathlib import Path
 from typing import cast, final, override
@@ -14,7 +13,6 @@ from typing import cast, final, override
 from scripts.production import change_review
 from scripts.production.staff_test_support import isolated_staff_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 

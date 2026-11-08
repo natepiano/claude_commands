@@ -1,11 +1,8 @@
 """Include source-scan regressions in the required helper discovery."""
 from __future__ import annotations
 
-from pathlib import Path
-import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import test_claude_launch_scan
 
 

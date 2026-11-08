@@ -143,7 +143,8 @@ if name == "basedpyright":
 
 BUMP_TEST_STUB = STUB + '''
 import subprocess
-sys.path.insert(0, __TEST_REPOSITORY__)
+with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
 from scripts.herdr.herdr import NATIVE_ID_MARKS
@@ -176,12 +177,14 @@ if (state / "gate-red").exists() and "-E" not in args:
 BUMP_SEND_STUB = STUB + '''
 import uuid
 if (state / "slow-delivery").exists():
-    sys.path.insert(0, __TEST_REPOSITORY__)
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     (state / "delivery-started").touch()
     wait_for_file(state / "delivery-release")
 if (state / "stop-before-showrunner-notice").exists():
-    sys.path.insert(0, __TEST_REPOSITORY__)
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
     from scripts.production import staff
     recipient = staff.local_snapshot().by_current_session(args[args.index("--to") + 1].removeprefix("session:"))
     if recipient is not None and recipient.kind == "showrunner":
@@ -315,7 +318,9 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.state.mkdir()
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=self.origin)
         _ = self.git("init", "-b", "main", cwd=self.checkout)
+        _ = self.git("config", "maintenance.auto", "false", cwd=self.checkout)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=self.checkout)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
@@ -418,6 +423,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         """Push an independent main fix through the fixture's private origin."""
         writer = self.root / "main-fix-writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
         self.write(writer, relative, content)

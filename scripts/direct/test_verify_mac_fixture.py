@@ -58,7 +58,6 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                         "BUILDLOG_HOLD_WAIT_FILE": str(root / "hold-wait"),
                         "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets/build_targets.py")}), \
                         mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]), \
-                        mock.patch.object(sys, "path", sys.path.copy()), \
                         mock.patch.object(runpy, "run_path", side_effect=SystemExit(10)):
                     with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=interrupt_publication):
                         with self.assertRaisesRegex(OSError, "interrupted publication"):

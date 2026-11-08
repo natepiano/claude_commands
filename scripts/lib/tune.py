@@ -14,7 +14,6 @@ import platform
 import shlex
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, main_publish
 from scripts.lib.conf import Unusable, check
 from scripts.lib.atomic_file import write_text_atomic

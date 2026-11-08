@@ -16,7 +16,7 @@ class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
         _ = gate.write_text('''set -T
 stop_before_sleep_wait() {
     if [[ "${FUNCNAME[1]:-}" == start_token_renewer &&
-          ( "$BASH_COMMAND" == 'delay_pid=$!' || "$BASH_COMMAND" == 'wait "$!"' ) ]]; then
+          "$BASH_COMMAND" == 'renew_sleep_pid=$!' ]]; then
         trap - DEBUG
         printf '%s\\n' "$BASHPID" > "$TEST_STOPPED_RENEWER"
         kill -TERM "$BASHPID"

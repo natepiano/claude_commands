@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import create_text_atomic
 
 AstraRole = Literal["astra-designer", "astra-reviewer"]

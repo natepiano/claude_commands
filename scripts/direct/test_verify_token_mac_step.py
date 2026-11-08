@@ -5,9 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
-import sys
 import unittest
-from unittest import mock
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -47,7 +45,7 @@ from pathlib import Path
 import sys
 if sys.argv[1] == "acquire":
     records = Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json")
-    sys.path.insert(0, str(Path.home() / ".claude"))
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.test_verify_step_state import read_step_row
     if any(read_step_row(path.stem)["runs_on"]["kind"] == "natedev_only" for path in records):
         (Path(os.environ["TEST_RUNNER_STATE"]) / "local-token-wait").touch()
@@ -157,8 +155,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
         self.assertFalse((self.board / "locks/cargo.d").exists())
 
     def test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready(self) -> None:
-        with mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[1] / "mac_test"), *sys.path]):
-            from scripts.mac_test import mac_test
+        from scripts.mac_test import mac_test
         meminfo = self.prepare_memory_lint()
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir(parents=True, exist_ok=True)

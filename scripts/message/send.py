@@ -2301,7 +2301,7 @@ def resolve_recipient(
             holder = membership.parent_of(member)
             if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
                                        or holder.worktree.machine == roster.remote.local_machine()):
-                run = worker_panes.worker_run(holder, record=membership)
+                run = worker_panes.worker_run(member, record=membership)
                 if unit_runs.worker_transport(run) == "herdr":
                     return PaneWorkerRecipient(member)
                 if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
