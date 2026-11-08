@@ -42,7 +42,7 @@ class SidePaneTests(StaffTestCase):
         self.launch_limits = []
         self.launch_interrupt = ""
         self.caller_id = fixture_runtime_id("ad-hoc-caller")
-        self.world.setup(self, compact_above_tokens=53000)
+        self.world.setup(self)
         self.router.setup(self, self.root)
         _ = self.enterContext(patch.object(staff, "runtime_id", side_effect=lambda: self.caller_id))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
@@ -90,20 +90,18 @@ class SidePaneTests(StaffTestCase):
         assert isinstance(result, side_pane.OpenSidePane)
         return result
 
-    def test_codex_side_pane_uses_the_compaction_limit_after_a_restart(self) -> None:
+    def test_codex_side_pane_keeps_the_native_compaction_limit_after_a_restart(self) -> None:
         self.caller("codex")
         first = self.start()
         arguments = self.world.requests[-1][1]
-        self.assertIn(["-c", "model_auto_compact_token_limit=53000"],
-                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                              "UNIT_COMPACT_ABOVE_TOKENS=71000"))
         del self.world.foreground[first.pane]
         self.assertEqual(self.start(), first)
         arguments = self.world.requests[-1][1]
-        self.assertIn(["-c", "model_auto_compact_token_limit=71000"],
-                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertEqual(len(self.world.launches), 2)
 
     def test_a_friend_launches_with_the_worker_permissions_for_both_families(self) -> None:
@@ -124,27 +122,30 @@ class SidePaneTests(StaffTestCase):
 
     def test_claude_side_pane_ignores_the_codex_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                              "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
         _ = self.start()
         family, arguments, _ = self.world.requests[-1]
         self.assertEqual(family, "claude")
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
 
-    def test_unusable_codex_compaction_limit_refuses_the_side_pane(self) -> None:
+    def test_codex_side_pane_ignores_the_between_turn_compaction_limit(self) -> None:
         self.caller("codex")
         config = self.root / "conf/direct.conf"
         original = config.read_text()
         before = staff.snapshot().rows
-        for value in ("", "invalid", "0", "-1", "1.5"):
+        for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
+                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                            "UNIT_COMPACT_ABOVE_TOKENS=" + value))
-                code, output, errors = self.command("open", "friend", "--cwd", str(self.root))
-                self.assertEqual(code, worker_panes.ExitCode.REFUSED)
-                self.assertEqual(output, "")
-                self.assertIn("UNIT_COMPACT_ABOVE_TOKENS", errors)
-                self.assertEqual(self.world.launches, [])
+                code, output, errors = self.command("open", f"friend-{index}", "--cwd", str(self.root))
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(output, "done\n")
+                self.assertEqual(errors, "")
+                family, arguments, _ = self.world.requests[-1]
+                self.assertEqual(family, "codex")
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+                self.assertEqual(len(self.world.launches), index + 1)
                 self.assertEqual(staff.snapshot().rows, before)
 
     def test_friend_question_and_followup_keep_the_caller_family_without_staff(self) -> None:

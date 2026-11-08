@@ -75,6 +75,32 @@ class ClientTests(unittest.TestCase):
                 _ = client.build_history_generation(client.READ_CONFIGURATION_AT_USE)
             self.assertIn("silence_seconds", str(error.exception))
 
+    def test_cloud_admit_uses_the_private_service_and_releases_its_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            with fixture.serving():
+                result = client.admit(request, lambda _wait: None, lambda: request)
+                assert isinstance(result, wire.Admitted)
+                self.assertEqual(result.need, 0)
+                self.assertEqual(client.release(result.reservation, 0, result.cleanup_timing), wire.Ok())
+            self.assertTrue(fixture.callers_released())
+
+    def test_cloud_place_survives_client_reconnect_and_estimate_refresh(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            transport = self.use_transport(fixture,
+                Exchange(reply_bytes(EXPIRED), TimedChunk(0.1, b"")),
+                Exchange(reply_bytes(GRANTED)))
+            refreshed = replace(request, place=wire.LocalPlace())
+            with redirect_stderr(io.StringIO()):
+                result = client.admit(request, lambda _wait: None, lambda: refreshed)
+            self.assertEqual(result, GRANTED)
+            self.assertGreaterEqual(len(transport.requests), 2)
+            for sent in transport.requests:
+                assert isinstance(sent, wire.AdmitRequest)
+                self.assertEqual(sent.place, wire.CloudPlace("aws"))
+
     def test_import_does_not_load_memory_admission(self) -> None:
         result = subprocess.run([sys.executable, "-c",
             "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],

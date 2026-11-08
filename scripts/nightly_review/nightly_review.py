@@ -325,6 +325,7 @@ def live_unit(production: NightlyProduction, *, resolver: RowResolver) -> LiveCl
 
 def tonight(day: date) -> list[str]:
     """Send the night's review to the live unit, starting it first through add_unit when it is gone."""
+    from scripts.message import session_send
     from scripts.production import session_staff, staff, unit_config
 
     resolver = session_staff.RowResolver(staff.snapshot())
@@ -353,8 +354,8 @@ def tonight(day: date) -> list[str]:
         return [f"skipped: units unreadable: {error}"]
     if claude is None:
         return [*lines, f"{selection.unit.name}: no live Claude has the unit's recorded identity"]
-    sent = subprocess.run([sys.executable, str(SCRIPTS / "message" / "send.py"), "--to", f"uds:{claude.socket}",
-                           "--from", "nightly-review timer", "--key", f"nightly-{day.isoformat()}", "--text", job(day)],
+    sent = subprocess.run(session_send.send_argv("--to", f"uds:{claude.socket}", "--from", "nightly-review timer",
+                                            "--key", f"nightly-{day.isoformat()}", "--text", job(day)),
                           capture_output=True, text=True, check=False)
     outcome = "tonight's review sent" if sent.returncode == 0 else f"tonight's review not sent: {sent.stderr.strip()}"
     return [*lines, f"{selection.unit.name}: {outcome}"]

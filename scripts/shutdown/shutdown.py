@@ -15,6 +15,8 @@ from typing import Literal, TypedDict, cast
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
+from scripts.accounts import accounts
+from scripts.whoami import agent_accounts, note_file
 from scripts.agents import worker_lifecycle
 from scripts.agents import codex_mesh
 from scripts.herdr import herdr
@@ -223,8 +225,20 @@ def main(argv: list[str] | None = None) -> int:
     options = cast(CommandLine, parser.parse_args(arguments))
     try:
         if options.command == "restart":
+            selected_account: restart.AllRestartAccounts | accounts.AccountSelection = restart.AllRestartAccounts()
+            if options.account:
+                parsed = note_file.parse_account_label(options.account)
+                if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "codex":
+                    if not isinstance(note_file.read_note(note_file.note_path(parsed.label)), note_file.Note):
+                        raise UnknownAccountName(f"unknown account {parsed.label}")
+                    home = agent_accounts.codex_account_home(parsed.label)
+                    selected_account = accounts.CodexWorkersAccount(home.label, home.home)
+                else:
+                    named = named_claude_account(options.account)
+                    selected_account = accounts.NamedAccount(named.label, accounts.account_dir(named.label))
             return restart.restart(stop_all=options.all, dry_run=options.dry_run,
-                                   only=tuple(item for item in options.only.split(",") if item))
+                                   only=tuple(item for item in options.only.split(",") if item),
+                                   account=selected_account)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0

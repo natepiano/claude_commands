@@ -205,6 +205,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/shutdown/inventory.py` | read | local_snapshot |
 | `scripts/shutdown/launch_names.py` | read | initial_snapshot |
+| `scripts/shutdown/member_account.py` | read | StaffRow (type check only) |
 | `scripts/shutdown/pane_record.py` | read | initial_snapshot |
 | `scripts/shutdown/pane_restore.py` | read | row_operation |
 | `scripts/shutdown/remote_control.py` | read | initial_snapshot |

@@ -324,6 +324,27 @@ class BuildBudgetTests(unittest.TestCase):
             self.assertEqual(gate.read_memory_config().request_max_bytes, size)
 
 
+class CloudFinalizationTests(unittest.TestCase):
+    def test_release_removes_cloud_progress_and_module_counter_files(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        with AdmissionFixture() as fixture:
+            sidecar = fixture.root / "cloud.cgroup"
+            _ = sidecar.write_text("")
+            request = replace(fixture.request(step="merge-gate"),
+                place=wire.CloudPlace("aws"), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 16, 0, fixture.clock.now()))
+            progress.publish_counter(sidecar, progress.ProgressCounter("modules", 4, 10))
+            cloud_file = Path(str(sidecar) + ".cloud.json")
+            self.assertTrue(cloud_file.exists())
+            fixture.release(grant)
+            for path in (sidecar, cloud_file, progress.progress_path(sidecar, "json")):
+                with self.subTest(path=path.name):
+                    self.assertFalse(path.exists())
+            self.assertFalse(fixture.server.reservations)
+
+
 class MemoryRoomRulesTests(unittest.TestCase):
     def test_room_and_keep_aside_never_become_negative(self) -> None:
         policy = admission_policy_fixture()

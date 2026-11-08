@@ -255,16 +255,11 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             hold.active = False
 
 
-class ClaudeCompaction(Enum):
-    NATIVE = "Claude controls compaction"
-
-
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
-    compact_above_tokens: int | ClaudeCompaction
 
 
 @dataclass(frozen=True)
@@ -557,8 +552,7 @@ def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     settings = models_registry.LaunchSettings("codex", model, effort, "")
-    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan",
-                        conf.read("direct").whole("ASTRA_REVIEW_COMPACT_ABOVE_TOKENS"))
+    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
 
 
 def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
@@ -572,9 +566,7 @@ def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> La
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                            if settings.kind == "codex" else ClaudeCompaction.NATIVE)
-    return LaunchPolicy(settings, sandbox, permission, compact_above_tokens)
+    return LaunchPolicy(settings, sandbox, permission)
 
 
 def _policy_arguments(policy: LaunchPolicy) -> list[str]:
@@ -582,7 +574,6 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
                       "-c", f'model_reasoning_effort="{settings.effort}"',
-                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}",
                       "-c", "notice.hide_rate_limit_model_nudge=true"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']

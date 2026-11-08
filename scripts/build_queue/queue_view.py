@@ -4,18 +4,23 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field as dataclass_field
 from functools import cache, cached_property
+import os
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_evidence, queue_lines
+from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
+from scripts.lib import conf
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+from scripts.message import unit_labels
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
 
 
@@ -50,6 +55,12 @@ class QueueModel:
     @cached_property
     def moves(self) -> head_facts.QueueMoves:
         return head_facts.queue_moves(self.reading, self.facts)
+
+    @cached_property
+    def cloud_labels(self) -> Mapping[str, UnitLabels]:
+        missing = {row.identity.session_id for row in cloud_rows(self)
+                   if row.identity.session_id and row.identity.session_id not in self.labels}
+        return {**unit_labels.unit_labels_for(missing, os.environ), **self.labels} if missing else self.labels
 
 
 def same_waiter(left: gate.WaitingStep, right: gate.WaitingStep) -> bool:
@@ -307,6 +318,70 @@ def leftover_age(minutes: int) -> str:
     return f"{minutes // (24 * 60)} d"
 
 
+@dataclass(frozen=True)
+class CloudPushInterval:
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CloudPushIntervalUnavailable:
+    reason: str
+
+
+def cloud_push_interval() -> CloudPushInterval | CloudPushIntervalUnavailable:
+    try:
+        return CloudPushInterval(conf.read("cloud_gate").number("log_push_s"))
+    except conf.Unusable as error:
+        return CloudPushIntervalUnavailable(str(error))
+
+
+def cloud_rows(model: QueueModel) -> tuple[wire.CloudRow, ...]:
+    return model.reading.cloud if isinstance(model.reading, wire.CloudQueueRead) else ()
+
+
+def cloud_matches(row: wire.CloudRow, selector: str, labels: Mapping[str, UnitLabels]) -> bool:
+    identity = row.identity
+    label = labels.get(identity.session_id)
+    return selector in (str(row.owner.pid), identity.session_id, identity.name, identity.unit,
+                        identity.folder, Path(identity.folder).name, label.session if label else "")
+
+
+def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...] = ()) -> list[Line]:
+    reading = model.reading
+    all_rows = cloud_rows(model)
+    if not all_rows or not isinstance(reading, wire.CloudQueueRead):
+        return []
+    used = sum(isinstance(row.wait, gate.ReadyForAdmission) for row in all_rows)
+    lines: list[Line] = [(Span(f"Cloud · {used} of {reading.cloud_slots} slots", bold=True),)]
+    interval = cloud_push_interval()
+    now = reading.explanation.now
+    for row in rows or all_rows:
+        identity, progress = row.identity, row.progress
+        unit = gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels) or "—"
+        if isinstance(row.wait, wire.CloudSlotWait):
+            state = "waiting; " + row.wait.text
+        elif isinstance(progress, cloud_progress.CloudProgress):
+            state = progress.state
+        else:
+            state = "progress " + progress.reason
+        counter = row.counter
+        modules = (f"{counter.done} of {counter.total} modules"
+                   if isinstance(counter, progress_profile.ProgressCounter) else "modules unknown")
+        size = f"{progress.size_vcpus} vCPUs" if isinstance(progress, cloud_progress.CloudProgress) else "vCPUs unknown"
+        elapsed = leftover_age(age(row.started_at or row.since, now))
+        text = f"{field(unit)} · {field(identity.step)} · {state} · {modules} · {size} · elapsed {elapsed}"
+        if isinstance(progress, cloud_progress.CloudProgress):
+            if progress.failed_modules:
+                text += f" · {progress.failed_modules} failed modules"
+            if isinstance(interval, CloudPushInterval):
+                stale_after = reading.cloud_gate_stale_pushes * interval.seconds
+                if now - progress.updated_at >= stale_after:
+                    update_age = started_ago(progress.updated_at, now).removeprefix("started ").removesuffix(" ago")
+                    text += f" · no update for {update_age}"
+        lines.extend(wrap((Span("   " + text),), columns, indent=3))
+    return lines
+
+
 def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
                 selector: str = "") -> list[Line]:
     explanation = model.reading.explanation
@@ -484,4 +559,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                               + (f"; {memory.swap_bytes / gate.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
             for member in activity.members[1:]:
                 lines.append((Span(f"   pid {member.pid} · {field(member.program)} · {owner}"),))
+    cloud = cloud_lines(model, columns)
+    if cloud:
+        lines.extend([(), *cloud])
     return [clip(line, columns) for line in lines]
