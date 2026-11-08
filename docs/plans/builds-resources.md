@@ -1804,3 +1804,44 @@ The folder audit names a session as a folder's maker only when one of that sessi
 
 **Ruled out:**
 - Exit-status reasoning (`false && mkdir x`, `(cd x); mkdir y`): the static parser cannot know an exit status, and the earliest-session rule limits the risk.
+
+### Phase 80 — Every Mac test run states its threads and the Mac's load  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-07 ("Plan accepted: Phase 80 after the merge hash.").
+
+#### Work Order
+
+**Goal:** find what slowed a hana test run on the Mac that shared no threads, and make every test run print a line that shows its threads and the load on its machine. A reader must never take a missing line as "no load".
+
+**Measured (fastest-unit, 2026-11-07, times EST):** all runs are from natedev worktree `/home/natepiano/worktrees/hana_catalyst-build-speed-tests` (commit `ec14ba07b4`, unchanged test tree). The Mac mirror is `/Users/natemccoy/.local/state/mac-test/mirror/hana`. Run logs are under `/tmp/claude/unit/e700519d-30f7-47eb-94c7-97082b8f7750/mesh_runs/`.
+1. Run `20261107T212913-453350-86a4`, 21:29:13–21:35:19: `verify.sh test hana --mac "the time comparison needs one machine" --no-cache --filter demo_kit`. It printed `mac_test: not running on the mac (busy)`, `verify.sh: waiting for the Mac (busy)` and `nextest: 6 of 12 test threads, shared with the runs in flight`. Nextest run `3ed7aec3-bbd6-4112-be26-916e00e632a8`. The demo kit effect Adds test took 12.339 s.
+2. First step of run `20261107T222110-2224423-02f9` (`phases/36/final_runs.py` in that run folder), 22:21:10–about 22:30:52. The same command. Output copy `phases/36/final-exact-1.log`. It printed `mac_test: running on the Mac ... tree copied in 6.8 s`, and no thread line. Nextest run `7fc641a9-fa71-4672-9283-f13dadb0905a`. The same test took 72.163 s.
+3. Second step of the same run, about 22:30:52–22:36:34: `verify.sh test hana --filter placement_disk` (verify.sh sent it to the Mac). `tree copied in 7.1 s`, no thread line. Nextest run `955a33a4-da4c-4500-84eb-a0733c98fd30`, 133 tests, 303.9 s. No earlier Mac time exists for it.
+4. `nextest_share_claim` in `scripts/lint/invoke.sh` prints `nextest: <shared> of <full> test threads, shared with the runs in flight` only when the share is narrower than the full width. A full-width run prints no thread line. Nothing reports load from processes outside these runs. The `+ cargo nextest run --test-threads 12` line is the requested width, not the granted width.
+
+**Spec:**
+1. Measure the cause first, with read-only commands only. Write the report to `phases/80/mac_load_report.md` in the run folder.
+   - For each of the three runs, state the machine the tests ran on, and how the logs show it. Run 1 printed both `not running on the mac (busy)` and a waiting line.
+   - For runs 2 and 3, find what else used the Mac's CPU, memory or disk at that time. Check other sessions' processes and builds, Spotlight (`mds`, `mdworker`) on the new mirror copy, Time Machine, thermal or power limits, memory pressure and swap, and a cold file cache after the copy. Use the Mac's own logs (`log show` for that window, `pmset -g log`) and our run records.
+   - Give one line for each cause you can prove, with its evidence, and say which causes you ruled out and how.
+2. Every test run prints one thread line, also at full width: `nextest: <granted> of <requested> test threads; load <one-minute load> on <cpu count> CPUs (<host>)`. A shared run keeps the words `shared with the runs in flight`. Read the load once, when the share is claimed. Use the same line on natedev and on the Mac.
+3. If the cause from step 1 is a Mac setting or a process outside our scripts, name the fix in the report. Do not change Mac settings. Change no script for it unless the Spec names that change.
+4. Add no guard, refusal or check that this Work Order does not ask for. Post blocked to ask instead.
+5. Update the share paragraph in `docs/as-built/nextest-width-and-lint-scope.md` with the new line.
+
+**Files:**
+- `scripts/lint/invoke.sh` — the thread line on every run.
+- `scripts/lint/nextest_budget.py` — only if the load reading belongs in the claim.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_nextest_budget.py` — the line at full width and at a shared width.
+- `docs/as-built/nextest-width-and-lint-scope.md` — the thread line.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the report, `scripts/lint/invoke.sh`, `scripts/lint/nextest_budget.py` and `docs/as-built/nextest-width-and-lint-scope.md`.
+- `test` owns `scripts/lint/test_memory_admit.py` and `scripts/lint/test_nextest_budget.py`.
+
+**Acceptance gate:**
+- The report names the machine of each run and each proven cause with its evidence, or states that no cause could be proven and what was ruled out.
+- A test shows a full-width run prints `nextest: 12 of 12 test threads; load ...`.
+- The existing shared-width assertion still finds `shared with the runs in flight`.
+- `scripts/lint/test_memory_admit.py` and `scripts/lint/test_nextest_budget.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
