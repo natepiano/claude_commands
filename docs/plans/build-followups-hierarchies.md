@@ -724,40 +724,21 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Depends on:** Phase 30
 
-Moved out of Phase 30 under the hard landing (sdlc, 2026-11-08). Neither gap is a regression against main: main has no pane family switch, and a closed-pane family change there ends uncertain. Phase 30's closure review 3 is `<run>/phases/30/claude-build-followups-hierarchies-review2_summary_1.txt`; the Astra review of the approach is `<run>/phases/30/astra_review_F011_F012.md`.
+#### As-built
 
-#### Work Order
-
-**Goal:** a family switch (Claude to Codex or back) of a worker whose pane is closed is as safe as one with an open or stopped pane.
-
-**Spec:**
-1. F011: a family switch of a closed worker passes the same busy-worker and live detached-run checks as an open or stopped worker. `can_close` accepts a closed worker through its stopped-worker branch; the open-worker status and transcript checks stay. Check the source worker's own run, which can differ from the destination run that `_start_locked` selects (`scripts/herdr/worker_panes.py` near line 797). Keep the existing `WorkerLockHold` held through the checks, source release, and publication.
-2. F012: when publication fails after the new agent starts, cleanup stops the agent that `start` launched, for every destination kind (a closed source launches into a new split pane). Read and check the launched pane's terminal; a missing or changed terminal is a cleanup failure, never a silent success. Stop no agent without proof of its identity.
-3. Replace the cleanup callback's `str | None` result in `scripts/production/worker_admission.py` (`publish_created`, `switch_worker`) with a named outcome type: the destination stopped; the destination retained, with its pane and the reason; or no destination to stop (the caller owns cleanup). Update every caller: `scripts/herdr/worker_panes.py`, `scripts/direct/claude_worker.py`, `scripts/production/staff_test_support.py`, and the tests that pass a cleanup.
-4. A failed native-session proof after launch (`switch_worker` runs `start` before `publish_created`, `worker_admission.py` near line 414) goes through the same cleanup as a failed publication. When cleanup cannot prove the agent, the refusal names the retained pane and the reason, and staff still names the source.
-5. Tests: add rows to the existing tables in `scripts/herdr/test_worker_panes.py` (refusal table near line 1493, publication-failure test near line 1541) and `scripts/production/test_worker_admission.py`. Add a source-state column that can omit the pane.
-   - A closed source with a live detached run, with an unfinished dispatch, and with a live detached run in an earlier source run while the destination run has none: refusal comes before source release or launch.
-   - A publication failure and a failed native proof, for both destination kinds: the destination stops, staff identity is unchanged, the shell is kept, and a retry succeeds with no second split.
-   - A missing or changed terminal at cleanup, for both destination kinds: no input goes to the unproved agent, staff is unchanged, and the refusal names the retained pane.
-   - An idle closed source switches.
-   Each new row fails without its repair.
-
-**Constraints from prior phases:**
-- Phase 30 renamed the detached runs. The live-run check reads only `<run>/detached_runs/`, and `detached_run_process.supervises` matches only `detached_runs.py`. A `mesh_runs.py supervise` process started before the rename is not seen. These end before Phase 30 lands on main; the director confirms with one `ps` read on natedev and the Mac at landing. Add no code for them.
+- A family switch (Claude to Codex or back) runs the same busy-worker and live detached-run checks for every source kind: open, stopped and closed. `_start_locked` calls `can_close` for any current worker. `can_close` takes a `ClosedWorker` through the stopped-worker branch, on the source worker's own run, with the held `WorkerLockHold`. A refusal comes before source release or launch.
+- Cleanup after a failed native proof or a failed publication is keyed on the launch (`launches[-1].pane`), for an existing pane and a new split pane. Right after launch, `start` records the launched terminal and the foreground agent process (pid and start ticks). Cleanup stops the agent only when the same process still runs in the same terminal, and keeps the shell.
+- `scripts/production/worker_admission.py` names the cleanup result: `DestinationStopped`, `DestinationRetained(pane, reason)` and `NoDestinationToStop`, with `CleanupOutcome` as their union. `publish_created` and `switch_worker` take `cleanup: Callable[[str], CleanupOutcome]`. `_cleanup_on_failure` runs the same cleanup around `start` and around publication.
+- When cleanup retains the destination, an ordinary error becomes `AdmissionRefused` that names the pane and the reason, and staff still names the source. `KeyboardInterrupt` and `SystemExit` keep their type; cleanup still runs.
+- `Herdr.pane_agent_process` reports a process that exits during the read as `HerdrFailure` naming the pane.
 
 **Files:**
-- `scripts/herdr/worker_panes.py`
-- `scripts/herdr/test_worker_panes.py`
-- `scripts/production/worker_admission.py`
-- `scripts/production/test_worker_admission.py`
-- `scripts/production/staff_test_support.py`
-- `scripts/direct/claude_worker.py`
-- `scripts/direct/test_claude_worker.py`
+- `scripts/herdr/worker_panes.py` — pre-switch checks and launch-keyed cleanup in `_start_locked`; `can_close` accepts `ClosedWorker`.
+- `scripts/production/worker_admission.py` — cleanup outcome types and `_cleanup_on_failure`.
+- `scripts/herdr/herdr.py` — `pane_agent_process` error conversion.
+- `scripts/direct/claude_worker.py`, `scripts/production/staff_test_support.py` — callers that own their cleanup pass `NoDestinationToStop`.
+- `scripts/herdr/test_worker_panes.py`, `scripts/production/test_worker_admission.py`, `scripts/direct/test_claude_worker.py`, `scripts/herdr/test_herdr.py` — source-kind, destination-kind, replacement-agent and retained-pane rows.
 
-**Test:** from the worktree root, `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/herdr test_worker_panes.py`, `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/production test_worker_admission.py`, and `python3 scripts/test_times/module_run.py /home/natepiano/worktrees/hierarchies/scripts/direct test_claude_worker.py`.
+**Gotchas:** a failed native proof calls cleanup with an empty identity. Only the recorded launch process protects a replacement agent of the same family in that terminal.
 
-**Lint:** `basedpyright` on every changed file gives `0 errors, 0 warnings, 0 notes`.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` owns `worker_panes.py`, `worker_admission.py`, `claude_worker.py` and `staff_test_support.py`.
-- `test` owns `test_worker_panes.py`, `test_worker_admission.py` and `test_claude_worker.py`.
+**Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
