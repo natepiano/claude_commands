@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import base64
-import gzip
 import hashlib
 import hmac
 import json
@@ -49,6 +47,7 @@ GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, thre
 root = pathlib.Path('/var/lib/gate-trial')
 links = json.loads((root / 'links.json').read_text())
 if links.get('production'):
+    gate_request = json.loads((root / 'request.json').read_text())
     request = urllib.request.Request('http://169.254.169.254/latest/api/token', method='PUT',
                                      headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'})
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -142,7 +141,7 @@ try:
                 if links.get('production'):
                     gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
                                                 module_time_limit_s=links['module_time_limit_s'],
-                                                selected=merge_gate.SelectedModules(tuple(json.loads(links['modules']))),
+                                                selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
                                                 mode=merge_gate.SuiteMode(links['mode']))
                 else:
                     gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
@@ -265,7 +264,14 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     """Run directly in amazon-init on each boot."""
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
-    session = (log_push_loop(links, log_push_s) if links.get('production') else '') + f'''ln -sf "$(command -v bash)" /bin/bash
+    def download(key: str, name: str) -> str:
+        url, destination = shlex.quote(links[key]), '/var/lib/gate-trial/' + name
+        return (f'aws s3 cp {url} {destination} --only-show-errors\n' if links[key].startswith('s3://') else
+                f'curl --fail --silent --show-error --max-time 60 {url} -o {destination}\n')
+    downloads = download('guest', 'guest.py')
+    if links.get('production'):
+        downloads += download('request', 'request.json')
+    session = (log_push_loop(links, log_push_s) if links.get('production') else '') + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
 mkdir -p /run/gate-trial-bin
 cp -a /run/current-system/sw/bin/. /run/gate-trial-bin/
@@ -283,7 +289,6 @@ exec python3 /var/lib/gate-trial/guest.py'
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
                 if links.get('production') else f'shutdown -h +{lifetime_minutes}')
-    guest_script = f"printf '%s' {shlex.quote(base64.b64encode(gzip.compress(GUEST.encode(), mtime=0)).decode())} | base64 -d | gzip -d > /var/lib/gate-trial/guest.py"
     return f'''#!/bin/sh
 {deadline}
 set -eu
@@ -294,7 +299,6 @@ export PATH=/run/current-system/sw/bin:$PATH
 {'' if links.get('production') else log_push_loop(links, log_push_s)}{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
 {json.dumps({**links, 'module_time_limit_s': module_time_limit_s})}
 GATE_LINKS
-{guest_script}
 touch /var/lib/gate-trial/timeline.log
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
