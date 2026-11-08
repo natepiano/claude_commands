@@ -2987,6 +2987,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - Phase 32: every launch destination runs `unalias <kind>` through `Herdr.run_in_pane` before `agent start`. Keep the one step when the launch path changes; a test fake pane shows an empty shell first.
 - Phase 35: a pane worker's Codex launch carries no `model_auto_compact_token_limit`. Do not bring back an in-turn compaction option; `UNIT_COMPACT_ABOVE_TOKENS` is for compaction between turns only.
 - Phase 37: `send.py` delivers to a herdr Codex pane through `CodexPaneRecipient` and `_prompt_pane`, by name and by `codex:<thread>`. When the `codex_mesh` route goes, a `codex:` address with no daemon and no pane still fails, and a staff row with no live entry still gets `QueuedStaffRecipient`.
+- Phase 39: a Codex pane with no herdr `agent_session` gets its thread from `native_pane_process(...).current_identity` in `roster._herdr_codex_panes`. When the `codex_mesh` route goes, keep that fallback; a pane address does not need a daemon.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3334,34 +3335,19 @@ Live check on 2026-11-07 17:00 EST: both sends printed `SENT: codex:01a18dbb-…
 
 ### Phase 39 — A message reaches morty when herdr reports no session · status: done
 
-**Depends on:** Phase 37 (on main at e1d8b73ed). It runs before Phase 38 (sdlc [44518c43], 2026-11-07: this goes before the close fix).
+#### As-built
 
-Defect (sdlc, 2026-11-07 19:17 EST, on main): `send.py --to morty` answers `QUEUED: no live Claude or Codex session answers to morty (01a18dbb-…)`, and `--to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` answers `FAILED: no live Codex daemon has thread … loaded`. Cause: `herdr agent list` gives morty's pane w2C:p1 no `agent_session` key, so `_herdr_codex_panes` (`scripts/message/roster.py`) gives the entry `NoCodexThread` and `CannotReceiveMessages`. The pane's Codex process holds its rollout open: `Herdr("agents").native_pane_process("w2C:p1", "codex", …)` returns `RolloutThread(01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a)` (director, 21:45 EST). Delivery already accepts that thread: `check_target` reads the same identity through `_pane_sessions`. The user's acceptance (via morty): send.py delivers to this existing thread, by name and by explicit address, with no restart.
+`roster._herdr_codex_panes` addresses a Codex pane that `herdr agent list` reports without an `agent_session`. For that pane it reads `herdr.Herdr(<session>).native_pane_process(<pane>, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity`, the same identity that `check_target` proves before delivery. The entry becomes `Messageable("codex:<thread>")` with `thread=CodexThread(<thread>)` and its `pane`. A reported session wins and costs no process read. A read that raises `HerdrFailure`, `OSError`, `ValueError` or `subprocess.SubprocessError` (a 10-second timeout included) leaves the entry `NoCodexThread` and `CannotReceiveMessages`; the rest of the roster still builds.
 
-#### Work Order
-
-**Goal:** a herdr Codex pane with no `agent_session` report gets its thread from its own Codex process, so `send.py` reaches it.
-
-**Spec:**
-
-1. In `_herdr_codex_panes`, when the agent's `agent_session` is `NoReportedAgentSession`, read `herdr.Herdr(<session>).native_pane_process(<pane>, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity`. This is the identity that `check_target` proves before it types keys. Use it as the entry's `CodexThread`; the entry is then `Messageable("codex:<thread>")` with its pane, as for a reported session.
-2. A reported `agent_session` still wins; do not read the process for it.
-3. When that read raises `HerdrFailure` or `ValueError`, the entry stays `NoCodexThread` and `CannotReceiveMessages`, as today.
-4. Add no check, refusal, validation, retry or wait that this list does not name.
+Live check on 2026-11-07 22:56 EST: herdr reported no session for morty's pane w2C:p1, and `send.py --to morty` and `--to codex:01a18dbb-…` both printed `SENT: codex:01a18dbb-… at agents:w2C:p1`.
 
 **Files:**
-- `scripts/message/roster.py`
-- `scripts/message/test_roster.py`
-- `scripts/message/test_send.py`
+- `scripts/message/roster.py` — the process-identity fallback in `_herdr_codex_panes`.
+- Tests: `scripts/message/test_roster.py` (`test_codex_pane_without_a_session_report_uses_its_process_identity`: absent report, failed read, reported session with no process read), `scripts/message/test_send.py` (`PaneWorkerMessageTests.codex_agent` builds its entry through the roster with no session report).
 
-**Workers:** `1 writer`.
+**Binds later work:** code that needs a Codex pane's thread reads `native_pane_process(...).current_identity` when `agent_session` is absent; it never relies on `agent_session` alone.
 
-**Acceptance gate:**
-- A unit test: a herdr Codex pane with no `agent_session` whose `native_pane_process` gives `RolloutThread(T)` gives a roster entry with thread T, messageable at `codex:T`, with its pane.
-- A unit test: the same pane whose process read raises `HerdrFailure` stays `CannotReceiveMessages`.
-- A unit test in `test_send.py`: a staff row with `current_session` T resolves to `CodexPaneRecipient` for that pane, and `--to codex:T` resolves to the same.
-- The changed modules pass in full (`test_roster`, `test_send`); basedpyright reads 0/0/0; the full gate passes.
-- Live check by the director after the checkpoint: `send.py --to morty` and `send.py --to codex:01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a` each print `SENT`, and the text shows in morty's pane. One ping each.
+**Gotchas:** herdr gives no `agent_session` for some resumed Codex panes, such as morty's pane and a resumed worker's new pane. Messages queued for a Codex staff row before this fix stay in its `session-<id>` queue file; no hook drains them.
 
 ### Phase 40 — A pane worker can always be closed, followed and kept small · status: todo
 
@@ -3396,9 +3382,11 @@ Defect (builds for natest, 2026-11-07 16:40 and 16:47 EST): `assign.sh` for nate
 
 **Files:**
 - `scripts/herdr/worker_panes.py`
+- `scripts/herdr/herdr.py`
 - `scripts/production/worker.py`
 - `scripts/direct/assign.py`
 - `scripts/herdr/test_worker_panes.py`
+- `scripts/herdr/test_herdr.py`
 - `scripts/production/test_worker.py`
 - `scripts/direct/test_assign_claude_panes.py`
 
@@ -3443,6 +3431,8 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held.
 8. **One completion rule (plan review after Phase 32).** The C1210 exception is in `_dispatch_turn` after a quiet wait, not in `dispatch_receipt`, which returns `DispatchWaitingForRuns` when a finished run's result is absent. Extract one completion decision before the wait is deleted. The hook and a detached run's completion both call it; 6.4's tests go through both.
 9. **Default policy is a named state.** `worker.dispatch` and `worker_panes.start_or_resume` take `LaunchPolicy | None`, where `None` means the role's configured policy. When this phase changes those signatures, replace `None` with a named state (for example `ConfiguredRolePolicy`).
+
+**Constraint from Phase 39:** herdr gives some resumed Codex panes no `agent_session`. Read a pane's thread through `Herdr.native_pane_process(...).current_identity` when the report is absent; do not rely on `agent_session` alone.
 
 **Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A hook launch fixture shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
 
