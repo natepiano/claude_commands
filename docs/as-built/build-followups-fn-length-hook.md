@@ -33,7 +33,7 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages six handlers. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard and build-hold guard use `PreToolUse` on `Bash`, with 10-second timeouts. Codex uses `Bash` for shell commands, as Claude Code does. The guards run `pre-tool-use-scratch-guard.py` and `pre-tool-use-build-hold-guard.sh`.
+`scripts/hooks/codex_hooks.py install|check` manages eight handlers. The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`, with `matcher: "*"` and 10-second timeouts; `docs/as-built/session-roster.md` describes them. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard and build-hold guard use `PreToolUse` on `Bash`, with 10-second timeouts. Codex uses `Bash` for shell commands, as Claude Code does. The guards run `pre-tool-use-scratch-guard.py` and `pre-tool-use-build-hold-guard.sh`.
 
 The `ste` and `ste-subagent` handlers run `session-start-ste.py` through the shared Python launcher, with 10-second timeouts. They use `SessionStart` and `SubagentStart`, respectively. Both use `matcher: "*"`. For `SessionStart`, the matcher filters the session source, including startup, resume, clear and compact. For `SubagentStart`, it filters the subagent type. The wildcard covers every source and type. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
 

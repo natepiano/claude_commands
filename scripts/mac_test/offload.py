@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
-from scripts.build_hold import build_hold, override_guard
+from scripts.build_hold import override_guard
 from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lint import sweep
@@ -579,8 +579,28 @@ IDLE_PROCESS = IdleProcess()
 
 
 @dataclass(frozen=True)
+class MeasuredCleanupSize:
+    """The target size measured before removal, in KiB."""
+
+    kib: int
+
+
+@dataclass(frozen=True)
+class CleanupSizeNotMeasured:
+    """The target size could not be measured before removal."""
+
+
+@dataclass(frozen=True)
 class CleanupDone:
     """The remote mirror's build output was removed."""
+
+    size: MeasuredCleanupSize | CleanupSizeNotMeasured
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class CleanupRemovedWithoutFacts:
+    """The remote output was removed without size or free-space facts."""
 
 
 @dataclass(frozen=True)
@@ -605,7 +625,7 @@ class CleanupUnconfirmed:
     """The remote command did not report a usable cleanup status."""
 
 
-CleanupOutcome = CleanupDone | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
+CleanupOutcome = CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
 
 
 @dataclass(frozen=True)
@@ -893,6 +913,10 @@ class ProcessController:
 
 
 def parse_cleanup(value: str) -> CleanupOutcome:
+    removed = re.fullmatch(r"0 ([0-9]+|-) ([0-9]+(?:[.][0-9]+)?)", value)
+    if removed:
+        size = CleanupSizeNotMeasured() if removed[1] == "-" else MeasuredCleanupSize(int(removed[1]))
+        return CleanupDone(size, float(removed[2]))
     if value == "skipped":
         return CleanupSkipped()
     if value == "kept":
@@ -903,14 +927,18 @@ def parse_cleanup(value: str) -> CleanupOutcome:
     if len(digits) > 3:
         return CleanupUnconfirmed()
     rc = int(digits)
-    if rc > 255:
-        return CleanupUnconfirmed()
-    return CleanupDone() if rc == 0 else CleanupFailed(rc)
+    if rc == 0:
+        return CleanupRemovedWithoutFacts()
+    return CleanupFailed(rc) if 0 < rc <= 255 else CleanupUnconfirmed()
 
 
-def report_cleanup(cleanup: CleanupOutcome, target: str = "") -> None:
+def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floor_gib: float) -> None:
     label = target or "Mac"
-    if isinstance(cleanup, CleanupFailed):
+    if isinstance(cleanup, CleanupDone):
+        size = sweep.gib(cleanup.size.kib * 1024) if isinstance(cleanup.size, MeasuredCleanupSize) else "size not measured"
+        print(f"{label} build output removed: {path}, {size}; "
+              + f"Mac free {cleanup.free_gib:g} GiB under the {free_floor_gib:g} GiB floor", flush=True)
+    elif isinstance(cleanup, CleanupFailed):
         print(f"{label} build output not removed: {cleanup.rc}", flush=True)
     elif isinstance(cleanup, CleanupSkipped):
         print(f"{label} build output kept: the run used another target dir", flush=True)
@@ -1077,6 +1105,23 @@ def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
 
 
+@dataclass(frozen=True)
+class FailedProbe:
+    """The target's last completed probe failed."""
+
+
+@dataclass(frozen=True)
+class NoFailedProbe:
+    """The target has no failed probe record."""
+
+
+FailedProbeState = FailedProbe | NoFailedProbe
+
+
+def read_failed_probe(target: str = "mac") -> FailedProbeState:
+    return FailedProbe() if (state_directory(target) / "failed_probe").exists() else NoFailedProbe()
+
+
 def read_backoff(now: float, target: str = "mac") -> BackoffState:
     path = backoff_path(target)
     try:
@@ -1146,6 +1191,10 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
     name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
     return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
         kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
+
+
+def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
+    return f"{remote_mirror(repository, target, slot)}/target"
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1325,6 +1374,12 @@ def linux_version_decline_path(target: str, repository_name: str) -> Path:
     return state_directory(target) / f"version-decline-{repository_name}"
 
 
+def write_version_decline(target: str, repository_name: str) -> None:
+    path = linux_version_decline_path(target, repository_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(str(time.time()), encoding="utf-8")
+
+
 def linux_version_declined_recently(target: str, repository_name: str, hold_s: float, now: float) -> bool:
     """Read whether this repository has a decline within the hold duration."""
     try:
@@ -1385,7 +1440,19 @@ def probe_mac(
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
+    *, record_version_decline: bool = True,
 ) -> ProbeResult:
+    mark = state_directory(target) / "failed_probe"
+
+    def failed() -> UnavailableProbe:
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        _ = mark.write_text("failed\n", encoding="utf-8")
+        return UNAVAILABLE_PROBE
+
+    def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
+        mark.unlink(missing_ok=True)
+        return probe
+
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform)
     if linux:
         from scripts.mac_test import linux_runner
@@ -1394,7 +1461,7 @@ def probe_mac(
         if isinstance(probe_reachability(controller, config), UnreachableHost):
             print(f"mac_test: could not reach {target}: SSH reachability check failed",
                   file=sys.stderr, flush=True)
-            return UNAVAILABLE_PROBE
+            return failed()
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
         script = probe_script(repository, target, slot)
@@ -1416,16 +1483,17 @@ def probe_mac(
     elif isinstance(result, CommandCouldNotStart):
         reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
     elif result.status != 0:
-        reason = " ".join(result.stderr.split()) or f"SSH probe exited with status {result.status}"
+        reason = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                      f"SSH probe exited with status {result.status}")
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if not linux:
-                return probe
+                return succeeded(probe)
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
             if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
-                return probe
+                return succeeded(probe)
             from scripts.mac_test import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
                       {"nextest": expected["nextest"], "mend": expected["mend"]},
@@ -1433,12 +1501,14 @@ def probe_mac(
                       if not isinstance(expected, UnavailableToolParity) else "")
             if detail:
                 print(detail, file=sys.stderr, flush=True)
+                if record_version_decline:
+                    write_version_decline(target, repository.name)
                 return UnavailableProbe(detail)
             print(f"mac_test: {target} is not ready: public tools or tracked scripts differ", file=sys.stderr)
-            return UNAVAILABLE_PROBE
+            return failed()
         reason = "the probe answer could not be read"
     print(f"mac_test: could not reach the {'Mac' if target in ('', 'mac') else target}: {reason}", file=sys.stderr, flush=True)
-    return UNAVAILABLE_PROBE
+    return failed()
 
 
 @dataclass(frozen=True)
@@ -1649,7 +1719,7 @@ def remote_test_command(
     elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
         cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(f"{remote_mirror(repository, request.target, request.slot)}/target")
+        target = shlex.quote(mirror_target(repository, request.target, request.slot))
         floor = shlex.quote(f"{config.free_floor_gib:g}")
         cleanup_command = (
             'if free_gib=$(df -g "$HOME"); then '
@@ -1657,7 +1727,10 @@ def remote_test_command(
             + 'else free_gib=; fi; '
             + f'if awk -v free="$free_gib" -v floor={floor} '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if rm -rf -- "$HOME"/{target}; then echo mac_cleanup=0; '
+            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+            + f'if rm -rf -- "$HOME"/{target}; then '
+            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
@@ -2064,16 +2137,21 @@ def claimed_run(
             if isinstance(remote_status, InterruptedTargetStatus):
                 return InterruptedTargetRun(remote_status.generation, elapsed_seconds(started))
             if isinstance(remote_status, ToolVersionMismatch):
+                write_version_decline(request.target, repository.name)
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
             if linux and isinstance(remote_status, UnresolvedSlotStartup):
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
                       else "runner sent no final status")
             return LostMacRun(elapsed_seconds(started), detail)
+        if not linux:
+            linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
-        report_cleanup(remote_status.cleanup, request.target)
+        report_cleanup(remote_status.cleanup, request.target,
+                       path=f"~/{mirror_target(repository, request.target, request.slot)}",
+                       free_floor_gib=config.free_floor_gib)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
@@ -2231,8 +2309,7 @@ def run_offload(
         detail = recorded_linux_version_mismatch(controller, config, request.target)
         decline_path = linux_version_decline_path(request.target, repository.name)
         if detail:
-            decline_path.parent.mkdir(parents=True, exist_ok=True)
-            _ = decline_path.write_text(str(time.time()))
+            write_version_decline(request.target, repository.name)
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
@@ -2366,6 +2443,8 @@ def parser() -> argparse.ArgumentParser:
 
 def holder_session() -> str:
     """Use the unit owner session before the shell session."""
+    from scripts.build_hold import build_hold
+
     owner = build_hold.owning_session()
     if isinstance(owner, build_hold.OwningSession):
         return owner.session_id

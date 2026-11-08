@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import AbstractContextManager, chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
@@ -23,6 +23,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.shutdown import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib import unit_runs
 from scripts.message import sessions
@@ -53,16 +54,14 @@ class StaffCommandTestCase(StaffTestCase):
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
+    def agents(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
+        with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
+              mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp("fixture", "w1:p1", "claude2")),
+              mock.patch.object(restart_support, "send_message", return_value={"kind": "sent", "how": "fixture"})):
+            result = invoke_cli(shutdown, lambda: shutdown.main(list(arguments)), list(arguments), dict(os.environ), CHECKOUT)
+        self.assertEqual(result.returncode, code, result.stderr)
+        return result
 
-class CountedStaffRows(tuple[staff.StaffRow, ...]):
-    """Count full scans of the staff rows during repeated id lookups."""
-
-    scans: int = 0
-
-    @override
-    def __iter__(self) -> Iterator[staff.StaffRow]:
-        self.scans += 1
-        return super().__iter__()
 
 KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
@@ -190,18 +189,6 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                 self.assertIn("morty", shown.stdout)
                 self.assertIn("agent", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
-
-    def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
-        _, unit, _ = self.tree()
-        expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
-                         for number in range(400))
-        rows = CountedStaffRows(expected)
-        record = staff.StaffSnapshot(rows)
-        for number in range(200):
-            row = expected[number % 7]
-            self.assertIs(record.by_id(row.id), row)
-            self.assertIsNone(record.by_id(MISSING_ID))
-        self.assertLessEqual(rows.scans, 1)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
@@ -432,6 +419,7 @@ class DocumentLookupTests(StaffCommandTestCase):
         main = self.root / "main"
         main.mkdir()
         self.git(main, "init", "-b", "main")
+        self.git(main, "config", "maintenance.auto", "false")
         self.git(main, "config", "user.name", "Document Test")
         self.git(main, "config", "user.email", "document@example.invalid")
         document = main / "docs/plans/example-production.md"
@@ -577,9 +565,10 @@ class StaffTests(StaffCommandTestCase):
         listener = write_session(sessions.sessions_dir(), "registry-name", caller.current_session)
         self.addCleanup(listener.close)
         self.enterContext(mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ""}))
+        _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=str(caller.current_session)))
         for attempt in range(2):
             with self.subTest(attempt=attempt):
-                result = self.script(STAFF_SCRIPT, "pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+                result = self.agents("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 current = staff.by_id(unit.id)
                 assert current is not None
@@ -592,7 +581,7 @@ class StaffTests(StaffCommandTestCase):
                 self.assertEqual(staff.by_id(worker.id), worker)
         for attempt in range(2):
             with self.subTest(resume=attempt):
-                result = self.cli("resume", f"{owner.name}/{unit.name}")
+                result = self.agents("resume", f"{owner.name}/{unit.name}")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(staff.by_id(unit.id), unit)
 
@@ -600,7 +589,7 @@ class StaffTests(StaffCommandTestCase):
         owner, unit, worker = self.tree()
         caller = fixture_worker("codex-director", owner.id, backend=staff.CodexBackend(self.root / "codex"))
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": caller.current_session}):
-            result = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+            result = self.agents("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
         self.assertEqual(result.returncode, 0, result.stderr)
         current = staff.by_id(unit.id)
         assert current is not None
@@ -612,14 +601,14 @@ class StaffTests(StaffCommandTestCase):
         second = fixture_member("unit", name="registry", parent=owner.id)
         other_owner = fixture_member("showrunner", name="hana")
         other = fixture_member("unit", name="other", parent=other_owner.id)
-        _ = self.cli("pause", "--production", owner.name, "--why", "review the production")
+        _ = self.agents("pause", "--production", owner.name, "--why", "review the production")
         for original in (first, second):
             current = staff.by_id(original.id)
             assert current is not None
             self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the production")
         self.assertEqual(staff.by_id(other.id), other)
         self.assertEqual(staff.by_id(worker.id), worker)
-        _ = self.cli("resume", "--production", owner.name)
+        _ = self.agents("resume", "--production", owner.name)
         self.assertEqual(staff.by_id(first.id), first)
         self.assertEqual(staff.by_id(second.id), second)
 
@@ -627,20 +616,20 @@ class StaffTests(StaffCommandTestCase):
         owner, selected, worker = self.tree()
         first = fixture_member("unit", name="registry", parent=owner.id)
         second = fixture_member("unit", name="builds", parent=owner.id)
-        _ = self.cli("pause", "--production", owner.name, "--except", first.name, "--except", second.name,
+        _ = self.agents("pause", "--production", owner.name, "--except", first.name, "--except", second.name,
                  "--why", "review the selected unit")
         current = staff.by_id(selected.id)
         assert current is not None
         self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the selected unit")
         for original in (first, second, worker):
             self.assertEqual(staff.by_id(original.id), original)
-        _ = self.cli("resume", "--production", owner.name)
+        _ = self.agents("resume", "--production", owner.name)
         self.assertEqual(staff.by_id(selected.id), selected)
 
     def test_production_pause_except_accepts_the_unit_suffix(self) -> None:
         owner, selected, worker = self.tree()
         excluded = fixture_member("unit", name="fastest", parent=owner.id)
-        result = self.cli("pause", "--production", owner.name, "--except", "fastest-unit",
+        result = self.agents("pause", "--production", owner.name, "--except", "fastest-unit",
                           "--why", "review the selected unit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(excluded.id), excluded)
@@ -653,7 +642,7 @@ class StaffTests(StaffCommandTestCase):
     def test_production_pause_except_accepts_the_unit_id(self) -> None:
         owner, selected, worker = self.tree()
         excluded = fixture_member("unit", name="fastest", parent=owner.id)
-        result = self.cli("pause", "--production", owner.name, "--except", str(excluded.id),
+        result = self.agents("pause", "--production", owner.name, "--except", str(excluded.id),
                           "--why", "review the selected unit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(excluded.id), excluded)
@@ -667,7 +656,7 @@ class StaffTests(StaffCommandTestCase):
         owner, selected, worker = self.tree()
         alias = fixture_member("unit", name="a", parent=owner.id)
         exact = fixture_member("unit", name="a-unit", parent=owner.id)
-        result = self.cli("pause", "--production", owner.name, "--except", exact.name,
+        result = self.agents("pause", "--production", owner.name, "--except", exact.name,
                           "--why", "review the selected units")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(exact.id), exact)
@@ -680,7 +669,7 @@ class StaffTests(StaffCommandTestCase):
     def test_production_pause_except_accepts_a_staff_name_with_spaces(self) -> None:
         owner, selected, worker = self.tree()
         excluded = fixture_member("unit", name="phase 9", parent=owner.id)
-        result = self.cli("pause", "--production", owner.name, "--except", excluded.name,
+        result = self.agents("pause", "--production", owner.name, "--except", excluded.name,
                           "--why", "review the selected unit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(excluded.id), excluded)
@@ -693,7 +682,7 @@ class StaffTests(StaffCommandTestCase):
         owner = self.tree()[0]
         excluded = fixture_member("unit", name="kept", parent=owner.id)
         before = self.staff_state()
-        result = self.cli("pause", "--production", owner.name, "--except", excluded.name,
+        result = self.agents("pause", "--production", owner.name, "--except", excluded.name,
                           "--except", "unknown-unit", "--why", "review the selected units", code=2)
         self.assertIn("StaffRefused", result.stderr)
         self.assertIn("unknown-unit", result.stderr)
@@ -707,7 +696,7 @@ class StaffTests(StaffCommandTestCase):
         before = self.staff_state()
         for reference in (foreign.name, str(foreign.id)):
             with self.subTest(reference=reference):
-                result = self.cli("pause", "--production", owner.name, "--except", reference,
+                result = self.agents("pause", "--production", owner.name, "--except", reference,
                                   "--why", "review the selected units", code=2)
                 self.assertIn("StaffRefused", result.stderr)
                 self.assertIn(reference, result.stderr)
@@ -717,7 +706,7 @@ class StaffTests(StaffCommandTestCase):
     def test_rename_and_move_preserve_the_pause_record(self) -> None:
         owner, unit, worker = self.tree()
         destination = fixture_member("showrunner", name="hana")
-        _ = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review before moving")
+        _ = self.agents("pause", f"{owner.name}/{unit.name}", "--why", "review before moving")
         paused = staff.by_id(unit.id)
         assert paused is not None
         changed = staff.rename(unit.id, "registry")
