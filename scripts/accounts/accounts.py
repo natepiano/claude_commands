@@ -894,31 +894,16 @@ def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) ->
     return {**source, "projects": projects}
 
 
-def without_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
-    """Remove only the selected projects' trust bits. Preserve all other settings."""
+def without_project_entries(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Remove project entries for the exact folder keys. Preserve all other entries and settings."""
     if not folders:
         return source
     raw_projects = source.get("projects", {})
     if not isinstance(raw_projects, dict):
         raise ValueError("projects must be an object")
-    projects = dict(cast(dict[str, object], raw_projects))
-    changed = False
-    for folder in folders:
-        if folder not in projects:
-            continue
-        raw_project = projects[folder]
-        if not isinstance(raw_project, dict):
-            raise ValueError("configured trust project must be an object")
-        project = cast(dict[str, object], raw_project)
-        if "hasTrustDialogAccepted" not in project:
-            continue
-        remaining = {key: value for key, value in project.items() if key != "hasTrustDialogAccepted"}
-        if remaining:
-            projects[folder] = remaining
-        else:
-            del projects[folder]
-        changed = True
-    return {**source, "projects": projects} if changed else source
+    projects = cast(dict[str, object], raw_projects)
+    remaining = {folder: project for folder, project in projects.items() if folder not in folders}
+    return {**source, "projects": remaining} if len(remaining) != len(projects) else source
 
 
 @contextmanager
@@ -1019,14 +1004,14 @@ def source_has_claude_trust(source: Path) -> bool:
 
 
 def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
-    """Set or clear folder trust in every existing account file. Report each failed home independently."""
+    """Trust a folder or remove its project entry in every existing account file. Report each failed home independently."""
     try:
         key = str(folder.resolve())
         files = _account_trust_files()
     except (OSError, ValueError) as error:
         print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
         return
-    change = with_trusted_folders if trusted else without_trusted_folders
+    change = with_trusted_folders if trusted else without_project_entries
     for account_file in files:
         try:
             _ = account_file.path.stat()

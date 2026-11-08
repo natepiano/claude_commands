@@ -121,8 +121,8 @@ Short tab titles can repeat across workspaces.
 `copies.py clone` checks source trust through `herdr.claude_trust` in every Claude account home.
 Trust in any home authorizes the clone in every existing account file.
 The clone record stores its resolved `claude_trust_folder` before the locked accounts writer grants trust.
-Removal clears only that folder's trust bit after the external removal mark exists.
-It preserves all other project settings and skips missing account files.
+Removal deletes that folder's complete project entry after the external removal mark exists.
+It preserves other project entries and settings and skips missing account files.
 Malformed or unreadable account files produce an anomaly while the other homes continue.
 
 A Claude session started in a folder the account has not trusted stops at the trust prompt. A launcher that sends it a prompt then waits on a session that never answers. Every launcher checks trust first and refuses with the one command the user runs, before it writes or launches anything.

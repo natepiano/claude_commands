@@ -25,7 +25,7 @@ Reading, preparation, publication, sync, and cleanup run under that lock.
 The command rebuilds a changed file before publication.
 It never opens a session.
 `copies.py clone` inherits source trust from any Claude home and records trust in every existing account file.
-Clone removal clears only the recorded clone trust bit and preserves other project settings.
+Clone removal deletes the complete project entry for its exact recorded folder key in every account file.
 
 ## Every account in one table
 

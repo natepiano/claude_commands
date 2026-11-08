@@ -433,16 +433,22 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(errors.getvalue().startswith("accounts: anomaly:"))
 
     def add_clone_project_settings(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+        key = str(checkout.resolve())
         for path in paths:
             document = accounts.read_json_object(path)
             projects = cast(dict[str, dict[str, object]], document["projects"])
-            projects[str(checkout.resolve())]["keep"] = ["clone setting"]
+            projects[key].update({"keep": ["clone setting"], "lastCost": 1.5, "exampleFiles": ["tracked.txt"]})
+            projects[key + "-neighbor"] = {"keep": "neighbor"}
+            projects[key + "/child"] = {"hasTrustDialogAccepted": True}
             _ = path.write_text(json.dumps(document))
 
-    def assert_clone_trust_removed(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+    def assert_clone_project_removed(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+        key = str(checkout.resolve())
         for path in paths:
             projects = self.trust_projects(path)
-            self.assertEqual(projects[str(checkout.resolve())], {"keep": ["clone setting"]})
+            self.assertNotIn(key, projects)
+            self.assertEqual(projects[key + "-neighbor"], {"keep": "neighbor"})
+            self.assertEqual(projects[key + "/child"], {"hasTrustDialogAccepted": True})
             self.assertIn("/other", projects)
             self.assertIn(str(self.source.resolve()), projects)
 
@@ -455,7 +461,7 @@ class StandingTests(unittest.TestCase):
 
         def delete(folder: Path) -> None:
             self.assertTrue(scratch.removal_mark(folder).exists())
-            self.assert_clone_trust_removed(checkout, paths)
+            self.assert_clone_project_removed(checkout, paths)
             remove(folder)
 
         processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
@@ -467,7 +473,7 @@ class StandingTests(unittest.TestCase):
                               "--repository", "hana", "--session", "fixture")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(checkout.parent.exists())
-        self.assert_clone_trust_removed(checkout, paths)
+        self.assert_clone_project_removed(checkout, paths)
 
     def test_temporary_sweep_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
@@ -476,7 +482,7 @@ class StandingTests(unittest.TestCase):
         entry = tmp_sweep.RemovableEntry(str(checkout.parent), str(checkout.parent.parent), time.time(), 1)
         self.assertTrue(tmp_sweep.remove_entry(entry, tmp_sweep.Sweep(), False))
         self.assertFalse(checkout.parent.exists())
-        self.assert_clone_trust_removed(checkout, paths)
+        self.assert_clone_project_removed(checkout, paths)
 
     def test_folder_audit_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
@@ -484,14 +490,14 @@ class StandingTests(unittest.TestCase):
         self.add_clone_project_settings(checkout, paths)
         self.assertEqual(folder_audit.remove(checkout.parent, time.time(), time.time()), folder_audit.REMOVED)
         self.assertFalse(checkout.parent.exists())
-        self.assert_clone_trust_removed(checkout, paths)
+        self.assert_clone_project_removed(checkout, paths)
 
     def test_task_end_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:end-trust")
         self.add_clone_project_settings(checkout, paths)
         self.assertEqual(scratch.end("gate:end-trust"), [checkout.parent])
-        self.assert_clone_trust_removed(checkout, paths)
+        self.assert_clone_project_removed(checkout, paths)
 
     def test_removal_retries_with_only_the_external_mark_and_changes_no_account_file(self) -> None:
         paths = self.clone_trust_files()
@@ -505,7 +511,7 @@ class StandingTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "stopped removal"):
             scratch.remove_marked(checkout.parent, stopped)
         self.assertTrue(scratch.removal_mark(checkout.parent).exists())
-        self.assert_clone_trust_removed(checkout, paths)
+        self.assert_clone_project_removed(checkout, paths)
         before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}
         scratch.remove_marked(checkout.parent, scratch.remove)
         self.assertFalse(checkout.parent.exists())

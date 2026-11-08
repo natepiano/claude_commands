@@ -2615,23 +2615,27 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
         })
 
-    def test_without_trusted_folders_preserves_settings_and_removes_empty_entries(self) -> None:
+    def test_without_project_entries_removes_exact_keys_and_preserves_other_settings(self) -> None:
         source: dict[str, object] = {"keep": [1, 2], "projects": {
-            "/settings": {"hasTrustDialogAccepted": True, "keep": ["setting"]},
+            "/settings": {"hasTrustDialogAccepted": True, "lastCost": 1.5, "exampleFiles": ["file"]},
             "/empty": {"hasTrustDialogAccepted": False},
+            "/without-trust": {"lastCost": 2.5},
+            "/settings/child": {"hasTrustDialogAccepted": True},
+            "/settings-neighbor": {"keep": "neighbor"},
             "/other": {"hasTrustDialogAccepted": True, "keep": "other"},
         }}
         before = json.dumps(source)
-        result = accounts.without_trusted_folders(source, ("/settings", "/empty", "/missing"))
+        result = accounts.without_project_entries(source, ("/settings", "/empty", "/without-trust", "/missing"))
         self.assertEqual(result, {"keep": [1, 2], "projects": {
-            "/settings": {"keep": ["setting"]},
+            "/settings/child": {"hasTrustDialogAccepted": True},
+            "/settings-neighbor": {"keep": "neighbor"},
             "/other": {"hasTrustDialogAccepted": True, "keep": "other"},
         }})
         self.assertEqual(json.dumps(source), before)
-        self.assertIs(accounts.without_trusted_folders(result, ("/settings", "/empty")), result)
-        self.assertIs(accounts.without_trusted_folders(source, ()), source)
+        self.assertIs(accounts.without_project_entries(result, ("/settings", "/empty")), result)
+        self.assertIs(accounts.without_project_entries(source, ()), source)
         absent: dict[str, object] = {"keep": "no projects"}
-        self.assertIs(accounts.without_trusted_folders(absent, ("/missing",)), absent)
+        self.assertIs(accounts.without_project_entries(absent, ("/missing",)), absent)
 
     def test_folder_trust_reports_a_failed_home_and_continues_on_set_and_clear(self) -> None:
         paths = self.write_trust_fixture()
