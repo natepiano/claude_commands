@@ -315,7 +315,9 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.state.mkdir()
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=self.origin)
         _ = self.git("init", "-b", "main", cwd=self.checkout)
+        _ = self.git("config", "maintenance.auto", "false", cwd=self.checkout)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=self.checkout)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
@@ -418,6 +420,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         """Push an independent main fix through the fixture's private origin."""
         writer = self.root / "main-fix-writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
         self.write(writer, relative, content)

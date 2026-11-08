@@ -343,6 +343,7 @@ class FastTrackTests(MergeCheckpointFixture):
     def move_main_during_check(self) -> str:
         writer = self.control / "writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Concurrent Writer", cwd=writer)
         _ = self.git("config", "user.email", "writer@example.invalid", cwd=writer)
         self.write(writer, "concurrent.txt", "another fix\n")

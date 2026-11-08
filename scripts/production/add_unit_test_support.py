@@ -222,11 +222,15 @@ class AddUnitTestCase(ShutdownTestCase):
         # HOME is private per test; this expands to its copied checkout without
         # rewriting a tracked file (and committing/pushing it) on every setup.
         fixture.checkout = Path("~/../project-trunk")
-        cls.seed = ImmutableGitSeed.create(root, "build-followups", "Unit Test", "unit@example.invalid", {
-            "docs/plans/build-followups-production.md": fixture.production_doc(),
-            "docs/plans/given.md": "# Given\n",
-            ".gitignore": "docs/plans/build-followups-log.md\n",
-        })
+        with patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": "'maintenance.auto=false'"}):
+            cls.seed = ImmutableGitSeed.create(root, "build-followups", "Unit Test", "unit@example.invalid", {
+                "docs/plans/build-followups-production.md": fixture.production_doc(),
+                "docs/plans/given.md": "# Given\n",
+                ".gitignore": "docs/plans/build-followups-log.md\n",
+            })
+        for repository in (cls.seed.checkout, cls.seed.origin):
+            _ = subprocess.run(["git", "-C", str(repository), "config", "maintenance.auto", "false"],
+                               capture_output=True, check=True)
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -342,6 +346,12 @@ class AddUnitTestCase(ShutdownTestCase):
             'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
         source = source.replace("raise SystemExit(main(sys.argv[1:]))", "raise SystemExit(submitting_main(sys.argv[1:]))")
         hook = r'''def submitting_main(argv):
+    with (Path(os.environ["STUB_STATE"]) / "process.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return submit_command(argv)
+
+
+def submit_command(argv):
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
@@ -379,7 +389,9 @@ class AddUnitTestCase(ShutdownTestCase):
     return result
 
 '''
-        source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
+        source = source.replace('if __name__ == "__main__":',
+                                hook + 'if __name__ == "__main__":\n'
+                                + f'    sys.path.insert(0, {str(SCRIPT.parents[2])!r})')
         _ = fake_path.write_text(source)
         fake_path.chmod(0o755)
         fake = str(fake_path)
