@@ -47,6 +47,27 @@ class CompletedMemoryHook(TypedDict):
     attempts: int
 
 
+ADMISSION_BEFORE_RETRY = r'''
+import os
+import sys
+
+sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+from scripts.build_queue import admission_client
+from scripts.build_queue.system_clock import SystemClock
+
+
+class AdmissionBeforeRetryClock(SystemClock):
+    """Keep admission before the first retry deadline during a result check."""
+
+    def monotonic(self) -> float:
+        return 0.0
+
+
+admission_client.CLOCK = AdmissionBeforeRetryClock()
+raise SystemExit(admission_client.main(sys.argv[2:]))
+'''
+
+
 OBSERVE_MEMORY_HOOK = r'''
 import json
 import os
@@ -356,6 +377,16 @@ source() {
         self.memory_hook_observer = observe
         observer = self.root / "observe-memory-hook.py"
         self.write_executable(observer, OBSERVE_MEMORY_HOOK)
+        self.install_admission_client(observer)
+        os.mkfifo(self.runner_state / "memory-hook-ack")
+
+    def control_admission_clock(self) -> None:
+        """Keep local admission ahead of retry passes in result checks."""
+        script = self.root / "admission-before-retry.py"
+        self.write_executable(script, ADMISSION_BEFORE_RETRY)
+        self.install_admission_client(script)
+
+    def install_admission_client(self, script: Path) -> None:
         library = self.home / ".claude/scripts/lib"
         if library.is_symlink():
             library.unlink()
@@ -368,8 +399,7 @@ source() {
                 (library / source.name).symlink_to(source)
         self.write_executable(library / "py", '#!/bin/sh\n'
             + 'case "${1:-}" in */admission_client.py)\n'
-            + f'  exec "{REPOSITORY}/scripts/lib/py" "{observer}" "$@" ;;\nesac\n' + launcher)
-        os.mkfifo(self.runner_state / "memory-hook-ack")
+            + f'  exec "{REPOSITORY}/scripts/lib/py" "{script}" "$@" ;;\nesac\n' + launcher)
 
     @override
     def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

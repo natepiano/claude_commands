@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from typing import cast, override
 
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class VerifySshResultsTests(VerifySshTargetsFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.control_admission_clock()
+
     def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
         self.configure("aws,spare,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={
