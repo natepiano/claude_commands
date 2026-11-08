@@ -344,6 +344,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
+        resumed = states[busy.row.id]
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertNotEqual(resumed.pane, busy.pane)
+        self.assertNotEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
         self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
         self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
@@ -781,7 +785,6 @@ class WorkerCommandTests(unittest.TestCase):
                     if closed:
                         self.agent.append(opened.pane, "user", "Detached run: verification\nRun finished: private verification")
                         _ = self.fixture.world.stop(opened.row, self.fixture.world)
-                        del self.fixture.world.locations[opened.pane]
                         atomic_file.write_text_atomic(path, json.dumps(record))
                         self.assertEqual(result.result(timeout=guard.remaining()), worker.ExitCode.NO_DONE)
                     else:
@@ -1364,7 +1367,8 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         self.assertEqual(self.dispatch("impl2"), worker.ExitCode.OK)
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
-        self.assertEqual(self.agent.submitted[0][0], second.pane)
+        self.assertNotEqual(self.agent.submitted[0][0], second.pane)
+        self.assertEqual(self.agent.row(self.agent.submitted[0][0]).current_session, second.row.current_session)
 
     def test_all_busy_assignment_names_each_worker_and_refuses(self) -> None:
         for name in ("impl", "impl2"):
@@ -2053,7 +2057,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("check")[0], 0)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         self.assertEqual(self.command("check")[0], 0)
-        self.fixture.world.unknown[opened.pane] = "process evidence lost"
+        resumed = self.opened()
+        self.fixture.world.unknown[resumed.pane] = "process evidence lost"
         code, output, errors = self.command("check")
         self.assertEqual(code, 1)
         self.assertIn("impl", output)

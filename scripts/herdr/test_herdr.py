@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import json
+import importlib
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
@@ -1640,6 +1641,63 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
+    def test_launch_exits_the_shell_only_for_worker_panes(self) -> None:
+        for kind in ("claude", "codex"):
+            for purpose in ("worker", "unit", "side"):
+                for setups in (1, 2):
+                    with self.subTest(kind=kind, purpose=purpose, setups=setups):
+                        environment = {"CLAUDE_CONFIG_DIR": str(self.root / "account"), "PATH": os.defpath}
+                        prepared = (herdr.WorkerPaneEnvironment(self.root, environment) if purpose == "worker" else
+                                    herdr.PreparedAgentEnvironment(self.root, environment))
+                        destination = (herdr.NewTab("units", "unit") if purpose == "unit" else
+                                       herdr.SplitPane("parent", "right", 0.5, purpose))
+                        client = Mock(spec=herdr.Herdr)
+                        cast(Mock, client.result).return_value = {"pane": {"pane_id": "launched-pane"}}
+                        with (patch.object(herdr, "Herdr", return_value=client),
+                              patch.object(herdr, "open_tab", return_value="launched-pane"),
+                              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+                            launched = herdr.launch_prepared_agent("agents", destination, prepared, kind, [],
+                                herdr.NoOpeningPrompt(), 5000, agent=purpose)
+                        self.assertEqual(launched.pane, "launched-pane")
+                        script = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])[1]
+                        command = shlex.join(["eval", script + '; print -r -- "worker-hooks:${#preexec_functions}"'])
+                        setup = (command + "\n") * setups
+                        shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-dfi"],
+                            input=f'{kind}() {{ print agent-returned; return 23; }}\n{setup}{kind}\nprint shell-retained\n',
+                            cwd=self.root, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertIn("agent-returned", shell.stdout)
+                        self.assertEqual(shell.stdout.splitlines().count("worker-hooks:1"), setups if purpose == "worker" else 0)
+                        self.assertEqual("shell-retained" in shell.stdout, purpose != "worker")
+                        self.assertEqual(shell.returncode, 23 if purpose == "worker" else 0, shell.stderr)
+
+    def test_quit_agent_accepts_a_shell_or_a_closed_worker_pane(self) -> None:
+        from scripts.herdr import test_worker_panes, worker_panes
+
+        for closure in ("shell", "before-row", "before-activity"):
+            with self.subTest(closure=closure):
+                case = test_worker_panes.WorkerPaneTests()
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                opened = case.start()
+                assert isinstance(opened, worker_panes.OpenWorker)
+                if closure != "before-row":
+                    case.world.exiting_panes.discard(opened.pane)
+                activity = case.world.pane_activity
+
+                def read_activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
+                    if closure == "before-activity":
+                        case.world.remove_pane(pane)
+                        raise herdr.HerdrFailure("pane closed", "pane_not_found")
+                    return activity(pane)
+
+                with patch.object(case.world, "pane_activity", side_effect=read_activity):
+                    case.world.quit_agent(opened.pane, opened.terminal, str(opened.row.current_session), 0.1)
+                self.assertEqual(opened.pane not in case.world.locations, closure != "shell")
+                self.assertNotIn(opened.pane, case.world.foreground)
+                self.assertEqual(case.world.commands[-1], ("agent", "prompt", opened.pane,
+                    script_prompt("/quit")))
+                self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
+
     def test_claude_launch_trusts_a_folder_without_a_trusting_account(self) -> None:
         account = self.root / "new-account"
         account.mkdir()
@@ -2374,6 +2432,8 @@ class HerdrTests(unittest.TestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        # Load account readers before a test selects a different platform.
+        _ = importlib.import_module("scripts.whoami.agent_accounts")
         trust_launch = herdr.trust_claude_launch
 
         def trust_fixture_launch(folder: Path, config_dir: Path) -> None:
