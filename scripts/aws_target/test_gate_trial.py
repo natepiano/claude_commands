@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -81,8 +81,7 @@ class FakeAws:
         self.observed_states: list[str] = []
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
-        self.handler_thread: int = threading.get_ident()
-        self.signal_handled: Callable[[], None] | None = None
+        self.signal_waiters: int = 1
         self.missing_log: bool = False
         self.query_timeout: bool = False
         self.zone_prices: dict[str, float] = {}
@@ -101,13 +100,6 @@ class FakeAws:
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
-        if 'get-object' in args:
-            with self.lock:
-                number, self.signal_number = self.signal_number, 0
-            if number:
-                signal.pthread_kill(self.handler_thread, number)
-                if self.signal_handled is not None:
-                    self.signal_handled()
         if 'get-object' in args and self.before_result is not None:
             key = args[args.index('--key') + 1]
             if not key.endswith('/log'):
@@ -317,15 +309,35 @@ class GateTrialTests(unittest.TestCase):
         command = trial.GateTrial(AwsCli('fixture', 'us-east-1', 1, self.fake), settings, self.root / 'state',
             trial.SigningKey('fixture-access', 'fixture-secret'), clock=self.clock.read, pause=self.clock.advance)
         self.command = command
-        def signal_handled() -> None:
+        main_thread = threading.get_ident()
+        number = self.fake.signal_number
+        waiting: set[str] = set()
+        sent = False
+        wait = command.changed.wait
+        def result(key: str) -> None:
             with command.changed:
+                waiting.add(key)
+                command.changed.notify_all()
                 self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
-        self.fake.signal_handled = signal_handled
+        def deliver_signal(timeout: float | None = None) -> bool:
+            nonlocal sent
+            if threading.get_ident() == main_thread and len(waiting) == self.fake.signal_waiters and not sent:
+                # Deliver the signal after the requested worker reads block, from the scheduler thread.
+                sent = True
+                self.fake.signal_number = 0
+                signal.raise_signal(number)
+                return True
+            return wait(timeout)
         output = StringIO()
         try:
             with (redirect_stdout(output), mock.patch.dict(os.environ, {'MERGE_GATE_STATE_DIR': str(self.root / 'measures')}),
-                  mock.patch.object(trial, 'NIXOS_LOCK', self.root / 'flake.lock')):
+                  mock.patch.object(trial, 'NIXOS_LOCK', self.root / 'flake.lock'), ExitStack() as hooks):
+                if number:
+                    _ = cast(object, hooks.enter_context(mock.patch.object(self.fake, 'before_result', new=result)))
+                    _ = cast(object, hooks.enter_context(mock.patch.object(command.changed, 'wait', side_effect=deliver_signal)))
                 _ = command.run(self.repo, step, sizes, runs, reserve, vcpus)
+                if number:
+                    self.assertTrue(sent)
         finally:
             self.output = output.getvalue()
         return command
@@ -502,37 +514,12 @@ class GateTrialTests(unittest.TestCase):
         self.assertLess(command.spent + command.s3_cost, 0.45)
 
     def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
-        main_thread = threading.get_ident()
-        schedule = trial.GateTrial.schedule
         for number in trial.TRIAL_SIGNALS:
             with self.subTest(number=number):
                 self.fake = FakeAws(self.clock)
-                waiting: set[str] = set()
-                sent = False
-                def result(key: str) -> None:
-                    command = self.command
-                    assert command is not None
-                    with command.changed:
-                        waiting.add(key)
-                        command.changed.notify_all()
-                        self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
-                def schedule_with_signal(command: trial.GateTrial, step: str, sizes: Sequence[int], runs: int,
-                                         reserve: float, vcpus: int) -> None:
-                    wait = command.changed.wait
-                    def deliver_signal(timeout: float | None = None) -> bool:
-                        nonlocal sent
-                        if threading.get_ident() == main_thread and len(waiting) == 2 and not sent:
-                            # Deliver the signal after both worker reads block, from the scheduler thread.
-                            sent = True
-                            signal.raise_signal(number)
-                            return True
-                        return wait(timeout)
-                    with mock.patch.object(command.changed, 'wait', side_effect=deliver_signal):
-                        schedule(command, step, sizes, runs, reserve, vcpus)
-                self.fake.before_result = result
-                with mock.patch.object(trial.GateTrial, 'schedule', new=schedule_with_signal):
-                    command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
-                self.assertTrue(sent)
+                self.fake.signal_number = number
+                self.fake.signal_waiters = 2
+                command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
                 self.assertEqual(self.fake.launches, 2)
                 self.assertTrue(command.interrupted)
                 self.assertEqual([row.verdict for row in command.attempts].count('cancelled'), 2)
