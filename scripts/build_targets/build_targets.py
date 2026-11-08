@@ -677,7 +677,6 @@ def command_reserve(args: CliArguments) -> int:
 
     from scripts.build_targets import target_config
     from scripts.lib.atomic_file import write_text_atomic
-    from scripts.mac_test import mac_test, offload
 
     destination = Path(args.reservation_file)
     if destination.exists():
@@ -690,17 +689,21 @@ def command_reserve(args: CliArguments) -> int:
             config = ssh_target_config(target)
             if not isinstance(config, ExcludedTarget):
                 if config.enabled:
+                    from scripts.mac_test import mac_test
+
                     paths = mac_test.state_paths(name)
                     if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
                         return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
         return 1
-    verb = remote_verb(args.kind)
     busy_mac = False
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
             continue
+        from scripts.mac_test import mac_test, offload
+
+        verb = remote_verb(args.kind)
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             if config.reason != "off":
@@ -748,7 +751,6 @@ def command_reserve(args: CliArguments) -> int:
 def command_release_wait(pid: int) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
     from scripts.lib import process_start as process_identity
-    from scripts.mac_test import mac_test
 
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
@@ -756,6 +758,8 @@ def command_release_wait(pid: int) -> int:
     for target in read_targets():
         if not isinstance(target, SshTarget):
             continue
+        from scripts.mac_test import mac_test
+
         paths = mac_test.state_paths(target.name)
         if not paths.directory.exists():
             continue
@@ -1072,9 +1076,9 @@ def command_eligibility(args: CliArguments) -> int:
     """Apply eligibility flags without loading them for other commands."""
 
     from scripts.lib.atomic_file import write_text_atomic
-    from scripts.mac_test import offload
-
     if args.probe_marks_file:
+        from scripts.mac_test import offload
+
         repository = offload.repository_identity(Path(args.repo_root))
         marks: list[str] = []
         for target in read_targets():
@@ -1084,6 +1088,8 @@ def command_eligibility(args: CliArguments) -> int:
                     marks.append(str(offload.linux_version_decline_path(target.name, repository.name)))
         write_text_atomic(Path(args.probe_marks_file), "".join(path + "\n" for path in marks))
     if args.remote_kinds_file:
+        from scripts.mac_test import offload
+
         write_text_atomic(Path(args.remote_kinds_file), "".join(
             f"{remote_verb(cast(StepKind, step))}\t{step}\n"
             for step in offload.remote_step_kinds(args.kind)))

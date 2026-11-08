@@ -1093,7 +1093,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** one step-start JSON command for all step facts (starts per step local 1→1, pinned SSH 4→3, Mac-only 3→3; `test_verify_mac_only.py` CPU −2.8%).
 
-### Phase 41q — Load mac_test and offload only for an SSH target  · status: todo
+### Phase 41q — Load mac_test and offload only for an SSH target  · status: done
 
 **Depends on:** Phase 41p.
 

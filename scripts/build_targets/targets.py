@@ -259,11 +259,21 @@ def target_eligibility(
     repo_root: Path, package: str, routing: Routing
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Keep configured order while excluding Mac targets the test cannot use."""
+    configured = read_targets()
+    if all(target.platform == "linux" for target in configured):
+        return tuple(EligibleTarget(target) for target in configured)
+    return mac_policy_eligibility(repo_root, package, routing, configured)
+
+
+def mac_policy_eligibility(
+    repo_root: Path, package: str, routing: Routing, configured: tuple[Target, ...]
+) -> tuple[EligibleTarget | ExcludedTarget, ...]:
+    """Read repository policy when a configured target uses macOS."""
     from scripts.mac_test import offload
 
     results: list[EligibleTarget | ExcludedTarget] = []
     repository = offload.repository_identity(repo_root)
-    for target in read_targets():
+    for target in configured:
         if target.platform == "linux":
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
