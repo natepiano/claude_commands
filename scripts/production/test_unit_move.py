@@ -31,6 +31,8 @@ from scripts.production.rename_rerun_test_support import file_versions, saved_fi
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
 from scripts.herdr import herdr
+from scripts.herdr.test_worker_panes import PaneWorld
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def setUpModule() -> None:
@@ -682,6 +684,51 @@ class UnitFolderMoveTests(FolderRenameFixture):
         before = file_versions(self.records)
         self.test_running_unit_stops_moves_and_resumes_current_session()
         self.assertEqual(file_versions(self.records), before)
+
+    def test_folder_move_resumes_the_unit_and_keeps_a_live_idle_worker_closed(self) -> None:
+        world = PaneWorld()
+        world.setup(self)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})))
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config.with_name("production.conf"), self.configuration.read_text())
+        write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+        idle = fixture_worker("idle", self.owner.id)
+        world.add(self.owner, "w1:p0")
+        world.add(idle, "w1:p1")
+        backend = FolderSessionFixture(self.owner, live=True)
+        real_start = restart.start_row
+
+        def live_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+            identities = {world.processes[pid].current_identity for pid, _, _ in world.foreground.values()}
+            return [row for row in rows if row.current_session in identities]
+
+        def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr) -> str:
+            if row.kind == "worker":
+                return real_start(row, record, client)
+            pane = backend.start(row, record, client)
+            world.activate(row.current_session, "w1:p0", "claude")
+            return pane
+
+        def stop(row: staff.StaffRow, client: herdr.Herdr) -> bool:
+            if row.id == self.owner.id:
+                _ = backend.stop(row, client)
+            return world.stop(row, client)
+
+        with (mock.patch.object(restart, "live_members", side_effect=live_members),
+              mock.patch.object(restart, "stop_row", side_effect=stop),
+              mock.patch.object(restart, "start_row", side_effect=start),
+              mock.patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              mock.patch.object(herdr.Herdr, "panes", wraps=world.panes),
+              mock.patch.object(os, "kill", side_effect=world.signal)):
+            result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assert_moved(backend)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertIn("idle: closed; its next assign resumes it\n", result.stdout)
+        self.assertIn("w1:p0", world.foreground)
+        self.assertNotIn("w1:p1", world.foreground)
+        self.assertEqual(world.launches, [])
 
     def test_folder_move_resumes_the_same_worker_thread_with_the_staff_folder(self) -> None:
         self.test_move_reads_only_members_and_resumes_their_current_sessions()

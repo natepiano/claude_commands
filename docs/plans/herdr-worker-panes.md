@@ -3436,7 +3436,7 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 
 **Files (first list; the Work Order at the phase start settles it):** `scripts/production/worker.py` and `test_worker.py`; `scripts/direct/assign.py`, `assign.sh`, `progress_history.py` and their tests; `scripts/herdr/worker_panes.py` and `test_worker_panes.py`; one new turn-end hook script in `scripts/herdr/` with its test; `commands/unit/direct.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`; `docs/as-built/long-lived-workers.md` and `herdr-adoption.md`.
 
-### Phase 42 — A renamed unit keeps its workers  · status: todo
+### Phase 42 — A renamed unit keeps its workers  · status: done
 
 **Depends on:** Phase 28 (it runs after 28; sdlc [1a1bc926], 2026-11-08). Phase 28a runs after it.
 
@@ -3482,9 +3482,10 @@ Path (herdr, 2026-11-08): a unit folder move (`unit_move.move_folder`, which a r
 
 Found by Phase 28's director proof, 2026-11-08 (test run `/home/natepiano/scratch/herdrcheck/answer-1794138524`). Both defects were there before Phase 28.
 
-1. Codex workers start with `--ask-for-approval never` (`worker_panes._policy_arguments`), so a Codex worker never stops on a question. Only a Claude worker (`AskUserQuestion`) reaches herdr status `blocked`.
+1. Live evidence (Phase 42 repair, 2026-11-08): a Codex worker does block. impl6 asked a question with Codex's question tool (pane shows `? 1 question`, `shift+← to answer`); herdr reported `blocked`, and the launcher gave exit 4 with the `question:` line. `worker.py answer` then failed: `herdr agent prompt: agent_blocked: agent w16:p63 is blocked and requires interactive input`. The director answered by hand: `herdr pane send-keys <pane> shift+left`, `herdr pane send-text <pane> "<answer>"`, then `send-keys <pane> enter` twice (the first enter did not submit). Make `answer` use that path for a blocked Codex pane, and the Claude equivalent for `AskUserQuestion`. Approval prompts stay off (`--ask-for-approval never`).
 2. A new Claude worker gets no first prompt. `worker_admission.transcript_source` raises "no source transcript found" for a Claude conversation that has no transcript yet, so `dispatch_receipt` returns evidence unknown and the launcher exits 8 with "no prompt sent". A new Codex conversation writes its rollout file at start, so Codex is not affected. Also check why the new Claude pane started in the director's worktree and not in `--cwd`.
 3. `worker_panes.py close` and `worker.py end` refuse a worker whose last pass is `interrupted` ("launcher has not recorded a completed pass"), so the proof pane `answerproof` (w16:p6A) stays open.
+4. `worker_panes.py close` reads a short shell prompt-hook process (direnv, with its bash child) in a stopped worker's pane as other work and refuses (cargo-liner [7ac1dfcc], 2026-11-08, pane p17). The process ended seconds later. A retry closes the pane.
 
 After the fix, run Phase 28's director proof: a Claude worker asked to edit a file outside its paths stops on the question; the director answers through `worker.py answer`, reruns the launcher, and the pass completes. A Claude worker needs a private `MODELS_CONFIG_FILE` with `direct=claude`. The Work Order is written at the phase start.
 
