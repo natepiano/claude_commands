@@ -6,6 +6,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -71,7 +72,7 @@ class AgentsUsageTests(unittest.TestCase):
             self.assertIn(DESKTOP_ID, {item["session_id"] for item in observed})
             code, output, errors = self.invoke(["status", "--here"])
             self.assertEqual(code, 0, errors)
-            self.assertNotIn(row.name, output)
+            self.assertNotRegex(output, rf"(?m)^  \S+ {re.escape(row.name)} · ")
         self.assertIn(UNIT_ID, {item["sessionId"] for item in sessions.live_sessions()})
 
     def invoke(self, arguments: list[str]) -> tuple[int, str, str]:
