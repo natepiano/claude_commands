@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from threading import Event
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -629,21 +630,28 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     pre_stop_codex = observed.codex
     unconfirmed: set[staff.StaffId] = set()
     unconfirmed_workers: set[staff.StaffId] = set()
-    def stop_holder(holder: staff.StaffRow) -> tuple[bool, tuple[staff.StaffId, ...]]:
-        with staff.row_operation(str(holder.id)):
-            shutdown_record.update(started=[], pending=members_by_holder[holder.id])
-            workers: tuple[staff.StaffId, ...] = ()
-            if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
-                if unresolved and holder.id in observed.pane_owners:
-                    workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
-                                    if child.id in selected_ids)
-            return stop_row(holder, client, codex=observed.codex, runs=observed.runs), workers
+    def stop_holder(holder: staff.StaffRow, previous: Event, recorded: Event) -> tuple[bool, tuple[staff.StaffId, ...]]:
+        _ = previous.wait()
+        try:
+            with staff.row_operation(str(holder.id)):
+                shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+                recorded.set()
+                workers: tuple[staff.StaffId, ...] = ()
+                if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
+                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
+                    if unresolved and holder.id in observed.pane_owners:
+                        workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
+                                        if child.id in selected_ids)
+                return stop_row(holder, client, codex=observed.codex, runs=observed.runs), workers
+        finally:
+            recorded.set()
 
     if stop_all and holders:
+        recorded = [Event() for _ in range(len(holders) + 1)]
+        recorded[0].set()
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
-            futures = [(holder, pool.submit(copy_context().run, stop_holder, holder))
-                       for holder in tuple(holders.values())]
+            futures = [(holder, pool.submit(copy_context().run, stop_holder, holder, recorded[index], recorded[index + 1]))
+                       for index, holder in enumerate(tuple(holders.values()))]
             for holder, future in futures:
                 try:
                     stopped, workers = future.result()
