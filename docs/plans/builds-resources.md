@@ -1876,3 +1876,12 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `docs/as-built/build-memory-admission.md` describes the Mac floor job.
 - The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
 - No Python change and no new test: the job calls an existing entry point.
+
+### Phase 83 — Memory admission holds a gate's tests back before the memory kill  · status: done
+**Approved:** builds showrunner, 2026-11-08. Closed as research with no code (builds, 2026-11-08: "Close Phase 83 as research with no code. Its report stays the evidence.").
+
+#### As-built
+- Report: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
+- earlyoom stopped hana `b2f5eb9641`'s gate nextest at 11:19:14, 11:19:28 and 11:19:51 UTC on 2026-11-08, with about 1.2 GiB available and no free swap. hana's nextest stayed inside its claim (8.6 GiB anonymous peak against 12.1 GiB).
+- A herdr merge gate that ran at the same time had a 4 GiB claim and a 26.4 GiB anonymous peak. Its first attempts of `test_verify_mac_memory_handoff.py` (27.0 GiB) and `test_verify_mac_local_release.py` (9.4 GiB) ran away; their retries passed at about 250 MiB. The builds slice also held up to 27 GiB of shmem that no reservation counts.
+- Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.
