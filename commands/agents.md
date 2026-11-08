@@ -1,6 +1,6 @@
 ---
-description: Show, pause, exit, resume, stop, or restart sessions.
-argument-hint: 'pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
+description: Show, pause, exit, retire, resume, stop, or restart sessions.
+argument-hint: 'retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
 ---
 
 Use the `agents` program.
@@ -12,7 +12,10 @@ Use the `agents` program.
 - Add `--finish-step` to pause or exit after the workers finish their current tasks.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
-- `agents resume NAME [--why TEXT] [--to ACCOUNT]`: resume a name, staff id, session id, or exact Codex thread name.
+- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a name, staff id, session id, or exact Codex thread name.
+- `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
+- `agents resume NAME --retired`: restore a retired unit and its retained workers.
+- Before running `--retired`, ask the user yes or no. Run it only after yes.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
@@ -27,11 +30,13 @@ Resume restores the saved folder and environment.
 Codex uses the configured `workers` account; Claude units and showrunners use their configured role accounts.
 Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
 The default reason is `resumed by name`.
+Retired units do not appear in active status or the board.
+Resume without `--retired` refuses a retired unit.
 A running session prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
-The short form `resume NAME [--why TEXT] [--to ACCOUNT]` stays available from any directory.
+The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.

@@ -271,7 +271,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
 
     def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
-        # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
+        # agents retire, add_unit and promote_showrunner leave their doc commit to the next merge push.
         self.write(self.checkout / "local.txt", "retired\n")
         local = self.commit(self.checkout, "production(fixture): retire alpha")
         result = self.run_gate()
