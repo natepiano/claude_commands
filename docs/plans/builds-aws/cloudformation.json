@@ -1490,6 +1490,25 @@
               "Resource": {
                 "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
               }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "GateBucket",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": [
+                    "artifacts/*"
+                  ]
+                }
+              }
             }
           ]
         }
