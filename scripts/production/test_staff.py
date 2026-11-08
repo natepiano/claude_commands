@@ -25,6 +25,7 @@ from unittest import mock
 from scripts.production import staff
 from scripts.shutdown import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
+from scripts.herdr import worker_panes
 from scripts.lib import unit_runs
 from scripts.message import sessions
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
@@ -137,7 +138,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         self.assertIn("unchanged", rerun.stderr)
                         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
                         self.assertEqual(displays.commands,
-                                         [("pane", "rename", "probe-pane", renamed.name)] if live else [])
+                                         [("pane", "rename", "probe-pane", worker_panes.agent_name(holder, renamed.name))] if live else [])
                         self.assertEqual(displays.tab, "previous")
                         self.assertEqual(staff.by_id(holder.id), holder)
 
@@ -161,13 +162,13 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         with displays.installed():
                             renamed = staff.rename(worker.id, name + "-renamed")
                             self.assertEqual(renamed, replace(worker, name=name + "-renamed"))
-                            self.assertEqual(displays.pane, renamed.name if live else "previous")
+                            self.assertEqual(displays.pane, worker_panes.agent_name(holder, renamed.name) if live else "previous")
                             settled = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
                             self.assertEqual(staff.rename(worker.id, renamed.name), renamed)
                         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), settled)
                         self.assertEqual((layout.read_bytes(), layout.stat().st_mtime_ns), before)
                         self.assertEqual(displays.commands,
-                                         [("pane", "rename", "probe-pane", renamed.name)] if live else [])
+                                         [("pane", "rename", "probe-pane", worker_panes.agent_name(holder, renamed.name))] if live else [])
                         self.assertEqual(displays.tab, "previous")
                         self.assertEqual(staff.by_id(holder.id), holder)
 
