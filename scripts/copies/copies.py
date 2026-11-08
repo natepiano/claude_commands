@@ -298,6 +298,21 @@ def load_config() -> CopiesConfiguration:
     return CopiesConfiguration(root.resolve(), delay, git_timeout, guard_timeout, allow_list)
 
 
+def guard_choice_limit() -> int:
+    """Read the branch limit, using the repository setting for older configuration files."""
+    path, values = config_settings()
+    if "guard_choice_limit" not in values:
+        path = Path(__file__).resolve().parents[2] / "config/copies.conf"
+        values = conf.read(path).values()
+    try:
+        limit = int(values["guard_choice_limit"])
+        if limit <= 0:
+            raise ValueError("guard_choice_limit must be positive")
+    except (KeyError, ValueError) as error:
+        raise CopyError(f"{path}: invalid copies configuration: {error}") from error
+    return limit
+
+
 def unit_owner(name: str) -> str:
     """Keep the recorded unit name and append one unit suffix."""
     return name.removesuffix("-unit") + "-unit"

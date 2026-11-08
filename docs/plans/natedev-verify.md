@@ -1165,7 +1165,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** an `end` command, a sweep, a timer, and a call from `end_session.sh` or the phase-start merge — the user wants the landing step to end a tree, not a cleanup tool.
 
-### Phase 41t — The copy guard refuses only what makes a repository tree  · status: todo
+### Phase 41t — The copy guard refuses only what makes a repository tree  · status: done
 
 **Depends on:** none. (Queue Phase 16 moved here by builds, 2026-11-08. Its queue dependencies are met: queue 18c is done, and verify Phase 35 is on builds.)
 
@@ -1193,6 +1193,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 6. **Run-place fixture (builds, 2026-11-08).** `scripts/direct/test_verify_run_place.py` fails without `PYTHONPATH`. Its fixture copies `scripts` but not `lib/package_root.py`, so the repo-root import fails. Add that file to the fixture. The tester owns this item.
 7. **Retained-claim flake (builds, 2026-11-08).** `test_verify_ssh_targets_retained.py` `test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits` fails with `LiveMemoryReading` while a real build runs in `builds.slice`; `slice_working_set` (`memory_admit.py:2641`) reads the live scope. `VerifySshTargetsFixture.setUp()` already calls `caller_admission`, which sets a fake `BUILDLOG_BUILDS_CGROUP` and the live-read tripwire. The direct claim call in the test also runs under `self.environment`. First find which run escapes that isolation (for example a child process with a different environment). Then close that path in the test. Do not add a second cgroup fixture. The tester owns this item.
 8. **Clock offset flake (builds, 2026-11-08).** `test_step_record.py` `test_write_reports_the_clock_offset_and_both_record_paths` failed under load 138 and passed alone. Find the wall-clock bound that load breaks, and remove it from the test. The tester owns this item.
+9. **Hold-events cleanup flake (builds, 2026-11-08).** On an aws cloud gate (32 modules at once), two local-admission tests in `scripts/direct/test_verify_hold_events.py` failed the first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Find the process that outlives the test, and close that path in the test or its fixture (`scripts/direct/verify_hold_wait_test_support.py`). The tester owns this item.
 
 **Files:**
 - `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
@@ -1200,6 +1201,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `scripts/direct/test_verify_run_place.py` — the fixture (item 6).
 - `scripts/direct/test_verify_ssh_targets_retained.py` — the faked cgroup (item 7).
 - `scripts/direct/test_step_record.py` — the clock offset test (item 8).
+- `scripts/direct/test_verify_hold_events.py`, `scripts/direct/verify_hold_wait_test_support.py` — the hold-events cleanup (item 9).
 
 **Constraints from prior phases:**
 - Phase 41s: `config/copies.conf` keeps `allow.worktree/worktrees.py`. `test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused` keeps its private `WORKTREES_STATE_DIR`, so the test writes no record to the real worktree state folder.
@@ -1213,6 +1215,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The retained-claim test reads no live `builds.slice` scope, and the summary names the run that escaped the fixture.
 - Unresolved input gets a message that does not name `copies.py`, through each of the three refusal entry points.
 - The clock offset test has no wall-clock bound that load can break.
+- The summary names the cause of the hold-events cleanup failure, and the fix keeps every assertion. As built: no outside process was proven. The cause found is a race: `mock.patch.dict` cleared `os.environ` while the `admission-readings` thread read it. `local_hold_environment` now restores only the changed keys.
 - The copies and hook suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
 - The director runs the targeted test.
 - Change-Review: a command that the guard refused now runs.
