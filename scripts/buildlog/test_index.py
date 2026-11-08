@@ -280,6 +280,11 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_update_enables_the_configured_spill_threshold(self) -> None:
+        spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA cache_spill").fetchone(), (spill_pages,))
+
     def test_complete_update_time_rolls_back_with_a_failed_update(self) -> None:
         self.write(self.host_file, step("retained"))
         with mock.patch.object(time, "time", return_value=100.0):
