@@ -24,62 +24,29 @@
 
 ### Phase 1 — The registry writer reads the branch it fetched  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** A registry edit fast-forwards only to the tip of its own branch, even when another fetch runs in the same checkout.
-
-**Spec:**
-Fault (sdlc, proved 2026-11-08 11:53 EST): `models_registry._fetch` runs `git fetch origin <branch>` and then reads `FETCH_HEAD`. Every fetch in the checkout writes `FETCH_HEAD`. A showrunner fetch of `sdlc-phases` came between the two calls. The catalog sync read that tip as `origin/main` and ran `git merge --ff-only` on live main.
-
-Fix: fetch into the branch's own remote ref and read that ref. Never read `FETCH_HEAD`.
-
-```python
-def _fetch(repo: Path, branch: str) -> str:
-    tracking = f"refs/remotes/origin/{branch}"
-    _ = _git(repo, "fetch", "origin", f"+refs/heads/{branch}:{tracking}")
-    return _git(repo, "rev-parse", "--verify", f"{tracking}^{{commit}}")
-```
-
-Test row: another fetch of a different branch between the fetch and the read does not change the target.
+`models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and returns `rev-parse --verify refs/remotes/origin/<branch>^{commit}`. It never reads `FETCH_HEAD`, because every fetch in the checkout writes `FETCH_HEAD`.
 
 **Files:**
-- `scripts/lib/models_registry.py` — `_fetch` reads its own remote ref.
-- `scripts/agents/test_models_conf_publish.py` — one test row.
+- `scripts/lib/models_registry.py` — `_fetch` reads the branch's own remote ref.
+- `scripts/agents/test_models_conf_publish.py` — a fetch of another branch between the fetch and the read does not change the target.
 
-**Workers:** director fix, agreed with sdlc (sdlc [12423414] named the fix).
-
-**State:** none.
-
-**Acceptance gate:** `scripts.agents.test_models_conf_publish` passes, with the new row; the merge gate passes.
+**Gotchas:** with `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref (git 2.54.0, checked 2026-11-08). Only a wildcard destination prunes others.
 
 ### Phase 2 — Codex can read the hooks file again  · status: done
 
-**Depends on:** none. Phase 3 depends on it: the herdr `SessionStart` hook reports a new pane's thread only when Codex can parse the hooks file.
+#### As-built
 
-#### Work Order
-
-**Goal:** The Codex hook installer writes every timeout as an integer, so Codex loads the hooks file.
-
-**Spec:**
-Fault (models, proved 2026-11-08 12:22 EST in a scratch pane): Codex 0.167.0 prints `failed to parse hooks config /home/natepiano/.codex1/hooks.json: invalid type: map, expected u64 at line 68 column 9` and runs no hook. Line 68 closes the `scratch-guard` handler, whose timeout is `10.0`. `CodexHook.timeout` returns `copy_guard.hook_timeout()`, a float from `config/copies.conf` `guard_timeout_seconds`. `codex_hooks.py check` lists every handler as absent in `~/.codex`, `~/.codex1` and `~/.codex2`.
-
-Fix: `CodexHook.timeout` returns whole seconds, `math.ceil(hook_timeout())` for `scratch-guard`.
-
-Test row: the installed hooks file carries an integer timeout for each handler.
-
-Live file: install compares timeouts with `==`, and `10.0 == 10` in Python, so install does not rewrite the live file. The live `hooks.json` needs a one-time edit of `10.0` to `10`, then `codex_hooks.py install` in each Codex home to trust the changed handler, then `check`.
+`CodexHook.timeout` returns an `int`. For `scratch-guard` it is `math.ceil(copy_guard.hook_timeout())`. Codex 0.167.0 refuses the whole `hooks.json` when any timeout is not an integer, and then runs no hook, `SessionStart` included.
 
 **Files:**
-- `scripts/hooks/codex_hooks.py` — `CodexHook.timeout` returns an `int`.
-- `scripts/hooks/test_codex_hooks.py` — one test row.
+- `scripts/hooks/codex_hooks.py` — `CodexHook.timeout` returns whole seconds.
+- `scripts/hooks/test_codex_hooks.py` — the installed hooks file carries an `int` timeout for each handler.
 
-**Workers:** director fix, agreed with sdlc (sdlc [c09f23e9] named the fix and the test row).
+**Binds later work:** the herdr `SessionStart` hook reports a new Codex pane's thread at the first prompt, not at process start.
 
-**State:** none.
-
-**Acceptance gate:** `scripts.hooks.test_codex_hooks` passes, with the new row; the merge gate passes.
+**Gotchas:** `install` compares timeouts with `==`, and `10.0 == 10` in Python, so `install` does not rewrite an old file. An old `hooks.json` needs a one-time edit of `10.0` to `10`, then `install` in each Codex home, then `check`. natedev and the Mac were migrated on 2026-11-08.
 
 ### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: todo
 
