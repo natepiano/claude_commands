@@ -700,10 +700,17 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     tables = {row[0] for row in cast(list[tuple[str]], connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).fetchall())}
-    if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
+    rebuild = version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables)
+    if rebuild:
         connection.close()
         remove_index(path)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    # WAL spill takes no exclusive database lock, so readers do not wait.
+    mode = cast(tuple[str], connection.execute("PRAGMA journal_mode = WAL").fetchone())[0]
+    if mode != "wal":
+        connection.close()
+        raise sqlite3.OperationalError(f"Cannot enable WAL journal mode: {mode}")
+    if rebuild:
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")

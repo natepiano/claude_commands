@@ -285,6 +285,36 @@ class IndexTests(unittest.TestCase):
         with closing(index.open_for_update(index.index_path())) as writer:
             self.assertEqual(writer.execute("PRAGMA cache_spill").fetchone(), (spill_pages,))
 
+    def test_update_uses_wal_for_new_and_existing_indexes(self) -> None:
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode").fetchone(), ("wal",))
+        with closing(sqlite3.connect(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode = DELETE").fetchone(), ("delete",))
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode").fetchone(), ("wal",))
+
+    def test_read_only_returns_committed_rows_during_spill_and_after_writer_closes(self) -> None:
+        wal = Path(str(index.index_path()) + "-wal")
+        with closing(index.open_for_update(index.index_path())) as writer:
+            writer.execute("INSERT INTO meta (key, value) VALUES ('retained', 'committed')").close()
+            writer.execute("PRAGMA cache_size = 10").close()
+            writer.execute("PRAGMA cache_spill = 10").close()
+            writer.execute("PRAGMA cache_spill = ON").close()
+            before = wal.stat().st_size if wal.exists() else 0
+            writer.execute("BEGIN IMMEDIATE").close()
+            try:
+                writer.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                   ((f"pending-{number}", "x" * 4096) for number in range(100))).close()
+                with self.subTest("WAL grows before commit"):
+                    self.assertGreater(wal.stat().st_size if wal.exists() else 0, before)
+                with mock.patch.object(index, "BUSY_TIMEOUT_MS", 100), closing(index.read_only()) as reader:
+                    self.assertEqual(reader.execute("SELECT COUNT(*) FROM meta").fetchone(), (1,))
+            finally:
+                writer.execute("ROLLBACK").close()
+        self.assertFalse(wal.exists())
+        with closing(index.read_only()) as reader:
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM meta").fetchone(), (1,))
+
     def test_complete_update_time_rolls_back_with_a_failed_update(self) -> None:
         self.write(self.host_file, step("retained"))
         with mock.patch.object(time, "time", return_value=100.0):
