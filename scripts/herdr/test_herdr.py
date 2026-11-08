@@ -2324,6 +2324,34 @@ class HerdrTests(unittest.TestCase):
                 if isinstance(observation, herdr.PromptInputReady):
                     self.assertEqual(observation.idle, state in {herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
 
+    def test_agent_inventory_decodes_a_reported_session_id(self) -> None:
+        identity = fixture_runtime_id("agent-inventory-report")
+        self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+            "pane_id": "worker", "agent": "codex", "agent_status": "idle",
+            "agent_session": {"kind": "id", "value": identity},
+        }]}}))
+        self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.ReportedAgentSession(identity))
+
+    def test_agent_inventory_decodes_no_reported_session(self) -> None:
+        reports: list[dict[str, object]] = [{}, {"agent_session": {"kind": "pending"}}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", **report,
+                }]}}))
+                self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.NoReportedAgentSession())
+
+    def test_agent_inventory_rejects_a_malformed_session_report(self) -> None:
+        reports: list[object] = [None, "thread", [], {}, {"kind": 7}, {"kind": "id"},
+                                 {"kind": "id", "value": 7}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", "agent_session": report,
+                }]}}))
+                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr agent session"):
+                    _ = self.herdr.agents()
+
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "pane", "rename", "worker", "dispatch-owner"])
@@ -4719,7 +4747,8 @@ class HerdrTests(unittest.TestCase):
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
-                  "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
+                  "agent": "codex", "pane_id": "pane-codex", "agent_status": herdr.AgentStatus.IDLE,
+                  "agent_session": herdr.ReportedAgentSession(str(codex.current_session)),
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
