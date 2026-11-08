@@ -191,8 +191,10 @@ first, preferring the worker that owns the files and reassigning another open wo
 under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
 open worker can take another file set. Each worker's task and kind are `fix`, its
 ninth argument remains its slot, and it gets its own
-`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker makes its repair and writes, for each testable finding, the regression test that would
-have caught it — one that fails without the repair. A finding about what is
+`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker repairs its findings.
+Cover each testable finding under the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6.
+Name the covering table row or test in the summary.
+The test must fail without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
 the prompt names; a test of components, constants or hand-written pointer hits
 does not count. It names each test for the behavior it pins and puts the
@@ -268,14 +270,13 @@ turn with the progress header per <DelegationResultFormat/>. While a fix runs
 that will receive a worker closure review, <EarlyReviewArm/> may arm that
 reviewer early.
 
-**A repair the main read can close, closes without a worker review.** Apply
-<ReviewDiffContract/> and read every repair hunk yourself. Close it directly —
-check each testable id has its regression test, record each verdict, and
-continue to <Synthesize/> — when the diff answers every id and each hunk is one
-of:
+**A repair the main read can close, closes without a worker review.**
+Apply <ReviewDiffContract/> and read every repair hunk yourself.
+Check each testable id's coverage under the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6.
+Record each verdict and continue to <Synthesize/> when the diff answers every id and each hunk is one of:
 
 - a path the batch's own findings named, a new file one of those paths
-  creates, or a test file holding the batch's regression tests;
+  creates, or a test file holding the batch's coverage under those rules;
 - a doc comment, user-facing copy, or comment change in any path, with no
   code change beside it;
 - a new private or crate-private type, function, or accessor whose every

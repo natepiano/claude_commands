@@ -24,11 +24,11 @@ def shutdown_state_root() -> Path:
 
 
 @dataclass(frozen=True)
-class NoRoleAccount:
-    """The recipient has no staff role that selects a Claude account."""
+class SessionWithoutStaffRow:
+    """The session has no row in the staff record."""
 
 
-NO_ROLE_ACCOUNT = NoRoleAccount()
+SESSION_WITHOUT_STAFF_ROW = SessionWithoutStaffRow()
 
 
 @dataclass(frozen=True)
