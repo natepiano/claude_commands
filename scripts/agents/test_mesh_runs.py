@@ -1121,6 +1121,36 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
                     self.assertIsInstance(mesh_runs.caller_from_environment({variable: row.id}), mesh_runs.NotMeshWorker)
 
+    def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
+        row = self.fixture.worker("TEST-command-owner", family="codex")
+        other = self.fixture.worker("TEST-impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        self.fixture.world.add(other, "w1:p2", family="codex")
+        other_run = self.fixture.root / "other-run"
+        other_run.mkdir()
+        write_text_atomic(other_run / "worker_transport", "herdr\n")
+        write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
+        runs = self.run_dir / codex_mesh.DETACHED_RUNS_DIR
+        for requested_run in (self.run_dir, other_run):
+            with self.subTest(session_dir=requested_run):
+                before = set(runs.glob("*.json"))
+                with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}),
+                      patch.object(treekey, "tree_key", return_value="private-tree"),
+                      patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+                      contextlib.redirect_stdout(io.StringIO()),
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    code = mesh_runs.main(["start", "--session-dir", str(requested_run), "--to", other.name,
+                                           "--", "private-check"])
+                self.assertEqual(code, 0, errors.getvalue())
+                spawn.assert_called_once()
+                path, = set(runs.glob("*.json")) - before
+                record = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+                self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
+                                 (str(self.run_dir), row.name, row.id))
+                self.assertEqual(errors.getvalue().splitlines(),
+                    [f"mesh_runs: --to {other.name} ignored; run belongs to worker {row.name}"])
+        self.assertFalse((other_run / codex_mesh.DETACHED_RUNS_DIR).exists())
+
     def test_run_started_for_a_pane_slot_stays_live_and_delivers_to_its_worker(self) -> None:
         _ = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
                                 transport="herdr", director_run=True)
