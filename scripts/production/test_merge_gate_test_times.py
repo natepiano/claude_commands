@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Sequence
 from datetime import datetime
+import gzip
 import io
 import os
 from pathlib import Path
@@ -134,8 +136,13 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertEqual(first["tests_s"], 0.25)
         self.assertEqual((retried["status"], retried["tests_run"], retried["failures"], retried["tests_s"]), (0, 1, 0, 0.25))
         self.assertEqual(retried["tests"], [])
+        kept = gzip.decompress((Path(self.environment["BUILDLOG_DIR"]) / first["log"]).read_bytes()).decode("utf-8")
+        self.assertIn("Traceback (most recent call last):", kept)
+        self.assertIn("AssertionError: fixture first run in hooks/test_first.py", kept)
+        self.assertEqual(retried["log"], "")
         passing = modules[("notify", "test_first.py", 1)]
         self.assertEqual((passing["status"], passing["tests_run"], passing["tests_s"], passing["tests"]), (0, 1, 0.25, []))
+        self.assertEqual(passing["log"], "")
         slow = modules[("direct", "test_first.py", 1)]
         self.assertEqual((slow["status"], slow["tests_run"], slow["tests_s"]), (0, 4, 6.5))
         self.assertEqual(slow["tests"], [
@@ -153,6 +160,22 @@ class MergeGateTestTimesTests(MergeGateFixture):
             self.assertEqual(argv[1], runner)
             self.assertEqual(environment["TEST_TIMES_OUT"], str(root / "test-times.json"))
             self.assertFalse(root.exists())
+
+    @gate_suites("hooks", "notify")
+    def test_failed_module_tracebacks_survive_cleanup_and_passing_modules_keep_no_log(self) -> None:
+        self.write(self.state / "red-hooks", "fail")
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        record = self.only_record()
+        failed = [module for module in record["modules"] if module["suite"] == "hooks"]
+        self.assertEqual([module["attempt"] for module in failed], [1, 2])
+        self.assertEqual(len({module["log"] for module in failed}), 2)
+        for module in failed:
+            kept = gzip.decompress((Path(self.environment["BUILDLOG_DIR"]) / module["log"]).read_bytes()).decode("utf-8")
+            self.assertIn("Traceback (most recent call last):", kept)
+            self.assertIn("AssertionError: fixture failure in hooks/test_first.py", kept)
+        passing, = [module for module in record["modules"] if module["suite"] == "notify"]
+        self.assertEqual((passing["status"], passing["log"]), (0, ""))
 
     def test_a_dead_module_has_a_missing_times_reason_on_each_attempt(self) -> None:
         self.write(self.state / "signal-hooks", "always")
@@ -203,9 +226,9 @@ class MergeGateTestTimesTests(MergeGateFixture):
             blocked_log = self.root / "blocked-buildlog"
             self.write(blocked_log, "This file cannot hold a build log.\n")
 
-            def blocked_write(run: gate_record.GateRun) -> None:
+            def blocked_write(run: gate_record.GateRun, executions: Sequence[gate_record.Execution]) -> None:
                 with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(blocked_log)}):
-                    write(run)
+                    write(run, executions)
 
             for failure in ("write", "config"):
                 with self.subTest(failure=failure):

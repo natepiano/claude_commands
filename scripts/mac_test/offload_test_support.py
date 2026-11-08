@@ -438,7 +438,7 @@ raise SystemExit(offload.main())
             [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
-            cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+            cwd=Path(__file__).resolve().parents[2], env=self.environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )

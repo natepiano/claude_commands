@@ -85,6 +85,8 @@ class WorkerPanes(Protocol):
 
 class WorkerRestore(Protocol):
     def restore(self, parent: staff.StaffId, *, record: staff.StaffSnapshot | None = None,
+                only: frozenset[staff.StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
+                started_panes: dict[staff.StaffId, str] | Literal["discard"] = "discard",
                 runs: dict[str, list[str]] | None = None,
                 codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> int: ...
 
@@ -214,15 +216,28 @@ def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartOb
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
-                     observed: RestartObservations | None = None) -> None:
+                     observed: RestartObservations | None = None,
+                     target_account: str | accounts.AccountSelection = "") -> str:
     worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
-    if row.kind in ("unit", "showrunner") and any(
+    started_panes: dict[staff.StaffId, str] = {}
+    if row.kind == "worker":
+        parent = record.parent_of(row)
+        if parent is None:
+            return ""
+        result = worker.restore(parent.id, record=record, only=frozenset({row.id}), started_panes=started_panes,
+            account=target_account,
+            runs=observed.runs if observed is not None else None,
+            codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT)
+    elif row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
             ) and (pane_workers(row) if observed is None else row.id in observed.pane_owners):
         result = (worker.restore(row.id) if observed is None else
                   worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
-        if result != 0:
-            raise OSError("worker restore is incomplete")
+    else:
+        return ""
+    if result != 0:
+        raise OSError("worker restore is incomplete")
+    return started_panes.get(row.id, "")
 
 
 def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> bool:
@@ -246,12 +261,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
         if isinstance(live, herdr.LiveConversation):
-            if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+            if row.kind != "worker" and worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                _ = (_restore_workers(row, record) if observed is None else
+                     _restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(live)
+        if row.kind == "worker":
+            return _restore_workers(row, record, observed=observed, target_account=target_account)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
         from scripts.shutdown import remote
         if machine != remote.local_machine():
@@ -297,7 +315,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                    herdr.read_conversation(str(row.current_session), kind, codex=observed.codex))
         if isinstance(current, herdr.LiveConversation):
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+                _ = (_restore_workers(row, record) if observed is None else
+                     _restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
@@ -333,7 +352,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
         if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-            _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+            _ = (_restore_workers(row, record) if observed is None else
+                 _restore_workers(row, record, observed=observed))
         print(f"{row.name}: restarted")
         return result.pane
 
@@ -705,7 +725,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                     raise OSError(fresh.reason)
                 if isinstance(fresh, herdr.LiveConversation):
                     if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                        _restore_workers(current, current_record, observed=observed)
+                        _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
                     return
             facts = session_staff.RowResolver(current_record)

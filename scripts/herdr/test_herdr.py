@@ -5987,7 +5987,7 @@ class RowTabTests(StaffTestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertTrue(self.client.retitle_row(self.rows["split"].id))
 
-        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[1]["pane_label"], "director-split")
         self.assertEqual(self.client.tabs[2]["pane_label"], self.rows["worker"].name)
         self.assertEqual(len(self.client.scans), 1)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -6341,7 +6341,7 @@ class RowTabTests(StaffTestCase):
         self.client.tabs[0]["label"] = self.rows["unit"].name
         self.client.tabs[1]["pane_label"] = "old-pane"
         self.assertTrue(self.client.retitle_row(self.rows["split"].id))
-        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[1]["pane_label"], "director-split")
         self.assertEqual(self.client.tabs[0]["label"], self.rows["unit"].name)
         self.assertFalse(any(command[:2] == ("tab", "rename") for command in self.client.commands))
         self.assertFalse(self.client.retitle_row(self.rows["split"].id))

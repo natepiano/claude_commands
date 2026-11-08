@@ -40,7 +40,9 @@ from scripts.herdr import herdr, pane_launch
 from scripts.shutdown import pane_record, shutdown
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
-from scripts.production import unit_lookup
+from scripts.production import unit_lookup, test_worker
+from scripts.direct import progress_history
+from scripts.lib.test_models_registry import write_registry
 from scripts.shutdown.test_pane_restore import FakeClient
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
@@ -56,6 +58,40 @@ def confirmed_fixture_move(result: stop_resume.ClaudeUp, _requester: str, _why: 
 
 class ResumeClock(local):
     elapsed: float = 0.0
+
+
+class WorkerResumeTests(unittest.TestCase):
+    def test_resume_without_a_worker_record_returns_the_restored_pane(self) -> None:
+        case = test_worker.WorkerCommandTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
+            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        opened = case.opened()
+        _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=case.prompt, kind="impl", lens="")
+        world = case.fixture.world
+        world.locations["w1:p0"]["agent_session"] = {"value": case.fixture.parent.current_session}
+        _ = world.stop(opened.row, world)
+        pane_record.save(world.session, {})
+
+        def running(identity: str, pane: str, *, kind: str = "claude"
+                    ) -> stop_resume.ClaudeUp | sessions.SessionNotLive:
+            self.assertEqual((identity, kind), (opened.row.current_session, "claude"))
+            return (stop_resume.ClaudeUp(identity, pane, "claude") if opened.pane in world.foreground else
+                    sessions.SessionNotLive())
+
+        with (patch.object(stop_resume, "running_on_account", side_effect=running) as proof,
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              redirect_stdout(io.StringIO())):
+            result = stop_resume.resume(str(opened.row.id))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.session_id, result.pane_id), (opened.row.current_session, opened.pane))
+        self.assertEqual(result.start_state, ClaudeStartState.STARTED)
+        self.assertEqual(proof.call_args.args, (opened.row.current_session, opened.pane))
 
 
 @final
