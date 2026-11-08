@@ -3671,15 +3671,45 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
+    process_root = _proc_root()
+    process_paths: list[Path] = []
+
+    @cache
+    def pane_servers() -> dict[int, str]:
+        return _live_server_processes(process_paths)
+
+    def add_unknown(pid: int, reason: str) -> None:
+        """Count terminal foreground groups; failed process reads retain uncertainty."""
+        try:
+            if _platform() == "darwin":
+                result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "pgid=,tpgid=", "-p", str(pid)],
+                                     timeout=PROGRAM_TIMEOUT_SECONDS)
+                require_success(result, "Codex terminal process group")
+                group, foreground = map(int, result.stdout.split())
+                if foreground <= 0 or group != foreground:
+                    return
+            else:
+                stat = (process_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+                group, foreground = int(stat[2]), int(stat[5])
+                if foreground <= 0 or group != foreground:
+                    return
+                leader = (process_root / stat[3] / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(leader[1]) not in pane_servers():
+                    return
+        except (OSError, ValueError, IndexError, HerdrFailure, subprocess.SubprocessError):
+            pass
+        unknown.append((pid, reason))
+
     try:
         if _platform() == "darwin":
             for process in _darwin_processes(complete=True):
                 if isinstance(process.arguments, UnreadableProcessArguments):
-                    unknown.append((process.pid, "Codex argv unknown"))
+                    add_unknown(process.pid, "Codex argv unknown")
                 else:
                     candidates.append((process.pid, list(process.arguments.argv)))
         else:
-            for path in _proc_root().iterdir():
+            process_paths = list(process_root.iterdir())
+            for path in process_paths:
                 if not path.name.isdecimal():
                     continue
                 try:
@@ -3687,9 +3717,9 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                         candidates.append((int(path.name), _process_arguments(path)))
                 except FileNotFoundError:
                     if path.exists():
-                        unknown.append((int(path.name), "process argv unknown"))
+                        add_unknown(int(path.name), "process argv unknown")
                 except OSError:
-                    unknown.append((int(path.name), "process argv unknown"))
+                    add_unknown(int(path.name), "process argv unknown")
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
@@ -3721,7 +3751,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
-                unknown.append((pid, "Codex thread unknown"))
+                add_unknown(pid, "Codex thread unknown")
             else:
                 identity = observed.current_identity
                 live[identity] = (*live.get(identity, ()), pid)
@@ -3748,7 +3778,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
-            unknown.append((pid, "Codex thread unknown"))
+            add_unknown(pid, "Codex thread unknown")
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:

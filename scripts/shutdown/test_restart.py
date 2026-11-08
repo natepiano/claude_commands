@@ -16,7 +16,7 @@ import tempfile
 import time
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, RLock, Thread
 from pathlib import Path
@@ -178,6 +178,112 @@ class CodexSnapshotTests(RestartTestCase):
 
     def liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
         return sessions.LiveSessionProcess(998080) if identity in self.claude else sessions.SessionNotLive()
+
+    def test_restart_drops_a_fake_codex_below_a_claude_pane_shell(self) -> None:
+        client = herdr.Herdr("agents")
+        proc = self.root / "gate-proc"
+        environment = {**os.environ, "HERDR_PROC": str(proc)}
+        for pid, parent, argv in ((998080, 1, ["zsh"]), (998089, 998080, ["python3"]),
+                                  (998090, 998089, ["codex"])):
+            fake_unit_host.process(environment, pid, parent, argv, {"HERDR_PANE_ID": "w1:p1"})
+        write_text_atomic(proc / "998090/stat", "998090 (codex) S 998089 998090 998080 0 -1 " + "0 " * 14)
+        panes: list[dict[str, object]] = [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1", "agent": "claude", "label": "TEST-gate"}]
+
+        def listed_rows(kind: str) -> list[dict[str, object]]:
+            return panes if kind == "pane" else [{"tab_id": "w1:t1", "label": "TEST-gate"}]
+
+        info = {"shell_pid": 998080, "foreground_process_group_id": 998089,
+                "foreground_processes": [{"pid": 998089, "argv": ["python3"]}]}
+        with (patch.dict(os.environ, environment),
+              patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "w1:p1"}),
+              patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(herdr, "codex_rollout_threads", side_effect=herdr.NoOpenCodexRollout()),
+              patch.object(herdr, "_process_display_name", return_value="TEST-gate"),
+              patch.object(client, "listed", side_effect=listed_rows) as listed,
+              patch.object(client, "result", return_value={"process_info": info}) as process,
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(herdr, "running_codex_threads", return_value=set()),
+              patch.object(restart, "live_members", return_value=[]) as members):
+            self.assertEqual(herdr.codex_conversations().unknown, ())
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), client), [])
+        observed = cast(herdr.CodexConversations, members.call_args.kwargs["codex"])
+        self.assertEqual(observed.unknown, ())
+        self.assertEqual(listed.call_args_list.count(call("pane")), 1)
+        process.assert_not_called()
+
+    def test_restart_keeps_a_codex_pane_foreground_process_with_an_unknown_thread(self) -> None:
+        client = herdr.Herdr("agents")
+        proc = self.root / "codex-proc"
+        environment = {**os.environ, "HERDR_PROC": str(proc)}
+        fake_unit_host.process(environment, 998091, 998080, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        (proc / "998091/stat").unlink()
+        panes: list[dict[str, object]] = [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1", "agent": "codex", "label": "TEST-worker"}]
+
+        def listed_rows(kind: str) -> list[dict[str, object]]:
+            return panes if kind == "pane" else []
+
+        info = {"shell_pid": 998080, "foreground_process_group_id": 998091,
+                "foreground_processes": [{"pid": 998091, "argv": ["codex"]}]}
+        # A failed stat read keeps the unknown process when the pane read also fails.
+        def answer(*_: str) -> dict[str, object]:
+            return {"process_info": info}
+
+        reads: tuple[object, ...] = (answer, herdr.HerdrFailure("fixture unread"))
+        for read in reads:
+            with self.subTest(read=type(read).__name__):
+                self.assert_codex_pane_keeps_unknown(client, environment, listed_rows, read)
+
+    def assert_codex_pane_keeps_unknown(self, client: herdr.Herdr, environment: dict[str, str],
+                                        listed_rows: Callable[[str], list[dict[str, object]]],
+                                        read: object) -> None:
+        with (patch.dict(os.environ, environment),
+              patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(herdr, "codex_rollout_threads", side_effect=herdr.NoOpenCodexRollout()),
+              patch.object(herdr, "_process_display_name", return_value="TEST-worker"),
+              patch.object(client, "listed", side_effect=listed_rows),
+              patch.object(client, "result", side_effect=read) as process,
+              patch.object(herdr, "pane_native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(herdr, "running_codex_threads", return_value=set()),
+              patch.object(restart, "live_members", return_value=[]) as members):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), client), [])
+        observed = cast(herdr.CodexConversations, members.call_args.kwargs["codex"])
+        self.assertEqual(observed.unknown, ("TEST-worker (Codex thread unknown)",))
+        process.assert_called_once_with("pane", "process-info", "--pane", "w1:p1")
+
+    def test_unassigned_live_session_uses_tab_pane_and_id_before_registry_or_bare_id(self) -> None:
+        client = herdr.Herdr("agents")
+        identities = ("a-pane", "b-registry", "c-bare")
+        self.claude.update(identities)
+        records = list(registry_confirmation(frozenset(identities)).records)
+        for record in records:
+            record.update(name="", cwd="")
+            if record["sessionId"] == "a-pane":
+                record["cwd"] = "/TEST-ignored-registry-folder"
+            elif record["sessionId"] == "b-registry":
+                record.update(name="TEST-registry-name", cwd="/TEST-registry-folder")
+        panes: list[dict[str, object]] = [{"pane_id": "w11:p1F", "tab_id": "w11:t1", "agent": "claude", "label": "probe28",
+                  "agent_session": {"kind": "id", "value": "a-pane"}}]
+        tabs: list[dict[str, object]] = [{"tab_id": "w11:t1", "label": "builds-queue"}]
+
+        def listed_rows(kind: str) -> list[dict[str, object]]:
+            return panes if kind == "pane" else tabs
+        info = {"shell_pid": 998080, "foreground_process_group_id": 998081,
+                "foreground_processes": [{"pid": 998081, "argv": ["claude"]}]}
+        with (patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
+              patch.object(sessions, "running_sessions", return_value=records),
+              patch.object(client, "listed", side_effect=listed_rows) as listed,
+              patch.object(client, "result", return_value={"process_info": info}),
+              patch.object(client, "pane_tab", side_effect=AssertionError("reuse the pane read")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), client), [])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "builds-queue probe28 (w11:p1F): restart anomaly: unassigned live session",
+            "TEST-registry-name in /TEST-registry-folder: restart anomaly: unassigned live session",
+            "c-bare: restart anomaly: unassigned live session"])
+        self.assertEqual(listed.call_args_list.count(call("pane")), 1)
 
     def test_live_rows_scans_codex_once_for_members_and_unassigned_candidates(self) -> None:
         with (patch.object(herdr, "_proc_root", return_value=self.proc) as scans,
