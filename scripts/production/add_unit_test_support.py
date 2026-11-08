@@ -160,6 +160,23 @@ if name == "systemd-run":
 '''
 
 
+class CompletedAgentCLI(subprocess.CompletedProcess[str]):
+    """A fake agent command completes inside the checkout process."""
+
+    def __enter__(self) -> CompletedAgentCLI:
+        return self
+
+    def __exit__(self, kind: object, value: object, traceback: object) -> None:
+        pass
+
+    def poll(self) -> int:
+        return self.returncode
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        del timeout
+        return self.stdout, self.stderr
+
+
 class RemoteControlDeadlineClock:
     """Let one pending readiness poll run, then expire its launch deadline."""
 
@@ -419,6 +436,16 @@ def submit_command(argv):
                 return REAL_HERDR_RUN_PROGRAM(argv, timeout, environment=environment)
 
         _ = self.enterContext(patch.object(herdr, "run_program", run_herdr))
+        real_popen = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
+
+        def spawn(argv: list[str], **options: object) -> subprocess.Popen[str] | CompletedAgentCLI:
+            if argv[0] != fake:
+                return real_popen(argv, **options)
+            environment = cast(dict[str, str], options["env"])
+            result = invoke_cli(fake_module, lambda: fake_main(argv[1:]), argv[1:], environment, Path.cwd())
+            return CompletedAgentCLI(argv, result.returncode, result.stdout, result.stderr)
+
+        _ = self.enterContext(patch.object(subprocess, "Popen", spawn))
         self.env.update({"HERDR_BIN": fake, "SYSTEMD_RUN": fake, "SYSTEMCTL": fake,
                          "HERDR_PROC": str(self.root / "proc"),
                          "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),

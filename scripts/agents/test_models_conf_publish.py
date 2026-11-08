@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Literal, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry, atomic_file  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
@@ -509,11 +508,11 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
 
     def test_the_showrunner_effort_writer_publishes_the_director_launch_row(self) -> None:
         before = self.dirty_state()
-        program = ("import os, sys; sys.path.insert(0,sys.argv[1]); import unit_effort; "
+        program = ("from scripts.production import unit_effort; import os, sys; "
                    + "from scripts.lib import models_registry; "
                    + "problem=unit_effort.set_row('opus','max',models_registry.edit_base(os.environ)); "
                    + "print(problem); sys.exit(bool(problem))")
-        result = self.command(sys.executable, "-c", program, str(REPO / "scripts/production"))
+        result = self.command(str(REPO / "scripts/lib/py"), "-c", program)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_published(before, "director=opus:max")
         self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")

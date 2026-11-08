@@ -255,6 +255,23 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
 
+    def test_restore_reuses_given_runs_for_two_workers(self) -> None:
+        for state in (self.opened("impl"), self.opened("review", "review")):
+            _ = progress_history.begin_dispatch(self.run_dir, slot=state.row.name, phase="8", role="impl",
+                worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="impl", lens="")
+            _ = self.fixture.world.stop(state.row, self.fixture.world)
+        record = staff.snapshot()
+        runs = {str(self.fixture.parent.current_session): [str(self.run_dir)]}
+        with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
+              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
+        self.assertEqual(active.call_count, 2)
+        self.assertEqual(searches.call_count, 0)
+        self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+
     def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
         idle = self.opened("review", "review")
         _ = self.fixture.world.stop(idle.row, self.fixture.world)
@@ -267,7 +284,7 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.fixture.world.stop(busy.row, self.fixture.world)
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
-            self.assertEqual(self.command("restore"), (0, "done\n", ""))
+            self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
         resume.assert_called_once_with(busy.row,
             progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
         self.assertEqual(self.fixture.staff_state(), before[0])
@@ -354,7 +371,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 
     def test_resume_workers_names_the_active_pass_and_idle_worker(self) -> None:
-        from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume
+        from scripts.lib.resume_message import UnsubmittedAssignment, IdleWorker, PaneWorkerResume
 
         busy = self.opened()
         idle = self.opened("review", "review")
@@ -364,15 +381,15 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
-        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
+        self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, UnsubmittedAssignment("dispatch-impl", ("assign.sh", "same command"))),
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
 
     def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
-        from scripts.lib.resume_message import BusyPass, NO_OWN_PASS
+        from scripts.lib.resume_message import UnsubmittedAssignment, NO_OWN_PASS
 
         opened = self.opened()
-        for active, expected in ((progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), BusyPass("own-dispatch")),
+        for active, expected in ((progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), UnsubmittedAssignment("own-dispatch", ("assign.sh",))),
                                  (progress_history.NoActiveDispatch(), NO_OWN_PASS),
                                  (progress_history.ActiveDispatchUnavailable("record unreadable"), NO_OWN_PASS)):
             with (self.subTest(active=active),
@@ -560,7 +577,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn(second.row.id, resumed)
         before = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
-            self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+            self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
 
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
@@ -1332,7 +1349,7 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.mesh_run()
         before = self.fixture.staff_state(), self.fixture.world.locations.copy(), self.fixture.world.launches.copy()
         with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh restore must not read panes")):
-            self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+            self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), self.fixture.world.locations, self.fixture.world.launches), before)
 
     def test_dispatch_role_survives_a_new_phase_with_an_empty_pass_map(self) -> None:
@@ -1369,7 +1386,7 @@ class WorkerCommandTests(unittest.TestCase):
         before = len(self.fixture.world.launches)
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(private_root)}):
             code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(staff.snapshot().by_id(row.id), row)
         self.assertEqual(len(self.fixture.world.launches), before)
         self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
@@ -1529,9 +1546,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.dispatch(opened.row, "impl", completed=True)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         before = self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()
-        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()), before)
         self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
@@ -1543,7 +1560,7 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.fixture.world.stop(retained.row, self.fixture.world)
         self.fixture.dispatch(retained.row, "review", completed=True)
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
-        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
         self.assertNotIn(retained.pane, self.fixture.world.foreground)
         self.assertNotIn(missing.pane, self.fixture.world.foreground)

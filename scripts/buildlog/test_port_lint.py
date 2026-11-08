@@ -10,23 +10,17 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import port_lint
 from scripts.buildlog import store
 from scripts.buildlog import treekey
 from scripts.buildlog.port_lint import Process, ProbeRow
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from scripts.buildlog.test_index import Record, encode, point_root_at, step
 from scripts.buildlog.test_treekey import GIT_ENVIRONMENT
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("port_lint.py")
 CLIPPY = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]

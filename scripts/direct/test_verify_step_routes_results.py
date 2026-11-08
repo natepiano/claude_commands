@@ -26,8 +26,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
                     'raise SystemExit(10 if any(holders.iterdir()) else 0)', '''
     marker = Path(os.environ["PACKAGE_ROOT"]) / "mac-returned"
     if marker.exists():
-        import sys
-        sys.path.insert(0, str(Path.home() / ".claude"))
+        with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
         from scripts.direct.test_verify_step_state import read_step_row
         record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
         (Path(os.environ["PACKAGE_ROOT"]) / "pending-state").write_text(record["state"])

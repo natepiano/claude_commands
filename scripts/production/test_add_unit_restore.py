@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import unittest
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 from scripts.production import add_unit
 
 

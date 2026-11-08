@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from contextlib import suppress
 from dataclasses import dataclass
 
 import json
@@ -27,7 +28,7 @@ from scripts.lib.socket_test_support import ShortUnixSocket
 
 BACKEND = '''import json, os, sys, socket
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
     output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", ""),
@@ -61,7 +62,7 @@ print("backgrounded · " + os.environ["FIXTURE_NATIVE_ID"][:8] + " · fresh-impl
 
 SEND = '''import json, os, sys, socket
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production import staff
 from scripts.direct import workers
 from scripts.usage import agents_log
@@ -298,10 +299,8 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             launcher_pid = int(delivery.recv(32))
                             if cancel:
                                 os.kill(launcher_pid, signal.SIGTERM)
-                                try:
+                                with suppress(BrokenPipeError, ConnectionResetError):
                                     delivery.sendall(b"1")
-                                except (BrokenPipeError, ConnectionResetError):
-                                    pass
                             else:
                                 delivery.sendall(b"1")
                         if not cancel:

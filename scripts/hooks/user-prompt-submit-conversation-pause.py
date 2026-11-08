@@ -118,13 +118,6 @@ def main() -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt)
-        return_question = conversation_pause.is_return_question(prompt)
-        if (source in {conversation_pause.PromptSource.SCHEDULED,
-                       conversation_pause.PromptSource.NOTICE}
-                and not return_question):
-            return
-        if not return_question and not conversation_pause.pauses(source):
-            return
         reply = conversation_pause.message_arrived(
             session_id, source, prompt, conversation_pause.now_epoch())
         if reply is conversation_pause.NoReply.NOTHING:

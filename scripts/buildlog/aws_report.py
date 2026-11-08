@@ -10,9 +10,9 @@ from statistics import median
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from ..aws_target.measurement import MeasurementUnavailable, number
-    from . import record, store
-    from ..mac_test import offload
+    from scripts.aws_target.measurement import MeasurementUnavailable, number
+    from scripts.buildlog import record, store
+    from scripts.mac_test import offload
 else:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
     from scripts.buildlog import record

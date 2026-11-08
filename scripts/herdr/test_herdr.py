@@ -642,7 +642,6 @@ class PromptSubmissionTests(unittest.TestCase):
     ready_at: float = 0
     typed: list[tuple[str, str, float]] = []
     enters: list[tuple[str, tuple[str, ...]]] = []
-    stashed_drafts: list[tuple[str, str]] = []
     ready_panes: list[str] = []
     screen: str = ""
     typed_screen: str = ""
@@ -670,7 +669,6 @@ class PromptSubmissionTests(unittest.TestCase):
         self.ready_at = 0.0
         self.typed = []
         self.enters = []
-        self.stashed_drafts = []
         self.ready_panes = []
         self.screen = "────────\n❯ \n────────"
         self.typed_screen = ""
@@ -752,10 +750,6 @@ class PromptSubmissionTests(unittest.TestCase):
             self.screen = self.typed_screen or f"────────\n❯ {text}\n────────"
 
     def enter_prompt(self, pane: str, *keys: str) -> None:
-        if keys == ("ctrl+s",):
-            self.stashed_drafts.append((pane, self.screen))
-            self.screen = "────────\n❯ \n────────"
-            return
         self.enters.append((pane, keys))
         if len(self.enters) == self.submit_on_enter:
             self.write_turn(self.typed[-1][1], seconds_after_launch=self.elapsed + 1)
@@ -780,58 +774,6 @@ class PromptSubmissionTests(unittest.TestCase):
 
         with patch.object(Path, "open", open_transcript):
             yield failures
-
-    def test_opening_prompt_stashes_a_draft_once_before_typing_and_submission(self) -> None:
-        draft = "────────\n❯ keep this draft\n────────"
-        self.screen = draft
-        self.submit_on_enter = 1
-        outcome = self.submit()
-        self.assertIsInstance(outcome, herdr.PromptSubmitted)
-        self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
-        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
-                         [("destination:p1", script_prompt("resume the saved work"))])
-        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
-
-    def test_proved_submission_returns_without_waiting_for_the_turn_or_restoring_the_stash(self) -> None:
-        text = "Resume the saved work.\nKeep the user's draft."
-        for draft_text in ("keep this draft", "[Pasted text #9 +2 lines]"):
-            draft = f"────────\n❯ {draft_text}\n────────"
-            for composer_text in ("", draft_text, script_prompt(text), "[Pasted text #1 +4 lines]"):
-                with self.subTest(draft=draft_text, composer=composer_text):
-                    self.elapsed = 0
-                    self.screen = draft
-                    self.stashed_drafts.clear()
-                    self.path.unlink(missing_ok=True)
-                    self.submit_on_type = True
-                    self.working_until = 60
-                    submitted_screen = f"────────\n❯ {composer_text}\n────────"
-
-                    def submit_with_composer(pane: str, prompt: str) -> None:
-                        self.type_prompt(pane, prompt)
-                        self.screen = submitted_screen
-
-                    with patch.object(self.client, "_prompt", side_effect=submit_with_composer):
-                        outcome = self.submit(text=text)
-                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
-                    self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
-                    self.assertEqual(self.enters, [])
-                    self.assertEqual(self.elapsed, 0.1)
-                    self.assertEqual(self.screen, submitted_screen)
-
-    def test_a_second_draft_waits_until_the_deadline_without_a_second_stash(self) -> None:
-        draft = "────────\n❯ keep this draft\n────────"
-        second_draft = "────────\n❯ keep this second draft\n────────"
-        self.screen = draft
-        self.events.append((0.1, lambda: setattr(self, "screen", second_draft)))
-        outcome = self.submit(timeout_ms=1000)
-        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
-        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).reason,
-                         "destination never became ready for input")
-        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).screen, second_draft)
-        self.assertEqual(self.stashed_drafts, [("destination:p1", draft)])
-        self.assertEqual(self.typed, [])
-        self.assertEqual(self.enters, [])
-        self.assertEqual(self.elapsed, 1)
 
     def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
         self.submit_on_enter = 1
@@ -1109,8 +1051,10 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_other_text_in_the_composer_is_never_overwritten(self) -> None:
         self.screen = "────────\n❯ the user is editing this\n────────"
-        with patch.object(self.client, "_send_keys", side_effect=herdr.HerdrFailure("draft stash unavailable")):
+        with patch.object(self.client, "_send_keys") as keys:
             self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptNotSubmitted)
+        keys.assert_not_called()
+        self.assertEqual(self.elapsed, 1)
         self.assertEqual((self.typed, self.enters), ([], []))
         self.assertEqual(self.screen, "────────\n❯ the user is editing this\n────────")
 
@@ -1692,6 +1636,47 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
+    def test_claude_launch_trusts_a_folder_without_a_trusting_account(self) -> None:
+        account = self.root / "new-account"
+        account.mkdir()
+        folder = self.root / "new-folder"
+        folder.mkdir()
+        prepared = herdr.PreparedAgentEnvironment(folder, {"CLAUDE_CONFIG_DIR": str(account)})
+        target = account / ".claude.json"
+
+        def start(*_args: object, **_kwargs: object) -> herdr.PromptSubmissionNotRequired:
+            self.assertIsInstance(herdr.claude_trust(folder, target), herdr.Trusted)
+            return herdr.PromptSubmissionNotRequired()
+
+        with (patch.object(herdr, "open_tab", return_value="worker-pane"),
+              patch.object(herdr.Herdr, "run_in_pane"),
+              patch.object(herdr, "start_agent", side_effect=start) as started):
+            result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
+                prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        started.assert_called_once()
+
+    def test_failed_claude_trust_write_prints_one_anomaly_and_does_not_start(self) -> None:
+        account = self.root / "broken-account"
+        account.mkdir()
+        target = account / ".claude.json"
+        write_text_atomic(target, "invalid JSON")
+        prepared = herdr.PreparedAgentEnvironment(self.root, {"CLAUDE_CONFIG_DIR": str(account)})
+        with (patch.object(herdr, "open_tab", return_value="worker-pane") as opened,
+              patch.object(herdr, "start_agent") as started,
+              redirect_stderr(io.StringIO()) as errors):
+            result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
+                prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
+        self.assertIsInstance(result.outcome, herdr.ClaudeTrustNotWritten)
+        started.assert_not_called()
+        opened.assert_not_called()
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("trust anomaly", lines[0])
+        self.assertIn(str(self.root), lines[0])
+        self.assertIn(str(target), lines[0])
+        self.assertIn("JSON", lines[0])
+
     def test_pane_launch_waits_for_shell_cleanup_before_sending_the_command(self) -> None:
         client = herdr.Herdr("agents")
         clock = StartupClock()
@@ -1859,7 +1844,7 @@ class LaunchDestinationTests(StaffTestCase):
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
         cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(herdr.PaneShell(123), herdr.PaneAtShell())
         lock = "STAFF_ROW_FD_0e8d7a1b-61d3-464c-98df-92de4ec0114c"
-        with (patch.dict(os.environ, {lock: "99"}), patch.object(herdr, "Herdr", return_value=client), patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin", "CLAUDE_CONFIG_DIR": "/account", lock: "99"})), patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+        with (patch.dict(os.environ, {lock: "99"}), patch.object(herdr, "Herdr", return_value=client), patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin", "CLAUDE_CONFIG_DIR": str(self.root / "account"), lock: "99"})), patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
             prepared = herdr.prepare_agent_environment("/tmp", {}, frozenset({"EXCLUDED_TOKEN"}))
             self.assertIsInstance(prepared, herdr.PreparedAgentEnvironment)
             _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
@@ -1876,7 +1861,7 @@ class LaunchDestinationTests(StaffTestCase):
         shell = subprocess.run(["zsh", "-c", script],
             env={**os.environ, "EXCLUDED_TOKEN": "stale", "CLAUDE_CODE_OAUTH_TOKEN": "stale", "HERDR_PANE_ID": "worker"},
             capture_output=True, text=True, check=True)
-        self.assertEqual(shell.stdout.strip(), "absent absent worker /account")
+        self.assertEqual(shell.stdout.strip(), f"absent absent worker {self.root / 'account'}")
 
     def test_child_environment_omits_no_color(self) -> None:
         child = herdr.child_environment({"NO_COLOR": "1", "PATH": "/bin"})
@@ -2329,6 +2314,14 @@ class HerdrTests(unittest.TestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        trust_launch = herdr.trust_claude_launch
+
+        def trust_fixture_launch(folder: Path, config_dir: Path) -> None:
+            # This fixture has no Git command and uses its folder as the trust key.
+            with patch.object(herdr, "repository_trust_key", return_value=folder):
+                trust_launch(folder, config_dir)
+
+        _ = self.enterContext(patch.object(herdr, "trust_claude_launch", trust_fixture_launch))
         self.fake = self.root / "fake-herdr"
         source = Path(__file__).with_name("fake_herdr.py").read_text()
         _ = self.fake.write_text("#!" + sys.executable + "\n" + source.split("\n", 1)[1])
@@ -3350,6 +3343,40 @@ class HerdrTests(unittest.TestCase):
             self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_report_batches_shell_pids_for_several_panes(self) -> None:
+        panes = [{"pane_id": f"w1:p{n}", "workspace_id": "w1"} for n in range(3)]
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+        for n in range(3):
+            self.configure_herdr(["pane", "process-info", "--pane", f"w1:p{n}"],
+                json.dumps({"result": {"process_info": {"shell_pid": 998070 + n}}}))
+        def server(*_arguments: object) -> object:
+            replies = io.StringIO()
+            def send(data: bytes) -> None:
+                request = cast(dict[str, object], json.loads(data.splitlines()[0]))
+                params = cast(dict[str, object], request["params"])
+                pane = str(params["pane_id"])
+                _ = replies.write(json.dumps({"id": pane, "result": {"process_info": {
+                    "shell_pid": 998070 + int(pane[-1])}}}) + "\n")
+                _ = replies.seek(0)
+            return nullcontext(SimpleNamespace(connect=Mock(), sendall=send, settimeout=Mock(),
+                                                makefile=Mock(return_value=replies)))
+
+        with patch("socket.socket", side_effect=server) as connection:
+            with herdr.observation_snapshot(), herdr.pane_snapshot():
+                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
+            self.assertEqual(connection.call_count, len(panes))
+
+    def test_report_lists_copy_changed_rows_without_deep_copies(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "label": "original"}]}}))
+        with (herdr.observation_snapshot(),
+              patch.object(herdr, "deepcopy", side_effect=AssertionError("unneeded deep copy"), create=True)):
+            first = self.herdr.listed("pane")
+            first[0]["label"] = "changed"
+            self.assertEqual(self.herdr.listed("pane")[0]["label"], "original")
 
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))
@@ -4487,12 +4514,12 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(path.read_text(), "")
 
-    def test_untracked_ready_pane_with_text_in_the_composer_holds_a_draft(self) -> None:
+    def test_untracked_ready_pane_with_text_in_the_composer_is_not_ready(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ keep this draft\n────────")
         state = self.herdr.prompt_input_state("pane-1")
-        self.assertIsInstance(state, herdr.PromptInputHoldsDraft)
-        self.assertEqual(cast(herdr.PromptInputHoldsDraft, state).screen, "────────\n❯ keep this draft\n────────")
+        self.assertIsInstance(state, herdr.PromptInputNotReady)
+        self.assertEqual(cast(herdr.PromptInputNotReady, state).screen, "────────\n❯ keep this draft\n────────")
 
     def test_untracked_blocked_pane_is_not_ready(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))

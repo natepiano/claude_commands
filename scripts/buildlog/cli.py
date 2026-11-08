@@ -253,7 +253,6 @@ def hourly() -> int:
 
 def run_in_user_zone() -> None:
     """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     from scripts.lib.user_zone import user_zone_name
 
     os.environ["TZ"] = user_zone_name()

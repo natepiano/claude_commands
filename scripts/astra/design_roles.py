@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic

@@ -158,7 +158,7 @@ test_inherited_editor_writes_without_catalog_sync() (
     MODELS_REGISTRY_EDIT_BASE="$("$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import os, sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.models_registry import RegistryEditBase
 path = Path(os.environ["MODELS_CONFIG_FILE"])
 print(RegistryEditBase(path, path.read_text(), ()).environment({})["MODELS_REGISTRY_EDIT_BASE"])

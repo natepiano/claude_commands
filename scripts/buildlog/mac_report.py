@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import re
 import sqlite3
-import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
@@ -25,8 +24,6 @@ from scripts.buildlog.mac_outcome import (
     UsableShare, is_mac_candidate, is_mac_step, offload_record, share_of_records,
 )
 
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 LOCAL_MAC_UNAVAILABLE_PATTERNS = (

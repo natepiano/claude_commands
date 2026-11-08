@@ -9,7 +9,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -35,7 +34,6 @@ INSTALLED_FRONT_END_ARTIFACTS = (
     SESSION_START_HOOK,
 )
 
-sys.path.insert(0, str(SCRIPTS_ROOT))
 
 
 def installed_front_end_artifact_digests() -> dict[str, str]:

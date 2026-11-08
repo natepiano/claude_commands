@@ -154,7 +154,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
 | `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
 | `sweep_push_text_limit` | Maximum length of a phone alert. |
-| `sweep_page_paths` | Maximum paths in a phone alert. |
+| `sweep_crossing_repeat_minutes` | Delivery key lifetime for a disk crossing, in minutes. |
 | `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
 | `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
 | `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
@@ -471,6 +471,19 @@ Transfers exclude admission and pending state directories.
 Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
+
+## memory_feed.conf
+
+`scripts/build_queue/memory_feed.py` reads these settings through `scripts/lib/conf.py` when the service starts.
+`CONF_DIR` selects another configuration folder.
+
+| Key | Value | Use |
+| --- | --- | --- |
+| `output_folder` | `~/.local/share/review-links/h7uj5c` | Publish `memory_live.html` and `memory.json` in this folder. |
+| `interval_seconds` | `3` | Set the interval between readings and the page refresh interval. |
+
+The service publishes the repository page with an atomic write at each start.
+The service retains the last successful reading when the admission service does not answer.
 
 ## test_times.conf
 

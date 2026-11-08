@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
+from typing import NamedTuple, TypeVar, cast
 
 from scripts.production import change_review
 from scripts.production import proposals_folder
@@ -45,15 +45,10 @@ from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-if TYPE_CHECKING:
-    from ..nightly_review import candidates
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "nightly_review"))
-    from scripts.nightly_review import candidates
+from scripts.nightly_review import candidates
 
 CHANGE = "change"
 PROPOSAL = "proposal"

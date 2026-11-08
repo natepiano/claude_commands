@@ -5,7 +5,6 @@ try:
 except FileNotFoundError:
     pass
 
-import argparse
 from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future
@@ -49,8 +48,6 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
-from scripts.message import send_budget, send_result
-from scripts.message.session_send import session_send_argv
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -81,6 +78,9 @@ class ReadingAlertDelivery:
 
 def deliver_reading_alert(claimed: outage_alerts.AlertClaim, hold: UnreadableReadingHold, elapsed: float) -> None:
     """Send the claimed alert outside the admission pass."""
+    from scripts.message import send_budget, send_result
+    from scripts.message.session_send import session_send_argv
+
     delivered = False
     try:
         settings = conf.read("lint")
@@ -2689,6 +2689,8 @@ def export_priority(directory: Path) -> None:
 
 
 def main() -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority"))
     default_state_dir = store.root() / "admission"

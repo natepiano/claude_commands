@@ -143,7 +143,8 @@ if name == "basedpyright":
 
 BUMP_TEST_STUB = STUB + '''
 import subprocess
-sys.path.insert(0, __TEST_REPOSITORY__)
+with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
 from scripts.herdr.herdr import NATIVE_ID_MARKS
@@ -176,12 +177,14 @@ if (state / "gate-red").exists() and "-E" not in args:
 BUMP_SEND_STUB = STUB + '''
 import uuid
 if (state / "slow-delivery").exists():
-    sys.path.insert(0, __TEST_REPOSITORY__)
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     (state / "delivery-started").touch()
     wait_for_file(state / "delivery-release")
 if (state / "stop-before-showrunner-notice").exists():
-    sys.path.insert(0, __TEST_REPOSITORY__)
+    with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
     from scripts.production import staff
     recipient = staff.local_snapshot().by_current_session(args[args.index("--to") + 1].removeprefix("session:"))
     if recipient is not None and recipient.kind == "showrunner":

@@ -63,7 +63,6 @@ import os
 import re
 import secrets
 import shutil
-import string
 import subprocess
 import sys
 import tempfile
@@ -90,7 +89,6 @@ HOLDS_ENV = "SCRATCH_HOLDS"
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-SUFFIX_CHARACTERS = string.ascii_lowercase + string.digits
 BUSY = ".claude-busy"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
@@ -486,7 +484,8 @@ def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = Use
 
 
 def random_suffix(scratch_settings: conf.ConfigRead) -> str:
-    return "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
+    length = scratch_settings.whole("suffix_length")
+    return secrets.token_hex(length)[:length]
 
 
 def until_task(moment: float, *,
@@ -608,7 +607,7 @@ def target(task: str, word: str, visible: bool, *,
     suffix = random_suffix(scratch_settings)
     name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
     slug = f"{match['kind']}-{name.replace('/', '-')}"
-    return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=scratch_settings.whole("suffix_length"),
+    return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=len(suffix),
                                             purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
 
 

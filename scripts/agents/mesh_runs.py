@@ -67,7 +67,6 @@ from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 from uuid import NAMESPACE_URL, uuid5
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh, mesh_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.direct import assign_gate
