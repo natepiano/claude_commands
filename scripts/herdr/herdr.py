@@ -150,6 +150,10 @@ class HerdrFailure(Exception):
         self.code: str = code
 
 
+class NativeRegistryUnavailable(ValueError):
+    """The process has no native registry identity."""
+
+
 class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
 
@@ -340,6 +344,7 @@ class OpeningPrompt:
     text: str
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
+    cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
@@ -367,6 +372,31 @@ class TranscriptCursor:
     sizes: dict[Path, int] = field(default_factory=dict)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def skip_existing_turns(self) -> None:
+        """Skip complete rows before launch without parsing historical JSON."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+            for path in paths:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, os.SEEK_END)
+                    position = size
+                    offset = 0
+                    while position:
+                        start = max(0, position - 4096)
+                        _ = stream.seek(start)
+                        chunk = stream.read(position - start)
+                        newline = chunk.rfind(b"\n")
+                        if newline >= 0:
+                            offset = start + newline + 1
+                            break
+                        position = start
+                    self.offsets[path] = offset
+                    self.sizes[path] = size
+        except OSError:
+            self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
@@ -861,10 +891,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -2203,10 +2246,11 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        cursor = (TranscriptCursor(opening.transcript, launched_at)
-                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        cursor = opening.cursor
+        if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
+            cursor = TranscriptCursor(opening.transcript, launched_at)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
@@ -2463,10 +2507,16 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
@@ -3427,7 +3477,7 @@ def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProces
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
-            raise ValueError(f"pid {pid}: native registry identity is unavailable")
+            raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
         raise ValueError(f"pid {pid}: unknown agent kind {kind}")

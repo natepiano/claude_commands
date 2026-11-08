@@ -377,13 +377,15 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        for kind in ("unit", "showrunner", "agent"):
+        for kind in ("unit", "showrunner", "agent", "missing"):
             for target in (None, "claude3"):
                 with self.subTest(kind=kind, target=target):
                     pane_record.save("agents", {self.entry["pane_id"]: self.entry})
-                    row = staff.StaffRow(identity, kind, "alpha", staff.STAFF_ROOT, current_session=identity)
-                    expected = target or ("claude4" if kind != "agent" else "claude3")
-                    with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                    row = staff.StaffRow(identity, "agent" if kind == "missing" else kind, "alpha",
+                                         staff.STAFF_ROOT, current_session=identity)
+                    expected = target or "claude4"
+                    rows = () if kind == "missing" else (row,)
+                    with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
                           patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
                               "claude4", self.root / ".claude4")) as selection,
                           patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
@@ -395,10 +397,19 @@ class StopResumeTests(unittest.TestCase):
                     entry = cast(pane_record.PaneLaunch, start.call_args.args[1])
                     self.assertEqual(entry["config_dir"], str(self.root / f".{expected}"))
                     self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], entry["config_dir"])
-                    if target is None and kind != "agent":
-                        selection.assert_called_once_with(kind)
+                    if target is None:
+                        selection.assert_called_once_with(kind if kind in ("unit", "showrunner") else "unit")
                     else:
                         selection.assert_not_called()
+
+    def test_resume_without_a_staff_row_on_the_same_account_reports_no_move(self) -> None:
+        result = stop_resume.resume(self.entry["session_id"], why="maintenance")
+        self.assertEqual(result, stop_resume.ClaudeUp(self.entry["session_id"], "w1:p2", "claude3"))
+        self.assertEqual(len(self.client.prompts), 1)
+        text = self.client.prompts[0][1].text
+        self.assertIn("You were stopped and resumed because maintenance.", text)
+        self.assertNotIn("You were moved", text)
+        self.start.assert_called_once()
 
     def saved_codex_name(self, name: str = "saved-worker") -> str:
         identity = "019b3a40-4250-7000-8000-000000000103"
@@ -489,7 +500,7 @@ class StopResumeTests(unittest.TestCase):
                   "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
               patch.object(self.client, "prompt") as prompt,
               redirect_stderr(io.StringIO()) as errors):
-            result = stop_resume.resume("alpha")
+            result = stop_resume.resume("alpha", to="codex1")
         return result, launch, prompt, source_label, errors.getvalue()
 
     def test_codex_staff_resume_uses_native_prompt_delivery(self) -> None:
@@ -739,6 +750,56 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines(),
                          [f"{result.session_id}: stop note anomaly: fixture write failed"])
 
+
+    def test_account_change_saves_pane_data_with_the_fixed_staff_reference(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        self.entry["session_id"] = row.id
+        pane_record.save("agents", {"w1:p2": self.entry})
+        with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))):
+            result = stop_resume.resume("alpha", to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        saved = pane_record.read("agents")["w1:p2"]
+        self.assertEqual(saved, {**self.entry, "config_dir": str(self.root / ".claude4"),
+                                "environment": {**self.entry["environment"],
+                                    **account.named_account_environment(self.root / ".claude4")}})
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertIn("CLAUDE_CODE_SESSION_ID=" + identity, command)
+
+    def test_own_pane_resume_saves_pane_data_with_the_fixed_staff_reference(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        self.entry["session_id"] = row.id
+        pane_record.save("agents", {"w1:p2": self.entry})
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
+              patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                _ = stop_resume.resume("alpha")
+        self.assertEqual(pane_record.read("agents")["w1:p2"], {**self.entry, "environment": {
+            **self.entry["environment"], **account.named_account_environment(self.root / ".claude3")}})
+        launched = cast(pane_launch.PaneLaunch, execute.call_args.args[1])
+        self.assertEqual(launched["session_id"], identity)
+        self.assertEqual(launched["environment"]["CLAUDE_CODE_SESSION_ID"], identity)
+
+    def test_own_pane_resume_by_old_tab_label_keeps_the_fixed_staff_reference(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "renamed-alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        self.entry["session_id"] = row.id
+        pane_record.save("agents", {"w1:p2": self.entry})
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
+              patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                _ = stop_resume.resume("alpha")
+        self.assertEqual(pane_record.read("agents")["w1:p2"]["session_id"], row.id)
+        execute.assert_called_once()
+        launched = cast(pane_launch.PaneLaunch, execute.call_args.args[1])
+        self.assertEqual(launched["session_id"], identity)
+        self.assertEqual(launched["name"], row.name)
 
     def test_failed_account_bookkeeping_reports_an_anomaly_and_resumes(self) -> None:
         with (patch.object(pane_record, "write", side_effect=OSError("fixture")),
@@ -1744,14 +1805,14 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
 
 
-    def test_shutdown_resume_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
+    def test_shutdown_resume_with_an_explicit_target_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
         self.start.side_effect = herdr.HerdrFailure("cannot start yet")
         self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
         self.start.side_effect = None
         for iteration in range(2):
             output = io.StringIO()
             with redirect_stdout(output):
-                status = shutdown.main(["resume", "alpha", "--why", "finish move"])
+                status = shutdown.main(["resume", "alpha", "--why", "finish move", "--to", "claude4"])
             self.assertEqual(status, 0, output.getvalue())
             self.assertEqual(len(output.getvalue().splitlines()), 1)
             self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
@@ -2162,9 +2223,12 @@ class StopResumeTests(unittest.TestCase):
 
     def test_move_waits_for_exit_when_term_removes_the_registry_before_cleanup_finishes(self) -> None:
         identity = self.entry["session_id"]
-        for exits, error in ((True, ValueError("pid 123: native registry identity is unavailable")),
+        staff_id = staff.StaffId(identity)
+        row = staff.StaffRow(staff_id, "unit", "alpha", staff.StaffRoot(), current_session=staff_id)
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))))
+        for exits, error in ((True, herdr.NativeRegistryUnavailable("pid 123: native registry identity is unavailable")),
                              (True, PermissionError("process read denied during exit")),
-                             (False, ValueError("pid 123: native registry identity is unavailable"))):
+                             (False, herdr.NativeRegistryUnavailable("pid 123: native registry identity is unavailable"))):
             with self.subTest(exits=exits, error=error):
                 self.clock.elapsed = 0
                 self.launched.clear()
@@ -2192,7 +2256,10 @@ class StopResumeTests(unittest.TestCase):
                 with patch.object(herdr, "native_process", side_effect=native), redirect_stderr(io.StringIO()) as output:
                     result = stop_resume.move("alpha", "claude4", why="limit")
                 self.kill.assert_called_once_with(123, signal.SIGTERM)
-                self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
+                if isinstance(error, herdr.NativeRegistryUnavailable):
+                    self.assertEqual(output.getvalue(), "")
+                else:
+                    self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
                 if exits:
                     self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude4"))
                     self.start.assert_called_once()
@@ -2405,6 +2472,33 @@ class StopResumeTests(unittest.TestCase):
             f"{self.entry['session_id']}: prompt identity anomaly: registry unavailable"])
         self.detach.assert_called()
 
+    def test_resume_prepares_the_transcript_cursor_before_launch(self) -> None:
+        path = Path(self.entry["config_dir"]) / "projects" / "fixture" / f"{self.entry['session_id']}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"type":"assistant","message":{"content":"old context"}}\n')
+        before = path.stat().st_size
+
+        def start(*_command: str) -> str:
+            with path.open("a") as stream:
+                _ = stream.write(json.dumps({
+                    "type": "user",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": {"role": "user", "content": "launch-time work"},
+                }) + "\n")
+            return ""
+
+        self.start.side_effect = start
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(len(self.client.prompts), 1)
+        cursor = self.client.prompts[0][1].cursor
+        assert isinstance(cursor, herdr.TranscriptCursor)
+        self.assertEqual(cursor.offsets[path], before)
+        self.assertEqual(len(cursor.read_turns()), 1)
+
     def test_resume_identity_mismatch_dispatches_no_work_without_retry(self) -> None:
         proof = "019b3a40-4250-7000-8000-000000000199"
         errors = io.StringIO()
@@ -2578,7 +2672,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(send.call_args.kwargs, {"recipient": "requester", "sender": "shutdown"})
         line = cast(str, send.call_args.args[2])
         self.assertEqual(line, "alpha stopped 0.6 s after its move or resume to claude3; resume it: "
-                         + "cd ~/.claude && python3 scripts/shutdown/shutdown.py resume alpha --to claude3 --why 'usage limit'")
+                         + "agents resume alpha --to claude3 --why 'usage limit'")
         self.assertIn(line, log)
         push.assert_not_called()
 
@@ -2595,7 +2689,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, 1)
         line = cast(str, tell.call_args.args[2])
         self.assertEqual(line, "019b3a40-4250-7000-8000-000000000102 stopped 0.6 s after its move or resume to claude3; resume it: "
-                         + "cd ~/.claude && python3 scripts/shutdown/shutdown.py resume 019b3a40-4250-7000-8000-000000000102 --to claude3 --why 'usage limit'")
+                         + "agents resume 019b3a40-4250-7000-8000-000000000102 --to claude3 --why 'usage limit'")
         self.assertIn(line, log)
         self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
 
