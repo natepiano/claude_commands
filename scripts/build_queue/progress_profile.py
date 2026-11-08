@@ -1,7 +1,7 @@
 """Capture phase counters and anonymous memory in five-percent bins."""
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -11,6 +11,7 @@ import re
 from typing import cast
 
 from scripts.lib.atomic_file import atomic_sample
+from scripts.lib import conf
 from scripts.buildlog import parse
 from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_value
 
@@ -43,6 +44,94 @@ class NoMatchingProfile:
 @dataclass(frozen=True)
 class UnmeasuredBin:
     pass
+
+
+@dataclass(frozen=True)
+class ConfiguredProfileRank:
+    pass
+
+
+CONFIGURED_PROFILE_RANK = ConfiguredProfileRank()
+
+
+def profile_rank(rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK) -> int:
+    return conf.read("build_admission").whole("progress_profile_rank") if isinstance(rank, ConfiguredProfileRank) else rank
+
+
+@dataclass(frozen=True)
+class ScopeReading:
+    directory: Path
+
+
+@dataclass(frozen=True)
+class ProcessTreeReading:
+    pids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ReadingSourceNotRecorded:
+    reason: str = "reading source not recorded"
+
+
+ReadingSource = ScopeReading | ProcessTreeReading | ReadingSourceNotRecorded
+
+
+@dataclass(frozen=True)
+class ProcessCommandUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProcessRssAnonUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProfileProcess:
+    pid: int
+    command: tuple[str, ...] | ProcessCommandUnavailable
+    rss_anon: int | ProcessRssAnonUnavailable
+
+
+@dataclass(frozen=True)
+class PeakProcessesNotRecorded:
+    reason: str = "process evidence not recorded"
+
+
+@dataclass(frozen=True)
+class PeakProcesses:
+    phase: str
+    bin: int
+    anonymous_bytes: int
+    processes: tuple[ProfileProcess, ...]
+
+
+READING_SOURCE_NOT_RECORDED = ReadingSourceNotRecorded()
+PEAK_PROCESSES_NOT_RECORDED = PeakProcessesNotRecorded()
+
+
+def read_processes(pids: Iterable[int], proc: Path) -> tuple[ProfileProcess, ...]:
+    """Read process evidence only when the caller records a new peak."""
+    result: list[ProfileProcess] = []
+    for pid in sorted(pids):
+        directory = proc / str(pid)
+        try:
+            command: tuple[str, ...] | ProcessCommandUnavailable = tuple(
+                part for part in (directory / "cmdline").read_bytes().decode(errors="replace").split("\0") if part)
+        except OSError as error:
+            command = ProcessCommandUnavailable(str(error))
+        try:
+            status = directory / "status"
+            fields = next((line.split() for line in status.read_text().splitlines() if line.startswith("RssAnon:")), list[str]())
+            rss_anon: int | ProcessRssAnonUnavailable = int(fields[1]) * 1024
+        except (OSError, UnicodeError, ValueError, IndexError) as error:
+            rss_anon = ProcessRssAnonUnavailable(str(error))
+        result.append(ProfileProcess(pid, command, rss_anon))
+    return tuple(result)
+
+
+def _no_peak_processes() -> PeakProcessesNotRecorded:
+    return PeakProcessesNotRecorded("process evidence not supplied")
 
 
 @dataclass(frozen=True)
@@ -175,21 +264,31 @@ class ProfileRecorder:
         return ProgressProfile(tuple(PhaseProfile(name, tuple(bins)) for name, bins in self.phases.items()))
 
 
-def merge_profiles(profiles: Iterable[ProgressProfile]) -> ProgressProfile | NoMatchingProfile:
-    """Keep phase order and the highest anonymous sample in each bin."""
+def merge_profiles(profiles: Iterable[ProgressProfile], rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK
+                   ) -> ProgressProfile | NoMatchingProfile:
+    """Keep phase order and select the configured highest run in each bin."""
+    selected_rank = profile_rank(rank)
     recorder = ProfileRecorder()
+    samples: dict[tuple[str, int], list[int]] = {}
     before: dict[str, set[str]] = {}
     for profile in profiles:
         previous: list[str] = []
+        run_samples: dict[tuple[str, int], int] = {}
         for phase in profile.phases:
             before.setdefault(phase.phase, set()).update(previous)
             previous.append(phase.phase)
             for index, value in enumerate(phase.bins):
                 if isinstance(value, int):
-                    _ = recorder.observe(ProgressCounter(phase.phase, index, BINS), value)
+                    key = (phase.phase, index)
+                    run_samples[key] = max(value, run_samples.get(key, 0))
             _ = recorder.phases.setdefault(phase.phase, [UnmeasuredBin()] * BINS)
+        for key, value in run_samples.items():
+            samples.setdefault(key, []).append(value)
     if not before:
         return NoMatchingProfile()
+    for (phase, index), values in samples.items():
+        values.sort(reverse=True)
+        recorder.phases[phase][index] = values[min(selected_rank, len(values)) - 1]
     for name, predecessors in before.items():
         kind, separator, number = name.rpartition(":")
         if separator and number.isdecimal():
@@ -215,12 +314,16 @@ def profile_key(parts: tuple[object, ...]) -> str:
 class RecordedProfile:
     profile: ProgressProfile
     at: float
+    reading_source: ReadingSource = ReadingSourceNotRecorded()
+    peak_processes: PeakProcesses | PeakProcessesNotRecorded = PeakProcessesNotRecorded()
 
 
-def save_profile(path: Path, profile: ProgressProfile, at: float) -> None:
+def save_profile(path: Path, profile: ProgressProfile, at: float, *,
+                 reading_source: ReadingSource = READING_SOURCE_NOT_RECORDED,
+                 peak_processes: PeakProcesses | PeakProcessesNotRecorded = PEAK_PROCESSES_NOT_RECORDED) -> None:
     """Publish attributed anonymous samples in the tagged record format."""
     atomic_sample(path, json.dumps({"measurement": "attributed_anonymous",
-        "record": snapshot_value(RecordedProfile(profile, at))}, separators=(",", ":")))
+        "record": snapshot_value(RecordedProfile(profile, at, reading_source, peak_processes))}, separators=(",", ":")))
 
 
 def read_profile_record(path: Path) -> RecordedProfile | NoMatchingProfile:
@@ -345,12 +448,15 @@ class PendingProfile:
     path: Path
     recorder: ProfileRecorder
     dirty: bool = False
+    reading_source: ReadingSource = ReadingSourceNotRecorded()
+    peak_processes: PeakProcesses | PeakProcessesNotRecorded = PeakProcessesNotRecorded()
 
 
 @dataclass(frozen=True)
 class MergedHistory:
     profile: ProgressProfile | NoMatchingProfile
     oldest: float
+    rank: int
 
 
 @dataclass
@@ -365,7 +471,7 @@ class ProfileHistory:
             self.cached[path] = read_profile_record(path)
         return self.cached[path]
 
-    def _history(self, key: str, cutoff: float) -> MergedHistory:
+    def _history(self, key: str, cutoff: float, rank: int) -> MergedHistory:
         profiles: list[ProgressProfile] = []
         oldest = math.inf
         directory = self.root / key
@@ -380,25 +486,29 @@ class ProfileHistory:
             oldest = min(oldest, record.at)
             if path.suffix == ".json":
                 profiles.append(record.profile)
-        history = MergedHistory(merge_profiles(profiles), oldest)
+        history = MergedHistory(merge_profiles(profiles, rank), oldest, rank)
         self.merged[key] = history
         return history
 
-    def prune(self, cutoff: float) -> None:
+    def prune(self, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK) -> None:
+        selected_rank = profile_rank(rank)
         for directory in self.root.glob("*"):
             if directory.is_dir():
                 history = self.merged.get(directory.name)
-                if history is None or history.oldest < cutoff:
-                    _ = self._history(directory.name, cutoff)
+                if history is None or history.oldest < cutoff or history.rank != selected_rank:
+                    _ = self._history(directory.name, cutoff, selected_rank)
 
-    def matching(self, key: str, cutoff: float) -> ProgressProfile | NoMatchingProfile:
+    def matching(self, key: str, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK
+                 ) -> ProgressProfile | NoMatchingProfile:
+        selected_rank = profile_rank(rank)
         history = self.merged.get(key)
-        if history is None or history.oldest < cutoff:
-            history = self._history(key, cutoff)
+        if history is None or history.oldest < cutoff or history.rank != selected_rank:
+            history = self._history(key, cutoff, selected_rank)
         return history.profile
 
     def observe(self, episode: str, key: str, counter: ProgressCounter | NoCounter,
-                anonymous_bytes: int, at: float) -> None:
+                anonymous_bytes: int, at: float, *, reading_source: ReadingSource = READING_SOURCE_NOT_RECORDED,
+                read_processes: Callable[[], tuple[ProfileProcess, ...] | PeakProcessesNotRecorded] = _no_peak_processes) -> None:
         if isinstance(counter, NoCounter):
             return
         identity = (episode, key)
@@ -408,20 +518,29 @@ class ProfileHistory:
             directory.mkdir(parents=True, exist_ok=True)
             active = directory / f"{episode}.active"
             recorder = ProfileRecorder()
-            restored = read_profile(active, float("-inf"))
-            if isinstance(restored, ProgressProfile):
-                recorder.phases = {phase.phase: list(phase.bins) for phase in restored.phases}
+            restored = read_profile_record(active)
+            if isinstance(restored, RecordedProfile):
+                recorder.phases = {phase.phase: list(phase.bins) for phase in restored.profile.phases}
             pending = PendingProfile(active, recorder)
+            if isinstance(restored, RecordedProfile):
+                pending.reading_source, pending.peak_processes = restored.reading_source, restored.peak_processes
             self.recorders[identity] = pending
+        highest = max((value for phase in pending.recorder.phases.values() for value in phase if isinstance(value, int)), default=-1)
+        if anonymous_bytes > highest:
+            processes = read_processes()
+            pending.reading_source = reading_source
+            pending.peak_processes = (processes if isinstance(processes, PeakProcessesNotRecorded) else
+                PeakProcesses(counter.phase, bin_index(counter.percent), anonymous_bytes, processes))
         changed = pending.recorder.observe(counter, anonymous_bytes)
         pending.dirty = pending.dirty or changed
         if pending.dirty:
-            save_profile(pending.path, pending.recorder.profile(), at)
+            save_profile(pending.path, pending.recorder.profile(), at,
+                reading_source=pending.reading_source, peak_processes=pending.peak_processes)
             pending.dirty = False
             _ = self.cached.pop(pending.path, None)
             history = self.merged.get(key)
             if history is not None:
-                self.merged[key] = MergedHistory(history.profile, min(history.oldest, at))
+                self.merged[key] = MergedHistory(history.profile, min(history.oldest, at), history.rank)
 
     def finish(self, episode: str, at: float, cutoff: float) -> None:
         paths = {path for path in self.root.glob(f"*/{episode}.active")}
@@ -430,11 +549,15 @@ class ProfileHistory:
             key = active.parent.name
             identity = (episode, key)
             pending = self.recorders.get(identity)
-            record = (RecordedProfile(pending.recorder.profile(), at) if pending is not None else self._record(active))
+            record = (RecordedProfile(pending.recorder.profile(), at, pending.reading_source, pending.peak_processes)
+                      if pending is not None else self._record(active))
             if isinstance(record, RecordedProfile):
-                save_profile(active.with_suffix(".json"), record.profile, at)
+                save_profile(active.with_suffix(".json"), record.profile, at,
+                    reading_source=record.reading_source, peak_processes=record.peak_processes)
             active.unlink(missing_ok=True)
             _ = self.recorders.pop(identity, None)
             _ = self.cached.pop(active, None)
             _ = self.cached.pop(active.with_suffix(".json"), None)
-            _ = self._history(key, cutoff)
+            previous = self.merged.pop(key, None)
+            if previous is not None:
+                _ = self._history(key, cutoff, previous.rank)
