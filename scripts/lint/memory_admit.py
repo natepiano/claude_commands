@@ -253,7 +253,7 @@ from scripts.build_queue.step_estimator import (
     expected_peak as expected_peak,
     filter_expressions as filter_expressions,
     filter_set as filter_set,
-    filtered_peak as filtered_peak,
+    read_estimate_history as read_estimate_history,
     fresh_test_peak as fresh_test_peak,
     git_identity as git_identity,
     history_arguments as history_arguments,
@@ -1613,6 +1613,45 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
             wait = MemoryWaitIncomplete()
         steps.append(QueueStepLifetime(pid, start, since, step, repo, ordered, tuple(gaps), end, wait))
     return tuple(sorted(steps, key=lambda step: (step.since, step.pid, step.start_time)))
+
+
+@dataclass(frozen=True)
+class QueueSourceCounts:
+    """Admission sources, logical memory waits, and missing lifecycle evidence."""
+
+    admissions: Mapping[NeedSource, int]
+    memory_waits: tuple[float, ...]
+    incomplete_memory_waits: int
+    unsampled_intervals: int
+    open_intervals: int
+    completed_steps: int
+
+
+def count_queue_sources(lifetimes: Sequence[QueueStepLifetime]) -> QueueSourceCounts:
+    """Count interval sources and each logical step's memory wait once."""
+    admissions: dict[NeedSource, int] = {}
+    waits: list[float] = []
+    incomplete = 0
+    unsampled = 0
+    opened = 0
+    completed = 0
+    for lifetime in lifetimes:
+        if isinstance(lifetime.memory_wait_s, MemoryWaitIncomplete):
+            incomplete += 1
+        else:
+            waits.append(lifetime.memory_wait_s)
+        if isinstance(lifetime.end, ReservationEnded) and isinstance(lifetime.end.end_kind, StepEnd):
+            completed += 1
+        for interval in lifetime.intervals:
+            source = interval.need_source
+            admissions[source] = admissions.get(source, 0) + 1
+            if isinstance(interval.end, StepStillOpen):
+                opened += 1
+            elif isinstance(interval.end.peak, NoPositiveSample):
+                unsampled += 1
+    return QueueSourceCounts(admissions=admissions, memory_waits=tuple(waits),
+                             incomplete_memory_waits=incomplete, unsampled_intervals=unsampled,
+                             open_intervals=opened, completed_steps=completed)
 
 
 def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: int) -> Path:

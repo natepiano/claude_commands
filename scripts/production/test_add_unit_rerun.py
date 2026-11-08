@@ -16,9 +16,8 @@ from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.production import resume_unit
+from scripts.shutdown import shutdown
 from scripts.production import unit_lookup as script_unit_lookup
-from scripts.production import retire_unit
 from scripts.lib import atomic_file
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
@@ -200,7 +199,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
-        unit = resume_unit.RetiredUnitRecovery(read_production(self.production_name), "alpha", self.root / "project-alpha",
+        unit = shutdown.RetiredUnitRecovery(read_production(self.production_name), "alpha", self.root / "project-alpha",
             "alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766")
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
@@ -213,9 +212,9 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(script_unit_lookup, "labeled_session", return_value=marked),
               patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
-              patch.object(retire_unit, "run", side_effect=run_resume),
+              patch.object(shutdown, "retirement_run", side_effect=run_resume),
               redirect_stdout(output)):
-            resume_unit.launch(unit)
+            shutdown.recovery_launch(unit)
         self.assertIn("alpha started:", output.getvalue())
         self.assertIn("resumed: session 62ccbd64-f22e-5647-b20e-7899aa39d766", output.getvalue())
         self.assertIn("Run /unit:direct", self.opening_prompt())

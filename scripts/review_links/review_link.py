@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from string import Template, ascii_lowercase, digits
+from string import Template
 from typing import cast
 from urllib.parse import quote
 
@@ -160,7 +160,7 @@ def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: boo
             folder = root / index[source_set]
         else:
             for _ in range(allocation_tries):
-                folder = root / "".join(secrets.choice(ascii_lowercase + digits) for _ in range(6))
+                folder = root / secrets.token_hex(3)
                 try:
                     folder.mkdir()
                 except FileExistsError:

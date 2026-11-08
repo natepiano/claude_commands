@@ -43,7 +43,7 @@ from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.lib.resume_message import (
-    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS,
+    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, launcher_prompt,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -799,17 +799,20 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers = NO_WORKERS
         own = NO_OWN_PASS
+        from scripts.production import worker
         try:
-            from scripts.production import worker
             if row is not None and row.kind == "worker":
                 own = worker.own_pass(row, names.tab_record)
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                 workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
-                                     row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
+        if isinstance(own, worker.UnsubmittedAssignment):
+            message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
+        else:
+            message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
+                                     workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
+                                         row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
                 entries = pane_record.read_strict(client.session)

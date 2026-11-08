@@ -442,7 +442,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
-        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "production/resume_unit.py",
+        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "shutdown/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "berth_fix/launch.sh",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
 
