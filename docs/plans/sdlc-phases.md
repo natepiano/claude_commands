@@ -134,7 +134,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a retrospective before sample — the design's Steps need a prospective one; start-time selection inside `phase_boundaries` — it breaks `daily_read.py`; deploy time as exposure — it does not prove which contract a phase read.
 
-### Phase 4 — Freeze the before sample for the `direct.md` route that shipped  · status: todo
+### Phase 4 — Freeze the before sample for the `direct.md` route that shipped  · status: done
 **Depends on:** Phase 3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16, Phase 17, Phase 18, Phase 19, Phase 20
 
 **Waits for:** nothing. The route reached main in 7733bee4c (2026-11-07 18:32:53 EST), so the before window is closed.
@@ -173,7 +173,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Spec:**
 - Fix both bounds before the run: `--since` is the time the route reached main, and `--until` is the collection time, written as UTC stamps in the Step log. Never use the script's moving fourteen-day default. Run one invocation per unit, because `render_trial` pools the primary measures across all selected units: `phase_process.py baseline --exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units <one unit of the before sample> --since <the route main time> --until <the collection time>`, at the Step log's measurement version. Record the after phase instances and their matching metadata the same way Phase 4's freeze did (`--detail trial` per unit, then each row's phase start event). Add the after numbers to the Step log with n for each: weighted director tokens over the phase plus its following gap (the primary measure), compactions per phase and context size after each reload (reported, no target). Show each unit's results apart, and each excluded state (`ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed) with n.
-- Matching: the same units in both windows, with matched mode, scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure. Two `NotRecorded` values never match: a control that is `NotRecorded` in either window makes the result `inconclusive`.
+- Matching: the same units in both windows, with matched scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure. Two `NotRecorded` values never match: a control that is `NotRecorded` in either window makes the result `inconclusive`.
+- Mode is not a matching control: no record holds the director's mode. The result names Mode as a `NotRecorded` limit in both windows (showrunner, 2026-11-08). Add no mode recording.
 - Counts: the n a step names counts usable primary observations (weighted tokens known). `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload` are reported with n; they are never 0 and never a failed saving.
 - Quality held: median and p90 phase time per unit, over the trial's eligible phases (the trial section's phase-time line), do not rise against the Step log's before sample. A rise is reported with the step's result.
 - If the window holds no eligible observation (n 0, or below the n the step names), the result is `not yet measurable`: the Step log names the missing evidence and the condition for the next collection, and the phase waits on it; this is never read as a failed step.
