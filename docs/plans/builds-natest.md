@@ -1807,28 +1807,33 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 5. A shared fixture sets `maintenance.auto false` before its first commit (Phase 81).
 6. Read the importers of a shared fixture before you change it. Every importer stays green.
 7. Add no guard, refusal or check (user rule, 2026-11-05).
+8. Showrunner order, 2026-11-07, after the first pass: in `FAKE_SSH` (`staff_test_support.py:549`), import the heavy modules after the `STAFF_TEST_SSH_FAIL` branch.
+9. Same order: share the owner imports across repeated fake SSH requests in one test. Keep a separate process where a test proves a lock or a process boundary.
+
+**First pass result (same-load pairs):** Git setup is not the cost. fast_track 55.5 -> 54.9 CPU s, add_unit 20.5 -> 20.5, staff 28.0 -> 28.0. The director dropped the `test_staff.py` class seed (no gain). Kept: `maintenance.auto false` in the seeds and two importer repairs in `add_unit_test_support.py`. The staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s).
 
 **Files:**
 - `scripts/production/test_fast_track.py`
-- `scripts/production/test_staff.py`
 - `scripts/production/test_add_unit.py`
 - `scripts/production/merge_checkpoint_test_support.py`
 - `scripts/production/add_unit_test_support.py`
+- `scripts/production/staff_test_support.py` (owner sdlc; showrunner assignment)
 
 **Workers:** 2 writers; split by module and its fixture
-- `impl` — `test_fast_track.py` and `test_add_unit.py`, hub: `merge_checkpoint_test_support.py`, `add_unit_test_support.py`
-- `test` — `test_staff.py`, opens as impl
+- `impl` — `test_fast_track.py` and `test_add_unit.py`, hub: `merge_checkpoint_test_support.py`, `add_unit_test_support.py` (done)
+- `test` — Spec 8 and 9, hub: `staff_test_support.py`, opens as impl
 
 **Constraints from prior phases:**
 - Phase 87: rule 2 removal gave no CPU gain in these modules. The cost is the temporary Git repository that each test builds.
-- `scripts/production/staff_test_support.py` is not natest's to edit (standing rule). A gain that needs a change there goes to the director as an architecture proposal with its measured gain.
+- The showrunner assigned `scripts/production/staff_test_support.py` to this phase (2026-11-07). The checkpoint notice says `also touches staff_test_support.py (owner sdlc), tested against origin/main`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
 - The behavior map has a row for each assertion. No assertion is removed.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
 - Each changed file and every importer of a changed fixture pass.
-- the targeted test green on the phase commit merged with `origin/builds`
+- Same-load CPU before and after for `test_staff.py` and the other heaviest `StaffTestCase` users.
+- the targeted test green on the phase commit merged with `origin/builds`, and a trial merge with `origin/main` for `staff_test_support.py`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
@@ -1869,7 +1874,7 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 90 — The style ledger tests seed staff once per class and close every database  · status: todo
+### Phase 90 — The style ledger tests seed staff once per class and close every database  · status: done
 **Depends on:** Phase 85
 
 #### Work Order
