@@ -535,7 +535,7 @@ Release recalculates the priority of a kept decision.
 
 **Imports**
 - `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
-- Buildlog uses `record.py`; shutdown uses `shutdown_record.py`. Their bare imports have distinct module names even when both folders are on `sys.path`. Shutdown has no old-name alias or shim. `roster.py` imports shutdown's `remote` by package.
+- Buildlog imports `scripts.buildlog.record`. Shutdown uses `shutdown_record.py`. These modules have distinct names. Shutdown has no alias for an old module name. `roster.py` imports shutdown's `remote` by package.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.

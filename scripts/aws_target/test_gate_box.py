@@ -55,6 +55,8 @@ class GateBoxTests(unittest.TestCase):
         second = gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'passed')
         run = gate.GateRun((second,), 4, 3, executions=(first, second))
         self.assertEqual(gate_box.decode_run(gate_box.encode_run(run)), run)
+        self.assertEqual([job.output for job in gate_box.execution_records(gate_box.decode_run(gate_box.encode_run(run)))],
+                         ['failed', 'passed'])
         record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'remote-host', 0, 4, 'merge-gate')
         self.assertEqual((record['kind'], record['host'], record['status']), ('gate_run', 'remote-host', 0))
         self.assertEqual(len(ledger.rows(record, 'modules')), 2)

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from decimal import Decimal
 from io import StringIO
+import gzip
 import json
 import os
 from pathlib import Path
@@ -311,16 +312,38 @@ class CloudGateTests(CostFixture):
         self.assertIsInstance(decision, ledger.SpendingRefused)
 
     def test_import_uses_real_remote_host_and_appends_once(self) -> None:
-        destination = self.root / 'buildlog/fixture-guest.jsonl'
+        buildlog = self.root / 'buildlog'
+        destination = buildlog / 'fixture-guest.jsonl'
         destination.parent.mkdir()
-        _ = destination.write_text('{"interrupted":')
-        with mock.patch.object(store, 'host_file', return_value=destination) as host_file:
-            cloud_gate.import_record(self.folder, self.result())
-            cloud_gate.import_record(self.folder, self.result())
-        self.assertEqual(host_file.call_args.args[0], 'fixture-guest')
-        records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
-        self.assertEqual([row['id'] for row in records], ['gate-attempt'])
-        self.assertEqual(records[0]['host'], 'fixture-guest')
+        traceback = 'Traceback (most recent call last):\nAssertionError: retained cloud failure\n'
+        for retried in (False, True):
+            with self.subTest(retried=retried):
+                passed = gate.GateJobResult('fixture', 'test_ok.py', 0, 1, 'OK')
+                failed = gate.GateJobResult('fixture', 'test_ok.py', 1, 2, traceback)
+                run = gate.GateRun((passed,), 3, 2, executions=(failed, passed) if retried else (passed,))
+                result = self.result()
+                result['gate'] = gate_box.encode_run(run)
+                result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
+                                                             self.now, self.now + 3, 'merge-gate')
+                _ = destination.write_text('{"interrupted":')
+                with (mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(buildlog)}),
+                      mock.patch.object(store, 'host_file', return_value=destination) as host_file):
+                    cloud_gate.import_record(self.folder, result)
+                    cloud_gate.import_record(self.folder, result)
+                self.assertEqual(host_file.call_args.args[0], 'fixture-guest')
+                records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
+                self.assertEqual([row['id'] for row in records], ['gate-attempt'])
+                self.assertEqual(records[0]['host'], 'fixture-guest')
+                modules = ledger.rows(records[0], 'modules')
+                if retried:
+                    first, second = modules
+                    self.assertNotEqual(first['log'], '')
+                    kept = gzip.decompress((buildlog / ledger.text(first, 'log')).read_bytes()).decode('utf-8')
+                    self.assertIn(traceback, kept)
+                    self.assertEqual((first['attempt'], first['status']), (1, 1))
+                    self.assertEqual((second['attempt'], second['status'], second['log']), (2, 0, ''))
+                else:
+                    self.assertEqual(modules[0]['log'], '')
 
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
