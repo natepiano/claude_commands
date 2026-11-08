@@ -13,12 +13,11 @@ from unittest import mock
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
+from scripts.build_targets import build_targets
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test import mac_test
 
 from scripts.lib import process_start as process_identity
-
-build_targets = eligibility_support.build_targets
-mac_test = eligibility_support.mac_test
 
 
 class VerifySshTargetsTests(VerifySshTargetsFixture):

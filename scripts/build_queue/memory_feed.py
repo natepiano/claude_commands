@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Publish the build memory page and its current queue reading."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -9,16 +13,40 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict
 from zoneinfo import ZoneInfo
 
+
+class CodeRootArguments(argparse.Namespace):
+    code_root: Path = Path(__file__).resolve().parents[2]
+
+
+installed = CodeRootArguments()
+if __name__ == "__main__":
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
+    installed, _remaining = bootstrap.parse_known_args(namespace=installed)
+    sys.path.insert(0, str(installed.code_root))
+
+from scripts.build_queue import admission_code
+
+
+def installed_code_version(code_root: Path) -> str:
+    """Use the admission service fingerprint for the installed sources."""
+    return admission_code.admission_code_version(code_root / "scripts")
+
+
+LOADED_ADMISSION_CODE_VERSION = installed_code_version(installed.code_root)
+
+from scripts.buildlog import charts
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
-from scripts.build_queue.queue_lines import plain
+from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
@@ -26,6 +54,7 @@ from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
@@ -36,23 +65,29 @@ PROC = Path("/proc")
 class FeedConfiguration:
     output_folder: Path
     interval_seconds: float
+    history_days: int
+    swap_rows: int
+    report_refresh_seconds: int
 
 
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
-    """Read the output folder and the interval from one configuration."""
+    """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
     return FeedConfiguration(Path(os.path.expandvars(settings.text("output_folder"))).expanduser(),
-                             settings.number("interval_seconds"))
+                             settings.number("interval_seconds"), settings.whole("history_days"),
+                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
 
 
-class PageArguments(argparse.Namespace):
+class PageArguments(CodeRootArguments):
     once: bool = False
 
 
 def page_arguments(argv: Sequence[str]) -> PageArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--once", action="store_true", help="Write one reading and exit.")
+    _ = parser.add_argument("--code-root", type=Path, default=PageArguments.code_root,
+                            help="Read the installed admission code from this repository.")
     return parser.parse_args(argv, namespace=PageArguments())
 
 
@@ -71,6 +106,19 @@ class GroupPart(TypedDict):
     who: str
     pid: int | gate.PidNotRecorded
     gib: float
+    age: str
+
+
+class LeftoverProcess(TypedDict):
+    pid: int | gate.PidNotRecorded
+    program: str
+
+
+class LeftoverScope(TypedDict):
+    owner: str
+    age: str
+    used: float
+    members: list[LeftoverProcess]
 
 
 class CIRunnerMemory(TypedDict):
@@ -125,6 +173,7 @@ class RowProgress(TypedDict):
 
 class RunRow(TypedDict):
     machine: NotRequired[str]
+    age: NotRequired[str]
     name: str
     showrunner: str
     unit: str
@@ -132,8 +181,8 @@ class RunRow(TypedDict):
     state: str
     pid: int | gate.PidNotRecorded
     detail: str
-    used: float
-    counted: float
+    used: float | gate.RunUseUnavailable
+    counted: float | gate.RunUseUnavailable
     reserved: float
     started_at: float
     queued: bool
@@ -178,6 +227,29 @@ class PressureLimits(TypedDict):
     swap: float
 
 
+class ReportCost(TypedDict):
+    machine: str
+    cause: str
+    recent: dict[str, object]
+    window: dict[str, object]
+    action: str
+    owner: str
+
+
+@dataclass(frozen=True)
+class ReportSections:
+    charts: dict[str, object]
+    top: tuple[ReportCost, ...]
+    start: str
+    end: str
+    recent_days: int
+    zone: str
+
+
+class ReportNotRead(Enum):
+    VALUE = "not read"
+
+
 class MemoryPage(TypedDict):
     ok: bool
     read_at: float
@@ -214,6 +286,9 @@ class MemoryPage(TypedDict):
     cloud_slots: int
     psi: PressureValues
     limits: PressureLimits
+    report: ReportSections | charts.IndexUnavailable
+    swap_rows: int
+    leftovers: list[LeftoverScope]
 
 
 class RetainedReading(MemoryPage):
@@ -393,17 +468,57 @@ def run_keep_text(hold: gate.RunKeepAside, steps: Sequence[gate.RunningStep]) ->
 
 def read_stalls() -> PressureValues:
     """Read the current ten-second memory stall averages."""
+    path = PROC / "pressure/memory"
     try:
-        lines = (PROC / "pressure/memory").read_text().splitlines()
-    except OSError as error:
-        missing = PressureNotRecorded(str(error))
+        lines = path.read_text().splitlines()
+    except OSError:
+        missing = PressureNotRecorded(f"Pressure is unreadable: {path}")
         return {"some": missing, "full": missing}
-    averages = {line.split()[0]: float(next(field.removeprefix("avg10=")
-                for field in line.split()[1:] if field.startswith("avg10="))) for line in lines}
-    return {"some": averages["some"], "full": averages["full"]}
+    values: PressureValues = {"some": PressureNotRecorded(f"Pressure is unreadable: {path}"),
+                              "full": PressureNotRecorded(f"Pressure is unreadable: {path}")}
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0] not in ("some", "full"):
+            continue
+        name = fields[0]
+        for field in fields[1:]:
+            if field.startswith("avg10="):
+                try:
+                    values[name] = float(field.removeprefix("avg10="))
+                except ValueError:
+                    values[name] = PressureNotRecorded(f"Pressure is unreadable: {path}")
+    return values
 
 
-def reading() -> MemoryPage:
+def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
+    """Read both report sections from one provider result."""
+    try:
+        recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
+        if days < recent_days:
+            raise conf.Unusable(f"history_days={days} must be at least TOP_COST_RECENT_DAYS={recent_days}")
+        report = charts.page_data(days, n=3)
+        if isinstance(report, charts.IndexUnavailable):
+            return report
+        top = report.top
+        rows: list[ReportCost] = []
+        if not isinstance(top.rows, charts.NoDataYet):
+            for row in top.rows:
+                window: dict[str, object] = ({"state": "matches recent"} if isinstance(row.window, charts.WindowMatchesRecent)
+                          else charts.cost_json(row.window.value, 3600))
+                rows.append({"machine": row.machine, "cause": row.cause,
+                             "recent": charts.cost_json(row.recent, 3600 * top.recent_days),
+                             "window": window, "action": row.action.text, "owner": row.action.owner})
+        zone = user_zone()
+        return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
+                              top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))
+    except (OSError, ValueError, RuntimeError) as error:
+        return charts.IndexUnavailable(str(error))
+
+
+def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+            report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
+    if isinstance(configuration, conf.UseConfiguredValue):
+        configuration = read_configuration()
     parsed = admission_client.view()
     explanation = parsed.explanation
     captured = explanation.room
@@ -412,6 +527,15 @@ def reading() -> MemoryPage:
         raise RuntimeError("recorded room unavailable")
     labels = unit_labels.unit_labels_for(
         [step.session_id for step in (*parsed.view.running, *parsed.view.waiting)], os.environ)
+    leftovers: list[LeftoverScope] = []
+    for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
+        identity = labels.get(activity.session_id)
+        owner = identity.session if identity is not None else activity.session_name or "unlabelled session"
+        scope_members: list[LeftoverProcess] = [{"pid": member.pid, "program": member.program} for member in activity.members]
+        if not scope_members:
+            scope_members = [{"pid": step.pid, "program": activity.program}]
+        leftovers.append({"owner": owner, "age": queue_view.leftover_age(age(activity.started_at, explanation.now))
+                          if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
     cap = gib(captured.cap) if isinstance(captured.cap, int) else captured.cap
     safety = gib(captured.safety)
     used = gib(captured.used)
@@ -433,17 +557,17 @@ def reading() -> MemoryPage:
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
-        name = step.step if step is not None else "between steps"
+        name = step_text(step, RECORDED_STEP_NAMES) if step is not None else "between steps"
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
         detail = unit if metadata is not None else hold.memory.owner
-        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, gate.AnonymousRunUse) else 0.0
+        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, gate.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (
             run.pid if isinstance(run, LiveBuildRun) else gate.PidNotRecorded())
         walk.append({"name": name, "showrunner": identity.showrunner, "unit": unit,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     "counted": use + gib(hold.bytes), "reserved": gib(hold.bytes),
+                     "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
@@ -452,7 +576,7 @@ def reading() -> MemoryPage:
         step = entry.step
         memory = step.measured
         identity = step_labels(step, labels)
-        name, detail = step.step, identity.unit
+        name, detail = step_text(step, RECORDED_STEP_NAMES), identity.unit
         unit, state = detail, ""
         if isinstance(memory, (gate.UnownedSliceMemory, gate.CompilerServiceMemory)):
             service = (isinstance(memory, gate.CompilerServiceMemory)
@@ -472,6 +596,7 @@ def reading() -> MemoryPage:
                 description = "Memory these processes hold outside the build queue."
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
+                           "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
                            "progress": row_progress((step,)),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, gate.UnownedSliceMemory):
@@ -491,13 +616,15 @@ def reading() -> MemoryPage:
             swaps.append({"name": name, "detail": detail, "swap": gib(memory.swap_bytes)})
     walk.sort(key=lambda row: row["started_at"])
     for name, members in groups.items():
-        amount = sum(row["used"] for row in members)
+        amount = sum(row["used"] for row in members if isinstance(row["used"], float))
         walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": gate.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
-                     "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"], "gib": row["used"]}
-                                               for row in sorted(members, key=lambda row: row["used"], reverse=True)]})
+                     "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"],
+                         "gib": row["used"], "age": row.get("age", "")}
+                         for row in sorted(members, key=lambda row: gib(row["used"]), reverse=True)
+                         if isinstance(row["used"], float)]})
     machine = host_name()
     for row in walk:
         row["machine"] = machine
@@ -509,9 +636,12 @@ def reading() -> MemoryPage:
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         identity = step_labels(waiter, labels)
-        waiters.append({"name": waiter.step, "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
+        reason = reason_phrase(waiter.reason, parsed.view.waiting)
+        if isinstance(waiter.reason, gate.BehindHead):
+            reason = "head protection · " + reason
+        waiters.append({"name": step_text(waiter, RECORDED_STEP_NAMES), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
-                        "reason": reason_phrase(waiter.reason, parsed.view.waiting),
+                        "reason": reason,
                         "fits": need <= captured.signed_room})
     cloud: list[str] = []
     cloud_heading = ""
@@ -553,19 +683,14 @@ def reading() -> MemoryPage:
         "cloud": cloud, "cloud_heading": cloud_heading,
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
+        "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,
+        "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
 
 
 def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
-    """Convert named unavailable readings to the page's JSON null values."""
-    value = cast(dict[str, object], codec.snapshot_value(payload))
-    if isinstance(payload.get("cap"), gate.CapUnavailable):
-        value["cap"] = None
-    pressure = payload.get("psi")
-    if isinstance(pressure, dict):
-        value["psi"] = {name: reading if isinstance(reading, (int, float)) else None
-                        for name, reading in cast(PressureValues, pressure).items()}
-    return json.dumps(value)
+    """Preserve named unavailable readings at the JSON boundary."""
+    return json.dumps(codec.snapshot_value(payload))
 
 
 def main(argv: Sequence[str]) -> int:
@@ -574,9 +699,18 @@ def main(argv: Sequence[str]) -> int:
     publish_page(configuration)
     target = configuration.output_folder / "memory.json"
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
+    report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
+    next_report_at = 0.0
     while True:
+        if installed_code_version(args.code_root) != LOADED_ADMISSION_CODE_VERSION:
+            print("The installed admission code changed. Restart the feed.", file=sys.stderr)
+            return 1
+        now = time.monotonic()
+        if isinstance(report, ReportNotRead) or now >= next_report_at:
+            report = report_reading(configuration.history_days)
+            next_report_at = now + configuration.report_refresh_seconds
         try:
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading()
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

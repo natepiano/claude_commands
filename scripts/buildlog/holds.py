@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Literal, TypedDict, cast
 
 from scripts.buildlog import store
 
+from scripts.lib.intervals import union_seconds
 from scripts.lib.user_zone import user_zone
 
 HoldTarget = Literal["mac", "natedev"]
+MICROSECOND = timedelta(microseconds=1)
 
 
 @dataclass(frozen=True)
@@ -216,24 +218,9 @@ class HoldDuration:
     incomplete: bool
 
 
-def union_seconds(spans: list[tuple[datetime, datetime]]) -> float:
-    if not spans:
-        return 0.0
-    ordered = sorted(spans)
-    first, last = ordered[0]
-    total = 0.0
-    for began, ended in ordered[1:]:
-        if began <= last:
-            last = max(last, ended)
-        else:
-            total += (last - first).total_seconds()
-            first, last = began, ended
-    return total + (last - first).total_seconds()
-
-
 def hold_duration(history: HoldHistory, target: HoldTarget, start: str, end: str) -> HoldDuration:
     first, last = datetime.fromisoformat(start), datetime.fromisoformat(end)
-    spans: list[tuple[datetime, datetime]] = []
+    spans: list[tuple[float, float]] = []
     recorded = history.recorded_since[target]
     incomplete = isinstance(recorded, NoHoldEventRecorded) or recorded.at > first
     for interval in history.intervals:
@@ -246,8 +233,9 @@ def hold_duration(history: HoldHistory, target: HoldTarget, start: str, end: str
             through = ended.through if isinstance(ended, OpenHold) else ended
             low, high = max(first, began), min(last, through)
             if high > low:
-                spans.append((low, high))
-    return HoldDuration(union_seconds(spans), incomplete)
+                # Whole microseconds preserve precision when spans are added.
+                spans.append(((low - first) / MICROSECOND, (high - first) / MICROSECOND))
+    return HoldDuration((union_seconds(spans) * MICROSECOND).total_seconds(), incomplete)
 
 
 def duration_text(duration: HoldDuration) -> str:

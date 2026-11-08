@@ -97,7 +97,7 @@ class SampleTests(unittest.TestCase):
             "reading = sample.filesystem_reading(); "
             "assert reading['state'] == 'measured', reading; "
             "assert 'scripts.buildlog.disk' not in sys.modules, 'filesystem reading imported disk'; "
-            "assert 'scripts.buildlog.sweep' not in sys.modules, 'filesystem reading imported sweep'"
+            "assert 'scripts.lint.sweep' not in sys.modules, 'filesystem reading imported sweep'"
         )
         result = subprocess.run(
             [str(CLI.parents[1] / "lib/py"), "-c", command],
