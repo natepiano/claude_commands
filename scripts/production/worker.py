@@ -677,22 +677,30 @@ class PaneWorkerStates:
 
 
 def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
+                  only: frozenset[StaffId] | Literal["all"] = "all",
                   scanned: dict[str, list[str]] | None = None) -> MeshWorkerRows | PaneWorkerStates:
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), scanned=scanned, record=record)
     if runs and unit_runs.parent_transport(str(parent.current_session),
             scanned={str(parent.current_session): runs}, record=record) == "mesh":
         return MeshWorkerRows(board_json.workers(Path(runs[0]), set(), record=record))
-    return PaneWorkerStates(worker_panes.observe(parent.id, record), [Path(run) for run in runs])
+    states = (worker_panes.observe(parent.id, record) if only == "all" else
+              worker_panes.observe_selected(parent.id, record, [WorkerName.parse(row.name)
+                  for row in record.find(kind="worker", parent=parent.id) if row.id in only]))
+    return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
+            only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
+            started_panes: dict[StaffId, str] | Literal["discard"] = "discard",
             runs: dict[str, list[str]] | None = None,
             codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> ExitCode:
     record = staff.snapshot() if record is None else record
     holder = next(row for row in record.rows if row.id == parent)
     changed = False
     outcome = ExitCode.OK
-    observed = _read_workers(holder, record, scanned=runs)
+    launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
+                       worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
+    observed = _read_workers(holder, record, only=only, scanned=runs)
     if isinstance(observed, MeshWorkerRows):
         print(f"{holder.name}: workers unchanged")
         return ExitCode.OK
@@ -716,14 +724,19 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         outcome = ExitCode.UNCERTAIN
                         continue
                     if not isinstance(active, progress_history.ActiveDispatch):
+                        if only != "all":
+                            print(f"{state.row.name}: closed; its next assign resumes it")
                         continue
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
-                        result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role, lock=hold, runs=runs, codex=codex)
+                        result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
+                            account=launch_account, lock=hold, runs=runs, codex=codex)
                         code = startup_result(WorkerName.parse(state.row.name), result)
                         if code != ExitCode.OK:
                             outcome = code
                             continue
+                        if isinstance(started_panes, dict):
+                            started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         changed = True
                     code = _resume_launcher(state.row, active)
                     if code != ExitCode.OK:
