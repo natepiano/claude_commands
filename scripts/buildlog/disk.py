@@ -5,16 +5,13 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 from scripts.lint import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 

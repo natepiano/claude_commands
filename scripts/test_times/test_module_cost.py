@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import module_cost, task_cpu
@@ -42,6 +43,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_command_measure_preserves_a_child_group_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_stop.py").write_text(
@@ -75,6 +79,9 @@ class ModuleCostTests(unittest.TestCase):
             _ = sockets.enter_context(reader)
             _ = sockets.enter_context(writer)
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             paused = tree / "paused.py"
             _ = paused.write_text(
                 "import os, signal\n"
@@ -83,11 +90,10 @@ class ModuleCostTests(unittest.TestCase):
             tracer = tree / "tracer.py"
             _ = tracer.write_text(
                 "import os, sys\nfrom pathlib import Path\n"
-                + f"sys.path.insert(0, {str(Path(task_cpu.__file__).resolve().parents[2])!r})\n"
                 + "from scripts.test_times.task_cpu import measure\n"
                 + f"measure([sys.executable, {str(paused)!r}], cwd=Path({str(tree)!r}), environment=dict(os.environ))\n",
                 encoding="utf-8")
-            process = subprocess.Popen([sys.executable, str(tracer)], pass_fds=(writer.fileno(),),
+            process = subprocess.Popen([str(Path(task_cpu.__file__).resolve().parents[1] / "lib/py"), str(tracer)], pass_fds=(writer.fileno(),),
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             writer.close()
             child = 0
@@ -140,6 +146,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_reports_each_module_when_the_trace_start_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             modules = ["test_first.py", "test_second.py"]
@@ -171,6 +180,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_lists_the_test_with_a_cpu_heavy_child_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_cpu.py").write_text(
@@ -196,6 +208,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_ends_a_detached_child_and_keeps_the_module_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             pids = tree / "pids"
@@ -229,6 +244,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_ranks_commands_by_their_cpu_and_reports_unassigned_cpu(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             heavy = tree / "heavy.py"
@@ -266,6 +284,9 @@ class ModuleCostTests(unittest.TestCase):
     def test_reports_costs_for_a_module_that_starts_two_children(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
+            self.enterContext(mock.patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+            }))
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_children.py").write_text(

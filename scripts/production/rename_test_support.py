@@ -367,7 +367,6 @@ def interrupted_move(command, *args, **kwargs):
     return original_run(command, *args, **kwargs)
 subprocess.run = interrupted_move
 sys.argv = sys.argv[1:]
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
 

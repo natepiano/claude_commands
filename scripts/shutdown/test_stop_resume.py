@@ -2524,6 +2524,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_worker_uses_its_own_busy_pass_and_leaves_idle_workers_without_input(self) -> None:
         from scripts.direct import progress_history
+        from scripts.production import worker
 
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("native-director"))
@@ -2534,7 +2535,8 @@ class StopResumeTests(unittest.TestCase):
             with (self.subTest(active=active),
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(worker_panes, "worker_run", return_value=self.root) as run,
-                  patch.object(progress_history, "active_dispatch", return_value=active) as read):
+                  patch.object(progress_history, "active_dispatch", return_value=active) as read,
+                  patch.object(worker, "resume_receipt", return_value=worker.DispatchSubmitted())):
                 self.launched.clear()
                 self.client.prompts.clear()
                 result = stop_resume.resume(str(row.id), why="maintenance")
@@ -2545,8 +2547,28 @@ class StopResumeTests(unittest.TestCase):
                     self.assertNotIn("Worker ", self.client.prompts[0][1].text)
                 else:
                     self.assertEqual(self.client.prompts, [])
-                run.assert_called_once_with(parent)
+                run.assert_called_once_with(row, record=record)
                 read.assert_called_once_with(row.id, self.root)
+
+    def test_named_resume_keeps_the_saved_assignment_when_the_worker_never_received_it(self) -> None:
+        from scripts.direct import progress_history
+        from scripts.production import worker
+
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("native-director"))
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId(self.entry["session_id"]))
+        record = staff.StaffSnapshot((parent, row))
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(worker_panes, "worker_run", return_value=self.root),
+              patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch(
+                  "own-dispatch", ("bash", "assign.sh", "saved prompt.md"))),
+              patch.object(worker, "resume_receipt", return_value=worker.DispatchNotSubmitted())):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        text = "\n".join(prompt.text for _pane, prompt in self.client.prompts)
+        self.assertIn("bash assign.sh 'saved prompt.md'", text)
+        self.assertNotIn("Continue pass", text)
 
     def test_resume_director_submits_an_opening_prompt_with_idle_pane_workers(self) -> None:
         from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers

@@ -1435,16 +1435,14 @@ def inherited_mirror_descriptors() -> tuple[int, ...]:
 def mirror_probe_setup(path: str) -> str:
     """Create a marked probe copy through the registered remote kind."""
     program = "\n".join((
-        "from pathlib import Path",
         "import sys",
-        "sys.path.insert(0, str(Path.home() / '.claude'))",
         "from scripts.copies import copies",
         "copies.probe_remote_folder(sys.argv[1])",
     ))
     relative = path.removeprefix("~/")
     mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
     shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
-    return ("test -f " + shell_mark + " || python3 -c " + shlex.quote(program) + " " +
+    return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
             shlex.quote(path) + " || exit 1")
 
 

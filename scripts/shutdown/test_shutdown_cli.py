@@ -1158,13 +1158,13 @@ class ResumeUnitTests(unittest.TestCase):
         # staff step are real, including the inherited operation lock.
         write_text_atomic(wrapper, "\n".join([
             "import sys", "from unittest.mock import patch",
-            f"sys.path.insert(0, {str(CHECKOUT / 'scripts/production')!r})",
-            f"sys.path.insert(0, {str(CHECKOUT)!r})",
+            "from pathlib import Path",
+            f'with open(Path({str(CHECKOUT)!r}) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {{"__file__": package_root.name}})',
             "from scripts.production import add_unit", "from scripts.production.production_doc import read_production",
             "def launch(arguments):",
             "    name = arguments[arguments.index('--production') + 1]",
             "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",
-            "    import pane_record",
+            "    from scripts.shutdown import pane_record",
             f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
             "    print(row.id)", "    return 0",
             "with patch.object(add_unit, '_main', side_effect=launch):",

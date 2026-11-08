@@ -68,7 +68,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, unit_runs  # noqa: E402
 from scripts.history.rounds import pass_ledger_round, phase_rounds, refunded_batches  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402

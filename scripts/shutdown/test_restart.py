@@ -34,7 +34,7 @@ from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
-from scripts.lib import unit_runs
+from scripts.lib import file_lock, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member
 from scripts.herdr.fake_herdr import herdr_listener
@@ -82,7 +82,7 @@ class ClaudeLaunchTrustTests(RestartTestCase):
             folder.mkdir()
         first_at_write, second_attempt, first_written = Event(), Event(), Event()
         read_text = Path.read_text
-        lock_config = accounts.claude_config_lock
+        lock_config = file_lock.claude_config_lock
 
         def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
             text = read_text(path, encoding=encoding, errors=errors)
@@ -108,7 +108,7 @@ class ClaudeLaunchTrustTests(RestartTestCase):
                 write_text_atomic(path, text, new_file_mode=new_file_mode)
 
         with (patch.object(Path, "read_text", read),
-              patch.object(accounts, "claude_config_lock", lock),
+              patch.object(file_lock, "claude_config_lock", lock),
               patch.object(herdr, "write_text_atomic", publish),
               ThreadPoolExecutor(max_workers=2) as writers):
             first = writers.submit(herdr.trust_claude_launch, folders[0], account)

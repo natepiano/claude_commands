@@ -42,7 +42,6 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import workers
 from scripts.lib import scratch
 

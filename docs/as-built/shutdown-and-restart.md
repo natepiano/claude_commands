@@ -158,6 +158,15 @@ Both readers share one scan and report unreadable evidence as anomalies.
 `unit_runs.run_folders` preserves root and name order, removes duplicate resolved paths, and skips each root's `active` marker folder.
 An unreadable root does not prevent reads of other roots.
 
+Pane worker resume uses the dispatch record and transcript to select one step.
+An idle worker receives a continuation prompt when its transcript contains the open dispatch.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+Restore, named resume, and director notes use one receipt rule.
+An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
+Director notes reuse shared dispatch history reads.
+A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
+The decision reads the record and transcript once per worker and uses the restart's shared run index.
+
 ## Launch names
 
 `LaunchNames.read()` supplies one staff snapshot for lookup, labels, and restore.

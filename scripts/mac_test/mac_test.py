@@ -32,6 +32,7 @@ from scripts.build_hold import override_guard
 from scripts.build_hold import build_hold
 from scripts.mac_test import offload
 from scripts.lib import conf
+from scripts.lint import sweep
 from scripts.lib.user_zone import user_zone
 
 from scripts.message import session_send
@@ -424,7 +425,7 @@ class InvalidBlockDuration:
 
 BlockDuration = ValidBlockDuration | InvalidBlockDuration
 INVALID_BLOCK_DURATION = InvalidBlockDuration()
-FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state"]
+FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state", "bad"]
 
 
 class CliArguments(argparse.Namespace):
@@ -2314,7 +2315,14 @@ def free_now(
         scopes_overlap(claim.scope, candidate) and run_is_live(claim.record)
         and (copy or not copy_gives_way(claim.record)) for claim in claims
     ) for candidate in scopes)
-    return "busy" if held else "free"
+    if held:
+        return "busy"
+    if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe):
+        return "bad"
+    repository_name = sweep.repo_name(str(repo_root))
+    if repository_name is not None and offload.linux_version_decline_path(paths.target, repository_name).exists():
+        return "bad"
+    return "free"
 
 
 def command_free_now(args: CliArguments, paths: StatePaths) -> int:
@@ -2555,7 +2563,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             else outcome.ci_problem
         )
         if not outcome.claims:
-            print("free")
+            print("unreachable: failed probe" if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe) else "free")
         for claim in outcome.claims:
             run = claim.record
             if run_is_kept(run):
@@ -2613,7 +2621,9 @@ def command_target_status(paths: StatePaths) -> int:
     for claim in claims:
         print(f"running: {claim.record['what']} ({claim.record['worktree']})")
     if isinstance(block, NoMacBlock) and not claims:
-        if isinstance(offload.read_backoff(time.time(), paths.target), offload.ActiveBackoff):
+        if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe):
+            print("unreachable: failed probe")
+        elif isinstance(offload.read_backoff(time.time(), paths.target), offload.ActiveBackoff):
             print("unreachable: retry backoff")
         else:
             print("free")

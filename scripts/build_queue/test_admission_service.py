@@ -57,6 +57,20 @@ def setUpModule() -> None:
     forbid_real_sender()
 
 
+class ImportTests(unittest.TestCase):
+    def test_clean_import_omits_cli_and_reading_alert_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.build_queue import admission_service; "
+                 + "assert not {'argparse', 'scripts.message.send_budget', 'scripts.message.send_result', "
+                 + "'scripts.message.session_send'}.intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class FixedSystemReader:
     """Publish private evidence without an operating-system reader."""
     def __init__(self, latest: service.SystemEvidence) -> None:

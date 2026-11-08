@@ -96,8 +96,7 @@ class ClaimServer:
 @contextmanager
 def warm_claim_servers() -> Generator[None]:
     """Keep the real claim commands, locks and replies without cold imports."""
-    with mock.patch.object(sys, "path", [str(Path(floor_claims.__file__).parent), *sys.path]):
-        _ = import_module('scripts.mac_test.mac_test')
+    _ = import_module("scripts.mac_test.mac_test")
     transport = SimpleNamespace(Popen=ClaimServer, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
                                 TimeoutExpired=subprocess.TimeoutExpired)
     with mock.patch.object(floor_claims, "subprocess", transport):

@@ -30,8 +30,6 @@ from functools import cache
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402

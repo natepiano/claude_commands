@@ -6,6 +6,8 @@ from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import BytesIO, StringIO
+import base64
+import gzip
 import json
 import os
 import pathlib
@@ -639,8 +641,9 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium', 'basedpyright'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
+        self.assertNotIn('#basedpyright', data)
         self.assertNotIn('#google-chrome', data)
         self.assertNotIn('#nodejs', data)
         self.assertNotIn('uv tool install', data)
@@ -657,7 +660,10 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
         self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
-        self.assertIn('machine=merge_gate.WholeMachine(timings)', data)
+        encoded = data.split("printf '%s' ", 1)[1].split(' | base64', 1)[0]
+        guest = gzip.decompress(base64.b64decode(shlex.split(encoded)[0])).decode()
+        self.assertEqual(guest, trial.GUEST)
+        self.assertIn('machine=merge_gate.WholeMachine(timings)', guest)
         self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
         self.assertNotIn('admission_service.py', data)
         self.assertNotIn('governor_gib', data)
@@ -1183,6 +1189,7 @@ class GuestTests(unittest.TestCase):
             shim = repo / 'scripts' / 'lib' / 'py'
             shim.parent.mkdir()
             shim.symlink_to(Path(__file__).resolve().parents[1] / 'lib' / 'py')
+            (shim.parent / 'package_root.py').symlink_to(Path(__file__).resolve().parents[1] / 'lib/package_root.py')
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result',
                      'module_seconds': 'https://fixture.invalid/module_seconds'}

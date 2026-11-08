@@ -330,8 +330,16 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore reopens only workers with active dispatches and retains launcher recovery.
-It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Restore reopens only workers with active dispatches.
+It reads each worker's dispatch record and transcript once to select the resume step.
+An accepted dispatch gets a continuation prompt only when the worker is idle.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+An unsubmitted dispatch keeps the saved assign command as its step.
+Restore, named resume, and director notes use the same receipt rule.
+Director notes keep the saved prompt path and reuse shared dispatch history reads.
+A dispatch with a DONE line or a finished record gets no resume note or step.
+Later chat does not reopen a completed dispatch.
+The restart shares its run index and snapshots. Idle workers stay closed until their next assign.
 Account moves must preserve closed idle workers.
 
 ### Cleanup

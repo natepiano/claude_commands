@@ -1436,5 +1436,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    _ = sys.modules.setdefault("record", sys.modules[__name__])
+    _ = sys.modules.setdefault("scripts.buildlog.record", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))
