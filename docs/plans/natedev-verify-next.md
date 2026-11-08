@@ -59,7 +59,7 @@
 
 **Owner:** whoever holds `scripts/lint/sweep.py` when the builds file freeze lifts. Queue-unit owns the `sweep.py` callers of the floor interfaces once Phase 35 is on GitHub builds.
 
-**Needed:** `lint/sweep.py` (near lines 3298, 3321 and 3678-3682) has one busy-mirror `LockHeld` loop in `_hold_floor_pass`. Rename `leased_mirrors` to `busy_mirrors`. Then close its route from the Phase 35 ledger (F031).
+**Needed:** `_hold_floor_pass` already uses `busy_mirrors` at `scripts/lint/sweep.py:3988`. Verify that loop against F031 and close its Phase 35 ledger route. `MacFloor.leased_mirrors` (`sweep.py:3542`) holds a different value; do not rename it.
 
 ## Mirror scans after the sweep.py file freeze
 
