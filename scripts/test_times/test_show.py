@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times import gate_record, show
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 else:
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
@@ -42,7 +42,7 @@ else:
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
@@ -120,6 +120,7 @@ def module_run(module: str, wall_s: float, *, suite: str = "tools", attempt: int
         "wall_s": wall_s, "cpu_s": wall_s / 2, "peak_mib": 12.0, "status": status,
         "tests_run": 0 if missing else 13, "failures": int(status != 0), "errors": 0, "skipped": 0,
         "tests_s": 0.0 if missing else wall_s / 4, "tests": list(tests), "restart": restart, "times_missing": missing,
+        "log": "",
     }
 
 
@@ -200,7 +201,7 @@ class TestTimesTests(unittest.TestCase):
         }
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
-            gate_record.write_gate_run(run)
+            gate_record.write_gate_run(run, fixture_executions(run))
 
     def report(self, *arguments: str) -> str:
         status, output, errors = run(*arguments)

@@ -942,11 +942,12 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     """Build one gate record without changing the gate verdict."""
     try:
         slow_test_s = gate_record.slow_test_s()
-        modules = gate_record.module_runs([
+        recorded_executions = [
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
-                                  job.peak_mib, job.returncode, job.restart, job.times)
+                                  job.peak_mib, job.returncode, job.restart, job.times, job.output)
             for job in executions
-        ], slow_test_s)
+        ]
+        modules = gate_record.module_runs(recorded_executions, slow_test_s)
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": suite_finished.get(suite, began) - began,
              "status": int(any(job.returncode for job in results
@@ -971,7 +972,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     except Exception as error:
         gate_record.report_not_written(error)
         return
-    gate_record.write_gate_run(run)
+    gate_record.write_gate_run(run, recorded_executions)
 
 
 def python_shim(repo: Path) -> Path:
