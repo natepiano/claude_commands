@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import process_reader
@@ -21,25 +21,14 @@ from scripts.lib.process_start_test_support import process_reader
 import unittest
 from unittest import mock
 
-
-if TYPE_CHECKING:
-    from scripts.build_targets import build_targets, targets
-    from scripts.aws_target import ledger
-    from scripts.aws_target.ledger_test_support import (
-        REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
-    )
-    from scripts.mac_test import mac_test as mac_test, offload as offload
-    from scripts.build_hold import build_hold
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.build_targets import build_targets, targets
-    from scripts.mac_test import mac_test, offload
-    from scripts.build_hold import build_hold
-    from scripts.aws_target import ledger
-    from scripts.aws_target.ledger_test_support import (
-        REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
-    )
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.build_targets import build_targets as build_targets, targets
+from scripts.mac_test import mac_test as mac_test, offload as offload
+from scripts.build_hold import build_hold
+from scripts.aws_target import ledger
+from scripts.aws_target.ledger_test_support import (
+    REAL_POPEN, git_only, install_cost_settings, instant, numeric_settings,
+)
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class SshEligibilityTests(unittest.TestCase):

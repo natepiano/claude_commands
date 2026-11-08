@@ -50,7 +50,24 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - New work and restores launch without an account hold or admission claim.
 
-- **Preflight** (`preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> ReadyToLaunch`): Check Claude trust on the selected account. An absent trust entry or unreadable file prints an anomaly. The launch continues; the checkout is on the merge branch; no other unit staff row holds this worktree; an existing unit (`ExistingUnitRow`) is read from its staff worktree and `.unit.toml`, and a new launch refuses when that worktree or its branch differs from the request; a re-run's mode matches the recorded one (`recorded_mode` reads the commit subject, then a `standby` or `permanent` plan, then the stub's `## Source`; a missing stub reads as a brief); the worktree path is free or already this branch's; no local or origin branch exists unless the row and worktree do; a `--plan` exists on the merge branch; a plain resume of an existing row continues its transcript and accepts its recorded plan; a resume with a different plan still refuses; a brief stub, if present, holds the same words. Preflight returns `UnitLaunch(identity=UnitIdentity(unit, session), ...)` with the row and director; `session` is `requested_name`, the name the session is launched under, and it is not recorded. A herdr session already marked as the unit is taken as launched; a live herdr session of the destination name that is not so marked refuses in `main` before any write. `--check` runs `launch_request` and `preflight` only. For a pane with session labels, a resume refuses on `ClaudeUnknown`. It closes the stale herdr session (`herdr.stop_session`) on `ClaudeNotRunning` before launch.
+- **Preflight.** `preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> ReadyToLaunch` checks the checkout, staff worktree, branch, plan, and mode.
+  The checkout must use the merge branch. Another unit cannot hold the requested worktree.
+  An existing unit uses its staff worktree and `.unit.toml`.
+  A new launch requires the requested worktree and branch to match the existing unit.
+  A rerun must use the recorded mode. `recorded_mode` reads the commit subject, plan, then stub source.
+  A missing stub means brief mode. The worktree path must be free or already use the requested branch.
+  Existing local or origin branches require the corresponding row and worktree.
+  A `--plan` file must exist on the merge branch. A plain resume accepts the existing row's recorded plan and transcript.
+  A resume with a different plan refuses. An existing brief stub must contain the same words.
+  Preflight returns `UnitLaunch(identity=UnitIdentity(unit, session), ...)` with the row and director.
+  `session` is the requested launch name and is not recorded.
+  A herdr session marked for the unit counts as launched.
+  Another live session with the destination name refuses before any write.
+  `--check` runs only `launch_request` and `preflight`.
+  A resume refuses on `ClaudeUnknown`. It closes a stale herdr session on `ClaudeNotRunning` before launch.
+  Preflight does not check Claude trust.
+  The shared launch writes trust in the selected account before starting Claude.
+  A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
  New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
@@ -374,13 +391,17 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
-  - **Pause records:** `staff.py pause <unit> --why "<why>"` records `paused: {since, by, why}` on the staff row.
-    `pause --production <showrunner name> [--except <unit>...] --why "<why>"` uses the production membership reader.
-    `resume <unit>` and `resume --production <showrunner name>` remove that field.
-    Both operations are safe to repeat and stop nothing.
-    `since` uses the user zone.
-    `by` uses the caller's staff name through its runtime identity.
-    Staff row copies retain the field.
+  - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
+    The director finishes its current turn and holds at the prompt.
+    `agents exit <unit> --why "<why>"` records `exited: {since, by, why}` and stops the director and workers.
+    Both commands retain the staff rows and tabs.
+    Add `--finish-step` to wait for the workers' current tasks before stopping them.
+    `agents pause --production <showrunner name> [--except <unit>...] --why "<why>"` uses the production membership reader.
+    `agents resume <unit>` removes a pause and sends one continuation. Failed delivery restores the pause and returns failure.
+    For an exited unit, resume starts its retained conversation on the role account. Success removes the exit record.
+    `agents resume --production <showrunner name>` resumes the production's units.
+    `since` uses the user zone. `by` uses the caller's staff name.
+    Staff row copies retain the hold fields.
   - **Phase productions:** `| Unit | Status | Phase | Task |`.
     Phase comes from `phase_table.show_production`.
     It shows `<n> of <total> · <title>`, `between phases, <done> of <total> done`, `not started`, `plan done`, `no phases` or `no plan`.

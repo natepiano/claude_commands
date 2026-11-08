@@ -161,7 +161,7 @@ Outcomes print as one line and log with the full text to `$XDG_STATE_HOME/messag
 |---|---|---|
 | `SENT: <how>` | 0 | delivered; the outbox path reports `postmaster; verbatim` or `postmaster; NOT VERBATIM`, then `session:<id>` |
 | `SKIPPED: <why>` | 0 | key acknowledged, or inside its repeat window |
-| `QUEUED: <why>` | 1 | a Claude recipient not reached; kept under its session id |
+| `QUEUED: <why>` | 1 | a Claude recipient or staff member without a live transport; kept under its native session id |
 | `REFUSED: <why>` | 2 | `pushover.py` refused before sending; nothing kept |
 | `HELD: <why>` | 4 | a user push not sent: it failed review (revise and resend), or another sender's claim on a legacy hold is live |
 | `REPLACED: <why>` | 0 | a newer version replaced this user push; nothing was sent |
@@ -188,6 +188,26 @@ See [message-clarity.md](message-clarity.md#sender-identity) for the stamp and q
 Before execing Claude, the relay's launcher uses `relay_identity.publish_relay_identity` to publish `STATE/relay_senders/<pid>.identity` and then the plain sender file `STATE/relay_senders/<pid>`, through the shared atomic-file writer. The identity file binds that sender to the process start and, on Linux, the boot ID. The shared `process_identity.process_start` reads the platform process identity; `sessions.process_start` exports the same reader for existing callers. Exec preserves both the process start and the PID used in Claude's `cc-socks/<pid>.sock` address. `live_relay_identity` is the shared check for session exclusion and miss recovery. Missing, unreadable, legacy or mismatched lifetime metadata cannot prove a live relay. The plain sender file remains available through `read_relay_sender` after the process exits, for dead-socket replies. A reply to a missing socket, or a delivery connect returning `ENOENT` or `ECONNREFUSED`, checks that sender through the supplied staff snapshot. A staff sender uses its current session. A non-staff sender uses the registry. Send and drain use the same resolver; no extra connect probes a live socket. No record or no live named recipient produces a failed result and a stderr line naming the socket and sender. The queue boundary rejects raw sockets without a live session; sends carry the session ID found at their queue decision so a later session exit cannot create a raw socket queue.
 
 `send.py drain-sockets` recovers raw `uds__*.sock.jsonl` queue files under a separate `.drain-sockets.lock`, so its relays do not block normal sends. It delivers each message in a recent file (newest entry under 24 hours old) to the live session, marked `Stuck message from <original time>:`. A saved relay sender takes precedence over queued recipient metadata. Each stable recovery ID gets a flushed and fsynced attempt in `STATE/socket-recovery-attempts.jsonl` before relay, then a durable result in `STATE/log.jsonl` before the queue checkpoint. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends and retries known failures without a second queued copy. An attempt with no result is archived without resending, reports `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent`, and exits 3 once. Its archive checkpoint preserves other unsent entries, and a retry reuses an identical archive instead of copying it. Unresolved or unreadable files stay in place with a report naming the file (exit 3); the drain continues with other files. Files at least 24 hours old move intact to `STATE/socket-queue-archive/`; one line reports the count and oldest and newest message times. Archive names never replace an existing file. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move. `pending` keeps its existing print-and-clear behavior.
+
+### Codex queue drain
+
+`send.py pending` without a target stays Claude-only. It uses the caller's live Claude session.
+`pending codex:<thread>` selects a Codex native thread explicitly and needs no Claude registry entry.
+The reader also selects queues owned by the current staff row, including rows kept for an earlier thread.
+For Codex, it reads only the local staff record and starts no SSH operation.
+It keeps the sender stamp, shown sender, message order and newest keyed copy.
+
+`scripts/hooks/codex-queue-drain.py` calls the same reader for Codex `SessionStart` and every `PostToolUse` event.
+The adapter uses the payload's `session_id`, so an inherited parent thread id cannot select the parent's queue.
+It prints `hookSpecificOutput.additionalContext` and flushes stdout while it holds the queue lock.
+It removes the selected rows only after that flush succeeds. A write or flush error leaves the rows for a retry.
+An unreadable queue stays in place. This rule also applies to Claude `pending`.
+Concurrent hook calls consume the selected rows once. An empty queue produces no hook output.
+A process exit after the flush and before removal can cause repeated output on retry.
+
+`scripts/hooks/codex_hooks.py install` registers and trusts both handlers in each selected Codex home.
+The queue drains at startup or after the next completed tool. An idle session waits for its next hook event.
+Live pane and daemon delivery use their existing paths. The hook needs no pane registration and adds no timer.
 
 ### Postmaster mod
 

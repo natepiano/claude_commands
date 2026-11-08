@@ -316,6 +316,8 @@ def target_state(target: Target) -> TargetState:
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return Held(block.holder, block.reason, block.since, block_end, session)
+        if isinstance(offload.read_failed_probe(target.name), offload.FailedProbe):
+            return Unreachable("failed probe")
         if is_aws_target(target):
             return read_aws_status(target)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))

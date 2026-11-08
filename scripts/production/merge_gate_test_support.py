@@ -601,9 +601,10 @@ class MergeGateFixture(unittest.TestCase):
                    + "raise SystemExit(entry.main(sys.argv[1:]))")
         return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
-    def run_promote_only(self, *extra: str) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str, explicit_checkout: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT),
+             *(["--repo", str(self.checkout)] if explicit_checkout else []), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if "--production" in extra else ["--production", "quiet"]), *extra],

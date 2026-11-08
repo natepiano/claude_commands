@@ -686,6 +686,20 @@ run() {
 }
 
 run_step() {
+    if [[ "${STEP_ELIGIBILITY_READY:-0}" == 2 ]]; then
+        local eligibility_answer eligibility_status=0 probe_mark
+        if [[ -f "$HOLD_WAIT_DIR/probe-marks" ]]; then
+            while IFS= read -r probe_mark; do
+                [[ -f "$probe_mark" ]] || continue
+                eligibility_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${STEP_ELIGIBILITY_ARGUMENTS[@]}") || eligibility_status=$?
+                if (( eligibility_status != 0 )); then return "$eligibility_status"; fi
+                STEP_TARGET_TABLE=${eligibility_answer#*$'\n'}
+                break
+            done < "$HOLD_WAIT_DIR/probe-marks"
+        fi
+    elif [[ "${STEP_ELIGIBILITY_READY:-0}" == 1 ]]; then
+        STEP_ELIGIBILITY_READY=2
+    fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
@@ -2243,13 +2257,15 @@ check_routing_hold() {
 initialize_step_record() {
     local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target"
     local eligible_names="" mac_names="" mac_disk_exclusions=""
-    local arguments=(eligible --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
+    local arguments=(eligible --new-step --probe-marks-file "$HOLD_WAIT_DIR/probe-marks" --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
     if [[ "$CMD" == final ]]; then arguments+=(--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds"); fi
     PKG="${ARGS[0]:-}"
     arguments+=(--package "$PKG")
     if [[ "$MAC_ONLY" == 1 ]]; then arguments+=(--mac); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
+    STEP_ELIGIBILITY_ARGUMENTS=("${arguments[@]}")
+    STEP_ELIGIBILITY_READY=1
     answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
@@ -2530,6 +2546,7 @@ ssh_reserve_hook() {
     remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
         --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+    if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
     if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }
 
@@ -2696,7 +2713,7 @@ route_test() {
             step_can_retry || continue
             if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
-            if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
+            if [[ "$(ssh_reserve_hook "$name" "$settings" "$retry")" == false ]]; then continue; fi
             remote_candidates=1
             if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" && "$platform" == macos ]]; then
                 retry_ready=0
@@ -2713,7 +2730,7 @@ route_test() {
             fi
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
-            eval "$(ssh_reserve_hook "$name" "$settings")" || reservation_status=$?
+            eval "$(ssh_reserve_hook "$name" "$settings" "$retry")" || reservation_status=$?
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 ]] \
                 && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then
