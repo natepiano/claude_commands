@@ -28,14 +28,12 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from scripts.message.sessions import addressed, live_sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.lib import unit_runs
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-from scripts.build_queue import admission_service
 from scripts.buildlog import store
 from scripts.message import session_send
 
@@ -269,6 +267,8 @@ def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult
 
 
 def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
+    from scripts.message.sessions import live_sessions
+
     def unblock(holder: str) -> MacHoldResult:
         arguments = ["unblock", "--holder", holder]
         return run_mac_hold(arguments, target)
@@ -563,6 +563,8 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
 
 def admitted_processes() -> frozenset[ProcessIdentity]:
     """Read durable grants, which precede replies and the next decision pass."""
+    from scripts.build_queue import admission_service
+
     try:
         state = admission_service.read_state(store.root() / "admission")
     except (OSError, ValueError) as error:
@@ -688,6 +690,8 @@ def holder_of(given: str | None) -> HolderIdentity:
     given, so a rename between hold and release loses nothing. A holder that is no live Claude
     session keeps `given` as its key.
     """
+    from scripts.message.sessions import addressed, live_sessions
+
     records = live_sessions()
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -702,6 +706,8 @@ def holder_of(given: str | None) -> HolderIdentity:
 def held_key(directory: Path, given: str | None) -> str:
     """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
     kept by session id is found by the name given, the session's name now, and each name it once had."""
+    from scripts.message.sessions import live_sessions
+
     identity = holder_of(given)
     key, name = identity.key, identity.name
     none: list[str] = []
@@ -722,6 +728,8 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
+    from scripts.message.sessions import live_sessions
+
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
         content = path.read_text().strip()
@@ -1226,6 +1234,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
+    from scripts.message.sessions import live_sessions
+
     with release_lock():
         # A receipt for a former name must never shadow a live session-id hold.
         if given is None and resume:
