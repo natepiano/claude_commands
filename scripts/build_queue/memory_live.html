@@ -8,8 +8,8 @@
 :root {
   color-scheme: light;
   --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #75736e;
-  --used: #2a78d6; --res-a: #86b6ef; --res-b: #cde2fb; --room: #1baf7a;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f;
+  --used: #2a78d6; --res-a: #427caf; --res-b: #6b91b7; --room: #1baf7a;
   --building: #007e78; --testing: #b00079;
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
 }
@@ -18,7 +18,7 @@
     color-scheme: dark;
     --bg: #121211; --card: #1a1a19; --line: #34332f;
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
-    --used: #3987e5; --res-a: #2a5d9c; --res-b: #173a63; --room: #199e70;
+    --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
     --building: #27c6b8; --testing: #ca458f;
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
   }
@@ -27,7 +27,7 @@
   color-scheme: dark;
   --bg: #121211; --card: #1a1a19; --line: #34332f;
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
-  --used: #3987e5; --res-a: #2a5d9c; --res-b: #173a63; --room: #199e70;
+  --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
   --building: #27c6b8; --testing: #ca458f;
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
 }
@@ -71,10 +71,12 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .mark::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; border-left: 3px solid var(--cap); }
 .bar > div, .mark-label { cursor: help; }
 .bar > div:hover { filter: brightness(1.12); }
-.legend .row { display: flex; gap: 8px; align-items: center; padding: 4px 0; border-radius: 6px; cursor: help; }
+.legend .row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; gap: 8px; align-items: center; padding: 4px 0; border-radius: 6px; cursor: help; }
 .legend .row:hover { background: var(--free); }
 .legend .row .name { font-weight: 600; }
-.legend .row .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+.legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+.legend .row[data-tip="progress"] { display: flex; flex-wrap: wrap; }
+.legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
 #tip b { display: block; margin-bottom: 2px; }
@@ -82,9 +84,9 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
-.legend { margin: 14px 0 0; display: grid; gap: 2px; }
+.legend { margin: 14px 0 0; display: grid; grid-template-columns: 12px minmax(min-content, max-content) max-content; gap: 2px 8px; }
 details { border-radius: 6px; }
-summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 5px 6px; border-radius: 6px; }
+summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 5px 0; border-radius: 6px; }
 summary::-webkit-details-marker { display: none; }
 summary:hover { background: var(--free); }
 summary .chev { flex: none; width: 14px; color: var(--ink-3); transition: transform 0.15s ease; font-size: 0.75rem; }
@@ -107,7 +109,7 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .sw.cap { height: 14px; border-radius: 0; background: linear-gradient(to right, transparent 4px, var(--cap) 4px 7px, transparent 7px); }
 .section-head { font-weight: 600; font-size: 1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; }
-th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+th, td { text-align: left; padding: 5px 0; border-bottom: 1px solid var(--line); }
 th { color: var(--ink-2); font-weight: 600; }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td small { color: var(--ink-3); }
@@ -119,8 +121,9 @@ td small { color: var(--ink-3); }
 .pill.hold .pd { background: var(--cap); }
 .pill.hold { color: var(--cap); border-color: var(--cap); }
 .pill:hover { background: var(--free); }
-.gauges { display: grid; gap: 10px; margin-top: 14px; }
-.gauge { padding-bottom: 22px; display: grid; grid-template-columns: 11rem minmax(0, 1fr); gap: var(--gap); align-items: center; font-size: 0.88rem; cursor: help; }
+.gauges { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px; margin-top: 14px; }
+.gauge { grid-column: 1 / -1; padding-bottom: 22px; display: grid; grid-template-columns: subgrid; gap: var(--gap); align-items: center; font-size: 0.88rem; cursor: help; }
+.gauge > span { white-space: nowrap; }
 .gauge .gt { position: relative; height: 14px; background: var(--free); border-radius: 3px; }
 .gauge .gf { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--room); transition: width 0.6s ease; }
 .gauge .gf.warn { background: var(--floor); } .gauge .gf.hold { background: var(--cap); }
@@ -132,7 +135,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .swaprows .row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: baseline; padding: 3px 0; border-radius: 6px; cursor: help; font-size: 0.88rem; }
 .swaprows .row:hover { background: var(--free); }
 .swaprows .row .name { max-width: min(20rem, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.swaprows .row small { color: var(--ink-2); min-width: 0; overflow-wrap: anywhere; }
+.swaprows .row small { color: var(--ink-2); font-size: inherit; min-width: 0; overflow-wrap: anywhere; }
 .swaprows .row .v { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .error { color: var(--cap); font-weight: 600; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
@@ -153,7 +156,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-memory { min-width: 0; }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
-.wrow.room .row-heading { flex-direction: column; gap: 0; }
+.wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
 .walk-table tr.room > *, .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
@@ -168,7 +171,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table th, .walk-table td { padding: 3px 16px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
-.walk-table .duration { min-width: var(--duration); }
+.walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid { font-variant-numeric: tabular-nums; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
@@ -226,6 +229,27 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .answer .big { font-size: 2.2rem; }
 }
 #s-ci_ram[hidden], #s-ci_kept[hidden], #ci-kept-legend[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
+.reserved-amount { color: var(--ink-2); }
+.room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.wait-reason { color: var(--ink-2); font-size: 0.8rem; overflow-wrap: anywhere; }
+.wait-reasons { margin-top: 10px; }
+.wait-reasons p { margin: 4px 0; }
+.pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
+.leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
+.leftover-row .age { white-space: nowrap; }
+.leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.report-window { color: var(--ink-2); font-size: 0.85rem; }
+.report-chart { width: 100%; height: auto; display: block; }
+.report-chart text { fill: var(--ink-2); font: 12px system-ui; }
+.report-chart .grid { stroke: var(--line); }
+.report-key { display: flex; gap: 12px; flex-wrap: wrap; font-size: 0.85rem; }
+.report-key span::before { content: ""; display: inline-block; width: 14px; height: 3px; background: var(--series); margin-right: 5px; vertical-align: middle; }
+.report-table { overflow-x: auto; }
+.report-table th, .report-table td { padding: 5px 12px 5px 0; vertical-align: top; }
+.report-top-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.report-top-row:last-child { border-bottom: 0; }
+.report-top-row p { margin: 3px 0; }
+.report-top-row .action { color: var(--ink-2); }
 </style>
 </head>
 <body>
@@ -283,6 +307,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
+    <p class="pressure-reason" id="cap-reason"></p>
+    <div class="wait-reasons" id="wait-reasons"></div>
   </section>
 
   <section class="card" id="cloud" hidden>
@@ -290,15 +316,31 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div id="cloud-rows"></div>
   </section>
 
+  <section class="card" id="leftovers" hidden>
+    <div class="section-head">Leftover processes</div>
+    <div id="leftover-rows"></div>
+  </section>
+
   <section class="card" id="swap">
-    <div class="walk-head"><span class="section-head" data-tip="swaphead">Swap and memory pressure</span><span class="walk-sum num" id="swap-sum"></span></div>
+    <div class="walk-head"><span class="section-head" data-tip="swaphead">Swap and memory pressure</span></div>
+    <p class="pressure-reason" id="pressure-reason"></p>
     <div class="gauges">
       <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
       <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
-      <div class="gauge" data-tip="g-swap"><span>Swap used</span><div class="gt"><div class="gf" id="gf-swap"></div><div class="gl" id="gl-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span><span class="bar-amount limit-label" id="limit-swap"></span></div></div></div>
+      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="gl" id="gl-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span><span class="bar-amount limit-label" id="limit-swap"></span></div></div></div>
     </div>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
+  </section>
+  <section class="card" id="report-charts">
+    <div class="section-head">Build history charts</div>
+    <p class="report-window" id="history-window"></p>
+    <div id="history-charts">Reading…</div>
+  </section>
+  <section class="card" id="report-top">
+    <div class="section-head">Top 3 costs</div>
+    <p class="report-window" id="cost-window"></p>
+    <div id="top-costs">Reading…</div>
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
@@ -310,7 +352,7 @@ const TIPS = {
   waiting: () => ["Waiting step, memory it needs", "The dashed bar shows the memory the step needs. It ends at the cap line."],
   progress: () => ["Build progress", "The line shows completed work. The building and testing lines use the colors in the legend."],
   room: (d) => [`Next step room · ${memoryAmount(d.room)}`, roomEquation(d)],
-  cap: (d) => [d.cap === null ? "Cap unavailable" : `Cap line · ${f1(d.cap)} GiB`, d.cap_text],
+  cap: (d) => [!hasCap(d) ? "Cap unavailable" : `Cap line · ${f1(d.cap)} GiB`, d.cap_text],
   ci: (d) => {
     const row = d.walk.find((r) => r.ci);
     return [`hana CI · ${row ? row.detail : `${f1(d.ci_ram)} GiB RAM`}`, row ? row.keep_text : "CI runner memory is not readable."];
@@ -318,11 +360,11 @@ const TIPS = {
   ci_kept: (d) => d.ci_kept > 0 ? [`CI reserved ${f1(d.ci_kept)} GiB`, "The queue reserves this memory while a CI job runs. It reduces room and stays separate from admitted runs."] : ["", ""],
   other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds: editors, agents, browsers and the system."],
   past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety. The bar shows zero room."],
-  floor: (d) => [`Safety · ${f1(d.floor)} GiB`, "The queue keeps 3 GiB free."],
+  floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
 function level(d) {
-  if (d.psi.some === null || d.psi.full === null) return "neutral";
+  if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
   const L = d.limits, sp = pctOf(d.swap_used, d.swap_total);
   return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6 || sp >= L.swap * 0.8) ? "warn" : "ok";
@@ -330,14 +372,17 @@ function level(d) {
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
   answer: (d) => ["Next step room", roomEquation(d)],
-  walksum: (d) => [d.cap === null ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, d.cap_text],
+  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, d.cap_text],
   walkhead: () => ["Running, in start order", "Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
-  ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${d.cap === null ? "The cap is unavailable." : "The red tick is the cap line."}`],
+  ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The cap is unavailable." : "The red tick is the cap line."}`],
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
-  "g-some": (d) => [`Some tasks stall · ${(d.psi.some === null ? "not recorded" : d.psi.some.toFixed(1))}%`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${d.limits.some}% (the red line).`],
-  "g-full": (d) => [`All tasks stall · ${(d.psi.full === null ? "not recorded" : d.psi.full.toFixed(1))}%`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${d.limits.full}%.`],
+  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : d.psi.some.toFixed(1))}%`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${d.limits.some}% (the red line).`],
+  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : d.psi.full.toFixed(1))}%`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${d.limits.full}%.`],
   "g-swap": (d) => [`Swap used · ${pctOf(d.swap_used, d.swap_total).toFixed(0)}%`, `The queue holds above ${d.limits.swap}% swap used.`],
 });
+function recorded(value) { return typeof value === "number"; }
+function hasCap(d) { return recorded(d.cap); }
+function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
     const jobs = (row.ci_runners || []).filter(runner => runner.state === "busy").map(runner => runner.job).filter(Boolean);
@@ -357,7 +402,8 @@ function rowOwner(row, waiting = false) {
   if (!waiting && (!row.queued || row.name === "between steps")) {
     return visibleDetail(row);
   }
-  return publicText(row.showrunner || "");
+  const owner = publicText(row.showrunner || "");
+  return owner === publicText(row.unit || "") ? "" : owner;
 }
 function rowLabel(name, owner = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
@@ -384,14 +430,14 @@ function rawTipText(key, d) {
     if (!r) return ["", ""];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
-    const res = r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
+    const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
     const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
     if (r.group) {
-      const parts = (r.parts || []).map((p) => `${p.who}${typeof p.pid === "number" ? ` · pid ${p.pid}` : ""} · ${f1(p.gib)} GiB`).join(", ");
+      const parts = (r.parts || []).map((p) => `${p.who}${typeof p.pid === "number" ? ` · pid ${p.pid}` : ""} · ${p.age || ""} · ${f1(p.gib)} GiB`).join(", ");
       const how = r.group === "Codex servers" ? "Codex servers hold this memory outside the build queue." : "Worker background runs hold this memory outside the build queue.";
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
-    return [`${r.name}${rowOwner(r) ? " · " + rowOwner(r) : ""}`, `${when}${r.keep_text || res} ${src}${r.unit ? "\n" + r.unit : ""}${progressTip(r)}`];
+    return [`${r.name}${rowOwner(r) ? " · " + rowOwner(r) : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${r.unit ? "\n" + r.unit : ""}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
@@ -453,8 +499,8 @@ document.addEventListener("click", (e) => {
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 const STALE = Math.max(15, SECONDS * 5);
 const $ = (id) => document.getElementById(id);
-const f1 = (n) => n.toFixed(1);
-const memoryAmount = (n) => `${f1(n)} GiB`;
+const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
+const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
 
 function setSeg(id, value, total) {
   $(id).style.flex = `0 0 ${value / total * 100}%`;
@@ -474,7 +520,7 @@ function render(d) {
   $("room-equation").textContent = roomEquation(d);
   document.body.classList.remove("queue-unavailable");
   const t = d.total;
-  const shownUse = Math.min(d.used, d.cap ?? t);
+  const shownUse = Math.min(d.used, (hasCap(d) ? d.cap : t));
   setSeg("s-used", shownUse, t);
   setSeg("s-reserved", d.shown_reserved, t);
   setSeg("s-room", d.room, t);
@@ -483,12 +529,12 @@ function render(d) {
   setSeg("s-ci_kept", d.shown_ci_kept, t);
   setSeg("s-past", 0, t);
   setSeg("s-floor", d.shown_safety, t);
-  $("mark").hidden = d.cap === null;
-  $("marklabel").hidden = d.cap === null;
-  document.querySelector('.sw.cap').hidden = d.cap === null;
-  $("marklabel").textContent = d.cap === null ? "cap unavailable" : `cap ${f1(d.cap)}`;
+  $("mark").hidden = !hasCap(d);
+  $("marklabel").hidden = !hasCap(d);
+  document.querySelector('.sw.cap').hidden = !hasCap(d);
+  $("marklabel").textContent = !hasCap(d) ? "cap unavailable" : `cap ${f1(d.cap)}`;
   $("barwrap").setAttribute("aria-label",
-    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, ${d.ci_kept > 0 ? `CI reserved ${f1(d.ci_kept)}, ` : ""}room ${f1(d.room)}, ${d.cap === null ? d.cap_text : `cap ${f1(d.cap)}`}`);
+    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, ${d.ci_kept > 0 ? `CI reserved ${f1(d.ci_kept)}, ` : ""}room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
 
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
@@ -496,7 +542,8 @@ function render(d) {
   const wait = d.waiting > 0 ? `${d.waiting} ${d.waiting === 1 ? "step waits" : "steps wait"}.` : "No step waits.";
   $("answer").textContent = `Next step room · ${wait}`;
   for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram", "ci_kept"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
-  $("v-cap").textContent = d.cap === null ? "unavailable" : memoryAmount(d.cap);
+  $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
+  $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
   $("v-past").textContent = memoryAmount(d.shortfall);
   const segVals = { used: shownUse, reserved: d.shown_reserved + d.shown_ci_kept, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram, ci_kept: d.shown_ci_kept };
   $("s-ci_kept").hidden = d.ci_kept === 0;
@@ -510,6 +557,8 @@ function render(d) {
   renderWalk(d);
   renderCloud(d);
   renderSwap(d);
+  renderLeftovers(d);
+  renderReport(d.report);
 }
 
 function renderCloud(d) {
@@ -523,20 +572,133 @@ function renderSwap(d) {
   const lv = level(d);
   $("pill").className = `pill ${lv}`;
   $("pill-t").textContent = ({ ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded" })[lv];
-  $("swap-sum").textContent = `${f1(d.swap_used)} of ${f1(d.swap_total)} GiB swap used`;
+  $("swap-sum").textContent = `${f1(d.swap_used)} / ${f1(d.swap_total)} GiB`;
+  const missing = Object.values(d.psi).filter(value => value && !recorded(value)).map(value => value.reason);
+  if (d.pressure !== "none") missing.unshift(d.pressure);
+  $("pressure-reason").textContent = [...new Set(missing)].join(" · ");
   const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full], swap: [pctOf(d.swap_used, d.swap_total), d.limits.swap] };
   for (const [k, [v, lim]] of Object.entries(g)) {
-    $(`gf-${k}`).style.width = `${v === null ? 0 : Math.min(100, v).toFixed(2)}%`;
+    $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
     $(`gl-${k}`).style.left = `${(lim).toFixed(2)}%`;
-    $(`gv-${k}`).textContent = v === null ? "not recorded" : `${v.toFixed(1)}%`;
+    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : `${v.toFixed(1)}%`;
     $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
   }
   placeLimitLabels();
-  $("swaprows").innerHTML = d.swap_by.map((row, index) => ({row, index}))
+  const sorted = d.swap_by.map((row, index) => ({row, index}))
     .filter(({row}) => Math.round(row.swap * 1024) > 0)
-    .sort((a, b) => b.row.swap - a.row.swap)
-    .map(({row: r, index: i}) => `<div class="row" data-tip="swap:${i}"><span class="name">${esc(publicText(r.name))}</span><span class="v">${memoryAmount(r.swap)}</span><small>${esc(visibleDetail(r))}</small></div>`).join("");
+    .sort((a, b) => b.row.swap - a.row.swap);
+  const visible = sorted.slice(0, d.swap_rows);
+  const rest = sorted.slice(visible.length);
+  $("swaprows").innerHTML = visible
+    .map(({row: r, index: i}) => `<div class="row" data-tip="swap:${i}"><span class="name">${esc(publicText(r.name))}</span><span class="v">${memoryAmount(r.swap)}</span><small>${esc(visibleDetail(r))}</small></div>`).join("") +
+    (rest.length ? `<div class="row"><span class="name">${rest.length} smaller groups</span><span class="v">${memoryAmount(rest.reduce((sum, item) => sum + item.row.swap, 0))}</span></div>` : "");
+}
+
+function renderLeftovers(d) {
+  const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
+    `<div class="leftover-row"><span class="detail">${esc(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
+  $("leftovers").hidden = rows.length === 0;
+  $("leftover-rows").innerHTML = rows.join("");
+}
+
+function reportCost(value, unit = "h/day") {
+  if (value.state === "unavailable") return `unavailable: ${value.reason}`;
+  if (value.state === "no data yet") return "no data yet";
+  if (value.state === "matches recent") return "matches recent";
+  const known = `${value.value.toFixed(2)} ${unit}`;
+  return value.state === "upper bound"
+    ? `${known} known; ${(value.unknown || 0).toFixed(2)} ${unit} unknown; upper bound ${((value.value || 0) + (value.unknown || 0)).toFixed(2)} ${unit}`
+    : known;
+}
+function sumReportCosts(points) {
+  const values = points.filter(point => point.state !== "no data yet");
+  if (!values.length) return {state: "no data yet"};
+  const missing = values.filter(point => point.state === "unavailable");
+  if (missing.length) return {state: "unavailable", reason: [...new Set(missing.map(point => point.reason))].join("; ")};
+  return {state: values.some(point => point.state === "upper bound") ? "upper bound" : "measured",
+    value: values.reduce((sum, point) => sum + point.value, 0),
+    unknown: values.reduce((sum, point) => sum + (point.unknown || 0), 0)};
+}
+function reportPlot(title, buckets, series, unit) {
+  const colors = ["var(--used)", "var(--testing)", "var(--room)", "var(--cap)", "var(--ink-2)", "var(--building)"];
+  const points = series.flatMap(line => line.values).filter(point => recorded(point.value));
+  const maximum = Math.max(1, ...points.map(point => point.value + (point.unknown || 0)));
+  const x = index => 48 + (buckets.length > 1 ? index / (buckets.length - 1) : 0.5) * 800;
+  const y = value => 180 - value / maximum * 150;
+  const lines = series.map((line, slot) => {
+    const color = colors[slot % colors.length];
+    let path = "", previous = false;
+    const dots = line.values.map((point, index) => {
+      if (!recorded(point.value)) { previous = false; return ""; }
+      path += `${previous ? "L" : "M"}${x(index)},${y(point.value)} `;
+      previous = true;
+      return `<circle cx="${x(index)}" cy="${y(point.value)}" r="3" fill="${color}"><title>${esc(`${buckets[index].label} · ${line.label}: ${reportCost(point, unit)}`)}</title></circle>` +
+        (point.unknown > 0 ? `<line x1="${x(index)}" x2="${x(index)}" y1="${y(point.value)}" y2="${y(point.value + point.unknown)}" stroke="${color}" stroke-dasharray="3 3"/>` : "");
+    }).join("");
+    return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}`;
+  }).join("");
+  const labels = buckets.map((bucket, index) => `<text x="${x(index)}" y="202" text-anchor="middle">${esc(bucket.label)}</text>`).join("");
+  const table = `<details><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
+  return `<h3>${esc(title)}</h3><svg class="report-chart" viewBox="0 0 900 220" role="img" aria-label="${esc(title)}"><line class="grid" x1="48" x2="848" y1="180" y2="180"/><line class="grid" x1="48" x2="848" y1="30" y2="30"/><text x="4" y="184">0</text><text x="4" y="34">${maximum.toFixed(1)}</text><text x="48" y="16">${esc(unit)}</text>${lines}${labels}${!points.length ? '<text x="450" y="100" text-anchor="middle">No measured data</text>' : ""}</svg>` +
+    `<div class="report-key">${series.map((line, slot) => `<span style="--series:${colors[slot % colors.length]}">${esc(line.label)}</span>`).join("")}</div>${table}`;
+}
+const reportView = {machine: "", cause: "", unit: "daily", tables: new Set()};
+let reportStamp = "";
+function captureReportView() {
+  if (!$("history-machine")) return;
+  reportView.machine = $("history-machine").value;
+  reportView.cause = $("history-cause").value;
+  reportView.unit = $("history-unit").value;
+  const tables = [...document.querySelectorAll("#history-plots details")];
+  if (tables.length) reportView.tables = new Set(tables.filter(table => table.open).map(table => table.querySelector("summary").textContent));
+}
+function reportDate(value, zone) {
+  return new Date(value).toLocaleDateString("en-US", {timeZone: zone, month: "short", day: "numeric", year: "numeric"});
+}
+function renderReport(report) {
+  const stamp = JSON.stringify(report);
+  if (stamp === reportStamp) return;
+  captureReportView();
+  reportStamp = stamp;
+  if (!report || report.kind === "IndexUnavailable") {
+    const reason = report?.reason || "Report data unavailable";
+    $("history-charts").textContent = reason;
+    $("top-costs").textContent = reason;
+    $("history-window").textContent = "";
+    $("cost-window").textContent = "";
+    return;
+  }
+  const data = report.charts;
+  $("history-window").textContent = `${reportDate(data.start, report.zone)} – ${reportDate(data.end, report.zone)} · ${report.zone}`;
+  $("cost-window").textContent = `${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone} · ${report.recent_days} days · hours per day`;
+  $("top-costs").innerHTML = report.top.length ? report.top.map(row =>
+    `<div class="report-top-row"><strong>${esc(row.machine)} · ${esc(row.cause)}</strong><p>${esc(reportCost(row.recent))}${row.window.state === "matches recent" ? "" : ` · Window: ${esc(reportCost(row.window))}`}</p><p class="action">${esc(row.action)} · ${esc(row.owner)}</p></div>`).join("") : "No data yet for this window.";
+  $("history-charts").innerHTML = `<div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p><div id="history-moments"></div>`;
+  if (data.machines.includes(reportView.machine)) $("history-machine").value = reportView.machine;
+  if (data.causes.includes(reportView.cause)) $("history-cause").value = reportView.cause;
+  $("history-unit").value = reportView.unit;
+  const draw = () => {
+    captureReportView();
+    const machine = $("history-machine").value, cause = $("history-cause").value;
+    const unit = $("history-unit").value;
+    const unitText = unit === "daily" ? "h/day" : "h/finished phase";
+    const phases = ["median", "p90"].map(key => ({label: key, values: data.buckets.map(bucket =>
+      bucket.phase.state === "measured" ? {state: "measured", value: bucket.phase[key] / 3600}
+        : {state: "unavailable", reason: bucket.phase.reason})}));
+    const causes = data.causes.map(label => ({label, values: data.buckets.map(bucket =>
+      sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
+    const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
+      sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
+    $("history-plots").innerHTML = reportPlot("Hana phase time", data.buckets, phases, "h/phase") +
+      reportPlot("Costs by cause", data.buckets, causes, unitText) + reportPlot("Costs by machine", data.buckets, machines, unitText);
+    for (const table of document.querySelectorAll("#history-plots details")) {
+      table.open = reportView.tables.has(table.querySelector("summary").textContent);
+    }
+  };
+  for (const id of ["history-machine", "history-cause", "history-unit"]) $(id).addEventListener("change", draw);
+  $("history-moments").textContent = [...data.moments.map(moment => `${moment.local} · ${moment.name}`), ...data.pending].join(" · ");
+  draw();
 }
 
 const LABEL_GAP = 6;
@@ -573,7 +735,7 @@ function renderWalk(d) {
   const tableRows = [];
   const cells = (name, duration, machine, unit, pid, tip, className = "") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || "—")}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || "") || "—")}</span></td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || "—")}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
       `<td class="pid">${typeof pid === "number" ? pid : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
@@ -590,9 +752,9 @@ function renderWalk(d) {
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` + rowMemory(`wait:${i}`) +
       `</div>`);
   });
-  if (d.cap !== null) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
-  $("walk").classList.toggle("has-cap", d.cap !== null);
-  $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"></div>${rows.join("")}` +
+  if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
+  $("walk").classList.toggle("has-cap", hasCap(d));
+  $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
     `<th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="unit">Unit</th>` +
@@ -600,13 +762,15 @@ function renderWalk(d) {
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
-  const axisEnd = d.cap ?? scale;
+  const axisEnd = hasCap(d) ? Math.max(0, Math.ceil(d.cap / step) - 1) * step : Math.floor(scale / step) * step;
   const lowerTicks = [];
-  for (let v = 0; v <= axisEnd; v += step) lowerTicks.push(`<span style="left:${v / axisEnd * 100}%">${v}</span>`);
+  for (let v = 0; v <= axisEnd; v += step) lowerTicks.push(`<span style="left:${(axisEnd ? v / axisEnd * 100 : 0)}%">${v}</span>`);
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  $("walk-sum").textContent = d.cap === null ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  $("wait-reasons").innerHTML = d.waiters.map(waiter =>
+    `<p class="wait-reason"><strong>${esc(waiter.name)}</strong> · ${esc(waiter.reason)}</p>`).join("");
   fitLabels();
 }
 
@@ -639,7 +803,7 @@ function fitWalkDetails() {
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
   walk.classList.add("measuring");
-  const capFraction = latest.cap === null ? 0 : latest.cap / latest.total;
+  const capFraction = !hasCap(latest) ? 0 : latest.cap / latest.total;
   function measure(labelWidth) {
     const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
@@ -658,19 +822,23 @@ function fitWalkDetails() {
       context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
       return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
     });
+    if (name === "duration") widths.push(context.measureText("waits 99 h 59 min").width + 16);
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
   const amountGroups = latest.walk.filter(row => row.queued || row.ci)
-    .map(row => [row.used, row.ci ? latest.ci_kept : row.reserved].filter(value => value > 0));
+    .map(row => [useValue(row), row.ci ? latest.ci_kept : row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (amountWidth + LABEL_GAP + 1) / (capFraction || 1));
   const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
-  const textWidth = Math.ceil(Math.max(...labels.map(label => {
+  const roomHeading = walk.querySelector(".wrow.room .row-heading");
+  context.font = getComputedStyle(roomHeading).font;
+  const roomWidth = context.measureText(`Next step room ${memoryAmount(latest.room)}`).width + 8;
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
     context.font = getComputedStyle(label).font;
     return context.measureText(label.textContent).width;
   }))) + 1;
@@ -678,7 +846,7 @@ function fitWalkDetails() {
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
   let fit = measure(labelWidth);
   if (fit.remainingWidth < minimumTrackWidth) {
-    labelWidth = `${Math.min(textWidth, 7 * rem)}px`;
+    labelWidth = `${Math.min(textWidth, 9 * rem)}px`;
     fit = measure(labelWidth);
   }
   const beside = fit.remainingWidth >= minimumTrackWidth;
@@ -700,7 +868,7 @@ function fitWalkDetails() {
   }
   if (beside) {
     const range = $("barwrap").getBoundingClientRect();
-    const tableLeft = latest.cap === null
+    const tableLeft = !hasCap(latest)
       ? walk.getBoundingClientRect().right - naturalWidth
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
     walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
@@ -710,9 +878,9 @@ function fitWalkDetails() {
 function placeMemoryBars(d) {
   const range = $("barwrap").getBoundingClientRect();
   const width = range.width;
-  const progressEnd = d.cap === null ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
+  const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const unit = width / d.total;
-  const end = (d.cap ?? Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.shown_ci_kept + d.room)) * unit;
+  const end = ((hasCap(d) ? d.cap : Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.shown_ci_kept + d.room))) * unit;
   const used = Math.min(end, d.used * unit);
   const ci = Math.min(end - used, d.ci_ram * unit);
   let reserved = Math.min(end - used - ci, d.shown_reserved * unit);
@@ -737,7 +905,7 @@ function placeMemoryBars(d) {
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
     container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${memoryAmount(amount.value)}</span>`).join("");
-    const limit = d.cap === null ? width : Math.max(0, progressEnd - LABEL_GAP);
+    const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
   let usedAt = 0, reservedAt = reserveAt;
@@ -748,20 +916,20 @@ function placeMemoryBars(d) {
     const amounts = [];
     if (run.ci) {
       bars = box(used, ciWidth, "seg-ci", "ci") + box(keptAt, kept, "hatch", "ci_kept");
-      if (run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
       if (kept > 0) amounts.push({kind: "reserved-amount", left: keptAt, value: d.ci_kept});
     } else {
-      const useWidth = Math.max(0, Math.min(run.used * unit, used - usedAt));
+      const useWidth = Math.max(0, Math.min(useValue(run) * unit, used - usedAt));
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, keptAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.min(Math.max(3, useWidth), end - usedAt) : 0;
       bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
-      if (run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
       if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: run.reserved});
       usedAt += useWidth;
       reservedAt += reserveWidth;
     }
     const progress = run.progress;
-    if (d.cap !== null && progress?.kind === "RowProgress") {
+    if (hasCap(d) && progress?.kind === "RowProgress") {
       bars += `<div class="progress-track" style="width:${progressEnd}px"></div>`;
       if (progress.percent > 0) {
         bars += `<div class="b row-progress ${progress.phase}" style="left:0;width:${Math.min(progressEnd, progressEnd * progress.percent / 100)}px"></div>`;
@@ -769,17 +937,21 @@ function placeMemoryBars(d) {
     }
     row.querySelector(".track").innerHTML = bars;
     placeAmounts(row, amounts);
+    if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {
     roomTrack.innerHTML = box(roomAt, room, "roomb");
-    placeAmounts(roomTrack.closest(".wrow"), room > 0 ? [{kind: "room-amount", left: roomAt, value: d.room}] : []);
+    roomTrack.closest(".wrow").querySelector(".room-value")?.remove();
+    roomTrack.closest(".wrow").querySelector(".row-heading").insertAdjacentHTML("beforeend",
+      `<span class="room-value">${memoryAmount(d.room)}</span>`);
+    roomTrack.closest(".wrow").querySelector(".amounts").replaceChildren();
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
     const waitWidth = Math.min(end, waiter.need * unit);
-    const waitAt = d.cap === null ? roomAt : end - waitWidth;
-    const drawnWidth = d.cap === null ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
+    const waitAt = !hasCap(d) ? roomAt : end - waitWidth;
+    const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
     placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: waiter.need}] : []);
   }
@@ -809,7 +981,7 @@ function fitLabels() {
   fitWalkDetails();
   if (latest) placeMemoryBars(latest);
   fitAxisLabels();
-  const at = latest && latest.cap !== null ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
+  const at = latest && hasCap(latest) ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
   $("mark").style.left = `${at}px`;
   $("marklabel").style.left = `${at}px`;
   for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram", "ci_kept"]) {
