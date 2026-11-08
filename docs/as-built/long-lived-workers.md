@@ -273,12 +273,40 @@ A failed end retains its transition record for retry.
 An ended identity cannot reopen.
 `[roles] new_open=false` in `config/design_roles.conf` preserves existing roles and refuses new ones.
 
+A design role uses `worker.py` operations.
+`worker.py list --json` gives each worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+It computes three fields at read time and stores none of them:
+
+1. `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state` for the current manager.
+2. `account`: the account label from `member_account.resume_account` for the current manager.
+3. `home`: the account's absolute home path.
+
+With unavailable backend evidence, `account` contains `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+`worker.py list --json --all` reads workers for every manager and adds each parent's name as `manager`.
+It needs no caller row and makes no process, pane, or thread read.
+Its `state` uses the saved dispatch status or staff hold.
+Its `activity` uses the saved pass activity, then its status.
+Per-manager listing keeps its live observations.
+
+History lookup resolves fixed manager ids through staff, even after a session change.
+It merges events from newest to oldest across files.
+A file search stops when newer dispatches supply each worker's state or all remaining events precede each worker's creation.
+A UUIDv7 staff id supplies its first conversation's creation time.
+Older id formats have no creation bound.
+The reader skips invalid lines and keeps history events absent from the current pass slots.
+Stored account history resolves only the unit group and reads its history once.
+
+The authority host comes from `[ownership]` in `config/design_roles.conf`.
 The configured authority host owns placement.
 Both roles remain on the design's recorded host.
 Host transfer is unsupported.
 Repository registration requires each host's absolute checkout mapping.
+Supply every host mapping on the first registration.
+Use `register_repository` for multiple mappings.
 Repeated registration must keep the same mappings.
-An authority error stops the local lifecycle operation.
+Placement uses a hash of the repository id and relative document path.
+The authority supports registration, reservation, lookup, generation advance, checkout changes, and aliases.
+An authority error stops the local lifecycle operation without changing placement.
 Renames and transfers retain worker staff ids without rewriting holder records.
 
 ### Dispatch and messages

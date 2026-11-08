@@ -317,6 +317,17 @@ class PaneReviewLauncherTests(unittest.TestCase):
                      "--prompt", str(self.fixture.prompt), "--early-ready", str(self.ready)]
         return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
 
+    def test_durable_design_dispatch_without_a_summary_saves_the_reply_beside_the_prompt(self) -> None:
+        arguments = ["--role", "review", "--target", "durable-design-role", "--policy", "astra-reviewer",
+                     "--parent", str(self.fixture.fixture.parent.id), "--new-worker", "TEST-astra-reviewer",
+                     "--cwd", str(self.fixture.fixture.root), "--phase", "8",
+                     "--session-dir", str(self.fixture.run_dir), "--prompt", str(self.fixture.prompt)]
+        result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reply = self.fixture.prompt.with_name(self.fixture.prompt.stem + "_reply.txt")
+        self.assertTrue(reply.read_text().startswith(self.fixture.agent.final))
+        self.assertEqual(len(self.fixture.agent.submitted), 1)
+
     def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
         reports: list[str] = []
         summary = self.phase / "review_summary_1.txt"

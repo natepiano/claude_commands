@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -54,6 +55,7 @@ class ModuleRun(TypedDict):
     tests: list[TestTime]
     restart: str
     times_missing: str
+    log: str
 
 
 class SuiteRun(TypedDict):
@@ -117,6 +119,7 @@ class Execution:
     status: int
     restart: Literal["", "hold"]
     times: ModuleTimes | NoModuleTimes | TimingNotApplicable
+    output: str
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -199,6 +202,7 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
             "status": job.status, "tests_run": 0, "failures": 0, "errors": 0,
             "skipped": 0, "tests_s": 0.0, "tests": [], "restart": job.restart,
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
+            "log": "",
         }
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
@@ -215,7 +219,30 @@ def report_not_written(error: BaseException) -> None:
     print(f"gate run not written: {detail}", file=sys.stderr)
 
 
-def write_gate_run(run: GateRun) -> None:
+def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence[ModuleRun],
+                      executions: Sequence[Execution]) -> None:
+    """Keep each failed attempt under the host that recorded the gate."""
+    from scripts.buildlog import record
+
+    for module in modules:
+        module["log"] = ""
+    failures = [(module, job) for module, job in zip(modules, executions, strict=True)
+                if job.status != 0 and not job.restart]
+    if failures:
+        limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+        for module, job in failures:
+            data = job.output.encode("utf-8")
+            cut = max(0, len(data) - limit)
+            kept = f"Cut {cut} bytes from the start of this output.\n".encode("utf-8") + data[-limit:]
+            key = json.dumps((module["suite"], module["module"], module["attempt"])).encode("utf-8")
+            name = f"{record_id}-{hashlib.sha256(key).hexdigest()}"
+            try:
+                module["log"] = record.keep_log(kept, host, epoch, name)
+            except Exception as error:
+                report_not_written(error)
+
+
+def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
     """Append one gate record without failing the caller."""
     try:
         # This import keeps gate_record free of an import cycle with index.py.
@@ -226,6 +253,7 @@ def write_gate_run(run: GateRun) -> None:
         entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
+        keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
         report_not_written(error)

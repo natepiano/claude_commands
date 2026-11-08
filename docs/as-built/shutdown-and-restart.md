@@ -117,6 +117,9 @@ Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
 
+`agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` delegates to the accounts move command.
+It normalizes the account label and preserves the result and output.
+
 `move_sessions` writes each session request before the stops, then records its confirmed or failed outcome in the accounts moves log.
 Each attempt has its own move ID and cause.
 Handed-off callers and sessions already on the target write nothing.

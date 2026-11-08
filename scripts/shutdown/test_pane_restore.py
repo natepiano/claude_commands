@@ -90,6 +90,8 @@ class FakeClient(herdr.Herdr):
                               "label": row["label"], "pane_count": 1} for row in self.rows]}
         if arguments[:2] == ("pane", "process-info"):
             return {"process_info": self.process_info}
+        if arguments[:2] == ("agent", "list"):
+            return {"agents": []}
         raise AssertionError(arguments)
 
     @contextmanager
@@ -690,6 +692,11 @@ class RestoreStaffNamesTests(StaffTestCase):
             f"-U {uid} -o pid=,command=": {"stdout": "42 zsh", "code": 0},
             "-o tpgid= -p 42": {"stdout": "42", "code": 0},
         }
+        for pid in range(992000, 992010):
+            process_responses[f"-o lstart=,tty= -p {pid}"] = {"stdout": "Mon Nov 2 10:00:00 2026 ??\n", "code": 0}
+            process_responses[f"-o command= -p {pid}"] = {"stdout": "claude\n", "code": 0}
+            process_responses[f"eww -o command= -p {pid}"] = {
+                "stdout": f"claude CLAUDE_CONFIG_DIR={config}\n", "code": 0}
         with (self.machine("mac"), mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.object(restart_records, "RECORD_DIR", directory),
               mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),

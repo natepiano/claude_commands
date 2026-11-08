@@ -77,7 +77,7 @@ If Claude opens but is not ready, such as at a dialog, the command prints its
 screen, sends no prompt, exits 3 and leaves the session open. Look at it in its tab.
 
 The user reaches the lower showrunner in its tab of `agents` or by
-Remote Control under the same name. `/showrunner:rename` changes the staff name and the live session names.
+Remote Control under the same name. `/agents rename` changes the staff name and the live session names.
 What each side does once attached is in
 `/showrunner:produce` → Nested showrunners. To take it out of the tree, use
 `/showrunner:attach detach <showrunner name>`; wrapping its production does the same.

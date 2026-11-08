@@ -715,3 +715,24 @@ Moved from herdr-unit (sdlc, 2026-11-07 14:22 EST, user: "have some other unit d
 - `docs/plans/herdr-worker-panes.md` — every path in the Files list of its Phase 19.
 
 **Workers:** the Workers line of `docs/plans/herdr-worker-panes.md` → Phase 19.
+
+### Phase 30a — Close the family-switch gaps for a worker with a closed pane  · status: todo
+
+Moved out of Phase 30 under the hard landing (sdlc, 2026-11-08). Neither gap is a regression against main: main has no pane family switch, and a closed-pane family change there ends uncertain. Phase 30's closure review 3 is `<run>/phases/30/claude-build-followups-hierarchies-review2_summary_1.txt`; the Astra review of the approach is `<run>/phases/30/astra_review_F011_F012.md`.
+
+#### Work Order
+
+**Goal:** a family switch (Claude to Codex or back) of a worker whose pane is closed is as safe as one with an open or stopped pane.
+
+**Spec:**
+1. F011: a family switch of a closed worker passes the same busy-worker and live detached-run checks as an open or stopped worker. `can_close` accepts a closed worker through its stopped-worker branch; the open-worker status and transcript checks stay.
+2. F012: when publication fails after the new agent starts, cleanup stops the agent that `start` launched, for every destination kind (a closed source launches into a new split pane). Read and check the launched pane's terminal; a missing or changed terminal is a cleanup failure, never a silent success. Stop no agent without proof of its identity.
+3. State the boundary for a failed native-session proof after launch (`switch_worker` runs `start` before `publish_created`): recover it, or record it as a known limit.
+4. Tests: add a source-state column to the existing table at `scripts/herdr/test_worker_panes.py` (refusal table, about line 1493) that can omit the pane. Cover a closed source with a live detached run and with an unfinished dispatch: refusal comes before source release or launch. For a publication failure, check destination shutdown, unchanged staff identity, kept shell, and a retry that succeeds with no second split. Cover an idle closed source that switches. Each new case fails without its repair.
+
+**Files:**
+- `scripts/herdr/worker_panes.py`
+- `scripts/herdr/test_worker_panes.py`
+- `scripts/production/worker_admission.py` (item 3 only)
+
+**Workers:** one Codex writer.

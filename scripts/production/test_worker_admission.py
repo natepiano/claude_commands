@@ -622,6 +622,23 @@ except admission.AdmissionRefused as error:
                 dispatch=dispatch, cleanup=events.append)
         self.assertEqual(events, [identity])
 
+    def test_missing_claude_transcript_is_empty_but_missing_codex_transcript_is_unavailable(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                allowed, source, _ = self.source(family)
+                assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+                row = allowed.slot.row
+                backend = staff.backend(row)
+                assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+                source.unlink()
+                entries = worker_admission.conversation_entries(row, backend, set())
+                if family == "claude":
+                    self.assertEqual(list(entries), [])
+                else:
+                    with self.assertRaisesRegex(ValueError, "no source transcript found"):
+                        _ = list(entries)
+                self.assertFalse(source.exists())
+
     def test_missing_transcript_allows_dispatch_but_failed_stop_preserves_the_source(self) -> None:
         for failure in ("stop", "unresolved", "transcript"):
             with self.subTest(failure=failure):

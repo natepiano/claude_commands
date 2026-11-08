@@ -4,6 +4,37 @@ Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
 
+## Failed module output
+
+Each merge gate record keeps a gzip log for each failed module attempt.
+The first failure keeps its log when the retry passes.
+Passing attempts and attempts stopped for a hold have an empty `log` field.
+The gate removes each temporary job folder after reading its output.
+
+`gate_modules.log` gives the saved path relative to `BUILDLOG_DIR`.
+The default build log root is `~/.local/state/buildlog`.
+Find the path with this command:
+
+```sh
+buildlog query "SELECT run_id, suite, module, attempt, log FROM gate_modules WHERE log IS NOT NULL AND log != '' ORDER BY started_at DESC LIMIT 20"
+```
+
+Set `log` to a path from that result, then read the output:
+
+```sh
+log='natedev/logs/YYYY-MM/<record-id>.log.gz'
+zcat "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/$log"
+```
+
+`GATE_FAILURE_LOG_KIB` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
+The writer reads this setting for each record that has failed attempts.
+The first line states how many bytes the writer cut from the start.
+That line is outside the limit.
+A failed log write reports an error and preserves the gate verdict.
+These logs have no pruning job.
+They remain until someone removes them.
+Older records without a `log` field have SQL NULL in that column.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
@@ -11,9 +42,19 @@ The route returns the existing `GateRun` and exit behavior.
 The build queue enforces nine cloud slots and shows remote progress.
 
 The route selects targeted modules on natedev.
-It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
+The box clones the public HTTPS URL from `clone_url` in `cloud_gate.conf`.
+The route bundles only commits outside natedev's `origin/main`.
+It bundles HEAD and the current branch ref with `--not refs/remotes/origin/main`.
+It uploads no bundle when HEAD is already on `origin/main`.
+The request records the exact tested commit, tree, and natedev `origin/main` hash.
+The box fetches the optional bundle and sets `origin/main` to the recorded hash.
 The guest verifies the tree and runs only the supplied paths from that checkout.
 The trial and route share `scripts/aws_target/gate_box.py`.
+The boot script downloads the guest program before Python starts.
+Production also downloads the request that contains the module list.
+User data contains the download links instead of the program or module paths.
+Production uses the instance role and S3 inside the tools shell.
+The trial uses signed HTTPS links for its program and source bundle.
 The guest performs no type check and installs no basedpyright package.
 An explicit type request and the nightly checker remain local.
 
@@ -22,13 +63,22 @@ Both sizes use one-time Spot with termination on interruption and shutdown.
 Termination deletes the root volume.
 A guest deadline and an independent expiry Lambda bound normal attempt lifetimes.
 The route confirms termination before it releases unused cost reservation.
-An uncertain reply retains the saved launch token, arguments, and reservation across restart.
+A launch timeout permits local fallback and releases the cost reservation when no instance identity is known.
 
-Local fallback requires AWS failure, an absent image or stack, a shared spending cap, or capacity refusal at both sizes.
-A remote failure remains red. A dead instance without a final result also remains red.
+Every cloud setup or infrastructure failure permits local fallback.
+This includes upload errors, timeouts, missing results, invalid results, and instance failures.
+Capacity refusals first exhaust the configured sizes and zones.
+The route releases the cost reservation and cloud slot before local admission.
+Only a real remote test failure remains red.
+A dead instance without a final test result permits local fallback.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once under the real remote host.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
+The AWS state folder retains `cloud-gate-launches.jsonl`.
+Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
+Local fallback prints `Cloud gate uses natedev: <reason>`.
+These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.
 It checks the existing $20 daily cap, $400 monthly cap, and safety reserve under one cost lock.

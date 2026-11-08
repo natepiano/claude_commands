@@ -14,6 +14,7 @@ import socketserver
 import sys
 import tempfile
 import time
+import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +29,8 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.message import sessions
 from scripts.shutdown import restart, shutdown
 from scripts.shutdown.unit_staff_test_support import unit_host
-from scripts.production import fake_unit_host, session_staff, staff
+from scripts.production import fake_unit_host, session_staff, staff, worker
+from scripts.production import test_worker
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import Account, UnknownAccountName
@@ -694,6 +696,137 @@ class MixedRestartTests(ShutdownTestCase):
             self.assertEqual(bool(orders.call_count), command == "restart")
 
 
+class WorkerRestartTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.case: test_worker.WorkerCommandTests = test_worker.WorkerCommandTests("runTest")
+
+    @override
+    def setUp(self) -> None:
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        world = self.case.fixture.world
+        world.locations["w1:p0"]["agent_session"] = {"value": self.case.fixture.parent.current_session}
+
+    def test_start_row_keeps_an_idle_worker_closed(self) -> None:
+        opened = self.case.opened()
+        world = self.case.fixture.world
+        _ = world.stop(opened.row, world)
+        before = len(world.launches)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(restart, "_saved_launch", side_effect=AssertionError("workers require worker restore")) as saved,
+              patch.object(restart, "session_launch", wraps=restart.session_launch) as generic,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.start_row(opened.row, staff.snapshot(), world), "")
+        self.assertIn(f"{opened.row.name}: closed; its next assign resumes it\n", output.getvalue())
+        self.assertEqual(len(world.launches), before)
+        self.assertNotIn(opened.pane, world.foreground)
+        saved.assert_not_called()
+        generic.assert_not_called()
+
+    def test_start_row_keeps_a_closed_selected_worker_with_an_unreadable_sibling_closed(self) -> None:
+        selected, sibling = self.case.opened(), self.case.opened("review", "review")
+        world = self.case.fixture.world
+        _ = world.stop(selected.row, world)
+        self.assertIsInstance(worker_panes.close(self.case.fixture.parent.id,
+            staff.WorkerName.parse(selected.row.name)), worker_panes.Closed)
+        world.unknown[sibling.pane] = "sibling process is unreadable"
+        before = len(world.launches)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.start_row(selected.row, staff.snapshot(), world,
+                worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), "")
+        self.assertIn(f"{selected.row.name}: closed; its next assign resumes it\n", output.getvalue())
+        self.assertEqual(errors.getvalue(), f"herdr agents:{sibling.pane} tab w1:t1: pane evidence is unknown: "
+                         + "sibling process is unreadable; row placement retained\n")
+        self.assertEqual(len(world.launches), before)
+        self.assertNotIn(selected.pane, world.locations)
+        self.assertIn(sibling.pane, world.foreground)
+
+    def test_start_row_resumes_one_worker_without_starting_its_owner(self) -> None:
+        opened = self.case.opened("review", "review")
+        initial = self.case.fixture.world.requests[-1][1]
+        _ = progress_history.begin_dispatch(self.case.run_dir, slot="review", phase="8", role="review",
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=self.case.prompt, kind="review", lens="")
+        world = self.case.fixture.world
+        _ = world.stop(opened.row, world)
+        before = len(world.launches)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(worker, "restore", wraps=worker.restore) as restore,
+              patch.object(restart, "_saved_launch", side_effect=AssertionError("workers require worker restore")) as saved,
+              patch.object(restart, "session_launch", wraps=restart.session_launch) as generic,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.start_row(opened.row, staff.snapshot(), world), opened.pane)
+        restore.assert_called_once()
+        self.assertEqual(restore.call_args.args, (self.case.fixture.parent.id,))
+        self.assertEqual(restore.call_args.kwargs["only"], frozenset({opened.row.id}))
+        saved.assert_not_called()
+        generic.assert_not_called()
+        self.assertEqual(len(world.launches), before + 1)
+        self.assertIn("w1:p0", world.foreground)
+        self.assertIn(opened.pane, world.foreground)
+        kind, arguments, environment = world.requests[-1]
+        self.assertEqual(kind, "codex")
+        self.assertEqual(arguments[arguments.index("--model") + 1], "gpt-test")
+        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
+        self.assertEqual(arguments[arguments.index("--ask-for-approval") + 1], "never")
+        self.assertTrue(any(argument.startswith('model_reasoning_effort="') for argument in arguments))
+        self.assertEqual(arguments[arguments.index("--model"):], initial[initial.index("--model"):])
+        self.assertEqual(environment["UNIT_TEAM_ROLE"], "review")
+        self.assertIn(opened.row.current_session, arguments)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", ())),
+              patch.object(worker, "restore", wraps=worker.restore) as restore,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.start_row(opened.row, staff.snapshot(), world), "")
+        restore.assert_not_called()
+        self.assertEqual(output.getvalue(), f"{opened.row.name}: unchanged\n")
+
+    def test_start_row_resumes_the_selected_worker_on_the_requested_account_without_its_sibling(self) -> None:
+        selected, sibling = self.case.opened(), self.case.opened("review", "review")
+        world = self.case.fixture.world
+        for opened in (selected, sibling):
+            _ = progress_history.begin_dispatch(self.case.run_dir, slot=opened.row.name, phase="8", role="impl",
+                worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                prompt=self.case.prompt, kind="impl", lens="")
+            _ = world.stop(opened.row, world)
+        destination = self.case.fixture.root / "codex2"
+        before = len(world.launches)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex2", destination, "fixture-login")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.start_row(selected.row, staff.snapshot(), world,
+                target_account=accounts.CodexWorkersAccount("codex2", destination),
+                worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), selected.pane)
+        self.assertEqual(len(world.launches), before + 1)
+        self.assertEqual(world.requests[-1][2]["CODEX_HOME"], str(destination))
+        self.assertIn(selected.pane, world.foreground)
+        self.assertNotIn(sibling.pane, world.foreground)
+        self.assertIsInstance(progress_history.active_dispatch(sibling.row.id, self.case.run_dir),
+                              progress_history.ActiveDispatch)
+
+    def test_start_row_keeps_the_selected_unnumbered_codex_home(self) -> None:
+        opened = self.case.opened()
+        _ = progress_history.begin_dispatch(self.case.run_dir, slot=opened.row.name, phase="8", role="impl",
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=self.case.prompt, kind="impl", lens="")
+        world = self.case.fixture.world
+        _ = world.stop(opened.row, world)
+        destination = self.case.fixture.root / ".codex"
+        selected = accounts.CodexWorkersAccount("codex", destination)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(agent_accounts, "codex_account_home", wraps=agent_accounts.codex_account_home) as resolve,
+              patch.object(worker, "restore", wraps=worker.restore) as restore,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.start_row(opened.row, staff.snapshot(), world,
+                target_account=selected, worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), opened.pane)
+        self.assertIs(cast(object, restore.call_args.kwargs["account"]), selected)
+        resolve.assert_not_called()
+        self.assertEqual(world.requests[-1][2]["CODEX_HOME"], str(destination))
+        self.assertIn(opened.row.current_session, world.requests[-1][1])
+
+
 class RestartTests(RestartTestCase):
     root: Path = Path()
     rows: tuple[staff.StaffRow, ...] = ()
@@ -901,7 +1034,7 @@ class RestartTests(RestartTestCase):
         with (patch.object(staff, "snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([], [])),
               redirect_stdout(io.StringIO()) as output):
-            restart._restore_workers(owner, record)  # pyright: ignore[reportPrivateUsage]
+            _ = restart._restore_workers(owner, record)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(output.getvalue().splitlines(), [f"{owner.name}: workers unchanged"])
 
     def account_processes(self) -> None:
@@ -1032,16 +1165,6 @@ class RestartTests(RestartTestCase):
                 self.assertEqual([item.args[0] for item in stop.call_args_list], [selected])
                 self.assertEqual([item.args[0] for item in start.call_args_list], [selected])
                 stop_workers.assert_not_called()
-
-    def test_start_row_resumes_one_worker_without_starting_its_owner(self) -> None:
-        owner = self.rows[0]
-        child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(owner.id))
-        self.rows = (owner, child, self.rows[2])
-        self.running.remove(str(child.current_session))
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(restart.start_row(child, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p1")
-        self.assertEqual([name for name, _pane in self.launches], [child.name])
-        self.assertIn(str(owner.current_session), self.running)
 
     def test_account_filter_selects_a_hosted_codex_thread_by_its_daemon_home(self) -> None:
         row = self.rows[0]

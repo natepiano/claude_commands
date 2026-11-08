@@ -162,7 +162,9 @@ Exit 6 means busy before submission.
 2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
 3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
 
-The answer uses the existing herdr pane input path.
+A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
+Herdr checks the target before each key.
+Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
 
@@ -333,7 +335,7 @@ The resume message builder retains the launcher prompt path for restored workers
 - A non-empty `TMUX_PANE` means the process is never a herdr place.
 - Native session ids select staff rows for launch and restore names.
   The Stop hook keeps member titles consistent with their rows.
-  A unit name mismatch prints `/showrunner:rename_unit` and never changes staff.
+  A unit name mismatch prints `/agents rename` and never changes staff.
 - Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
 - Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
 - Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.

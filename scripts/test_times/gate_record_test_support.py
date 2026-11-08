@@ -1,6 +1,17 @@
 """Shared timing records for tests with private build logs."""
 
+from typing import Literal, cast
+
+from scripts.test_times import gate_record
 from scripts.test_times.gate_record import GateRun, ModuleTimes
+
+
+def fixture_executions(run: gate_record.GateRun) -> list[gate_record.Execution]:
+    """Supply executions for fixtures that already contain module rows."""
+    return [gate_record.Execution(module["suite"], module["module"], module["wall_s"], module["cpu_s"],
+                                  module["peak_mib"], module["status"], cast(Literal["", "hold"], module["restart"]),
+                                  gate_record.NoModuleTimes("fixture supplies module rows"), "")
+            for module in run["modules"]]
 
 
 def remove_run_measurements(record: dict[str, object]) -> None:
@@ -34,5 +45,5 @@ def gate_run() -> GateRun:
                      "status": 1, "tests_run": times["tests_run"], "failures": times["failures"],
                      "errors": times["errors"], "skipped": times["skipped"],
                      "tests_s": times["tests_s"], "tests": times["tests"],
-                     "restart": "hold", "times_missing": ""}],
+                     "restart": "hold", "times_missing": "", "log": ""}],
     }

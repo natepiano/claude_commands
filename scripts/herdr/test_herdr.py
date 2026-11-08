@@ -2231,7 +2231,8 @@ class HerdrTests(unittest.TestCase):
         return herdr.Herdr("fixture")
 
     @contextmanager
-    def prompt_target(self, client: herdr.Herdr, pane: str, session: str) -> Generator[None]:
+    def prompt_target(self, client: herdr.Herdr, pane: str, session: str, *, read_composer: bool = False
+                      ) -> Generator[None]:
         result = client.result
         def process_info(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
             if arguments[:2] == ("pane", "process-info"):
@@ -2246,9 +2247,64 @@ class HerdrTests(unittest.TestCase):
             return herdr.ComposerInput("")
         with (patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": pane, "terminal_id": "prompt-terminal", "session_id": session}]),
               patch.object(client, "result", side_effect=process_info),
-              patch.object(client, "composer", side_effect=composer),
+              nullcontext() if read_composer else patch.object(client, "composer", side_effect=composer),
               patch.object(herdr, "native_process", side_effect=native)):
             yield
+
+    @contextmanager
+    def question_box(self, client: herdr.Herdr, pane: str, session: str, *, prompt_marker: str = "❯"
+                     ) -> Generator[list[tuple[str, ...]]]:
+        typed = ""
+        commands: list[tuple[str, ...]] = []
+
+        def run(*arguments: str, deadline: float = math.inf) -> str:
+            nonlocal typed
+            del deadline
+            if arguments[:2] == ("pane", "read"):
+                self.assertEqual(arguments, ("pane", "read", pane, "--source", "visible", "--format", "ansi"))
+                return f"────────────────────\n{prompt_marker} {typed}\n────────────────────"
+            commands.append(arguments)
+            if arguments[:2] == ("pane", "send-text"):
+                typed = arguments[3]
+            return ""
+
+        with (self.prompt_target(client, pane, session, read_composer=True),
+              patch.object(client, "run", side_effect=run)):
+            yield commands
+
+    def test_answer_question_checks_the_target_with_the_expected_composer_before_each_key(self) -> None:
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        with (self.question_box(client, pane, session) as commands,
+              patch.object(herdr, "check_target", wraps=herdr.check_target) as checks):
+            client.answer_question(pane, text, target=session)
+        self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
+                                    ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
+        self.assertEqual([cast(str, entry.kwargs["text"]) for entry in checks.call_args_list], ["", text, text])
+        self.assertEqual([entry.args for entry in checks.call_args_list], [(session,)] * 3)
+        self.assertTrue(all(entry.kwargs["action"] == "keys" for entry in checks.call_args_list))
+
+    def test_answer_question_sends_all_keys_with_the_real_codex_box_composer(self) -> None:
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        with self.question_box(client, pane, session, prompt_marker="›") as commands:
+            client.answer_question(pane, text, target=session)
+            self.assertIsInstance(client.composer(pane), herdr.NoComposer)
+        self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text),
+                                    ("pane", "send-keys", pane, "enter"), ("pane", "send-keys", pane, "enter")])
+
+    def test_answer_question_rechecks_the_target_before_enter(self) -> None:
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        with self.question_box(client, pane, session) as commands:
+            def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                current = session if len(commands) < 2 else "another-session"
+                return herdr.NativeAgentProcess(herdr.RolloutThread(current), "fixture-start", {})
+
+            with patch.object(herdr, "native_process", side_effect=native):
+                with self.assertRaisesRegex(herdr.HerdrFailure, "does not run session"):
+                    client.answer_question(pane, text, target=session)
+        self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text)])
 
     def test_failed_source_record_prevents_prompt_submission(self) -> None:
         from scripts.lib import script_prompts
@@ -5973,7 +6029,7 @@ class RowTabTests(StaffTestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertTrue(self.client.retitle_row(self.rows["split"].id))
 
-        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[1]["pane_label"], "director-split")
         self.assertEqual(self.client.tabs[2]["pane_label"], self.rows["worker"].name)
         self.assertEqual(len(self.client.scans), 1)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -6327,7 +6383,7 @@ class RowTabTests(StaffTestCase):
         self.client.tabs[0]["label"] = self.rows["unit"].name
         self.client.tabs[1]["pane_label"] = "old-pane"
         self.assertTrue(self.client.retitle_row(self.rows["split"].id))
-        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[1]["pane_label"], "director-split")
         self.assertEqual(self.client.tabs[0]["label"], self.rows["unit"].name)
         self.assertFalse(any(command[:2] == ("tab", "rename") for command in self.client.commands))
         self.assertFalse(self.client.retitle_row(self.rows["split"].id))

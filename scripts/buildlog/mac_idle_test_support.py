@@ -28,7 +28,7 @@ def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> 
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "alert.json"
     _ = path.write_text(json.dumps({
-        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600,
+        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600, "changed": now - 600,
         "waiting": 7, "cause": "blocked", "holder": "research", "detail": "P15 F11 L0 run",
         "until": 0, "messaged": True, "pushed": False,
     }))

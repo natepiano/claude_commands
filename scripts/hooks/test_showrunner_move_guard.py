@@ -1,4 +1,4 @@
-"""A showrunner's hand paths for stopping or moving a session are refused and name /showrunner:move."""
+"""The move guard names agents and preserves its showrunner scope."""
 from __future__ import annotations
 
 from scripts.shutdown import remote
@@ -33,7 +33,7 @@ class Guard(Protocol):
 
 guard = cast(Guard, cast(object, module))
 SHOWRUNNER = "11111111-2222-3333-4444-555555555555"
-MOVE = '~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunner_move.py session nightly-review "claude 1"'
+MOVE = 'agents move TEST-nightly-review "claude 1"'
 
 
 class RefusalTest(unittest.TestCase):
@@ -110,7 +110,7 @@ class SessionTest(unittest.TestCase):
         response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(SHOWRUNNER, "tmux send-keys -t unit /exit Enter")))
         decision = response["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn("/showrunner:move", decision["permissionDecisionReason"])
+        self.assertIn("/agents move", decision["permissionDecisionReason"])
 
     def test_the_skill_path_passes_in_a_showrunner(self) -> None:
         self.assertEqual(self.run_hook(SHOWRUNNER, MOVE), "")

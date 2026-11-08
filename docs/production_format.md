@@ -155,11 +155,12 @@ every tool's arguments. A unit's session name can change, so find the unit at th
 prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
 session name now. `<showrunner name>` is the parent showrunner row's `name`.
 
-To rename a unit or showrunner, run `/showrunner:rename plan|apply <old> <new>`.
+Run `/agents rename OLD NEW` to rename a unit, showrunner, or worker.
 Use a staff id, `showrunner/name`, or a unique name.
-A bare name first selects the calling showrunner or its units.
+A bare name first selects the calling showrunner or unit and its direct children.
 The command searches all productions only when that scope has no match.
 A unit rename changes matching folder and branch suffixes and resumes its live sessions.
+A worker rename changes its pane title and keeps its shared tab and workspace names.
 The command keeps staff ids and creates no commit.
 Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 

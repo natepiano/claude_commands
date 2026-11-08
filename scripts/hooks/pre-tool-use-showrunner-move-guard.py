@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Refuse a showrunner's hand paths for stopping or moving a Claude session; name /showrunner:move.
+"""Direct showrunner stop and move commands through agents.
 
-A session is a showrunner's when an update timer is addressed to its session id. In one, a Bash
-call is refused when it sends `/exit` into a pane through tmux or herdr ,
-kills a Claude process, or resumes `claude` with a CLAUDE_CONFIG_DIR of its own. Every other call,
-and every call in any other session, passes. A broken hook never blocks a call.
+Refuse manual pane exits, process kills, and Claude resumes with a configuration directory.
+A broken hook does not block a call.
 """
 from __future__ import annotations
 try:
@@ -22,8 +20,7 @@ from typing import TypedDict, cast
 
 from scripts.production.showrunners import production_of
 
-SKILL = ("Move or stop a session with /showrunner:move: it pauses the session first, proves the account it "
-         "comes back on and tells its showrunner. ")
+SKILL = "Use /agents move to move a session. Use /agents stop to stop it. "
 EXIT_REFUSAL = SKILL + "Sending /exit into another session's pane stops it in the middle of its turn."
 KILL_REFUSAL = SKILL + "Killing a Claude process ends its turn and leaves no record to bring it back."
 RESUME_REFUSAL = SKILL + "A hand-launched claude --resume with CLAUDE_CONFIG_DIR is never checked for its account."

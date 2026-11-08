@@ -297,7 +297,7 @@ When the first argument is `update`, the launcher uses the shared `~/.codex` ins
 
 Configured groups select accounts for new unit and showrunner launches.
 Nightly reviews use the units account.
-Set a group with `accounts.py move units|showrunners claudeN`.
+Set a group with `agents move units|showrunners claudeN`.
 An unconfigured group refuses with that command.
 Explicit launch overrides must name the configured account.
 New launches retain the selected account and model in herdr pane launch records.
@@ -345,8 +345,8 @@ Historical `default`, `~/.claude` or `~/.codex` records resolve from their own l
 In this terminal:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <claudeN> [--dry-run] [--why "<text>"]
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <claudeN> [--dry-run] [--why "<text>"]
+agents move <session-id-or-exact-name> <claudeN> [--dry-run] [--why "<text>"]
+agents move units|showrunners <claudeN> [--dry-run] [--why "<text>"]
 ```
 
 A move stops the selected session and resumes its conversation in its herdr pane on the target account.
@@ -354,7 +354,9 @@ The resume message explains the move and the retained workers.
 Worker account moves use the pane procedure below.
 Only local tabs are in scope; run the command on the other machine for its sessions.
 
-One result line per member names its resumed account and pane, or the failure. The command returns the result directly. There is no move record, ready mark, follow or cancel step. `/showrunner:move` uses this same path and result.
+Each member prints one result line with its resumed account and pane, or its failure.
+`agents move` delegates to `accounts.py move` and returns its result unchanged.
+The command has no ready, follow, or cancel step.
 
 A single session is found by id, then exact name.
 A move outside the group account prints that the member returns to the group account at its next resume or restart.
