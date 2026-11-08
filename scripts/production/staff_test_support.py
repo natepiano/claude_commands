@@ -881,17 +881,26 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
-        """A unit run with actual state, roster, server and director records."""
+    def worker_run(self, production_name: str, unit: str, director: str, *,
+                   passes: tuple[dict[str, object], ...] = (), transport: Literal["mesh", "herdr"] = "mesh",
+                   director_run: bool = False) -> Path:
+        """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
             "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
+            "pass": {str(passed["worker_name"]): passed for passed in passes},
         })
         write_text_atomic(run / "director", director + "\n")
+        write_text_atomic(run / "worker_transport", transport + "\n")
         self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if transport == "mesh":
+            self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if director_run:
+            from scripts.lib import unit_runs
+
+            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
         return run
 
     @contextmanager

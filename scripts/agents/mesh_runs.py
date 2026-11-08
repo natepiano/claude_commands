@@ -174,7 +174,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         from scripts.herdr import worker_panes
         parent = membership.parent_of(native_member)
         if parent is not None:
-            run = worker_panes.worker_run(parent)
+            run = worker_panes.worker_run(native_member, record=membership)
             if unit_runs.worker_transport(run) == "herdr":
                 return PaneCaller(str(run), native_member.name, native_member.id)
     thread_id = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")

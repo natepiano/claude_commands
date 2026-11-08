@@ -1122,9 +1122,13 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertIsInstance(mesh_runs.caller_from_environment({variable: row.id}), mesh_runs.NotMeshWorker)
 
     def test_run_started_for_a_pane_slot_stays_live_and_delivers_to_its_worker(self) -> None:
+        _ = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
+                                transport="herdr", director_run=True)
         self.fixture.world.add(self.fixture.worker("test", family="codex"), "w1:p3", family="codex")
-        for name, pane in (("detached-command-owner", "w1:p1"), ("test2", "w1:p2")):
-            with self.subTest(name=name):
+        cases = (("detached-command-owner", "w1:p1", False), ("test2", "w1:p2", False),
+                 ("implicit-command-owner", "w1:p4", True))
+        for name, pane, implicit in cases:
+            with self.subTest(name=name, implicit=implicit):
                 row = self.fixture.worker(name, family="codex")
                 self.fixture.world.add(row, pane, family="codex")
                 prompt = self.fixture.root / "assignment.txt"
@@ -1141,10 +1145,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 before = set(runs.glob("*.json"))
                 input_count = len(self.inputs)
                 output = io.StringIO()
-                with (patch.object(treekey, "tree_key", return_value="private-tree"),
+                route = [] if implicit else ["--session-dir", str(self.run_dir), "--to", "test"]
+                with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}),
+                      patch.object(treekey, "tree_key", return_value="private-tree"),
                       patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)),
                       contextlib.redirect_stdout(output)):
-                    code = mesh_runs.main(["start", "--session-dir", str(self.run_dir), "--to", "test", "--", "true"])
+                    code = mesh_runs.main(["start", *route, "--", "true"])
                 self.assertEqual(code, 0, output.getvalue())
                 path, = set(runs.glob("*.json")) - before
                 record = cast(mesh_runs.RunRecord, json.loads(path.read_text()))

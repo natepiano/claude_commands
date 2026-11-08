@@ -530,12 +530,12 @@ def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispa
 
 
 def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | NoOwnPass:
-    """Read the worker's active pass through its parent."""
+    """Read the worker's active pass from its own run."""
     try:
         parent = record.parent_of(row)
         if parent is None:
             raise ValueError("worker parent is unavailable")
-        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(parent))
+        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(row, record=record))
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
         elif isinstance(active, progress_history.ActiveDispatch):
@@ -556,8 +556,8 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
         os.environ.get("ROSTER_RUN_ROOT"), record=record)]
     mesh = [run for run in runs if unit_runs.worker_transport(run) == "mesh"]
     panes: list[PaneWorkerResume] = []
-    run = worker_panes.worker_run(holder)
     for row in record.find(kind="worker", parent=parent) if not mesh else ():
+        run = worker_panes.worker_run(row, record=record)
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
@@ -598,7 +598,6 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
         print(f"{holder.name}: workers unchanged")
         return ExitCode.OK
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
-    run = worker_panes.worker_run(holder, record=record, scanned=runs)
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
             if isinstance(state, worker_panes.OpenWorker):
@@ -607,6 +606,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
+                run = worker_panes.worker_run(state.row, record=record, scanned=runs)
                 active = progress_history.active_dispatch(state.row.id, run)
                 if isinstance(active, progress_history.ActiveDispatchUnavailable):
                     print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)

@@ -2766,11 +2766,11 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
 
 def _write_claude_trust(folder: Path, target: Path, project_key: Path) -> Trusted | UnreadableTrustFile:
     """Lock the account file through its read and atomic trust update."""
-    from scripts.accounts.accounts import claude_config_lock
+    from scripts.lib import file_lock
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with claude_config_lock(target):
+        with file_lock.claude_config_lock(target):
             try:
                 raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
             except FileNotFoundError:

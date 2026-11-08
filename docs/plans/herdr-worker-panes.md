@@ -3230,7 +3230,7 @@ The user decided worker question item 9 (through sdlc, 2026-11-07): "When a Code
 - Director proof: in a test run under `/home/natepiano/scratch/herdrcheck/`, a worker asked to edit a file outside its paths stops on the question; the director answers through `worker.py answer`, reruns the launcher, and the pass completes.
 
 
-### Phase 29 — A worker's run is the run of its own dispatch  · status: todo
+### Phase 29 — A worker's run is the run of its own dispatch  · status: done
 
 **Depends on:** Phase 27 (it edits `scripts/production/worker.py` and `scripts/accounts/pane_moves.py`, which call `worker_run`). It lands before Phase 28 and Phase 19 (herdr, 2026-11-07: a live defect).
 

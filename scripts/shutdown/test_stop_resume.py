@@ -2545,7 +2545,7 @@ class StopResumeTests(unittest.TestCase):
                     self.assertNotIn("Worker ", self.client.prompts[0][1].text)
                 else:
                     self.assertEqual(self.client.prompts, [])
-                run.assert_called_once_with(parent)
+                run.assert_called_once_with(row, record=record)
                 read.assert_called_once_with(row.id, self.root)
 
     def test_resume_director_submits_an_opening_prompt_with_idle_pane_workers(self) -> None:

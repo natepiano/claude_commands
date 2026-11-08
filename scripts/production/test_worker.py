@@ -256,13 +256,15 @@ class WorkerCommandTests(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def test_restore_reuses_given_runs_for_two_workers(self) -> None:
+        first = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
+                                       transport="herdr", director_run=True)
         for state in (self.opened("impl"), self.opened("review", "review")):
             _ = progress_history.begin_dispatch(self.run_dir, slot=state.row.name, phase="8", role="impl",
                 worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(state.row, self.fixture.world)
         record = staff.snapshot()
-        runs = {str(self.fixture.parent.current_session): [str(self.run_dir)]}
+        runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
         with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
               patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
@@ -401,7 +403,7 @@ class WorkerCommandTests(unittest.TestCase):
                   patch.object(progress_history, "active_dispatch", return_value=active) as read,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(worker.own_pass(opened.row, staff.snapshot()), expected)
-            run.assert_called_once_with(self.fixture.parent)
+            run.assert_called_once_with(opened.row, record=staff.snapshot())
             read.assert_called_once_with(opened.row.id, self.run_dir)
             self.assertEqual(errors.getvalue(), "anomaly: impl: record unreadable\n"
                              if isinstance(active, progress_history.ActiveDispatchUnavailable) else "")
@@ -1028,7 +1030,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.dispatch(opened.row, "review")
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
-        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        self.assertEqual(self.command("restore"), (0, "unit: workers unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
         self.assertEqual(self.fixture.world.stops, [])
         self.assertEqual(self.agent.submitted, [])

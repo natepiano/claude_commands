@@ -466,13 +466,23 @@ def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *
     return pane
 
 
-def worker_run(parent: staff.StaffRow, *,
+def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
+    """Use the worker's newest state pass, with the parent's run as the default."""
+    parent = member
+    if member.kind == "worker":
+        record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+        parent = record.parent_of(member) or member
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)
-    if runs:
-        return Path(runs[0])
-    return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
+    fallback = (Path(runs[0]) if runs else Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR")
+                else unit_runs.state_dir() / "staff" / "workers" / parent.id)
+    if member.kind == "worker":
+        candidates = dict.fromkeys((*(Path(run) for run in runs), fallback))
+        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run))]
+        if passes:
+            return max(passes, key=lambda item: _pass_started_at(item[1]))[0]
+    return fallback
 
 
 def _passes(run: Path) -> list[dict[str, object]]:
@@ -486,14 +496,17 @@ def _passes(run: Path) -> list[dict[str, object]]:
         for item in fields.values() if isinstance(item, dict)]
 
 
-def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
-    def started_at(item: dict[str, object]) -> float:
-        value = item.get("started_at")
-        return value if isinstance(value, (int, float)) else float("-inf")
+def _pass_started_at(item: dict[str, object]) -> float:
+    value = item.get("started_at")
+    return value if isinstance(value, (int, float)) else float("-inf")
 
+
+def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
     no_pass: dict[str, object] = {}
-    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
+    return max((item for item in reversed(_passes(run))
+                if item.get("worker_id") == row.id or item.get("worker_name") == row.name
+                or (not item.get("worker_id") and not item.get("worker_name") and item.get("team_slot") == row.name)),
+               key=_pass_started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
@@ -568,7 +581,7 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
-    directory = run.directory if isinstance(run, DispatchRun) else worker_run(parent)
+    directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
     if isinstance(worker, StoppedWorker):
         return _idle_checks(worker.row, directory, lock)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
@@ -747,7 +760,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
-    run = worker_run(owner, record=record, scanned=runs)
+    run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+    if existing is not None and worker_pass(existing, run).get("status") not in ("active", "refused"):
+        run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
@@ -1016,7 +1031,7 @@ def close(parent: StaffId, name: WorkerName, *,
                 _layout(parent, evidence)
                 return Closed()
             owner = record.parent_of(row)
-            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(owner), held,
+            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(row, record=record), held,
                                      closing_turn=interrupt or recovered)
                         if (interrupt or recovered or isinstance(observed, ProcessUnknownWorker)) and owner is not None
                         else can_close(observed, run=run, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))

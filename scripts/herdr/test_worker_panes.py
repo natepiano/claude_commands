@@ -619,10 +619,20 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.stops, [])
         self.assertEqual([command[3] for command in self.prompts()], ["/quit", "/quit"])
 
+    def test_first_admission_uses_the_parent_run_when_two_runs_exist(self) -> None:
+        first = self.worker_run("a-first", "unit", self.parent.current_session, transport="herdr")
+        _ = self.worker_run("z-second", "unit", self.parent.current_session, transport="herdr")
+        result = self.start("new-worker")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(first))
+        self.assertEqual(self.start("new-worker"), result)
+        self.assertEqual(len(self.world.launches), 1)
+
     def test_close_uses_the_newest_pass_when_an_older_short_slot_is_last(self) -> None:
-        for index, (older_start, newest_start) in enumerate(((10, 20), (None, -1), ("later", -1)), start=1):
-            with self.subTest(older_start=older_start):
-                row = self.worker(f"claude-queue-test-{index}")
+        cases = ((10, 20, False), (None, -1, False), ("later", -1, False), (10, 20, True))
+        for index, (older_start, newest_start, foreign_worker) in enumerate(cases, start=1):
+            with self.subTest(older_start=older_start, foreign_worker=foreign_worker):
+                row = self.worker("test" if foreign_worker else f"claude-queue-test-{index}")
                 pane = f"w1:p{index}"
                 self.world.add(row, pane)
                 self.completed_dispatch(row, "impl")
@@ -632,13 +642,22 @@ class WorkerPaneTests(StaffTestCase):
                 passes = cast(dict[str, dict[str, object]], state["pass"])
                 newest = passes[row.name]
                 newest["started_at"] = newest_start
+                own_pass = dict(newest)
                 older: dict[str, object] = {"instance_id": "older-dispatch", "worker_name": row.name,
                     "team_slot": "test", "kind": "impl", "status": "completed"}
                 if older_start is not None:
                     older["started_at"] = older_start
-                passes["test"] = older
+                if foreign_worker:
+                    newest.update(worker_name="test2", team_slot="test", instance_id="foreign-dispatch",
+                                  status="active", started_at=30)
+                else:
+                    passes["test"] = older
                 write_text_atomic(path, json.dumps(state))
-                self.assertEqual(worker_panes.worker_pass(row, run), newest)
+                first = self.worker_run("a-old", "unit", self.parent.current_session, transport="herdr", director_run=True,
+                    passes=(own_pass if foreign_worker else {"worker_name": row.name, "status": "active", "kind": "review",
+                             "instance_id": "older-run-dispatch", "started_at": -10},))
+                self.assertEqual(worker_panes.worker_pass(row, run), {} if foreign_worker else newest)
+                self.assertEqual(worker_panes.worker_run(row), first if foreign_worker else run)
                 closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                 self.assertIsInstance(closed, worker_panes.Closed)
                 self.assertIn(row.current_session, self.world.stops)
