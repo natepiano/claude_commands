@@ -74,6 +74,46 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_local_commands_omit_ssh_modules(self) -> None:
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(directory)
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment.update({**config_environment(root), "HOME": directory,
+                            "BUILDLOG_DIR": str(root / "buildlog"),
+                            "BUILD_HOLD_DIR": str(root / "holds"),
+                            "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
+                            "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                            "MAC_IDLE_STATE_DIR": str(root / "mac-idle"),
+                            "UNIT_RUN_DIR": str(root / "board"),
+                            "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
+        common = ["--repo-root", directory, "--kind", "test"]
+        reservation = ["reserve", *common, "--pid", str(os.getpid()),
+                       "--reservation-file", str(root / "reservation")]
+        cases = (
+            ("bare-eligible", False, ["eligible", "--repo-root", directory], 0),
+            ("kind-eligible", False, ["eligible", *common], 0),
+            ("release-wait", False, ["release-wait", "--pid", str(os.getpid())], 0),
+            ("filtered-reserve", True, [*reservation, "--target", "natedev"], 1),
+        )
+        for name, ssh_target, arguments, status in cases:
+            with self.subTest(command=name):
+                _ = (root / "build_targets.conf").write_text(
+                    f"targets={'natedev,mac' if ssh_target else 'natedev'}\n"
+                    + "kind.natedev=local\nplatform.natedev=linux\n"
+                    + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                code = (
+                    "import sys; from scripts.build_targets import build_targets; "
+                    + "sys.argv=['build_targets.py', *sys.argv[1:]]; "
+                    + f"assert build_targets.main()=={status}; "
+                    + "loaded=[name for name in sys.modules if name in "
+                    + "('scripts.mac_test.mac_test', 'scripts.mac_test.offload')]; "
+                    + "assert not loaded, loaded")
+                result = REAL_SUBPROCESS_RUN(
+                    [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", code, *arguments],
+                    cwd=Path(__file__).parent, env=environment,
+                    capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_folder_invocation_records_hold_events(self) -> None:
         result = subprocess.run(
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-m", "unittest",
