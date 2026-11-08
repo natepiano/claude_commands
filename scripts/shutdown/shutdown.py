@@ -94,6 +94,7 @@ class CommandLine(argparse.Namespace):
     new: str = ""
     to_doc: str = ""
     to_branch: str = ""
+    target: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -244,6 +245,7 @@ USAGE = """usage: agents COMMAND
   agents resume --production SHOWRUNNER
   agents retire NAME
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
+  agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run]
 """
@@ -373,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("new")
     _ = command.add_argument("--to-doc", default="")
     _ = command.add_argument("--to-branch", default="")
+    command = commands.add_parser("move", description="Move Claude sessions to <claudeN>.")
+    _ = command.add_argument("session", metavar="SESSION_OR_GROUP")
+    _ = command.add_argument("target", metavar="ACCOUNT")
+    _ = command.add_argument("--dry-run", action="store_true")
+    _ = command.add_argument("--why", default="")
     command = commands.add_parser("restart")
     _ = command.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
@@ -397,6 +404,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run)
+        if options.command == "move":
+            move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
+            if options.dry_run:
+                move_arguments.append("--dry-run")
+            if options.why:
+                move_arguments.extend(("--why", options.why))
+            return accounts.main(move_arguments)
         if options.command == "restart":
             selected_account: restart.AllRestartAccounts | accounts.AccountSelection = restart.AllRestartAccounts()
             if options.account:
