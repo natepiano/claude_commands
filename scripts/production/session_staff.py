@@ -29,7 +29,7 @@ from scripts.shutdown import remote
 from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
-from scripts.herdr.pane_launch import PaneLaunch, agent_kind
+from scripts.herdr.pane_launch import PaneLaunch, agent_kind, without_staff_labels
 from scripts.lib import legacy_identity
 from scripts.production import unit_names
 
@@ -879,17 +879,12 @@ class LaunchMembership:
 
 
 def record_membership(launch: PaneLaunch) -> PaneLaunch:
-    """Supply launch session labels from its conversation history and staff owner."""
+    """Keep pane settings from the conversation history without staff labels."""
     from scripts.shutdown import pane_record
 
     result = launch.copy()
     result["environment"] = pane_record.retained_environment(result, pane_record.launches())
-    try:
-        membership = LaunchMembership.read()
-        result["environment"] = membership.environment(result)
-    except (staff.StaffUnreadable, OSError, ValueError):
-        pass  # An unavailable owner cannot erase already recorded identity.
-    return result
+    return without_staff_labels(result)
 
 
 @dataclass(frozen=True)
@@ -900,11 +895,11 @@ class RepairedSessionLabels:
 
 
 def repair_marks() -> list[RepairedSessionLabels]:
-    """Repair retained identities in place; never launch or change a conversation."""
+    """Remove saved staff labels and recover missing pane observations."""
     from scripts.message import sessions
     from scripts.shutdown import pane_record
 
-    membership = LaunchMembership.read()
+    record = staff.snapshot()
     history = pane_record.launches()
     newest = {entry["session_id"]: entry["written_at"]
               for entry in sorted(history, key=lambda item: item["written_at"])}
@@ -926,15 +921,13 @@ def repair_marks() -> list[RepairedSessionLabels]:
                 entry = pane_record.running_launch(session, process.place, process.cwd)
             except (OSError, ValueError):
                 continue
-            entry["environment"] = membership.environment(entry)
-            if membership.record.by_current_session(entry["session_id"]) is None:
+            if record.by_current_session(entry["session_id"]) is None:
                 continue
             pane_record.write(process.place.session, entry)
             newest[entry["session_id"]] = entry["written_at"]
             repaired.append(RepairedSessionLabels(
                 f"{process.place.session}:{process.place.pane}:{entry['session_id']}",
-                tuple((key, value) for key, value in sorted(entry["environment"].items())
-                      if key in herdr.NATIVE_ID_MARKS), ()))
+                (), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)
@@ -944,7 +937,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
                     continue
                 restored = entry.copy()
                 restored["environment"] = pane_record.retained_environment(entry, history)
-                restored["environment"] = membership.environment(restored)
+                restored = without_staff_labels(restored)
                 if restored != entry:
                     entries[pane] = restored
                     before, after = entry["environment"], restored["environment"]

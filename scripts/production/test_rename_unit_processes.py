@@ -1,9 +1,12 @@
 """Check process ownership without the deleted rename shutdown step."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
 import tempfile
+import unittest
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 from unittest import mock
@@ -24,6 +27,10 @@ from scripts.lint.memory_test_support import config_environment
 from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeProcess(NamedTuple):

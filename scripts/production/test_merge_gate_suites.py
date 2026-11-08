@@ -13,7 +13,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.gate_modules import discover_test_modules, test_module_name
-from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites
+from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
@@ -102,10 +102,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertIn("stopped", output.getvalue())
 
     def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
-        runner = self.checkout / "scripts/test_times/module_run.py"
-        source = Path(merge_gate.__file__).resolve().parents[1] / "test_times/module_run.py"
+        runner = install_test_runner(self.checkout)
         marker = self.state / "checkout-runner"
-        self.write(runner, source.read_text().replace(
+        self.write(runner, runner.read_text().replace(
             'if __name__ == "__main__":',
             f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
             + 'if __name__ == "__main__":'))

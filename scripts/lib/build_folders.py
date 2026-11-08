@@ -160,9 +160,7 @@ class BuildFolderSpec:
 def _settings() -> ConfigRead:
     from scripts.lib import conf
 
-    if "CONF_DIR" in os.environ and not conf.path("build_folders").exists():
-        return conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
-    return conf.read("build_folders")
+    return conf.read_or_repository("build_folders")
 
 
 def repository_key_for(name: str, identity: str) -> str:
@@ -299,18 +297,16 @@ OWNER_MARKER = ".build-folder-owner.json"
 
 def run_build(owner: str, name: str, command: Sequence[str]) -> int:
     """Keep the folder until the command and its descendants stop."""
-    import ctypes
     import json
     import subprocess
+    from scripts.lib.descendants import adopt_descendants
     from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
     if sys.platform != "linux":
         raise ValueError("run requires Linux descendant adoption")
-    # Linux subreapers adopt orphaned descendants, including children that create another session.
-    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
-        raise OSError(ctypes.get_errno(), "cannot adopt command descendants")
+    _ = adopt_descendants()
     settings = _settings()
     root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
     spec = BuildFolderSpec(kind="temporary", parent=root, repository=repository_key(Path.cwd()),

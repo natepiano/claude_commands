@@ -4,6 +4,8 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import fcntl
 import io
 import os
@@ -21,7 +23,9 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.lib import copy_record
-from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
+from scripts.production import (
+    showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
+)
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
@@ -64,6 +68,7 @@ DEMO_ID = fixture_runtime_id("showrunner::demo")
 def setUpModule() -> None:
     """The pin on the row `show` printed and the scratch folders a verdict removes are in a temporary
     folder, never ~/.local/state/next, /tmp/claude/scratch or ~/rust/repro."""
+    unittest.enterModuleContext(foreign_hostname())
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
@@ -146,7 +151,6 @@ class ProducerFixture(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "NEXT_STATE_DIR": str(self.root / "next")}))
-        _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Producer fixture")
         _ = self.git("config", "user.email", "producer@example.invalid")
@@ -173,7 +177,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-m",
             f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
         _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name}")
+        _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name} into main")
         _ = self.git("push", "origin", "main")
         return self.git("rev-parse", "HEAD")
 
@@ -212,6 +216,14 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.branch_unit("new", "unit", "branch-a", "branch-b.md")
         return self.branch_unit("second", "second", "branch-b", "second.md")
 
+    def unrelated_unit(self, name: str = "external-unit", plan: str = "external-plan.md") -> staff.StaffRow:
+        doc = self.root / "other.md"
+        _ = doc.write_text("# Other\n")
+        row = recorded_unit("other", name, self.root / "external", doc, plan=plan)
+        _ = subprocess.run(["git", "-C", str(self.root / "external"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        return row
+
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
         _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
@@ -220,10 +232,87 @@ class ProducerWriterTests(ProducerFixture):
 
     def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
         second = self.colliding_units()
-        _ = self.merge("branch-b")
+        _ = self.git("checkout", "-b", "checkpoints")
+        for name in ("branch-b", "branch-a"):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints into main")
+        _ = self.git("push", "origin", "main")
+        merged = self.git("rev-parse", "HEAD")
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
-        merge_checkpoint.record_publication_changes(production)
+        merge_checkpoint.record_publication_changes(
+            production, known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], second.id)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Producer"] for row in rows], [second.id, self.unit.id])
+        self.assertEqual([row["Production"] for row in rows], [production.owner.id, production.owner.id])
+
+    def test_publication_writes_an_unrelated_units_producer_and_production(self) -> None:
+        other = self.unrelated_unit()
+        _ = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], other.id)
+        assert isinstance(other.parent, staff.ReportsTo)
+        self.assertEqual(row["Production"], other.parent.id)
+
+    def test_publication_uses_the_live_unit_before_a_retired_unit_with_the_same_branch(self) -> None:
+        retired = self.unrelated_unit(name="retired-unit")
+        live_doc = self.root / "live.md"
+        _ = live_doc.write_text("# Live\n")
+        live = recorded_unit("live", "live-unit", self.root / "live", live_doc)
+        _ = subprocess.run(["git", "-C", str(self.root / "live"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}))
+        parked = unit_config.parked_path(retired.id)
+        parked.parent.mkdir(parents=True)
+        _ = parked.write_text((self.root / "external/.unit.toml").read_text()
+            + f'\n[retired]\ndate = "2026-11-05"\nsession = "{retired.current_session}"\nbranch = "external-branch"\n')
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "external"),
+                              expected=retired.worktree)
+        _ = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], live.id)
+        assert isinstance(live.parent, staff.ReportsTo)
+        self.assertEqual(row["Production"], live.parent.id)
+
+    def test_unit_producer_resolves_the_exact_staff_name_across_productions(self) -> None:
+        other = self.unrelated_unit()
+        for name, expected in (("new", self.unit.id), ("external-unit", other.id),
+                               ("new-unit", change_review.UNKNOWN_PRODUCER), ("external", change_review.UNKNOWN_PRODUCER)):
+            with self.subTest(name=name):
+                self.assertEqual(change_review.unit_producer(name), expected)
+
+    def test_unit_producer_returns_unknown_for_duplicate_and_absent_names(self) -> None:
+        _ = self.unrelated_unit(name="new")
+        for name in ("new", "absent"):
+            with self.subTest(name=name):
+                self.assertIs(change_review.unit_producer(name), change_review.UNKNOWN_PRODUCER)
+
+    def test_publication_keeps_the_scoped_alias_when_another_production_has_it(self) -> None:
+        other = self.unrelated_unit(plan="old-plan.md")
+        _ = self.git("checkout", "-b", "checkpoints")
+        for name in ("external-branch", "old-plan", "old"):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints into main")
+        _ = self.git("push", "origin", "main")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        merge_checkpoint.record_publication_changes(production)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Producer"] for row in rows], [other.id, self.unit.id, self.unit.id])
+        assert isinstance(other.parent, staff.ReportsTo)
+        assert isinstance(self.unit.parent, staff.ReportsTo)
+        self.assertEqual([row["Production"] for row in rows],
+                         [other.parent.id, self.unit.parent.id, self.unit.parent.id])
 
     def test_a_checkpoint_with_an_unmatched_branch_pattern_keeps_the_row_values_aligned(self) -> None:
         _ = self.git("checkout", "-b", "old-branch")
@@ -231,7 +320,7 @@ class ProducerWriterTests(ProducerFixture):
             _ = self.git("commit", "--allow-empty", "-m",
                          f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
         _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge all")
+        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge all into main")
         _ = self.git("push", "origin", "main")
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         merge_checkpoint.record_publication_changes(production)
@@ -239,7 +328,7 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual([row["Change"] for row in rows], ["First", "Unmatched", "Last"])
         self.assertEqual([row["Producer"] for row in rows], [self.unit.id, "", self.unit.id])
         assert isinstance(self.unit.parent, staff.ReportsTo)
-        self.assertEqual([row["Production"] for row in rows], [self.unit.id, self.unit.parent.id, self.unit.id])
+        self.assertEqual([row["Production"] for row in rows], [self.unit.parent.id] * 3)
 
 
     def test_a_verdict_preserves_the_producer_for_a_returning_row(self) -> None:
@@ -251,11 +340,38 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.root / "change-review - other.md").tab, "top")
 
     def test_merge_publication_writes_the_units_staff_id(self) -> None:
-        _ = self.merge()
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
-        merge_checkpoint.record_publication_changes(production)
+        for branch in ("old-branch", "natedev-shutdown"):
+            with self.subTest(branch=branch):
+                _ = subprocess.run(["git", "-C", str(self.root / "unit"), "branch", "-M", branch], check=True)
+                _ = self.merge(branch, change=branch)
+                merge_checkpoint.record_publication_changes(production)
+                row = change_review.pending(self.listing)[-1]
+                self.assertEqual(row["Producer"], self.unit.id)
+                self.assertNotIn(self.unit.name, row["Producer"])
+                self.assertEqual(row["Production"], production.owner.id)
+
+    def test_unit_merge_with_an_unmatched_slug_writes_the_units_staff_id(self) -> None:
+        merged = self.merge("unmatched-checkpoint-slug")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
+                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
+        unit = merge_checkpoint.unit_from_row(
+            self.unit, session_staff.RowResolver(staff.snapshot()))
+        assert isinstance(unit, merge_checkpoint.Unit)
+        request = merge_checkpoint.MergeRequest(
+            production, unit, "1", merged, merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
+            (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            merge_checkpoint.record_publication_changes(
+                request.production, record=request.staff_record,
+                known_producer=change_review.KnownMergeProducer(merged, request.unit.staff_id))
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertNotIn(self.unit.name, change_review.pending(self.listing)[0]["Producer"])
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], production.owner.id)
+        notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
+        self.assertEqual(notes, [])
 
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         _ = self.merge()
@@ -672,6 +788,7 @@ def origin_commits(root: Path) -> tuple[Path, str, str]:
 class ReadyListTests(ProducerFixture):
     repo: Path = Path()
     promotion: Path = Path()
+    listing: Path
 
     @override
     def setUp(self) -> None:
@@ -694,7 +811,7 @@ class ReadyListTests(ProducerFixture):
         environment = {**os.environ, "GIT_AUTHOR_DATE": day, "GIT_COMMITTER_DATE": day}
         message = f"checkpoint({branch}): visible change\n\n{lines}"
         for arguments in (("commit", "--allow-empty", "-m", message),
-                          ("checkout", "integration"), ("merge", "--no-ff", branch, "-m", f"Merge {branch}")):
+                          ("checkout", "integration"), ("merge", "--no-ff", branch, "-m", f"Merge {branch} into integration")):
             result = subprocess.run(["git", "-C", str(self.repo), *arguments], env=environment,
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -1020,37 +1137,98 @@ class ReadyListTests(ProducerFixture):
             + f"- **Showrunner checkout:** `{self.repo}`\n- **Merge branch:** `other-integration`\n"
             + f"- **Change review:** `{other_list}`\n")
         _ = recorded_unit("other", "foreign", self.root / "foreign", other_doc, plan="foreign.md")
+        root_doc = self.root / "root.md"
+        _ = root_doc.write_text("# Root\n")
+        _ = recorded_showrunner("root", root_doc)
+        _ = recorded_showrunner("top", self.doc, parent="root")
+        _ = recorded_showrunner("other", other_doc, parent="root")
+        shared_list = self.root / "change-review - root.md"
+        _ = self.doc.write_text(self.doc.read_text().replace(str(self.listing), str(shared_list)))
+        _ = other_doc.write_text(other_doc.read_text().replace(str(other_list), str(shared_list)))
+        self.listing = shared_list
         _ = self.git("checkout", "-b", "foreign")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(foreign): other\n\nChange-Review: Foreign | Read | Other")
+        foreign_changes = (("foreign", "Foreign", ""),
+                           ("unmatched-foreign-checkpoint", "Foreign unmatched",
+                            "\nChange-Review: Foreign held | Read | Restarted other | after restart"))
+        for branch, change, held in foreign_changes:
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({branch}): other\n\nChange-Review: {change} | Read | Other{held}")
         _ = self.git("checkout", "-b", "other-integration", "integration")
-        _ = self.git("merge", "--no-ff", "foreign", "-m", "Merge foreign")
+        _ = self.git("merge", "--no-ff", "foreign", "-m", "Merge foreign into other-integration")
         _ = self.git("push", "origin", "other-integration")
+        foreign_merge = self.git("rev-parse", "HEAD")
+        _ = self.git("checkout", "-b", "fast-forward-import", "integration")
+        _ = self.git("merge", "--ff-only", "other-integration")
+        _ = self.git("push", "origin", "fast-forward-import", "other-integration:main")
+        fast_forward_list = self.root / "change-review - fast-forward.md"
+        _ = fast_forward_list.write_text(change_review.skeleton(fast_forward_list, self.doc, change_review.today()))
+        before = fast_forward_list.read_bytes()
+        selections = (change_review.ReadinessScan(), change_review.CompletedStep(foreign_merge, "restart"))
+        for selection in selections:
+            with self.subTest(fast_forward=selection):
+                if isinstance(selection, change_review.CompletedStep):
+                    with self.assertRaisesRegex(change_review.ChangeReviewError, "no change waits"):
+                        _ = change_review.list_ready(self.repo, self.doc, "fast-forward-import",
+                                                    review_list=fast_forward_list, selection=selection)
+                else:
+                    self.assertEqual(change_review.list_ready(
+                        self.repo, self.doc, "fast-forward-import", review_list=fast_forward_list), [])
+                self.assertEqual(fast_forward_list.read_bytes(), before)
         _ = self.git("checkout", "integration")
-        _ = self.git("merge", "--no-ff", "other-integration", "-m", "Merge other production")
+        _ = self.git("merge", "--no-ff", "other-integration", "-m", "Merge imported checkpoints into integration")
         child_doc = self.root / "child.md"
         _ = child_doc.write_text(f"# Child\n- **Repository:** `{self.repo}`\n"
             + f"- **Showrunner checkout:** `{self.repo}`\n- **Merge branch:** `child-integration`\n- **Kind:** style\n")
         _ = recorded_unit("child", "child-unit", self.root / "child-unit", child_doc, plan="child-unit.md")
-        _ = recorded_showrunner("child", child_doc, parent="top")
+        child = recorded_showrunner("child", child_doc, parent="top")
         _ = self.git("checkout", "-b", "child-unit")
         _ = self.git("commit", "--allow-empty", "-m", "checkpoint(child-unit): handoff\n\nChange-Review: Child | Read | Attached")
         _ = self.git("checkout", "-b", "child-integration", "integration")
-        _ = self.git("merge", "--no-ff", "child-unit", "-m", "Merge child unit")
+        _ = self.git("merge", "--no-ff", "child-unit", "-m", "Merge child unit into child-integration")
         _ = self.git("push", "origin", "child-integration")
         _ = self.git("checkout", "integration")
-        _ = self.git("merge", "--no-ff", "child-integration", "-m", "Merge child hand-off")
-        _ = self.merge_change("Change-Review: Own | Read | Top result")
+        _ = self.git("merge", "--no-ff", "child-integration", "-m", "Merge child hand-off into integration")
+        merged = self.merge_change("Change-Review: Own | Read | Top result\n"
+                                   + "Change-Review: Own held | Read | Restarted result | after restart")
         self.promote()
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={
-            "top": self.doc, "other": other_doc, "child": child_doc}))
+            "root": root_doc, "top": self.doc, "other": other_doc, "child": child_doc}))
         self.assertEqual(self.ready()[0], 0)
-        self.assertEqual(run("list-ready", "--repo", str(self.repo), "--production", "other")[0], 0)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Child", "Own"])
-        self.assertEqual([row["Change"] for row in change_review.pending(other_list)], ["Foreign"])
-        before = self.listing.read_bytes(), other_list.read_bytes()
+        parent = unit_lookup.doc_owner(self.doc, staff.snapshot())
+        self.assertEqual([row["Production"] for row in change_review.pending(self.listing)], [child.id, parent.id])
+        isolated_list = self.root / "change-review - top-only.md"
+        _ = change_review.list_ready(self.repo, self.doc, "integration", review_list=isolated_list)
+        self.assertEqual([row["Change"] for row in change_review.pending(isolated_list)], ["Child", "Own"])
+        self.assertEqual(run("list-ready", "--repo", str(self.repo), "--production", "other")[0], 0)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Change"] for row in rows], ["Child", "Own", *(item[1] for item in foreign_changes)])
+        other = unit_lookup.doc_owner(other_doc, staff.snapshot())
+        self.assertEqual([row["Production"] for row in rows], [child.id, parent.id, other.id, other.id])
+        before = self.listing.read_bytes()
         self.assertEqual(self.ready()[0], 0)
         self.assertEqual(run("list-ready", "--repo", str(self.repo), "--production", "other")[0], 0)
-        self.assertEqual((self.listing.read_bytes(), other_list.read_bytes()), before)
+        self.assertEqual(self.listing.read_bytes(), before)
+        _ = self.git("checkout", "other-integration")
+        _ = self.git("merge", "--no-ff", "origin/main", "-m", "Merge main after publication")
+        _ = self.git("push", "origin", "other-integration")
+        _ = self.git("checkout", "integration")
+        cases = ((self.listing, ["Child", "Own", *(item[1] for item in foreign_changes)], merged[:8]),
+                 (isolated_list, ["Child", "Own"], merged))
+        for review_list, expected, checkpoint in cases:
+            with self.subTest(review_list=review_list):
+                before = review_list.read_bytes()
+                self.assertEqual(change_review.list_ready(
+                    self.repo, self.doc, "integration", review_list=review_list), [])
+                self.assertEqual(review_list.read_bytes(), before)
+                released = change_review.list_ready(
+                    self.repo, self.doc, "integration", review_list=review_list,
+                    selection=change_review.CompletedStep(checkpoint, "restart"))
+                self.assertEqual(len(released), 1)
+                rows = change_review.pending(review_list)
+                self.assertEqual([row["Change"] for row in rows], [*expected, "Own held"])
+                self.assertEqual(rows[-1]["Producer"], self.unit.id)
+                self.assertEqual(rows[-1]["Production"], parent.id)
 
 
 class MergedAddTests(unittest.TestCase):

@@ -24,6 +24,8 @@ The command acquires the publication lock once for each home.
 Reading, preparation, publication, sync, and cleanup run under that lock.
 The command rebuilds a changed file before publication.
 It never opens a session.
+`copies.py clone` inherits source trust from any Claude home and records trust in every existing account file.
+Clone removal deletes the complete project entry for its exact recorded folder key in every account file.
 
 ## Every account in one table
 
@@ -47,7 +49,7 @@ A noted account without a usable home has a `not set up` row when no home holds 
 Each role has a separate row.
 The first role row shows the account's values.
 Later rows show only the role and its counts.
-The text table puts counts in the Role cell, such as `units ✓ 21 (busy 5, shell 1, idle 15)`.
+The text table puts counts in the Role cell, such as `units ✓ 21 (busy 5, idle 15, paused 0, exited 1)`.
 A role appears on each account where its members run.
 `✓` marks its selected account, including when it has zero members.
 An account with one role or no role keeps its existing row.
@@ -80,10 +82,16 @@ Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `wee
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.
 Codex roles are `workers` or `spare`.
-Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, shell, idle, total}`.
-Claude sessions use their session-record state; stopped members use `shell`.
-Codex workers are busy while their turns run or start; otherwise, they are idle.
-Codex shell counts are null.
+Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, idle, paused, exited, total}`.
+Claude sessions use their session-record state for busy and idle counts.
+A unit or showrunner without a live session counts as exited on its selected role account.
+Absent units use the units account; absent showrunners use the showrunners account.
+`agents status` supplies no separate paused or exited state for these rows. Paused therefore stays 0.
+Mesh workers are busy while their turns run or start; otherwise, they are idle.
+Native Codex workers use the shared conversation snapshot and one herdr agent status read.
+Each process supplies its account through CODEX_HOME.
+Absent Codex workers do not count.
+Workers count only while live; paused and exited stay 0, and total equals busy plus idle.
 A role with no reported members has zero counts; `spare` has a null entry.
 Missing readings are null.
 Reset and read times are ISO 8601 UTC strings.
@@ -93,19 +101,19 @@ Codex `use_credits` is true unless its note says `use_credits: off`.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
-The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled.
+The accounts board orders its columns as account, left, role, busy, idle, paused, exited, total, resets, credits, enabled.
 Each role has a separate row with its own counts from natedev and the Mac.
 The first role row includes all account values.
 Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
 Spare counts are blank.
 Running Claude session records supply `busy` during a turn.
-Other running Claude sessions count as idle, including records with an old `shell` state.
-A missing messaging socket does not make a running Claude session count as shell.
-A stopped staff member counts as `shell` on its last saved launch account.
+Other running Claude sessions count as idle.
+A missing messaging socket does not make a running Claude session count as exited.
+A unit or showrunner without a live session counts as exited on its selected role account.
 Live process account settings take precedence over saved launch accounts.
 The Mac reads those settings through the kernel, without a subprocess for each member.
-Members without an observed account are not assigned to the selected account.
+A live member with an unreadable account remains unattributed.
 The detail view uses the same count snapshot as the main table.
 Missing activity counts as idle only when native evidence proves that the session runs.
 Worker displays read staff rows and panes through `worker_panes.observe` with one staff snapshot.
@@ -139,11 +147,11 @@ The count columns then show local counts only.
 A later successful fetch restores the combined counts on the next board tick.
 
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
-Each role value contains `busy`, `shell`, `idle`, and `total`.
+Each role value contains `busy`, `idle`, `paused`, `exited`, and `total`, in that order.
 The JSON omits unavailable machines from this field.
 Python combines the available machine counts once in `role_counts`, in role order.
 The board and text table read `role_counts` without combining machine records again.
-Claude shell counts include each available machine; Codex shell counts stay null.
+Each activity count includes every available machine.
 The JSON has no session identities or account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
@@ -304,11 +312,14 @@ Commands accept numbered accounts and launch groups; `default` refuses.
 
 ### Memory on a named account
 
-A session on `~/.claudeN` starts with two variables: `CLAUDE_CONFIG_DIR=~/.claudeN` and `CLAUDE_CODE_REMOTE_MEMORY_DIR=~/.claude`. The aliases, unit launches and `/shutdown restart` all set both.
+A session on `~/.claudeN` starts with two variables: `CLAUDE_CONFIG_DIR=~/.claudeN` and `CLAUDE_CODE_REMOTE_MEMORY_DIR=~/.claude`.
+The aliases, unit launches, and `/agents restart` set both variables.
 
 The second one is why memory writes do not ask. Claude Code saves a memory file without asking only when no link sits in the file's path, and `~/.claudeN/projects` is a link to `~/.claude/projects`. With the variable, the session uses `~/.claude/projects/<project>/memory/` itself, the folder every account shares.
 
-- A session started with `CLAUDE_CONFIG_DIR` alone asks on each memory write ("… which is a sensitive file"). No allow rule clears it: that check runs before allow rules. Restart the session through an alias or `/shutdown restart`.
+- A session with `CLAUDE_CONFIG_DIR` alone requests permission for each memory write ("… which is a sensitive file").
+  This check runs before allow rules.
+  Restart the session through an alias or `/agents restart`.
 - A session started before this change keeps asking until it is restarted.
 - The variable is not in Claude Code's public documentation. After a Claude Code update that brings the prompt back, check it first: in a scratch folder run `claude3 -p --permission-mode default` and ask it to write one `.md` file into the memory folder its prompt names.
 - Memory that a custom subagent keeps in its `local` scope is stored under `~/.claude/projects/<project>/agent-memory-local/` in these sessions, not in the project's `.claude/`.

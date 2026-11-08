@@ -255,16 +255,11 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             hold.active = False
 
 
-class ClaudeCompaction(Enum):
-    NATIVE = "Claude controls compaction"
-
-
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
-    compact_above_tokens: int | ClaudeCompaction
 
 
 @dataclass(frozen=True)
@@ -272,6 +267,18 @@ class PaneEvidence:
     panes: list[dict[str, object]]
     scan: herdr.RowPaneScan
     states: list[WorkerPane]
+    layout_terminals: frozenset[str]
+
+
+@dataclass(frozen=True)
+class SelectedWorkers:
+    """Judge only these workers from one complete pane read."""
+
+    names: frozenset[str]
+
+
+class AllWorkers(Enum):
+    CURRENT = "all workers"
 
 
 @dataclass(frozen=True)
@@ -324,10 +331,12 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr,
-                     read: PaneRead | PaneReadUnavailable) -> PaneEvidence:
+                     read: PaneRead | PaneReadUnavailable, *,
+                     selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
     workers = record.find(kind="worker", parent=parent)
+    selected = [row for row in workers if not isinstance(selection, SelectedWorkers) or row.name in selection.names]
     if isinstance(read, PaneReadUnavailable):
-        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in workers])
+        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected], frozenset())
     panes, scan, statuses = read.panes, read.scan, read.statuses
     parent_row = record.by_id(parent)
     unread = {item.pane for item in scan.unknown}
@@ -336,7 +345,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
         and _text(pane, "pane_id") in unread]
     parent_tabs = {_text(pane, "tab_id") for pane in parent_panes} - {""}
     states: list[WorkerPane] = []
-    for row in workers:
+    for row in selected:
         matches = scan.found.get(row.id, [])
         if len(matches) > 1:
             states.append(_uncertain(row, "duplicate native identities; panes retained"))
@@ -350,7 +359,10 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
             else:
                 states.append(OpenWorker(row, identity, terminal, statuses.get(identity, herdr.AgentStatus.UNKNOWN)))
             continue
-        labelled = [pane for pane in panes if pane.get("label") == row.name
+        labels = {row.name}
+        if isinstance(selection, SelectedWorkers) and parent_row is not None:
+            labels.add(f"{parent_row.name}-{row.name}")
+        labelled = [pane for pane in panes if pane.get("label") in labels
                     and _text(pane, "tab_id") in parent_tabs]
         related_unknown = [item for item in scan.unknown if any(
             _text(pane, "pane_id") == item.pane for pane in labelled)]
@@ -379,15 +391,40 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
             except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: {row.name}: {error}", file=sys.stderr)
                 states.append(ProcessUnknownWorker(row, identity, terminal, str(error)))
-        elif any(item.tab in parent_tabs for item in scan.unknown):
+        elif isinstance(selection, AllWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
             states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))
-    return PaneEvidence(panes, scan, states)
+    terminals: frozenset[str] = frozenset()
+    if isinstance(selection, SelectedWorkers):
+        labels = {label for row in workers for label in (row.name, f"{parent_row.name}-{row.name}" if parent_row else row.name)}
+        terminals = frozenset(_text(pane, "terminal_id") for pane in panes
+                               if pane.get("label") in labels and _text(pane, "tab_id") in parent_tabs)
+    return PaneEvidence(panes, scan, states, terminals)
 
 
-def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneEvidence:
-    return _parent_evidence(parent, record, client, _read_panes(record, client))
+def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
+              selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
+    return _parent_evidence(parent, record, client, _read_panes(record, client), selection=selection)
+
+
+class WorkerNotObserved(Enum):
+    CURRENT = "the worker has no observation"
+
+
+def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName]) -> list[WorkerPane]:
+    """Judge the requested rows from one complete identity scan."""
+    selection = SelectedWorkers(frozenset(name.value for name in names))
+    return _evidence(parent, record, _client(), selection=selection).states
+
+
+def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot) -> WorkerPane | WorkerNotObserved:
+    """Read all pane identities and judge the selected worker."""
+    current = record.by_id(row.id)
+    if current is None:
+        return WorkerNotObserved.CURRENT
+    states = observe_selected(parent, record, [WorkerName.parse(current.name)])
+    return next((state for state in states if state.row.id == current.id), WorkerNotObserved.CURRENT)
 
 
 def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
@@ -448,9 +485,13 @@ def _passes(run: Path) -> list[dict[str, object]]:
 
 
 def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+    def started_at(item: dict[str, object]) -> float:
+        value = item.get("started_at")
+        return value if isinstance(value, (int, float)) else float("-inf")
+
     no_pass: dict[str, object] = {}
-    return next((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                 or item.get("team_slot") == row.name), no_pass)
+    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
+                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
@@ -553,8 +594,7 @@ def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     settings = models_registry.LaunchSettings("codex", model, effort, "")
-    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan",
-                        conf.read("direct").whole("ASTRA_REVIEW_COMPACT_ABOVE_TOKENS"))
+    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
 
 
 def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
@@ -568,9 +608,7 @@ def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> La
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                            if settings.kind == "codex" else ClaudeCompaction.NATIVE)
-    return LaunchPolicy(settings, sandbox, permission, compact_above_tokens)
+    return LaunchPolicy(settings, sandbox, permission)
 
 
 def _policy_arguments(policy: LaunchPolicy) -> list[str]:
@@ -578,7 +616,6 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
                       "-c", f'model_reasoning_effort="{settings.effort}"',
-                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}",
                       "-c", "notice.hide_rate_limit_model_nudge=true"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
@@ -667,6 +704,8 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
+    workers.update(_text(pane, "pane_id") for pane in evidence.panes
+                   if _text(pane, "terminal_id") in evidence.layout_terminals and _text(pane, "tab_id") == tab)
     if not workers:
         return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, name)
     layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
@@ -760,7 +799,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     deadline = started + start_seconds
     client = _client()
     record = staff.snapshot()
-    evidence = _evidence(owner.id, record, client)
+    selection = SelectedWorkers(frozenset({name.value}))
+    evidence = _evidence(owner.id, record, client, selection=selection)
     current = next((state for state in evidence.states if state.row.name == name.value), None)
     row = current.row if current is not None else None
     if row is not None:
@@ -798,7 +838,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     return UnpublishedWorker(identity, str(error))
-                recovered = _evidence(owner.id, staff.snapshot(), client)
+                recovered = _evidence(owner.id, staff.snapshot(), client, selection=selection)
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
                 if isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
                     _layout(owner.id, recovered)
@@ -866,12 +906,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
-        if row is None and policy.settings.kind == "codex":
-            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                return UnpublishedWorker(launched.pane, launched.outcome.reason)
-            identity = _codex_start_session(client, launched.pane)
-        else:
-            identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        with herdr.launch_rollout_proof():
+            if row is None and policy.settings.kind == "codex":
+                if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                    return UnpublishedWorker(launched.pane, launched.outcome.reason)
+                identity = _codex_start_session(client, launched.pane)
+            else:
+                identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
         if row is not None and identity != row.current_session:
             return _uncertain(row, "launch proves another native session; pane retained")
         if row is None:
@@ -882,7 +923,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 else UnpublishedWorker(launched.pane, str(error)))
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason)
-    fresh = _evidence(owner.id, staff.snapshot(), client)
+    with herdr.launch_rollout_proof():
+        fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
     return result if isinstance(result, (OpenWorker, ProcessUnknownWorker, UncertainWorker)) else _uncertain(row, "agent launch is incomplete")
@@ -953,6 +995,7 @@ def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
     client = _client()
     selected = {item.terminal for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                 and item.row.reports_to(parent)}
+    selected.update(evidence.layout_terminals)
     panes = client.panes()
     tabs = {pane.get("tab_id", "") for pane in panes if pane.get("terminal_id", "") in selected}
     for tab in tabs - {""}:

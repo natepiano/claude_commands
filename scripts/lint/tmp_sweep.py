@@ -1119,10 +1119,7 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     if not dry_run:
         try:
             path = Path(entry.path)
-            if copy_record.copy_folder(path) == path.resolve():
-                scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
-            else:
-                scratch.remove_with_cargo_output(path, lambda folder: delete_tree(str(folder)))
+            scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
         except OSError as error:
             if os.path.lexists(entry.path):
                 result.failed.append(FailedEntry(path=entry.path, error=str(error)))

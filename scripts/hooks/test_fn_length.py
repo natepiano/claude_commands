@@ -15,9 +15,8 @@ from pathlib import Path
 from typing import Callable, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import fn_length_lib
+from scripts.hooks import fn_length_lib
 from scripts.hooks import hook_dispatch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -276,8 +275,8 @@ class FunctionScopeTests(SyntheticPackageTests):
         self.write_function(101)
         script = (
             "import sys\n"
-            "sys.path.insert(0, sys.argv[1])\n"
-            "import fn_length_lib\n"
+            "with open(sys.argv[1] + '/../lib/package_root.py') as package_root: exec(package_root.read(), {'__file__': package_root.name})\n"
+            "from scripts.hooks import fn_length_lib\n"
             "scope, functions = fn_length_lib.long_functions(sys.argv[2])\n"
             "if scope.enabled or functions:\n"
             "    raise RuntimeError('unexpected lint scope')\n"

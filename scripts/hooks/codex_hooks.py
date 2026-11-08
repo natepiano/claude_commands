@@ -17,7 +17,6 @@ except FileNotFoundError:
 import contextlib
 import json
 import os
-from pathlib import Path
 import selectors
 import shutil
 import subprocess
@@ -65,7 +64,6 @@ class CodexHook:
     @property
     def timeout(self) -> float:
         if self.name == "scratch-guard":
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.copies.copy_guard import hook_timeout
             return hook_timeout()
         return self._timeout
@@ -87,6 +85,8 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("build-hold-guard", ShellHookFront("pre-tool-use-build-hold-guard.sh"), "PreToolUse", 10, "Bash"),
     CodexHook("ste", PythonHookScript("session-start-ste.py"), "SessionStart", 10, "*"),
     CodexHook("ste-subagent", PythonHookScript("session-start-ste.py"), "SubagentStart", 10, "*"),
+    CodexHook("queue-start", PythonHookScript("codex-queue-drain.py"), "SessionStart", matcher="*"),
+    CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
 )
 
 

@@ -11,8 +11,8 @@ Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `commands/plan/phase_review.md`.
 
 <PhaseEnd>
-Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the
-next boundary instead of closing, even with no todo phase. Skip step 7 (shrink,
+Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the next boundary, even with no todo phase.
+Read `docs/direct/standing_plan_refill.md` for that rule. Skip step 7 (shrink,
 shrink commit and notice); never stage, commit or shrink the excluded plan or
 pinned rule files. A no-change ticket follows <CheckpointCommit/> step 6's
 ancestry-checked HEAD path with no code commit, push or merge request, then
@@ -70,7 +70,7 @@ Run these steps in order for each completed loop or verbose phase:
    turn holding on them. <DispatchContract/> allows this synchronous work after
    launch besides the main review.
 
-When no todo phase remains, run step 7, then <NextPhase/> for <FinalGate/>.
+When no todo phase remains, run step 7, then <NextPhase/> for <FinalGate/> in `docs/direct/final_gate_commit.md`.
 When a <PeriodicCI/> point is due (outside a production), run step 7 before
 step 6, so CI runs on a clean tree; then the CI point, then step 6.
 When a todo phase remains but verbose mode is outside an auto window, run step

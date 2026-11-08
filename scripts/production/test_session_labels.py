@@ -43,15 +43,16 @@ class NativeSessionLabelTests(StaffTestCase):
 
     def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
         from scripts.shutdown import pane_record
+        from scripts.shutdown.launch_names import LaunchNames
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
-        membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources(()))
+        names = LaunchNames(staff.snapshot())
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
             {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
             ["claude"])
         before = self.staff_file.read_bytes()
-        selected = membership.environment(launch)
+        selected = names.environment(launch)
         self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
                                     "ENABLE_TOOL_SEARCH": "true"})
         self.assertEqual(self.staff_file.read_bytes(), before)

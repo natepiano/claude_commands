@@ -4,6 +4,8 @@ Shutdown and build_hold use private records.
 The pane server supplies private process evidence."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import fixture_member
@@ -63,6 +65,7 @@ STOP_SESSION = stop_resume.stop
 
 
 def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
 
 

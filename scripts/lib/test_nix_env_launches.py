@@ -58,6 +58,7 @@ class HerdrLaunchTests(NixFixture):
         super().setUp()
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="fixture-server"))
         _ = self.enterContext(patch.object(herdr, "start_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = self.enterContext(patch.object(os, "execvp", side_effect=AssertionError("unexpected fixture attach")))
         _ = self.enterContext(patch.object(account, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")}))
 

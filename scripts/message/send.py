@@ -30,7 +30,8 @@ name is separate from the sender, who is named in the message. Delivery is read 
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
-Other `codex:` addresses queue through the shared Codex daemon.
+Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
+An absent staff recipient keeps its queue without selecting a session family.
 One staff snapshot selects each staff recipient.
 Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
@@ -137,6 +138,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
+from scripts.herdr.place import HerdrPlace
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start
@@ -405,7 +407,7 @@ def new_queue_order() -> QueueOrder:
             for queue in (STATE / "queue").glob("*.jsonl"):
                 try:
                     entries = read_queue(queue)
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
                 previous = max(previous, max((entry.get("send_order", 0) for entry in entries), default=0))
         order = QueueOrder(previous + 1)
@@ -600,11 +602,25 @@ class CodexSessionRecipient:
 
 
 @dataclass(frozen=True)
+class CodexPaneRecipient:
+    address: str
+    place: HerdrPlace
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class QueuedStaffRecipient:
+    address: str
+    name: str
+    session_id: str
+
+
+@dataclass(frozen=True)
 class PaneWorkerRecipient:
     row: staff.StaffRow
 
 
-SessionRecipient = ClaudeRecipient | CodexSessionRecipient
+SessionRecipient = ClaudeRecipient | CodexSessionRecipient | CodexPaneRecipient
 
 
 @dataclass(frozen=True)
@@ -643,7 +659,7 @@ class TransportQueueOwner:
 TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
 
 
-DeliveryRoute = SessionRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+DeliveryRoute = SessionRecipient | QueuedStaffRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -848,7 +864,7 @@ def _queued_message(value: object) -> QueuedMessage | None:
 def read_queue(path: Path) -> list[QueuedMessage]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
     messages = (_queued_message(loads(line)) for line in lines)
     return [message for message in messages if message is not None]
@@ -913,7 +929,7 @@ def enqueue(message: Message, reason: str, at: datetime, *,
                     continue
                 try:
                     queues.append((previous, read_queue(previous)))
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
         if message.key is not None and any(
             _matches_queued_key(old, message.key, recipient, own_path=previous == path)
@@ -960,7 +976,7 @@ def remove_queued_key(to: str, key: str, *,
         for path in candidates:
             try:
                 entries = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1646,30 +1662,53 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
     return code, lines
 
 
-def pending(to: str | None, *, emit: bool = False) -> str:
+@dataclass(frozen=True)
+class CodexQueueOwner:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class CodexHookContext:
+    event: Literal["SessionStart", "PostToolUse"]
+
+
+class PendingTextFormat(Enum):
+    TEXT = "text"
+
+
+def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
+            output: PendingTextFormat | CodexHookContext = PendingTextFormat.TEXT) -> str:
     """Print and clear queued messages for the selected session.
 
     Current staff owners also receive their messages from queues for previous sessions.
     Names from previous sessions remain eligible when no other live session uses them.
     """
-    records = sessions.live_sessions()
-    if to is None:
-        own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("pending without a name runs inside a live Claude session")
+    if isinstance(to, str) and to.startswith("codex:"):
+        to = CodexQueueOwner(to.removeprefix("codex:"))
+    if isinstance(to, CodexQueueOwner):
+        own = to.thread_id
+        keys = [f"session-{own}", f"session:{own}", f"codex:{own}", own]
     else:
-        session = sessions.addressed(to, records)
-    keys = [] if to is None else [to]
-    if session is not None:
-        taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
-        keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
-                *(name for name in session["formerNames"] if name not in taken), *keys]
+        records = sessions.live_sessions()
+        if to is None:
+            own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            session = next((record for record in records if own and record["sessionId"] == own), None)
+            if session is None:
+                raise ValueError("pending without a name runs inside a live Claude session")
+        else:
+            session = sessions.addressed(to, records)
+        keys = [] if to is None else [to]
+        own = session["sessionId"] if session is not None else ""
+        if session is not None:
+            taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
+            keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
+                    *(name for name in session["formerNames"] if name not in taken), *keys]
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     stable_values = set(keys)
-    if session is not None:
+    if own:
         try:
-            member = staff.snapshot().by_current_session(session["sessionId"])
+            membership = staff.local_snapshot() if isinstance(to, CodexQueueOwner) else staff.snapshot()
+            member = membership.by_current_session(own)
         except staff.StaffUnreadable:
             member = None
         if member is not None:
@@ -1683,7 +1722,7 @@ def pending(to: str | None, *, emit: bool = False) -> str:
             kept: list[QueuedMessage] = []
             try:
                 queued = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1717,7 +1756,9 @@ def pending(to: str | None, *, emit: bool = False) -> str:
             "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             for index, entry in enumerate(entries, 1))
         if emit and text:
-            print(text, flush=True)
+            rendered = (json.dumps({"hookSpecificOutput": {"hookEventName": output.event, "additionalContext": text}})
+                        if isinstance(output, CodexHookContext) else text)
+            print(rendered, flush=True)
         for path, kept in rewrites:
             _rewrite_queue(path, kept)
         return text
@@ -1776,6 +1817,8 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
         raise AssertionError("a messageable recipient needs an address")
     address = entry.reach.address
     if address.startswith("codex:"):
+        if isinstance(entry.pane, HerdrPlace):
+            return CodexPaneRecipient(address, entry.pane, address.removeprefix("codex:"))
         if not isinstance(entry.daemon, codex_daemon.CodexDaemon):
             usage_error(f"{address} has no owning Codex daemon")
         return CodexSessionRecipient(
@@ -2016,7 +2059,10 @@ def resolve_recipient(
             return RecipientLookupFailed(
                 f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
         if isinstance(member, staff.StaffRow):
-            return ClaudeRecipient(f"session:{member.current_session}")
+            address = f"session:{member.current_session}"
+            if sessions.addressed(address, records or []) is not None:
+                return ClaudeRecipient(address)
+            return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
         usage_error(f"no staff row or live session for {to!r}")
@@ -2934,6 +2980,14 @@ def send(options: Options) -> Result:
         return _send(options, membership=membership)
 
 
+def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -> None:
+    """Submit text and require the selected pane to start a turn."""
+    from scripts.herdr import herdr
+
+    herdr.Herdr(place.session).prompt(
+        place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "") -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
@@ -2947,8 +3001,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
             try:
-                herdr.Herdr(herdr.shared_session()).prompt(
-                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
+                _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
+                             target=str(worker.current_session), timeout=timeout)
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr.HerdrFailure, OSError) as error:
                 reason = str(error)
@@ -3000,7 +3054,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                  else UserDelivery())
     else:
         route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
-    destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -3074,6 +3128,18 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
+    elif isinstance(route, CodexPaneRecipient):
+        from scripts.herdr import herdr
+
+        try:
+            _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
+            result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
+        except (herdr.HerdrFailure, OSError) as error:
+            result = Result("failed", str(error))
+    elif isinstance(route, QueuedStaffRecipient):
+        result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
+                        + " so it is kept for it")
+        enqueue(message, result.detail, started, recipient=stable, order=order)
     elif isinstance(route, PaneWorkerRecipient):
         result = deliver_worker_text(route.row, membership, agent_text(message),
                                      sender=message.sender, timeout=options.timeout)

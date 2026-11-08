@@ -18,6 +18,7 @@ from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.build_steps import read_step_names
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
@@ -26,6 +27,49 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+
+    def test_local_and_cloud_places_survive_the_request_wire(self) -> None:
+        with AdmissionFixture() as fixture:
+            for place in (wire.LocalPlace(), wire.CloudPlace("aws")):
+                with self.subTest(place=place):
+                    request = replace(fixture.request(step="merge-gate"), place=place)
+                    parsed = wire.parse_request(wire.encode_request(request))
+                    self.assertEqual(parsed, request)
+                    assert isinstance(parsed, wire.AdmitRequest)
+                    self.assertEqual(parsed.place, place)
+
+    def test_cloud_rows_survive_view_and_mine_reply_wires(self) -> None:
+        from scripts.build_queue import cloud_progress, progress_profile
+
+        with AdmissionFixture() as fixture:
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            base = reply.reading
+            cloud_row = wire.CloudRow(wire.Owner(700001, "10"),
+                wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
+                wire.CloudPlace("aws"), NOW - 60, NOW - 50,
+                cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
+                progress_profile.ProgressCounter("modules", 7, 12), gate.ReadyForAdmission())
+            reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered,
+                diagnostics=base.diagnostics, cloud=(cloud_row,), cloud_slots=9, cloud_gate_stale_pushes=3)
+            for outcome in (wire.ViewReply(reading), wire.MineReply(reading)):
+                with self.subTest(reply=type(outcome).__name__):
+                    self.assertEqual(wire.parse_reply(wire.encode_reply(outcome)), outcome)
+
+    def test_cloud_slot_wait_survives_the_reply_wire(self) -> None:
+        reply = replace(wait_reply(gate.NeedsMemory()),
+            reason=wire.CloudSlotWait(9, 9), text="waits for a cloud slot: 9 of 9 in use")
+        self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+
+    def test_a_request_without_place_defaults_to_local(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            self.assertEqual(request.place, wire.LocalPlace())
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            data = cast(dict[str, object], envelope["data"])
+            del data["place"]
+            parsed = wire.parse_request(json.dumps(envelope) + "\n")
+            self.assertEqual(parsed, request)
 
     def test_codec_reuses_shared_records_only_within_one_encode(self) -> None:
         shared = {"name": "private", "values": [1, 2]}
@@ -154,7 +198,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
                 shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"))
+                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
                 self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
 
@@ -300,8 +344,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 
     def test_unknown_versions_and_malformed_envelopes_are_rejected(self) -> None:
         message = cast(dict[str, object], json.loads(wire.encode_request(wire.ViewRequest())))
-        message["v"] = 2
-        with self.assertRaisesRegex(ValueError, "client version 2, service supports 1..1"):
+        message["v"] = 3
+        with self.assertRaisesRegex(ValueError, "client version 3, service supports 1..2"):
             _ = wire.parse_request(json.dumps(message))
         for line in ("", "not json", "[]", '{}', '{"v":true}', '{"v":1,"type":"bump","data":{}}'):
             with self.subTest(line=line), self.assertRaises(ValueError):
@@ -329,9 +373,11 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), gate.EstimateExpired)
             zone = ZoneInfo("UTC")
-            self.assertEqual(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone),
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone))
-            self.assertTrue(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone).startswith("the estimate expired at"))
+            names = read_step_names()
+            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
+            self.assertEqual(shown,
+                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
+            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, gate.HeadExplanation)
             assert isinstance(local.head.cause, gate.EstimateExpired)
             assert isinstance(parsed.explanation.head, gate.HeadExplanation)

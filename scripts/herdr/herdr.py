@@ -152,6 +152,10 @@ class HerdrFailure(Exception):
         self.code: str = code
 
 
+class NativeRegistryUnavailable(ValueError):
+    """The process has no native registry identity."""
+
+
 class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
 
@@ -342,6 +346,7 @@ class OpeningPrompt:
     text: str
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
+    cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
@@ -369,6 +374,31 @@ class TranscriptCursor:
     sizes: dict[Path, int] = field(default_factory=dict)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def skip_existing_turns(self) -> None:
+        """Skip complete rows before launch without parsing historical JSON."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+            for path in paths:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, os.SEEK_END)
+                    position = size
+                    offset = 0
+                    while position:
+                        start = max(0, position - 4096)
+                        _ = stream.seek(start)
+                        chunk = stream.read(position - start)
+                        newline = chunk.rfind(b"\n")
+                        if newline >= 0:
+                            offset = start + newline + 1
+                            break
+                        position = start
+                    self.offsets[path] = offset
+                    self.sizes[path] = size
+        except OSError:
+            self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
@@ -863,10 +893,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -2205,10 +2248,11 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        cursor = (TranscriptCursor(opening.transcript, launched_at)
-                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        cursor = opening.cursor
+        if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
+            cursor = TranscriptCursor(opening.transcript, launched_at)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
@@ -2465,10 +2509,16 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
@@ -3312,6 +3362,24 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
     return files
 
 
+class RolloutProofPhase(Enum):
+    STABLE = "stable conversation"
+    LAUNCH = "conversation opening during launch"
+
+
+_rollout_proof_phase: ContextVar[RolloutProofPhase] = ContextVar("rollout_proof_phase", default=RolloutProofPhase.STABLE)
+
+
+@contextmanager
+def launch_rollout_proof() -> Generator[None]:
+    """Allow rollout descriptors to open within the launch proof deadline."""
+    token = _rollout_proof_phase.set(RolloutProofPhase.LAUNCH)
+    try:
+        yield
+    finally:
+        _rollout_proof_phase.reset(token)
+
+
 def codex_rollout_threads(pid: int) -> set[str]:
     """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
@@ -3352,7 +3420,8 @@ def codex_rollout_threads(pid: int) -> set[str]:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
         if current == files:
             break
-        if not current.items() < files.items() or time.monotonic() >= deadline:
+        opening = _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH and files.items() < current.items()
+        if (not current.items() < files.items() and not opening) or time.monotonic() >= deadline:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
@@ -3428,7 +3497,7 @@ def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProces
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
-            raise ValueError(f"pid {pid}: native registry identity is unavailable")
+            raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
         raise ValueError(f"pid {pid}: unknown agent kind {kind}")
@@ -5067,8 +5136,9 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
+        script = f"unalias {kind} 2>/dev/null; "
         if isinstance(destination, ExistingPane):
-            # Change the existing shell, so the canonical agent inherits the proved environment.
+            # Set the environment in the existing shell before the agent starts.
             environment = _pane_environment(prepared.env)
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
                                   if not key.startswith("HERDR_") or key == "HERDR_AGENT_PANE"])
@@ -5076,12 +5146,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                 "STAFF_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
             }) - {"TERM", "COLORTERM"}
-            script = (f"unalias {kind} 2>/dev/null; "
-                      "for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
+            script += ("for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-            client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
+        client.run_in_pane(pane, ["eval", script],
+                           terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
     except AgentExited:

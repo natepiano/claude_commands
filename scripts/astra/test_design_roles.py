@@ -10,7 +10,6 @@ from scripts.production.staff_test_support import (
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import conf
 
 import ast
 import io
@@ -18,7 +17,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
@@ -28,8 +26,6 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
@@ -234,8 +230,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
             self.assertEqual(arguments[arguments.index(permission_flag) + 1], permission)
             if family == "codex":
                 self.assertIn(f'model_reasoning_effort="{effort}"', arguments)
-                compact = conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                self.assertIn(f"model_auto_compact_token_limit={compact}", arguments)
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
             self.assertNotIn("STAFF_ID", environment)
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id)), 2)
 

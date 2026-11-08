@@ -10,11 +10,11 @@ import sys
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import assign
+from scripts.direct import assign, workers
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import commit_repository
@@ -25,6 +25,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_worker_records
+from scripts.whoami import agent_accounts
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,8 +66,41 @@ class LauncherScript:
 
 
 AssignmentExecution = InProcessAssignment | LauncherScript
-# Worker admission requires the actual assignment process.
+# Process cases keep the actual assignment launcher.
 DEFAULT_ASSIGNMENT_EXECUTION = LauncherScript(ASSIGN)
+
+
+def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Call the real coordinator and its synchronous Python commands."""
+    real_call = assign.call
+
+    def call(command: list[str], env: dict[str, str], *, capture: bool = False,
+             check: bool = True) -> subprocess.CompletedProcess[str]:
+        if command[1] == assign.PROGRESS:
+            result = invoke_recorder(command[2:], env, ROOT)
+        elif command[1] == str(assign.SCRIPTS / "workers.py"):
+            result = invoke_cli(workers, workers.main, command[2:], env, ROOT)
+        elif command[1] == assign.MESH:
+            result = invoke_cli(codex_mesh, codex_mesh.main, command[2:], env, ROOT)
+        else:
+            return real_call(command, env, capture=capture, check=check)
+        if not capture:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+        if check and result.returncode:
+            if capture:
+                print(result.stderr or result.stdout, file=sys.stderr, end="")
+            raise SystemExit(2)
+        return result
+
+    def follow(dispatch: assign.Dispatch, command: list[str], shown: str, log: Path) -> int:
+        del shown, log
+        return call(command, dispatch.env, check=False).returncode
+
+    # Process tests cover the ancestor check and the child lifecycle.
+    with (patch.object(assign, "require_live_director"),
+          patch.object(assign, "call", call), patch.object(assign.Dispatch, "follow", follow)):
+        return invoke_cli(assign, assign.main, arguments, environment, ROOT)
 
 
 def read_object(path: Path) -> dict[str, object]:
@@ -195,7 +229,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             arguments.extend(["--paths", str(self.paths)])
         arguments.extend(options)
         if isinstance(execution, InProcessAssignment):
-            return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+            return invoke_assignment(arguments, os.environ.copy())
         return self.run_launcher(["bash", str(execution.path), *arguments])
 
     def run_launcher(self, arguments: list[str], *, family: str = "codex",
@@ -203,29 +237,16 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         director = self.session_dir.parent / family
         if not director.exists():
             director.symlink_to(sys.executable)
-        completion = self.session_dir.parent / "launcher-exit"
         script = "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
-        if isolate_ancestors:
-            completion.unlink(missing_ok=True)
-            script = "\n".join((
-                "import os, select, subprocess, sys",
-                "from pathlib import Path",
-                "starter = os.pidfd_open(os.getpid())",
-                "if os.fork(): os._exit(0)",
-                # The pidfd becomes readable after the kernel reparents the child.
-                "select.select([starter], [], [])",
-                "os.close(starter)",
-                f"Path({str(completion)!r}).write_text(str(subprocess.call(sys.argv[1:])))",
-            ))
         command = [str(director), "-c", script, *arguments]
+        if isolate_ancestors:
+            command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc",
+                       str(director), "-c", script, *arguments]
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            if isolate_ancestors:
-                self.assertTrue(completion.exists(), output + errors)
-            code = int(completion.read_text()) if isolate_ancestors else child.returncode
-            return subprocess.CompletedProcess(arguments, code, output, errors)
+            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -290,3 +311,91 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             "assign.call = call",
         )))
         return prepared
+
+
+@dataclass(frozen=True)
+class FirstDispatchArtifact:
+    """A completed first dispatch publishes this file."""
+
+    relative: Path
+    content: bytes
+    mode: int
+
+
+def snapshot_files(root: Path) -> dict[Path, bytes]:
+    """Read regular files before a dispatch."""
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()}
+
+
+def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
+    """Keep files that the dispatch changed."""
+    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
+                 for relative, content in snapshot_files(root).items()
+                 if before.get(relative) != content)
+
+
+class FirstDispatchObservations(TypedDict):
+    requests: list[dict[str, object]]
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class CompletedFirstDispatch:
+    """Keep the real first dispatch output for later independent tests."""
+
+    root: Path
+    artifacts: tuple[FirstDispatchArtifact, ...]
+    observations: str
+
+
+class FirstDispatchFixture(AssignLauncherFixture):
+    """Copy completed first dispatch state before testing a later dispatch."""
+
+    first_dispatches: ClassVar[dict[tuple[str, ...], CompletedFirstDispatch]] = {}
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.first_dispatches = {}
+        cls.addClassCleanup(cls.first_dispatches.clear)
+
+    def first_assignment(self, role: str = "implement", *options: str) -> None:
+        root = self.session_dir.parent
+        key = (role, *options)
+        if key not in self.first_dispatches:
+            before = snapshot_files(root)
+            _ = self.successful(role, *options)
+            artifacts = changed_files(root, before)
+            observations: FirstDispatchObservations = {
+                "requests": self.server.requests, "turn_starts": self.turn_starts,
+                "turn_inputs": self.turn_inputs, "started_turns": self.started_turns,
+                "claims": self.claims, "reservations": self.reservations,
+            }
+            self.first_dispatches[key] = CompletedFirstDispatch(root, artifacts, json.dumps(observations))
+            return
+        completed = self.first_dispatches[key]
+        for artifact in completed.artifacts:
+            path = root / artifact.relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(artifact.content.replace(os.fsencode(completed.root), os.fsencode(root)))
+            path.chmod(artifact.mode)
+        saved = cast(FirstDispatchObservations, json.loads(
+            completed.observations.replace(str(completed.root), str(root))))
+        self.server.requests = saved["requests"]
+        self.turn_starts = saved["turn_starts"]
+        self.turn_inputs = saved["turn_inputs"]
+        self.started_turns = saved["started_turns"]
+        self.claims = saved["claims"]
+        self.reservations = saved["reservations"]
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home())

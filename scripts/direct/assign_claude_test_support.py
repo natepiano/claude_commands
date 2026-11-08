@@ -10,6 +10,7 @@ from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.test_models_registry import registry_text, write_registry
 
+from dataclasses import dataclass
 from functools import cached_property
 import json
 import os
@@ -17,9 +18,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.direct.assign_launcher_test_support import changed_files, snapshot_files
 from scripts.lib.atomic_file import write_text_atomic
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -135,10 +137,58 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
+@dataclass(frozen=True)
+class LauncherSetupFile:
+    relative: Path
+    content: bytes
+    mode: int
+
+
+@dataclass(frozen=True)
+class CompletedLauncherSetup:
+    root: Path
+    files: tuple[LauncherSetupFile, ...]
+    result: subprocess.CompletedProcess[str]
+    parent: str
+
+
 class AssignClaudeLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
     assign_script: Path = Path()
+    completed_setups: ClassVar[dict[str, CompletedLauncherSetup]] = {}
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.completed_setups = {}
+        cls.addClassCleanup(cls.completed_setups.clear)
+
+    def first_worker_launch(self, *, repair: bool = False) -> tuple[Path, subprocess.CompletedProcess[str]]:
+        """Copy the real first launch state before a later launch."""
+        key = "repair" if repair else "first"
+        session = self.root / "first-launch"
+        if key not in self.completed_setups:
+            before = snapshot_files(self.root)
+            if repair:
+                session, result = self.first_worker_launch()
+                self.open_repair_round(session)
+            else:
+                session = self.start_phase("first-launch")
+                result = self.worker_launch(session)
+            files = tuple(LauncherSetupFile(artifact.relative, artifact.content, artifact.mode)
+                          for artifact in changed_files(self.root, before))
+            self.completed_setups[key] = CompletedLauncherSetup(self.root, files, result, self.staff_parent)
+        else:
+            completed = self.completed_setups[key]
+            for artifact in completed.files:
+                path = self.root / artifact.relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_bytes(artifact.content.replace(os.fsencode(completed.root), os.fsencode(self.root)))
+                path.chmod(artifact.mode)
+            self.__dict__["staff_parent"] = completed.parent
+        return session, self.completed_setups[key].result
 
     @override
     def setUp(self) -> None:

@@ -115,7 +115,7 @@ next run, so a change is immediate:
 
 Use `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]`.
 Without a package, lint covers the workspace. `--check` prevents repairs with
-or without a package. See `<VerificationContract/>` in `commands/unit/direct.md`
+or without a package. See `<VerificationContract/>` in `docs/direct/verification.md`
 for all command forms.
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
@@ -477,7 +477,7 @@ Rsync replaces complete files and preserves this host's append files.
 `SLOW_TEST_S` sets the minimum gate test time retained in the build log.
 `NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
-`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
+`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 
@@ -500,7 +500,7 @@ agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
 `UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
-`<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
+`<CodexDispatchWait/>` in `docs/direct/codex_dispatch_wait.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
 

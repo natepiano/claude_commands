@@ -23,7 +23,12 @@ export interface BoardEta {
   fix_done: number; fix_running: number;
 }
 export type BoardStep = [state: string, what: string, started: BoardTime, took_seconds: number];
-export interface BoardWorker { name?: string; slot: string; role: string; state: string; model: string; effort?: string; doing: string }
+export type RunGrowth =
+  | { kind: 'measured'; cpu_percent: number; log_bytes_per_minute: number }
+  | { kind: 'first_reading' }
+  | { kind: 'finished'; exit_code: number };
+export interface WorkerRun { label: string; started_at: number; growth: RunGrowth; last_line: string }
+export interface BoardWorker { name?: string; slot: string; role: string; state: string; model: string; effort?: string; doing: string; run?: WorkerRun }
 export interface PlanPhase { kind: 'plan'; id: string; of: number; title: string }
 export interface TicketPhase { kind: 'ticket'; id: string; title: string; merged: number }
 export interface BoardUnit {
@@ -34,6 +39,6 @@ export interface BoardUnit {
 }
 export interface BoardData {
   production: string; as_of: BoardTime; zone: string; utc_offset_minutes: number;
-  units: BoardUnit[]; sources: string[];
+  units: BoardUnit[]; sources: string[]; live: boolean;
 }
 export interface BoardResult { files: string[]; watch: string[] }

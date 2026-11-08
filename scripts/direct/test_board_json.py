@@ -13,17 +13,21 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.direct import board_json
+from scripts.direct import board_json, worker_runs
+from scripts.agents.codex_mesh import DETACHED_RUNS_DIR
+from scripts.agents.mesh_runs import RunRecord
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
@@ -40,6 +44,18 @@ from scripts.production import display_cells
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"
 NOW = int(datetime(2026, 10, 16, 18, tzinfo=UTC).timestamp())
+
+
+def unavailable_process_stat(pid: int) -> worker_runs.ProcessStatUnavailable:
+    return worker_runs.ProcessStatUnavailable(f"fixture pid {pid}")
+
+
+@contextmanager
+def fixture_run_readings() -> Generator[None]:
+    """Keep board fixtures on their supplied ps readings."""
+    factory = partial(worker_runs.BoardRunReadings, stat_reader=unavailable_process_stat)
+    with patch.object(worker_runs, "BoardRunReadings", side_effect=factory):
+        yield
 
 
 def object_fields(value: object) -> dict[str, object]:
@@ -95,6 +111,7 @@ class BoardJsonTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fixture_run_readings())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
         config.mkdir()
@@ -357,6 +374,33 @@ class BoardJsonTests(unittest.TestCase):
             encoding="utf-8",
         )
         return directory
+
+    def pane_session(self, fixture: ProductionFixture, name: str = "current") -> tuple[Path, staff.StaffRow, staff.StaffRow]:
+        directory = self.session_files(name)
+        parent = self.unit_member(fixture.name)
+        worker = fixture_worker("reader", parent.id)
+        write_text_atomic(directory / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+        write_text_atomic(directory / "worker_transport", "herdr\n")
+        return directory, parent, worker
+
+    def detached_run(self, directory: Path, worker: staff.StaffRow, *,
+                     status: Literal["running", "finished"] = "running") -> Path:
+        runs = directory / DETACHED_RUNS_DIR
+        runs.mkdir(exist_ok=True)
+        log = runs / "checks.log"
+        record: RunRecord = {
+            "run_id": directory.name + "-checks", "status": status, "session_dir": str(directory),
+            "worker": worker.name, "staff_id": worker.id, "label": "Python tests",
+            "command": ["python3", "-m", "unittest"], "log": str(log),
+            "started_at": NOW - 120, "pid": 912_345, "director_dir": "", "done_message_file": "",
+        }
+        if status == "finished":
+            record["finished_at"] = datetime.fromtimestamp(NOW - 20, UTC).isoformat()
+            record["exit_code"] = 1
+            record["delivery"] = "queued for director"
+        _ = (runs / "checks.json").write_text(json.dumps(record), encoding="utf-8")
+        _ = log.write_text("\x1b[32mchecking fixture\x1b[0m\n\n", encoding="utf-8")
+        return log
 
     @contextmanager
     def source_readers(self) -> Generator[None]:
@@ -1513,6 +1557,134 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(object_fields(eta["finished"])["at"], NOW - 4_080)
         self.assertEqual(eta["delta_minutes"], 2)
 
+    def test_idle_pane_waits_on_its_run_with_measured_growth_and_live_refresh(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory, parent, worker = self.pane_session(fixture)
+        pane = worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.IDLE)
+        table = worker_runs.parse_process_table("912345 1 00:01\n912346 912345 00:02\n")
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [pane]}), patch.object(
+                worker_runs, "read_process_table", return_value=table) as process:
+            start = time.perf_counter()
+            no_run, _ = self.unit(fixture)
+            no_run_seconds = time.perf_counter() - start
+            self.assertFalse(no_run["live"])
+            self.assertEqual(process.call_count, 0)
+            self.assertFalse((self.output / "run_readings.json").exists())
+            log = self.detached_run(directory, worker)
+            start = time.perf_counter()
+            first, unit = self.unit(fixture)
+            run_seconds = time.perf_counter() - start
+            self.assertEqual(process.call_count, 1)
+            self.assertTrue(first["live"])
+            row = object_fields(array_items(unit["workers"])[0])
+            self.assertEqual(row["state"], "waiting on run")
+            self.assertEqual(row["run"], {
+                "label": "Python tests", "started_at": NOW - 120,
+                "growth": {"kind": "first_reading"}, "last_line": "checking fixture",
+            })
+            self.assertIn(str(directory / DETACHED_RUNS_DIR / "checks.json"), array_items(first["sources"]))
+            self.assertNotIn(str(self.output / "run_readings.json"), array_items(first["sources"]))
+            self.assertNotIn(str(self.output), array_items(first["sources"]))
+            with log.open("a", encoding="utf-8") as stream:
+                _ = stream.write("z" * 99 + "\n")
+            process.return_value = worker_runs.parse_process_table("912345 1 00:03\n912346 912345 00:05\n")
+            self.environment["UNIT_NOW_EPOCH"] = str(NOW + 10)
+            second, unit = self.unit(fixture)
+            self.assertTrue(second["live"])
+            self.assertEqual(process.call_count, 2)
+            row = object_fields(array_items(unit["workers"])[0])
+            self.assertEqual(object_fields(row["run"])["growth"], {
+                "kind": "measured", "cpu_percent": 50, "log_bytes_per_minute": 600,
+            })
+        print(f"board build: no running run {no_run_seconds:.4f}s; one running run {run_seconds:.4f}s")
+
+    def test_production_subtree_uses_one_process_snapshot_for_all_workers(self) -> None:
+        parent_fixture = self.production("parent")
+        child_fixture = self.production("child")
+        self.attach(child_fixture.name, parent_fixture.name)
+        panes: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {}
+        for fixture, name in ((parent_fixture, "current"), (child_fixture, "child-run")):
+            _ = self.write_run(fixture, self.delivery_events(), name=name)
+            directory, parent, worker = self.pane_session(fixture, name)
+            _ = self.detached_run(directory, worker)
+            panes[parent.id] = [worker_panes.OpenWorker(worker, "pane-" + name, "terminal", herdr.AgentStatus.IDLE)]
+        table = worker_runs.parse_process_table("912345 1 00:01\n")
+        with patch.object(worker_panes, "observe_parents", return_value=panes), patch.object(
+                worker_runs, "read_process_table", return_value=table) as process:
+            _, documents = self.generate("--production", parent_fixture.name)
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual([document["production"] for document in documents], ["parent", "child"])
+        for document in documents:
+            unit = object_fields(array_items(document["units"])[0])
+            self.assertEqual(object_fields(array_items(unit["workers"])[0])["state"], "waiting on run")
+            self.assertTrue(document["live"])
+
+    def test_queued_run_result_clears_on_the_workers_new_pass(self) -> None:
+        fixture = self.production()
+        events = self.delivery_events()
+        _ = self.write_run(fixture, events)
+        directory, parent, worker = self.pane_session(fixture)
+        _ = self.detached_run(directory, worker, status="finished")
+        pane = worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.IDLE)
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [pane]}), patch.object(
+                worker_runs, "read_process_table", side_effect=AssertionError("finished run needs no ps")):
+            document, unit = self.unit(fixture)
+            row = object_fields(array_items(unit["workers"])[0])
+            self.assertEqual(row["state"], "result queued")
+            self.assertEqual(object_fields(row["run"])["growth"], {"kind": "finished", "exit_code": 1})
+            self.assertFalse(document["live"])
+            self.assertFalse((self.output / "run_readings.json").exists())
+            events.append(self.event("pass_started", NOW - 10, worker_id=worker.id,
+                                     pass_instance_id="next-check", pass_kind="test"))
+            _ = self.write_run(fixture, events)
+            document, unit = self.unit(fixture)
+        row = object_fields(array_items(unit["workers"])[0])
+        self.assertEqual(row["state"], "idle")
+        self.assertNotIn("run", row)
+        self.assertFalse(document["live"])
+
+    def test_board_live_flag_follows_working_waiting_and_gone_workers(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory, parent, worker = self.pane_session(fixture)
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [
+                worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.WORKING)]}):
+            document, unit = self.unit(fixture)
+        self.assertTrue(document["live"])
+        self.assertEqual(object_fields(array_items(unit["workers"])[0])["state"], "working")
+        _ = self.detached_run(directory, worker)
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [
+                worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.IDLE)]}), patch.object(
+                worker_runs, "read_process_table", return_value={}):
+            document, unit = self.unit(fixture)
+        self.assertFalse(document["live"])
+        self.assertEqual(object_fields(array_items(unit["workers"])[0])["state"], "run gone")
+
+    def test_failed_process_snapshot_keeps_the_board_live_until_a_good_snapshot(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory, parent, worker = self.pane_session(fixture)
+        _ = self.detached_run(directory, worker)
+        pane = worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.IDLE)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["ps"], 1, "", "process table unavailable")):
+            failed = worker_runs.read_process_table()
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [pane]}), patch.object(
+                worker_runs, "read_process_table", return_value=failed) as process:
+            document, unit = self.unit(fixture)
+            self.assertTrue(document["live"])
+            row = object_fields(array_items(unit["workers"])[0])
+            self.assertEqual(row["state"], "waiting on run")
+            self.assertEqual(object_fields(row["run"])["growth"], {"kind": "first_reading"})
+            self.assertFalse((self.output / "run_readings.json").exists())
+
+            process.return_value = worker_runs.parse_process_table("")
+            document, unit = self.unit(fixture)
+            self.assertEqual(process.call_count, 2)
+            self.assertFalse(document["live"])
+            self.assertEqual(object_fields(array_items(unit["workers"])[0])["state"], "run gone")
+
     def test_workers_read_models_and_only_their_latest_board_message(self) -> None:
         fixture = self.production()
         _ = self.write_run(fixture, self.delivery_events())
@@ -1785,6 +1957,20 @@ class BoardJsonTests(unittest.TestCase):
         _ = self.ledger(fixture)
         document, _ = self.unit(fixture)
         samples.append(document)
+        directory, parent, worker = self.pane_session(fixture)
+        pane = worker_panes.OpenWorker(worker, "pane-test", "terminal", herdr.AgentStatus.IDLE)
+        _ = self.detached_run(directory, worker)
+        table = worker_runs.parse_process_table("912345 1 00:01\n")
+        with patch.object(worker_panes, "observe_parents", return_value={parent.id: [pane]}), patch.object(
+                worker_runs, "read_process_table", return_value=table):
+            document, _ = self.unit(fixture)
+            samples.append(document)
+            self.environment["UNIT_NOW_EPOCH"] = str(NOW + 10)
+            document, _ = self.unit(fixture)
+            samples.append(document)
+            _ = self.detached_run(directory, worker, status="finished")
+            document, _ = self.unit(fixture)
+            samples.append(document)
         declared = set(re.findall(r"\b([A-Za-z_]\w*)\??\s*:", CONTRACT.read_text(encoding="utf-8")))
 
         def check_fields(value: object, location: str) -> None:
@@ -1801,6 +1987,11 @@ class BoardJsonTests(unittest.TestCase):
 
 
 class PaneBoardTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(fixture_run_readings())
+
     def pane_run(self) -> tuple[Path, staff.StaffRow, staff.StaffRow]:
         parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         worker = fixture_worker("reader", parent.id)

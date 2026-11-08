@@ -398,20 +398,27 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(client.closed, ["w1:p2"], output)
 
     def test_restore_reuses_worker_shell(self) -> None:
+        from scripts.direct import progress_history
         from scripts.herdr import test_worker_panes, worker_panes
+        from scripts.production import worker
 
         fixture = test_worker_panes.WorkerPaneTests("runTest")
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", side_effect=staff.snapshot))
         row = fixture.worker(family="codex")
         fixture.world.add(row, "w1:p1", live=False, family="codex")
-        fixture.dispatch(row, "impl", completed=True)
-        write_text_atomic(fixture.root / "run/worker_transport", "herdr\n")
+        run = fixture.run_state()
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        _ = progress_history.begin_dispatch(run, slot=row.name, phase="earlier", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["bash", "assign.sh", "impl", str(prompt)],
+            prompt=prompt, kind="impl", lens="")
         pane_record.write("agents", pane_record.launch("w1:p1", str(row.current_session), str(fixture.root),
             {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)]))
         before = fixture.world.panes()
-        with (mock.patch.object(staff, "initial_snapshot", side_effect=staff.snapshot),
-              mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+              mock.patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
@@ -444,6 +451,11 @@ class PaneRestoreTests(unittest.TestCase):
 
 @final
 class RestoreStaffNamesTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "run_in_pane"))
+
     def saved_batch(self, *, machine: Literal["natedev", "mac"] = "natedev") -> tuple[Path, FakeClient]:
         parent, unit, worker = self.tree()
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
@@ -472,7 +484,6 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
-        _ = self.enterContext(mock.patch.object(FakeClient, "run_in_pane"))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
         unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))

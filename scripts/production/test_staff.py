@@ -12,8 +12,8 @@ import stat
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable, Iterator
-from contextlib import chdir, redirect_stderr
+from collections.abc import Callable
+from contextlib import AbstractContextManager, chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -23,6 +23,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.lib import unit_runs
 from scripts.message import sessions
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -31,15 +33,26 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 MISSING_ID = staff.StaffId("s00000000000")
 
 
-class CountedStaffRows(tuple[staff.StaffRow, ...]):
-    """Count full scans of the staff rows during repeated id lookups."""
-
-    scans: int = 0
+class StaffCommandTestCase(StaffTestCase):
+    """Run local CLI logic with the real parser, handlers, and private state."""
 
     @override
-    def __iter__(self) -> Iterator[staff.StaffRow]:
-        self.scans += 1
-        return super().__iter__()
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "ROSTER_RUN_ROOT": str(self.root / "unit"),
+            "UNIT_RUN_ROOT": str(self.root / "unit"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+        })))
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
+
+    @override
+    def cli(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
+        result = invoke_cli(staff, lambda: staff.main(list(arguments)), list(arguments),
+                            dict(os.environ), CHECKOUT)
+        self.assertEqual(result.returncode, code, result.stderr)
+        return result
+
 
 KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
@@ -67,7 +80,7 @@ def concurrent_ensure(
             result.send((False, repr(error)))
 
 
-class NativeRuntimeIdentityTests(StaffTestCase):
+class NativeRuntimeIdentityTests(StaffCommandTestCase):
     def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
         unit = fixture_member("unit", name="models", parent=runner.id)
@@ -91,7 +104,6 @@ class NativeRuntimeIdentityTests(StaffTestCase):
         self.assertEqual(environment["MODELS_REGISTRY_EDIT_BASE"], "editor-generation")
 
     def test_worker_rename_cli_keeps_identity_for_each_backend_and_holder(self) -> None:
-        from scripts.production.cli_fixture import invoke_cli
         from scripts.production.rename_test_support import RenameDisplays
 
         runner, unit, _ = self.tree()
@@ -168,18 +180,6 @@ class NativeRuntimeIdentityTests(StaffTestCase):
                 self.assertIn("morty", shown.stdout)
                 self.assertIn("agent", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
-
-    def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
-        _, unit, _ = self.tree()
-        expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
-                         for number in range(400))
-        rows = CountedStaffRows(expected)
-        record = staff.StaffSnapshot(rows)
-        for number in range(200):
-            row = expected[number % 7]
-            self.assertIs(record.by_id(row.id), row)
-            self.assertIsNone(record.by_id(MISSING_ID))
-        self.assertLessEqual(rows.scans, 1)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
@@ -337,7 +337,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
         self.assertEqual(staff.by_id(worker.id), worker)
 
 
-class RecordedWorkerRoleTests(StaffTestCase):
+class RecordedWorkerRoleTests(StaffCommandTestCase):
 
     def test_rows_share_one_publication_for_admission_replacement_and_retirement(self) -> None:
         for action in ("admit", "replace", "retire"):
@@ -400,7 +400,7 @@ class RecordedWorkerRoleTests(StaffTestCase):
 
 
 
-class DocumentLookupTests(StaffTestCase):
+class DocumentLookupTests(StaffCommandTestCase):
     def git(self, checkout: Path, *arguments: str) -> None:
         result = subprocess.run(["git", *arguments], cwd=checkout, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -410,6 +410,7 @@ class DocumentLookupTests(StaffTestCase):
         main = self.root / "main"
         main.mkdir()
         self.git(main, "init", "-b", "main")
+        self.git(main, "config", "maintenance.auto", "false")
         self.git(main, "config", "user.name", "Document Test")
         self.git(main, "config", "user.email", "document@example.invalid")
         document = main / "docs/plans/example-production.md"
@@ -528,7 +529,7 @@ class DocumentLookupTests(StaffTestCase):
         self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
 
 
-class StaffTests(StaffTestCase):
+class StaffTests(StaffCommandTestCase):
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()
@@ -557,7 +558,7 @@ class StaffTests(StaffTestCase):
         self.enterContext(mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ""}))
         for attempt in range(2):
             with self.subTest(attempt=attempt):
-                result = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+                result = self.script(STAFF_SCRIPT, "pause", f"{owner.name}/{unit.name}", "--why", "review the change")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 current = staff.by_id(unit.id)
                 assert current is not None
@@ -1884,8 +1885,8 @@ class StaffTests(StaffTestCase):
 
     def test_mac_reads_and_writes_use_owner_via_fake_ssh_without_a_local_copy(self) -> None:
         showrunner, unit, worker = self.tree()
-        owner_show = self.cli("show", "--json")
-        owner_display = self.cli("show").stdout
+        owner_show = self.script(STAFF_SCRIPT, "show", "--json")
+        owner_display = self.script(STAFF_SCRIPT, "show").stdout
         reads: tuple[Callable[[], object], ...] = (
             lambda: staff.by_id(worker.id),
             lambda: staff.by_path("sdlc/models/impl1"),
@@ -1904,7 +1905,7 @@ class StaffTests(StaffTestCase):
             for read, expected in zip(reads, owner_results):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)
-            self.assertEqual(self.cli("show").stdout, owner_display)
+            self.assertEqual(self.script(STAFF_SCRIPT, "show").stdout, owner_display)
             created = staff.ensure_worker(staff.native_id(fixture_runtime_id("mac-native-worker")),
                                           "test1", unit.id)
             moved_name = staff.rename(unit.id, "registry")

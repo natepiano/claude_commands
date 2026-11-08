@@ -244,6 +244,11 @@ class NotDaemonSession:
 
 
 @dataclass(frozen=True)
+class NoHerdrPane:
+    """This session has no herdr pane route."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -259,6 +264,7 @@ class RosterEntry:
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
 
 
 @dataclass(frozen=True)
@@ -412,6 +418,7 @@ class SnapshotEntry(TypedDict):
     session: dict[str, str]
     account: NotRequired[dict[str, str]]
     daemon: NotRequired[dict[str, str]]
+    pane: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
@@ -441,6 +448,8 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         session=_tagged_state(entry.session), account=_tagged_state(entry.account),
         daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
                 if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
+        pane=({"session": entry.pane.session, "pane": entry.pane.pane}
+              if isinstance(entry.pane, herdr.HerdrPlace) else {}),
     )
 
 
@@ -503,8 +512,8 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account", "daemon"}
-    if not required <= set(values) or set(values) - required - {"account", "daemon"}:
+    required = set(SnapshotEntry.__annotations__) - {"account", "daemon", "pane"}
+    if not required <= set(values) or set(values) - required - {"account", "daemon", "pane"}:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -515,6 +524,11 @@ def _decode_entry(value: object) -> RosterEntry:
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
+    if "pane" in values:
+        place = _snapshot_object(values["pane"])
+        if place:
+            pane = herdr.HerdrPlace(_snapshot_string(place, "session"), _snapshot_string(place, "pane"))
     if "daemon" in values:
         owner = _snapshot_object(values["daemon"])
         if owner:
@@ -540,7 +554,7 @@ def _decode_entry(value: object) -> RosterEntry:
         role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed, daemon=daemon,
+        thread=thread, session=session, account=attributed, daemon=daemon, pane=pane,
     )
 
 
@@ -1263,7 +1277,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = ()) -> Roster:
-    """Interactive Codex panes have no messaging address; preserve partial reads."""
+    """Use the reported session or the pane process to address Codex."""
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
@@ -1293,13 +1307,25 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
             if agent.get("agent") != "codex":
                 continue
             pane = agent["pane_id"]
+            report = agent["agent_session"]
+            thread: CodexThread | NoCodexThread = NoCodexThread()
+            if isinstance(report, herdr.ReportedAgentSession):
+                thread = CodexThread(report.session_id)
+            else:
+                try:
+                    thread = CodexThread(herdr.Herdr(name).native_pane_process(
+                        pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
+                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                    pass
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
                 continue
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
                 name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
-                reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
+                reach=(Messageable(f"codex:{thread.thread_id}") if isinstance(thread, CodexThread)
+                       else CannotReceiveMessages("interactive Codex in a herdr pane")),
+                thread=thread, pane=herdr.HerdrPlace(name, pane),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
                 account=_process_account(process.pid, "codex") if process else AccountUnread("pane process not found"),

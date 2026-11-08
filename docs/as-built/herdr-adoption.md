@@ -118,6 +118,13 @@ Short tab titles can repeat across workspaces.
 
 ### Claude trust before every launch
 
+`copies.py clone` checks source trust through `herdr.claude_trust` in every Claude account home.
+Trust in any home authorizes the clone in every existing account file.
+The clone record stores its resolved `claude_trust_folder` before the locked accounts writer grants trust.
+Removal deletes that folder's complete project entry after the external removal mark exists.
+It preserves other project entries and settings and skips missing account files.
+Malformed or unreadable account files produce an anomaly while the other homes continue.
+
 A Claude session started in a folder the account has not trusted stops at the trust prompt. A launcher that sends it a prompt then waits on a session that never answers. Every launcher checks trust first and refuses with the one command the user runs, before it writes or launches anything.
 
 - `herdr.claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile` is the one check. A folder is trusted when `projects[k].hasTrustDialogAccepted is True` in the account's `.claude.json` for a key `k` in: the folder itself, its `git rev-parse --show-toplevel` (`repository_root`), and its main checkout (`repository_trust_key`, the parent of `--git-common-dir`). Both git helpers share `_repository_key`, which strips inherited `GIT_*` variables and runs git with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`.
@@ -127,7 +134,7 @@ A Claude session started in a folder the account has not trusted stops at the tr
 - Callers. Each refuses with `<unit | child showrunner name | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`:
   - `add_unit.preflight(request, selected)` exits 2 before any stub, table row or worktree is written. A worktree that does not exist yet is checked by its main checkout's key, and its trust command runs in the main checkout.
   - `add_showrunner.checked`, and through it `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` sets the account file in tests.
-  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. Nothing writes `hasTrustDialogAccepted`.
+  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. The launch check does not write `hasTrustDialogAccepted`.
   - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
   - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
 - Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.
@@ -287,7 +294,17 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-Pane worker account moves use the shared stop, resume, and prompt APIs. The move retains the conversation and the terminal. A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt. The resume message builder also retains the launcher prompt path for restored workers.
+After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
+Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
+Shutdown restart uses the shared worker restore.
+Pane worker account moves use the shared stop, resume, and prompt APIs.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+An open worker with an active dispatch keeps its conversation and terminal during an account move.
+A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
+The resume message builder retains the launcher prompt path for restored workers.
 
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - One herdr session, `agents` (user, 2026-10-26). Every launcher opens a tab there with `start_server(shared_session())` and `open_tab`. Probes and live checks run as tabs there too, never in a server of their own. `_require_shared` refuses a server start under any other name, and `test_one_session.py` fails on code that starts one or tells the user to attach to one.
@@ -363,7 +380,9 @@ Pane worker account moves use the shared stop, resume, and prompt APIs. The move
 - `/tmp` is `/private/tmp`, so compare resolved paths.
 - Patching `sys.platform` after import does not change `herdr._PLATFORM`.
 - `test_support.py` sets the import path before importing `herdr`. Importing first breaks other suites.
-- `merge_gate.py` refuses on the Mac (no `/dev/shm`). Run Mac suites as `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+- `merge_gate.py` refuses on the Mac because `/dev/shm` is absent.
+  Run Mac suites from the clone root with `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+  Set no `PYTHONPATH`.
 - `list --on` runs the other machine's installed `~/.claude` code, so both machines need the promoted code before a remote list shows a change.
 
 **Trust.**

@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.build_steps import read_step_names
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
@@ -312,6 +313,27 @@ class BuildBudgetTests(unittest.TestCase):
         for size in (70000, 2097152):
             _ = write_config_fault(self.config, f"[memory]\nrequest_max_bytes={size}\n")
             self.assertEqual(gate.read_memory_config().request_max_bytes, size)
+
+
+class CloudFinalizationTests(unittest.TestCase):
+    def test_release_removes_cloud_progress_and_module_counter_files(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        with AdmissionFixture() as fixture:
+            sidecar = fixture.root / "cloud.cgroup"
+            _ = sidecar.write_text("")
+            request = replace(fixture.request(step="merge-gate"),
+                place=wire.CloudPlace("aws"), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 16, 0, fixture.clock.now()))
+            progress.publish_counter(sidecar, progress.ProgressCounter("modules", 4, 10))
+            cloud_file = Path(str(sidecar) + ".cloud.json")
+            self.assertTrue(cloud_file.exists())
+            fixture.release(grant)
+            for path in (sidecar, cloud_file, progress.progress_path(sidecar, "json")):
+                with self.subTest(path=path.name):
+                    self.assertFalse(path.exists())
+            self.assertFalse(fixture.server.reservations)
 
 
 class MemoryRoomRulesTests(unittest.TestCase):
@@ -1990,7 +2012,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertEqual(running.promise, hold.memory.need)
                 assert isinstance(running.step.measured, gate.MeasuredMemory)
                 self.assertIsInstance(running.step.measured.peak_history, gate.TestPhaseStarted)
-                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"))
+                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn(f"tests started: need {expected:.1f} GiB", text)
                 self.assertIn(f"test peak {peak / GIB:.1f} GiB, history 3.0 GiB x 1.2", text)
                 self.assertIn(queue_evidence.keep_aside_text(hold), text)

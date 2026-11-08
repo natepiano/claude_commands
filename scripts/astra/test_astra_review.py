@@ -6,15 +6,13 @@ import io
 import json
 import os
 import subprocess
-import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.agents import codex_mesh_test_support as mesh_fixture  # noqa: E402
+from scripts.agents import codex_mesh_test_support as mesh_fixture
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, unit_membership
@@ -25,7 +23,7 @@ from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr, side_pane
 from scripts.direct import assign
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
-from scripts.lib import conf, unit_runs
+from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 
 STUB = """#!/usr/bin/env python3
@@ -217,8 +215,7 @@ class AstraReviewTests(StaffTestCase):
             self.assertEqual(argv[argv.index(flag) + 1], value)
         settings = [argv[index + 1] for index, word in enumerate(argv) if word == "-c"]
         self.assertIn('model_reasoning_effort="xhigh"', settings)
-        compact = conf.read("direct").whole("ASTRA_REVIEW_COMPACT_ABOVE_TOKENS")
-        self.assertIn(f"model_auto_compact_token_limit={compact}", settings)
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in argv))
         self.assertEqual(argv[argv.index("--ask-for-approval") + 1], "never")
         self.assertEqual(environment["CODEX_HOME"], str(self.root / "codex"))
         self.assertNotIn("STAFF_ID", environment)

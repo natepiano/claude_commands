@@ -74,6 +74,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
+| `scripts/agents/codex_mesh_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/mesh_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
@@ -104,6 +105,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
+| `scripts/direct/worker_runs.py` | read | StaffId, StaffSnapshot |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
@@ -206,6 +208,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/shutdown/inventory.py` | read | local_snapshot |
 | `scripts/shutdown/launch_names.py` | read | initial_snapshot |
+| `scripts/shutdown/member_account.py` | read | StaffRow (type check only) |
 | `scripts/shutdown/pane_record.py` | read | initial_snapshot |
 | `scripts/shutdown/pane_restore.py` | read | row_operation |
 | `scripts/shutdown/remote_control.py` | read | initial_snapshot |
@@ -234,7 +237,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-169 accessors: 30 write, 138 read, 1 owner.
+172 accessors: 30 write, 141 read, 1 owner.
 
 ## Approved copies
 

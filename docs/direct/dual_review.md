@@ -333,11 +333,13 @@ contains only:
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
-- Three questions: for each id, `FIXED`, `NOT FIXED`, or `UNCLEAR` with
-  file/line evidence; for each id, the regression test that covers it and
-  whether it would fail without the repair — a testable id with no such test is
-  `NOT FIXED`; and whether this repair breaks any caller, consumer, transition,
-  or invariant of its changed symbols.
+- Three questions:
+
+  1. For each id, is it `FIXED`, `NOT FIXED`, or `UNCLEAR`, with file/line evidence?
+  2. For each id, does its test coverage meet the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6?
+     State whether the covering test fails without the repair.
+     Mark an id `NOT FIXED` when those rules require coverage and that coverage is missing.
+  3. Does this repair break any caller, consumer, transition, or invariant of its changed symbols?
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.
 - For a Codex reviewer, the `## Builds and tests` section of

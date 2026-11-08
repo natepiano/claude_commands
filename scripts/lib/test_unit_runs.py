@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
@@ -58,6 +58,7 @@ class UnitRunsTest(StaffTestCase):
         for run in (first, second):
             run.mkdir()
             write_text_atomic(run / unit_runs.STATE_FILE, "{}")
+            write_text_atomic(run / "fixture-impl_status", "running\n")
         record = staff.snapshot()
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             for run in (first, second, first, second):
@@ -191,6 +192,78 @@ class UnitRunsTest(StaffTestCase):
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name, "owner_staff_id": owner.id}))
 
+    def test_owner_scans_are_quiet_for_ended_runs_and_runs_without_resumable_workers(self) -> None:
+        owner = fixture_member("showrunner", name="quiet-scan-fixture")
+        record = staff.StaffSnapshot((owner,))
+        session = fixture_runtime_id("quiet-runs")
+        for status in ("ended", "active"):
+            with self.subTest(status=status):
+                root = self.root / status
+                runs, active = root / "runs", root / "active"
+                run = runs / "run"
+                run.mkdir(parents=True)
+                active.mkdir()
+                write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({"status": status}))
+                if status == "ended":
+                    write_text_atomic(run / "impl_status_fixture", "implementing\n")
+                else:
+                    phase = run / "phases/1"
+                    phase.mkdir(parents=True)
+                    write_text_atomic(phase / "fixture-impl_status", "idle\n")
+                write_text_atomic(active / session, str(run))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    scanned = unit_runs.held_by_session(runs, record=record)
+                    self.assertNotIn(session, scanned)
+                    self.assertEqual(unit_runs.held(session, runs, active, scanned=scanned, record=record), [])
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_director_without_progress_state_has_no_owner_or_output(self) -> None:
+        owner = fixture_member("showrunner", name="no-state-production")
+        run = self.root / "no-state-run"
+        run.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.director(run, record=staff.StaffSnapshot((owner,))), "")
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_held_keeps_a_herdr_run_with_an_idle_worker(self) -> None:
+        session = fixture_runtime_id("idle-herdr-owner")
+        runs, active = self.root / "runs", self.root / "active"
+        run = runs / "herdr"
+        phase = run / "phases/1"
+        phase.mkdir(parents=True)
+        self.staff_owner(run, session)
+        _ = (phase / "fixture-impl_status").write_text("idle\n")
+        _ = (run / "worker_transport").write_text("herdr\n")
+        self.assertEqual(unit_runs.held(session, runs, active), [str(run)])
+
+    def test_director_reports_a_missing_owner_for_active_pane_workers(self) -> None:
+        for folder in ("", "phases/1"):
+            with self.subTest(folder=folder):
+                run = self.root / ("phase" if folder else "root")
+                directory = run / folder
+                directory.mkdir(parents=True)
+                write_text_atomic(run / unit_runs.STATE_FILE, '{"status":"active"}')
+                write_text_atomic(directory / "fixture-impl_status", "running\n")
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(unit_runs.director(run), "")
+                self.assertIn(f"anomaly: {run}:", errors.getvalue())
+
+    def test_director_uses_the_recorder_for_an_idle_worker_with_an_active_dispatch(self) -> None:
+        from scripts.direct import progress_history
+
+        owner = fixture_member("showrunner", name="dispatch-owner")
+        worker = fixture_worker("fixture-impl", owner.id)
+        run = self.root / "dispatch"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text('{"status":"active"}')
+        _ = (run / f"{worker.name}_status").write_text("idle\n")
+        with (patch.object(progress_history, "active_dispatch",
+                           return_value=progress_history.ActiveDispatch("instance", ("fixture",))) as read,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(unit_runs.director(run), "")
+        read.assert_called_once_with(worker.id, run)
+        self.assertIn(f"anomaly: {run}:", errors.getvalue())
 
     def test_director_reports_existing_invalid_or_unreadable_progress_state(self) -> None:
         _ = fixture_member("showrunner", name="state-diagnostics")

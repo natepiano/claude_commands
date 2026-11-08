@@ -74,3 +74,34 @@ Watchers and watcher events move to `worker_lifecycle.py`.
 `finished_run_status` has the same owner.
 `loaded_threads` moves to `herdr.py`.
 Shared launcher fixtures move to `codex_mesh_test_support.py` without changing their names.
+
+## Pane closure and restore
+
+The director closes a worker pane after it accepts a pass.
+An immediate repair or phase dispatch can retain the pane.
+A busy worker or live detached run prevents closure.
+Closure keeps the staff row and thread.
+The next assign resumes that thread in a new pane.
+Restore reopens only workers with active dispatches.
+Idle workers stay closed until their next assign.
+Account moves preserve closed idle workers.
+
+## Worker account display
+
+`worker.py list --json` gives each worker its name, fixed id, current session, state, role and activity.
+It computes `work`, `account` and `home` when it reads each worker.
+It stores none of these three fields.
+`worker_panes.worker_state` supplies `work` as `idle`, `busy` or `unknown`.
+`member_account.resume_account` supplies the account label and absolute home path.
+Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
+That row has no `home` field.
+
+## Assignment settings and command files
+
+`UNIT_COMPACT_ABOVE_TOKENS` controls idle mesh compaction until round 2 removes that path.
+Pane workers have no option for compaction during a turn.
+Codex keeps its own full-window limit.
+`commands/unit/direct.md` defines `<LongLivedWorkers/>`.
+`docs/direct/repair_rounds.md` references it from `<FixDispatch/>`.
+`docs/direct/launch_implementation.md` references it from `<LaunchImplementation/>`.
+`docs/direct/early_review.md` defines `<EarlyReviewArm/>` and the early review worker.

@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-
+from collections.abc import Iterable, Mapping
 import fcntl
 import hashlib
 import json
@@ -19,23 +19,21 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from scripts.buildlog import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.message import send_budget, session_send
 
-from scripts.lint import memory_admit
-from scripts.build_queue import admission_client, admission_protocol
-from scripts.direct import step_record
-from scripts.mac_test import mac_test
-from scripts.notify import push_texts
-from scripts.notify.push_catalog import mac_idle_reservation
-from scripts.buildlog import mac_idle_alert
-from scripts.lib.process_failure import failure_detail
-from scripts.lib.user_zone import user_zone
-from scripts.message.unit_labels import unit_labels_for
+if TYPE_CHECKING:
+    from scripts.lint import memory_admit
+    from scripts.direct import step_record
+    from scripts.mac_test import mac_test
+    from scripts.buildlog import mac_idle_alert
+    from scripts.message.unit_labels import UnitLabels
+else:
+    from scripts.direct import step_record
+    from scripts.buildlog import mac_idle_alert
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -159,6 +157,8 @@ class AdmissionQueryFailed:
 
 
 def admission_waiters() -> AdmissionWaiters | AdmissionQueryFailed:
+    from scripts.build_queue import admission_client, admission_protocol
+
     try:
         return AdmissionWaiters([row for _, row in admission_client.view().ordered])
     except admission_protocol.AdmissionUnavailable as error:
@@ -284,6 +284,16 @@ def outage_repeat_minutes(since: float, now: float, settings: mac_idle_alert.Mac
 
 
 def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = REPAIR_MESSAGE) -> bool:
+    if TYPE_CHECKING:
+        from scripts.message import send_budget, session_send
+        from scripts.notify import push_texts
+        from scripts.lib.process_failure import failure_detail
+    else:
+        from scripts.message import send_budget
+        from scripts.message import session_send
+        from scripts.notify import push_texts
+        from scripts.lib.process_failure import failure_detail
+
     try:
         result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
                                 capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
@@ -344,6 +354,8 @@ class MacStateUnreadable:
 
 def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | MacUnreachable | MacStateUnreadable:
     """Use the claim owner's live rule and its saved work reading; never contact the Mac."""
+    from scripts.mac_test import mac_test
+
     try:
         # read_run is the single JSON boundary for claim records.
         try:
@@ -379,6 +391,8 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,
                   calls: tuple[VerifyCall, ...], live: dict[int, LiveProcess],
                   admission: AdmissionWaiters | AdmissionQueryFailed) -> bool:
+    from scripts.lib.user_zone import user_zone
+
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
     waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
     text = (line or "") + "".join(
@@ -389,6 +403,11 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    from scripts.notify import push_texts
+    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.lib.process_failure import failure_detail
+    from scripts.lib.user_zone import user_zone
+
     holder, detail = saved["holder"] or "none", saved["detail"] or "no block and no claim"
     blocked = saved["cause"] == "blocked"
     clears = (f"/build:mac unblock by {holder}" if blocked else f"release of the idle claim {detail}"
@@ -426,6 +445,13 @@ def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float
         "session": call.session, "repo": call.repo, "package": call.package, "wait": wait, "cause": cause, "action": action})
 
 
+def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
+    """Load holder labels when the watch needs them. Keep the test patch point."""
+    from scripts.message import unit_labels
+
+    return unit_labels.unit_labels_for(session_ids, environment)
+
+
 def calls_past_wait_limit(paths: MacIdlePaths, calls: tuple[VerifyCall, ...], now: float,
                          alert_seconds: float) -> tuple[VerifyCall, ...]:
     path = paths.state / "wait_starts.json"
@@ -449,6 +475,8 @@ def calls_past_wait_limit(paths: MacIdlePaths, calls: tuple[VerifyCall, ...], no
 
 def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
     """Save the one idle reading, notify its outage and repair free-Mac waits."""
+    from scripts.mac_test import mac_test
+
     paths.state.mkdir(parents=True, exist_ok=True)
     with (paths.state / "watch.lock").open("a+") as lock:
         try:

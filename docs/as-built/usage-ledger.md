@@ -212,12 +212,34 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 ### Waste watch: `scripts/usage/waste_watch.py`
 
-`scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`; the collector runs this script after each good pass (step 7 above). It reads the store through `open_read_store` and `check_store_version`, groups the last 2 hours' requests (`at` compared as UTC text) by thread in SQL (`thread_usage`: folder, latest role, weighted, waiting weighted, waiting actions, the longest run of Codex requests whose `input + cache_read` is above 250,000 by gaps and islands in `(at, turn_key)` order), and prints nothing when nothing alerts.
+`scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]` runs after each successful collector pass.
+It reads the store through `open_read_store` and `check_store_version`.
+The `thread_usage` query groups requests from the last two hours by thread.
+Each group includes the folder, latest role, weighted usage, waiting usage, and waiting actions.
+The context query orders requests by `(at, turn_key)` and compares `input + cache_read` with each request's model limit.
+The script prints nothing when no alert applies.
 
 - **Units**: each folder's unit comes from the `## Units` tables of every registered showrunner's production doc and of `--production-docs`, longest worktree first, else the folder's last component, else `unknown`.
 - **Wait alert**: a unit whose Codex worker threads (`impl`, `test`, `fix`, `review`, `worker` or unassigned) spend over 10% of their weighted usage on waiting requests, on at least 1,000,000 of their weighted tokens in the window. Claude sessions and other Codex roles never count toward it: a Claude session reads a background task's output once after its completion notice, which the classifier labels wait but is the required step, not a poll. On 2026-10-16 00:30–01:20 EDT those reads alone put two units at 9–11% while no worker polled. Their waiting stays visible in `wait_share`.
-- **Context flag**: a Codex thread with role `impl`, `test`, `fix`, `review`, `worker` or none, with 5 or more requests in a row above 250,000 tokens. It makes its unit alert too; one message per unit holds both.
-- **Message**: first line `Message from usage-waste-watch: <unit> spent <x>% of its weighted usage in the last 2 hours on requests that only waited` (or the context finding alone), the window totals, the top 3 waiting threads, the most common waiting action, the flagged threads with run length and peak, and the `usage_report.py wait_share --by unit,role --since <start>` command.
+- **Context flag**: a Codex worker thread alerts after five consecutive requests exceed their models’ compaction limits.
+  Worker roles are `impl`, `test`, `fix`, `review`, `worker`, and unassigned.
+  Each request uses `turns.model`.
+  Unknown models and requests at or below the model limit interrupt a run.
+  A model change preserves a run when each request exceeds its model limit.
+  The script reads `models_cache.json` from `CODEX_HOME`, or `~/.codex` when `CODEX_HOME` is empty.
+  Codex 0.166.0 uses `context_window`, or `max_context_window` when `context_window` is absent.
+  Its default compaction limit is `window * 9 // 10`.
+  A cached `auto_compact_token_limit` can lower this limit.
+  The `effective_context_window_percent` value controls usable input space and does not change the compaction limit.
+  Source: [ModelInfo::auto_compact_token_limit](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/openai_models.rs#L522-L544).
+  The script silently omits models with unreadable required values.
+  The usage ledger cannot distinguish mesh threads with launch overrides from pane threads.
+  The script therefore uses the model rule for all threads.
+  One unit alert can contain both context findings and waiting findings.
+- **Message**: the first line reports the waiting share or the context finding.
+  A waiting alert includes the window totals, three threads with the most waiting usage, and the most common waiting action.
+  Each context finding names the thread, model, limit, consecutive request count, and peak context size.
+  The message includes `usage_report.py wait_share --by unit,role --since <start>`.
 - **Delivery**: the registered showrunner (`showrunners.registered_showrunners()`) whose doc lists the unit, running ones first, through `send.py --to uds:<socket> --from usage-waste-watch --text` (`WASTE_WATCH_SEND` replaces the script path in tests). Exit 0 or 1 (queued) is delivered. No showrunner listing the unit, a stopped one or a failed lookup prints the alert to stdout with the reason; a failed send prints it too.
 - **Throttle**: at most one alert per unit per 6 hours, in `<state_dir()>/waste_watch.json` (unit → UTC time), written atomically after a delivery or a printed no-showrunner alert; a failed send is not recorded.
 - **Dry run**: `--dry-run`, and any store other than the default `collect.store_path()`, print each alert with its destination, send nothing, write no state and ignore the throttle. Tests and scratch stores therefore never send.
@@ -330,7 +352,14 @@ These writes do not enter the usage store.
 ## Why
 
 - **Request activity stored per request.** Codex workers spent about half their weighted usage waiting on builds for days, and nothing recorded what a request did, so it went unseen until an account used a week's usage in 20 hours.
-- **The watch's thresholds.** At the measured median of 2.1M weighted tokens per folder per 2 hours and about 19K per request, 1M is about 50 requests; below it a handful of polls sets the share. At 10% the waste at the minimum is at least 100K weighted tokens, more than the showrunner turn an alert costs. Codex compacts workers at 200,000 tokens, so five requests in a row above 250,000 mean compaction is not happening. Six hours between alerts keeps one problem to one message per working session.
+- **The watch's thresholds.** The measured median is 2.1M weighted tokens per folder per two hours.
+  A request uses about 19K weighted tokens, so 1M represents about 50 requests.
+  Below that minimum, a few waiting requests can dominate the share.
+  The 10% threshold requires at least 100K weighted tokens of waiting usage.
+  This exceeds the cost of the showrunner alert.
+  Five consecutive requests above the model compaction limit trigger a context alert.
+  The `gpt-6.1-sol` cache window of 500,000 tokens gives a compaction limit of 450,000 tokens.
+  Six hours between alerts limits repeated messages.
 
 - **SQLite, one store on natedev.** Metrics are joins of requests against roles and outcomes, and SQLite ships with Python. The store and the timer are on natedev because the Mac sleeps with its lid closed; a Mac that does not answer is caught up on the next hourly pass.
 - **Roles recorded at assignment.** The log preserves role changes after a run folder disappears.
