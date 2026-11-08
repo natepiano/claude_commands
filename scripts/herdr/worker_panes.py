@@ -622,9 +622,9 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         latest = progress_history.last_dispatch(worker.row.id)
         status, dispatch = ((latest.status, latest.instance_id)
                             if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
-    if status not in ("canceled", "completed", "active"):
+    if status not in ("canceled", "interrupted", "completed", "active"):
         return Kept("launcher has not recorded a completed pass")
-    completion = CloseAllowed() if status == "canceled" else _completed_turn(worker.row, dispatch)
+    completion = CloseAllowed() if status in ("canceled", "interrupted") else _completed_turn(worker.row, dispatch)
     if isinstance(completion, Kept):
         return completion
     return _idle_checks(worker.row, directory, lock, closing_turn=status == "active")
